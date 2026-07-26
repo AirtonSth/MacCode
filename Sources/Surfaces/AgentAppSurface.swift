@@ -254,7 +254,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Host lifecycle gate used while destructive thread deletion awaits provider
     /// termination. AppContext owns queue draining, so the surface requests the
     /// same suppression used by mirror-driven deletion.
-    public var setQueueDrainSuppressed: ((Set<AgentThreadID>, Bool) -> Void)?
+    public var acquireQueueDrainSuppression: ((AgentThreadID) async -> UUID)?
+    public var releaseQueueDrainSuppression: ((AgentThreadID, UUID) -> Void)?
     /// UX-MAC_AGENT-OPEN-SPLIT: wired by AppCommandRouter. A clicked file mention
     /// (absolute path, already resolved) opens — or reuses — a Files split panel
     /// to the right of this surface.
@@ -3512,8 +3513,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @discardableResult
     public func deleteThreads(_ ids: Set<AgentThreadID>) async -> Bool {
         guard !ids.isEmpty else { return true }
-        setQueueDrainSuppressed?(ids, true)
-        defer { setQueueDrainSuppressed?(ids, false) }
+        var suppressionLeases: [(AgentThreadID, UUID)] = []
+        if let acquireQueueDrainSuppression {
+            for id in ids {
+                suppressionLeases.append((id, await acquireQueueDrainSuppression(id)))
+            }
+        }
+        defer {
+            for (id, lease) in suppressionLeases {
+                releaseQueueDrainSuppression?(id, lease)
+            }
+        }
         // AG-002: a thread row owns the provider lifecycle. Do not cascade-delete
         // its data or evict UI caches until every selected provider has confirmed
         // terminal state and its process tree is dead.

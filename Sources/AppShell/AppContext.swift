@@ -185,13 +185,20 @@ public final class AppContext {
     var distillClientOverrideForTesting: DistillServiceClient?
     var queueDrainProviderIdleTimeout: TimeInterval = 10
     var queueDrainProviderIdlePollInterval: TimeInterval = 0.05
+    var queueDrainProviderLateIdlePollInterval: TimeInterval = 1
+    var queueDrainPollObserverForTesting: ((AgentThreadID) -> Void)?
+    var queueDrainBeforeDispatchForTesting: (() async -> Void)?
+    var queueDrainSleepForTesting: ((AgentThreadID, Duration) async throws -> Duration)?
+    var queueDrainSuppressionAcquiredForTesting: ((AgentThreadID) async -> Void)?
     private struct QueueDrainWaiter {
         let token: UUID
         let task: Task<Void, Never>
     }
     private var queueDrainWaiters: [AgentThreadID: QueueDrainWaiter] = [:]
-    private var queueDrainSuppressedThreadIDs = Set<AgentThreadID>()
+    private var queueDrainSuppressionLeases: [AgentThreadID: Set<UUID>] = [:]
+    private var isTerminating = false
     var queueDrainWaiterCountForTesting: Int { queueDrainWaiters.count }
+    var queueDrainSuppressedThreadCountForTesting: Int { queueDrainSuppressionLeases.count }
     /// Test seam: sandbox the SessionLearn target instruction files so tests never write
     /// into the developer's real ~/.claude/CLAUDE.md or ~/.codex/AGENTS.md.
     var sessionLearnInstructionFilesOverrideForTesting: [URL]?
@@ -856,7 +863,7 @@ public final class AppContext {
                 queue: .main
             ) { [weak self] _ in
                 MainActor.assumeIsolated {
-                    self?.prepareForApplicationTermination()
+                    _ = self?.prepareForApplicationTermination()
                 }
             }
         }
@@ -868,7 +875,7 @@ public final class AppContext {
     }
 
     func ensureQueueDrainWaiterIfNeeded(threadId: AgentThreadID) {
-        guard !queueDrainSuppressedThreadIDs.contains(threadId) else { return }
+        guard queueDrainAllowsWork(threadId: threadId) else { return }
         guard let queuedMessages = try? queuedMessageRepo.list(threadId: threadId),
               !queuedMessages.isEmpty else {
             cancelQueueDrainWaiterIfQueueEmpty(threadId: threadId)
@@ -876,14 +883,21 @@ public final class AppContext {
         }
         guard queueDrainWaiters[threadId] == nil else { return }
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(queueDrainProviderIdleTimeout))
+        let startedAt = clock.now
+        let timeout = Duration.seconds(max(0.001, queueDrainProviderIdleTimeout))
         let pollInterval = Duration.seconds(max(0.001, queueDrainProviderIdlePollInterval))
         let token = UUID()
 
         let task = Task { @MainActor [weak self] in
             var publishedTimeoutFailure = false
+            var evaluatedDeadline = false
+            var elapsed = Duration.zero
             while !Task.isCancelled {
                 guard let self else { return }
+                guard self.queueDrainAllowsWork(threadId: threadId) else {
+                    self.removeQueueDrainWaiter(threadId: threadId, token: token)
+                    return
+                }
                 guard (try? self.threadRepo.get(id: threadId)) != nil,
                       let queuedMessages = try? self.queuedMessageRepo.list(threadId: threadId),
                       !queuedMessages.isEmpty else {
@@ -897,24 +911,49 @@ public final class AppContext {
                 // Crossing the deadline means provider state is still uncertain,
                 // not failed. Keep the single waiter alive so a late native
                 // cancellation can drain exactly once without replaying the row.
-                let remaining = clock.now.duration(to: deadline)
-                let interval = remaining > .zero ? min(pollInterval, remaining) : pollInterval
+                let remaining = elapsed < timeout ? timeout - elapsed : .zero
+                let latePollInterval = Duration.seconds(max(0.001, self.queueDrainProviderLateIdlePollInterval))
+                let interval: Duration
+                if remaining > .zero {
+                    interval = min(pollInterval, remaining)
+                } else {
+                    interval = evaluatedDeadline ? latePollInterval : pollInterval
+                }
+                self.queueDrainPollObserverForTesting?(threadId)
                 do {
-                    try await clock.sleep(for: interval)
+                    if let queueDrainSleepForTesting = self.queueDrainSleepForTesting {
+                        elapsed = try await queueDrainSleepForTesting(threadId, interval)
+                    } else {
+                        try await clock.sleep(for: interval)
+                        elapsed = startedAt.duration(to: clock.now)
+                    }
                 } catch {
                     self.removeQueueDrainWaiter(threadId: threadId, token: token)
                     return
                 }
-                if !publishedTimeoutFailure, clock.now >= deadline {
+                if !self.coordinator.hasProviderSession(threadId: threadId) {
+                    await self.finishScheduledQueueDrain(threadId: threadId, token: token)
+                    return
+                }
+                let threadStatus = (try? self.threadRepo.get(id: threadId))?.status
+                if elapsed >= timeout {
+                    evaluatedDeadline = true
+                }
+                let hasTerminalOrStopEvidence: Bool
+                switch threadStatus {
+                case .completed, .failed, .cancelled, .interrupted:
+                    hasTerminalOrStopEvidence = true
+                case .pending, .running, nil:
+                    hasTerminalOrStopEvidence = false
+                }
+                if !publishedTimeoutFailure,
+                   elapsed >= timeout,
+                   hasTerminalOrStopEvidence {
                     publishedTimeoutFailure = true
                     EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
                         "thread_id": .string(threadId.value.uuidString),
                         "message": .string("Provider is still stopping. The queued message remains safe and will start when the provider becomes idle.")
                     ]))
-                }
-                if !self.coordinator.hasProviderSession(threadId: threadId) {
-                    await self.finishScheduledQueueDrain(threadId: threadId, token: token)
-                    return
                 }
             }
             self?.removeQueueDrainWaiter(threadId: threadId, token: token)
@@ -924,13 +963,20 @@ public final class AppContext {
 
     private func finishScheduledQueueDrain(threadId: AgentThreadID, token: UUID) async {
         guard queueDrainWaiters[threadId]?.token == token,
-              !queueDrainSuppressedThreadIDs.contains(threadId) else {
+              queueDrainAllowsWork(threadId: threadId),
+              !Task.isCancelled else {
             removeQueueDrainWaiter(threadId: threadId, token: token)
             return
         }
         defer { removeQueueDrainWaiter(threadId: threadId, token: token) }
+        if let queueDrainBeforeDispatchForTesting {
+            await queueDrainBeforeDispatchForTesting()
+        }
+        guard queueDrainAllowsWork(threadId: threadId), !Task.isCancelled else { return }
         do {
             try await router?.drainNextQueuedAgentMessage(thread: threadId)
+        } catch is CancellationError {
+            return
         } catch {
             EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
                 "thread_id": .string(threadId.value.uuidString),
@@ -948,14 +994,32 @@ public final class AppContext {
         queueDrainWaiters.removeValue(forKey: threadId)?.task.cancel()
     }
 
-    func suppressQueueDrain(threadId: AgentThreadID) {
-        queueDrainSuppressedThreadIDs.insert(threadId)
-        cancelQueueDrainWaiter(threadId: threadId)
+    func acquireQueueDrainSuppression(threadId: AgentThreadID) async -> UUID {
+        let lease = UUID()
+        queueDrainSuppressionLeases[threadId, default: []].insert(lease)
+        if let queueDrainSuppressionAcquiredForTesting {
+            await queueDrainSuppressionAcquiredForTesting(threadId)
+        }
+        if let waiter = queueDrainWaiters.removeValue(forKey: threadId) {
+            waiter.task.cancel()
+            await waiter.task.value
+        }
+        return lease
     }
 
-    func resumeQueueDrain(threadId: AgentThreadID) {
-        queueDrainSuppressedThreadIDs.remove(threadId)
-        ensureQueueDrainWaiterIfNeeded(threadId: threadId)
+    func releaseQueueDrainSuppression(threadId: AgentThreadID, lease: UUID) {
+        guard var leases = queueDrainSuppressionLeases[threadId],
+              leases.remove(lease) != nil else { return }
+        if leases.isEmpty {
+            queueDrainSuppressionLeases.removeValue(forKey: threadId)
+            ensureQueueDrainWaiterIfNeeded(threadId: threadId)
+        } else {
+            queueDrainSuppressionLeases[threadId] = leases
+        }
+    }
+
+    func queueDrainAllowsWork(threadId: AgentThreadID) -> Bool {
+        !isTerminating && queueDrainSuppressionLeases[threadId]?.isEmpty != false
     }
 
     private func removeQueueDrainWaiter(threadId: AgentThreadID, token: UUID) {
@@ -963,16 +1027,19 @@ public final class AppContext {
         queueDrainWaiters.removeValue(forKey: threadId)
     }
 
-    private func cancelAllQueueDrainWaiters() {
+    private func cancelAllQueueDrainWaiters() -> [Task<Void, Never>] {
         let tasks = queueDrainWaiters.values.map(\.task)
         queueDrainWaiters.removeAll()
         for task in tasks { task.cancel() }
+        return tasks
     }
 
-    func prepareForApplicationTermination() {
+    @discardableResult
+    func prepareForApplicationTermination() -> [Task<Void, Never>] {
+        isTerminating = true
         flushPendingTokenSaverUsage()
         flushWriterQueue()
-        cancelAllQueueDrainWaiters()
+        return cancelAllQueueDrainWaiters()
     }
 
     /// Managed `/distill` state is only useful while Token Saver is on, so the skill

@@ -1261,6 +1261,103 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         }
     }
 
+    func test_normalQueuedMessageWaitsPastTimeoutWithoutFalseFailureAndDrainsOnceAcrossProviders() async throws {
+        // WHY: the queue timeout describes delayed stop recovery, not normal
+        // queue residence. A legitimately running turn may exceed it without
+        // making the durable follow-up unsafe or showing a false failure.
+        for provider in AgentProvider.allCases {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+            try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            defer { closeAndUnregisterAllSurfaces() }
+            let ctx = try AppContext(
+                channel: .debug,
+                appSupportOverride: root.appendingPathComponent("support").path
+            )
+            ctx.queueDrainProviderIdleTimeout = 0.02
+            ctx.queueDrainProviderIdlePollInterval = 0.005
+            let router = AppCommandRouter(context: ctx)
+            ctx.router = router
+            let runner = DelayedCancelQueueRunner(provider: provider, cancellationDelay: nil)
+            ctx.coordinator.replaceProvider(provider, runner: runner)
+            let sleeper = QueueDrainTestSleeper()
+            ctx.queueDrainSleepForTesting = { try await sleeper.sleep(threadId: $0, duration: $1) }
+            let workspace = try router.createWorkspace(
+                name: "normal-queue-\(provider.rawValue)",
+                cwd: workspaceDir.path
+            )
+            let thread = try router.createAgentThread(
+                workspace: workspace.id,
+                title: "normal queue \(provider.rawValue)",
+                provider: provider,
+                model: "test-model",
+                permissionMode: .supervised,
+                reasoningEffort: .medium
+            )
+            _ = try await router.sendAgentMessage(
+                thread: thread.id,
+                text: "legitimately long turn",
+                provider: nil,
+                model: nil,
+                permissionMode: nil,
+                reasoningEffort: nil
+            )
+            let failures = QueueFailureCounter(threadId: thread.id)
+            let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) {
+                failures.record($0)
+            }
+            defer { EventBus.shared.unsubscribe(subscription) }
+
+            _ = try await router.sendAgentMessage(
+                thread: thread.id,
+                text: "ordinary queued follow-up",
+                provider: nil,
+                model: nil,
+                permissionMode: nil,
+                reasoningEffort: nil
+            )
+            for _ in 0..<5 {
+                await sleeper.advanceNext(threadId: thread.id)
+            }
+            await sleeper.waitForRequestCount(6, threadId: thread.id)
+
+            XCTAssertEqual(failures.count, 0,
+                           "\(provider.rawValue) normal queue residence must not look like stop failure")
+            XCTAssertEqual(runner.startCount, 1)
+            XCTAssertEqual(
+                try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.text),
+                ["ordinary queued follow-up"]
+            )
+            XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 1)
+
+            let drained = QueueDrainAsyncSignal()
+            let drainedSubscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) {
+                guard $0.kind == "agent.message.queue.drained",
+                      $0.payload.objectValue?["thread_id"]?.stringValue == thread.id.value.uuidString else {
+                    return
+                }
+                Task { await drained.signal() }
+            }
+            defer { EventBus.shared.unsubscribe(drainedSubscription) }
+            runner.finishRun(ordinal: 1, status: .completed)
+            await sleeper.advanceNext(threadId: thread.id)
+            await drained.wait()
+
+            XCTAssertEqual(runner.startCount, 2)
+            XCTAssertEqual(failures.count, 0)
+            XCTAssertTrue(try ctx.queuedMessageRepo.list(threadId: thread.id).isEmpty)
+            XCTAssertEqual(
+                try ctx.messageRepo.list(threadId: thread.id)
+                    .filter { $0.role == .user && $0.content == "ordinary queued follow-up" }.count,
+                1,
+                "\(provider.rawValue) normal completion must drain the queued intent exactly once"
+            )
+            runner.finishRun(ordinal: 2, status: .completed)
+        }
+    }
+
     func test_forceQueueNeverIdlePreservesIntentWithSingleTimeoutFailureAcrossProviders() async throws {
         // WHY: a provider that ignores cancellation must not trigger repeated
         // drain attempts, emit a false terminal failure, or consume the row.
@@ -1580,7 +1677,11 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread.id)
 
         let deadline = Date().addingTimeInterval(3)
-        while runner.startCount < 1, Date() < deadline {
+        while Date() < deadline {
+            if runner.startCount >= 1,
+               try ctx.queuedMessageRepo.list(threadId: thread.id).isEmpty {
+                break
+            }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTAssertEqual(runner.startCount, 1)
@@ -1650,7 +1751,11 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                        "old cancellation cleanup must be token-checked")
         runner.finishRun(ordinal: 1, status: .cancelled)
         let deadline = Date().addingTimeInterval(3)
-        while runner.startCount < 2, Date() < deadline {
+        while Date() < deadline {
+            if runner.startCount >= 2,
+               try ctx.queuedMessageRepo.list(threadId: thread.id).isEmpty {
+                break
+            }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTAssertEqual(runner.startCount, 2)
@@ -1787,6 +1892,354 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                        "deletion shutdown must not start the queued follow-up")
         XCTAssertNil(try ctx.threadRepo.get(id: thread.id))
         XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 0)
+    }
+
+    func test_overlappingQueueDrainSuppressionLeasesRearmOnlyAfterFinalRelease() async throws {
+        // WHY: UI and RPC deletion can overlap for the same thread. Releasing
+        // either owner must not rearm queued work while the other still owns
+        // destructive shutdown.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: nil)
+        ctx.coordinator.replaceProvider(.claude, runner: runner)
+        let workspace = try router.createWorkspace(name: "overlapping-delete", cwd: workspaceDir.path)
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "overlapping delete",
+            provider: .claude,
+            model: "test-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        _ = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "existing turn",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        _ = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "must remain suppressed",
+            attachments: [],
+            interactionMode: .default
+        )
+        ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread.id)
+
+        let firstLease = await ctx.acquireQueueDrainSuppression(threadId: thread.id)
+        let secondLease = await ctx.acquireQueueDrainSuppression(threadId: thread.id)
+        XCTAssertEqual(ctx.queueDrainSuppressedThreadCountForTesting, 1)
+        XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 0)
+
+        ctx.releaseQueueDrainSuppression(threadId: thread.id, lease: firstLease)
+        XCTAssertEqual(ctx.queueDrainSuppressedThreadCountForTesting, 1)
+        XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 0)
+
+        ctx.releaseQueueDrainSuppression(threadId: thread.id, lease: secondLease)
+        XCTAssertEqual(ctx.queueDrainSuppressedThreadCountForTesting, 0)
+        XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 1)
+        _ = await ctx.acquireQueueDrainSuppression(threadId: thread.id)
+        runner.finishRun(ordinal: 1, status: .cancelled)
+    }
+
+    func test_deletionAwaitsInFlightQueueDrainBeforeRemovingThread() async throws {
+        // WHY: cancellation alone is not a barrier. A waiter that already
+        // entered drain must finish observing cancellation before destructive
+        // deletion can remove its thread or start queued work afterward.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        ctx.queueDrainProviderIdlePollInterval = 0.005
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: nil)
+        ctx.coordinator.replaceProvider(.claude, runner: runner)
+        let workspace = try router.createWorkspace(name: "delete-drain-barrier", cwd: workspaceDir.path)
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "delete drain barrier",
+            provider: .claude,
+            model: "test-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        _ = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "existing turn",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        _ = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "must not start after delete",
+            attachments: [],
+            interactionMode: .default
+        )
+        let barrier = QueueDrainAsyncBarrier()
+        ctx.queueDrainBeforeDispatchForTesting = { await barrier.enterAndWait() }
+        ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread.id)
+        runner.finishRun(ordinal: 1, status: .completed)
+        await barrier.waitUntilEntered()
+
+        let suppression = QueueDrainAsyncSignal()
+        ctx.queueDrainSuppressionAcquiredForTesting = {
+            guard $0 == thread.id else { return }
+            await suppression.signal()
+        }
+        let deletion = Task { try await router.deleteAgentThread(thread: thread.id) }
+        await suppression.wait()
+        XCTAssertNotNil(try ctx.threadRepo.get(id: thread.id),
+                        "deletion must await the in-flight waiter cancellation barrier")
+        await barrier.release()
+        try await deletion.value
+
+        XCTAssertNil(try ctx.threadRepo.get(id: thread.id))
+        XCTAssertEqual(runner.startCount, 1)
+        XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 0)
+    }
+
+    func test_agentAppDeletionSuppressesQueueAfterPreflightBeforeProviderStart() async throws {
+        // WHY: queue dispatch awaits provider preflight after its outer guards.
+        // Deletion suppression acquired during that suspension must still win at
+        // the actual start boundary, release the prepared lease, and preserve
+        // the queued intent in the completed deletion's undo snapshot.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        ctx.queueDrainProviderIdlePollInterval = 0.005
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: nil)
+        ctx.coordinator.replaceProvider(.claude, runner: runner)
+        let workspace = try router.createWorkspace(name: "post-preflight-delete", cwd: workspaceDir.path)
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "post preflight delete",
+            provider: .claude,
+            model: "test-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let descriptor = try router.createSurface(
+            workspace: workspace.id,
+            type: .agentApp,
+            paneID: nil,
+            title: "Agent App"
+        )
+        let surface = try XCTUnwrap(
+            SurfaceRegistry.shared.surface(descriptor.id) as? AgentAppSurface
+        )
+        surface.viewModel.selectThread(thread.id)
+        _ = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "existing turn",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        _ = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "preserve across delete",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        let failures = QueueFailureCounter(threadId: thread.id)
+        let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) {
+            failures.record($0)
+        }
+        defer { EventBus.shared.unsubscribe(subscription) }
+        let barrier = QueueDrainAsyncBarrier()
+        router.queueDispatchBeforeProviderStartForTesting = { await barrier.enterAndWait() }
+        runner.finishRun(ordinal: 1, status: .completed)
+        await barrier.waitUntilEntered()
+
+        let suppression = QueueDrainAsyncSignal()
+        ctx.queueDrainSuppressionAcquiredForTesting = {
+            guard $0 == thread.id else { return }
+            await suppression.signal()
+        }
+        let deletion = Task { await surface.viewModel.deleteThread(thread.id) }
+        await suppression.wait()
+        XCTAssertNotNil(try ctx.threadRepo.get(id: thread.id))
+        await barrier.release()
+        let deleted = await deletion.value
+        XCTAssertTrue(deleted)
+
+        XCTAssertEqual(runner.startCount, 1,
+                       "suppression after preflight must prevent queued provider start")
+        XCTAssertEqual(failures.count, 0,
+                       "deliberate suppression cancellation must not report a queue failure")
+        XCTAssertNil(try ctx.threadRepo.get(id: thread.id),
+                     "the deletion owner must complete after the cancelled drain exits")
+        XCTAssertTrue(surface.viewModel.undoLastThreadDeletion())
+        XCTAssertEqual(
+            try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.text),
+            ["preserve across delete"],
+            "pre-start cancellation must release the prepared lease before deletion snapshots it"
+        )
+    }
+
+    func test_applicationTerminationBlocksDrainAlreadyAtDispatchBarrier() async throws {
+        // WHY: app termination is synchronous and cannot await waiter tasks.
+        // Its gate must make a waiter already inside drain abandon dispatch as
+        // soon as that waiter resumes.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        ctx.queueDrainProviderIdlePollInterval = 0.005
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: nil)
+        ctx.coordinator.replaceProvider(.claude, runner: runner)
+        let workspace = try router.createWorkspace(name: "quit-drain-barrier", cwd: workspaceDir.path)
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "quit drain barrier",
+            provider: .claude,
+            model: "test-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        _ = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "existing turn",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        _ = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "must remain queued at quit",
+            attachments: [],
+            interactionMode: .default
+        )
+        let barrier = QueueDrainAsyncBarrier()
+        ctx.queueDrainBeforeDispatchForTesting = { await barrier.enterAndWait() }
+        ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread.id)
+        runner.finishRun(ordinal: 1, status: .completed)
+        await barrier.waitUntilEntered()
+
+        let cancelledWaiters = ctx.prepareForApplicationTermination()
+        await barrier.release()
+        for waiter in cancelledWaiters {
+            await waiter.value
+        }
+
+        XCTAssertEqual(runner.startCount, 1)
+        XCTAssertEqual(
+            try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.text),
+            ["must remain queued at quit"]
+        )
+        XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 0)
+    }
+
+    func test_lateIdleWaitersBackOffPollingAcrossThreads() async throws {
+        // WHY: late-idle recovery remains eventual, but many legitimately long
+        // turns must not wake the MainActor every 50ms after the warning deadline.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        ctx.queueDrainProviderIdleTimeout = 0.02
+        ctx.queueDrainProviderIdlePollInterval = 0.005
+        ctx.queueDrainProviderLateIdlePollInterval = 0.05
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: nil)
+        ctx.coordinator.replaceProvider(.claude, runner: runner)
+        let sleeper = QueueDrainTestSleeper()
+        ctx.queueDrainSleepForTesting = { try await sleeper.sleep(threadId: $0, duration: $1) }
+        let workspace = try router.createWorkspace(name: "late-idle-backoff", cwd: workspaceDir.path)
+        var threads: [AgentThread] = []
+        for index in 1...2 {
+            let thread = try router.createAgentThread(
+                workspace: workspace.id,
+                title: "backoff \(index)",
+                provider: .claude,
+                model: "test-model",
+                permissionMode: .supervised,
+                reasoningEffort: .medium
+            )
+            threads.append(thread)
+            _ = try await router.sendAgentMessage(
+                thread: thread.id,
+                text: "long turn \(index)",
+                provider: nil,
+                model: nil,
+                permissionMode: nil,
+                reasoningEffort: nil
+            )
+            _ = try await router.sendAgentMessage(
+                thread: thread.id,
+                text: "queued \(index)",
+                provider: nil,
+                model: nil,
+                permissionMode: nil,
+                reasoningEffort: nil
+            )
+        }
+
+        for thread in threads {
+            for _ in 0..<4 {
+                await sleeper.advanceNext(threadId: thread.id)
+            }
+            await sleeper.waitForRequestCount(5, threadId: thread.id)
+            let intervals = await sleeper.requestedIntervals(threadId: thread.id)
+            XCTAssertEqual(intervals, [
+                .seconds(0.005),
+                .seconds(0.005),
+                .seconds(0.005),
+                .seconds(0.005),
+                .seconds(0.05)
+            ], "post-deadline polling must switch to the low-rate interval")
+            _ = await ctx.acquireQueueDrainSuppression(threadId: thread.id)
+        }
+        runner.finishRun(ordinal: 1, status: .cancelled)
+        runner.finishRun(ordinal: 2, status: .cancelled)
     }
 
     func test_agentAppDeleteThreadSuppressesQueuedDrainBeforeAwaitingProviderTermination() async throws {
@@ -2493,5 +2946,133 @@ private final class QueueFailureCounter: @unchecked Sendable {
         guard event.kind == "agent.message.queue.failed",
               event.payload.objectValue?["thread_id"]?.stringValue == threadId else { return }
         lock.withLock { value += 1 }
+    }
+}
+
+private actor QueueDrainAsyncSignal {
+    private var signalled = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func signal() {
+        signalled = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.resume() }
+    }
+
+    func wait() async {
+        guard !signalled else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
+private actor QueueDrainTestSleeper {
+    private struct PendingSleep {
+        let id: UUID
+        let duration: Duration
+        let continuation: CheckedContinuation<Duration, Error>
+    }
+
+    private var elapsedByThread: [AgentThreadID: Duration] = [:]
+    private var intervalsByThread: [AgentThreadID: [Duration]] = [:]
+    private var pendingByThread: [AgentThreadID: PendingSleep] = [:]
+    private var requestWaiters: [AgentThreadID: [(Int, CheckedContinuation<Void, Never>)]] = [:]
+    private var cancelledSleepIDs = Set<UUID>()
+
+    func sleep(threadId: AgentThreadID, duration: Duration) async throws -> Duration {
+        let id = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled || cancelledSleepIDs.remove(id) != nil {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                intervalsByThread[threadId, default: []].append(duration)
+                pendingByThread[threadId] = PendingSleep(
+                    id: id,
+                    duration: duration,
+                    continuation: continuation
+                )
+                resumeSatisfiedRequestWaiters(threadId: threadId)
+            }
+        } onCancel: {
+            Task { await self.cancel(threadId: threadId, sleepID: id) }
+        }
+    }
+
+    func advanceNext(threadId: AgentThreadID) async {
+        if pendingByThread[threadId] == nil {
+            await waitForRequestCount(
+                intervalsByThread[threadId, default: []].count + 1,
+                threadId: threadId
+            )
+        }
+        guard let pending = pendingByThread.removeValue(forKey: threadId) else { return }
+        let elapsed = elapsedByThread[threadId, default: .zero] + pending.duration
+        elapsedByThread[threadId] = elapsed
+        pending.continuation.resume(returning: elapsed)
+    }
+
+    func waitForRequestCount(_ count: Int, threadId: AgentThreadID) async {
+        guard intervalsByThread[threadId, default: []].count < count else { return }
+        await withCheckedContinuation {
+            requestWaiters[threadId, default: []].append((count, $0))
+        }
+    }
+
+    func requestedIntervals(threadId: AgentThreadID) -> [Duration] {
+        intervalsByThread[threadId, default: []]
+    }
+
+    private func cancel(threadId: AgentThreadID, sleepID: UUID) {
+        guard let pending = pendingByThread[threadId], pending.id == sleepID else {
+            cancelledSleepIDs.insert(sleepID)
+            return
+        }
+        pendingByThread.removeValue(forKey: threadId)
+        pending.continuation.resume(throwing: CancellationError())
+    }
+
+    private func resumeSatisfiedRequestWaiters(threadId: AgentThreadID) {
+        let count = intervalsByThread[threadId, default: []].count
+        let waiters = requestWaiters.removeValue(forKey: threadId) ?? []
+        var remaining: [(Int, CheckedContinuation<Void, Never>)] = []
+        for waiter in waiters {
+            if waiter.0 <= count {
+                waiter.1.resume()
+            } else {
+                remaining.append(waiter)
+            }
+        }
+        if !remaining.isEmpty {
+            requestWaiters[threadId] = remaining
+        }
+    }
+}
+
+private actor QueueDrainAsyncBarrier {
+    private var entered = false
+    private var released = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+    func enterAndWait() async {
+        entered = true
+        let waiters = entryWaiters
+        entryWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        guard !released else { return }
+        await withCheckedContinuation { releaseWaiter = $0 }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { entryWaiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        releaseWaiter?.resume()
+        releaseWaiter = nil
     }
 }

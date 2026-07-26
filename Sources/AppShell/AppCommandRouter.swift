@@ -97,6 +97,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     var providerSignInTerminalInputSenderForTests: ((SurfaceID, String) -> TerminalInputStatus)?
     var terminalRestartRuntimePreparerForTesting: ((WorkspaceID, String, SurfaceID) -> TerminalPreparedPTYRuntime?)?
     var terminalRestartPreparedDiscardAdditionalBarrierForTesting: (() -> SurfaceTerminationBarrier?)?
+    var queueDispatchBeforeProviderStartForTesting: (() async -> Void)?
     var codexForkProtocolSupportProbe: (String, [String: String]) -> Bool = { binary, environment in
         CodexForkProtocolSupport.probe(binary: binary, environment: environment).isSupported
     }
@@ -2064,15 +2065,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private static func wireQueueDrainControl(on viewModel: AgentAppViewModel, context: AppContext) {
-        viewModel.setQueueDrainSuppressed = { [weak context] threadIDs, suppressed in
-            guard let context else { return }
-            for threadID in threadIDs {
-                if suppressed {
-                    context.suppressQueueDrain(threadId: threadID)
-                } else {
-                    context.resumeQueueDrain(threadId: threadID)
-                }
-            }
+        viewModel.acquireQueueDrainSuppression = { [weak context] threadID in
+            guard let context else { return UUID() }
+            return await context.acquireQueueDrainSuppression(threadId: threadID)
+        }
+        viewModel.releaseQueueDrainSuppression = { [weak context] threadID, lease in
+            context?.releaseQueueDrainSuppression(threadId: threadID, lease: lease)
         }
     }
 
@@ -2872,6 +2870,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 )
             }
         }
+        if queueMessageId != nil {
+            if let queueDispatchBeforeProviderStartForTesting {
+                await queueDispatchBeforeProviderStartForTesting()
+            }
+            guard ctx.queueDrainAllowsWork(threadId: thread), !Task.isCancelled else {
+                throw CancellationError()
+            }
+        }
         let runId = try await ctx.coordinator.startRun(req, routingSnapshot: coordinatorSnapshot)
         // HC-5 (R1): a message sent from the mobile mirror / RPC must become
         // visible on the Mac host. Refresh every Agent App rail so the thread
@@ -2892,6 +2898,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         recoverPreparedFromPriorProcess: Bool = false
     ) async throws {
         guard let ctx = context,
+              ctx.queueDrainAllowsWork(threadId: thread),
+              !Task.isCancelled,
               let threadState = try ctx.threadRepo.get(id: thread),
               threadState.status != .running,
               threadState.status != .pending,
@@ -2925,7 +2933,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             publishQueuedMessage(kind: "agent.message.queue.drained", recovered)
             refreshAgentSurfaces(thread: thread)
         }
+        guard ctx.queueDrainAllowsWork(threadId: thread), !Task.isCancelled else { return }
         guard let lease = try ctx.queuedMessageRepo.claimFirst(threadId: thread) else { return }
+        guard ctx.queueDrainAllowsWork(threadId: thread), !Task.isCancelled else {
+            _ = try? ctx.queuedMessageRepo.release(lease)
+            return
+        }
         let queued = lease.message
         let dispatchRunId = AgentRunID(queued.id.value)
         guard try ctx.queuedMessageRepo.prepareDispatch(lease, runId: dispatchRunId) else {
@@ -2935,6 +2948,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         var providerStartConfirmed = false
         do {
             let queuedRouting = try routingSnapshotForQueuedMessage(queued, context: ctx)
+            guard ctx.queueDrainAllowsWork(threadId: thread), !Task.isCancelled else {
+                _ = try? ctx.queuedMessageRepo.releasePrepared(lease, runId: dispatchRunId)
+                return
+            }
             _ = try await sendAgentMessage(
                 thread: thread,
                 text: queued.text,
@@ -3560,17 +3577,25 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func deleteAgentThread(thread: AgentThreadID) async throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        ctx.suppressQueueDrain(threadId: thread)
-        defer { ctx.resumeQueueDrain(threadId: thread) }
+        let suppressionLease = await ctx.acquireQueueDrainSuppression(threadId: thread)
+        defer { ctx.releaseQueueDrainSuppression(threadId: thread, lease: suppressionLease) }
         try await ctx.coordinator.stopAndAwaitTermination(threadId: thread)
         try ctx.threadRepo.delete(id: thread)
     }
 
     public func deleteAgentThreads(_ threads: [AgentThreadID]) async throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        for thread in threads { ctx.suppressQueueDrain(threadId: thread) }
+        var suppressionLeases: [(AgentThreadID, UUID)] = []
+        for thread in threads {
+            suppressionLeases.append((
+                thread,
+                await ctx.acquireQueueDrainSuppression(threadId: thread)
+            ))
+        }
         defer {
-            for thread in threads { ctx.resumeQueueDrain(threadId: thread) }
+            for (thread, lease) in suppressionLeases {
+                ctx.releaseQueueDrainSuppression(threadId: thread, lease: lease)
+            }
         }
         for thread in threads {
             try await ctx.coordinator.stopAndAwaitTermination(threadId: thread)
