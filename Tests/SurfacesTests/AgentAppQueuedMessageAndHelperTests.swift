@@ -35,11 +35,13 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
         let threadRepo = AgentThreadRepository(db: db)
         let messageRepo = AgentMessageRepository(db: db)
         let runRepo = AgentRunRepository(db: db)
+        let providerSessionRepo = ProviderSessionRuntimeRepository(db: db)
         let queuedRepo = withQueue ? AgentQueuedMessageRepository(db: db) : nil
         let coord = AgentRunCoordinator(
             runRepo: runRepo,
             messageRepo: messageRepo,
             threadRepo: threadRepo,
+            providerSessionRepo: providerSessionRepo,
             providers: [
                 .codex: provider ?? FakeProviderRunner(provider: .codex),
                 .claude: FakeProviderRunner(provider: .claude)
@@ -51,7 +53,8 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
             coordinator: coord,
             threadRepo: threadRepo,
             messageRepo: messageRepo,
-            queuedMessageRepo: queuedRepo
+            queuedMessageRepo: queuedRepo,
+            providerSessionRepo: providerSessionRepo
         )
         vm.providerSnapshots = [operationalSnapshot(for: provider?.provider ?? .codex)]
         return (vm, queuedRepo)
@@ -272,7 +275,7 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
                        "a confirmed force-now start must persist exactly one user message")
     }
 
-    func test_forceQueuedMessageNow_whenStartFailsLeavesOnlyDurableRunRetrySurface() async throws {
+    func test_forceQueuedMessageNow_whenStartFailsPreservesPreparedIntentWithoutReplay() async throws {
         let runner = QueueStartProbeRunner(failuresBeforeSuccess: 1)
         let (vm, repo) = try makeVM(withQueue: true, provider: runner)
         let queuedRepo = try XCTUnwrap(repo)
@@ -286,10 +289,11 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
 
         await vm.forceQueuedMessageNow(queued)
 
-        XCTAssertTrue(try queuedRepo.list(threadId: threadId).isEmpty,
-                      "the durable failed run owns Retry; retaining the queue would create a second replay surface")
-        XCTAssertEqual(eventKinds.filter { $0 == AgentQueueEventKinds.drained }.count, 1,
-                       "removing the redundant queue intent must publish one drained event")
+        XCTAssertEqual(try queuedRepo.list(threadId: threadId).map(\.id), [queued.id],
+                       "a same-call start failure is not provider-acceptance proof, so Force must preserve the prepared intent")
+        XCTAssertEqual(try queuedRepo.dispatch(id: queued.id)?.state, .prepared)
+        XCTAssertEqual(eventKinds.filter { $0 == AgentQueueEventKinds.drained }.count, 0,
+                       "an ambiguous prepared start failure must not publish a drained acknowledgement")
         XCTAssertEqual(try vm.messageRepo.list(threadId: threadId).filter { $0.role == .user && $0.content == "retry me" }.count, 1,
                        "the failed attempt must retain exactly one durable user row for Retry")
         XCTAssertEqual(try vm.coordinator.runStatus(AgentRunID(queued.id.value)), .failed)
@@ -382,7 +386,56 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
         XCTAssertTrue(runner.startedRunIDs.isEmpty,
                       "normal Force must never treat a live prepared lease as a prior-process crash window")
         XCTAssertEqual(try queuedRepo.dispatch(id: queued.id)?.state, .prepared)
-        XCTAssertTrue(vm.queueStatusMessage?.contains("Already processing") == true)
+        XCTAssertTrue(vm.queueStatusMessage?.contains("Start confirmation is pending") == true)
+    }
+
+    func test_forceQueuedMessageNow_preservesPreparedAmbiguousProviderEvidence() async throws {
+        // WHY: a persisted run row, a threadStarted event, a recorded start
+        // failure, or a timeout marker can all exist before provider acceptance.
+        let runner = QueueStartProbeRunner(finishSynchronously: true)
+        let (vm, repo) = try makeVM(withQueue: true, provider: runner)
+        let queuedRepo = try XCTUnwrap(repo)
+        vm.createThread(title: "t")
+        let threadId = try XCTUnwrap(vm.selectedThreadId)
+        let ambiguousEvidence: [(kind: String, status: AgentRunStatus)] = [
+            ("run.pending", .pending),
+            ("threadStarted(codex-thread-1)", .pending),
+            ("run.start_failed", .failed),
+            ("run.start_timeout", .failed)
+        ]
+
+        for (index, evidence) in ambiguousEvidence.enumerated() {
+            let queued = AgentQueuedMessage(
+                threadId: threadId,
+                text: "wait for provider proof \(index)",
+                position: index + 1
+            )
+            try queuedRepo.upsert(queued)
+            let lease = try XCTUnwrap(queuedRepo.claim(id: queued.id, leaseId: "interrupted-start-\(index)"))
+            let runId = AgentRunID(queued.id.value)
+            XCTAssertTrue(try queuedRepo.prepareDispatch(lease, runId: runId))
+            try AgentRunRepository(db: queuedRepo.db).upsert(
+                AgentRun(id: runId, threadId: threadId, provider: .codex, model: "test-model", status: evidence.status)
+            )
+            try ProviderSessionRuntimeRepository(db: queuedRepo.db).upsert(ProviderSessionRuntime(
+                threadId: threadId,
+                provider: .codex,
+                status: evidence.status,
+                lastRunId: runId,
+                lastEventKind: evidence.kind
+            ))
+            vm.reloadQueuedMessages()
+
+            await vm.forceQueuedMessageNow(queued)
+
+            XCTAssertEqual(try queuedRepo.dispatch(id: queued.id)?.state, .prepared,
+                           "\(evidence.kind) is not provider-acceptance proof, so Force must preserve the queued message")
+            XCTAssertTrue(vm.queueStatusMessage?.contains("Start confirmation is pending") == true,
+                          "the UI must distinguish protected \(evidence.kind) ambiguity from an ordinary busy queue")
+        }
+
+        XCTAssertEqual(runner.startedRunIDs, [],
+                       "Force must not replay an ambiguous prepared dispatch")
     }
 
     func test_forceQueuedMessageNow_oneHundredConcurrentCallsStartProviderExactlyOnce() async throws {

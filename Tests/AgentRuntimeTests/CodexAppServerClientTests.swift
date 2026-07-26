@@ -237,6 +237,21 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual(params["sandbox"] as? String, "danger-full-access")
     }
 
+    func test_timedOutThreadResumeRequiresFreshClientRecovery() {
+        XCTAssertTrue(
+            CodexAppServerClient.requiresFreshClientAfterThreadResumeFailure(
+                CodexAppServerError.requestTimedOut(method: "thread/resume", timeout: 30)
+            ),
+            "the client deadline intentionally stops a silent resume peer, so only a new client may safely start a fresh thread"
+        )
+        XCTAssertFalse(
+            CodexAppServerClient.requiresFreshClientAfterThreadResumeFailure(
+                CodexAppServerError.requestTimedOut(method: "turn/start", timeout: 30)
+            ),
+            "a turn-start timeout is not a context-loss signal and must not be converted into a new-thread fallback"
+        )
+    }
+
     func test_forkThread_usesNativeProviderBranchAndReturnsChildThreadId() async throws {
         let script = try makeFakeAppServerPeer()
         let client = try CodexAppServerClient(

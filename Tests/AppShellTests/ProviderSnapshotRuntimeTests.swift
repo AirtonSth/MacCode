@@ -1187,7 +1187,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         adapter.stopAll()
     }
 
-    func test_drainQueue_startFailureAcknowledgesIntentAfterDurableFailedRunWithoutReplay() async throws {
+    func test_drainQueue_startFailurePreservesPreparedIntentWithoutReplay() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
         try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
@@ -1210,48 +1210,57 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             XCTFail("provider start must fail")
         } catch {}
 
-        XCTAssertTrue(try ctx.queuedMessageRepo.list(threadId: thread.id).isEmpty,
-                      "once the deterministic failed run is durable, the queue intent is redundant and must be acknowledged without provider replay")
+        XCTAssertEqual(try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.id), [queued.id],
+                       "same-call start failure does not prove provider acceptance, so drain must preserve the prepared queue intent")
+        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .prepared)
         XCTAssertEqual(try ctx.messageRepo.list(threadId: thread.id).filter { $0.role == .user }.count, 1)
         let failedRun = try XCTUnwrap(ctx.runRepo.get(id: AgentRunID(queued.id.value)))
         XCTAssertEqual(failedRun.status, .failed,
-                       "the visible failed run must own Retry/Continue after the queue intent is acknowledged")
+                       "the visible failed run must explain the failed start without deleting the unaccepted queue intent")
         XCTAssertEqual(
             try ctx.providerSessionRuntimeRepo.get(threadId: thread.id)?.lastRunId,
             failedRun.id,
             "start-failure persistence must retain the run-bound evidence needed if the host crashes before queue acknowledgement"
         )
         XCTAssertEqual(failing.startCount, 1,
-                       "onRunFinished queue draining must not replay a provider start already represented by the deterministic failed run")
+                       "the same-call cleanup must not replay a failed provider start")
     }
 
-    func test_forceQueue_startFailureLeavesOnlyDurableFailedRunRecoverySurface() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
-        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        defer { closeAndUnregisterAllSurfaces() }
-        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
-        let router = AppCommandRouter(context: ctx)
-        ctx.router = router
-        let workspace = try router.createWorkspace(name: "queue-force-retry", cwd: workspaceDir.path)
-        var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: .codex, model: "gpt-5.5", permissionMode: .supervised, reasoningEffort: .medium)
-        thread.status = .failed
-        try ctx.threadRepo.upsert(thread)
-        let queued = try ctx.queuedMessageRepo.enqueue(threadId: thread.id, text: "one recovery surface", attachments: [], interactionMode: .default)
-        let failing = ThrowingStartRunner(provider: .codex)
-        ctx.coordinator.replaceProvider(.codex, runner: failing)
+    func test_forceQueue_startFailureAndTimeoutPreservePreparedIntentWithoutReplay() async throws {
+        let startErrors: [(label: String, error: Error)] = [
+            ("failure", AgentRunError.spawnFailed("intentional queue-start failure")),
+            ("timeout", CodexAppServerError.requestTimedOut(method: "turn/start", timeout: 30))
+        ]
 
-        do {
-            _ = try await router.forceAgentQueuedMessageNow(id: queued.id)
-            XCTFail("provider start must fail")
-        } catch {}
+        for startError in startErrors {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+            try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            defer { closeAndUnregisterAllSurfaces() }
+            let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+            let router = AppCommandRouter(context: ctx)
+            ctx.router = router
+            let workspace = try router.createWorkspace(name: "queue-force-\(startError.label)", cwd: workspaceDir.path)
+            var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: .codex, model: "gpt-5.5", permissionMode: .supervised, reasoningEffort: .medium)
+            thread.status = .failed
+            try ctx.threadRepo.upsert(thread)
+            let queued = try ctx.queuedMessageRepo.enqueue(threadId: thread.id, text: "one recovery surface", attachments: [], interactionMode: .default)
+            let failing = ThrowingStartRunner(provider: .codex, error: startError.error)
+            ctx.coordinator.replaceProvider(.codex, runner: failing)
 
-        XCTAssertTrue(try ctx.queuedMessageRepo.list(threadId: thread.id).isEmpty,
-                      "Force must acknowledge the redundant queue row after the deterministic failed run is durable")
-        XCTAssertEqual(try ctx.messageRepo.list(threadId: thread.id).filter { $0.role == .user }.count, 1)
-        XCTAssertEqual(try ctx.runRepo.get(id: AgentRunID(queued.id.value))?.status, .failed)
-        XCTAssertEqual(failing.startCount, 1)
+            do {
+                _ = try await router.forceAgentQueuedMessageNow(id: queued.id)
+                XCTFail("provider \(startError.label) must fail")
+            } catch {}
+
+            XCTAssertEqual(try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.id), [queued.id],
+                           "same-call \(startError.label) is not positive provider acceptance evidence")
+            XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .prepared)
+            XCTAssertEqual(try ctx.messageRepo.list(threadId: thread.id).filter { $0.role == .user }.count, 1)
+            XCTAssertEqual(try ctx.runRepo.get(id: AgentRunID(queued.id.value))?.status, .failed)
+            XCTAssertEqual(failing.startCount, 1)
+        }
     }
 
     func test_drainQueue_relaunchAcknowledgesDispatchedHeadWithoutProviderReplay() async throws {
@@ -1404,6 +1413,68 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                      "Force must not replay an ambiguous prepared dispatch")
     }
 
+    func test_forceQueuedMessagePreservesAmbiguousPreparedEvidenceBeforeBusyThread() async throws {
+        // WHY: Force must not let a stale busy projection turn any ambiguous
+        // start diagnostic into an acknowledgement or a replay.
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = RequestCaptureRunner(provider: .codex)
+        ctx.coordinator.replaceProvider(.codex, runner: runner)
+        let workspace = try router.createWorkspace(name: "queue-force-busy-prepared", cwd: workspaceDir.path)
+        var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: .codex, model: "gpt-5.5", permissionMode: .supervised, reasoningEffort: .medium)
+        thread.status = .running
+        try ctx.threadRepo.upsert(thread)
+        let ambiguousEvidence: [(kind: String, status: AgentRunStatus)] = [
+            ("run.pending", .pending),
+            ("threadStarted(codex-thread-1)", .pending),
+            ("run.start_failed", .failed),
+            ("run.start_timeout", .failed)
+        ]
+        for (index, evidence) in ambiguousEvidence.enumerated() {
+            let queued = try ctx.queuedMessageRepo.enqueue(
+                threadId: thread.id,
+                text: "do not preempt ambiguity \(index)",
+                attachments: [],
+                interactionMode: .default
+            )
+            let lease = try XCTUnwrap(ctx.queuedMessageRepo.claim(id: queued.id, leaseId: "interrupted-start-\(index)"))
+            let runId = AgentRunID(queued.id.value)
+            XCTAssertTrue(try ctx.queuedMessageRepo.prepareDispatch(lease, runId: runId))
+            try ctx.runRepo.upsert(AgentRun(
+                id: runId,
+                threadId: thread.id,
+                provider: .codex,
+                model: "gpt-5.5",
+                status: evidence.status
+            ))
+            try ctx.providerSessionRuntimeRepo.upsert(ProviderSessionRuntime(
+                threadId: thread.id,
+                provider: .codex,
+                status: evidence.status,
+                lastRunId: runId,
+                lastEventKind: evidence.kind
+            ))
+
+            do {
+                _ = try await router.forceAgentQueuedMessageNow(id: queued.id)
+                XCTFail("Force must fail loud while \(evidence.kind) leaves provider acceptance unconfirmed")
+            } catch let error as JSONRPCError {
+                XCTAssertTrue(error.message.contains("remains queued"),
+                              "prepared \(evidence.kind) ambiguity must win over the stale busy-thread projection")
+            }
+
+            XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .prepared)
+        }
+        XCTAssertNil(runner.lastRequest,
+                     "Force must not stop/replay a prepared message before its prior start is resolved")
+    }
+
     func test_drainQueue_relaunchAcknowledgesPreparedHeadWithExistingRunWithoutProviderReplay() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
@@ -1520,14 +1591,21 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
 
 private final class ThrowingStartRunner: AgentProviderRunner, @unchecked Sendable {
     let provider: AgentProvider
+    let error: Error
     private let lock = NSLock()
     private var starts = 0
-    init(provider: AgentProvider) { self.provider = provider }
+    init(
+        provider: AgentProvider,
+        error: Error = AgentRunError.spawnFailed("intentional queue-start failure")
+    ) {
+        self.provider = provider
+        self.error = error
+    }
     var startCount: Int { lock.withLock { starts } }
     func listModels() async -> [AgentModelDescriptor] { [] }
     func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
         lock.withLock { starts += 1 }
-        throw AgentRunError.spawnFailed("intentional queue-start failure")
+        throw error
     }
 }
 

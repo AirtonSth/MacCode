@@ -2176,10 +2176,41 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             extraArgs: activeTurnId.map { ["remotecode.recovery.activeTurnId=\($0)"] } ?? [],
             runAsUser: thread.runAsUser
         )
-        try await adapter.recoverSession(request) { _ in }
+        let recoveryEventRunId = try recoveryEventRunId(session: session, thread: thread)
+        try await adapter.recoverSession(request) { [weak self] event in
+            self?.handle(event: event, runId: recoveryEventRunId, threadId: threadId)
+        }
         lock.lock()
         providerTurnScopes[threadId] = ProviderTurnScope(environment: request.environment)
         lock.unlock()
+    }
+
+    private func recoveryEventRunId(
+        session: ProviderSessionRuntime,
+        thread: AgentThread
+    ) throws -> AgentRunID {
+        if let runId = session.lastRunId, try runRepo.get(id: runId) != nil {
+            return runId
+        }
+        let runId = AgentRunID()
+        let status: AgentRunStatus = switch session.status {
+        case .pending, .running: .interrupted
+        default: session.status
+        }
+        try runRepo.upsert(AgentRun(
+            id: runId,
+            threadId: thread.id,
+            provider: thread.provider,
+            providerInstanceId: thread.providerInstanceId,
+            model: session.model ?? thread.model,
+            status: status
+        ))
+        if var persistedSession = try providerSessionRepo?.get(threadId: thread.id) {
+            persistedSession.lastRunId = runId
+            persistedSession.updatedAt = Date()
+            try providerSessionRepo?.upsert(persistedSession)
+        }
+        return runId
     }
 
     private func providerBinaryIdentity(_ provider: AgentProvider, adapter: AgentProviderAdapter) -> String? {
