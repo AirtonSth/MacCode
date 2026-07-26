@@ -382,6 +382,7 @@ public final class GrokACPClient: @unchecked Sendable {
     private let stdoutPipe = Pipe()
     private let stderrPipe = Pipe()
     private let parseQueue = DispatchQueue(label: "remotecode.grok-acp.parse")
+    private let parseQueueKey = DispatchSpecificKey<UInt8>()
     private let writeQueue = DispatchQueue(label: "remotecode.grok-acp.write")
     private let lock = NSLock()
     private let lineBuffer = LineBuffer()
@@ -411,6 +412,7 @@ public final class GrokACPClient: @unchecked Sendable {
         self.notificationHandler = notificationHandler
         self.serverRequestHandler = serverRequestHandler
         self.tokenSaverCensusAllowed = tokenSaverCensusAllowed
+        parseQueue.setSpecific(key: parseQueueKey, value: 1)
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = ["agent", "stdio"]
         process.currentDirectoryURL = URL(fileURLWithPath: cwd)
@@ -492,11 +494,17 @@ public final class GrokACPClient: @unchecked Sendable {
         _ = try await requestJSONObject(method: "session/set_mode", params: ["sessionId": sessionId, "modeId": modeId], timeout: 15)
     }
 
-    func prompt(sessionId: String, request: AgentRunRequest, capabilities: GrokACPInitializeResult) async throws -> JSONObject {
+    func prompt(
+        sessionId: String,
+        request: AgentRunRequest,
+        capabilities: GrokACPInitializeResult,
+        onAccepted: @escaping @Sendable () -> Void
+    ) async throws -> JSONObject {
         try await requestJSONObject(
             method: "session/prompt",
             params: ["sessionId": sessionId, "prompt": try Self.promptBlocks(for: request, capabilities: capabilities)],
-            timeout: nil
+            timeout: nil,
+            onAccepted: onAccepted
         )
     }
 
@@ -587,13 +595,28 @@ public final class GrokACPClient: @unchecked Sendable {
         return blocks
     }
 
-    private func requestJSONObject(method: String, params: Any?, timeout: TimeInterval?) async throws -> JSONObject {
-        let value: Any? = try await request(method: method, params: params, timeout: timeout)
+    private func requestJSONObject(
+        method: String,
+        params: Any?,
+        timeout: TimeInterval?,
+        onAccepted: (@Sendable () -> Void)? = nil
+    ) async throws -> JSONObject {
+        let value: Any? = try await request(
+            method: method,
+            params: params,
+            timeout: timeout,
+            onAccepted: onAccepted
+        )
         guard let object = value as? JSONObject else { throw GrokACPError.responseTypeMismatch(method) }
         return object
     }
 
-    private func request(method: String, params: Any?, timeout: TimeInterval?) async throws -> Any? {
+    private func request(
+        method: String,
+        params: Any?,
+        timeout: TimeInterval?,
+        onAccepted: (@Sendable () -> Void)? = nil
+    ) async throws -> Any? {
         let id = reserveId()
         return try await withCheckedThrowingContinuation { continuation in
             lock.lock()
@@ -601,7 +624,21 @@ public final class GrokACPClient: @unchecked Sendable {
             lock.unlock()
             var payload: JSONObject = ["jsonrpc": "2.0", "id": id, "method": method]
             if let params { payload["params"] = params }
-            do { try write(payload) }
+            do {
+                if let onAccepted {
+                    let writeAndAccept = {
+                        try self.write(payload)
+                        onAccepted()
+                    }
+                    if DispatchQueue.getSpecific(key: parseQueueKey) != nil {
+                        try writeAndAccept()
+                    } else {
+                        try parseQueue.sync(execute: writeAndAccept)
+                    }
+                } else {
+                    try write(payload)
+                }
+            }
             catch { completePending(id: id, result: .failure(error)) }
             if let timeout {
                 DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) { [weak self] in

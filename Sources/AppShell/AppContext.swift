@@ -185,6 +185,13 @@ public final class AppContext {
     var distillClientOverrideForTesting: DistillServiceClient?
     var queueDrainProviderIdleTimeout: TimeInterval = 10
     var queueDrainProviderIdlePollInterval: TimeInterval = 0.05
+    private struct QueueDrainWaiter {
+        let token: UUID
+        let task: Task<Void, Never>
+    }
+    private var queueDrainWaiters: [AgentThreadID: QueueDrainWaiter] = [:]
+    private var queueDrainSuppressedThreadIDs = Set<AgentThreadID>()
+    var queueDrainWaiterCountForTesting: Int { queueDrainWaiters.count }
     /// Test seam: sandbox the SessionLearn target instruction files so tests never write
     /// into the developer's real ~/.claude/CLAUDE.md or ~/.codex/AGENTS.md.
     var sessionLearnInstructionFilesOverrideForTesting: [URL]?
@@ -735,51 +742,38 @@ public final class AppContext {
                 EventBus.shared.publish(kind: "agent.run.error", payload: .object(errorPayload))
             }
         }
-        coordinator.onRunFinished = { tid, rid, status in
-            let kind = (status == .completed) ? "agent.run.completed" : "agent.run.failed"
-            EventBus.shared.publish(kind: kind, payload: agentRunPayload(threadId: tid, runId: rid, status: status))
-            EventBus.shared.publish(kind: "agent.run.finished", payload: agentRunPayload(threadId: tid, runId: rid, status: status))
-            // Flush any debounced usage for this run now that the run is done so
-            // the final token batch is never stranded in the accumulator.
-            self.flushPendingTokenSaverUsage(runId: rid)
-            self.recordSessionLearnFromRun(runId: rid, status: status) // P5 SessionLearn (off by default)
-            // Grok has no live `.accountUsage` stream (Claude/Codex do). Re-read
-            // the local billing snapshot after each Grok run so the Token Saver
-            // purple ring updates without waiting for the 5-minute periodic probe.
-            if let run = try? self.runRepo.get(id: rid), run.provider == .grok {
-                self.refreshGrokTokenSaverAccountUsage(reason: "run_finished")
-            }
-            // Drain the next queued message after ANY terminal status. stopRun
-            // can publish its host terminal before a provider-native interrupt
-            // makes the adapter idle. Wait through that bounded cancellation
-            // window; otherwise Force gets one premature drain and the promoted
-            // message remains stranded with no later lifecycle callback.
-            Task { @MainActor in
-                guard await self.waitForProviderIdleBeforeQueueDrain(threadId: tid) else {
-                    EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
-                        "thread_id": .string(tid.value.uuidString),
-                        "message": .string("Provider remained active after the queue-drain cancellation window.")
-                    ]))
-                    return
+        coordinator.onRunFinished = { [weak self] tid, rid, status in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let kind = (status == .completed) ? "agent.run.completed" : "agent.run.failed"
+                EventBus.shared.publish(kind: kind, payload: agentRunPayload(threadId: tid, runId: rid, status: status))
+                EventBus.shared.publish(kind: "agent.run.finished", payload: agentRunPayload(threadId: tid, runId: rid, status: status))
+                // Flush any debounced usage for this run now that the run is done so
+                // the final token batch is never stranded in the accumulator.
+                self.flushPendingTokenSaverUsage(runId: rid)
+                self.recordSessionLearnFromRun(runId: rid, status: status) // P5 SessionLearn (off by default)
+                // Grok has no live `.accountUsage` stream (Claude/Codex do). Re-read
+                // the local billing snapshot after each Grok run so the Token Saver
+                // purple ring updates without waiting for the 5-minute periodic probe.
+                if let run = try? self.runRepo.get(id: rid), run.provider == .grok {
+                    self.refreshGrokTokenSaverAccountUsage(reason: "run_finished")
                 }
-                do {
-                    try await self.router?.drainNextQueuedAgentMessage(thread: tid)
-                } catch {
-                    EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
-                        "thread_id": .string(tid.value.uuidString),
-                        "message": .string(String(describing: error))
-                    ]))
-                }
-            }
-            if let content = RemoteCodeNotificationContent.threadOutcome(
-                threadId: tid.value.uuidString,
-                workspaceId: (try? self.threadRepo.get(id: tid)?.workspaceId)?.value.uuidString,
-                title: try? self.threadRepo.get(id: tid)?.title,
-                phase: status
-            ) {
-                SystemNotifier.shared.post(content)
-                Task {
-                    await self.privateNotificationBridge.deliver(content)
+                // Drain the next queued message after ANY terminal status. stopRun
+                // can publish its host terminal before a provider-native interrupt
+                // makes the adapter idle. Wait through that bounded cancellation
+                // window; otherwise Force gets one premature drain and the promoted
+                // message remains stranded with no later lifecycle callback.
+                self.ensureQueueDrainWaiterIfNeeded(threadId: tid)
+                if let content = RemoteCodeNotificationContent.threadOutcome(
+                    threadId: tid.value.uuidString,
+                    workspaceId: (try? self.threadRepo.get(id: tid)?.workspaceId)?.value.uuidString,
+                    title: try? self.threadRepo.get(id: tid)?.title,
+                    phase: status
+                ) {
+                    SystemNotifier.shared.post(content)
+                    Task {
+                        await self.privateNotificationBridge.deliver(content)
+                    }
                 }
             }
         }
@@ -861,7 +855,9 @@ public final class AppContext {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                self?.flushPendingTokenSaverUsage()
+                MainActor.assumeIsolated {
+                    self?.prepareForApplicationTermination()
+                }
             }
         }
 
@@ -871,15 +867,112 @@ public final class AppContext {
         }
     }
 
-    private func waitForProviderIdleBeforeQueueDrain(threadId: AgentThreadID) async -> Bool {
-        let deadline = Date().addingTimeInterval(queueDrainProviderIdleTimeout)
-        while coordinator.hasProviderSession(threadId: threadId) {
-            let remaining = deadline.timeIntervalSinceNow
-            guard remaining > 0 else { return false }
-            let interval = min(queueDrainProviderIdlePollInterval, remaining)
-            try? await Task.sleep(nanoseconds: UInt64(max(0.001, interval) * 1_000_000_000))
+    func ensureQueueDrainWaiterIfNeeded(threadId: AgentThreadID) {
+        guard !queueDrainSuppressedThreadIDs.contains(threadId) else { return }
+        guard let queuedMessages = try? queuedMessageRepo.list(threadId: threadId),
+              !queuedMessages.isEmpty else {
+            cancelQueueDrainWaiterIfQueueEmpty(threadId: threadId)
+            return
         }
-        return true
+        guard queueDrainWaiters[threadId] == nil else { return }
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(queueDrainProviderIdleTimeout))
+        let pollInterval = Duration.seconds(max(0.001, queueDrainProviderIdlePollInterval))
+        let token = UUID()
+
+        let task = Task { @MainActor [weak self] in
+            var publishedTimeoutFailure = false
+            while !Task.isCancelled {
+                guard let self else { return }
+                guard (try? self.threadRepo.get(id: threadId)) != nil,
+                      let queuedMessages = try? self.queuedMessageRepo.list(threadId: threadId),
+                      !queuedMessages.isEmpty else {
+                    self.removeQueueDrainWaiter(threadId: threadId, token: token)
+                    return
+                }
+                if !self.coordinator.hasProviderSession(threadId: threadId) {
+                    await self.finishScheduledQueueDrain(threadId: threadId, token: token)
+                    return
+                }
+                // Crossing the deadline means provider state is still uncertain,
+                // not failed. Keep the single waiter alive so a late native
+                // cancellation can drain exactly once without replaying the row.
+                let remaining = clock.now.duration(to: deadline)
+                let interval = remaining > .zero ? min(pollInterval, remaining) : pollInterval
+                do {
+                    try await clock.sleep(for: interval)
+                } catch {
+                    self.removeQueueDrainWaiter(threadId: threadId, token: token)
+                    return
+                }
+                if !publishedTimeoutFailure, clock.now >= deadline {
+                    publishedTimeoutFailure = true
+                    EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
+                        "thread_id": .string(threadId.value.uuidString),
+                        "message": .string("Provider is still stopping. The queued message remains safe and will start when the provider becomes idle.")
+                    ]))
+                }
+                if !self.coordinator.hasProviderSession(threadId: threadId) {
+                    await self.finishScheduledQueueDrain(threadId: threadId, token: token)
+                    return
+                }
+            }
+            self?.removeQueueDrainWaiter(threadId: threadId, token: token)
+        }
+        queueDrainWaiters[threadId] = QueueDrainWaiter(token: token, task: task)
+    }
+
+    private func finishScheduledQueueDrain(threadId: AgentThreadID, token: UUID) async {
+        guard queueDrainWaiters[threadId]?.token == token,
+              !queueDrainSuppressedThreadIDs.contains(threadId) else {
+            removeQueueDrainWaiter(threadId: threadId, token: token)
+            return
+        }
+        defer { removeQueueDrainWaiter(threadId: threadId, token: token) }
+        do {
+            try await router?.drainNextQueuedAgentMessage(thread: threadId)
+        } catch {
+            EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
+                "thread_id": .string(threadId.value.uuidString),
+                "message": .string(String(describing: error))
+            ]))
+        }
+    }
+
+    func cancelQueueDrainWaiterIfQueueEmpty(threadId: AgentThreadID) {
+        guard ((try? queuedMessageRepo.list(threadId: threadId)) ?? []).isEmpty else { return }
+        cancelQueueDrainWaiter(threadId: threadId)
+    }
+
+    func cancelQueueDrainWaiter(threadId: AgentThreadID) {
+        queueDrainWaiters.removeValue(forKey: threadId)?.task.cancel()
+    }
+
+    func suppressQueueDrain(threadId: AgentThreadID) {
+        queueDrainSuppressedThreadIDs.insert(threadId)
+        cancelQueueDrainWaiter(threadId: threadId)
+    }
+
+    func resumeQueueDrain(threadId: AgentThreadID) {
+        queueDrainSuppressedThreadIDs.remove(threadId)
+        ensureQueueDrainWaiterIfNeeded(threadId: threadId)
+    }
+
+    private func removeQueueDrainWaiter(threadId: AgentThreadID, token: UUID) {
+        guard queueDrainWaiters[threadId]?.token == token else { return }
+        queueDrainWaiters.removeValue(forKey: threadId)
+    }
+
+    private func cancelAllQueueDrainWaiters() {
+        let tasks = queueDrainWaiters.values.map(\.task)
+        queueDrainWaiters.removeAll()
+        for task in tasks { task.cancel() }
+    }
+
+    func prepareForApplicationTermination() {
+        flushPendingTokenSaverUsage()
+        flushWriterQueue()
+        cancelAllQueueDrainWaiters()
     }
 
     /// Managed `/distill` state is only useful while Token Saver is on, so the skill

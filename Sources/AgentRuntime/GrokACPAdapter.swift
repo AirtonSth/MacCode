@@ -38,6 +38,26 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         func drain() -> [(String, Any?)] { lock.lock(); defer { lock.unlock() }; let value = items; items.removeAll(); return value }
     }
 
+    private final class PromptAcceptanceGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Void, Error>?
+        private var settled = false
+
+        func install(_ continuation: CheckedContinuation<Void, Error>) {
+            lock.withLock { self.continuation = continuation }
+        }
+
+        func settle(_ result: Result<Void, Error>) {
+            let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+                guard !settled else { return nil }
+                settled = true
+                defer { self.continuation = nil }
+                return self.continuation
+            }
+            continuation?.resume(with: result)
+        }
+    }
+
     private final class Session: @unchecked Sendable {
         let threadId: AgentThreadID
         let providerThreadId: String
@@ -49,6 +69,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         let planModeID: String?
         var mode: String?
         var status: AgentRunStatus = .completed
+        var isLive = true
         var inFlight = false
         var cancelRequested = false
         var forcedKillByUs = false
@@ -97,6 +118,12 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     private static let discoveryCacheLock = NSLock()
     private static var sharedDiscoveryCache: [String: (result: GrokACPDiscoveryResult, fetchedAt: Date)] = [:]
     private var sessions: [AgentThreadID: Session] = [:]
+    private var promptWriteAcceptanceCountForTestingStorage = 0
+    var beforePromptWriteForTesting: (() -> Void)?
+    var afterPromptWriteForTesting: (() -> Void)?
+    var promptWriteAcceptanceCountForTesting: Int {
+        synchronized { promptWriteAcceptanceCountForTestingStorage }
+    }
 
     public init(
         binaryNameOverride: String? = nil,
@@ -355,6 +382,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             lock.unlock()
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
+        session.isLive = false
         let pending = Array(session.pendingPermissions.values)
         session.pendingPermissions.removeAll()
         lock.unlock()
@@ -494,7 +522,11 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 guard let self, let session else { return }
                 self.handleTermination(session: session, reason: reason, status: status, error: error)
             }
-            let replaced = synchronized { sessions.updateValue(session, forKey: request.threadId) }
+            let replaced = synchronized { () -> Session? in
+                let replaced = sessions.updateValue(session, forKey: request.threadId)
+                replaced?.isLive = false
+                return replaced
+            }
             replaced?.client.stop()
             for (method, params) in bufferedNotifications.drain() {
                 handleNotification(method: method, params: params, session: session)
@@ -526,6 +558,9 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         onEvent: @escaping @Sendable (AgentRunEvent) -> Void
     ) async throws {
         try synchronized {
+            guard sessions[request.threadId] === session, session.isLive else {
+                throw AgentProviderAdapterError.sessionNotFound(request.threadId)
+            }
             guard !session.inFlight else {
                 throw AgentProviderAdapterError.unsupported("Grok ACP session already has an in-flight prompt")
             }
@@ -563,21 +598,50 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                     session.mapper.setCurrentModeId(requestedMode)
                 }
             }
-            for event in session.mapper.beginTurn() { emit(event, session: session) }
-            onEvent(.status(.running))
-            Task { [weak self, weak session] in
-                guard let self, let session else { return }
-                do {
-                    let response = try await session.client.prompt(
-                        sessionId: session.providerThreadId,
-                        request: request,
-                        capabilities: session.capabilities
-                    )
-                    self.handlePromptResponse(response, session: session)
-                } catch {
-                    self.finishTransportFailure(session: session, error: error, forced: false)
+            let acceptance = PromptAcceptanceGate()
+            beforePromptWriteForTesting?()
+            try synchronized {
+                guard sessions[request.threadId] === session, session.isLive else {
+                    throw AgentProviderAdapterError.sessionNotFound(request.threadId)
                 }
             }
+            try await withCheckedThrowingContinuation { continuation in
+                acceptance.install(continuation)
+                Task { [weak self, weak session] in
+                    guard let self, let session else {
+                        acceptance.settle(.failure(AgentProviderAdapterError.sessionNotFound(request.threadId)))
+                        return
+                    }
+                    do {
+                        let response = try await session.client.prompt(
+                            sessionId: session.providerThreadId,
+                            request: request,
+                            capabilities: session.capabilities,
+                            onAccepted: { [weak self, weak session] in
+                                guard let self, let session else {
+                                    acceptance.settle(.failure(
+                                        AgentProviderAdapterError.sessionNotFound(request.threadId)
+                                    ))
+                                    return
+                                }
+                                self.synchronized {
+                                    self.promptWriteAcceptanceCountForTestingStorage += 1
+                                }
+                                for event in session.mapper.beginTurn() {
+                                    self.emit(event, session: session)
+                                }
+                                onEvent(.status(.running))
+                                acceptance.settle(.success(()))
+                            }
+                        )
+                        self.handlePromptResponse(response, session: session)
+                    } catch {
+                        acceptance.settle(.failure(error))
+                        self.finishTransportFailure(session: session, error: error, forced: false)
+                    }
+                }
+            }
+            afterPromptWriteForTesting?()
         } catch {
             synchronized { session.inFlight = false }
             if error is AgentProviderAdapterError { throw error }
@@ -660,6 +724,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         if sessions[session.threadId] === session {
             sessions.removeValue(forKey: session.threadId)
         }
+        session.isLive = false
         lock.unlock()
         guard active else { return }
         let terminal = GrokACPTerminalClassifier.status(

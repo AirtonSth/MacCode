@@ -251,6 +251,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Canonical host mutation used when local selection acknowledges unread work.
     public var markThreadRead: ((AgentThreadID) throws -> Void)?
     public var onQueuedMessageEvent: ((String, AgentQueuedMessage) -> Void)?
+    /// Host lifecycle gate used while destructive thread deletion awaits provider
+    /// termination. AppContext owns queue draining, so the surface requests the
+    /// same suppression used by mirror-driven deletion.
+    public var setQueueDrainSuppressed: ((Set<AgentThreadID>, Bool) -> Void)?
     /// UX-MAC_AGENT-OPEN-SPLIT: wired by AppCommandRouter. A clicked file mention
     /// (absolute path, already resolved) opens — or reuses — a Files split panel
     /// to the right of this surface.
@@ -3508,6 +3512,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @discardableResult
     public func deleteThreads(_ ids: Set<AgentThreadID>) async -> Bool {
         guard !ids.isEmpty else { return true }
+        setQueueDrainSuppressed?(ids, true)
+        defer { setQueueDrainSuppressed?(ids, false) }
         // AG-002: a thread row owns the provider lifecycle. Do not cascade-delete
         // its data or evict UI caches until every selected provider has confirmed
         // terminal state and its process tree is dead.
@@ -3976,6 +3982,26 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func dismissQueueStatusMessage() {
         queueStatusMessage = nil
+    }
+
+    public func handleQueueLifecycleEvent(kind: String, threadId: String?, message: String?) {
+        guard let selectedThreadId,
+              threadId == selectedThreadId.value.uuidString else {
+            return
+        }
+        switch kind {
+        case "agent.message.queue.failed":
+            queueStatusMessage = message ?? "The queued message could not start yet."
+        case AgentQueueEventKinds.drained:
+            queueStatusMessage = nil
+        case AgentQueueEventKinds.cancelled:
+            if let queuedMessageRepo,
+               (try? queuedMessageRepo.list(threadId: selectedThreadId).isEmpty) == true {
+                queueStatusMessage = nil
+            }
+        default:
+            break
+        }
     }
 
     public func dismissProviderThreadSnapshotStatusMessage() {

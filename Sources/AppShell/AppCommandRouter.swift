@@ -362,15 +362,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             guard let self else { throw LayoutError.workspaceNotFound }
                             try self.markAgentThreadRead(thread: threadID)
                         }
-                        let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
+                        let queueSubscriptionToken = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
                             guard ev.kind.hasPrefix("agent.thread.") || ev.kind.hasPrefix("agent.message.queue") || ev.kind == "agent.message.queued" else { return }
                             DispatchQueue.main.async {
+                                agent?.viewModel.handleQueueLifecycleEvent(
+                                    kind: ev.kind,
+                                    threadId: ev.payload.objectValue?["thread_id"]?.stringValue,
+                                    message: ev.payload.objectValue?["message"]?.stringValue
+                                )
                                 agent?.viewModel.reloadThreads()
                                 agent?.viewModel.reloadQueuedMessages()
                             }
                         }
-                        agent.subscriptionToken = AnyHashable(token)
-                        agent.onClose = { EventBus.shared.unsubscribe(token) }
+                        agent.subscriptionToken = AnyHashable(queueSubscriptionToken)
+                        agent.onClose = { EventBus.shared.unsubscribe(queueSubscriptionToken) }
                         agent.viewModel.providerSnapshotLoader = { [weak self, weak agent] in
                             // Probe as the composer run-as-user so Auto admission
                             // matches the account Claude will actually exec as.
@@ -428,6 +433,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             self?.publishAgentThreadLifecycle(event)
                         }
                         Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
+                        Self.wireQueueDrainControl(on: agent.viewModel, context: ctx)
                         agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
                             self?.publishAgentPlanNotesUpdated(thread: thread, notes: notes)
                         }
@@ -2057,6 +2063,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         viewModel.stopScheduledThread = nil
     }
 
+    private static func wireQueueDrainControl(on viewModel: AgentAppViewModel, context: AppContext) {
+        viewModel.setQueueDrainSuppressed = { [weak context] threadIDs, suppressed in
+            guard let context else { return }
+            for threadID in threadIDs {
+                if suppressed {
+                    context.suppressQueueDrain(threadId: threadID)
+                } else {
+                    context.resumeQueueDrain(threadId: threadID)
+                }
+            }
+        }
+    }
+
     public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier = .auto, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, runAsUser: AgentRunAsUser? = nil, surfaceID: SurfaceID? = nil) throws -> AgentThread {
         try createAgentThread(
             workspace: workspace,
@@ -2480,6 +2499,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         publishQueuedMessage(kind: "agent.message.queue.cancelled", cancelled)
         refreshAgentSurfaces(thread: cancelled.threadId)
+        ctx.cancelQueueDrainWaiterIfQueueEmpty(threadId: cancelled.threadId)
         return cancelled
     }
 
@@ -2770,6 +2790,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             )
             publishQueuedMessage(kind: "agent.message.queued", queued)
             refreshAgentSurfaces(thread: thread)
+            ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread)
             return AgentMessageSendResult(status: .queued, queuedMessage: queued)
         }
         // A message-send is not a provider-change gesture. The provider INSTANCE
@@ -3539,12 +3560,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func deleteAgentThread(thread: AgentThreadID) async throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        ctx.suppressQueueDrain(threadId: thread)
+        defer { ctx.resumeQueueDrain(threadId: thread) }
         try await ctx.coordinator.stopAndAwaitTermination(threadId: thread)
         try ctx.threadRepo.delete(id: thread)
     }
 
     public func deleteAgentThreads(_ threads: [AgentThreadID]) async throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        for thread in threads { ctx.suppressQueueDrain(threadId: thread) }
+        defer {
+            for thread in threads { ctx.resumeQueueDrain(threadId: thread) }
+        }
         for thread in threads {
             try await ctx.coordinator.stopAndAwaitTermination(threadId: thread)
         }
@@ -5081,15 +5108,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 }
                 // Socket-driven thread mutations (create/rename/delete/read)
                 // refresh this already-open surface — fixes the stale-VM gap.
-                let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
+                let queueSubscriptionToken = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
                     guard ev.kind.hasPrefix("agent.thread.") || ev.kind.hasPrefix("agent.message.queue") || ev.kind == "agent.message.queued" else { return }
                     DispatchQueue.main.async {
+                        agent?.viewModel.handleQueueLifecycleEvent(
+                            kind: ev.kind,
+                            threadId: ev.payload.objectValue?["thread_id"]?.stringValue,
+                            message: ev.payload.objectValue?["message"]?.stringValue
+                        )
                         agent?.viewModel.reloadThreads()
                         agent?.viewModel.reloadQueuedMessages()
                     }
                 }
-                agent.subscriptionToken = AnyHashable(token)
-                agent.onClose = { EventBus.shared.unsubscribe(token) }
+                agent.subscriptionToken = AnyHashable(queueSubscriptionToken)
+                agent.onClose = { EventBus.shared.unsubscribe(queueSubscriptionToken) }
                 agent.viewModel.providerSnapshotLoader = { [weak self, weak agent] in
                     await self?.listAgentProviderSnapshots(runAsUser: agent?.viewModel.runAsUser) ?? []
                 }
@@ -5145,6 +5177,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     self?.publishAgentThreadLifecycle(event)
                 }
                 Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
+                Self.wireQueueDrainControl(on: agent.viewModel, context: ctx)
                 agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
                     self?.publishAgentPlanNotesUpdated(thread: thread, notes: notes)
                 }

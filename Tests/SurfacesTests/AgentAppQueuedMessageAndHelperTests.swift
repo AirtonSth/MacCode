@@ -308,6 +308,67 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
       }
     }
 
+    func test_queueLifecycleEventsSurfaceTimeoutAndClearOnLateDrainForSelectedThread() throws {
+        let (vm, _) = try makeVM(withQueue: true)
+        vm.createThread(title: "selected")
+        let threadId = try XCTUnwrap(vm.selectedThreadId)
+        vm.queueStatusMessage = "Stopping current run to start this now."
+        vm.handleQueueLifecycleEvent(
+            kind: "agent.message.queue.failed",
+            threadId: threadId.value.uuidString,
+            message: "Provider is still stopping."
+        )
+        XCTAssertEqual(vm.queueStatusMessage, "Provider is still stopping.")
+
+        vm.handleQueueLifecycleEvent(
+            kind: AgentQueueEventKinds.drained,
+            threadId: threadId.value.uuidString,
+            message: nil
+        )
+        XCTAssertNil(vm.queueStatusMessage)
+
+        vm.queueStatusMessage = "unchanged"
+        vm.handleQueueLifecycleEvent(
+            kind: "agent.message.queue.failed",
+            threadId: AgentThreadID().value.uuidString,
+            message: "foreign"
+        )
+        XCTAssertEqual(vm.queueStatusMessage, "unchanged")
+    }
+
+    func test_cancelLifecycleClearsFailureOnlyAfterFinalQueuedRowIsGone() throws {
+        // WHY: cancelling the final failed queue intent removes Retry/Copy's
+        // subject, while cancelling one of several rows must preserve status
+        // relevant to the work that remains.
+        let (vm, repo) = try makeVM(withQueue: true)
+        let queuedRepo = try XCTUnwrap(repo)
+        vm.createThread(title: "cancel lifecycle")
+        let threadId = try XCTUnwrap(vm.selectedThreadId)
+        let first = AgentQueuedMessage(threadId: threadId, text: "first", position: 1)
+        let second = AgentQueuedMessage(threadId: threadId, text: "second", position: 2)
+        try queuedRepo.upsert(first)
+        try queuedRepo.upsert(second)
+        vm.reloadQueuedMessages()
+        vm.onQueuedMessageEvent = { [weak vm] kind, queued in
+            vm?.handleQueueLifecycleEvent(
+                kind: kind,
+                threadId: queued.threadId.value.uuidString,
+                message: nil
+            )
+        }
+        vm.queueStatusMessage = "Provider is still stopping. Retry or Copy."
+
+        vm.cancelQueuedMessage(first)
+
+        XCTAssertEqual(vm.queueStatusMessage, "Provider is still stopping. Retry or Copy.")
+        XCTAssertEqual(try queuedRepo.list(threadId: threadId).map(\.id), [second.id])
+
+        vm.cancelQueuedMessage(second)
+
+        XCTAssertNil(vm.queueStatusMessage)
+        XCTAssertTrue(try queuedRepo.list(threadId: threadId).isEmpty)
+    }
+
     func test_forceQueuedMessageNow_ackFailureAfterAcceptedStartRecoversAckOnlyWithoutProviderReplay() async throws {
         let runner = QueueStartProbeRunner(finishSynchronously: true)
         let (vm, repo) = try makeVM(withQueue: true, provider: runner)
