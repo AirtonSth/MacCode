@@ -149,6 +149,70 @@ final class MarkdownSurfaceFixtureTests: XCTestCase {
             "T053: code fence must HTML-escape angle brackets so the script is inert")
     }
 
+    // MARK: - GFM tables in Files markdown preview
+
+    /// WHY: agent docs and playbooks commonly use GFM tables. Without a table
+    /// branch, renderHTML turns each pipe row into a paragraph and the Files
+    /// Preview looks broken (raw | cells). This is the user-reported defect.
+    func test_gfmTable_rendersAsHTMLTable() {
+        let markdown = """
+        # Limits
+
+        | ID | Rule |
+        | --- | --- |
+        | A1 | before mutation |
+        | A2 | max 10 originals |
+        """
+
+        let html = MarkdownSurface.renderHTML(markdown: markdown)
+
+        XCTAssertTrue(html.contains("<table>"),
+            "GFM table must emit a real HTML table, not pipe paragraphs")
+        XCTAssertTrue(html.contains("<thead>"),
+            "header row must land in thead")
+        XCTAssertTrue(html.contains("<th>ID</th>") || html.contains("<th>ID</th>".lowercased()) || html.contains(">ID</th>"),
+            "header cells must include ID")
+        XCTAssertTrue(html.contains("<tbody>"),
+            "data rows must land in tbody")
+        XCTAssertTrue(html.contains(">A1</td>") || html.contains("A1"),
+            "first data cell must appear")
+        XCTAssertTrue(html.contains("table-wrap"),
+            "wide tables need a horizontal-scroll wrapper for readability")
+        // Separator and raw pipes must not be shown as paragraphs.
+        XCTAssertFalse(html.contains("<p>| ID | Rule |</p>"),
+            "header pipe row must not fall through as a paragraph")
+        XCTAssertFalse(html.contains("<p>| --- | --- |</p>"),
+            "separator row must be consumed, not rendered as text")
+    }
+
+    /// WHY: a lone pipe line without a following separator is not a GFM table
+    /// (e.g. prose that happens to include |). It must stay a paragraph so we
+    /// do not invent tables from unrelated content.
+    func test_pipeLineWithoutSeparator_isNotTable() {
+        let markdown = "Use A|B|C as alternatives."
+        let html = MarkdownSurface.renderHTML(markdown: markdown)
+        XCTAssertFalse(html.contains("<table>"),
+            "pipe prose without a separator row must not become a table")
+        XCTAssertTrue(html.contains("<p>"),
+            "pipe prose must remain a normal paragraph")
+    }
+
+    /// WHY: angle brackets inside table cells must stay escaped so preview
+    /// remains safe for untrusted repo markdown (same contract as T053).
+    func test_gfmTable_cellContentIsEscaped() {
+        let markdown = """
+        | Col |
+        | --- |
+        | <script>x</script> |
+        """
+        let html = MarkdownSurface.renderHTML(markdown: markdown)
+        XCTAssertTrue(html.contains("<table>"))
+        XCTAssertFalse(html.contains("<script>x</script>"),
+            "raw script tags in table cells must not reach the DOM")
+        XCTAssertTrue(html.contains("&lt;script&gt;"),
+            "table cells must HTML-escape angle brackets")
+    }
+
     /// WHY: an & ampersand in markdown must not double-encode when round-tripped.
     /// escape() converts & -> &amp;; inlineMD must not re-encode that. This
     /// is a correctness fixture, not a security fixture, but it lives here

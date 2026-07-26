@@ -99,8 +99,8 @@ public final class MarkdownSurface: NSObject, Surface, WKNavigationDelegate {
     }
 
     /// Minimal Markdown -> HTML translator. Handles headings, code fences,
-    /// inline code, bold, italic, lists, paragraphs, links, hr. Good
-    /// enough for in-app preview of READMEs; not CommonMark-complete.
+    /// inline code, bold, italic, lists, paragraphs, links, hr, and GFM
+    /// tables. Good enough for in-app preview of READMEs; not CommonMark-complete.
     public nonisolated static func renderHTML(markdown: String, scrollY: Double = 0) -> String {
         // PERF-011: accumulate fragments and join once instead of repeated
         // `body += …` on a Swift String (avoids O(n²) reallocation).
@@ -114,8 +114,55 @@ public final class MarkdownSurface: NSObject, Surface, WKNavigationDelegate {
             if inList { frags.append("</ul>\n"); inList = false }
         }
 
-        for rawLine in markdown.components(separatedBy: "\n") {
-            let line = rawLine
+        func tableCells(from line: String) -> [String] {
+            var s = line.trimmingCharacters(in: .whitespaces)
+            if s.hasPrefix("|") { s = String(s.dropFirst()) }
+            if s.hasSuffix("|") { s = String(s.dropLast()) }
+            return s.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+        }
+
+        func isSeparatorRow(_ line: String) -> Bool {
+            let s = line.trimmingCharacters(in: .whitespaces)
+            guard s.contains("-") else { return false }
+            let stripped = s
+                .replacingOccurrences(of: "|", with: "")
+                .replacingOccurrences(of: "-", with: "")
+                .replacingOccurrences(of: ":", with: "")
+                .replacingOccurrences(of: " ", with: "")
+            return stripped.isEmpty
+        }
+
+        func isPipeRow(_ line: String) -> Bool {
+            let s = line.trimmingCharacters(in: .whitespaces)
+            return s.contains("|")
+        }
+
+        func emitTable(headers: [String], rows: [[String]]) {
+            closeList()
+            var parts: [String] = ["<div class=\"table-wrap\"><table>\n<thead><tr>"]
+            for header in headers {
+                parts.append("<th>\(inlineMD(header))</th>")
+            }
+            parts.append("</tr></thead>\n<tbody>\n")
+            let columnCount = max(headers.count, rows.map(\.count).max() ?? 0)
+            for row in rows {
+                parts.append("<tr>")
+                for index in 0..<columnCount {
+                    let cell = index < row.count ? row[index] : ""
+                    parts.append("<td>\(inlineMD(cell))</td>")
+                }
+                parts.append("</tr>\n")
+            }
+            parts.append("</tbody></table></div>\n")
+            frags.append(parts.joined())
+        }
+
+        let lines = markdown.components(separatedBy: "\n")
+        var i = lines.startIndex
+        while i < lines.endIndex {
+            let line = lines[i]
+            i = lines.index(after: i)
+
             if inFence {
                 if line.hasPrefix("```") {
                     frags.append("<pre><code class=\"lang-\(fenceLang)\">" + escape(fenceBuf.joined(separator: "\n")) + "</code></pre>\n")
@@ -131,8 +178,28 @@ public final class MarkdownSurface: NSObject, Surface, WKNavigationDelegate {
                 fenceLang = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
                 continue
             }
+
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.isEmpty { closeList(); continue }
+
+            // GFM table: header pipe-row + separator on the next line.
+            if isPipeRow(trimmed), i < lines.endIndex {
+                let nextTrimmed = lines[i].trimmingCharacters(in: .whitespaces)
+                if isSeparatorRow(nextTrimmed) {
+                    let headers = tableCells(from: trimmed)
+                    i = lines.index(after: i) // consume separator
+                    var rows: [[String]] = []
+                    while i < lines.endIndex {
+                        let dataTrimmed = lines[i].trimmingCharacters(in: .whitespaces)
+                        if dataTrimmed.isEmpty || !isPipeRow(dataTrimmed) { break }
+                        rows.append(tableCells(from: dataTrimmed))
+                        i = lines.index(after: i)
+                    }
+                    emitTable(headers: headers, rows: rows)
+                    continue
+                }
+            }
+
             if trimmed == "---" || trimmed == "***" { closeList(); frags.append("<hr/>\n"); continue }
             if let h = headingLevel(line) {
                 closeList()
@@ -157,9 +224,11 @@ public final class MarkdownSurface: NSObject, Surface, WKNavigationDelegate {
 
         // UX-016: honor system appearance via prefers-color-scheme instead
         // of a forced dark page; ship both palettes and let the OS pick.
+        // Tables: readable borders + header weight + horizontal scroll wrap
+        // (ui-ux: data-table readability, contrast, no edge-clipped content).
         let css = """
         :root { color-scheme: light dark; }
-        body { font: 14px -apple-system, system-ui; color: #1c2530; background: #ffffff; padding: 24px; max-width: 820px; margin: 0 auto; }
+        body { font: 14px -apple-system, system-ui; color: #1c2530; background: #ffffff; padding: 24px; max-width: 820px; margin: 0 auto; line-height: 1.55; }
         h1 { font-size: 28px; border-bottom: 1px solid #d6dde4; padding-bottom: 8px; }
         h2 { font-size: 22px; border-bottom: 1px solid #d6dde4; padding-bottom: 4px; }
         h3 { font-size: 18px; }
@@ -174,6 +243,11 @@ public final class MarkdownSurface: NSObject, Surface, WKNavigationDelegate {
         a:hover { text-decoration: underline; }
         ul { padding-left: 22px; }
         hr { border: 0; border-top: 1px solid #d6dde4; margin: 22px 0; }
+        .table-wrap { overflow-x: auto; margin: 16px 0; -webkit-overflow-scrolling: touch; }
+        table { border-collapse: collapse; width: 100%; font-size: 13px; }
+        th, td { border: 1px solid #d6dde4; padding: 8px 12px; text-align: left; vertical-align: top; }
+        th { background: #f4f6f8; font-weight: 600; color: #1c2530; }
+        tr:nth-child(even) td { background: #fafbfc; }
         @media (prefers-color-scheme: dark) {
           body { color: #e7edf3; background: #0f1419; }
           h1, h2 { border-bottom-color: #2a3440; }
@@ -183,6 +257,9 @@ public final class MarkdownSurface: NSObject, Surface, WKNavigationDelegate {
           hr { border-top-color: #2a3440; }
           .rc-copy { color: #e7edf3; background: #1a1f26; border-color: #2a3440; }
           .rc-copy:hover { background: #222831; }
+          th, td { border-color: #2a3440; }
+          th { background: #1a1f26; color: #e7edf3; }
+          tr:nth-child(even) td { background: #12171d; }
         }
         """
         // UX-016: restore the saved scroll offset after the body lays out.

@@ -1134,7 +1134,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if let sourcePane, let neighbor = ws.layout.rightNeighborPane(of: sourcePane) {
             if let filesDesc = neighbor.surfaces.first(where: { $0.type == .files }),
                let files = SurfaceRegistry.shared.surface(filesDesc.id) as? FilesSurface {
-                files.reveal(relativePath: info.relativePath)
+                // Preview-first + collapsed tree for agent link opens (UX-MAC_AGENT-OPEN-SPLIT).
+                files.reveal(relativePath: info.relativePath, agentSplitOpen: true)
                 updateSurfaceDescriptor(workspace: workspace, surface: filesDesc.id) { descriptor in
                     descriptor.title = info.title
                     descriptor.metadata["selected_path"] = info.relativePath
@@ -1145,7 +1146,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 reconcileSurfaceVisibility()
                 return
             }
-            let desc = makeFilesSurface(workspace: workspace, cwd: ws.cwd, title: info.title, selectedPath: info.relativePath)
+            let desc = makeFilesSurface(workspace: workspace, cwd: ws.cwd, title: info.title, selectedPath: info.relativePath, agentSplitOpen: true)
             try? ctx.apply(.addSurface(workspace, paneID: neighbor.id, descriptor: desc))
             windowController?.refreshFromState()
             reconcileSurfaceVisibility()
@@ -1153,7 +1154,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             return
         }
         guard let targetPane = sourcePane ?? ws.focusedPaneID ?? ws.layout.paneIDs().first else { return }
-        let desc = makeFilesSurface(workspace: workspace, cwd: ws.cwd, title: info.title, selectedPath: info.relativePath)
+        let desc = makeFilesSurface(workspace: workspace, cwd: ws.cwd, title: info.title, selectedPath: info.relativePath, agentSplitOpen: true)
         try? ctx.apply(.splitPane(workspace, paneID: targetPane, direction: .right, newSurface: desc))
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
@@ -5171,8 +5172,22 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func makeFilesSurface(workspace: WorkspaceID, cwd: String, title: String, selectedPath: String) -> SurfaceDescriptor {
-        let surface = FilesSurface(workspaceID: workspace, cwd: cwd, title: title, router: self, initialState: nil, selectedPath: selectedPath)
+    private func makeFilesSurface(
+        workspace: WorkspaceID,
+        cwd: String,
+        title: String,
+        selectedPath: String,
+        agentSplitOpen: Bool = false
+    ) -> SurfaceDescriptor {
+        let surface = FilesSurface(
+            workspaceID: workspace,
+            cwd: cwd,
+            title: title,
+            router: self,
+            initialState: nil,
+            selectedPath: selectedPath,
+            agentSplitOpen: agentSplitOpen
+        )
         SurfaceRegistry.shared.register(surface)
         return surface.descriptor
     }
