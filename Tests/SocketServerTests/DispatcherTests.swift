@@ -1842,8 +1842,50 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(obj["position"], .number(1))
         XCTAssertNil(obj["run_id"],
                      "queued sends must not expose a run id before they actually start")
+        guard case .object(let queuedPayload)? = obj["queued_message"] else {
+            return XCTFail("queued sends must include the mirror-ready queued message")
+        }
+        XCTAssertEqual(queuedPayload["durable_state"], .string("queued"))
+        XCTAssertEqual(queuedPayload["durableState"], .string("queued"),
+                       "socket clients using either naming convention must receive durable queue state")
         XCTAssertEqual(router.queuedMessageStore.first?.text, "run after current turn",
                        "a send during an active run must persist as an editable queued message instead of being dropped")
+    }
+
+    @MainActor
+    func test_agentMessageQueueListIncludesDurableStateForMirrorReconciliation() async throws {
+        // WHY: after reconnect, remote clients must distinguish a safe queued
+        // draft from a prepared or dispatched intent without replaying it.
+        let router = FakeRouter()
+        let thread = AgentThread(
+            workspaceId: nil,
+            title: "durable queue",
+            provider: .claude,
+            model: "claude-opus"
+        )
+        let prepared = AgentQueuedMessage(
+            threadId: thread.id,
+            text: "possibly accepted",
+            position: 1,
+            durableState: .prepared
+        )
+        router.threadStore = [thread]
+        router.queuedMessageStore = [prepared]
+
+        let response = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.message.queue.list",
+            params: ["thread_id": .string(thread.id.value.uuidString)]
+        ))
+
+        guard case .array(let messages)? = response.result,
+              case .object(let payload)? = messages.first else {
+            return XCTFail("queue list must return the durable queued message")
+        }
+        XCTAssertEqual(payload["durable_state"], .string("prepared"))
+        XCTAssertEqual(payload["durableState"], .string("prepared"),
+                       "mirror payloads must preserve durable queue state across naming conventions")
     }
 
     @MainActor

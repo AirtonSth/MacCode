@@ -1598,6 +1598,12 @@ public struct AgentThreadDraft: Codable, Sendable, Equatable {
     }
 }
 
+public enum AgentQueuedMessageDurableState: String, Codable, Sendable, Equatable {
+    case queued
+    case prepared
+    case dispatched
+}
+
 public struct AgentQueuedMessage: Codable, Sendable, Equatable, Identifiable {
     public let id: AgentQueuedMessageID
     public let threadId: AgentThreadID
@@ -1608,6 +1614,9 @@ public struct AgentQueuedMessage: Codable, Sendable, Equatable, Identifiable {
     public let createdAt: Date
     public var updatedAt: Date
     public var routingSnapshot: AgentQueuedMessageRoutingSnapshot?
+    /// Persisted dispatch state when supplied by the host repository. Optional
+    /// keeps older socket payloads decodable; locally-created rows start queued.
+    public var durableState: AgentQueuedMessageDurableState?
 
     public init(
         id: AgentQueuedMessageID = AgentQueuedMessageID(),
@@ -1618,7 +1627,8 @@ public struct AgentQueuedMessage: Codable, Sendable, Equatable, Identifiable {
         position: Int = 0,
         createdAt: Date = Date(),
         updatedAt: Date = Date(),
-        routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil
+        routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil,
+        durableState: AgentQueuedMessageDurableState? = .queued
     ) {
         self.id = id
         self.threadId = threadId
@@ -1629,6 +1639,7 @@ public struct AgentQueuedMessage: Codable, Sendable, Equatable, Identifiable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.routingSnapshot = routingSnapshot
+        self.durableState = durableState
     }
 }
 

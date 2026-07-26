@@ -195,6 +195,11 @@ public final class AppContext {
     private var queueDrainWaiters: [AgentThreadID: QueueDrainWaiter] = [:]
     private var queueDrainSuppressionLeases: [AgentThreadID: Set<UUID>] = [:]
     private var queueDispatchAcceptancePermits: [AgentThreadID: AgentRunAcceptancePermit] = [:]
+    private struct DeferredQueuePromotion {
+        let ownerId: AgentQueuedMessageID
+        let targetId: AgentQueuedMessageID
+    }
+    private var deferredQueuePromotions: [AgentThreadID: DeferredQueuePromotion] = [:]
     private var isTerminating = false
     var queueDrainWaiterCountForTesting: Int { queueDrainWaiters.count }
     var queueDrainSuppressedThreadCountForTesting: Int { queueDrainSuppressionLeases.count }
@@ -957,6 +962,7 @@ public final class AppContext {
 
     func cancelQueueDrainWaiterIfQueueEmpty(threadId: AgentThreadID) {
         guard ((try? queuedMessageRepo.list(threadId: threadId)) ?? []).isEmpty else { return }
+        deferredQueuePromotions.removeValue(forKey: threadId)
         cancelQueueDrainWaiter(threadId: threadId)
     }
 
@@ -978,6 +984,33 @@ public final class AppContext {
     ) {
         guard queueDispatchAcceptancePermits[threadId] === permit else { return }
         queueDispatchAcceptancePermits.removeValue(forKey: threadId)
+    }
+
+    func deferQueuePromotion(
+        id: AgentQueuedMessageID,
+        after ownerId: AgentQueuedMessageID,
+        threadId: AgentThreadID
+    ) {
+        deferredQueuePromotions[threadId] = DeferredQueuePromotion(
+            ownerId: ownerId,
+            targetId: id
+        )
+    }
+
+    func deferredQueuePromotion(
+        threadId: AgentThreadID,
+        ownerId: AgentQueuedMessageID
+    ) -> AgentQueuedMessageID? {
+        guard deferredQueuePromotions[threadId]?.ownerId == ownerId else { return nil }
+        return deferredQueuePromotions[threadId]?.targetId
+    }
+
+    func clearDeferredQueuePromotion(
+        threadId: AgentThreadID,
+        ownerId: AgentQueuedMessageID
+    ) {
+        guard deferredQueuePromotions[threadId]?.ownerId == ownerId else { return }
+        deferredQueuePromotions.removeValue(forKey: threadId)
     }
 
     func acquireQueueDrainSuppression(threadId: AgentThreadID) async -> UUID {

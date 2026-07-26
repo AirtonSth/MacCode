@@ -86,6 +86,45 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
                       "the loaded SDK version must be persisted in the normalized runtime timeline for diagnostics")
     }
 
+    // WHY: AppContext drains queued work from the provider-terminal callback.
+    // The callback must therefore observe the resident Claude session as idle
+    // immediately; relying on a later Task.yield makes queue progress scheduler-
+    // dependent and can strand Force until another lifecycle event happens.
+    func test_finishedCallbackObservesIdleSession() async throws {
+        guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
+        let tmp = try Self.makeTempDir(prefix: "rc2-sdk-causal-idle")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+        let commandLog = tmp.appendingPathComponent("commands.jsonl")
+        try Self.loggingFakeBridgeSource(sessionId: "sdk-causal-idle")
+            .write(to: bridge, atomically: true, encoding: .utf8)
+
+        let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
+        let threadId = AgentThreadID()
+        let finished = expectation(description: "Claude terminal callback")
+        let probe = ClaudeCausalIdleProbe()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "sonnet",
+            cwd: tmp.path,
+            prompt: "finish causally idle",
+            extraArgs: [commandLog.path]
+        )) { event in
+            guard case .finished = event else { return }
+            let status = adapter.listSessions()
+                .first(where: { $0.threadId == threadId })?
+                .status
+            probe.observeTerminalCallback(sessionStatus: status)
+            finished.fulfill()
+        }
+        defer { try? adapter.stopSession(threadId: threadId) }
+
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(probe.observedStatuses, [.completed],
+                       "the terminal callback is the causal idle edge; the adapter must commit idle state before publishing it")
+    }
+
     // MARK: - Adapter: rc_configure carries effort + settings (F0)
 
     // WHY: the SDK bridge is the production-default Claude adapter. If
@@ -1397,6 +1436,21 @@ private actor EventSink {
     private var events: [AgentRunEvent] = []
     func record(_ event: AgentRunEvent) { events.append(event) }
     func snapshot() -> [AgentRunEvent] { events }
+}
+
+private final class ClaudeCausalIdleProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var statuses: [AgentRunStatus?] = []
+
+    func observeTerminalCallback(sessionStatus: AgentRunStatus?) {
+        lock.withLock {
+            statuses.append(sessionStatus)
+        }
+    }
+
+    var observedStatuses: [AgentRunStatus?] {
+        lock.withLock { statuses }
+    }
 }
 
 private actor ClaudeForkMutationMock: ClaudeSDKSessionMutating {

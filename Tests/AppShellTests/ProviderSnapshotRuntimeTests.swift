@@ -2535,6 +2535,107 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         adapter.stopAll()
     }
 
+    func test_claudeSDKTerminalCallbackDrainsAndAcknowledgesNextQueueRowExactlyOnce() async throws {
+        // WHY: AppContext starts queued work from the provider terminal callback.
+        // The real Claude SDK adapter must already report the resident session
+        // idle at that edge so the next row starts and is acknowledged without
+        // scheduler yields, sleeps, or a later lifecycle event.
+        guard ProcessLocator.resolve("node") != nil else {
+            throw XCTSkip("node not available")
+        }
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-sdk-causal-drain-\(UUID().uuidString)", isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        let bridge = root.appendingPathComponent("fake-sdk-bridge.mjs")
+        let commandLog = root.appendingPathComponent("commands.jsonl")
+        let releaseFIFO = root.appendingPathComponent("release-first-turn")
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        try Self.causalQueueFakeClaudeBridge(
+            commandLogPath: commandLog.path,
+            releaseFIFOPath: releaseFIFO.path
+        ).write(to: bridge, atomically: true, encoding: .utf8)
+        let mkfifo = Process()
+        mkfifo.executableURL = URL(fileURLWithPath: "/usr/bin/mkfifo")
+        mkfifo.arguments = [releaseFIFO.path]
+        try mkfifo.run()
+        mkfifo.waitUntilExit()
+        XCTAssertEqual(mkfifo.terminationStatus, 0)
+
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
+        ctx.coordinator.replaceProviderAdapter(.claude, adapter: adapter)
+        defer { adapter.stopAll() }
+        let workspace = try router.createWorkspace(
+            name: "Claude SDK causal drain",
+            cwd: workspaceDir.path
+        )
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "Claude SDK causal drain",
+            provider: .claude,
+            model: "sonnet",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+
+        let first = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "hold the first turn",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        XCTAssertEqual(first.status, .started)
+        let queuedResult = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "drain exactly once",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        XCTAssertEqual(queuedResult.status, .queued)
+        let queued = try XCTUnwrap(queuedResult.queuedMessage)
+
+        let drained = QueueDrainAsyncSignal()
+        let drainedSubscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) {
+            guard $0.kind == "agent.message.queue.drained",
+                  $0.payload.objectValue?["queued_message_id"]?.stringValue
+                    == queued.id.value.uuidString else {
+                return
+            }
+            Task { await drained.signal() }
+        }
+        defer { EventBus.shared.unsubscribe(drainedSubscription) }
+
+        try await Task.detached {
+            let handle = try FileHandle(forWritingTo: releaseFIFO)
+            try handle.write(contentsOf: Data([0x31]))
+            try handle.close()
+        }.value
+        await drained.wait()
+
+        XCTAssertNil(try ctx.queuedMessageRepo.get(id: queued.id))
+        let turnCommands = try Self.loggedClaudeBridgeCommands(
+            at: commandLog,
+            type: "rc_turn"
+        )
+        XCTAssertEqual(turnCommands.count, 2,
+                       "the first turn and one queued turn must be the only provider writes")
+        let prompts = turnCommands.compactMap { $0["prompt"] as? String }
+        XCTAssertEqual(prompts.count, 2)
+        XCTAssertTrue(prompts[0].hasSuffix("User request:\nhold the first turn"))
+        XCTAssertTrue(prompts[1].hasSuffix("User request:\ndrain exactly once"))
+    }
+
     func test_drainQueue_definiteStartFailureRequeuesForOneExplicitRetry() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
@@ -3136,15 +3237,20 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         }
         defer { EventBus.shared.unsubscribe(drainedSubscription) }
         await preparedBarrier.release()
+        _ = await firstForce.value
         await startBarrier.waitUntilClaimed()
         XCTAssertEqual(startBarrier.claimCount, 1)
+        XCTAssertEqual(
+            startBarrier.physicalWriteCount,
+            0,
+            "the invalidated first owner must stop before claiming a provider write"
+        )
         startBarrier.releaseWrite()
-        _ = await firstForce.value
-        await startBarrier.waitUntilCancelled()
         await secondDrained.wait()
 
-        XCTAssertEqual(startBarrier.claimCount, 2,
-                       "the second intent must write only after the stopped first owner settles")
+        XCTAssertEqual(startBarrier.claimCount, 1,
+                       "only the second intent may claim a provider write after the first owner settles")
+        XCTAssertEqual(startBarrier.physicalWriteCount, 1)
         XCTAssertNil(try ctx.queuedMessageRepo.get(id: second.id))
         ctx.coordinator.stopRun(threadId: thread.id)
     }
@@ -3253,6 +3359,265 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         XCTAssertTrue(try ctx.messageRepo.list(threadId: thread.id).isEmpty)
     }
 
+    func test_pendingAdmissionTerminationUsesOneDeadlineAndPreservesDurableIntent() async throws {
+        // WHY: provider admission may never resume. Destructive callers still
+        // need one bounded shutdown deadline, and timeout must preserve both the
+        // thread and its queued user intent instead of deleting unconfirmed work.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pending-admission-timeout-\(UUID().uuidString)", isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = RequestCaptureRunner(provider: .claude)
+        ctx.coordinator.replaceProvider(.claude, runner: runner)
+        ctx.coordinator.gracefulStopTimeout = 0.02
+        ctx.coordinator.hardStopTimeout = 0.12
+        let admissionBarrier = QueueDrainAsyncBarrier()
+        ctx.coordinator.providerAdmissionCheck = { _, _ in
+            await admissionBarrier.enterAndWait()
+        }
+        let workspace = try router.createWorkspace(
+            name: "pending admission timeout",
+            cwd: workspaceDir.path
+        )
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "pending admission timeout",
+            provider: .claude,
+            model: "test-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let queued = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "preserve across admission timeout",
+            attachments: [],
+            interactionMode: .default
+        )
+        let force = Task {
+            do {
+                _ = try await router.forceAgentQueuedMessageNow(id: queued.id)
+                return false
+            } catch {
+                return true
+            }
+        }
+        await admissionBarrier.waitUntilEntered()
+
+        let startedAt = ContinuousClock.now
+        let deletionError = await Task { () -> Error? in
+            do {
+                try await router.deleteAgentThread(thread: thread.id)
+                return nil
+            } catch {
+                return error
+            }
+        }.value
+
+        XCTAssertEqual((deletionError as NSError?)?.code, 504)
+        XCTAssertLessThan(startedAt.duration(to: .now), .seconds(1),
+                          "the pending-start wait must consume the same hard-stop deadline")
+        XCTAssertNotNil(try ctx.threadRepo.get(id: thread.id),
+                        "timeout cannot authorize destructive thread deletion")
+        XCTAssertNotNil(try ctx.queuedMessageRepo.get(id: queued.id),
+                        "timeout must preserve the queued user intent")
+        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .prepared)
+        XCTAssertNil(runner.lastRequest,
+                     "an admission timeout must not cross the provider write boundary")
+
+        let cleanupSuppression = await ctx.acquireQueueDrainSuppression(threadId: thread.id)
+        defer {
+            ctx.releaseQueueDrainSuppression(
+                threadId: thread.id,
+                lease: cleanupSuppression
+            )
+        }
+        await admissionBarrier.release()
+        let forceFailed = await force.value
+        XCTAssertTrue(forceFailed)
+        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .queued)
+        XCTAssertFalse(ctx.coordinator.hasPendingProviderStart(threadId: thread.id))
+    }
+
+    func test_secondForceBeforePendingPersistenceStopsFirstWithoutProviderWrite() async throws {
+        // WHY: pending ownership exists before the run/thread pending rows. A
+        // second Force in that window must stop the first launch causally before
+        // it claims a provider write, while keeping both user intents durable.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pre-persist-second-force-\(UUID().uuidString)", isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = CompletingAcceptanceCaptureRunner(provider: .claude)
+        ctx.coordinator.replaceProvider(.claude, runner: runner)
+        let admissionBarrier = QueueDrainAsyncBarrier()
+        ctx.coordinator.providerAdmissionCheck = { _, _ in
+            await admissionBarrier.enterAndWait()
+        }
+        let workspace = try router.createWorkspace(
+            name: "pre persist second Force",
+            cwd: workspaceDir.path
+        )
+        var thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "pre persist second Force",
+            provider: .claude,
+            model: "test-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        thread.status = .failed
+        try ctx.threadRepo.upsert(thread)
+        let first = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "first pre-persistence owner",
+            attachments: [],
+            interactionMode: .default
+        )
+        let second = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "second Force owner",
+            attachments: [],
+            interactionMode: .default
+        )
+        let firstForce = Task {
+            do {
+                _ = try await router.forceAgentQueuedMessageNow(id: first.id)
+                return false
+            } catch {
+                return true
+            }
+        }
+        await admissionBarrier.waitUntilEntered()
+
+        XCTAssertTrue(ctx.coordinator.hasPendingProviderStart(threadId: thread.id))
+        XCTAssertNil(try ctx.runRepo.get(id: AgentRunID(first.id.value)))
+        XCTAssertTrue(runner.acceptedRunIDs.isEmpty)
+        let secondResult = try await router.forceAgentQueuedMessageNow(id: second.id)
+        XCTAssertEqual(secondResult.status, .queued)
+        XCTAssertEqual(secondResult.queuedMessage?.id, second.id)
+
+        let cleanupSuppression = await ctx.acquireQueueDrainSuppression(threadId: thread.id)
+        await admissionBarrier.release()
+        let firstForceFailed = await firstForce.value
+        XCTAssertTrue(firstForceFailed)
+
+        XCTAssertTrue(runner.acceptedRunIDs.isEmpty,
+                       "the invalidated first launch must never claim a provider write")
+        XCTAssertNotNil(try ctx.queuedMessageRepo.get(id: first.id))
+        XCTAssertNotNil(try ctx.queuedMessageRepo.get(id: second.id))
+
+        let secondDrained = QueueDrainAsyncSignal()
+        let drainedSubscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) {
+            guard $0.kind == "agent.message.queue.drained",
+                  $0.payload.objectValue?["queued_message_id"]?.stringValue
+                    == second.id.value.uuidString else {
+                return
+            }
+            Task { await secondDrained.signal() }
+        }
+        defer { EventBus.shared.unsubscribe(drainedSubscription) }
+
+        ctx.releaseQueueDrainSuppression(
+            threadId: thread.id,
+            lease: cleanupSuppression
+        )
+        await secondDrained.wait()
+
+        XCTAssertEqual(
+            runner.acceptedRunIDs,
+            [AgentRunID(second.id.value)],
+            "releasing suppression must start the forced second intent exactly once"
+        )
+        XCTAssertNotNil(
+            try ctx.queuedMessageRepo.get(id: first.id),
+            "the invalidated first intent must remain durable for explicit recovery"
+        )
+        XCTAssertNil(try ctx.queuedMessageRepo.get(id: second.id))
+    }
+
+    func test_continueRejectsPendingProviderStartBeforePersistence() async throws {
+        // WHY: Continue must not race an admitted-but-not-yet-persisted launch
+        // and create a second provider turn while durable status still looks idle.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("continue-pending-start-\(UUID().uuidString)", isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = RequestCaptureRunner(provider: .claude)
+        ctx.coordinator.replaceProvider(.claude, runner: runner)
+        let admissionBarrier = QueueDrainAsyncBarrier()
+        ctx.coordinator.providerAdmissionCheck = { _, _ in
+            await admissionBarrier.enterAndWait()
+        }
+        let workspace = try router.createWorkspace(
+            name: "continue pending start",
+            cwd: workspaceDir.path
+        )
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "continue pending start",
+            provider: .claude,
+            model: "test-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let initialStart = Task {
+            do {
+                _ = try await router.sendAgentMessage(
+                    thread: thread.id,
+                    text: "pending admission",
+                    provider: nil,
+                    model: nil,
+                    permissionMode: nil,
+                    reasoningEffort: nil
+                )
+                return false
+            } catch {
+                return true
+            }
+        }
+        await admissionBarrier.waitUntilEntered()
+
+        do {
+            _ = try await router.continueAgentRun(thread: thread.id)
+            XCTFail("Continue must reject pending provider ownership")
+        } catch let error as JSONRPCError {
+            XCTAssertTrue(error.message.contains("active run"))
+        }
+        XCTAssertTrue(try ctx.queuedMessageRepo.list(threadId: thread.id).isEmpty,
+                      "Continue must not enqueue an empty recovery prompt")
+        XCTAssertNil(runner.lastRequest)
+
+        ctx.coordinator.stopRun(threadId: thread.id)
+        await admissionBarrier.release()
+        let initialStartFailed = await initialStart.value
+        XCTAssertTrue(initialStartFailed)
+        XCTAssertNil(runner.lastRequest,
+                     "the stopped pending launch must not reach the provider writer")
+    }
+
     func test_drainQueue_relaunchAcknowledgesDispatchedHeadWithoutProviderReplay() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
@@ -3279,6 +3644,154 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         XCTAssertNil(runner.lastRequest,
                      "relaunch recovery must acknowledge durable dispatched proof without invoking the provider")
         XCTAssertNil(try ctx.queuedMessageRepo.get(id: queued.id))
+    }
+
+    func test_forceDispatchedQueueRowFinishesCleanupBeforeBusyThreadHandling() async throws {
+        // WHY: dispatched is positive provider-start evidence. The recovery
+        // action is ack-only even while that same provider run remains busy;
+        // routing through Force promotion would try to interrupt or replay it.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("force-dispatched-busy-\(UUID().uuidString)", isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = RequestCaptureRunner(provider: .codex)
+        ctx.coordinator.replaceProvider(.codex, runner: runner)
+        let workspace = try router.createWorkspace(
+            name: "force dispatched busy",
+            cwd: workspaceDir.path
+        )
+        var thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "force dispatched busy",
+            provider: .codex,
+            model: "gpt-5.5",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        thread.status = .running
+        try ctx.threadRepo.upsert(thread)
+        let queued = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "provider already accepted",
+            attachments: [],
+            interactionMode: .default
+        )
+        let normalNext = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "normal next",
+            attachments: [],
+            interactionMode: .default
+        )
+        let forcedNext = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "forced next",
+            attachments: [],
+            interactionMode: .default
+        )
+        let lease = try XCTUnwrap(
+            ctx.queuedMessageRepo.claim(id: queued.id, leaseId: "accepted-provider-start")
+        )
+        let runId = AgentRunID(queued.id.value)
+        XCTAssertTrue(try ctx.queuedMessageRepo.prepareDispatch(lease, runId: runId))
+        XCTAssertTrue(try ctx.queuedMessageRepo.markDispatched(lease, runId: runId))
+        ctx.deferQueuePromotion(
+            id: forcedNext.id,
+            after: queued.id,
+            threadId: thread.id
+        )
+
+        let result = try await router.forceAgentQueuedMessageNow(id: queued.id)
+
+        XCTAssertEqual(result.status, .started)
+        XCTAssertEqual(result.runId, runId)
+        XCTAssertNil(try ctx.queuedMessageRepo.get(id: queued.id))
+        XCTAssertNil(runner.lastRequest,
+                     "Finish cleanup must not call the provider or replay dispatched work")
+        XCTAssertEqual(try ctx.threadRepo.get(id: thread.id)?.status, .running,
+                       "ack-only cleanup must not stop the already accepted provider run")
+        XCTAssertEqual(
+            try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.id),
+            [forcedNext.id, normalNext.id],
+            "dispatched cleanup must preserve the user's deferred Force priority"
+        )
+    }
+
+    func test_automaticDispatchedRecoveryConsumesDeferredForceBeforeNextProviderWrite() async throws {
+        // WHY: the automatic recovery path must consume the same owner-bound
+        // promotion as the manual Finish cleanup action.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("auto-dispatched-force-\(UUID().uuidString)", isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = RequestCaptureRunner(provider: .codex)
+        ctx.coordinator.replaceProvider(.codex, runner: runner)
+        let workspace = try router.createWorkspace(
+            name: "automatic dispatched force",
+            cwd: workspaceDir.path
+        )
+        var thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "automatic dispatched force",
+            provider: .codex,
+            model: "gpt-5.5",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        thread.status = .completed
+        try ctx.threadRepo.upsert(thread)
+        let owner = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "accepted owner",
+            attachments: [],
+            interactionMode: .default
+        )
+        let normalNext = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "normal next",
+            attachments: [],
+            interactionMode: .default
+        )
+        let forcedNext = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "forced next",
+            attachments: [],
+            interactionMode: .default
+        )
+        let lease = try XCTUnwrap(
+            ctx.queuedMessageRepo.claim(id: owner.id, leaseId: "accepted-owner")
+        )
+        let ownerRunId = AgentRunID(owner.id.value)
+        XCTAssertTrue(try ctx.queuedMessageRepo.prepareDispatch(lease, runId: ownerRunId))
+        XCTAssertTrue(try ctx.queuedMessageRepo.markDispatched(lease, runId: ownerRunId))
+        ctx.deferQueuePromotion(
+            id: forcedNext.id,
+            after: owner.id,
+            threadId: thread.id
+        )
+
+        try await router.drainNextQueuedAgentMessage(thread: thread.id)
+
+        XCTAssertEqual(runner.lastRequest?.runId, AgentRunID(forcedNext.id.value),
+                       "automatic recovery must write only the deferred forced intent next")
+        XCTAssertNil(try ctx.queuedMessageRepo.get(id: owner.id))
+        XCTAssertNil(try ctx.queuedMessageRepo.get(id: forcedNext.id))
+        XCTAssertEqual(try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.id), [normalNext.id])
     }
 
     func test_drainQueue_relaunchRequeuesPreparedHeadWhenNoRunExistsAndStartsExactlyOnce() async throws {
@@ -3555,6 +4068,69 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
       }
     }
 
+    private static func causalQueueFakeClaudeBridge(
+        commandLogPath: String,
+        releaseFIFOPath: String
+    ) -> String {
+        """
+        import fs from 'node:fs';
+        import readline from 'node:readline';
+        const commandLog = '\(commandLogPath)';
+        const releaseFIFO = '\(releaseFIFOPath)';
+        const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+        let turn = 0;
+        function write(obj) { process.stdout.write(JSON.stringify(obj) + '\\n'); }
+        function finishTurn(ordinal) {
+          write({
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            result: 'DONE_' + ordinal,
+            session_id: 'sdk-causal-queue'
+          });
+        }
+        for await (const line of rl) {
+          if (!line.trim()) continue;
+          const command = JSON.parse(line);
+          fs.appendFileSync(commandLog, JSON.stringify(command) + '\\n');
+          if (command.type === 'rc_configure') {
+            write({ type: 'system', subtype: 'init', session_id: 'sdk-causal-queue' });
+          } else if (command.type === 'rc_turn') {
+            turn += 1;
+            if (turn === 1) {
+              const gate = fs.createReadStream(releaseFIFO);
+              gate.once('data', () => {
+                gate.close();
+                finishTurn(turn);
+              });
+            } else {
+              finishTurn(turn);
+            }
+          } else if (command.type === 'rc_close') {
+            process.exit(0);
+          }
+        }
+        """
+    }
+
+    private static func loggedClaudeBridgeCommands(
+        at url: URL,
+        type: String
+    ) throws -> [[String: Any]] {
+        try String(contentsOf: url, encoding: .utf8)
+            .components(separatedBy: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            .compactMap { line in
+                guard let data = line.data(using: .utf8),
+                      let object = try? JSONSerialization.jsonObject(with: data)
+                        as? [String: Any] else {
+                    return nil
+                }
+                return object
+            }
+            .filter { ($0["type"] as? String) == type }
+    }
+
     private func makeLiveAdapterRouterFixture(
         root: URL
     ) async throws -> (AppContext, AppCommandRouter, OneShotProviderAdapter, AgentThread) {
@@ -3634,6 +4210,43 @@ private final class RequestCaptureRunner: AgentProviderRunner, @unchecked Sendab
             onEvent(.event(.turnStarted(turnId: "turn-1")))
             onEvent(.event(.turnCompleted(turnId: "turn-1", finalMessage: "ok")))
             onEvent(.finished(.completed, finalMessage: "ok", providerThreadId: providerThreadId))
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+}
+
+private final class CompletingAcceptanceCaptureRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider
+    private let lock = NSLock()
+    private var capturedRunIDs: [AgentRunID] = []
+
+    init(provider: AgentProvider) {
+        self.provider = provider
+    }
+
+    var acceptedRunIDs: [AgentRunID] {
+        lock.withLock { capturedRunIDs }
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        guard let acceptancePermit = request.acceptancePermit else {
+            throw AgentRunAcceptanceError.cancelled
+        }
+        try acceptancePermit.withAcceptance {
+            lock.withLock { capturedRunIDs.append(request.runId) }
+        }
+        Task.detached {
+            onEvent(.status(.completed))
+            onEvent(.finished(
+                .completed,
+                finalMessage: "accepted",
+                providerThreadId: request.providerThreadId
+            ))
         }
         return AgentRunHandle(runId: request.runId, process: nil) {}
     }

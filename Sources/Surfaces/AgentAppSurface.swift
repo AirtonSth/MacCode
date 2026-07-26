@@ -316,6 +316,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public private(set) var pendingAttachmentRetryConfirmation: AttachmentRetryConfirmation?
     @Published public var queuedMessages: [AgentQueuedMessage] = []
     @Published public var queueStatusMessage: String?
+    private var queueStatusByThread: [AgentThreadID: String] = [:]
     @Published public var editingQueuedMessage: AgentQueuedMessage?
     @Published public var queuedMessageDraft: String = ""
     /// When the active run started — drives the "Working for Xs" line.
@@ -999,19 +1000,76 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func reloadQueuedMessages() {
         guard let selectedThreadId, let queuedMessageRepo else {
             queuedMessages = []
+            queueStatusMessage = nil
             return
         }
         queuedMessages = (try? queuedMessageRepo.list(threadId: selectedThreadId)) ?? []
-        if let head = queuedMessages.first,
-           (try? queuedMessageRepo.dispatch(id: head.id)?.state) == .prepared {
-            queueStatusMessage = "Start confirmation is pending. The message was not replayed."
+        if let status = queueStatusByThread[selectedThreadId] {
+            queueStatusMessage = status
+        } else if queuedMessages.first?.durableState == .prepared {
+            queueStatusMessage = Self.preparedQueueStatusMessage
+        } else {
+            queueStatusMessage = nil
+        }
+    }
+
+    private static let preparedQueueStatusMessage =
+        "Start confirmation is pending. Check status before deciding whether to remove this queue record."
+
+    private func setQueueStatus(_ message: String?, threadId: AgentThreadID) {
+        if let message {
+            queueStatusByThread[threadId] = message
+        } else {
+            queueStatusByThread.removeValue(forKey: threadId)
+        }
+        if selectedThreadId == threadId {
+            queueStatusMessage = message
+        }
+    }
+
+    public func canForceQueuedMessage(_ message: AgentQueuedMessage) -> Bool {
+        true
+    }
+
+    public func queuedMessageForceLabel(_ message: AgentQueuedMessage) -> String {
+        switch message.durableState ?? .queued {
+        case .queued:
+            return "Force"
+        case .prepared:
+            return "Check status"
+        case .dispatched:
+            return "Finish cleanup"
+        }
+    }
+
+    public func queuedMessagePrimaryActionAccessibilityLabel(
+        _ message: AgentQueuedMessage
+    ) -> String {
+        switch message.durableState ?? .queued {
+        case .queued:
+            return "Force queued message \(message.position) now"
+        case .prepared:
+            return "Check queued message \(message.position) provider status"
+        case .dispatched:
+            return "Finish queued message \(message.position) cleanup"
+        }
+    }
+
+    public func queuedMessageDurableStatus(_ message: AgentQueuedMessage) -> String? {
+        switch message.durableState ?? .queued {
+        case .queued:
+            return nil
+        case .prepared:
+            return "Provider acceptance is unresolved. The message is retained to prevent duplicate work."
+        case .dispatched:
+            return "Provider start was confirmed. Queue acknowledgement is being recovered."
         }
     }
 
     public func editQueuedMessage(_ message: AgentQueuedMessage) {
         editingQueuedMessage = message
         queuedMessageDraft = message.text
-        queueStatusMessage = nil
+        setQueueStatus(nil, threadId: message.threadId)
     }
 
     public func saveQueuedMessageEdit() {
@@ -1020,7 +1078,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard !text.isEmpty || !editingQueuedMessage.attachments.isEmpty else { return }
         do {
             if let updated = try queuedMessageRepo.update(id: editingQueuedMessage.id, text: text, attachments: editingQueuedMessage.attachments) {
-                queueStatusMessage = nil
+                setQueueStatus(nil, threadId: editingQueuedMessage.threadId)
                 self.editingQueuedMessage = nil
                 queuedMessageDraft = ""
                 // Queue edits stay in the queue UI only. The transcript bubble is
@@ -1028,38 +1086,74 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 reloadQueuedMessages()
                 onQueuedMessageEvent?(AgentQueueEventKinds.updated, updated)
             } else {
-                queueStatusMessage = "Already processing."
                 self.editingQueuedMessage = nil
                 queuedMessageDraft = ""
                 reloadQueuedMessages()
+                setQueueStatus("Already processing.", threadId: editingQueuedMessage.threadId)
             }
         } catch {
-            queueStatusMessage = "Queue edit failed: \(error)"
+            setQueueStatus(
+                "Queue edit failed: \(error)",
+                threadId: editingQueuedMessage.threadId
+            )
         }
     }
 
     public func forceQueuedMessageNow(_ message: AgentQueuedMessage) async {
         guard let forceQueuedMessage else {
-            queueStatusMessage = "Force is unavailable while the app router is not ready."
+            setQueueStatus(
+                "Queue action is unavailable while the app router is not ready.",
+                threadId: message.threadId
+            )
             return
         }
+        let statusBeforeAction = queueStatusByThread[message.threadId]
         do {
             let result = try await forceQueuedMessage(message.id)
-            queueStatusMessage = nil
             reloadQueuedMessages()
             if result.status == .queued {
-                queueStatusMessage = "Stopping current run to start this now."
+                setQueueStatus(
+                    "Stopping current run to start this now.",
+                    threadId: message.threadId
+                )
+            } else {
+                setQueueStatus(nil, threadId: message.threadId)
             }
         } catch {
-            queueStatusMessage = "Queue force failed: \(error)"
+            let hostStatus = queueStatusByThread[message.threadId]
             reloadQueuedMessages()
+            if hostStatus != statusBeforeAction, let hostStatus {
+                setQueueStatus(hostStatus, threadId: message.threadId)
+                return
+            }
+            let prefix = message.durableState == .queued
+                ? "Queue force failed"
+                : "Queue status check failed"
+            setQueueStatus("\(prefix): \(error)", threadId: message.threadId)
         }
     }
 
     public func cancelQueuedMessage(_ message: AgentQueuedMessage) {
+        removeQueuedMessage(message)
+    }
+
+    public func removeQueuedMessage(_ message: AgentQueuedMessage) {
         guard let queuedMessageRepo else { return }
         do {
-            if let cancelled = try queuedMessageRepo.delete(id: message.id) {
+            let removed: AgentQueuedMessage?
+            switch message.durableState ?? .queued {
+            case .queued:
+                removed = try queuedMessageRepo.delete(id: message.id)
+            case .prepared:
+                removed = try queuedMessageRepo.abandonPrepared(id: message.id)
+            case .dispatched:
+                setQueueStatus(
+                    "Provider start was confirmed. Use Finish cleanup instead of removing this message.",
+                    threadId: message.threadId
+                )
+                return
+            }
+            if let cancelled = removed {
                 if editingQueuedMessage?.id == message.id {
                     editingQueuedMessage = nil
                     queuedMessageDraft = ""
@@ -1080,11 +1174,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 reloadQueuedMessages()
                 onQueuedMessageEvent?(AgentQueueEventKinds.cancelled, cancelled)
             } else {
-                queueStatusMessage = "Already processing."
                 reloadQueuedMessages()
+                setQueueStatus(
+                    "Queue state changed before removal. Check status and try again.",
+                    threadId: message.threadId
+                )
             }
         } catch {
-            queueStatusMessage = "Queue cancel failed: \(error)"
+            setQueueStatus(
+                "Queue removal failed: \(error)",
+                threadId: message.threadId
+            )
         }
     }
 
@@ -1127,7 +1227,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 onQueuedMessageEvent?(AgentQueueEventKinds.updated, queued)
             }
         } catch {
-            queueStatusMessage = "Queue reorder failed: \(error)"
+            if let selectedThreadId {
+                setQueueStatus("Queue reorder failed: \(error)", threadId: selectedThreadId)
+            }
         }
     }
 
@@ -3840,23 +3942,26 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func dismissQueueStatusMessage() {
+        if let selectedThreadId {
+            queueStatusByThread.removeValue(forKey: selectedThreadId)
+        }
         queueStatusMessage = nil
     }
 
     public func handleQueueLifecycleEvent(kind: String, threadId: String?, message: String?) {
-        guard let selectedThreadId,
-              threadId == selectedThreadId.value.uuidString else {
-            return
-        }
+        guard let threadId,
+              let uuid = UUID(uuidString: threadId) else { return }
+        let eventThreadId = AgentThreadID(uuid)
         switch kind {
         case "agent.message.queue.failed":
-            queueStatusMessage = message ?? "The queued message could not start yet."
+            let status = message ?? "The queued message could not start yet."
+            setQueueStatus(status, threadId: eventThreadId)
         case AgentQueueEventKinds.drained:
-            queueStatusMessage = nil
+            setQueueStatus(nil, threadId: eventThreadId)
         case AgentQueueEventKinds.cancelled:
             if let queuedMessageRepo,
-               (try? queuedMessageRepo.list(threadId: selectedThreadId).isEmpty) == true {
-                queueStatusMessage = nil
+               (try? queuedMessageRepo.list(threadId: eventThreadId).isEmpty) == true {
+                setQueueStatus(nil, threadId: eventThreadId)
             }
         default:
             break
@@ -4083,14 +4188,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             clearComposerDraftMemory(threadId: selectedThreadId, providerInstanceId: providerInstanceId)
             // UX-MAC_AGENT-019: a run is in flight, so this message was queued,
             // not sent now — confirm that explicitly near the composer.
-            queueStatusMessage = "Queued — will run after the current turn."
             reloadQueuedMessages()
+            setQueueStatus(
+                "Queued — will run after the current turn.",
+                threadId: selectedThreadId
+            )
             // QA-MAC_AGENT-010: track queue depth for diagnostics.
             agentSurfaceLog.info("queue.enqueued thread=\(selectedThreadId.value.uuidString, privacy: .public) depth=\(self.queuedMessages.count, privacy: .public)")
             onQueuedMessageEvent?(AgentQueueEventKinds.queued, queued)
             return true
         } catch {
-            queueStatusMessage = "Queue send failed: \(error)"
+            setQueueStatus(
+                "Queue send failed: \(error)",
+                threadId: selectedThreadId
+            )
             return false
         }
     }
@@ -9863,20 +9974,33 @@ public struct AgentAppView: View {
             .padding(.vertical, DS.Space.md)
             .background(DS.Palette.bg)
             .confirmationDialog(
-                "Cancel queued message?",
+                queuedMessagePendingCancel?.durableState == .prepared
+                    ? "Remove message with unresolved provider acceptance?"
+                    : "Cancel queued message?",
                 isPresented: Binding(
                     get: { queuedMessagePendingCancel != nil },
                     set: { if !$0 { queuedMessagePendingCancel = nil } }
                 )
             ) {
-                Button("Cancel queued message", role: .destructive) {
+                Button(
+                    queuedMessagePendingCancel?.durableState == .prepared
+                        ? "Remove from queue"
+                        : "Cancel queued message",
+                    role: .destructive
+                ) {
                     if let queuedMessagePendingCancel {
-                        vm.cancelQueuedMessage(queuedMessagePendingCancel)
+                        vm.removeQueuedMessage(queuedMessagePendingCancel)
                     }
                     queuedMessagePendingCancel = nil
                 }
                 Button("Keep message", role: .cancel) {
                     queuedMessagePendingCancel = nil
+                }
+            } message: {
+                if queuedMessagePendingCancel?.durableState == .prepared {
+                    Text(
+                        "The provider may already have received this message. Removing it only abandons the queue record and cannot undo provider-side work."
+                    )
                 }
             }
         }
@@ -9991,6 +10115,15 @@ public struct AgentAppView: View {
                             .font(DS.Font.caption)
                             .foregroundColor(DS.Palette.textTertiary)
                     }
+                    if let durableStatus = vm.queuedMessageDurableStatus(message) {
+                        Text(durableStatus)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier(
+                                "agent.queued.state.\(message.id.value.uuidString)"
+                            )
+                    }
                 }
                 Spacer(minLength: DS.Space.sm)
                 if vm.editingQueuedMessage?.id == message.id {
@@ -10007,11 +10140,12 @@ public struct AgentAppView: View {
                     Button {
                         Task { await vm.forceQueuedMessageNow(message) }
                     } label: {
-                        Text("Force")
+                        Text(vm.queuedMessageForceLabel(message))
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
-                    .accessibilityLabel("Force queued message \(message.position) now")
+                    .disabled(!vm.canForceQueuedMessage(message))
+                    .accessibilityLabel(vm.queuedMessagePrimaryActionAccessibilityLabel(message))
                     .accessibilityIdentifier("agent.queued.force.\(message.id.value.uuidString)")
                     Button {
                         vm.editQueuedMessage(message)
@@ -10020,23 +10154,36 @@ public struct AgentAppView: View {
                     }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
+                        .disabled((message.durableState ?? .queued) != .queued)
                         .accessibilityLabel("Edit queued message \(message.position)")
                         .accessibilityIdentifier("agent.queued.edit.\(message.id.value.uuidString)")
                     Button {
-                        if message.attachments.isEmpty && message.text.count < 120 {
-                            vm.cancelQueuedMessage(message)
+                        if message.durableState == .prepared {
+                            queuedMessagePendingCancel = message
+                        } else if message.attachments.isEmpty && message.text.count < 120 {
+                            vm.removeQueuedMessage(message)
                         } else {
                             queuedMessagePendingCancel = message
                         }
                     } label: {
-                        Image(systemName: "trash")
-                            .foregroundColor(DS.Palette.danger)
+                        if message.durableState == .prepared {
+                            Text("Remove")
+                                .foregroundColor(DS.Palette.danger)
+                        } else {
+                            Image(systemName: "trash")
+                                .foregroundColor(DS.Palette.danger)
+                        }
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    .disabled(message.durableState == .dispatched)
                     .tint(DS.Palette.danger)
                     .foregroundColor(DS.Palette.danger)
-                    .accessibilityLabel("Cancel queued message \(message.position)")
+                    .accessibilityLabel(
+                        message.durableState == .prepared
+                            ? "Remove queued message \(message.position) with unresolved provider acceptance"
+                            : "Cancel queued message \(message.position)"
+                    )
                     .accessibilityIdentifier("agent.queued.cancel.\(message.id.value.uuidString)")
                 }
             }
