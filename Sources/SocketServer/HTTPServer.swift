@@ -604,9 +604,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
     public let dispatcher: JSONRPCDispatcher
     public let commandReceiptMetrics: CommandReceiptMetrics
     public weak var auth: DirectAuthProvider?
-    /// Stable, persisted host identity. iOS pins this (RCA-022); it must
+    /// Stable, persisted **logical** host identity. iOS pins this (RCA-022); it must
     /// survive process restarts or every relaunch looks like a different
     /// Mac and forces a re-pair (GAP-2).
+    ///
+    /// This is not a certificate/public-key identity. The listener is plaintext
+    /// HTTP; cryptographic host proof requires a coordinated protocol change
+    /// (iOS `HostIdentityTrustBoundary.cryptographicVerificationSupported` is
+    /// fail-closed until then).
     public let serverId: String
     public let bootEpoch: UInt64
 
