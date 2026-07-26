@@ -33,7 +33,15 @@ final class FilesSurface: NSObject, Surface {
     let view: NSView
     private let model: FilesViewModel
 
-    init(workspaceID: WorkspaceID, cwd: String, title: String = "Files", router: AppCommandRouter, initialState: String?, selectedPath: String? = nil) {
+    init(
+        workspaceID: WorkspaceID,
+        cwd: String,
+        title: String = "Files",
+        router: AppCommandRouter,
+        initialState: String?,
+        selectedPath: String? = nil,
+        agentSplitOpen: Bool = false
+    ) {
         var metadata = ["workspace": workspaceID.value.uuidString, "cwd": cwd]
         if let initialState { metadata["files_state"] = initialState }
         if let selectedPath {
@@ -42,6 +50,9 @@ final class FilesSurface: NSObject, Surface {
         }
         self.descriptor = SurfaceDescriptor(type: .files, title: title, iconName: "folder", metadata: metadata)
         self.model = FilesViewModel(surfaceID: descriptor.id, workspaceID: workspaceID, root: cwd, router: router)
+        if agentSplitOpen, let selectedPath {
+            self.model.prepareAgentSplitOpen(relativePath: selectedPath)
+        }
         self.view = NSHostingView(rootView: FilesSurfaceRoot(model: model))
         super.init()
         DispatchQueue.main.async { [model] in model.loadInitialState() }
@@ -56,7 +67,41 @@ final class FilesSurface: NSObject, Surface {
 
     /// UX-MAC_AGENT-OPEN-SPLIT: programmatic navigation used when the Agent App
     /// reuses this panel as the right-hand split for a clicked file mention.
-    func reveal(relativePath: String) { model.reveal(relativePath: relativePath) }
+    func reveal(relativePath: String, agentSplitOpen: Bool = false) {
+        model.reveal(relativePath: relativePath, agentSplitOpen: agentSplitOpen)
+    }
+}
+
+// MARK: - Agent split-open presentation (pure; unit-tested)
+
+/// Whether a workspace-relative path should open the Files reader in Preview
+/// when launched from an Agent App adjacent-split link. Matches the kinds
+/// Files already renders via `previewBody` (markdown/html/pdf/image/video).
+func filesPathPrefersReaderPreview(_ relativePath: String) -> Bool {
+    let ext = (relativePath as NSString).pathExtension.lowercased()
+    switch ext {
+    case "md", "markdown", "html", "htm", "pdf":
+        return true
+    case "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "heic", "svg":
+        return true
+    case "mp4", "mov", "avi", "mkv", "webm":
+        return true
+    default:
+        return false
+    }
+}
+
+/// Presentation applied when Agent App opens a file link into an adjacent Files split.
+struct FilesAgentSplitOpenPresentation: Equatable {
+    let readerMode: String
+    let hideSidebar: Bool
+
+    static func forRelativePath(_ relativePath: String) -> FilesAgentSplitOpenPresentation {
+        FilesAgentSplitOpenPresentation(
+            readerMode: filesPathPrefersReaderPreview(relativePath) ? "preview" : "source",
+            hideSidebar: true
+        )
+    }
 }
 
 struct FileTabDragPayload {
@@ -948,6 +993,11 @@ final class FilesViewModel: ObservableObject {
     @Published var isDirty = false
     @Published var dirtyPaths: Set<String> = []
     @Published var readerMode = "source"
+    /// UX-MAC_AGENT-OPEN-SPLIT: hide the Files tree for link-driven open so the
+    /// reader fills the split. Tab-local only — does not write AppStorage intent.
+    @Published var forceHideSidebar = false
+    /// Applied once after `loadInitialState` so default `reader_mode=source` does not win the race.
+    private var preferredAgentReaderMode: String?
     // Lazy tree state: which directory rows are currently expanded. The actual per-directory child
     // listings live in `treeStore`, which fetches them on first expand and caches them. Reset
     // whenever the displayed directory changes (P1). `expandedPaths` is the @Published trigger that
@@ -1039,6 +1089,13 @@ final class FilesViewModel: ObservableObject {
                 readerMode = state["reader_mode"]?.stringValue ?? "source"
                 dirtyPaths = Self.dirtyPaths(from: state)
             }
+            // Agent split-open wins over the default source reader mode for previewable paths.
+            if let preferred = preferredAgentReaderMode {
+                preferredAgentReaderMode = nil
+                if preferred != readerMode {
+                    setReaderMode(preferred)
+                }
+            }
             loadDirectory(currentDirectory)
             if let initialSelectedPath,
                let entry = entries.first(where: { !$0.isDirectory && $0.relativePath == initialSelectedPath }) {
@@ -1048,6 +1105,13 @@ final class FilesViewModel: ObservableObject {
         } catch {
             errorText = String(describing: error)
         }
+    }
+
+    /// UX-MAC_AGENT-OPEN-SPLIT: set preview + collapsed tree for a link-driven open.
+    func prepareAgentSplitOpen(relativePath: String) {
+        let presentation = FilesAgentSplitOpenPresentation.forRelativePath(relativePath)
+        forceHideSidebar = presentation.hideSidebar
+        preferredAgentReaderMode = presentation.readerMode
     }
 
     func loadDirectory(_ relativePath: String) {
@@ -1074,7 +1138,15 @@ final class FilesViewModel: ObservableObject {
     /// UX-MAC_AGENT-OPEN-SPLIT: reveal a workspace-relative path — select it when
     /// already listed, otherwise navigate to its parent directory and select the
     /// entry there (a directory path opens the directory itself).
-    func reveal(relativePath: String) {
+    /// When `agentSplitOpen` is true, apply preview-first + collapsed-tree presentation.
+    func reveal(relativePath: String, agentSplitOpen: Bool = false) {
+        if agentSplitOpen {
+            let presentation = FilesAgentSplitOpenPresentation.forRelativePath(relativePath)
+            forceHideSidebar = presentation.hideSidebar
+            if presentation.readerMode != readerMode {
+                setReaderMode(presentation.readerMode)
+            }
+        }
         if let known = allKnownEntry(relativePath: relativePath) {
             select(known)
             return
@@ -1653,11 +1725,20 @@ private struct FilesSurfaceRoot: View {
                 reader
                     .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
             }
-            .onAppear { applyAdaptiveSidebar(width: proxy.size.width, event: .structural) }
+            .onAppear {
+                if model.forceHideSidebar { sidebarVisible = false }
+                applyAdaptiveSidebar(width: proxy.size.width, event: .structural)
+            }
             .onChange(of: proxy.size.width) { width in
                 applyAdaptiveSidebar(width: width, event: .resize)
             }
             .onChange(of: model.readerMode) { _ in
+                applyAdaptiveSidebar(width: proxy.size.width, event: .structural)
+            }
+            .onChange(of: model.forceHideSidebar) { hide in
+                if hide {
+                    sidebarVisible = false
+                }
                 applyAdaptiveSidebar(width: proxy.size.width, event: .structural)
             }
         }
@@ -2269,6 +2350,8 @@ private struct FilesSurfaceRoot: View {
                 HStack(spacing: 8) {
                     if !sidebarVisible {
                         DSIconButton("sidebar.left", help: "Show file sidebar") {
+                            // Clear agent-open collapse so adaptive policy / intent can take over.
+                            model.forceHideSidebar = false
                             sidebarIntent = .forcedVisible
                             sidebarVisible = true
                         }
@@ -2354,6 +2437,11 @@ private struct FilesSurfaceRoot: View {
     }
 
     private func applyAdaptiveSidebar(width: CGFloat, event: AdaptiveSidebarLayoutEvent) {
+        // Agent split-open: keep the tree collapsed until the user explicitly shows it.
+        if model.forceHideSidebar {
+            if sidebarVisible { sidebarVisible = false }
+            return
+        }
         let now = Date().timeIntervalSinceReferenceDate
         let decision = AdaptiveSidebarPolicy.nextVisibility(
             availableExtent: width,
