@@ -86,6 +86,45 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
                       "the loaded SDK version must be persisted in the normalized runtime timeline for diagnostics")
     }
 
+    // WHY: AppContext drains queued work from the provider-terminal callback.
+    // The callback must therefore observe the resident Claude session as idle
+    // immediately; relying on a later Task.yield makes queue progress scheduler-
+    // dependent and can strand Force until another lifecycle event happens.
+    func test_finishedCallbackObservesIdleSession() async throws {
+        guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
+        let tmp = try Self.makeTempDir(prefix: "rc2-sdk-causal-idle")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+        let commandLog = tmp.appendingPathComponent("commands.jsonl")
+        try Self.loggingFakeBridgeSource(sessionId: "sdk-causal-idle")
+            .write(to: bridge, atomically: true, encoding: .utf8)
+
+        let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
+        let threadId = AgentThreadID()
+        let finished = expectation(description: "Claude terminal callback")
+        let probe = ClaudeCausalIdleProbe()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "sonnet",
+            cwd: tmp.path,
+            prompt: "finish causally idle",
+            extraArgs: [commandLog.path]
+        )) { event in
+            guard case .finished = event else { return }
+            let status = adapter.listSessions()
+                .first(where: { $0.threadId == threadId })?
+                .status
+            probe.observeTerminalCallback(sessionStatus: status)
+            finished.fulfill()
+        }
+        defer { try? adapter.stopSession(threadId: threadId) }
+
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(probe.observedStatuses, [.completed],
+                       "the terminal callback is the causal idle edge; the adapter must commit idle state before publishing it")
+    }
+
     // MARK: - Adapter: rc_configure carries effort + settings (F0)
 
     // WHY: the SDK bridge is the production-default Claude adapter. If
@@ -158,6 +197,59 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
         let configures = try Self.loggedCommands(at: commandLog, ofType: "rc_configure")
         XCTAssertEqual(configures.first?["claude_executable_path"] as? String, "/usr/bin/true",
                        "the saved Claude path must remain authoritative even before a refreshed provider snapshot adds providerBinary")
+    }
+
+    func test_recoverSessionConfiguresSavedCursorAndContinuesOnRecoveredBridge() async throws {
+        // WHY: after a host restart the SDK adapter must configure the persisted
+        // Claude cursor before accepting the next turn; starting a blank query
+        // would silently discard the prior conversation.
+        guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
+        let tmp = try Self.makeTempDir(prefix: "rc2-sdk-saved-cursor")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+        let commandLog = tmp.appendingPathComponent("commands.jsonl")
+        try Self.loggingFakeBridgeSource(sessionId: "saved-claude-cursor")
+            .write(to: bridge, atomically: true, encoding: .utf8)
+        let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
+        let threadId = AgentThreadID()
+        let request = AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "sonnet",
+            cwd: tmp.path,
+            prompt: "",
+            providerThreadId: "saved-claude-cursor",
+            extraArgs: [commandLog.path]
+        )
+        let sink = EventSink()
+
+        try await adapter.recoverSession(request) { event in
+            Task { await sink.record(event) }
+        }
+        XCTAssertTrue(adapter.hasSession(threadId: threadId))
+        let recovered = try XCTUnwrap(
+            adapter.listSessions().first { $0.threadId == threadId }
+        )
+        XCTAssertEqual(recovered.providerThreadId, "saved-claude-cursor")
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "sonnet",
+            cwd: tmp.path,
+            prompt: "continue saved conversation",
+            providerThreadId: "saved-claude-cursor",
+            extraArgs: [commandLog.path]
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        try await waitForFinish(in: sink, expected: "DONE_1")
+        defer { try? adapter.stopSession(threadId: threadId) }
+
+        let configures = try Self.loggedCommands(at: commandLog, ofType: "rc_configure")
+        XCTAssertEqual(configures.count, 1,
+                       "recovery and the following turn must reuse one configured bridge")
+        XCTAssertEqual(configures.first?["provider_thread_id"] as? String, "saved-claude-cursor",
+                       "the recovered bridge must receive the persisted Claude cursor used as the SDK resume option")
     }
 
     func test_realBridgeHandshakePublishesProtocolAndLoadedSDKVersion() throws {
@@ -1344,6 +1436,21 @@ private actor EventSink {
     private var events: [AgentRunEvent] = []
     func record(_ event: AgentRunEvent) { events.append(event) }
     func snapshot() -> [AgentRunEvent] { events }
+}
+
+private final class ClaudeCausalIdleProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var statuses: [AgentRunStatus?] = []
+
+    func observeTerminalCallback(sessionStatus: AgentRunStatus?) {
+        lock.withLock {
+            statuses.append(sessionStatus)
+        }
+    }
+
+    var observedStatuses: [AgentRunStatus?] {
+        lock.withLock { statuses }
+    }
 }
 
 private actor ClaudeForkMutationMock: ClaudeSDKSessionMutating {

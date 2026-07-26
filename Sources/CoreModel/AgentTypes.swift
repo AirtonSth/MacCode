@@ -411,6 +411,125 @@ public struct AgentRoutingConfiguration: Codable, Sendable, Equatable {
     }
 }
 
+public enum AgentRunAcceptanceError: Error, LocalizedError, Sendable {
+    case cancelled
+
+    public var errorDescription: String? {
+        "Provider start was cancelled before prompt acceptance."
+    }
+}
+
+public enum AgentRunAcceptanceOutcome: Sendable, Equatable {
+    case notAccepted
+    case accepted
+    case unknown
+}
+
+/// Completion for a provider write that already claimed its acceptance permit.
+/// Invalidation never waits on provider I/O; destructive callers may await this
+/// object asynchronously after issuing provider stop.
+public final class AgentRunAcceptanceAttempt: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isComplete = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    fileprivate init() {}
+
+    public func wait() async {
+        if lock.withLock({ isComplete }) { return }
+        await withCheckedContinuation { continuation in
+            let resumeNow = lock.withLock { () -> Bool in
+                guard !isComplete else { return true }
+                waiters.append(continuation)
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+    }
+
+    fileprivate func complete() {
+        let pending = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            guard !isComplete else { return [] }
+            isComplete = true
+            let pending = waiters
+            waiters.removeAll()
+            return pending
+        }
+        pending.forEach { $0.resume() }
+    }
+}
+
+/// Linearizes a queued dispatch's final cancellation check with the provider's
+/// actual prompt write without holding a lock across provider I/O. A claimed
+/// write linearizes before later invalidation; destructive flows then stop and
+/// await that provider instead of blocking the MainActor on a pipe write.
+public final class AgentRunAcceptancePermit: @unchecked Sendable {
+    private enum State {
+        case pending
+        case invalidated
+        case claimed(AgentRunAcceptanceAttempt)
+        case accepted
+        case unknown
+    }
+
+    private let lock = NSLock()
+    private var state: State = .pending
+
+    public init() {}
+
+    @discardableResult
+    public func invalidate() -> AgentRunAcceptanceAttempt? {
+        lock.withLock {
+            if case .pending = state {
+                state = .invalidated
+                return nil
+            }
+            if case .claimed(let attempt) = state {
+                return attempt
+            }
+            return nil
+        }
+    }
+
+    public var outcome: AgentRunAcceptanceOutcome {
+        lock.withLock {
+            switch state {
+            case .pending, .invalidated:
+                return .notAccepted
+            case .accepted:
+                return .accepted
+            case .claimed, .unknown:
+                return .unknown
+            }
+        }
+    }
+
+    public func withAcceptance<T>(
+        failureOutcome: AgentRunAcceptanceOutcome = .unknown,
+        _ body: () throws -> T
+    ) throws -> T {
+        let attempt = try lock.withLock { () throws -> AgentRunAcceptanceAttempt in
+            guard case .pending = state else {
+                throw AgentRunAcceptanceError.cancelled
+            }
+            let attempt = AgentRunAcceptanceAttempt()
+            state = .claimed(attempt)
+            return attempt
+        }
+        defer { attempt.complete() }
+        do {
+            let result = try body()
+            lock.withLock { state = .accepted }
+            return result
+        } catch {
+            lock.withLock {
+                state = failureOutcome == .notAccepted ? .invalidated : .unknown
+            }
+            throw error
+        }
+    }
+}
+
 public struct AgentRunRequest: Codable, Sendable, Equatable {
     public let runId: AgentRunID
     public let threadId: AgentThreadID
@@ -430,6 +549,9 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     public let environment: [String: String]
     public let extraArgs: [String]
     public let runAsUser: AgentRunAsUser?
+    /// Runtime-only queue dispatch gate. Intentionally excluded from Codable and
+    /// value equality; it has no meaning outside the current host process.
+    public var acceptancePermit: AgentRunAcceptancePermit?
 
     public init(
         runId: AgentRunID = AgentRunID(),
@@ -449,7 +571,8 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         providerBinary: String? = nil,
         environment: [String: String] = [:],
         extraArgs: [String] = [],
-        runAsUser: AgentRunAsUser? = nil
+        runAsUser: AgentRunAsUser? = nil,
+        acceptancePermit: AgentRunAcceptancePermit? = nil
     ) {
         self.runId = runId
         self.threadId = threadId
@@ -469,6 +592,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         self.environment = environment
         self.extraArgs = extraArgs
         self.runAsUser = runAsUser
+        self.acceptancePermit = acceptancePermit
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -495,6 +619,28 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         environment = try c.decodeIfPresent([String: String].self, forKey: .environment) ?? [:]
         extraArgs = try c.decodeIfPresent([String].self, forKey: .extraArgs) ?? []
         runAsUser = try c.decodeIfPresent(AgentRunAsUser.self, forKey: .runAsUser)
+        acceptancePermit = nil
+    }
+
+    public static func == (lhs: AgentRunRequest, rhs: AgentRunRequest) -> Bool {
+        lhs.runId == rhs.runId
+            && lhs.threadId == rhs.threadId
+            && lhs.provider == rhs.provider
+            && lhs.providerInstanceId == rhs.providerInstanceId
+            && lhs.model == rhs.model
+            && lhs.cwd == rhs.cwd
+            && lhs.prompt == rhs.prompt
+            && lhs.userMessageContent == rhs.userMessageContent
+            && lhs.attachments == rhs.attachments
+            && lhs.providerThreadId == rhs.providerThreadId
+            && lhs.permissionMode == rhs.permissionMode
+            && lhs.reasoningEffort == rhs.reasoningEffort
+            && lhs.serviceTier == rhs.serviceTier
+            && lhs.interactionMode == rhs.interactionMode
+            && lhs.providerBinary == rhs.providerBinary
+            && lhs.environment == rhs.environment
+            && lhs.extraArgs == rhs.extraArgs
+            && lhs.runAsUser == rhs.runAsUser
     }
 
     public var providerPrompt: String {
@@ -1452,6 +1598,12 @@ public struct AgentThreadDraft: Codable, Sendable, Equatable {
     }
 }
 
+public enum AgentQueuedMessageDurableState: String, Codable, Sendable, Equatable {
+    case queued
+    case prepared
+    case dispatched
+}
+
 public struct AgentQueuedMessage: Codable, Sendable, Equatable, Identifiable {
     public let id: AgentQueuedMessageID
     public let threadId: AgentThreadID
@@ -1462,6 +1614,9 @@ public struct AgentQueuedMessage: Codable, Sendable, Equatable, Identifiable {
     public let createdAt: Date
     public var updatedAt: Date
     public var routingSnapshot: AgentQueuedMessageRoutingSnapshot?
+    /// Persisted dispatch state when supplied by the host repository. Optional
+    /// keeps older socket payloads decodable; locally-created rows start queued.
+    public var durableState: AgentQueuedMessageDurableState?
 
     public init(
         id: AgentQueuedMessageID = AgentQueuedMessageID(),
@@ -1472,7 +1627,8 @@ public struct AgentQueuedMessage: Codable, Sendable, Equatable, Identifiable {
         position: Int = 0,
         createdAt: Date = Date(),
         updatedAt: Date = Date(),
-        routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil
+        routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil,
+        durableState: AgentQueuedMessageDurableState? = .queued
     ) {
         self.id = id
         self.threadId = threadId
@@ -1483,6 +1639,7 @@ public struct AgentQueuedMessage: Codable, Sendable, Equatable, Identifiable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.routingSnapshot = routingSnapshot
+        self.durableState = durableState
     }
 }
 

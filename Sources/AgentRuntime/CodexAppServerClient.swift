@@ -297,9 +297,10 @@ public final class CodexAppServerClient: @unchecked Sendable {
     }
 
     public func startTurn(providerThreadId: String, for request: AgentRunRequest) async throws -> JSONObject {
-        try await requestJSONObject(
+        try await self.request(
             method: "turn/start",
-            params: Self.turnStartParams(providerThreadId: providerThreadId, for: request)
+            params: Self.turnStartParams(providerThreadId: providerThreadId, for: request),
+            acceptancePermit: request.acceptancePermit
         )
     }
 
@@ -469,7 +470,11 @@ public final class CodexAppServerClient: @unchecked Sendable {
         }
     }
 
-    private func request<T>(method: String, params: Any?) async throws -> T {
+    private func request<T>(
+        method: String,
+        params: Any?,
+        acceptancePermit: AgentRunAcceptancePermit? = nil
+    ) async throws -> T {
         let id = reserveId()
         return try await withCheckedThrowingContinuation { continuation in
             lock.lock()
@@ -490,7 +495,11 @@ public final class CodexAppServerClient: @unchecked Sendable {
             var payload: JSONObject = ["id": id, "method": method]
             if let params { payload["params"] = params }
             do {
-                try write(payload)
+                if let acceptancePermit {
+                    try acceptancePermit.withAcceptance { try write(payload) }
+                } else {
+                    try write(payload)
+                }
             } catch {
                 completePending(id: id, result: .failure(error))
             }

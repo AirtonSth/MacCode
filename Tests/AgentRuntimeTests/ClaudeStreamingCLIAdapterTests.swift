@@ -3,6 +3,114 @@ import CoreModel
 @testable import AgentRuntime
 
 final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
+    func test_agentSDKBridgeInvalidatedAcceptancePermitBlocksTurnBeforeWireWrite() async throws {
+        guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-sdk-acceptance-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+        let commandLog = tmp.appendingPathComponent("commands.jsonl")
+        let acceptanceMarker = tmp.appendingPathComponent("prompt-accepted")
+        try """
+        import fs from 'node:fs';
+        import readline from 'node:readline';
+        const commandLog = process.argv[2];
+        const acceptanceMarker = process.argv[3];
+        const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+        function write(obj) { process.stdout.write(JSON.stringify(obj) + '\\n'); }
+        for await (const line of rl) {
+          if (!line.trim()) continue;
+          const command = JSON.parse(line);
+          fs.appendFileSync(commandLog, JSON.stringify(command) + '\\n');
+          if (command.type === 'rc_configure') {
+            write({ type: 'system', subtype: 'init', session_id: 'sdk-acceptance-session' });
+          } else if (command.type === 'rc_turn') {
+            fs.writeFileSync(acceptanceMarker, command.prompt);
+          } else if (command.type === 'rc_close') {
+            process.exit(0);
+          }
+        }
+        """.write(to: bridge, atomically: true, encoding: .utf8)
+
+        let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
+        let permit = AgentRunAcceptancePermit()
+        permit.invalidate()
+        let events = LockedAgentRunEventSink()
+
+        do {
+            _ = try await adapter.sendTurn(AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .claude,
+                model: "claude-haiku-4-5-20251001",
+                cwd: tmp.path,
+                prompt: "must not cross the SDK bridge",
+                providerBinary: "/usr/bin/true",
+                extraArgs: [commandLog.path, acceptanceMarker.path],
+                acceptancePermit: permit
+            )) { event in
+                events.record(event)
+            }
+            XCTFail("suppression must win before the Claude SDK rc_turn write")
+        } catch is AgentRunAcceptanceError {}
+
+        let commands = try String(contentsOf: commandLog, encoding: .utf8)
+        XCTAssertTrue(commands.contains(#""type":"rc_configure""#),
+                      "the fake SDK bridge must complete its deterministic initialization handshake")
+        XCTAssertFalse(commands.contains(#""type":"rc_turn""#),
+                       "a revoked permit must block the SDK writeTurn closure itself")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: acceptanceMarker.path),
+                       "the fake SDK bridge must never accept the prompt")
+        XCTAssertTrue(events.snapshot().isEmpty,
+                      "a rejected SDK turn must emit no running or terminal lifecycle")
+        adapter.stopAll()
+    }
+
+    func test_invalidatedAcceptancePermitBlocksClaudePromptBeforeWireWrite() async throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-acceptance-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let script = tmp.appendingPathComponent("fake-claude")
+        let marker = tmp.appendingPathComponent("prompt-written")
+        try """
+        #!/usr/bin/env python3
+        import json, pathlib, sys
+        marker = pathlib.Path("\(marker.path)")
+        print(json.dumps({"type":"system","subtype":"init","session_id":"acceptance-session"}), flush=True)
+        for line in sys.stdin:
+            if line.strip():
+                marker.write_text(line)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let adapter = ClaudeStreamingCLIAdapter(binaryNameOverride: script.path)
+        let permit = AgentRunAcceptancePermit()
+        permit.invalidate()
+        let events = EventSink()
+
+        do {
+            _ = try await adapter.sendTurn(AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .claude,
+                model: "claude-haiku-4-5-20251001",
+                cwd: tmp.path,
+                prompt: "must not cross stdin",
+                acceptancePermit: permit
+            )) { event in
+                Task { await events.record(event) }
+            }
+            XCTFail("suppression must win before the Claude stdin write")
+        } catch is AgentRunAcceptanceError {}
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        let recorded = await events.snapshot()
+        XCTAssertFalse(recorded.contains {
+            if case .status(.running) = $0 { return true }
+            return false
+        })
+        adapter.stopAll()
+    }
+
     func test_adapterSendsMultipleTurnsThroughOneStreamingProcess() async throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-streaming-adapter-\(UUID().uuidString)", isDirectory: true)
@@ -2329,6 +2437,19 @@ private actor EventSink {
     private var events: [AgentRunEvent] = []
     func record(_ event: AgentRunEvent) { events.append(event) }
     func snapshot() -> [AgentRunEvent] { events }
+}
+
+private final class LockedAgentRunEventSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [AgentRunEvent] = []
+
+    func record(_ event: AgentRunEvent) {
+        lock.withLock { events.append(event) }
+    }
+
+    func snapshot() -> [AgentRunEvent] {
+        lock.withLock { events }
+    }
 }
 
 /// Thread-safe accumulator for draining a child process's stdout off the main

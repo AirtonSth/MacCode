@@ -85,6 +85,51 @@ final class AgentQueuedMessageLeaseTests: XCTestCase {
         XCTAssertEqual(try repo.update(id: claimed.id, text: "editable again", attachments: [])?.text, "editable again")
     }
 
+    func test_promoteUnleasedMessageAheadOfActiveLeasePreservesLeaseAndNextIntent() throws {
+        // WHY: a second Force may arrive while the first intent owns the
+        // provider-start lease. It must choose the next intent without mutating
+        // or replaying the in-flight owner.
+        let tmp = NSTemporaryDirectory() + "rc2-queue-force-next-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let repo = AgentQueuedMessageRepository(db: db)
+        let thread = AgentThread(title: "queue", provider: .codex, model: "gpt")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let first = try repo.enqueue(
+            threadId: thread.id,
+            text: "in-flight owner",
+            attachments: [],
+            interactionMode: .default
+        )
+        let second = try repo.enqueue(
+            threadId: thread.id,
+            text: "forced next",
+            attachments: [],
+            interactionMode: .default
+        )
+        let lease = try XCTUnwrap(repo.claim(id: first.id, leaseId: "provider-start"))
+        let runId = AgentRunID(first.id.value)
+        XCTAssertTrue(try repo.prepareDispatch(lease, runId: runId))
+
+        XCTAssertNil(
+            try repo.promoteToFront(id: second.id),
+            "promotion must remain deferred while the durable owner is ambiguous"
+        )
+        XCTAssertEqual(try repo.first(threadId: thread.id)?.id, first.id,
+                       "a crash in this window must still recover the prepared owner first")
+        XCTAssertNil(
+            try repo.claimFirst(threadId: thread.id, leaseId: "must-wait"),
+            "the active lease remains the provider-side owner until it settles"
+        )
+        XCTAssertTrue(try repo.releasePrepared(lease, runId: runId, promoting: second.id))
+        XCTAssertEqual(
+            try repo.claimFirst(threadId: thread.id, leaseId: "next")?.message.id,
+            second.id,
+            "after the cancelled owner releases, the explicitly forced intent must run next"
+        )
+        XCTAssertNotNil(try repo.get(id: first.id),
+                        "promoting the next intent must not discard the prior durable intent")
+    }
+
     func test_staleLeaseCannotReleaseOrAcknowledgeReplacementLease() throws {
         let tmp = NSTemporaryDirectory() + "rc2-queue-lease-owner-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()

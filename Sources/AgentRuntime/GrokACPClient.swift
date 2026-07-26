@@ -382,6 +382,7 @@ public final class GrokACPClient: @unchecked Sendable {
     private let stdoutPipe = Pipe()
     private let stderrPipe = Pipe()
     private let parseQueue = DispatchQueue(label: "remotecode.grok-acp.parse")
+    private let parseQueueKey = DispatchSpecificKey<UInt8>()
     private let writeQueue = DispatchQueue(label: "remotecode.grok-acp.write")
     private let lock = NSLock()
     private let lineBuffer = LineBuffer()
@@ -411,6 +412,7 @@ public final class GrokACPClient: @unchecked Sendable {
         self.notificationHandler = notificationHandler
         self.serverRequestHandler = serverRequestHandler
         self.tokenSaverCensusAllowed = tokenSaverCensusAllowed
+        parseQueue.setSpecific(key: parseQueueKey, value: 1)
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = ["agent", "stdio"]
         process.currentDirectoryURL = URL(fileURLWithPath: cwd)
@@ -492,11 +494,22 @@ public final class GrokACPClient: @unchecked Sendable {
         _ = try await requestJSONObject(method: "session/set_mode", params: ["sessionId": sessionId, "modeId": modeId], timeout: 15)
     }
 
-    func prompt(sessionId: String, request: AgentRunRequest, capabilities: GrokACPInitializeResult) async throws -> JSONObject {
+    func prompt(
+        sessionId: String,
+        request: AgentRunRequest,
+        capabilities: GrokACPInitializeResult,
+        writePermit: AgentRunAcceptancePermit,
+        beforeWrite: @escaping @Sendable () -> Void,
+        onAccepted: @escaping @Sendable () throws -> Void
+    ) async throws -> JSONObject {
         try await requestJSONObject(
             method: "session/prompt",
             params: ["sessionId": sessionId, "prompt": try Self.promptBlocks(for: request, capabilities: capabilities)],
-            timeout: nil
+            timeout: nil,
+            acceptancePermit: request.acceptancePermit,
+            writePermit: writePermit,
+            beforeWrite: beforeWrite,
+            onAccepted: onAccepted
         )
     }
 
@@ -587,13 +600,37 @@ public final class GrokACPClient: @unchecked Sendable {
         return blocks
     }
 
-    private func requestJSONObject(method: String, params: Any?, timeout: TimeInterval?) async throws -> JSONObject {
-        let value: Any? = try await request(method: method, params: params, timeout: timeout)
+    private func requestJSONObject(
+        method: String,
+        params: Any?,
+        timeout: TimeInterval?,
+        acceptancePermit: AgentRunAcceptancePermit? = nil,
+        writePermit: AgentRunAcceptancePermit? = nil,
+        beforeWrite: (@Sendable () -> Void)? = nil,
+        onAccepted: (@Sendable () throws -> Void)? = nil
+    ) async throws -> JSONObject {
+        let value: Any? = try await request(
+            method: method,
+            params: params,
+            timeout: timeout,
+            acceptancePermit: acceptancePermit,
+            writePermit: writePermit,
+            beforeWrite: beforeWrite,
+            onAccepted: onAccepted
+        )
         guard let object = value as? JSONObject else { throw GrokACPError.responseTypeMismatch(method) }
         return object
     }
 
-    private func request(method: String, params: Any?, timeout: TimeInterval?) async throws -> Any? {
+    private func request(
+        method: String,
+        params: Any?,
+        timeout: TimeInterval?,
+        acceptancePermit: AgentRunAcceptancePermit? = nil,
+        writePermit: AgentRunAcceptancePermit? = nil,
+        beforeWrite: (@Sendable () -> Void)? = nil,
+        onAccepted: (@Sendable () throws -> Void)? = nil
+    ) async throws -> Any? {
         let id = reserveId()
         return try await withCheckedThrowingContinuation { continuation in
             lock.lock()
@@ -601,7 +638,35 @@ public final class GrokACPClient: @unchecked Sendable {
             lock.unlock()
             var payload: JSONObject = ["jsonrpc": "2.0", "id": id, "method": method]
             if let params { payload["params"] = params }
-            do { try write(payload) }
+            do {
+                if let onAccepted {
+                    let writeAndAccept = {
+                        beforeWrite?()
+                        let queueGuardedWrite = {
+                            if let acceptancePermit {
+                                try acceptancePermit.withAcceptance(failureOutcome: .notAccepted) {
+                                    try self.write(payload)
+                                }
+                            } else {
+                                try self.write(payload)
+                            }
+                        }
+                        if let writePermit {
+                            try writePermit.withAcceptance(failureOutcome: .notAccepted, queueGuardedWrite)
+                        } else {
+                            try queueGuardedWrite()
+                        }
+                        try onAccepted()
+                    }
+                    if DispatchQueue.getSpecific(key: parseQueueKey) != nil {
+                        try writeAndAccept()
+                    } else {
+                        try parseQueue.sync(execute: writeAndAccept)
+                    }
+                } else {
+                    try write(payload)
+                }
+            }
             catch { completePending(id: id, result: .failure(error)) }
             if let timeout {
                 DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) { [weak self] in
