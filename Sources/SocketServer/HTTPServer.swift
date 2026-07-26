@@ -2145,10 +2145,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
             hostId: serverId,
             bootEpoch: bootEpoch,
             activeConnection: { [activeWebSocketConnections] connectionID, ownerFingerprint in
-                activeWebSocketConnections.watermark(
-                    for: connectionID,
-                    ownerFingerprint: ownerFingerprint
-                ) != nil
+                // One host/boot authority for HTTP and WebSocket. Live WS still
+                // pins mutations to the owned connection_id. When that socket is
+                // gone, authenticated HTTP remains usable so retries and
+                // idempotent commands do not depend on a second transport.
+                Self.hybridConnectionAuthorized(
+                    connectionID: connectionID,
+                    ownerFingerprint: ownerFingerprint,
+                    registeredOwner: {
+                        activeWebSocketConnections.ownerFingerprint(for: connectionID)
+                    },
+                    ownerHasLiveConnection: {
+                        activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
+                    }
+                )
             }
         )
         let response = await dispatcher.dispatch(request, mutationContext: mutationContext)
@@ -2206,6 +2216,28 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return rpcErrorObject(.internalError, id: wireID)
     }
 
+    /// Hybrid transport authority for mutations (and snapshot ownership checks).
+    ///
+    /// - If `connectionID` is live: only its registered owner may use it.
+    /// - If this owner has any other live WS: they must use that connection_id
+    ///   (wrong-connection stays fail-closed).
+    /// - If nothing is live for this owner and the id is unregistered: allow
+    ///   authenticated HTTP under the host/boot gate (WS-absent hybrid path).
+    nonisolated static func hybridConnectionAuthorized(
+        connectionID: String,
+        ownerFingerprint: String,
+        registeredOwner: () -> String?,
+        ownerHasLiveConnection: () -> Bool
+    ) -> Bool {
+        _ = connectionID
+        if let registered = registeredOwner() {
+            return registered == ownerFingerprint
+        }
+        // Unregistered connection_id: reject when the owner still holds a live WS.
+        if ownerHasLiveConnection() { return false }
+        return true
+    }
+
     private func encodeSyncSnapshotResponse(
         rawParams: [String: Any],
         wireID: Any,
@@ -2228,17 +2260,36 @@ public final class DirectHTTPServer: @unchecked Sendable {
         let expectedBootEpoch = Self.strictUInt64(rawParams["expectedBootEpoch"]),
         expectedBootEpoch == bootEpoch,
         let supportedStateVersion = Self.strictInt64(rawParams["supportedStateVersion"]),
-        supportedStateVersion == 3,
+        supportedStateVersion == 3 else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+
+        // Hybrid ownership: live connection_id is owner-pinned; unregistered ids
+        // are only accepted when this owner has no live WebSocket (HTTP baseline).
+        guard Self.hybridConnectionAuthorized(
+            connectionID: connectionID,
+            ownerFingerprint: ownerFingerprint,
+            registeredOwner: {
+                activeWebSocketConnections.ownerFingerprint(for: connectionID)
+            },
+            ownerHasLiveConnection: {
+                activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
+            }
+        ) else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
         let watermark = activeWebSocketConnections.watermark(
             for: connectionID,
             ownerFingerprint: ownerFingerprint
-        ),
-        watermark.beginSnapshot() else {
+        )
+        if let watermark, !watermark.beginSnapshot() {
             return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
         }
+
         let knownRevisions: ConnectionDomainRevisions?
         if rawParams.keys.contains("knownDomainRevisions") {
             guard let parsed = ConnectionDomainRevisions.parse(rawParams["knownDomainRevisions"]) else {
+                if let watermark { watermark.cancelSnapshot() }
                 return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
             }
             knownRevisions = parsed
@@ -2248,15 +2299,17 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
         var snapshotAdopted = false
         defer {
-            if !snapshotAdopted { watermark.cancelSnapshot() }
+            if let watermark, !snapshotAdopted { watermark.cancelSnapshot() }
         }
         do {
             let snapshot = try await dispatcher.readConnectionSnapshot()
-            guard activeWebSocketConnections.watermark(
-                for: connectionID,
-                ownerFingerprint: ownerFingerprint
-            ) === watermark else {
-                return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+            if let watermark {
+                guard activeWebSocketConnections.watermark(
+                    for: connectionID,
+                    ownerFingerprint: ownerFingerprint
+                ) === watermark else {
+                    return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+                }
             }
             let hostRevisions = snapshot.metadata.domainRevisions
             let includeDomains: Set<String>?
@@ -2283,18 +2336,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 stateVersion: 3,
                 state: state
             )
-            switch watermark.adoptSnapshot(sequence: snapshot.metadata.sequence) {
-            case .adopted:
+            if let watermark {
+                switch watermark.adoptSnapshot(sequence: snapshot.metadata.sequence) {
+                case .adopted:
+                    snapshotAdopted = true
+                case .gap(let expected, let received):
+                    return rpcJSONData(rpcErrorObject(JSONRPCError(
+                        code: -32010,
+                        message: "Event sequence gap detected; reconnect and request a new baseline.",
+                        data: .object([
+                            "expectedSequence": .number(Double(expected)),
+                            "receivedSequence": .number(Double(received)),
+                        ])
+                    ), id: wireID))
+                }
+            } else {
+                // HTTP-only baseline: no WS gap watermark to adopt.
                 snapshotAdopted = true
-            case .gap(let expected, let received):
-                return rpcJSONData(rpcErrorObject(JSONRPCError(
-                    code: -32010,
-                    message: "Event sequence gap detected; reconnect and request a new baseline.",
-                    data: .object([
-                        "expectedSequence": .number(Double(expected)),
-                        "receivedSequence": .number(Double(received)),
-                    ])
-                ), id: wireID))
             }
             // C-24: one JSONEncoder pass for the full RPC response (id + result).
             // Avoids the prior Data → Any → Data cycle on multi-hundred-KB snapshots.

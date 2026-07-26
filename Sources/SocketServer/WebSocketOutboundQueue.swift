@@ -784,6 +784,21 @@ final class ActiveWebSocketConnectionRegistry: @unchecked Sendable {
         return entry.watermark
     }
 
+    /// Owner fingerprint registered for `connectionID`, if any live entry exists.
+    func ownerFingerprint(for connectionID: String) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return entries[connectionID]?.ownerFingerprint
+    }
+
+    /// True when this owner currently holds at least one live WebSocket entry.
+    /// Used by the hybrid HTTP path: while a live WS exists, only that
+    /// connection_id may authorize mutations/snapshots; when none exist,
+    /// authenticated HTTP may proceed with host/boot identity alone.
+    func hasConnection(ownedBy ownerFingerprint: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return entries.values.contains { $0.ownerFingerprint == ownerFingerprint }
+    }
+
     func remove(_ connectionID: String) {
         lock.lock(); entries.removeValue(forKey: connectionID); lock.unlock()
     }
