@@ -214,20 +214,49 @@ final class HybridHTTPWebSocketContractTests: XCTestCase {
 
     func test_httpSnapshotAndEventsRecentWorkWithoutLiveWebSocket() async throws {
         // WHY: when WS is down the client must still rebaseline via HTTP snapshot
-        // and advance by HTTP replay against the same EventBus sequence authority.
+        // and advance by HTTP replay against the same EventBus sequence authority,
+        // under the same bearer auth gate used by hybrid mutations (not loopback-open).
         let router = HybridReceiptRouter()
         let port = UInt16.random(in: 33_000...44_000)
         let bootEpoch: UInt64 = 901
+        // DirectHTTPServer.auth is weak; retain for the server's lifetime.
+        let auth = HybridAuth(tokens: [ownerToken])
         let server = DirectHTTPServer(
             port: port,
-            loopbackOnly: true,
+            loopbackOnly: false,
             dispatcher: JSONRPCDispatcher(router: router),
+            auth: auth,
             serverId: hostId,
             bootEpoch: bootEpoch
         )
         try server.start()
         defer { server.stop() }
         try await Task.sleep(nanoseconds: 80_000_000)
+
+        let snapshotParams: [String: Any] = [
+            "connectionId": "http-only-session",
+            "expectedHostId": hostId,
+            "expectedBootEpoch": bootEpoch,
+            "supportedStateVersion": 3,
+        ]
+
+        let missingAuth = try await rpcHTTP(
+            port: port,
+            method: "sync.snapshot",
+            params: snapshotParams,
+            token: nil
+        )
+        XCTAssertEqual(missingAuth.status, 401,
+                       "sync.snapshot over gated HTTP must reject a missing bearer")
+
+        let wrongAuth = try await rpcHTTP(
+            port: port,
+            method: "sync.snapshot",
+            params: snapshotParams,
+            token: "wrong-token"
+        )
+        XCTAssertEqual(wrongAuth.status, 401,
+                       "sync.snapshot over gated HTTP must reject an invalid bearer")
 
         let before = EventBus.shared.currentSeq
         EventBus.shared.publish(
@@ -238,12 +267,8 @@ final class HybridHTTPWebSocketContractTests: XCTestCase {
         let snapshot = try await rpc(
             port: port,
             method: "sync.snapshot",
-            params: [
-                "connectionId": "http-only-session",
-                "expectedHostId": hostId,
-                "expectedBootEpoch": bootEpoch,
-                "supportedStateVersion": 3,
-            ]
+            params: snapshotParams,
+            token: ownerToken
         )
         XCTAssertNil(snapshot["error"], "HTTP snapshot must succeed without a live WebSocket: \(snapshot)")
         let snapResult = try XCTUnwrap(snapshot["result"] as? [String: Any])
@@ -256,7 +281,8 @@ final class HybridHTTPWebSocketContractTests: XCTestCase {
         let replay = try await rpc(
             port: port,
             method: "events.recent",
-            params: ["since_seq": before]
+            params: ["since_seq": before],
+            token: ownerToken
         )
         XCTAssertNil(replay["error"], "HTTP events.recent must work without WebSocket: \(replay)")
         let replayResult = try XCTUnwrap(replay["result"] as? [String: Any])
@@ -383,12 +409,12 @@ final class HybridHTTPWebSocketContractTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func rpc(
+    private func rpcHTTP(
         port: UInt16,
         method: String,
         params: [String: Any],
         token: String? = nil
-    ) async throws -> [String: Any] {
+    ) async throws -> (status: Int, data: Data) {
         var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/rpc")!)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -401,7 +427,18 @@ final class HybridHTTPWebSocketContractTests: XCTestCase {
             "method": method,
             "params": params,
         ])
-        let (data, _) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        return (status, data)
+    }
+
+    private func rpc(
+        port: UInt16,
+        method: String,
+        params: [String: Any],
+        token: String? = nil
+    ) async throws -> [String: Any] {
+        let (_, data) = try await rpcHTTP(port: port, method: method, params: params, token: token)
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 
