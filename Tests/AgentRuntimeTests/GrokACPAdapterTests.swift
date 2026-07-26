@@ -156,6 +156,34 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(adapter.listSessions().first?.providerThreadId, "saved-session")
     }
 
+    func test_replacingRecoveredSessionIgnoresLateOldProcessTermination() async throws {
+        // WHY: replacing a recovered Grok process stops the old transport. Its
+        // asynchronous termination callback must not evict the new session
+        // stored under the same host thread.
+        let peer = try FakeGrokACPPeer(mode: .load)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path)
+        let threadId = AgentThreadID()
+
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: "old-session"
+        )) { _ in }
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: "replacement-session"
+        )) { _ in }
+
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(peer.launchCount, 2)
+        XCTAssertTrue(adapter.hasSession(threadId: threadId))
+        XCTAssertEqual(
+            adapter.listSessions().first { $0.threadId == threadId }?.providerThreadId,
+            "replacement-session"
+        )
+        adapter.stopAll()
+    }
+
     func test_cancelThenProcessDeathRecoversContextThroughSessionLoad() async throws {
         let peer = try FakeGrokACPPeer(mode: .cancel)
         defer { peer.remove() }
@@ -192,6 +220,37 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(peer.launchCount, 2,
                        "recovery proof must use a new ACP process and the prior provider session identity")
         relaunched.stopAll()
+    }
+
+    func test_forcedCancelEvictsDeadSessionBeforeSavedIdentityRecovery() async throws {
+        // WHY: if Grok ignores session/cancel, the grace-period kill ends the
+        // process. Keeping that dead client cached makes the next turn write to
+        // a zombie transport instead of loading the durable ACP session.
+        let peer = try FakeGrokACPPeer(mode: .ignoreCancel)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path, cancellationGracePeriod: 0.05)
+        let threadId = AgentThreadID()
+        let box = GrokACPEventBox()
+        let handle = try await adapter.startSession(makeRequest(threadId: threadId)) { box.append($0) }
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        handle.cancel()
+        let cancelled = try await box.waitFinished(timeout: 3)
+        let savedProviderThreadId = try XCTUnwrap(cancelled.providerThreadId)
+        XCTAssertEqual(cancelled.status, .cancelled)
+        XCTAssertFalse(adapter.hasSession(threadId: threadId),
+                       "a process that was force-killed cannot remain a reusable live session")
+
+        let recovered = GrokACPEventBox()
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: savedProviderThreadId
+        )) { recovered.append($0) }
+
+        XCTAssertTrue(recovered.assistantText.contains("replayed"),
+                      "recovery must load the saved ACP identity into a fresh process")
+        XCTAssertEqual(peer.launchCount, 2)
+        adapter.stopAll()
     }
 
     func test_authenticatedDiscoveryUsesSessionModelsInsteadOfStaticCatalog() async throws {
@@ -529,7 +588,7 @@ private final class GrokACPEventBox: @unchecked Sendable {
 
 private final class FakeGrokACPPeer {
     enum Mode: String {
-        case permission, cancel, crash, load, discovery, plan
+        case permission, cancel, ignoreCancel, crash, load, discovery, plan
         case auth, rateLimit, network, invalidResume, invalidJSON
     }
     let root: URL
@@ -580,7 +639,7 @@ private final class FakeGrokACPPeer {
           elif printf '%s' "$line" | grep -q '"method":"session.*prompt"'; then
               id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
               if [ "$mode" = crash ]; then kill -ABRT $$; fi
-              if [ "$mode" = cancel ]; then prompt_id="$id"; continue; fi
+              if [ "$mode" = cancel ] || [ "$mode" = ignoreCancel ]; then prompt_id="$id"; continue; fi
               if [ "$mode" = auth ]; then
                 printf '{"jsonrpc":"2.0","id":%s,"error":{"code":401,"message":"Unauthorized access_token=fake-secret-value at /Users/example/.grok/config"}}\n' "$id"
                 continue
@@ -614,7 +673,8 @@ private final class FakeGrokACPPeer {
               printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}}}}\n'
               printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$prompt_id"
           elif printf '%s' "$line" | grep -q '"method":"session.*cancel"'; then
-              printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"cancelled"}}\n' "$prompt_id"
+            if [ "$mode" = ignoreCancel ]; then continue; fi
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"cancelled"}}\n' "$prompt_id"
           fi
         done
         """#

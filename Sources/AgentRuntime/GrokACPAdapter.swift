@@ -657,6 +657,9 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         let active = session.inFlight && !session.turnTerminalEmitted
         let forced = session.forcedKillByUs
         let cancelled = session.cancelRequested
+        if sessions[session.threadId] === session {
+            sessions.removeValue(forKey: session.threadId)
+        }
         lock.unlock()
         guard active else { return }
         let terminal = GrokACPTerminalClassifier.status(

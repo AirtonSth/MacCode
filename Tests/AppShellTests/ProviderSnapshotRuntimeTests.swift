@@ -1164,6 +1164,159 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         adapter.stopAll()
     }
 
+    func test_forceQueuedMessageRetriesDrainAfterDelayedProviderCancellationAcrossProviders() async throws {
+        // WHY: stopRun publishes the host-side cancellation before a native
+        // provider necessarily becomes idle. The first drain can therefore see
+        // a live adapter session; Force still owes exactly one later start.
+        for provider in AgentProvider.allCases {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+            try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            defer { closeAndUnregisterAllSurfaces() }
+
+            let ctx = try AppContext(
+                channel: .debug,
+                appSupportOverride: root.appendingPathComponent("support").path
+            )
+            let router = AppCommandRouter(context: ctx)
+            ctx.router = router
+            let runner = DelayedCancelQueueRunner(provider: provider)
+            ctx.coordinator.replaceProvider(provider, runner: runner)
+            let workspace = try router.createWorkspace(
+                name: "delayed-force-\(provider.rawValue)",
+                cwd: workspaceDir.path
+            )
+            let thread = try router.createAgentThread(
+                workspace: workspace.id,
+                title: "delayed force \(provider.rawValue)",
+                provider: provider,
+                model: "test-model",
+                permissionMode: .supervised,
+                reasoningEffort: .medium
+            )
+            _ = try await router.sendAgentMessage(
+                thread: thread.id,
+                text: "existing turn",
+                provider: nil,
+                model: nil,
+                permissionMode: nil,
+                reasoningEffort: nil
+            )
+            _ = try ctx.queuedMessageRepo.enqueue(
+                threadId: thread.id,
+                text: "later",
+                attachments: [],
+                interactionMode: .default
+            )
+            let forced = try ctx.queuedMessageRepo.enqueue(
+                threadId: thread.id,
+                text: "force exactly once",
+                attachments: [],
+                interactionMode: .default
+            )
+
+            let result = try await router.forceAgentQueuedMessageNow(id: forced.id)
+            XCTAssertEqual(result.status, .queued)
+
+            let deadline = Date().addingTimeInterval(3)
+            while runner.startCount < 2, Date() < deadline {
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+
+            try await Task.sleep(nanoseconds: 200_000_000)
+            XCTAssertEqual(runner.startCount, 2,
+                           "\(provider.rawValue) Force must retry after delayed provider idle and start once")
+            XCTAssertEqual(
+                try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.text),
+                ["later"],
+                "\(provider.rawValue) must acknowledge only the forced queue row"
+            )
+            XCTAssertEqual(
+                try ctx.messageRepo.list(threadId: thread.id)
+                    .filter { $0.role == .user && $0.content == "force exactly once" }.count,
+                1,
+                "\(provider.rawValue) delayed cancellation must not duplicate the forced user message"
+            )
+            try await Task.sleep(nanoseconds: 150_000_000)
+            XCTAssertEqual(runner.startCount, 2,
+                           "\(provider.rawValue) must remain at exactly one forced restart after settling")
+            XCTAssertEqual(try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.text), ["later"])
+            XCTAssertEqual(
+                try ctx.messageRepo.list(threadId: thread.id)
+                    .filter { $0.role == .user && $0.content == "force exactly once" }.count,
+                1
+            )
+            ctx.coordinator.stopRun(threadId: thread.id)
+        }
+    }
+
+    func test_forceQueueTimesOutOnceWhenProviderNeverBecomesIdle() async throws {
+        // WHY: a provider that ignores cancellation must not trigger repeated
+        // drain attempts or silently consume the promoted queue row.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        ctx.queueDrainProviderIdleTimeout = 0.05
+        ctx.queueDrainProviderIdlePollInterval = 0.005
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: nil)
+        ctx.coordinator.replaceProvider(.claude, runner: runner)
+        let workspace = try router.createWorkspace(name: "never-idle", cwd: workspaceDir.path)
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "never idle",
+            provider: .claude,
+            model: "test-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        _ = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "existing turn",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        let forced = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "preserve after timeout",
+            attachments: [],
+            interactionMode: .default
+        )
+        let failures = QueueFailureCounter(threadId: thread.id)
+        let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { failures.record($0) }
+        defer { EventBus.shared.unsubscribe(subscription) }
+
+        _ = try await router.forceAgentQueuedMessageNow(id: forced.id)
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertEqual(failures.count, 1)
+        XCTAssertEqual(runner.startCount, 1)
+        XCTAssertEqual(try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.text), ["preserve after timeout"])
+        XCTAssertEqual(
+            try ctx.messageRepo.list(threadId: thread.id)
+                .filter { $0.role == .user && $0.content == "preserve after timeout" }.count,
+            0
+        )
+
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(failures.count, 1)
+        XCTAssertEqual(runner.startCount, 1)
+        XCTAssertEqual(try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.text), ["preserve after timeout"])
+    }
+
     func test_continueRejectsLiveAdapterSessionWithoutQueueingEmptyPrompt() async throws {
         // WHY: Continue is a recovery action, not a message. If the provider is
         // still live it must fail as already active, never enqueue an empty turn.
@@ -1232,7 +1385,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             ("timeout", CodexAppServerError.requestTimedOut(method: "turn/start", timeout: 30))
         ]
 
-        for startError in startErrors {
+        for provider in AgentProvider.allCases {
+          for startError in startErrors {
             let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
             let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
             try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
@@ -1242,12 +1396,12 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             let router = AppCommandRouter(context: ctx)
             ctx.router = router
             let workspace = try router.createWorkspace(name: "queue-force-\(startError.label)", cwd: workspaceDir.path)
-            var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: .codex, model: "gpt-5.5", permissionMode: .supervised, reasoningEffort: .medium)
+            var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: provider, model: "test-model", permissionMode: .supervised, reasoningEffort: .medium)
             thread.status = .failed
             try ctx.threadRepo.upsert(thread)
             let queued = try ctx.queuedMessageRepo.enqueue(threadId: thread.id, text: "one recovery surface", attachments: [], interactionMode: .default)
-            let failing = ThrowingStartRunner(provider: .codex, error: startError.error)
-            ctx.coordinator.replaceProvider(.codex, runner: failing)
+            let failing = ThrowingStartRunner(provider: provider, error: startError.error)
+            ctx.coordinator.replaceProvider(provider, runner: failing)
 
             do {
                 _ = try await router.forceAgentQueuedMessageNow(id: queued.id)
@@ -1260,6 +1414,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             XCTAssertEqual(try ctx.messageRepo.list(threadId: thread.id).filter { $0.role == .user }.count, 1)
             XCTAssertEqual(try ctx.runRepo.get(id: AgentRunID(queued.id.value))?.status, .failed)
             XCTAssertEqual(failing.startCount, 1)
+          }
         }
     }
 
@@ -1416,6 +1571,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
     func test_forceQueuedMessagePreservesAmbiguousPreparedEvidenceBeforeBusyThread() async throws {
         // WHY: Force must not let a stale busy projection turn any ambiguous
         // start diagnostic into an acknowledgement or a replay.
+      for provider in AgentProvider.allCases {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
         try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
@@ -1424,10 +1580,10 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
-        let runner = RequestCaptureRunner(provider: .codex)
-        ctx.coordinator.replaceProvider(.codex, runner: runner)
+        let runner = RequestCaptureRunner(provider: provider)
+        ctx.coordinator.replaceProvider(provider, runner: runner)
         let workspace = try router.createWorkspace(name: "queue-force-busy-prepared", cwd: workspaceDir.path)
-        var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: .codex, model: "gpt-5.5", permissionMode: .supervised, reasoningEffort: .medium)
+        var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: provider, model: "test-model", permissionMode: .supervised, reasoningEffort: .medium)
         thread.status = .running
         try ctx.threadRepo.upsert(thread)
         let ambiguousEvidence: [(kind: String, status: AgentRunStatus)] = [
@@ -1449,13 +1605,13 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             try ctx.runRepo.upsert(AgentRun(
                 id: runId,
                 threadId: thread.id,
-                provider: .codex,
-                model: "gpt-5.5",
+                provider: provider,
+                model: "test-model",
                 status: evidence.status
             ))
             try ctx.providerSessionRuntimeRepo.upsert(ProviderSessionRuntime(
                 threadId: thread.id,
-                provider: .codex,
+                provider: provider,
                 status: evidence.status,
                 lastRunId: runId,
                 lastEventKind: evidence.kind
@@ -1473,9 +1629,11 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         }
         XCTAssertNil(runner.lastRequest,
                      "Force must not stop/replay a prepared message before its prior start is resolved")
+      }
     }
 
     func test_drainQueue_relaunchAcknowledgesPreparedHeadWithExistingRunWithoutProviderReplay() async throws {
+      for provider in AgentProvider.allCases {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
         try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
@@ -1484,23 +1642,23 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
-        let runner = RequestCaptureRunner(provider: .codex)
-        ctx.coordinator.replaceProvider(.codex, runner: runner)
+        let runner = RequestCaptureRunner(provider: provider)
+        ctx.coordinator.replaceProvider(provider, runner: runner)
         let workspace = try router.createWorkspace(name: "queue-existing-run", cwd: workspaceDir.path)
-        var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: .codex, model: "gpt-5.5", permissionMode: .supervised, reasoningEffort: .medium)
+        var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: provider, model: "test-model", permissionMode: .supervised, reasoningEffort: .medium)
         thread.status = .failed
         try ctx.threadRepo.upsert(thread)
         let queued = try ctx.queuedMessageRepo.enqueue(threadId: thread.id, text: "already represented by run", attachments: [], interactionMode: .default)
         let lease = try XCTUnwrap(ctx.queuedMessageRepo.claim(id: queued.id, leaseId: "dead-process"))
         let runId = AgentRunID(queued.id.value)
         XCTAssertTrue(try ctx.queuedMessageRepo.prepareDispatch(lease, runId: runId))
-        var failedRun = AgentRun(id: runId, threadId: thread.id, provider: .codex, model: "gpt-5.5", status: .failed)
+        var failedRun = AgentRun(id: runId, threadId: thread.id, provider: provider, model: "test-model", status: .failed)
         failedRun.finishedAt = Date()
         failedRun.errorMessage = "provider start outcome retained"
         try ctx.runRepo.upsert(failedRun)
         try ctx.providerSessionRuntimeRepo.upsert(ProviderSessionRuntime(
             threadId: thread.id,
-            provider: .codex,
+            provider: provider,
             status: .failed,
             lastRunId: runId,
             lastEventKind: "run.started"
@@ -1514,12 +1672,14 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                      "the redundant prepared queue intent must be acknowledged instead of poisoning the queue head")
         XCTAssertEqual(try ctx.runRepo.get(id: runId)?.status, .failed,
                        "queue acknowledgement must preserve the visible run recovery record")
+      }
     }
 
     func test_drainQueueDoesNotUseLaterRunSessionEvidenceForPreparedEarlierRun() async throws {
         // WHY: provider-session diagnostics are thread-scoped. Without the
         // matching run id, a later turn's run.started can silently delete an
         // earlier prompt that crashed before provider acceptance.
+      for provider in AgentProvider.allCases {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
         try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
@@ -1529,7 +1689,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
         let workspace = try router.createWorkspace(name: "queue-run-evidence", cwd: workspaceDir.path)
-        var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: .codex, model: "gpt-5.5", permissionMode: .supervised, reasoningEffort: .medium)
+        var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: provider, model: "test-model", permissionMode: .supervised, reasoningEffort: .medium)
         thread.status = .interrupted
         try ctx.threadRepo.upsert(thread)
         let queued = try ctx.queuedMessageRepo.enqueue(threadId: thread.id, text: "run A must remain", attachments: [], interactionMode: .default)
@@ -1537,13 +1697,13 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         let runA = AgentRunID(queued.id.value)
         let runB = AgentRunID()
         XCTAssertTrue(try ctx.queuedMessageRepo.prepareDispatch(lease, runId: runA))
-        try ctx.runRepo.upsert(AgentRun(id: runA, threadId: thread.id, provider: .codex, model: "gpt-5.5", status: .pending))
-        var completedB = AgentRun(id: runB, threadId: thread.id, provider: .codex, model: "gpt-5.5", status: .completed)
+        try ctx.runRepo.upsert(AgentRun(id: runA, threadId: thread.id, provider: provider, model: "test-model", status: .pending))
+        var completedB = AgentRun(id: runB, threadId: thread.id, provider: provider, model: "test-model", status: .completed)
         completedB.finishedAt = Date()
         try ctx.runRepo.upsert(completedB)
         try ctx.providerSessionRuntimeRepo.upsert(ProviderSessionRuntime(
             threadId: thread.id,
-            provider: .codex,
+            provider: provider,
             status: .completed,
             lastRunId: runB,
             lastEventKind: "run.started"
@@ -1557,6 +1717,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         }
         XCTAssertEqual(try ctx.queuedMessageRepo.get(id: queued.id)?.text, "run A must remain")
         XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .prepared)
+      }
     }
 
     private func makeLiveAdapterRouterFixture(
@@ -1662,5 +1823,59 @@ private final class BlockingCancelRunner: AgentProviderRunner, @unchecked Sendab
             onEvent(.status(.cancelled))
             onEvent(.finished(.cancelled, finalMessage: nil, providerThreadId: nil))
         }
+    }
+}
+
+private final class DelayedCancelQueueRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider
+    private let lock = NSLock()
+    private var starts = 0
+    private let cancellationDelay: TimeInterval?
+
+    init(provider: AgentProvider, cancellationDelay: TimeInterval? = 0.15) {
+        self.provider = provider
+        self.cancellationDelay = cancellationDelay
+    }
+
+    var startCount: Int {
+        lock.withLock { starts }
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        let ordinal = lock.withLock { () -> Int in
+            starts += 1
+            return starts
+        }
+        onEvent(.status(.running))
+        return AgentRunHandle(runId: request.runId, process: nil) {
+            guard ordinal == 1, let cancellationDelay = self.cancellationDelay else { return }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + cancellationDelay) {
+                onEvent(.status(.cancelled))
+                onEvent(.finished(.cancelled, finalMessage: nil, providerThreadId: "delayed-session"))
+            }
+        }
+    }
+}
+
+private final class QueueFailureCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private let threadId: String
+    private var value = 0
+
+    init(threadId: AgentThreadID) {
+        self.threadId = threadId.value.uuidString
+    }
+
+    var count: Int { lock.withLock { value } }
+
+    func record(_ event: EventBus.Event) {
+        guard event.kind == "agent.message.queue.failed",
+              event.payload.objectValue?["thread_id"]?.stringValue == threadId else { return }
+        lock.withLock { value += 1 }
     }
 }

@@ -183,6 +183,8 @@ public final class AppContext {
     /// Test seam: when set, used instead of resolving a client from the live
     /// sidecar status. Production code never sets this.
     var distillClientOverrideForTesting: DistillServiceClient?
+    var queueDrainProviderIdleTimeout: TimeInterval = 10
+    var queueDrainProviderIdlePollInterval: TimeInterval = 0.05
     /// Test seam: sandbox the SessionLearn target instruction files so tests never write
     /// into the developer's real ~/.claude/CLAUDE.md or ~/.codex/AGENTS.md.
     var sessionLearnInstructionFilesOverrideForTesting: [URL]?
@@ -747,12 +749,19 @@ public final class AppContext {
             if let run = try? self.runRepo.get(id: rid), run.provider == .grok {
                 self.refreshGrokTokenSaverAccountUsage(reason: "run_finished")
             }
-            // Drain the next queued message after ANY terminal status. A run that
-            // ended .failed previously stranded queued messages (no run to pick
-            // them up); drainNextQueuedAgentMessage re-checks the thread is not
-            // running/pending before sending, so an unconditional drain is safe
-            // and onRunFinished only fires on terminal statuses.
+            // Drain the next queued message after ANY terminal status. stopRun
+            // can publish its host terminal before a provider-native interrupt
+            // makes the adapter idle. Wait through that bounded cancellation
+            // window; otherwise Force gets one premature drain and the promoted
+            // message remains stranded with no later lifecycle callback.
             Task { @MainActor in
+                guard await self.waitForProviderIdleBeforeQueueDrain(threadId: tid) else {
+                    EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
+                        "thread_id": .string(tid.value.uuidString),
+                        "message": .string("Provider remained active after the queue-drain cancellation window.")
+                    ]))
+                    return
+                }
                 do {
                     try await self.router?.drainNextQueuedAgentMessage(thread: tid)
                 } catch {
@@ -860,6 +869,17 @@ public final class AppContext {
         if let snap = try snapshotRepo.latest() {
             self.state = snap.layout
         }
+    }
+
+    private func waitForProviderIdleBeforeQueueDrain(threadId: AgentThreadID) async -> Bool {
+        let deadline = Date().addingTimeInterval(queueDrainProviderIdleTimeout)
+        while coordinator.hasProviderSession(threadId: threadId) {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { return false }
+            let interval = min(queueDrainProviderIdlePollInterval, remaining)
+            try? await Task.sleep(nanoseconds: UInt64(max(0.001, interval) * 1_000_000_000))
+        }
+        return true
     }
 
     /// Managed `/distill` state is only useful while Token Saver is on, so the skill

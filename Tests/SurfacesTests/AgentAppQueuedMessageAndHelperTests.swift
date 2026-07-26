@@ -37,15 +37,18 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
         let runRepo = AgentRunRepository(db: db)
         let providerSessionRepo = ProviderSessionRuntimeRepository(db: db)
         let queuedRepo = withQueue ? AgentQueuedMessageRepository(db: db) : nil
+        var providers: [AgentProvider: AgentProviderRunner] = [
+            .codex: FakeProviderRunner(provider: .codex),
+            .claude: FakeProviderRunner(provider: .claude),
+            .grok: FakeProviderRunner(provider: .grok)
+        ]
+        if let provider { providers[provider.provider] = provider }
         let coord = AgentRunCoordinator(
             runRepo: runRepo,
             messageRepo: messageRepo,
             threadRepo: threadRepo,
             providerSessionRepo: providerSessionRepo,
-            providers: [
-                .codex: provider ?? FakeProviderRunner(provider: .codex),
-                .claude: FakeProviderRunner(provider: .claude)
-            ]
+            providers: providers
         )
         let vm = AgentAppViewModel(
             workspaceID: WorkspaceID(),
@@ -56,6 +59,7 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
             queuedMessageRepo: queuedRepo,
             providerSessionRepo: providerSessionRepo
         )
+        vm.provider = provider?.provider ?? .codex
         vm.providerSnapshots = [operationalSnapshot(for: provider?.provider ?? .codex)]
         return (vm, queuedRepo)
     }
@@ -276,7 +280,9 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
     }
 
     func test_forceQueuedMessageNow_whenStartFailsPreservesPreparedIntentWithoutReplay() async throws {
-        let runner = QueueStartProbeRunner(failuresBeforeSuccess: 1)
+      for provider in AgentProvider.allCases {
+       for startError in [QueueStartProbeError.rejected, .timedOut] {
+        let runner = QueueStartProbeRunner(provider: provider, failuresBeforeSuccess: 1, startError: startError)
         let (vm, repo) = try makeVM(withQueue: true, provider: runner)
         let queuedRepo = try XCTUnwrap(repo)
         vm.createThread(title: "t")
@@ -298,6 +304,8 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
                        "the failed attempt must retain exactly one durable user row for Retry")
         XCTAssertEqual(try vm.coordinator.runStatus(AgentRunID(queued.id.value)), .failed)
         XCTAssertEqual(runner.startedRunIDs, [AgentRunID(queued.id.value)])
+       }
+      }
     }
 
     func test_forceQueuedMessageNow_ackFailureAfterAcceptedStartRecoversAckOnlyWithoutProviderReplay() async throws {
@@ -336,7 +344,8 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
     }
 
     func test_forceQueuedMessageNow_acceptedToMarkCrashWindowAcknowledgesRunEvidenceWithoutReplay() async throws {
-        let runner = QueueStartProbeRunner(finishSynchronously: true)
+      for provider in AgentProvider.allCases {
+        let runner = QueueStartProbeRunner(provider: provider, finishSynchronously: true)
         let (vm, repo) = try makeVM(withQueue: true, provider: runner)
         let queuedRepo = try XCTUnwrap(repo)
         vm.createThread(title: "t")
@@ -364,6 +373,7 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
         XCTAssertNil(try queuedRepo.get(id: queued.id),
                      "the durable run owns subsequent Retry/Continue and the redundant queue intent must not poison the head")
         XCTAssertNil(vm.queueStatusMessage)
+      }
     }
 
     func test_forceQueuedMessageNow_doesNotRecoverLivePreparedLeaseWithoutRunEvidence() async throws {
@@ -392,7 +402,8 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
     func test_forceQueuedMessageNow_preservesPreparedAmbiguousProviderEvidence() async throws {
         // WHY: a persisted run row, a threadStarted event, a recorded start
         // failure, or a timeout marker can all exist before provider acceptance.
-        let runner = QueueStartProbeRunner(finishSynchronously: true)
+      for provider in AgentProvider.allCases {
+        let runner = QueueStartProbeRunner(provider: provider, finishSynchronously: true)
         let (vm, repo) = try makeVM(withQueue: true, provider: runner)
         let queuedRepo = try XCTUnwrap(repo)
         vm.createThread(title: "t")
@@ -415,11 +426,11 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
             let runId = AgentRunID(queued.id.value)
             XCTAssertTrue(try queuedRepo.prepareDispatch(lease, runId: runId))
             try AgentRunRepository(db: queuedRepo.db).upsert(
-                AgentRun(id: runId, threadId: threadId, provider: .codex, model: "test-model", status: evidence.status)
+                AgentRun(id: runId, threadId: threadId, provider: provider, model: "test-model", status: evidence.status)
             )
             try ProviderSessionRuntimeRepository(db: queuedRepo.db).upsert(ProviderSessionRuntime(
                 threadId: threadId,
-                provider: .codex,
+                provider: provider,
                 status: evidence.status,
                 lastRunId: runId,
                 lastEventKind: evidence.kind
@@ -436,6 +447,48 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
 
         XCTAssertEqual(runner.startedRunIDs, [],
                        "Force must not replay an ambiguous prepared dispatch")
+      }
+    }
+
+    func test_forceQueuedMessageNow_doesNotUseLaterRunEvidenceForPreparedEarlierRun() async throws {
+        for provider in AgentProvider.allCases {
+            let runner = QueueStartProbeRunner(provider: provider, finishSynchronously: true)
+            let (vm, repo) = try makeVM(withQueue: true, provider: runner)
+            let queuedRepo = try XCTUnwrap(repo)
+            vm.createThread(title: "t")
+            let threadId = try XCTUnwrap(vm.selectedThreadId)
+            let queued = AgentQueuedMessage(threadId: threadId, text: "earlier intent", position: 1)
+            try queuedRepo.upsert(queued)
+            let lease = try XCTUnwrap(queuedRepo.claim(id: queued.id, leaseId: "old-process"))
+            let earlierRun = AgentRunID(queued.id.value)
+            let laterRun = AgentRunID()
+            XCTAssertTrue(try queuedRepo.prepareDispatch(lease, runId: earlierRun))
+            let runRepo = AgentRunRepository(db: queuedRepo.db)
+            try runRepo.upsert(AgentRun(
+                id: earlierRun, threadId: threadId, provider: provider,
+                model: "test-model", status: .pending
+            ))
+            var completed = AgentRun(
+                id: laterRun, threadId: threadId, provider: provider,
+                model: "test-model", status: .completed
+            )
+            completed.finishedAt = Date()
+            try runRepo.upsert(completed)
+            try ProviderSessionRuntimeRepository(db: queuedRepo.db).upsert(ProviderSessionRuntime(
+                threadId: threadId,
+                provider: provider,
+                status: .completed,
+                lastRunId: laterRun,
+                lastEventKind: "run.started"
+            ))
+            vm.reloadQueuedMessages()
+
+            await vm.forceQueuedMessageNow(queued)
+
+            XCTAssertEqual(try queuedRepo.dispatch(id: queued.id)?.state, .prepared)
+            XCTAssertNotNil(try queuedRepo.get(id: queued.id))
+            XCTAssertTrue(runner.startedRunIDs.isEmpty)
+        }
     }
 
     func test_forceQueuedMessageNow_oneHundredConcurrentCallsStartProviderExactlyOnce() async throws {
@@ -889,15 +942,23 @@ private final class ActiveQueueRunner: AgentProviderRunner, @unchecked Sendable 
 }
 
 private final class QueueStartProbeRunner: AgentProviderRunner, @unchecked Sendable {
-    let provider: AgentProvider = .codex
+    let provider: AgentProvider
     private let lock = NSLock()
     private var failuresRemaining: Int
     private let finishSynchronously: Bool
+    private let startError: QueueStartProbeError
     private var _startedRunIDs: [AgentRunID] = []
 
-    init(failuresBeforeSuccess: Int = 0, finishSynchronously: Bool = false) {
+    init(
+        provider: AgentProvider = .codex,
+        failuresBeforeSuccess: Int = 0,
+        finishSynchronously: Bool = false,
+        startError: QueueStartProbeError = .rejected
+    ) {
+        self.provider = provider
         failuresRemaining = failuresBeforeSuccess
         self.finishSynchronously = finishSynchronously
+        self.startError = startError
     }
 
     var startedRunIDs: [AgentRunID] {
@@ -916,7 +977,7 @@ private final class QueueStartProbeRunner: AgentProviderRunner, @unchecked Senda
             failuresRemaining -= 1
             return true
         }
-        if shouldFail { throw QueueStartProbeError.rejected }
+        if shouldFail { throw startError }
         if finishSynchronously {
             onEvent(.finished(.completed, finalMessage: "done", providerThreadId: "queue-probe"))
         }
@@ -926,4 +987,5 @@ private final class QueueStartProbeRunner: AgentProviderRunner, @unchecked Senda
 
 private enum QueueStartProbeError: Error {
     case rejected
+    case timedOut
 }

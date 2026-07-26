@@ -160,6 +160,59 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
                        "the saved Claude path must remain authoritative even before a refreshed provider snapshot adds providerBinary")
     }
 
+    func test_recoverSessionConfiguresSavedCursorAndContinuesOnRecoveredBridge() async throws {
+        // WHY: after a host restart the SDK adapter must configure the persisted
+        // Claude cursor before accepting the next turn; starting a blank query
+        // would silently discard the prior conversation.
+        guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
+        let tmp = try Self.makeTempDir(prefix: "rc2-sdk-saved-cursor")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+        let commandLog = tmp.appendingPathComponent("commands.jsonl")
+        try Self.loggingFakeBridgeSource(sessionId: "saved-claude-cursor")
+            .write(to: bridge, atomically: true, encoding: .utf8)
+        let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
+        let threadId = AgentThreadID()
+        let request = AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "sonnet",
+            cwd: tmp.path,
+            prompt: "",
+            providerThreadId: "saved-claude-cursor",
+            extraArgs: [commandLog.path]
+        )
+        let sink = EventSink()
+
+        try await adapter.recoverSession(request) { event in
+            Task { await sink.record(event) }
+        }
+        XCTAssertTrue(adapter.hasSession(threadId: threadId))
+        let recovered = try XCTUnwrap(
+            adapter.listSessions().first { $0.threadId == threadId }
+        )
+        XCTAssertEqual(recovered.providerThreadId, "saved-claude-cursor")
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "sonnet",
+            cwd: tmp.path,
+            prompt: "continue saved conversation",
+            providerThreadId: "saved-claude-cursor",
+            extraArgs: [commandLog.path]
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        try await waitForFinish(in: sink, expected: "DONE_1")
+        defer { try? adapter.stopSession(threadId: threadId) }
+
+        let configures = try Self.loggedCommands(at: commandLog, ofType: "rc_configure")
+        XCTAssertEqual(configures.count, 1,
+                       "recovery and the following turn must reuse one configured bridge")
+        XCTAssertEqual(configures.first?["provider_thread_id"] as? String, "saved-claude-cursor",
+                       "the recovered bridge must receive the persisted Claude cursor used as the SDK resume option")
+    }
+
     func test_realBridgeHandshakePublishesProtocolAndLoadedSDKVersion() throws {
         guard let node = ProcessLocator.resolve("node") else { throw XCTSkip("node not available") }
         let harness = try RealBridgeHarness(node: node, fakeSDKIndexJS: """
