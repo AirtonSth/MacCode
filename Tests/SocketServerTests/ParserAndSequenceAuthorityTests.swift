@@ -1,0 +1,537 @@
+import XCTest
+@testable import SocketServer
+
+/// Deterministic contracts for the macOS invariant
+/// “Preservar semântica do parser e sequência autoritativa”.
+///
+/// Covers only gaps not already locked by `RFC6455MaskingTests`,
+/// `ConnectionSnapshotPhase3Tests`, `EventBusOrderingTests`, or
+/// `HTTPServerTests` outbound-owner suites.
+final class ParserAndSequenceAuthorityTests: XCTestCase {
+
+    // MARK: - Frame helpers
+
+    /// Build a masked client frame with optional RSV bits (RFC6455 s5.2).
+    private func makeClientFrame(
+        fin: Bool,
+        rsv: UInt8 = 0,
+        opcode: UInt8,
+        payload: [UInt8],
+        maskKey: [UInt8]? = [0x37, 0xFA, 0x21, 0x3D]
+    ) -> [UInt8] {
+        var frame: [UInt8] = []
+        frame.append((fin ? 0x80 : 0x00) | ((rsv & 0x07) << 4) | (opcode & 0x0F))
+        let len = payload.count
+        let maskedBit: UInt8 = (maskKey != nil) ? 0x80 : 0x00
+        if len < 126 {
+            frame.append(maskedBit | UInt8(len))
+        } else if len <= 0xFFFF {
+            frame.append(maskedBit | 126)
+            frame.append(UInt8((len >> 8) & 0xFF))
+            frame.append(UInt8(len & 0xFF))
+        } else {
+            frame.append(maskedBit | 127)
+            for shift in stride(from: 56, through: 0, by: -8) {
+                frame.append(UInt8((len >> shift) & 0xFF))
+            }
+        }
+        if let key = maskKey {
+            frame.append(contentsOf: key)
+            frame.append(contentsOf: payload.enumerated().map { i, b in b ^ key[i & 3] })
+        } else {
+            frame.append(contentsOf: payload)
+        }
+        return frame
+    }
+
+    private func makeCloseFrame(code: UInt16?, reason: [UInt8] = []) -> [UInt8] {
+        var payload: [UInt8] = []
+        if let code {
+            payload.append(UInt8((code >> 8) & 0xFF))
+            payload.append(UInt8(code & 0xFF))
+            payload.append(contentsOf: reason)
+        }
+        return makeClientFrame(fin: true, opcode: 0x8, payload: payload)
+    }
+
+    private func drain(
+        _ assembler: inout WebSocketClientFrameAssembler,
+        buf: [UInt8]
+    ) -> [WebSocketClientFrameAssembler.Event] {
+        var events: [WebSocketClientFrameAssembler.Event] = []
+        var offset = 0
+        while offset < buf.count {
+            let (event, consumed) = assembler.consume(buf: buf, from: offset)
+            events.append(event)
+            switch event {
+            case .needMore:
+                return events
+            case .mustClose, .peerClose:
+                offset += consumed
+                return events
+            case .fragmentProgress, .text, .binary, .ping, .pong:
+                offset += consumed
+            }
+        }
+        return events
+    }
+
+    private func eventJSON(
+        seq: Int64,
+        kind: String,
+        payload: [String: Any] = [:]
+    ) throws -> Data {
+        let object: [String: Any] = [
+            "type": "event",
+            "sequence": seq,
+            "kind": kind,
+            "payload": payload,
+        ]
+        return try JSONSerialization.data(withJSONObject: object)
+    }
+
+    // MARK: - Fragmented data (missing vs RFC6455MaskingTests)
+
+    func test_fragmentedBinary_reassemblesAcrossContinuations() {
+        // WHY: Binary is the wire path for compressed / opaque payloads.
+        // Text-only fragment tests leave a hole where a regression could
+        // reassemble text but drop binary continuations.
+        let part1: [UInt8] = [0x00, 0x01, 0x02]
+        let part2: [UInt8] = [0xFE, 0xFF]
+        let buf =
+            makeClientFrame(fin: false, opcode: 0x2, payload: part1)
+            + makeClientFrame(fin: true, opcode: 0x0, payload: part2)
+
+        var assembler = WebSocketClientFrameAssembler()
+        let events = drain(&assembler, buf: buf)
+
+        XCTAssertEqual(events.count, 2)
+        guard case .fragmentProgress = events[0] else {
+            return XCTFail("first event must be fragmentProgress, got \(events[0])")
+        }
+        guard case .binary(let data) = events[1] else {
+            return XCTFail("completed binary must surface as .binary, got \(events[1])")
+        }
+        XCTAssertEqual([UInt8](data), part1 + part2)
+        XCTAssertFalse(assembler.isFragmenting)
+    }
+
+    func test_threePartFragmentedText_reassemblesInOrder() {
+        // WHY: Two-fragment tests miss mid-stream continuations (FIN=0 opcode 0).
+        // A three-part message proves intermediate continuation keeps the open
+        // fragment and only FIN=1 completes the text message.
+        let buf =
+            makeClientFrame(fin: false, opcode: 0x1, payload: Array("aa".utf8))
+            + makeClientFrame(fin: false, opcode: 0x0, payload: Array("bb".utf8))
+            + makeClientFrame(fin: true, opcode: 0x0, payload: Array("cc".utf8))
+
+        var assembler = WebSocketClientFrameAssembler()
+        let events = drain(&assembler, buf: buf)
+
+        XCTAssertEqual(events.count, 3)
+        guard case .fragmentProgress = events[0],
+              case .fragmentProgress = events[1],
+              case .text(let data) = events[2] else {
+            return XCTFail("expected progress, progress, text; got \(events)")
+        }
+        XCTAssertEqual(String(data: data, encoding: .utf8), "aabbcc")
+    }
+
+    func test_interleavedPongDuringBinaryFragmentation_doesNotAbortMessage() {
+        // WHY: Ping interleave is covered; pong (and any control) must also be
+        // allowed mid-fragment without resetting the binary reassembly buffer.
+        let part1: [UInt8] = [0x10, 0x20]
+        let part2: [UInt8] = [0x30]
+        let pongPayload: [UInt8] = [0xAA]
+        let buf =
+            makeClientFrame(fin: false, opcode: 0x2, payload: part1)
+            + makeClientFrame(fin: true, opcode: 0xA, payload: pongPayload)
+            + makeClientFrame(fin: true, opcode: 0x0, payload: part2)
+
+        var assembler = WebSocketClientFrameAssembler()
+        let events = drain(&assembler, buf: buf)
+
+        XCTAssertEqual(events.count, 3)
+        guard case .fragmentProgress = events[0] else {
+            return XCTFail("expected fragmentProgress, got \(events[0])")
+        }
+        guard case .pong(let pong) = events[1] else {
+            return XCTFail("expected interleaved pong, got \(events[1])")
+        }
+        XCTAssertEqual([UInt8](pong), pongPayload)
+        guard case .binary(let data) = events[2] else {
+            return XCTFail("expected completed binary after pong, got \(events[2])")
+        }
+        XCTAssertEqual([UInt8](data), part1 + part2)
+    }
+
+    // MARK: - Invalid order / opcode / RSV / control
+
+    func test_continuationWithoutOpenFragment_mustClose1002() {
+        // WHY: A lone continuation is a protocol error (RFC6455 s5.4). Accepting
+        // it would fabricate a data message from a dangling fragment and break
+        // the authoritative client→host stream.
+        let buf = makeClientFrame(fin: true, opcode: 0x0, payload: Array("x".utf8))
+        var assembler = WebSocketClientFrameAssembler()
+        let (event, consumed) = assembler.consume(buf: buf, from: 0)
+        XCTAssertGreaterThan(consumed, 0)
+        guard case .mustClose(let code) = event else {
+            return XCTFail("orphan continuation must mustClose, got \(event)")
+        }
+        XCTAssertEqual(code, WebSocketClientFrameAssembler.invalidCloseCode)
+        XCTAssertEqual(code, 1002)
+    }
+
+    func test_newDataOpcodeWhileFragmenting_mustClose1002() {
+        // WHY: Starting a second data message before FIN of the first violates
+        // continuation ordering. Silent accept would interleave two logical
+        // messages into one reassembly buffer.
+        let buf =
+            makeClientFrame(fin: false, opcode: 0x1, payload: Array("ab".utf8))
+            + makeClientFrame(fin: true, opcode: 0x1, payload: Array("cd".utf8))
+
+        var assembler = WebSocketClientFrameAssembler()
+        let (e1, c1) = assembler.consume(buf: buf, from: 0)
+        guard case .fragmentProgress = e1 else {
+            return XCTFail("first fragment must be accepted, got \(e1)")
+        }
+        let (e2, c2) = assembler.consume(buf: buf, from: c1)
+        XCTAssertGreaterThan(c2, 0)
+        guard case .mustClose(let code) = e2 else {
+            return XCTFail("overlapping data message must mustClose, got \(e2)")
+        }
+        XCTAssertEqual(code, 1002)
+    }
+
+    func test_rsvBitsNonZero_mustClose1002() {
+        // WHY: No extension is negotiated; any RSV bit must close with 1002
+        // (RFC6455 s5.2) so a peer cannot smuggle extension state into the host.
+        for rsv: UInt8 in [0b001, 0b010, 0b100, 0b111] {
+            let buf = makeClientFrame(
+                fin: true, rsv: rsv, opcode: 0x1, payload: Array("ok".utf8)
+            )
+            var assembler = WebSocketClientFrameAssembler()
+            let (event, consumed) = assembler.consume(buf: buf, from: 0)
+            XCTAssertGreaterThan(consumed, 0, "rsv=\(rsv)")
+            guard case .mustClose(let code) = event else {
+                return XCTFail("rsv=\(rsv) must mustClose, got \(event)")
+            }
+            XCTAssertEqual(code, 1002, "rsv=\(rsv)")
+        }
+    }
+
+    func test_fragmentedControlFrame_mustClose1002() {
+        // WHY: Control frames must not be fragmented (RFC6455 s5.5). A FIN=0
+        // ping would otherwise hang the receive loop waiting for a control
+        // continuation that the protocol forbids.
+        let buf = makeClientFrame(fin: false, opcode: 0x9, payload: [0x01])
+        var assembler = WebSocketClientFrameAssembler()
+        let (event, consumed) = assembler.consume(buf: buf, from: 0)
+        XCTAssertGreaterThan(consumed, 0)
+        guard case .mustClose(let code) = event else {
+            return XCTFail("fragmented control must mustClose, got \(event)")
+        }
+        XCTAssertEqual(code, 1002)
+    }
+
+    func test_controlPayloadOver125_mustClose1002() {
+        // WHY: Control payload max is 125 bytes. Oversized control must fail
+        // closed rather than allocate or treat as application data.
+        let payload = [UInt8](repeating: 0x41, count: 126)
+        let buf = makeClientFrame(fin: true, opcode: 0x9, payload: payload)
+        var assembler = WebSocketClientFrameAssembler()
+        let (event, consumed) = assembler.consume(buf: buf, from: 0)
+        XCTAssertGreaterThan(consumed, 0)
+        guard case .mustClose(let code) = event else {
+            return XCTFail("control >125 must mustClose, got \(event)")
+        }
+        XCTAssertEqual(code, 1002)
+    }
+
+    func test_unknownDataOpcode_mustClose1002() {
+        // WHY: Reserved data opcodes (3–7) and reserved control (B–F) are
+        // protocol errors. Accepting them would let a peer inject untyped
+        // frames into the reassembly state machine.
+        for opcode: UInt8 in [0x3, 0x7, 0xB, 0xF] {
+            let buf = makeClientFrame(fin: true, opcode: opcode, payload: [0x00])
+            var assembler = WebSocketClientFrameAssembler()
+            let (event, _) = assembler.consume(buf: buf, from: 0)
+            guard case .mustClose(let code) = event else {
+                return XCTFail("opcode \(opcode) must mustClose, got \(event)")
+            }
+            XCTAssertEqual(code, 1002, "opcode \(opcode)")
+        }
+    }
+
+    func test_singleFrameOverOneMib_mustClose1009() {
+        // WHY: Aggregate overflow is covered for multi-fragment; a single FIN=1
+        // frame above the 1 MiB contract must also reject with 1009 without
+        // allocating the payload body.
+        let over = WebSocketClientFrameAssembler.maxFragmentedMessageBytes + 1
+        // Header-only path: 64-bit length field claims oversize.
+        var oversize: [UInt8] = [
+            0x82, // FIN + binary
+            0xFF, // MASK + 127 (64-bit length)
+        ]
+        // big-endian UInt64 length = over
+        var wide = UInt64(over)
+        var lengthBytes = [UInt8](repeating: 0, count: 8)
+        for i in stride(from: 7, through: 0, by: -1) {
+            lengthBytes[i] = UInt8(wide & 0xFF)
+            wide >>= 8
+        }
+        oversize += lengthBytes
+        // Mask key present so the reject path is evaluated after header parse.
+        oversize += [0x01, 0x02, 0x03, 0x04]
+
+        var assembler = WebSocketClientFrameAssembler()
+        let (event, consumed) = assembler.consume(buf: oversize, from: 0)
+        XCTAssertGreaterThan(consumed, 0)
+        guard case .mustClose(let code) = event else {
+            return XCTFail("single-frame oversize must mustClose, got \(event)")
+        }
+        XCTAssertEqual(code, WebSocketClientFrameAssembler.tooLargeCloseCode)
+        XCTAssertEqual(code, 1009)
+    }
+
+    // MARK: - Close / UTF-8 edge contracts
+
+    func test_emptyClosePayload_isPeerCloseWithoutCode() {
+        // WHY: Empty close payload is legal (RFC6455 s5.5.1). Host teardown
+        // must treat it as peerClose, not invent a status code.
+        let buf = makeCloseFrame(code: nil)
+        var assembler = WebSocketClientFrameAssembler()
+        let (event, consumed) = assembler.consume(buf: buf, from: 0)
+        XCTAssertGreaterThan(consumed, 0)
+        guard case .peerClose(let code, let reason) = event else {
+            return XCTFail("empty close must be peerClose, got \(event)")
+        }
+        XCTAssertNil(code)
+        XCTAssertTrue(reason.isEmpty)
+    }
+
+    func test_singleByteClosePayload_mustClose1002() {
+        // WHY: A one-byte close body is illegal (RFC6455 s5.5.1). Protocol
+        // error close is 1002 so session teardown never observes a half status.
+        let buf = makeClientFrame(fin: true, opcode: 0x8, payload: [0x03])
+        var assembler = WebSocketClientFrameAssembler()
+        let (event, _) = assembler.consume(buf: buf, from: 0)
+        guard case .mustClose(let code) = event else {
+            return XCTFail("single-byte close must mustClose, got \(event)")
+        }
+        XCTAssertEqual(code, 1002)
+    }
+
+    func test_closeReasonInvalidUTF8_mustClose1007() {
+        // WHY: Close reason, like text frames, must be valid UTF-8. Invalid
+        // reason must close with 1007 (not 1002) so clients can distinguish
+        // encoding faults from protocol faults.
+        let badReason: [UInt8] = [0xC3, 0x28]
+        let buf = makeCloseFrame(code: 1000, reason: badReason)
+        var assembler = WebSocketClientFrameAssembler()
+        let (event, _) = assembler.consume(buf: buf, from: 0)
+        guard case .mustClose(let code) = event else {
+            return XCTFail("invalid close reason UTF-8 must mustClose, got \(event)")
+        }
+        XCTAssertEqual(code, WebSocketClientFrameAssembler.invalidUtf8CloseCode)
+        XCTAssertEqual(code, 1007)
+    }
+
+    func test_fragmentedTextCompletingWithInvalidUTF8_mustClose1007() {
+        // WHY: UTF-8 is validated only when the message completes. A valid
+        // first fragment plus an invalid final continuation must not emit
+        // partial text to JSON-RPC.
+        let buf =
+            makeClientFrame(fin: false, opcode: 0x1, payload: [0x41])
+            + makeClientFrame(fin: true, opcode: 0x0, payload: [0xC3, 0x28])
+
+        var assembler = WebSocketClientFrameAssembler()
+        let (e1, c1) = assembler.consume(buf: buf, from: 0)
+        guard case .fragmentProgress = e1 else {
+            return XCTFail("first fragment must progress, got \(e1)")
+        }
+        let (e2, _) = assembler.consume(buf: buf, from: c1)
+        guard case .mustClose(let code) = e2 else {
+            return XCTFail("completed invalid UTF-8 text must mustClose, got \(e2)")
+        }
+        XCTAssertEqual(code, 1007)
+        XCTAssertFalse(assembler.isFragmenting)
+    }
+
+    // MARK: - Sequence authority (EventBus + connection watermark fences)
+
+    func test_eventBus_publishAllocatesStrictlyMonotonicSequences() {
+        // WHY: EventBus is the single sequence authority for the host. Publish
+        // must allocate 1,2,3… with no gaps/duplicates so connection watermarks
+        // and iOS reducers share one total order.
+        let bus = EventBus()
+        var seen: [Int64] = []
+        _ = bus.subscribe(since: nil) { seen.append($0.seq) }
+
+        for i in 0..<5 {
+            bus.publish(kind: "k.\(i)", payload: .null)
+        }
+
+        XCTAssertEqual(seen, [1, 2, 3, 4, 5])
+        XCTAssertEqual(bus.currentSeq, 5)
+        XCTAssertEqual(bus.snapshot().lastSeq, 5)
+    }
+
+    func test_eventBus_commitPersistedEventsSharesAuthorityWithPublish() throws {
+        // WHY: Receipt commits and live publish must share one counter. A
+        // second authority would let HTTP mutation receipts race ahead of WS
+        // events and create false gaps on the client.
+        let bus = EventBus()
+        bus.publish(kind: "live", payload: .null) // seq 1
+
+        let committed = try bus.commitPersistedEvents { floor in
+            XCTAssertEqual(floor, 1, "commit floor is the publish watermark")
+            return [
+                EventBus.Event(seq: floor + 1, kind: "receipt", payload: .null, ts: 0),
+                EventBus.Event(seq: floor + 2, kind: "receipt", payload: .null, ts: 0),
+            ]
+        }
+        XCTAssertEqual(committed.map(\.seq), [2, 3])
+        XCTAssertEqual(bus.currentSeq, 3)
+
+        bus.publish(kind: "after", payload: .null)
+        XCTAssertEqual(bus.currentSeq, 4,
+                       "publish after commit must continue the same monotonic counter")
+    }
+
+    func test_connectionWatermark_beginSnapshotIsSingleFlightFence() {
+        // WHY: Two concurrent snapshot adoptions on one connection would race
+        // pending/filtered sets. beginSnapshot must refuse a second in-flight
+        // snapshot so adoption remains a single fence.
+        let watermark = ConnectionSequenceWatermark(initialSequence: 0)
+        XCTAssertTrue(watermark.beginSnapshot())
+        XCTAssertFalse(watermark.beginSnapshot(),
+                       "second beginSnapshot while in flight must fail closed")
+        XCTAssertEqual(watermark.adoptSnapshot(sequence: 0), .adopted(sequence: 0))
+        XCTAssertTrue(watermark.beginSnapshot(),
+                      "after adoption a new snapshot may begin")
+    }
+
+    func test_connectionWatermark_monotonicAdvanceThenLoudGap() {
+        // WHY: Outside snapshot buffering, the watermark must advance only on
+        // contiguous seq and fail loud on holes — that gap is how clients are
+        // forced to baseline instead of applying out-of-order state.
+        let watermark = ConnectionSequenceWatermark(initialSequence: 0)
+        XCTAssertEqual(watermark.recordEnqueuedEvent(sequence: 1), .advanced)
+        XCTAssertEqual(watermark.recordEnqueuedEvent(sequence: 2), .advanced)
+        XCTAssertEqual(
+            watermark.recordEnqueuedEvent(sequence: 4),
+            .gap(expected: 3, received: 4)
+        )
+        XCTAssertEqual(watermark.value, 2,
+                       "a gap must not advance the connection watermark")
+    }
+
+    // MARK: - Coalescing fences (outbound degrade pure contracts)
+
+    func test_coalesceApplicationFrames_lwwSummaryAndConcatDeltaPreserveNonKeyedOrder() throws {
+        // WHY: Degrade LWW for surface summaries is safe (geometry/counts) but
+        // agent.item.delta must concatenate or tokens disappear. Non-keyed
+        // frames must keep arrival order so critical lifecycle events stay fenced.
+        let s1 = try eventJSON(seq: 1, kind: "surface.output.summary",
+                               payload: ["surface_id": "s1", "v": 1])
+        let critical = try eventJSON(seq: 2, kind: "agent.run.completed",
+                                     payload: ["thread_id": "t"])
+        let s2 = try eventJSON(seq: 3, kind: "surface.output.summary",
+                               payload: ["surface_id": "s1", "v": 2])
+        let d1 = try eventJSON(seq: 4, kind: "agent.item.delta",
+                               payload: ["item_id": "i1", "text": "Hel"])
+        let d2 = try eventJSON(seq: 5, kind: "agent.item.delta",
+                               payload: ["item_id": "i1", "text": "lo"])
+
+        let coalesced = WebSocketOutboundQueue.coalesceApplicationFrames(
+            [s1, critical, s2, d1, d2]
+        )
+
+        XCTAssertEqual(coalesced.count, 3,
+                       "two summaries LWW to one; two deltas merge; critical kept")
+        XCTAssertEqual(WebSocketOutboundQueue.eventKind(in: coalesced[0]),
+                       "surface.output.summary")
+        XCTAssertEqual(WebSocketOutboundQueue.eventSequence(in: coalesced[0]), 3,
+                       "LWW keeps the later summary sequence")
+        XCTAssertEqual(WebSocketOutboundQueue.eventKind(in: coalesced[1]),
+                       "agent.run.completed")
+        XCTAssertEqual(WebSocketOutboundQueue.eventSequence(in: coalesced[1]), 2,
+                       "non-keyed critical must not move relative to surrounding keys' slots")
+        XCTAssertEqual(WebSocketOutboundQueue.eventKind(in: coalesced[2]),
+                       "agent.item.delta")
+
+        // Merged delta payload must retain both text chunks (concat, not LWW).
+        let mergedObject = try JSONSerialization.jsonObject(with: coalesced[2]) as? [String: Any]
+        let payload = mergedObject?["payload"] as? [String: Any]
+        let text = payload?["text"] as? String
+        XCTAssertEqual(text, "Hello",
+                       "delta coalesce must concatenate append fields, not last-write-wins")
+    }
+
+    func test_degradePreservesControlFramesWhileSheddingBulk() throws {
+        // WHY: Coalescing/shedding must never drop pong/close control frames.
+        // Losing a pong under pressure kills a healthy session and weakens the
+        // liveness authority that fences sequence recovery.
+        let stall = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let owner = WebSocketOutboundQueue(
+            maxQueuedBytes: 64 * 1024,
+            applicationWriter: { data in
+                if String(decoding: data, as: UTF8.self).contains("\"sequence\":1") {
+                    stall.signal()
+                    _ = release.wait(timeout: .now() + 2)
+                }
+                return true
+            },
+            controlWriter: { _, _ in true },
+            writeFailureClosingData: Data(),
+            onTerminal: { _ in XCTFail("degrade must never terminate") },
+            didSendTerminal: { XCTFail("degrade must never shut down") }
+        )
+
+        let first = try eventJSON(seq: 1, kind: "agent.item.delta",
+                                  payload: ["item_id": "i", "text": "a"])
+        XCTAssertEqual(owner.enqueueApplication(first), .accepted)
+        XCTAssertEqual(stall.wait(timeout: .now() + 2), .success)
+
+        for seq in 2...5 {
+            let frame = try eventJSON(seq: Int64(seq), kind: "surface.output",
+                                      payload: ["surface_id": "s", "base64": "QQ=="])
+            XCTAssertEqual(owner.enqueueApplication(frame), .accepted)
+        }
+        XCTAssertEqual(owner.enqueueControl(opcode: 0xA, data: Data([0x01, 0x02])),
+                       .accepted, "pong control must queue under load")
+
+        let before = owner.queuedFrameCountForTests
+        let outcome = owner.degrade()
+        XCTAssertGreaterThan(before, 0)
+        XCTAssertTrue(
+            outcome.discardedBulkFrames > 0
+                || outcome.coalescedAwayFrames > 0
+                || outcome.needsBaselineRequired,
+            "degrade should report pressure work when bulk is queued"
+        )
+        // Control frame remains accounted in the queue after application shed.
+        XCTAssertGreaterThanOrEqual(owner.queuedFrameCountForTests, 1,
+                                    "control frames must survive degrade")
+        XCTAssertEqual(owner.enqueueControl(opcode: 0xA, data: Data([0x03])),
+                       .accepted, "socket stays open; control still accepted")
+
+        release.signal()
+        owner.finish()
+    }
+
+    func test_isSheddableKind_fencesCriticalLifecycleEvents() {
+        // WHY: Only bulk/diagnostic kinds may be discarded under pressure.
+        // Shedding agent.run.completed or settings.updated would silently
+        // desync the client from the authoritative EventBus sequence.
+        XCTAssertTrue(WebSocketOutboundQueue.isSheddableKind("surface.output"))
+        XCTAssertTrue(WebSocketOutboundQueue.isSheddableKind("agent.item.delta"))
+        XCTAssertTrue(WebSocketOutboundQueue.isSheddableKind("diagnostic.tick"))
+        XCTAssertTrue(WebSocketOutboundQueue.isSheddableKind("metrics.sample"))
+        XCTAssertFalse(WebSocketOutboundQueue.isSheddableKind("agent.run.completed"))
+        XCTAssertFalse(WebSocketOutboundQueue.isSheddableKind("settings.updated"))
+        XCTAssertFalse(WebSocketOutboundQueue.isSheddableKind("workspace.updated"))
+    }
+}
