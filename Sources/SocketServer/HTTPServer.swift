@@ -3354,14 +3354,29 @@ public final class DirectHTTPServer: @unchecked Sendable {
                                 bodyData: body,
                                 ownerFingerprint: fingerprint
                             )
-                            // Control queue so hydration RPC replies are not
-                            // stuck behind a full application event backlog.
-                            switch outbound.enqueueControl(opcode: 0x1, data: response) {
-                            case .accepted, .closed:
-                                break
-                            case .queueFull:
-                                _ = outbound.degrade()
-                                _ = outbound.enqueueControl(opcode: 0x1, data: response)
+                            // Stop/input and other interactive RPC replies stay
+                            // on the control lane so they drain ahead of events.
+                            // Large `sync.snapshot` success bodies are bulk under
+                            // the existing nested `result.type == "snapshot"`
+                            // shape: put them on the application bulk lane so an
+                            // accepted snapshot backlog cannot indefinitely
+                            // block control (pong / stop / input) traffic.
+                            if WebSocketOutboundQueue.applicationPriority(of: response) == .bulk {
+                                switch outbound.enqueueApplication(response) {
+                                case .accepted, .closed:
+                                    break
+                                case .queueFull:
+                                    _ = outbound.degrade()
+                                    _ = outbound.enqueueApplication(response)
+                                }
+                            } else {
+                                switch outbound.enqueueControl(opcode: 0x1, data: response) {
+                                case .accepted, .closed:
+                                    break
+                                case .queueFull:
+                                    _ = outbound.degrade()
+                                    _ = outbound.enqueueControl(opcode: 0x1, data: response)
+                                }
                             }
                         }
                         continue

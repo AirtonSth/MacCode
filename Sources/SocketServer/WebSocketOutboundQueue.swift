@@ -527,9 +527,17 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         return outcome
     }
 
-    /// Classify using only existing protocol `type` / sheddable `kind` fields.
+    /// Classify using only existing protocol `type` / sheddable `kind` fields
+    /// (plus the existing Wave-4 JSON-RPC success envelope that wraps a
+    /// `result.type == "snapshot"` transport frame — not a new command class).
     static func applicationPriority(of data: Data) -> ApplicationPriority {
         guard let type = frameType(in: data) else {
+            // Large `sync.snapshot` RPC replies are multiplexed on the same WS
+            // as stop/input. Treat the existing nested snapshot result as bulk
+            // so they cannot monopolize the control drain path.
+            if isSnapshotRPCSuccessEnvelope(data) {
+                return .bulk
+            }
             // Opaque / test blobs stay on the normal FIFO lane.
             return .normal
         }
@@ -548,8 +556,26 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     /// Whether an encoded application frame is safe to shed under pressure.
     static func isSheddableApplicationFrame(_ data: Data) -> Bool {
         if frameType(in: data) == "snapshot" { return true }
+        // Nested snapshot RPC bodies are the same bulk baseline as bare
+        // `type:snapshot` frames; shed under pressure so recovery/control can
+        // reclaim capacity without inventing a new wire field.
+        if isSnapshotRPCSuccessEnvelope(data) { return true }
         guard let kind = eventKind(in: data) else { return false }
         return isSheddableKind(kind)
+    }
+
+    /// Existing Wave-4 WebSocket JSON-RPC success envelope whose `result` is a
+    /// `ConnectionSnapshotFrame` (`type == "snapshot"`). Detected only from
+    /// those wire keys — no new priority vocabulary.
+    static func isSnapshotRPCSuccessEnvelope(_ data: Data) -> Bool {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["jsonrpc"] as? String == "2.0",
+              object["method"] == nil,
+              let result = object["result"] as? [String: Any],
+              result["type"] as? String == "snapshot" else {
+            return false
+        }
+        return true
     }
 
     static func isSheddableKind(_ kind: String) -> Bool {

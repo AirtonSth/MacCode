@@ -563,6 +563,22 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
         let completion = try eventJSON(seq: 2, kind: "agent.run.completed",
                                        payload: ["thread_id": "t"])
         let opaque = Data("not-json".utf8)
+        // Wave-4 WS multiplex: `sync.snapshot` success wraps ConnectionSnapshotFrame
+        // under result — existing keys only, not a new priority vocabulary.
+        let snapshotRPC = try JSONSerialization.data(withJSONObject: [
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": [
+                "type": "snapshot",
+                "sequence": 42,
+                "state": ["workspaces": []],
+            ],
+        ])
+        let stopRPC = try JSONSerialization.data(withJSONObject: [
+            "jsonrpc": "2.0",
+            "id": 8,
+            "result": ["ok": true, "stopped": true],
+        ])
 
         XCTAssertEqual(WebSocketOutboundQueue.applicationPriority(of: baseline), .priority)
         XCTAssertEqual(WebSocketOutboundQueue.applicationPriority(of: error), .priority)
@@ -571,8 +587,163 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
         XCTAssertEqual(WebSocketOutboundQueue.applicationPriority(of: bulkEvent), .bulk)
         XCTAssertEqual(WebSocketOutboundQueue.applicationPriority(of: completion), .normal)
         XCTAssertEqual(WebSocketOutboundQueue.applicationPriority(of: opaque), .normal)
+        XCTAssertTrue(WebSocketOutboundQueue.isSnapshotRPCSuccessEnvelope(snapshotRPC))
+        XCTAssertEqual(WebSocketOutboundQueue.applicationPriority(of: snapshotRPC), .bulk,
+                       "nested result.type=snapshot must be bulk so it leaves control free")
+        XCTAssertTrue(WebSocketOutboundQueue.isSheddableApplicationFrame(snapshotRPC),
+                      "snapshot RPC bulk must be sheddable under degrade pressure")
+        XCTAssertFalse(WebSocketOutboundQueue.isSnapshotRPCSuccessEnvelope(stopRPC))
+        XCTAssertEqual(WebSocketOutboundQueue.applicationPriority(of: stopRPC), .normal,
+                       "stop/input-style RPC results are not bulk (caller uses control lane)")
         XCTAssertTrue(WebSocketOutboundQueue.isSheddableApplicationFrame(snapshot),
                       "snapshots are bulk under pressure so degrade can free capacity")
+    }
+
+    func test_controlInteractive_drainsAheadOfAcceptedSnapshotRPCBulk() throws {
+        // WHY: "Impedir snapshot grande de bloquear stop/input" — once a large
+        // sync.snapshot success body is accepted on the bulk application lane,
+        // stop/input RPC replies and WebSocket pongs must still drain first on
+        // the control lane, not wait behind the snapshot bulk FIFO.
+        let recorded = LockedStringArray()
+        let holdEntered = DispatchSemaphore(value: 0)
+        let releaseHold = DispatchSemaphore(value: 0)
+        let owner = WebSocketOutboundQueue(
+            maxQueuedBytes: 256 * 1024,
+            applicationWriter: { data in
+                if WebSocketOutboundQueue.eventSequence(in: data) == 1 {
+                    holdEntered.signal()
+                    _ = releaseHold.wait(timeout: .now() + 2)
+                }
+                let label: String
+                if WebSocketOutboundQueue.isSnapshotRPCSuccessEnvelope(data) {
+                    label = "snapshot-rpc"
+                } else if let seq = WebSocketOutboundQueue.eventSequence(in: data) {
+                    label = "event:\(seq)"
+                } else if let type = WebSocketOutboundQueue.frameType(in: data) {
+                    label = type
+                } else {
+                    label = "app-other"
+                }
+                recorded.append(label)
+                return true
+            },
+            controlWriter: { opcode, data in
+                if opcode == 0xA {
+                    recorded.append("pong")
+                } else if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          object["jsonrpc"] as? String == "2.0" {
+                    let idValue: Int
+                    if let n = object["id"] as? Int {
+                        idValue = n
+                    } else if let n = object["id"] as? NSNumber {
+                        idValue = n.intValue
+                    } else {
+                        idValue = -1
+                    }
+                    recorded.append("rpc-control:\(idValue)")
+                } else {
+                    recorded.append("control:\(opcode)")
+                }
+                return true
+            },
+            writeFailureClosingData: Data(),
+            onTerminal: { _ in XCTFail("must not terminate") },
+            didSendTerminal: {}
+        )
+
+        let hold = try eventJSON(seq: 1, kind: "agent.run.completed", payload: ["t": "hold"])
+        XCTAssertEqual(owner.enqueueApplication(hold), .accepted)
+        XCTAssertEqual(holdEntered.wait(timeout: .now() + 2), .success)
+
+        let snapshotRPC = try JSONSerialization.data(withJSONObject: [
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [
+                "type": "snapshot",
+                "sequence": 99,
+                "blob": String(repeating: "S", count: 2_048),
+            ],
+        ])
+        let stopRPC = try JSONSerialization.data(withJSONObject: [
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": ["ok": true, "stopped": true],
+        ])
+
+        // Production path after the fix: snapshot RPC → application bulk;
+        // stop/input → control. Both are accepted while a prior write holds drain.
+        XCTAssertEqual(WebSocketOutboundQueue.applicationPriority(of: snapshotRPC), .bulk)
+        XCTAssertEqual(owner.enqueueApplication(snapshotRPC), .accepted)
+        XCTAssertEqual(owner.enqueueControl(opcode: 0x1, data: stopRPC), .accepted)
+        XCTAssertEqual(owner.enqueueControl(opcode: 0xA, data: Data([0x01])), .accepted)
+
+        releaseHold.signal()
+        owner.finish()
+
+        let labels = recorded.snapshot
+        guard let stopIndex = labels.firstIndex(of: "rpc-control:2"),
+              let pongIndex = labels.firstIndex(of: "pong"),
+              let snapshotIndex = labels.firstIndex(of: "snapshot-rpc") else {
+            return XCTFail("expected stop RPC, pong, and snapshot-rpc in drain order; got \(labels)")
+        }
+        XCTAssertLessThan(stopIndex, snapshotIndex,
+                          "stop/input RPC on control must drain before accepted snapshot bulk")
+        XCTAssertLessThan(pongIndex, snapshotIndex,
+                          "pong control must drain before accepted snapshot bulk")
+        XCTAssertEqual(labels.first, "event:1",
+                       "in-flight application write still completes first (RFC6455)")
+    }
+
+    func test_degradeShedsSnapshotRPCBulkWithoutDroppingControl() throws {
+        // WHY: Accepted snapshot RPC bulk must free capacity under pressure so
+        // baseline recovery and control can continue; dropping control would
+        // kill liveness while the bulk body is sheddable by contract.
+        let holdEntered = DispatchSemaphore(value: 0)
+        let releaseHold = DispatchSemaphore(value: 0)
+        let owner = WebSocketOutboundQueue(
+            maxQueuedBytes: 16 * 1024,
+            applicationWriter: { data in
+                if WebSocketOutboundQueue.eventSequence(in: data) == 1 {
+                    holdEntered.signal()
+                    _ = releaseHold.wait(timeout: .now() + 2)
+                }
+                return true
+            },
+            controlWriter: { _, _ in true },
+            writeFailureClosingData: Data(),
+            onTerminal: { _ in XCTFail("degrade must never terminate") },
+            didSendTerminal: { XCTFail("degrade must never shut down") }
+        )
+
+        let hold = try eventJSON(seq: 1, kind: "agent.run.completed", payload: [:])
+        XCTAssertEqual(owner.enqueueApplication(hold), .accepted)
+        XCTAssertEqual(holdEntered.wait(timeout: .now() + 2), .success)
+
+        for i in 0..<8 {
+            let snapshotRPC = try JSONSerialization.data(withJSONObject: [
+                "jsonrpc": "2.0",
+                "id": i,
+                "result": [
+                    "type": "snapshot",
+                    "sequence": 100 + i,
+                    "blob": String(repeating: "S", count: 400),
+                ],
+            ])
+            _ = owner.enqueueApplication(snapshotRPC)
+        }
+        XCTAssertEqual(owner.enqueueControl(opcode: 0xA, data: Data([0xAB])), .accepted)
+
+        let before = owner.queuedFrameCountForTests
+        let outcome = owner.degrade()
+        XCTAssertGreaterThan(outcome.discardedBulkFrames, 0,
+                             "nested snapshot RPC envelopes must shed as bulk")
+        XCTAssertTrue(outcome.needsBaselineRequired)
+        XCTAssertLessThan(owner.queuedFrameCountForTests, before)
+        XCTAssertEqual(owner.enqueueControl(opcode: 0xA, data: Data([0xCD])), .accepted,
+                       "control must remain available after shedding snapshot RPC bulk")
+
+        releaseHold.signal()
+        owner.finish()
     }
 
     func test_priorityApplication_overtakesQueuedBulkWhilePreservingSequencedFIFO() throws {
