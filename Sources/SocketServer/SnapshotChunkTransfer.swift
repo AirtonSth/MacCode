@@ -9,7 +9,9 @@ public enum SnapshotChunkCapability {
 }
 
 /// Bounded negotiated chunk size. Clients may send `preferredChunkBytes`; the
-/// host clamps. Named seam for later measured-quality adaptation on the host.
+/// host clamps. Adaptation is client next-transfer: each begin freezes
+/// `chunkBytes` on the transfer record; later preferred sizes never rewrite
+/// an in-flight transfer.
 public enum SnapshotChunkSizePolicy {
     public static let minimumBytes = 8_192
     public static let maximumBytes = 256 * 1_024
@@ -21,6 +23,10 @@ public enum SnapshotChunkSizePolicy {
     public static let maximumCachedTransfers = 8
     public static let maximumCachedBytes = 8 * 1_024 * 1_024
     public static let defaultTTLNanoseconds: UInt64 = 120_000_000_000
+    /// Mirrors client adaptive step sizes so host negotiation stays aligned.
+    public static let increaseStepBytes = 16 * 1_024
+    public static let decreaseStepBytes = 16 * 1_024
+    public static let stableSuccessesBeforeIncrease = 2
 
     public static func negotiate(preferredChunkBytes: Int?) -> Int {
         let preferred = preferredChunkBytes ?? defaultBytes
@@ -30,6 +36,39 @@ public enum SnapshotChunkSizePolicy {
     public static func chunkCount(totalBytes: Int, chunkBytes: Int) -> Int {
         guard totalBytes > 0, chunkBytes > 0 else { return 0 }
         return (totalBytes + chunkBytes - 1) / chunkBytes
+    }
+}
+
+/// Pure client-side next-transfer preference helper (mirrored on host for tests).
+/// Host production path only clamps `preferredChunkBytes` at begin; it does not
+/// rewrite an existing transfer's frozen `chunkBytes`.
+public struct SnapshotChunkAdaptivePreference: Equatable, Sendable {
+    public private(set) var preferredBytes: Int
+    private var consecutiveStableSuccesses: Int
+
+    public init(preferredBytes: Int = SnapshotChunkSizePolicy.defaultBytes) {
+        self.preferredBytes = SnapshotChunkSizePolicy.negotiate(preferredChunkBytes: preferredBytes)
+        self.consecutiveStableSuccesses = 0
+    }
+
+    /// Stable chunk progress grows preferred size for the next begin only.
+    public mutating func noteStableChunkProgress() {
+        consecutiveStableSuccesses += 1
+        guard consecutiveStableSuccesses >= SnapshotChunkSizePolicy.stableSuccessesBeforeIncrease else {
+            return
+        }
+        consecutiveStableSuccesses = 0
+        preferredBytes = SnapshotChunkSizePolicy.negotiate(
+            preferredChunkBytes: preferredBytes + SnapshotChunkSizePolicy.increaseStepBytes
+        )
+    }
+
+    /// Timeout, retry, or jitter shrinks preferred size immediately with a floor.
+    public mutating func noteDegradedSignal() {
+        consecutiveStableSuccesses = 0
+        preferredBytes = SnapshotChunkSizePolicy.negotiate(
+            preferredChunkBytes: preferredBytes - SnapshotChunkSizePolicy.decreaseStepBytes
+        )
     }
 }
 

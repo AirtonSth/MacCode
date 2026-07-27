@@ -79,6 +79,115 @@ final class SnapshotChunkTransferTests: XCTestCase {
         )
     }
 
+    func test_adaptivePreference_stableProgressIncreasesWithinBounds() {
+        // WHY: client next-transfer growth must raise preferred gradually and
+        // never escape host negotiate clamps (no unbounded payload growth).
+        var adaptive = SnapshotChunkAdaptivePreference(
+            preferredBytes: SnapshotChunkSizePolicy.minimumBytes
+        )
+        let before = adaptive.preferredBytes
+        adaptive.noteStableChunkProgress()
+        XCTAssertEqual(adaptive.preferredBytes, before, "growth requires consecutive stable signals")
+        adaptive.noteStableChunkProgress()
+        XCTAssertEqual(
+            adaptive.preferredBytes,
+            before + SnapshotChunkSizePolicy.increaseStepBytes
+        )
+        for _ in 0..<64 {
+            adaptive.noteStableChunkProgress()
+        }
+        XCTAssertEqual(adaptive.preferredBytes, SnapshotChunkSizePolicy.maximumBytes)
+        XCTAssertEqual(
+            SnapshotChunkSizePolicy.negotiate(preferredChunkBytes: adaptive.preferredBytes),
+            SnapshotChunkSizePolicy.maximumBytes
+        )
+    }
+
+    func test_adaptivePreference_degradeReducesWithFloor() {
+        // WHY: timeout/retry/jitter must shrink preferred immediately with a floor.
+        var adaptive = SnapshotChunkAdaptivePreference(
+            preferredBytes: SnapshotChunkSizePolicy.defaultBytes
+        )
+        let before = adaptive.preferredBytes
+        adaptive.noteDegradedSignal()
+        XCTAssertEqual(
+            adaptive.preferredBytes,
+            before - SnapshotChunkSizePolicy.decreaseStepBytes
+        )
+        for _ in 0..<64 {
+            adaptive.noteDegradedSignal()
+        }
+        XCTAssertEqual(adaptive.preferredBytes, SnapshotChunkSizePolicy.minimumBytes)
+    }
+
+    func test_adaptivePreference_nextTransferOnlyDoesNotMutateActiveRecord() throws {
+        // WHY: begin freezes chunkBytes on the transfer; later client preferred
+        // adaptation must open a *new* transfer, not rewrite the in-flight one.
+        let cache = SnapshotChunkTransferCache()
+        let frame = Data((0..<40_000).map { UInt8($0 % 90) })
+        var adaptive = SnapshotChunkAdaptivePreference(preferredBytes: 8_192)
+        let first = try cache.insert(
+            frameBytes: frame,
+            ownerFingerprint: "owner",
+            connectionId: "c",
+            hostId: "h",
+            bootEpoch: 1,
+            snapshotId: "s1",
+            sequence: 1,
+            generatedAtEpochMs: 1,
+            stateVersion: 3,
+            preferredChunkBytes: adaptive.preferredBytes
+        ).record
+        let frozen = first.chunkBytes
+        XCTAssertEqual(frozen, 8_192)
+
+        adaptive.noteStableChunkProgress()
+        adaptive.noteStableChunkProgress()
+        XCTAssertGreaterThan(adaptive.preferredBytes, frozen)
+
+        // Active transfer record stays at original negotiated size.
+        XCTAssertEqual(first.chunkBytes, frozen)
+        XCTAssertEqual(first.manifest.chunkBytes, frozen)
+        let retry = try cache.fetchChunk(
+            transferId: first.transferId,
+            chunkIndex: 0,
+            ownerFingerprint: "owner",
+            connectionId: "c",
+            hostId: "h",
+            bootEpoch: 1
+        )
+        XCTAssertEqual(retry.byteCount, min(frozen, frame.count))
+
+        // New begin with adapted preferred yields a different frozen size.
+        adaptive.noteDegradedSignal()
+        adaptive.noteDegradedSignal()
+        let second = try cache.insert(
+            frameBytes: frame,
+            ownerFingerprint: "owner",
+            connectionId: "c",
+            hostId: "h",
+            bootEpoch: 1,
+            snapshotId: "s2",
+            sequence: 2,
+            generatedAtEpochMs: 2,
+            stateVersion: 3,
+            preferredChunkBytes: adaptive.preferredBytes
+        ).record
+        XCTAssertEqual(second.chunkBytes, adaptive.preferredBytes)
+        XCTAssertEqual(first.chunkBytes, frozen, "prior transfer must remain immutable")
+        XCTAssertNotEqual(first.transferId, second.transferId)
+    }
+
+    func test_legacyNilPreferred_stillNegotiatesDefaultWithoutAdaptiveRequirement() {
+        // WHY: hosts without client adaptive state / old clients keep default clamp.
+        XCTAssertEqual(
+            SnapshotChunkSizePolicy.negotiate(preferredChunkBytes: nil),
+            SnapshotChunkSizePolicy.defaultBytes
+        )
+        let adaptive = SnapshotChunkAdaptivePreference()
+        XCTAssertEqual(adaptive.preferredBytes, SnapshotChunkSizePolicy.defaultBytes)
+    }
+
     func test_cache_rejectsWrongIdentityAndExpiresDeterministically() throws {
         // WHY: a chunk HTTP request must never bypass ownership or serve after TTL.
         var now: UInt64 = 1_000
