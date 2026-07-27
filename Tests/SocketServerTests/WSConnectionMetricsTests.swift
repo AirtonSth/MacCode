@@ -5,18 +5,38 @@ import XCTest
 /// No @MainActor, no network I/O, no timing - all assertions are structural.
 final class WSConnectionMetricsTests: XCTestCase {
 
+    /// JSONSerialization boxes integers/floats loosely; normalize for asserts.
+    private func jsonUInt64(_ value: Any?) -> UInt64? {
+        if let v = value as? UInt64 { return v }
+        if let v = value as? Int { return UInt64(v) }
+        if let v = value as? NSNumber { return v.uint64Value }
+        return nil
+    }
+
+    private func jsonDouble(_ value: Any?) -> Double? {
+        if let v = value as? Double { return v }
+        if let v = value as? Int { return Double(v) }
+        if let v = value as? NSNumber { return v.doubleValue }
+        return nil
+    }
+
     // MARK: - connectionMetricsJSON helper
 
     func test_connectionMetricsJSON_includesAllDocumentedFields() {
         // WHY: the health assembler must include every field the client
         // and support tooling depend on for "why is sync slow" / 3G limit analysis.
+        var wait = OutboundQueueWaitMetricsSnapshot.zero
+        wait.priority.record(waitMilliseconds: 12)
+        wait.normal.record(waitMilliseconds: 40)
+        wait.bulk.record(waitMilliseconds: 90)
         let result = connectionMetricsJSON(
             activeClients: 3,
             totalQueuedBytes: 4096,
             slowClientDrops: 1,
             maxObservedOutboundQueuedBytes: 8192,
             maxObservedFrameBytes: 2048,
-            framesRejectedOrEvicted: 7
+            framesRejectedOrEvicted: 7,
+            outboundQueueWait: wait
         )
         XCTAssertEqual(result["active_clients"] as? Int, 3,
                        "active_clients must reflect the given counter")
@@ -30,6 +50,18 @@ final class WSConnectionMetricsTests: XCTestCase {
                        "max_observed_frame_bytes must reflect the high-water mark")
         XCTAssertEqual(result["frames_rejected_or_evicted"] as? Int, 7,
                        "frames_rejected_or_evicted must reflect the reject/evict counter")
+        let waitJSON = result["outbound_queue_wait_ms"] as? [String: Any]
+        XCTAssertNotNil(waitJSON, "queue wait aggregates must appear under connections")
+        let priority = waitJSON?["priority"] as? [String: Any]
+        XCTAssertEqual(jsonUInt64(priority?["count"]), 1)
+        XCTAssertEqual(jsonDouble(priority?["total"]), 12)
+        XCTAssertEqual(jsonDouble(priority?["max"]), 12)
+        let normal = waitJSON?["normal"] as? [String: Any]
+        XCTAssertEqual(jsonUInt64(normal?["count"]), 1)
+        XCTAssertEqual(jsonDouble(normal?["max"]), 40)
+        let bulk = waitJSON?["bulk"] as? [String: Any]
+        XCTAssertEqual(jsonUInt64(bulk?["count"]), 1)
+        XCTAssertEqual(jsonDouble(bulk?["max"]), 90)
     }
 
     func test_connectionMetricsJSON_zeroState_isValid() {
@@ -49,11 +81,19 @@ final class WSConnectionMetricsTests: XCTestCase {
         XCTAssertEqual(result["max_observed_outbound_queued_bytes"] as? Int, 0)
         XCTAssertEqual(result["max_observed_frame_bytes"] as? Int, 0)
         XCTAssertEqual(result["frames_rejected_or_evicted"] as? Int, 0)
+        let waitJSON = result["outbound_queue_wait_ms"] as? [String: Any]
+        for lane in ["priority", "normal", "bulk"] {
+            let laneJSON = waitJSON?[lane] as? [String: Any]
+            XCTAssertEqual(jsonUInt64(laneJSON?["count"]), 0, "\(lane) count zero at cold start")
+            XCTAssertEqual(jsonDouble(laneJSON?["total"]), 0, "\(lane) total zero at cold start")
+            XCTAssertEqual(jsonDouble(laneJSON?["max"]), 0, "\(lane) max zero at cold start")
+        }
     }
 
     func test_connectionMetricsJSON_keysOnly_noExtraKeys() {
         // WHY: health response schema must be stable; unexpected keys
-        // break iOS client decoding contracts.
+        // break iOS client decoding contracts. Additive wait aggregates are
+        // the only intentional extension for queue-time diagnostics.
         let result = connectionMetricsJSON(
             activeClients: 0,
             totalQueuedBytes: 0,
@@ -65,28 +105,89 @@ final class WSConnectionMetricsTests: XCTestCase {
             "slow_client_drops",
             "max_observed_outbound_queued_bytes",
             "max_observed_frame_bytes",
-            "frames_rejected_or_evicted"
+            "frames_rejected_or_evicted",
+            "outbound_queue_wait_ms"
         ]
         XCTAssertEqual(Set(result.keys), expected,
                        "connectionMetricsJSON must return exactly the documented keys")
+        let waitJSON = result["outbound_queue_wait_ms"] as? [String: Any]
+        XCTAssertEqual(Set((waitJSON ?? [:]).keys), Set(["priority", "normal", "bulk"]),
+                       "wait aggregates must use only existing application lane labels")
+        for lane in ["priority", "normal", "bulk"] {
+            let laneJSON = waitJSON?[lane] as? [String: Any]
+            XCTAssertEqual(Set((laneJSON ?? [:]).keys), Set(["count", "total", "max"]),
+                           "\(lane) wait object must stay count/total/max only")
+        }
     }
 
     func test_connectionMetricsJSON_clampsNegativeInputs() {
         // WHY: health must never emit negative gauges even if a caller
         // passes a bad sample under race or bug — support tooling treats
         // negatives as corruption.
+        var wait = OutboundQueueWaitMetricsSnapshot.zero
+        wait.priority.record(waitMilliseconds: -5)
+        wait.normal.record(waitMilliseconds: .nan)
+        wait.bulk.record(waitMilliseconds: -1)
+        // Force a negative total via direct construction for clamp coverage.
+        wait.priority = OutboundQueueWaitLaneMetrics(count: 1, totalMilliseconds: -9, maxMilliseconds: -3)
         let result = connectionMetricsJSON(
             activeClients: -1,
             totalQueuedBytes: -100,
             slowClientDrops: -2,
             maxObservedOutboundQueuedBytes: -5,
             maxObservedFrameBytes: -9,
-            framesRejectedOrEvicted: -3
+            framesRejectedOrEvicted: -3,
+            outboundQueueWait: wait
         )
-        for key in result.keys {
+        for key in result.keys where key != "outbound_queue_wait_ms" {
             XCTAssertGreaterThanOrEqual(result[key] as? Int ?? -1, 0,
                                         "\(key) must be nonnegative in health JSON")
         }
+        let waitJSON = result["outbound_queue_wait_ms"] as? [String: Any]
+        for lane in ["priority", "normal", "bulk"] {
+            let laneJSON = waitJSON?[lane] as? [String: Any]
+            XCTAssertGreaterThanOrEqual(jsonDouble(laneJSON?["total"]) ?? -1, 0,
+                                        "\(lane) total must clamp nonnegative")
+            XCTAssertGreaterThanOrEqual(jsonDouble(laneJSON?["max"]) ?? -1, 0,
+                                        "\(lane) max must clamp nonnegative")
+        }
+    }
+
+    func test_connectionMetricsJSON_queueWait_isSecretFreeBoundedShape() {
+        // WHY: diagnostics must never leak payloads/tokens/host identity into
+        // /v1/health.connections — only fixed lane labels and numeric aggregates.
+        var wait = OutboundQueueWaitMetricsSnapshot.zero
+        wait.priority.record(waitMilliseconds: 5)
+        wait.normal.record(waitMilliseconds: 15)
+        wait.bulk.record(waitMilliseconds: 25)
+        wait.bulk.record(waitMilliseconds: 50)
+        let result = connectionMetricsJSON(
+            activeClients: 1,
+            totalQueuedBytes: 100,
+            slowClientDrops: 0,
+            outboundQueueWait: wait
+        )
+        guard let encoded = try? JSONSerialization.data(
+            withJSONObject: result,
+            options: [.sortedKeys]
+        ),
+              let text = String(data: encoded, encoding: .utf8) else {
+            return XCTFail("connections JSON must be serializable")
+        }
+        for secretish in [
+            "token", "Bearer", "password", "payload", "host",
+            "127.0.0.1", "authorization", "secret", "device"
+        ] {
+            XCTAssertFalse(
+                text.localizedCaseInsensitiveContains(secretish),
+                "health connections JSON must not contain secret-like key/value \(secretish)"
+            )
+        }
+        let waitJSON = result["outbound_queue_wait_ms"] as? [String: Any]
+        let bulk = waitJSON?["bulk"] as? [String: Any]
+        XCTAssertEqual(jsonUInt64(bulk?["count"]), 2)
+        XCTAssertEqual(jsonDouble(bulk?["total"]), 75)
+        XCTAssertEqual(jsonDouble(bulk?["max"]), 50)
     }
 
     // MARK: - WSConnectionTracker
@@ -101,6 +202,34 @@ final class WSConnectionMetricsTests: XCTestCase {
         XCTAssertEqual(tracker.maxObservedOutboundQueuedBytes, 0)
         XCTAssertEqual(tracker.maxObservedFrameBytes, 0)
         XCTAssertEqual(tracker.framesRejectedOrEvicted, 0)
+        let wait = tracker.outboundQueueWaitMetrics
+        XCTAssertEqual(wait.priority, .zero)
+        XCTAssertEqual(wait.normal, .zero)
+        XCTAssertEqual(wait.bulk, .zero)
+    }
+
+    func test_tracker_recordOutboundQueueWait_attributesLanesAndClamps() {
+        // WHY: process-scoped wait aggregates must attribute the existing
+        // application lanes only and stay nonnegative for health consumers.
+        let tracker = WSConnectionTracker()
+        tracker.recordOutboundQueueWait(priority: .priority, waitMilliseconds: 10)
+        tracker.recordOutboundQueueWait(priority: .normal, waitMilliseconds: 20)
+        tracker.recordOutboundQueueWait(priority: .bulk, waitMilliseconds: 30)
+        tracker.recordOutboundQueueWait(priority: .bulk, waitMilliseconds: 50)
+        tracker.recordOutboundQueueWait(priority: .normal, waitMilliseconds: -4)
+        tracker.recordOutboundQueueWait(priority: .priority, waitMilliseconds: .infinity)
+
+        let wait = tracker.outboundQueueWaitMetrics
+        XCTAssertEqual(wait.priority.count, 2)
+        XCTAssertEqual(wait.priority.totalMilliseconds, 10,
+                       "non-finite wait must record as 0 and not poison totals")
+        XCTAssertEqual(wait.priority.maxMilliseconds, 10)
+        XCTAssertEqual(wait.normal.count, 2)
+        XCTAssertEqual(wait.normal.totalMilliseconds, 20)
+        XCTAssertEqual(wait.normal.maxMilliseconds, 20)
+        XCTAssertEqual(wait.bulk.count, 2)
+        XCTAssertEqual(wait.bulk.totalMilliseconds, 80)
+        XCTAssertEqual(wait.bulk.maxMilliseconds, 50)
     }
 
     func test_tracker_clientConnected_incrementsActiveClients() {
@@ -250,11 +379,16 @@ final class WSConnectionMetricsTests: XCTestCase {
         tracker.updateQueuedBytes(previous: 500, current: 0)
         tracker.recordFrameBytes(-1)
         tracker.recordFramesRejectedOrEvicted(-1)
+        tracker.recordOutboundQueueWait(priority: .bulk, waitMilliseconds: -100)
         XCTAssertGreaterThanOrEqual(tracker.activeClients, 0)
         XCTAssertGreaterThanOrEqual(tracker.totalQueuedBytes, 0)
         XCTAssertGreaterThanOrEqual(tracker.slowClientDrops, 0)
         XCTAssertGreaterThanOrEqual(tracker.maxObservedOutboundQueuedBytes, 0)
         XCTAssertGreaterThanOrEqual(tracker.maxObservedFrameBytes, 0)
         XCTAssertGreaterThanOrEqual(tracker.framesRejectedOrEvicted, 0)
+        let wait = tracker.outboundQueueWaitMetrics
+        XCTAssertGreaterThanOrEqual(wait.priority.totalMilliseconds, 0)
+        XCTAssertGreaterThanOrEqual(wait.normal.totalMilliseconds, 0)
+        XCTAssertGreaterThanOrEqual(wait.bulk.totalMilliseconds, 0)
     }
 }

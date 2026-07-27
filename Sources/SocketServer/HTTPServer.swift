@@ -54,8 +54,9 @@ public extension DirectAuthProvider {
 /// Public so the test suite can inject controlled values.
 ///
 /// Lifetime counters (`slowClientDrops`, max-observed depths, rejected/evicted
-/// frame counts) are process-scoped and never decrease. Live gauges
-/// (`activeClients`, `totalQueuedBytes`) follow connect/disconnect samples.
+/// frame counts, outbound queue wait aggregates) are process-scoped and never
+/// decrease. Live gauges (`activeClients`, `totalQueuedBytes`) follow
+/// connect/disconnect samples.
 public final class WSConnectionTracker: @unchecked Sendable {
     private let lock = NSLock()
     private var _activeClients: Int = 0
@@ -67,6 +68,9 @@ public final class WSConnectionTracker: @unchecked Sendable {
     private var _maxObservedFrameBytes: Int = 0
     /// Frames refused at enqueue under backpressure or shed by degrade().
     private var _framesRejectedOrEvicted: Int = 0
+    /// Enqueue→dequeue wait aggregates by existing application priority lane.
+    /// Secret-free: count/total/max milliseconds only.
+    private var _outboundQueueWait = OutboundQueueWaitMetricsSnapshot.zero
 
     public init() {}
 
@@ -98,6 +102,12 @@ public final class WSConnectionTracker: @unchecked Sendable {
     public var framesRejectedOrEvicted: Int {
         lock.lock(); defer { lock.unlock() }
         return _framesRejectedOrEvicted
+    }
+
+    /// Process-scoped outbound queue wait aggregates (priority / normal / bulk).
+    var outboundQueueWaitMetrics: OutboundQueueWaitMetricsSnapshot {
+        lock.lock(); defer { lock.unlock() }
+        return _outboundQueueWait
     }
 
     /// Called when a WS connection is established.
@@ -150,26 +160,67 @@ public final class WSConnectionTracker: @unchecked Sendable {
     public func recordSlowClientDrop() {
         lock.lock(); _slowClientDrops += 1; lock.unlock()
     }
+
+    /// Record one application-frame enqueue→dequeue wait sample for a lane.
+    /// Negative/non-finite waits are clamped; lane labels are fixed enums only.
+    func recordOutboundQueueWait(
+        priority: WebSocketOutboundQueue.ApplicationPriority,
+        waitMilliseconds: Double
+    ) {
+        let bounded: Double
+        if waitMilliseconds.isFinite {
+            bounded = max(0, waitMilliseconds)
+        } else {
+            bounded = 0
+        }
+        lock.lock()
+        switch priority {
+        case .priority:
+            _outboundQueueWait.priority.record(waitMilliseconds: bounded)
+        case .normal:
+            _outboundQueueWait.normal.record(waitMilliseconds: bounded)
+        case .bulk:
+            _outboundQueueWait.bulk.record(waitMilliseconds: bounded)
+        }
+        lock.unlock()
+    }
 }
 
 /// Pure helper: assembles the `connections` sub-object for /v1/health from
 /// plain counter inputs. No I/O, no actor, fully unit-testable.
 /// Values are clamped nonnegative so health never emits negative gauges.
+///
+/// `outbound_queue_wait_ms` is additive diagnostics only (count/total/max per
+/// existing application lane). It never includes payloads, tokens, hosts, or
+/// request bodies.
 public func connectionMetricsJSON(
     activeClients: Int,
     totalQueuedBytes: Int,
     slowClientDrops: Int,
     maxObservedOutboundQueuedBytes: Int = 0,
     maxObservedFrameBytes: Int = 0,
-    framesRejectedOrEvicted: Int = 0
+    framesRejectedOrEvicted: Int = 0,
+    outboundQueueWait: OutboundQueueWaitMetricsSnapshot = .zero
 ) -> [String: Any] {
+    func laneJSON(_ metrics: OutboundQueueWaitLaneMetrics) -> [String: Any] {
+        [
+            "count": metrics.count,
+            "total": max(0, metrics.totalMilliseconds),
+            "max": max(0, metrics.maxMilliseconds)
+        ]
+    }
     return [
         "active_clients": max(0, activeClients),
         "total_queued_bytes": max(0, totalQueuedBytes),
         "slow_client_drops": max(0, slowClientDrops),
         "max_observed_outbound_queued_bytes": max(0, maxObservedOutboundQueuedBytes),
         "max_observed_frame_bytes": max(0, maxObservedFrameBytes),
-        "frames_rejected_or_evicted": max(0, framesRejectedOrEvicted)
+        "frames_rejected_or_evicted": max(0, framesRejectedOrEvicted),
+        "outbound_queue_wait_ms": [
+            "priority": laneJSON(outboundQueueWait.priority),
+            "normal": laneJSON(outboundQueueWait.normal),
+            "bulk": laneJSON(outboundQueueWait.bulk)
+        ]
     ]
 }
 
@@ -1444,6 +1495,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 didSendTerminal: { [weak self] in
                     self?.activeWebSocketConnections.remove(connectionId)
                     shutdown(fd, SHUT_RDWR)
+                },
+                onApplicationQueueWaitRecorded: { [wsTracker] priority, waitMilliseconds in
+                    // Secret-free process aggregates for /v1/health.connections.
+                    wsTracker.recordOutboundQueueWait(
+                        priority: priority,
+                        waitMilliseconds: waitMilliseconds
+                    )
                 }
             )
             // C-04: pressure baseline_required ≤1/s, never as a close reason.
@@ -1827,7 +1885,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     slowClientDrops: wsTracker.slowClientDrops,
                     maxObservedOutboundQueuedBytes: wsTracker.maxObservedOutboundQueuedBytes,
                     maxObservedFrameBytes: wsTracker.maxObservedFrameBytes,
-                    framesRejectedOrEvicted: wsTracker.framesRejectedOrEvicted
+                    framesRejectedOrEvicted: wsTracker.framesRejectedOrEvicted,
+                    outboundQueueWait: wsTracker.outboundQueueWaitMetrics
                 ),
                 "command_receipts": [
                     "claims_total": receiptMetrics.claimsTotal,

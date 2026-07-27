@@ -76,6 +76,71 @@ struct WebSocketFrameFIFO<Element> {
     }
 }
 
+/// Aggregate enqueue→dequeue wait for one outbound application priority lane.
+/// Secret-free: counts and milliseconds only (no payloads, tokens, hosts).
+/// Public so `connectionMetricsJSON` can accept a typed default argument.
+public struct OutboundQueueWaitLaneMetrics: Equatable, Sendable {
+    public var count: UInt64
+    public var totalMilliseconds: Double
+    public var maxMilliseconds: Double
+
+    public static let zero = OutboundQueueWaitLaneMetrics(
+        count: 0,
+        totalMilliseconds: 0,
+        maxMilliseconds: 0
+    )
+
+    public init(count: UInt64, totalMilliseconds: Double, maxMilliseconds: Double) {
+        self.count = count
+        self.totalMilliseconds = totalMilliseconds
+        self.maxMilliseconds = maxMilliseconds
+    }
+
+    public mutating func record(waitMilliseconds: Double) {
+        let bounded: Double
+        if waitMilliseconds.isFinite {
+            bounded = max(0, waitMilliseconds)
+        } else {
+            bounded = 0
+        }
+        count &+= 1
+        totalMilliseconds += bounded
+        maxMilliseconds = max(maxMilliseconds, bounded)
+    }
+}
+
+/// Process-safe snapshot of queue wait aggregates by existing application lane.
+/// Public fixed numeric shape only (priority/normal/bulk count/total/max).
+public struct OutboundQueueWaitMetricsSnapshot: Equatable, Sendable {
+    public var priority: OutboundQueueWaitLaneMetrics
+    public var normal: OutboundQueueWaitLaneMetrics
+    public var bulk: OutboundQueueWaitLaneMetrics
+
+    public static let zero = OutboundQueueWaitMetricsSnapshot(
+        priority: .zero,
+        normal: .zero,
+        bulk: .zero
+    )
+
+    public init(
+        priority: OutboundQueueWaitLaneMetrics,
+        normal: OutboundQueueWaitLaneMetrics,
+        bulk: OutboundQueueWaitLaneMetrics
+    ) {
+        self.priority = priority
+        self.normal = normal
+        self.bulk = bulk
+    }
+
+    func metrics(for priority: WebSocketOutboundQueue.ApplicationPriority) -> OutboundQueueWaitLaneMetrics {
+        switch priority {
+        case .priority: return self.priority
+        case .normal: return normal
+        case .bulk: return bulk
+        }
+    }
+}
+
 final class WebSocketOutboundQueue: @unchecked Sendable {
     enum EnqueueResult: Equatable {
         case accepted
@@ -85,7 +150,7 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
 
     /// Application-frame priority derived only from existing wire fields
     /// (`type` / sheddable `kind`). Does not invent input/stop semantics.
-    enum ApplicationPriority: Equatable {
+    enum ApplicationPriority: Equatable, Hashable {
         /// Transport recovery / liveness frames that are not event-stream
         /// sequenced with client gap detection: error, closing, baselineRequired, heartbeat.
         case priority
@@ -93,6 +158,14 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         case normal
         /// Snapshots and existing sheddable bulk/diagnostic event kinds.
         case bulk
+    }
+
+    /// Buffered application frame with enqueue stamp for wait instrumentation.
+    private struct QueuedApplicationFrame {
+        let data: Data
+        let priority: ApplicationPriority
+        /// Monotonic timestamp from `now` at accept time (not wall clock).
+        let enqueuedAt: TimeInterval
     }
 
     /// Result of a backpressure degrade pass. Callers use this to account for
@@ -154,8 +227,8 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     //    sequenced event/snapshot FIFO
     // Sequenced event frames and bulk share one FIFO so seq order is preserved.
     // Each enqueue still dispatches exactly one drain token; only pick order changes.
-    private var pendingPriorityApplicationFrames = WebSocketFrameFIFO<Data>()
-    private var pendingApplicationFrames = WebSocketFrameFIFO<Data>()
+    private var pendingPriorityApplicationFrames = WebSocketFrameFIFO<QueuedApplicationFrame>()
+    private var pendingApplicationFrames = WebSocketFrameFIFO<QueuedApplicationFrame>()
     private var pendingControlFrames = WebSocketFrameFIFO<(opcode: UInt8, data: Data)>()
     private let applicationWriter: @Sendable (Data) -> Bool
     private let controlWriter: @Sendable (UInt8, Data) -> Bool
@@ -164,6 +237,13 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     private let didSendTerminal: @Sendable () -> Void
     private let acceptedSubmissionHook: @Sendable () -> Void
     private let terminationAttemptHook: @Sendable () -> Void
+    /// Monotonic (or injectable) clock for enqueue→dequeue wait. Default is
+    /// process uptime so wall-clock jumps never skew wait samples.
+    private let now: @Sendable () -> TimeInterval
+    /// Optional process-scoped sink (e.g. WSConnectionTracker). Never receives payloads.
+    private let onApplicationQueueWaitRecorded: @Sendable (ApplicationPriority, Double) -> Void
+    /// Per-queue aggregate wait by existing application lane (tests + diagnostics).
+    private var waitMetrics = OutboundQueueWaitMetricsSnapshot.zero
     /// EMA of observed application+control drain rate (bytes/sec).
     private var measuredDrainBytesPerSecond: Double = 0
     private var lastDrainAt: TimeInterval = 0
@@ -179,7 +259,9 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         onTerminal: @escaping @Sendable (String) -> Void,
         didSendTerminal: @escaping @Sendable () -> Void,
         acceptedSubmissionHook: @escaping @Sendable () -> Void = {},
-        terminationAttemptHook: @escaping @Sendable () -> Void = {}
+        terminationAttemptHook: @escaping @Sendable () -> Void = {},
+        now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        onApplicationQueueWaitRecorded: @escaping @Sendable (ApplicationPriority, Double) -> Void = { _, _ in }
     ) {
         self.queue = DispatchQueue(label: label)
         self.configuredMaxQueuedBytes = max(1, maxQueuedBytes)
@@ -191,6 +273,8 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         self.didSendTerminal = didSendTerminal
         self.acceptedSubmissionHook = acceptedSubmissionHook
         self.terminationAttemptHook = terminationAttemptHook
+        self.now = now
+        self.onApplicationQueueWaitRecorded = onApplicationQueueWaitRecorded
     }
 
     convenience init(
@@ -235,6 +319,12 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         return measuredDrainBytesPerSecond
     }
 
+    /// Aggregate enqueue→dequeue wait by existing application lane (secret-free).
+    var queueWaitMetricsSnapshot: OutboundQueueWaitMetricsSnapshot {
+        lock.lock(); defer { lock.unlock() }
+        return waitMetrics
+    }
+
     func enqueue(_ data: Data) -> EnqueueResult {
         // C-04: overflow is a degrade signal, never an implicit close.
         enqueueApplication(data)
@@ -276,13 +366,18 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
                 return .queueFull
             }
         }
+        let queued = QueuedApplicationFrame(
+            data: data,
+            priority: priority,
+            enqueuedAt: now()
+        )
         queuedBytes += data.count
         queuedFrames += 1
         switch priority {
         case .priority:
-            pendingPriorityApplicationFrames.append(data)
+            pendingPriorityApplicationFrames.append(queued)
         case .normal, .bulk:
-            pendingApplicationFrames.append(data)
+            pendingApplicationFrames.append(queued)
         }
         acceptedSubmissionHook()
         queue.async { [weak self] in self?.writeNextPendingFrame() }
@@ -331,6 +426,9 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     /// Backpressure ladder (C-04): coalesce by key → discard bulk/diagnostic
     /// application frames → report that a focused `baseline_required` is needed.
     /// Never closes the socket. Control frames are preserved.
+    ///
+    /// Degrade re-staging is not send admission: wait stamps are preserved for
+    /// kept frames and only recorded when the drain actually dequeues them.
     @discardableResult
     func degrade() -> DegradeOutcome {
         lock.lock()
@@ -339,32 +437,45 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             return .empty
         }
 
-        var frames: [Data] = []
+        var queued: [QueuedApplicationFrame] = []
         while let frame = pendingPriorityApplicationFrames.popFirst() {
-            frames.append(frame)
+            queued.append(frame)
         }
         while let frame = pendingApplicationFrames.popFirst() {
-            frames.append(frame)
+            queued.append(frame)
         }
-        guard !frames.isEmpty else {
+        guard !queued.isEmpty else {
             lock.unlock()
             return .empty
         }
 
+        // Coalesce operates on payloads only; reattach the oldest matching stamp
+        // so enqueue→send wait still reflects original acceptance time.
+        var enqueueStampsByData: [Data: TimeInterval] = [:]
+        enqueueStampsByData.reserveCapacity(queued.count)
+        for frame in queued {
+            if let existing = enqueueStampsByData[frame.data] {
+                enqueueStampsByData[frame.data] = min(existing, frame.enqueuedAt)
+            } else {
+                enqueueStampsByData[frame.data] = frame.enqueuedAt
+            }
+        }
+
+        let frames = queued.map(\.data)
         let beforeBytes = frames.reduce(0) { $0 + $1.count }
         let beforeCount = frames.count
 
         let coalesced = Self.coalesceApplicationFrames(frames)
         let coalescedAway = beforeCount - coalesced.count
 
-        var kept: [Data] = []
+        var kept: [QueuedApplicationFrame] = []
         var droppedSequences: [Int64] = []
         var discardedBulk = 0
         kept.reserveCapacity(coalesced.count)
         for frame in coalesced {
             // Snapshots and sheddable event kinds are bulk under pressure.
-            if Self.applicationPriority(of: frame) == .bulk
-                || Self.isSheddableApplicationFrame(frame) {
+            let priority = Self.applicationPriority(of: frame)
+            if priority == .bulk || Self.isSheddableApplicationFrame(frame) {
                 discardedBulk += 1
                 if let sequence = Self.eventSequence(in: frame) {
                     droppedSequences.append(sequence)
@@ -374,13 +485,14 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
                 }
                 continue
             }
-            kept.append(frame)
+            let stamp = enqueueStampsByData[frame] ?? now()
+            kept.append(QueuedApplicationFrame(data: frame, priority: priority, enqueuedAt: stamp))
         }
 
         // If coalescing alone made room and nothing bulk was shed, still report
         // sequences lost to last-write-wins coalesce so the caller can baseline.
         if discardedBulk == 0, coalescedAway > 0 {
-            let keptSequences = Set(kept.compactMap { Self.eventSequence(in: $0) })
+            let keptSequences = Set(kept.compactMap { Self.eventSequence(in: $0.data) })
             for frame in frames {
                 guard let sequence = Self.eventSequence(in: frame),
                       !keptSequences.contains(sequence) else { continue }
@@ -388,13 +500,13 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             }
         }
 
-        let afterBytes = kept.reduce(0) { $0 + $1.count }
+        let afterBytes = kept.reduce(0) { $0 + $1.data.count }
         let controlBytes = queuedControlBytes
         let controlFrames = queuedFrames - beforeCount
         queuedBytes = max(0, controlBytes) + afterBytes
         queuedFrames = max(0, controlFrames) + kept.count
         for frame in kept {
-            if Self.applicationPriority(of: frame) == .priority {
+            if frame.priority == .priority {
                 pendingPriorityApplicationFrames.append(frame)
             } else {
                 pendingApplicationFrames.append(frame)
@@ -604,23 +716,55 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     /// An application frame whose write already started is never preempted
     /// (RFC 6455 frames must not interleave).
     private func writeNextPendingFrame() {
+        enum Admission {
+            case control(opcode: UInt8, data: Data)
+            case application(QueuedApplicationFrame, waitMilliseconds: Double)
+        }
+
+        let admission: Admission?
         lock.lock()
         if let control = pendingControlFrames.popFirst() {
+            admission = .control(opcode: control.opcode, data: control.data)
             lock.unlock()
-            writeControl(opcode: control.opcode, data: control.data)
+        } else if let frame = pendingPriorityApplicationFrames.popFirst() {
+            let waitMs = recordApplicationQueueWaitLocked(frame)
+            admission = .application(frame, waitMilliseconds: waitMs)
+            lock.unlock()
+            onApplicationQueueWaitRecorded(frame.priority, waitMs)
+        } else if let frame = pendingApplicationFrames.popFirst() {
+            let waitMs = recordApplicationQueueWaitLocked(frame)
+            admission = .application(frame, waitMilliseconds: waitMs)
+            lock.unlock()
+            onApplicationQueueWaitRecorded(frame.priority, waitMs)
+        } else {
+            lock.unlock()
+            admission = nil
+        }
+
+        switch admission {
+        case .control(let opcode, let data):
+            writeControl(opcode: opcode, data: data)
+        case .application(let frame, _):
+            writeApplication(frame.data)
+        case nil:
             return
         }
-        if let data = pendingPriorityApplicationFrames.popFirst() {
-            lock.unlock()
-            writeApplication(data)
-            return
+    }
+
+    /// Attribute enqueue→dequeue wait to the lane classified at accept time.
+    /// Call only while holding `lock`. Returns non-negative milliseconds.
+    @discardableResult
+    private func recordApplicationQueueWaitLocked(_ frame: QueuedApplicationFrame) -> Double {
+        let waitMs = max(0, (now() - frame.enqueuedAt) * 1_000)
+        switch frame.priority {
+        case .priority:
+            waitMetrics.priority.record(waitMilliseconds: waitMs)
+        case .normal:
+            waitMetrics.normal.record(waitMilliseconds: waitMs)
+        case .bulk:
+            waitMetrics.bulk.record(waitMilliseconds: waitMs)
         }
-        guard let data = pendingApplicationFrames.popFirst() else {
-            lock.unlock()
-            return
-        }
-        lock.unlock()
-        writeApplication(data)
+        return waitMs
     }
 
     private func writeApplication(_ data: Data) {

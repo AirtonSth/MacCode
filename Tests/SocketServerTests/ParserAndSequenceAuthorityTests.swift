@@ -766,6 +766,171 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
         release.signal()
         owner.finish()
     }
+
+    // MARK: - Queue wait by existing application priority lane
+
+    func test_queueWait_attributedToExistingLanes_withInjectableClock() throws {
+        // WHY: "Medir tempo de fila por prioridade" is only useful if each
+        // frame's enqueue→dequeue wait is charged to the lane derived from
+        // existing wire fields — not a single undifferentiated timer, and not
+        // invented input/stop classes.
+        let clock = LockedMonotonicClock(start: 1_000)
+        let stall = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let tracker = WSConnectionTracker()
+        let owner = WebSocketOutboundQueue(
+            maxQueuedBytes: 64 * 1024,
+            applicationWriter: { data in
+                // Hold the first (normal) write so later frames sit in queue
+                // while the injectable clock advances.
+                if WebSocketOutboundQueue.eventSequence(in: data) == 1 {
+                    stall.signal()
+                    _ = release.wait(timeout: .now() + 2)
+                }
+                return true
+            },
+            controlWriter: { _, _ in true },
+            writeFailureClosingData: Data(),
+            onTerminal: { _ in XCTFail("wait instrumentation must not terminate") },
+            didSendTerminal: {},
+            now: { clock.now },
+            onApplicationQueueWaitRecorded: { priority, waitMs in
+                tracker.recordOutboundQueueWait(priority: priority, waitMilliseconds: waitMs)
+            }
+        )
+
+        let normalHold = try eventJSON(seq: 1, kind: "agent.run.completed", payload: ["t": "hold"])
+        XCTAssertEqual(owner.enqueueApplication(normalHold), .accepted)
+        XCTAssertEqual(stall.wait(timeout: .now() + 2), .success)
+
+        // Enqueue one frame per existing application lane while drain is blocked.
+        clock.advance(by: 0.010) // 10ms wall of queue time before bulk stamp
+        let bulk = try JSONSerialization.data(withJSONObject: [
+            "type": "snapshot",
+            "sequence": 50,
+            "blob": "bulk-body",
+        ])
+        XCTAssertEqual(owner.enqueueApplication(bulk), .accepted)
+
+        clock.advance(by: 0.020) // bulk has waited 20ms more; normal-next enqueues now
+        let normalNext = try eventJSON(seq: 2, kind: "agent.run.completed",
+                                       payload: ["thread_id": "t"])
+        XCTAssertEqual(owner.enqueueApplication(normalNext), .accepted)
+
+        clock.advance(by: 0.005)
+        let priority = try JSONSerialization.data(withJSONObject: [
+            "type": "baselineRequired",
+            "reason": "outbound_queue_pressure",
+            "token": "must-not-appear-in-metrics",
+            "host": "secret.example",
+        ])
+        XCTAssertEqual(owner.enqueueApplication(priority), .accepted)
+
+        // Advance clock so every queued frame has a deterministic wait when drained.
+        // Priority drains next (overtakes bulk/normal FIFO), then bulk, then normal.
+        //
+        // Timeline (clock seconds from start 1000):
+        //   normalHold @ 1000.000 (immediate dequeue, wait≈0)
+        //   bulk @ 1000.010
+        //   normalNext @ 1000.030
+        //   priority @ 1000.035
+        //   advance to 1000.135 then release
+        // At dequeue (same now=1000.135):
+        //   priority wait = 100ms
+        //   bulk wait = 125ms
+        //   normalNext wait = 105ms
+        clock.advance(by: 0.100)
+        release.signal()
+        owner.finish()
+
+        let queueSnap = owner.queueWaitMetricsSnapshot
+        let trackerSnap = tracker.outboundQueueWaitMetrics
+
+        // First normal hold may have near-zero wait (drained immediately).
+        XCTAssertGreaterThanOrEqual(queueSnap.normal.count, 2,
+                                    "hold + completion must both attribute to normal lane")
+        XCTAssertEqual(queueSnap.priority.count, 1,
+                       "baselineRequired must attribute only to priority lane")
+        XCTAssertEqual(queueSnap.bulk.count, 1,
+                       "snapshot must attribute only to bulk lane")
+
+        XCTAssertEqual(queueSnap.priority.maxMilliseconds, 100, accuracy: 0.001)
+        XCTAssertEqual(queueSnap.bulk.maxMilliseconds, 125, accuracy: 0.001)
+        XCTAssertEqual(queueSnap.priority.totalMilliseconds, 100, accuracy: 0.001)
+        XCTAssertGreaterThanOrEqual(queueSnap.normal.maxMilliseconds, 105 - 0.001)
+
+        // Tracker mirror must match queue (process-scoped health sink).
+        XCTAssertEqual(trackerSnap.priority.count, queueSnap.priority.count)
+        XCTAssertEqual(trackerSnap.bulk.count, queueSnap.bulk.count)
+        XCTAssertEqual(trackerSnap.normal.count, queueSnap.normal.count)
+        XCTAssertEqual(trackerSnap.priority.maxMilliseconds, queueSnap.priority.maxMilliseconds,
+                       accuracy: 0.001)
+        XCTAssertEqual(trackerSnap.bulk.maxMilliseconds, queueSnap.bulk.maxMilliseconds,
+                       accuracy: 0.001)
+
+        // Health surface stays secret-free even when frames carried secrets.
+        let health = connectionMetricsJSON(
+            activeClients: 1,
+            totalQueuedBytes: owner.queuedByteCount,
+            slowClientDrops: 0,
+            outboundQueueWait: trackerSnap
+        )
+        guard let encoded = try? JSONSerialization.data(withJSONObject: health),
+              let text = String(data: encoded, encoding: .utf8) else {
+            return XCTFail("health connections JSON must encode")
+        }
+        for leak in ["must-not-appear-in-metrics", "secret.example", "token", "baselineRequired",
+                     "snapshot", "agent.run.completed", "bulk-body"] {
+            XCTAssertFalse(text.contains(leak),
+                           "queue wait health metrics must not leak \(leak)")
+        }
+        let waitJSON = health["outbound_queue_wait_ms"] as? [String: Any]
+        XCTAssertEqual(Set((waitJSON ?? [:]).keys), Set(["priority", "normal", "bulk"]))
+    }
+
+    func test_queueWait_controlFramesDoNotInflateApplicationLaneMetrics() throws {
+        // WHY: control/pong path is not an application priority lane; counting
+        // it as normal/priority would misdiagnose application backlog.
+        let clock = LockedMonotonicClock(start: 50)
+        let owner = WebSocketOutboundQueue(
+            maxQueuedBytes: 4_096,
+            applicationWriter: { _ in true },
+            controlWriter: { _, _ in true },
+            writeFailureClosingData: Data(),
+            onTerminal: { _ in XCTFail("must not terminate") },
+            didSendTerminal: {},
+            now: { clock.now }
+        )
+        clock.advance(by: 0.050)
+        XCTAssertEqual(owner.enqueueControl(opcode: 0xA, data: Data([0x01])), .accepted)
+        owner.finish()
+
+        let snap = owner.queueWaitMetricsSnapshot
+        XCTAssertEqual(snap.priority, .zero)
+        XCTAssertEqual(snap.normal, .zero)
+        XCTAssertEqual(snap.bulk, .zero)
+    }
+}
+
+/// Deterministic monotonic clock for queue-wait tests (seconds).
+private final class LockedMonotonicClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: TimeInterval
+
+    init(start: TimeInterval) {
+        self.value = start
+    }
+
+    var now: TimeInterval {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+
+    func advance(by delta: TimeInterval) {
+        lock.lock()
+        value += max(0, delta)
+        lock.unlock()
+    }
 }
 
 /// Thread-safe string log for outbound writer tests.
