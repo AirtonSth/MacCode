@@ -772,6 +772,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
     static let maximumAcceptedConnections = AcceptedSocketRegistry.defaultMaximumDescriptors
     var acceptedSocketCountForTests: Int { acceptedSockets.count }
     var afterWelcomeWriteForTests: ((String) -> Void)?
+    /// Test seam: fires once per WS upgrade with the coalescing window (ms)
+    /// that is passed as `WebSocketEventBatcher.delay` after header negotiation.
+    /// Production never sets this; used only to prove `X-RC2-WS-Coalesce-Window-Ms`
+    /// is honored on the real HTTP→WebSocket path (not just the pure helper).
+    var webSocketCoalescingWindowObserverForTests: (@Sendable (Int) -> Void)?
     var acceptedFDObserverForTesting: (@Sendable (Int32) -> Void)?
     var connectionReadWaitObserverForTesting: (@Sendable (Int32, ConnectionReadWaitStageForTesting) -> Void)?
 
@@ -1644,6 +1649,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // terminal.output.summary per surface → ≥5× fewer summaries/sec).
             // C-15: coalesce agent.item.delta on all links; cellular uses a longer
             // window (100ms) so ~10× fewer frames than one-frame-per-token.
+            // Same value negotiated from `X-RC2-WS-Coalesce-Window-Ms` (or
+            // filter default / clamp) is what the batcher is configured with.
+            webSocketCoalescingWindowObserverForTests?(coalescingWindowMs)
             let batcher = WebSocketEventBatcher(
                 enabled: wsFilter.isCellularSafe,
                 filter: wsFilter,
