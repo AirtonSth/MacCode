@@ -34,12 +34,49 @@ final class ToolRowPresentationTests: XCTestCase {
     func test_cappedDetailTruncatesLongOutput() {
         let long = String(repeating: "x", count: 10_000)
         let capped = AgentTimelineItemPresentation.cappedDetail(long, limit: 6_000)
-        XCTAssertLessThan(capped.count, long.count, "a noisy Skill/command dump must not blow up the transcript")
+        XCTAssertLessThan(capped.count, long.count, "a noisy ordinary command dump must not blow up the transcript")
         XCTAssertTrue(capped.contains("truncated in view"))
     }
 
     func test_cappedDetailLeavesShortOutput() {
         XCTAssertEqual(AgentTimelineItemPresentation.cappedDetail("short", limit: 6_000), "short")
+    }
+
+    func test_skillToolOutputIsNeverTruncatedEvenWhenLarge() {
+        // WHY: skill content is a protected verbatim category. Ordinary tool output
+        // still uses the generic cap; Skill must return complete bodies so the agent
+        // path and the displayed/persisted canonical representation stay whole.
+        let largeSkillBody = """
+        ---
+        name: fixture-skill
+        ---
+        # Fixture Skill
+        \(String(repeating: "complete skill line — never distill or truncate\n", count: 400))
+        SKILL_FIXTURE_END
+        """
+        XCTAssertGreaterThan(largeSkillBody.count, 6_000, "fixture must exceed the ordinary display cap")
+
+        let skillItem = toolItem(
+            body: #"{"skill":"fixture-skill","args":""}"#,
+            summary: "Skill",
+            output: largeSkillBody
+        )
+        XCTAssertTrue(AgentTimelineItemPresentation.isSkillToolItem(skillItem))
+
+        let presented = AgentTimelineItemPresentation.cappedDetail(largeSkillBody, limit: 6_000, for: skillItem)
+        XCTAssertEqual(presented, largeSkillBody,
+                       "Skill presentation must preserve exact skill content with no truncation marker")
+        XCTAssertFalse(presented.contains("truncated in view"))
+        XCTAssertFalse(presented.contains("[[rc:"))
+        XCTAssertTrue(presented.hasSuffix("SKILL_FIXTURE_END\n") || presented.contains("SKILL_FIXTURE_END"))
+
+        // Ordinary Bash of the same size still truncates (cap remains for non-skill).
+        let bashItem = toolItem(body: #"{"command":"swift test"}"#, summary: "Bash", output: largeSkillBody)
+        XCTAssertFalse(AgentTimelineItemPresentation.isSkillToolItem(bashItem))
+        let ordinary = AgentTimelineItemPresentation.cappedDetail(largeSkillBody, limit: 6_000, for: bashItem)
+        XCTAssertTrue(ordinary.contains("truncated in view"),
+                      "ordinary tool output remains eligible for display truncation")
+        XCTAssertNotEqual(ordinary, largeSkillBody)
     }
 
     func test_presentationStillShowsRanToolName() {

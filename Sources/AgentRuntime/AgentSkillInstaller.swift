@@ -140,7 +140,7 @@ public enum RemoteCodeOrchestrateInstallError: Error, Sendable, Equatable {
 public final class AgentSkillInstaller: @unchecked Sendable {
     public static let distillSkillID = "distill"
     public static let distillSourceURL = "https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md"
-    public static let distillLocalVersion = "6"
+    public static let distillLocalVersion = "7"
     public static let distillInstructionsBeginMarker = "<!-- distill skill: begin -->"
     public static let distillInstructionsEndMarker = "<!-- distill skill: end -->"
     public static let distillCLIBeginMarker = "# RemoteCode managed distill CLI: begin"
@@ -153,9 +153,11 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     public static let remoteCodeOrchestratePinnedPackage = RemoteCodeOrchestratePackage(
         skillID: "remote-code-orchestrate",
         sourceURL: "https://github.com/samuelfaj/sam-skills/tree/main/sam-orchestrate",
+        // Upstream base revision; tree digest is recomputed from the embedded package
+        // after local contract edits (skill content must stay complete / no Distill-in-skills).
         sourceRevision: "2c77fa48431bc20e5dc841652079594a3ea918c9",
-        sourceTreeSHA256: "c9d7eb11b83d3fd4a7be38e4de2e7acac0100be11a27441b435b41006709a0eb",
-        localVersion: "1",
+        sourceTreeSHA256: "920c6cd819b285332a8381526552e08b47fd28ba55a1f4392b57f71010ce19c8",
+        localVersion: "2",
         allowedPaths: [
             "SKILL.md",
             "agents/openai.yaml",
@@ -202,8 +204,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     - Do not output a rewritten/compressed version of the latest user prompt unless the user explicitly asks to compress text.
     - Emit `Dict:` early only when aliases reduce repetition (never secrets/people/paths/URLs as aliases).
 
-    Command-output policy (Token Saver — compress noisy output; never distill exact-payload tools):
-    - DEFAULT: pipe high-volume / noisy, pipable commands through the RemoteCode-managed `distill` CLI with an explicit extraction prompt and `pipefail` when exit status matters.
+    Command-output policy (Token Saver — compress eligible ordinary noisy output; never distill exact-payload tools or skill content):
+    - DEFAULT: pipe high-volume / noisy, pipable ordinary commands through the RemoteCode-managed `distill` CLI with an explicit extraction prompt and `pipefail` when exit status matters.
       Good for: build, test, lint, install, docker, kubectl, terraform, find, ls (large listings), git log/status/diff (summaries), long CI logs.
     - NEVER pipe `| distill` for exact-output commands — the agent needs the full stdout for the next step:
       search/match: rg, grep, egrep, fgrep, ag, ugrep, git grep
@@ -211,9 +213,10 @@ public final class AgentSkillInstaller: @unchecked Sendable {
       exact compare/bytes: diff, cmp, od, hexdump, xxd, base64
       structure extractors when parsing: jq, yq
       Also skip for: patches/apply, hash/token copy, interactive/TUI, non-pipable calls, or unavailable RemoteCodeDistillService.
+    - NEVER Distill skill content: Skill tool output and requested/returned SKILL.md bodies are a protected verbatim category — return them complete (no summary, recovery handle, truncation, or savings accounting).
     - Never call Node, tsx, npm, bun, or a source-checkout CLI for `distill`.
-    - When you skip `| distill`, state that briefly (e.g. skip: exact sed/rg output).
-    - Every subagent, worker, reviewer, or delegated prompt must repeat this Distill rule and require its descendants to do the same; never assume inherited context is enough.
+    - When you skip `| distill`, state that briefly (e.g. skip: exact sed/rg output; skip: skill content).
+    - Host/runtime carries the ordinary-output Distill policy; do not require every worker prompt to restate it.
     - If a summary includes `[[rc:<handle>]]`, recover exact bytes with `distill retrieve <handle>`.
     - Wait for `distill` before continuing when you did pipe it.
 
@@ -235,11 +238,12 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     Prefixes when used: S=state, C=context, D=action, R=risk, O=outcome, N=no-go, P=proof.
     Dict/`#` vars only when they reduce repetition. Never alias secrets, people, IDs, paths, URLs.
     Do not return a rewritten/compressed copy of the user's prompt unless explicitly asked to compress text.
-    Token Saver — compress noisy output via managed `distill` CLI with an explicit extraction prompt; use `pipefail` when exit status matters.
+    Token Saver — compress eligible ordinary noisy output via managed `distill` CLI with an explicit extraction prompt; use `pipefail` when exit status matters.
     Good to pipe: build/test/lint/install/docker/kubectl/terraform, large find/ls, git log/status/diff summaries, long logs.
     NEVER pipe `| distill` for exact-output tools (agent needs full stdout): rg, grep, egrep, fgrep, sed, awk, cat, head, tail, nl, cut, tr, diff, jq, yq, git grep/show/cat-file/blame; also patches/hashes/tokens, interactive/TUI, non-pipable, or service unavailable — state the skip briefly.
+    NEVER Distill skill content: Skill tool output and requested/returned SKILL bodies must stay complete/verbatim (no summary, `[[rc:]]` handle, truncation, or savings accounting).
     Never invoke Node/tsx/npm/bun or a source-checkout `distill`.
-    Every subagent, worker, reviewer, or delegated prompt MUST repeat this rule and require its descendants to do the same; never assume inheritance.
+    Host/runtime carries the ordinary-output Distill policy; do not require every worker prompt to restate it.
     If a summary includes `[[rc:<handle>]]`, recover exact bytes with `distill retrieve <handle>`. Wait for `distill` before continuing when used.
     Details and examples live in the managed `distill` SKILL.md.
     <!-- distill skill: end -->

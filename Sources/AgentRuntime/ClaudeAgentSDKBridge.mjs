@@ -64,10 +64,11 @@ const TOKEN_SAVER_MIN_BYTES = 1024;
 const TOKEN_SAVER_MIN_LINES = 10;
 const TOKEN_SAVER_STORE_MIN_BYTES = 2048;
 const TOKEN_SAVER_HOOK_TIMEOUT_MS = 1000;
-// Exact-byte tools are the ONLY carve-out: distilling file content / edit echoes
-// would break the agent's verbatim edits (the distill policy itself says "skip
-// when you need the exact bytes"). Every OTHER tool is compressed (no allowlist).
-const TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['read', 'edit', 'write', 'multiedit', 'notebookedit', 'grep']);
+// Exact-byte tools + Skill content are the ONLY carve-outs: distilling file
+// content / edit echoes would break verbatim edits, and skill bodies must stay
+// complete (never Distill/summary/handle). Every OTHER tool is compressed
+// (no allowlist).
+const TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['read', 'edit', 'write', 'multiedit', 'notebookedit', 'grep', 'skill']);
 // AGENTS.md: never distill exact-output shell tools. Bash commands whose primary
 // binary is one of these must stay full stdout for line slices / matches.
 const TOKEN_SAVER_EXACT_OUTPUT_BASH = new Set([
@@ -238,13 +239,17 @@ function isExactOutputBashCommand(toolInput) {
 
 function tokenSaverToolDecision(toolName, toolInput, output) {
   const normalized = normalizeToolName(toolName);
-  // Every tool compresses (no allowlist); only the exact-byte tools and
-  // sub-threshold output are skipped.
+  // Every tool compresses (no allowlist); only exact-byte tools, Skill content,
+  // and sub-threshold output are skipped. Skill is protected before threshold.
   const profile = TOKEN_SAVER_PROFILES.get(normalized) || TOKEN_SAVER_DEFAULT_PROFILE;
   let skipReason = null;
-  if (TOKEN_SAVER_EXCLUDED_TOOLS.has(normalized)) skipReason = 'excluded_tool';
-  else if (normalized === 'bash' && isExactOutputBashCommand(toolInput)) skipReason = 'exact_output_shell';
-  else if (Buffer.byteLength(output || '', 'utf8') <= TOKEN_SAVER_MIN_BYTES && lineCount(output) <= TOKEN_SAVER_MIN_LINES) skipReason = 'below_threshold';
+  if (TOKEN_SAVER_EXCLUDED_TOOLS.has(normalized)) {
+    skipReason = normalized === 'skill' ? 'skill_content' : 'excluded_tool';
+  } else if (normalized === 'bash' && isExactOutputBashCommand(toolInput)) {
+    skipReason = 'exact_output_shell';
+  } else if (Buffer.byteLength(output || '', 'utf8') <= TOKEN_SAVER_MIN_BYTES && lineCount(output) <= TOKEN_SAVER_MIN_LINES) {
+    skipReason = 'below_threshold';
+  }
   return { profile, shouldCompress: skipReason == null, skipReason };
 }
 

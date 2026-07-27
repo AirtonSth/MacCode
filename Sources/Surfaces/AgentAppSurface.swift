@@ -200,6 +200,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public private(set) var customModelsByProvider: [AgentProvider: [String]] = [:]
     @Published public var status: AgentRunStatus = .pending
     @Published public var statusMessage: String = ""
+    /// Informational replay state is separate from statusMessage so a bounded
+    /// history window cannot be presented as a provider/persistence error.
+    @Published public private(set) var historyReplayNotice: String?
+    public static let historyReplayNoticeText = "Showing the recent Agent history window. Earlier transcript events remain outside the hot replay budget."
+
+    public static func replayNoticeText(isPartial: Bool) -> String? {
+        isPartial ? historyReplayNoticeText : nil
+    }
     /// CLAUDE-BG-LIFECYCLE: how many CLI-owned background shells / async
     /// subagents the provider last reported as still running, from the
     /// `claude.session.snapshot` runtime event. Mirrors the Claude CLI's own
@@ -782,6 +790,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func selectThread(_ id: AgentThreadID, markRead: Bool = true) {
         guard !isDisposed else { return }
+        historyReplayNotice = nil
         let isThreadSwitch = selectedThreadId != id
         if isThreadSwitch {
             // IMP-MAC_AGENT-011: stash the leaving thread's draft before swapping,
@@ -882,7 +891,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         _ = streamEventBatch.drain()
         let persistedEvents = coordinator.latestStreamEvents(threadId: id)
         if coordinator.hotReplayIsPartial(threadId: id) {
-            statusMessage = "Showing the recent Agent history window. Earlier transcript events remain outside the hot replay budget."
+            historyReplayNotice = Self.replayNoticeText(isPartial: true)
         }
         // PERF: the provider-thread snapshot read (coordinator.readThread) used to
         // block thread-open for up to a provider round-trip (codex app-server),
@@ -3941,6 +3950,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         attachmentInputError = nil
     }
 
+    public func dismissHistoryReplayNotice() {
+        historyReplayNotice = nil
+    }
+
     public func dismissQueueStatusMessage() {
         if let selectedThreadId {
             queueStatusByThread.removeValue(forKey: selectedThreadId)
@@ -6065,11 +6078,32 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         }
     }
 
-    /// Sanitize + cap inline tool/skill output: strip ANSI escape codes (Bash output is full
+    /// Whether this timeline item is a Skill tool whose body/output must stay complete.
+    /// Skill content is a protected verbatim category (never Distill / display truncation).
+    static func isSkillToolItem(_ item: AssistantItem) -> Bool {
+        if let summary = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines),
+           summary.compare("Skill", options: .caseInsensitive) == .orderedSame {
+            return true
+        }
+        let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let data = body.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let skill = (obj["skill"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !skill.isEmpty else {
+            return false
+        }
+        return true
+    }
+
+    /// Sanitize + cap inline tool output: strip ANSI escape codes (Bash output is full
     /// of them and they render as literal garbage in a Text view) and cap length so one noisy
     /// command can't blow up the transcript. Full text remains selectable / in the stored event.
-    static func cappedDetail(_ text: String, limit: Int = 6_000) -> String {
+    /// Skill tool output is never truncated in presentation — skill content must stay complete.
+    static func cappedDetail(_ text: String, limit: Int = 6_000, for item: AssistantItem? = nil) -> String {
         let clean = stripANSI(text)
+        if let item, isSkillToolItem(item) {
+            return clean
+        }
         guard clean.count > limit else { return clean }
         let head = clean.prefix(limit)
         let dropped = clean.count - head.count
@@ -7892,6 +7926,13 @@ public struct AgentAppView: View {
             timeline
             backgroundAwaitBanner
             pendingCallbackRows
+            if let message = vm.historyReplayNotice {
+                inlineInfoBanner(
+                    message,
+                    identifier: "agent.history.replay.notice",
+                    dismiss: { vm.dismissHistoryReplayNotice() }
+                )
+            }
             if let message = Self.visibleStatusMessage(vm.statusMessage) {
                 inlineStatusBanner(
                     message,
@@ -9813,10 +9854,11 @@ public struct AgentAppView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
             }
 
-            // Output, collapsed by default and capped so a noisy command (or a Skill dump)
-            // can't blow up the transcript. Full text stays selectable.
+            // Output, collapsed by default and capped so a noisy command can't blow up
+            // the transcript. Skill tool output stays complete (source-aware exception).
+            // Full text stays selectable.
             if expanded, let o = output, !o.isEmpty {
-                Text(AgentTimelineItemPresentation.cappedDetail(o))
+                Text(AgentTimelineItemPresentation.cappedDetail(o, for: item))
                     .font(DS.Font.mono).foregroundColor(DS.Palette.textSecondary)
                     .textSelection(.enabled)
                     .padding(DS.Space.md)
@@ -10056,6 +10098,40 @@ public struct AgentAppView: View {
         .padding(.horizontal, DS.Space.lg)
         .padding(.vertical, DS.Space.sm)
         .background(DS.Palette.danger.opacity(0.09))
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier(identifier)
+    }
+
+    private func inlineInfoBanner(
+        _ message: String,
+        identifier: String,
+        dismiss: @escaping () -> Void
+    ) -> some View {
+        HStack(alignment: .center, spacing: DS.Space.sm) {
+            Image(systemName: "info.circle")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(DS.Palette.textSecondary)
+                .frame(width: 14, height: 14, alignment: .center)
+            Text(message)
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textSecondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(action: dismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .frame(width: 16, height: 16, alignment: .center)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(DS.Palette.textTertiary)
+            .accessibilityLabel("Dismiss history notice")
+            .accessibilityIdentifier("\(identifier).dismiss")
+            .help("Dismiss history notice")
+        }
+        .padding(.horizontal, DS.Space.lg)
+        .padding(.vertical, DS.Space.sm)
+        .background(DS.Palette.surfaceRaised)
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier(identifier)
     }
