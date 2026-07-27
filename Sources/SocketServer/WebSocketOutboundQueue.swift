@@ -585,6 +585,26 @@ final class LockedSubscriberID: @unchecked Sendable {
     }
 }
 
+/// Per-connection last outbound queue-byte sample for /v1/health gauges.
+final class LockedQueuedBytesSample: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: Int = 0
+
+    var value: Int {
+        lock.lock(); defer { lock.unlock() }
+        return storage
+    }
+
+    /// Atomically replace the sample and return the previous value.
+    func swap(_ newValue: Int) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let previous = storage
+        storage = max(0, newValue)
+        return previous
+    }
+}
+
 /// Rate-limits in-band `baseline_required` emissions under outbound pressure
 /// so a busy agent cannot flood the client (acceptance: ≤1/s).
 final class OutboundPressureBaselineGate: @unchecked Sendable {

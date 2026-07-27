@@ -52,11 +52,21 @@ public extension DirectAuthProvider {
 /// Thread-safe counters for active WS connections, backpressure, and
 /// slow-client evictions. Used by /v1/health to answer \"why is sync slow\".
 /// Public so the test suite can inject controlled values.
+///
+/// Lifetime counters (`slowClientDrops`, max-observed depths, rejected/evicted
+/// frame counts) are process-scoped and never decrease. Live gauges
+/// (`activeClients`, `totalQueuedBytes`) follow connect/disconnect samples.
 public final class WSConnectionTracker: @unchecked Sendable {
     private let lock = NSLock()
     private var _activeClients: Int = 0
     private var _totalQueuedBytes: Int = 0
     private var _slowClientDrops: Int = 0
+    /// High-water mark of observed outbound queue depth (per sample and aggregate).
+    private var _maxObservedOutboundQueuedBytes: Int = 0
+    /// High-water mark of observed application frame payload sizes.
+    private var _maxObservedFrameBytes: Int = 0
+    /// Frames refused at enqueue under backpressure or shed by degrade().
+    private var _framesRejectedOrEvicted: Int = 0
 
     public init() {}
 
@@ -75,6 +85,21 @@ public final class WSConnectionTracker: @unchecked Sendable {
         return _slowClientDrops
     }
 
+    public var maxObservedOutboundQueuedBytes: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _maxObservedOutboundQueuedBytes
+    }
+
+    public var maxObservedFrameBytes: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _maxObservedFrameBytes
+    }
+
+    public var framesRejectedOrEvicted: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _framesRejectedOrEvicted
+    }
+
     /// Called when a WS connection is established.
     public func clientConnected() {
         lock.lock(); _activeClients += 1; lock.unlock()
@@ -85,15 +110,39 @@ public final class WSConnectionTracker: @unchecked Sendable {
     public func clientDisconnected(queuedBytes: Int) {
         lock.lock()
         _activeClients = max(0, _activeClients - 1)
-        _totalQueuedBytes = max(0, _totalQueuedBytes - queuedBytes)
+        _totalQueuedBytes = max(0, _totalQueuedBytes - max(0, queuedBytes))
         lock.unlock()
     }
 
     /// Called when the outbound queue for a connection changes (sampled on
-    /// enqueue). Replaces the previous sample for this connection.
+    /// enqueue / degrade). Replaces the previous sample for this connection.
     public func updateQueuedBytes(previous: Int, current: Int) {
         lock.lock()
-        _totalQueuedBytes = max(0, _totalQueuedBytes - previous + current)
+        let prev = max(0, previous)
+        let cur = max(0, current)
+        _totalQueuedBytes = max(0, _totalQueuedBytes - prev + cur)
+        // Max is monotonic: track both per-connection depth and aggregate.
+        _maxObservedOutboundQueuedBytes = max(
+            _maxObservedOutboundQueuedBytes,
+            cur,
+            _totalQueuedBytes
+        )
+        lock.unlock()
+    }
+
+    /// Record an observed application-frame byte size (monotonic high-water).
+    public func recordFrameBytes(_ bytes: Int) {
+        lock.lock()
+        _maxObservedFrameBytes = max(_maxObservedFrameBytes, max(0, bytes))
+        lock.unlock()
+    }
+
+    /// Count frames refused under backpressure or shed by degrade.
+    /// Negative counts are ignored so callers cannot underflow health.
+    public func recordFramesRejectedOrEvicted(_ count: Int = 1) {
+        guard count > 0 else { return }
+        lock.lock()
+        _framesRejectedOrEvicted += count
         lock.unlock()
     }
 
@@ -105,15 +154,22 @@ public final class WSConnectionTracker: @unchecked Sendable {
 
 /// Pure helper: assembles the `connections` sub-object for /v1/health from
 /// plain counter inputs. No I/O, no actor, fully unit-testable.
+/// Values are clamped nonnegative so health never emits negative gauges.
 public func connectionMetricsJSON(
     activeClients: Int,
     totalQueuedBytes: Int,
-    slowClientDrops: Int
+    slowClientDrops: Int,
+    maxObservedOutboundQueuedBytes: Int = 0,
+    maxObservedFrameBytes: Int = 0,
+    framesRejectedOrEvicted: Int = 0
 ) -> [String: Any] {
     return [
-        "active_clients": activeClients,
-        "total_queued_bytes": totalQueuedBytes,
-        "slow_client_drops": slowClientDrops
+        "active_clients": max(0, activeClients),
+        "total_queued_bytes": max(0, totalQueuedBytes),
+        "slow_client_drops": max(0, slowClientDrops),
+        "max_observed_outbound_queued_bytes": max(0, maxObservedOutboundQueuedBytes),
+        "max_observed_frame_bytes": max(0, maxObservedFrameBytes),
+        "frames_rejected_or_evicted": max(0, framesRejectedOrEvicted)
     ]
 }
 
@@ -1439,13 +1495,30 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     }
                 }
             }
+            // METRICS: last per-connection queue sample for /v1/health gauges.
+            // Process-scoped max/reject counters live on wsTracker; this only
+            // keeps the live totalQueuedBytes contribution accurate.
+            let queuedBytesSample = LockedQueuedBytesSample()
+            let sampleOutboundQueuedBytes: @Sendable () -> Void = { [wsTracker] in
+                let current = outbound.queuedByteCount
+                let previous = queuedBytesSample.swap(current)
+                wsTracker.updateQueuedBytes(previous: previous, current: current)
+            }
             /// C-04 degrade ladder: never close on queueFull.
-            let enqueueApplicationOrDegrade: @Sendable (Data) -> Void = { data in
+            let enqueueApplicationOrDegrade: @Sendable (Data) -> Void = { [wsTracker] data in
+                // Transport-limit observability for 3G: frame size + queue depth
+                // + rejected/evicted counts. Does not change enqueue policy.
+                wsTracker.recordFrameBytes(data.count)
                 switch outbound.enqueueApplication(data) {
                 case .accepted:
                     recordAcceptedEvent(data)
+                    sampleOutboundQueuedBytes()
                 case .queueFull:
                     let outcome = outbound.degrade()
+                    if outcome.freedFrames > 0 {
+                        wsTracker.recordFramesRejectedOrEvicted(outcome.freedFrames)
+                        sampleOutboundQueuedBytes()
+                    }
                     if outcome.needsBaselineRequired {
                         emitPressureBaseline()
                     }
@@ -1454,18 +1527,21 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         if let sequence = WebSocketOutboundQueue.eventSequence(in: data) {
                             sequenceWatermark.recordFilteredEvent(sequence: sequence)
                         }
+                        wsTracker.recordFramesRejectedOrEvicted(1)
                         emitPressureBaseline()
                         return
                     }
                     switch outbound.enqueueApplication(data) {
                     case .accepted:
                         recordAcceptedEvent(data)
+                        sampleOutboundQueuedBytes()
                     case .queueFull:
                         // Still saturated after degrade: drop with filtered
                         // watermark accounting; socket stays open.
                         if let sequence = WebSocketOutboundQueue.eventSequence(in: data) {
                             sequenceWatermark.recordFilteredEvent(sequence: sequence)
                         }
+                        wsTracker.recordFramesRejectedOrEvicted(1)
                         emitPressureBaseline()
                     case .closed:
                         break
@@ -1655,7 +1731,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
             batcher.stop()
             outbound.close()
             outbound.finish()
-            wsTracker.clientDisconnected(queuedBytes: outbound.queuedByteCount)
+            // Remove this connection's last sampled contribution (not post-close
+            // residual) so total_queued_bytes stays non-negative and accurate.
+            wsTracker.clientDisconnected(queuedBytes: queuedBytesSample.value)
             return
         }
 
@@ -1746,7 +1824,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "connections": connectionMetricsJSON(
                     activeClients: wsTracker.activeClients,
                     totalQueuedBytes: wsTracker.totalQueuedBytes,
-                    slowClientDrops: wsTracker.slowClientDrops
+                    slowClientDrops: wsTracker.slowClientDrops,
+                    maxObservedOutboundQueuedBytes: wsTracker.maxObservedOutboundQueuedBytes,
+                    maxObservedFrameBytes: wsTracker.maxObservedFrameBytes,
+                    framesRejectedOrEvicted: wsTracker.framesRejectedOrEvicted
                 ),
                 "command_receipts": [
                     "claims_total": receiptMetrics.claimsTotal,
