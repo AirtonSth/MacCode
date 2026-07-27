@@ -420,6 +420,36 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
         )
     }
 
+    func test_reloadQueuedMessagesClearsPreparedBannerWhenPreparedHeadResolves() throws {
+        // WHY: older builds only SET the "Start confirmation is pending" banner
+        // when the head was prepared and never cleared it. After the row is
+        // acknowledged/abandoned the sticky banner still showed with Copy/Retry
+        // even though the queue was empty (standalone banner path).
+        let (vm, repo) = try makeVM(withQueue: true)
+        let queuedRepo = try XCTUnwrap(repo)
+        vm.createThread(title: "clear prepared banner")
+        let threadId = try XCTUnwrap(vm.selectedThreadId)
+        let queued = AgentQueuedMessage(threadId: threadId, text: "resolve me", position: 1)
+        try queuedRepo.upsert(queued)
+        let lease = try XCTUnwrap(queuedRepo.claim(id: queued.id))
+        let runId = AgentRunID(queued.id.value)
+        XCTAssertTrue(try queuedRepo.prepareDispatch(lease, runId: runId))
+        vm.reloadQueuedMessages()
+        XCTAssertEqual(
+            vm.queueStatusMessage,
+            "Start confirmation is pending. Check status before deciding whether to remove this queue record."
+        )
+
+        XCTAssertNotNil(try queuedRepo.acknowledgePreparedWithRunEvidence(id: queued.id, runId: runId))
+        vm.reloadQueuedMessages()
+
+        XCTAssertTrue(vm.queuedMessages.isEmpty)
+        XCTAssertNil(
+            vm.queueStatusMessage,
+            "prepared status must not stick after the durable prepared head is gone"
+        )
+    }
+
     func test_removePreparedUsesPreparedCASWhileDispatchedRemainsRecoverable() throws {
         // WHY: an inconclusive prepared intent may be explicitly abandoned after
         // warning the user, but a provider-confirmed dispatch must remain until

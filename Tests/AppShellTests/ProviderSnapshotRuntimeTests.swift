@@ -4068,6 +4068,53 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
       }
     }
 
+    func test_drainQueue_postAcceptMarkDispatchedFailureStillAcknowledgesWithoutReplay() async throws {
+        // WHY: after acceptancePermit.accepted, markDispatched can return false
+        // (CAS race / lease drift). The old path threw with providerStartConfirmed
+        // true and left a sticky prepared head while the agent was already running.
+        // finalizeQueueDispatchAfterProviderStart must fall back to
+        // acknowledgePreparedWithRunEvidence without a second provider write.
+      for provider in AgentProvider.allCases {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = ConcurrentPreparedAckRunner(
+            provider: provider,
+            queuedMessageRepo: ctx.queuedMessageRepo
+        )
+        ctx.coordinator.replaceProvider(provider, runner: runner)
+        let workspace = try router.createWorkspace(name: "queue-mark-fail", cwd: workspaceDir.path)
+        var thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "queue",
+            provider: provider,
+            model: "test-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        thread.status = .completed
+        try ctx.threadRepo.upsert(thread)
+        let queued = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "accept then CAS-lose",
+            attachments: [],
+            interactionMode: .default
+        )
+
+        try await router.drainNextQueuedAgentMessage(thread: thread.id)
+
+        XCTAssertEqual(runner.startCount, 1, "provider must start exactly once")
+        XCTAssertNil(try ctx.queuedMessageRepo.get(id: queued.id),
+                     "post-accept markDispatched failure must still drain the prepared head")
+        XCTAssertEqual(try ctx.runRepo.get(id: AgentRunID(queued.id.value))?.status, .running)
+      }
+    }
+
     private static func causalQueueFakeClaudeBridge(
         commandLogPath: String,
         releaseFIFOPath: String
@@ -4211,6 +4258,45 @@ private final class RequestCaptureRunner: AgentProviderRunner, @unchecked Sendab
             onEvent(.event(.turnCompleted(turnId: "turn-1", finalMessage: "ok")))
             onEvent(.finished(.completed, finalMessage: "ok", providerThreadId: providerThreadId))
         }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+}
+
+/// Accepts the provider write, then deletes the matching prepared queue row so
+/// the caller's subsequent `markDispatched` CAS returns false — proving the
+/// post-accept finalize fallback path.
+private final class ConcurrentPreparedAckRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider
+    let queuedMessageRepo: AgentQueuedMessageRepository
+    private let lock = NSLock()
+    private var starts = 0
+
+    init(provider: AgentProvider, queuedMessageRepo: AgentQueuedMessageRepository) {
+        self.provider = provider
+        self.queuedMessageRepo = queuedMessageRepo
+    }
+
+    var startCount: Int { lock.withLock { starts } }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        lock.withLock { starts += 1 }
+        guard let acceptancePermit = request.acceptancePermit else {
+            throw AgentRunAcceptanceError.cancelled
+        }
+        try acceptancePermit.withAcceptance {
+            _ = try queuedMessageRepo.acknowledgePreparedWithRunEvidence(
+                id: AgentQueuedMessageID(request.runId.value),
+                runId: request.runId
+            )
+        }
+        // Leave the run non-terminal so post-accept recovery is visible while
+        // the provider turn is still considered live.
+        onEvent(.status(.running))
         return AgentRunHandle(runId: request.runId, process: nil) {}
     }
 }

@@ -2632,12 +2632,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 routingSnapshot: queuedRouting
             )
             providerStartConfirmed = acceptancePermit.outcome == .accepted
-            guard try ctx.queuedMessageRepo.markDispatched(lease, runId: dispatchRunId) else {
-                throw JSONRPCError(code: -32000, message: "Provider started; queue acknowledgement needs recovery.")
-            }
-            guard let drained = try ctx.queuedMessageRepo.acknowledge(lease) else {
-                throw JSONRPCError(code: -32000, message: "Queued message lease changed before start acknowledgement.")
-            }
+            let drained = try finalizeQueueDispatchAfterProviderStart(
+                context: ctx,
+                lease: lease,
+                runId: dispatchRunId,
+                providerStartConfirmed: providerStartConfirmed
+            )
             try promoteDeferredQueueMessage(
                 context: ctx,
                 ownerId: queued.id,
@@ -2662,6 +2662,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 if acceptancePermit.outcome == .notAccepted {
                     ctx.ensureQueueDrainWaiterIfNeeded(threadId: queued.threadId)
                 }
+            } else if let drained = try? finalizeQueueDispatchAfterProviderStart(
+                context: ctx,
+                lease: lease,
+                runId: dispatchRunId,
+                providerStartConfirmed: true
+            ) {
+                // Post-accept CAS races must not leave a prepared head while the
+                // provider is already running; surface the original error only if
+                // the queue intent is still present.
+                try? promoteDeferredQueueMessage(
+                    context: ctx,
+                    ownerId: queued.id,
+                    threadId: queued.threadId
+                )
+                publishQueuedMessage(kind: "agent.message.queue.drained", drained)
             }
             refreshAgentSurfaces(thread: queued.threadId)
             throw error
@@ -3059,12 +3074,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 routingSnapshot: queuedRouting
             )
             providerStartConfirmed = acceptancePermit.outcome == .accepted
-            guard try ctx.queuedMessageRepo.markDispatched(lease, runId: dispatchRunId) else {
-                throw JSONRPCError(code: -32000, message: "Provider started; queue acknowledgement needs recovery.")
-            }
-            guard let drained = try ctx.queuedMessageRepo.acknowledge(lease) else {
-                throw JSONRPCError(code: -32000, message: "Queued message lease changed before start acknowledgement.")
-            }
+            let drained = try finalizeQueueDispatchAfterProviderStart(
+                context: ctx,
+                lease: lease,
+                runId: dispatchRunId,
+                providerStartConfirmed: providerStartConfirmed
+            )
             try promoteDeferredQueueMessage(
                 context: ctx,
                 ownerId: queued.id,
@@ -3082,6 +3097,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 ) {
                     publishQueuedMessage(kind: "agent.message.queue.drained", drained)
                 }
+            } else if let drained = try? finalizeQueueDispatchAfterProviderStart(
+                context: ctx,
+                lease: lease,
+                runId: dispatchRunId,
+                providerStartConfirmed: true
+            ) {
+                try? promoteDeferredQueueMessage(
+                    context: ctx,
+                    ownerId: queued.id,
+                    threadId: queued.threadId
+                )
+                publishQueuedMessage(kind: "agent.message.queue.drained", drained)
             }
             refreshAgentSurfaces(thread: thread)
             throw error
@@ -3093,6 +3120,49 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         context: AppContext
     ) throws -> AgentQueuedMessageRoutingSnapshot? {
         try context.queuedMessageRepo.routingSnapshot(id: message.id)
+    }
+
+    /// After `sendAgentMessage` returns for a prepared lease, remove the durable
+    /// queue intent. Prefer the happy path (prepared → dispatched → delete). If
+    /// that CAS loses a race or fails after provider acceptance, fall back to
+    /// run-bound prepared/dispatched acknowledgement so a live turn never leaves
+    /// a sticky "Start confirmation is pending" head.
+    private func finalizeQueueDispatchAfterProviderStart(
+        context: AppContext,
+        lease: AgentQueuedMessageLease,
+        runId: AgentRunID,
+        providerStartConfirmed: Bool
+    ) throws -> AgentQueuedMessage {
+        if try context.queuedMessageRepo.markDispatched(lease, runId: runId),
+           let drained = try context.queuedMessageRepo.acknowledge(lease) {
+            return drained
+        }
+        let hasEvidence = (try? preparedQueueRunHasProviderEvidence(
+            threadId: lease.message.threadId,
+            runId: runId
+        )) == true
+        if providerStartConfirmed || hasEvidence {
+            if let drained = try context.queuedMessageRepo.acknowledgePreparedWithRunEvidence(
+                id: lease.message.id,
+                runId: runId
+            ) {
+                return drained
+            }
+            if let drained = try context.queuedMessageRepo.acknowledgeDispatched(
+                id: lease.message.id,
+                runId: runId
+            ) {
+                return drained
+            }
+            // Concurrent recovery already removed the row (e.g. Force status check).
+            if try context.queuedMessageRepo.get(id: lease.message.id) == nil {
+                return lease.message
+            }
+        }
+        throw JSONRPCError(
+            code: -32000,
+            message: "Provider started; queue acknowledgement needs recovery."
+        )
     }
 
     /// A same-process start failure still leaves a durable run row before the
