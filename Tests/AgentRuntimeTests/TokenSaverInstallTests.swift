@@ -321,6 +321,16 @@ final class TokenSaverInstallTests: XCTestCase {
                        "Token Saver off must not inject Distill or safety ABI")
         XCTAssertFalse(offRuntime.contains(AgentSkillInstaller.distillAgentInstructionsBody))
         XCTAssertFalse(offRuntime.contains(TokenSaverProviderSafetyABI.block))
+        XCTAssertFalse(offRuntime.contains("NEVER Distill skill content"),
+                       "Token Saver off must not inject skill/Distill policy at all")
+
+        // Token Saver on still protects skill content as a verbatim category while
+        // keeping ordinary-output Distill eligibility.
+        XCTAssertTrue(runtimePrompt.contains("NEVER Distill skill content"))
+        XCTAssertTrue(runtimePrompt.contains("eligible ordinary")
+                      || runtimePrompt.contains("Good to pipe:"))
+        XCTAssertFalse(runtimePrompt.contains("[[rc:skill"),
+                       "skill content must not be represented via recovery handles")
     }
 
     func test_runtimePromptNormalizesAdversarialSafetyABIForClaudeCodexAndGrok() {

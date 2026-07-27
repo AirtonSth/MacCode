@@ -398,6 +398,12 @@ public final class GrokACPClient: @unchecked Sendable {
     public var terminationHandler: (@Sendable (_ reason: Process.TerminationReason, _ status: Int32, _ error: Error) -> Void)?
     public var runningProcess: Process { process }
 
+    /// Exact argv for every Grok ACP stdio launch.
+    /// `--no-leader` keeps the worker isolated from shared-leader auth that
+    /// requires a `client_id` RemoteCode does not supply (Grok 0.2.112+).
+    /// Unsupported shared-leader mode must fail through the existing error path.
+    public static let launchArguments = ["agent", "--no-leader", "stdio"]
+
     public init(
         binary: String = "grok",
         cwd: String,
@@ -414,7 +420,7 @@ public final class GrokACPClient: @unchecked Sendable {
         self.tokenSaverCensusAllowed = tokenSaverCensusAllowed
         parseQueue.setSpecific(key: parseQueueKey, value: 1)
         process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = ["agent", "stdio"]
+        process.arguments = Self.launchArguments
         process.currentDirectoryURL = URL(fileURLWithPath: cwd)
         process.environment = CodexRunner.processEnvironment(overrides: environment, purpose: .agentTurn(.grok))
         process.standardInput = stdinPipe

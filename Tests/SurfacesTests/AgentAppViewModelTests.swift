@@ -4968,6 +4968,19 @@ final class AgentAppViewModelTests: XCTestCase {
         )
     }
 
+    func test_partialHotReplayUsesInformationalNotice_notErrorBanner() {
+        // WHY: a bounded replay window is expected for large threads; it must
+        // not occupy the red provider/persistence error channel shown in the UI.
+        XCTAssertEqual(
+            AgentAppViewModel.replayNoticeText(isPartial: true),
+            AgentAppViewModel.historyReplayNoticeText
+        )
+        XCTAssertNil(
+            AgentAppViewModel.replayNoticeText(isPartial: false),
+            "complete replay must not leave a stale history notice"
+        )
+    }
+
     func test_errorDismissActionsClearEachVisibleErrorChannel() throws {
         let (vm, _) = try makeVM()
         vm.timeline.apply(.error(message: "provider failed", recoverable: true))

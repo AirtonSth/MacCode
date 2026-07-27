@@ -1150,11 +1150,11 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         Auto is on. Run $\(skill) controller-only, token-efficient:
         - FIRST: Micro chat bypass — if the request is only conversational (who are you, hi, which model/LLM, trivial status) and does not ask for code/files/commands/PR/deploy/repo change → answer on the controller in one short reply; no workers, no DAG, no validator, no matrix load.
         - Otherwise classify T0–T3 + certainty (absolute|high|medium|low); pick Micro/Single/Multi/Critical.
-        - Progressive disclosure: load only the skill sections needed for that mode.
+        - Progressive disclosure: load only the skill sections needed for that mode; requested/returned skill content must stay complete (never Distill skill bodies).
         - Controller stays LIGHT; escalate workers only after capability failure.
         - Fan-out default 2 / hard cap 3; skip REVIEWER on micro absolute/high certainty when rules allow.
         - Thin prompts (slice-only); cheap proof (scope diff + one focused command); lean table report.
-        - EVERY worker/reviewer prompt must require explicit `| distill` for each pipable output-producing tool call and propagate that rule to all descendants.
+        - Distill applies only to eligible ordinary tool/command output when Token Saver is active; never Distill skill content; do not require every worker prompt to restate Distill rules.
 
         \(hostBlock)
 
