@@ -534,4 +534,251 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
         XCTAssertFalse(WebSocketOutboundQueue.isSheddableKind("settings.updated"))
         XCTAssertFalse(WebSocketOutboundQueue.isSheddableKind("workspace.updated"))
     }
+
+    // MARK: - Outbound application priority (wire fields only)
+
+    func test_applicationPriority_classifiesExistingWireTypesWithoutInventingSemantics() throws {
+        // WHY: End-to-end priority must use only existing ConnectionTransport
+        // `type` and sheddable event `kind` fields. Inventing input/stop
+        // outbound classes would be unverified protocol invention.
+        let baseline = try JSONSerialization.data(withJSONObject: [
+            "type": "baselineRequired",
+            "reason": "outbound_queue_pressure",
+        ])
+        let error = try JSONSerialization.data(withJSONObject: [
+            "type": "error",
+            "code": 1011,
+            "message": "x",
+        ])
+        let heartbeat = try JSONSerialization.data(withJSONObject: [
+            "type": "heartbeat",
+            "nonce": "n",
+        ])
+        let snapshot = try JSONSerialization.data(withJSONObject: [
+            "type": "snapshot",
+            "sequence": 9,
+        ])
+        let bulkEvent = try eventJSON(seq: 1, kind: "agent.item.delta",
+                                      payload: ["item_id": "i", "text": "a"])
+        let completion = try eventJSON(seq: 2, kind: "agent.run.completed",
+                                       payload: ["thread_id": "t"])
+        let opaque = Data("not-json".utf8)
+
+        XCTAssertEqual(WebSocketOutboundQueue.applicationPriority(of: baseline), .priority)
+        XCTAssertEqual(WebSocketOutboundQueue.applicationPriority(of: error), .priority)
+        XCTAssertEqual(WebSocketOutboundQueue.applicationPriority(of: heartbeat), .priority)
+        XCTAssertEqual(WebSocketOutboundQueue.applicationPriority(of: snapshot), .bulk)
+        XCTAssertEqual(WebSocketOutboundQueue.applicationPriority(of: bulkEvent), .bulk)
+        XCTAssertEqual(WebSocketOutboundQueue.applicationPriority(of: completion), .normal)
+        XCTAssertEqual(WebSocketOutboundQueue.applicationPriority(of: opaque), .normal)
+        XCTAssertTrue(WebSocketOutboundQueue.isSheddableApplicationFrame(snapshot),
+                      "snapshots are bulk under pressure so degrade can free capacity")
+    }
+
+    func test_priorityApplication_overtakesQueuedBulkWhilePreservingSequencedFIFO() throws {
+        // WHY: A large snapshot/replay backlog must not starve baselineRequired
+        // recovery frames. Sequenced events must stay FIFO relative to each
+        // other so client gap detection keeps sequence authority.
+        let recorded = LockedStringArray()
+        let firstWriteEntered = DispatchSemaphore(value: 0)
+        let releaseFirstWrite = DispatchSemaphore(value: 0)
+        let owner = WebSocketOutboundQueue(
+            maxQueuedBytes: 64 * 1024,
+            applicationWriter: { data in
+                let label: String
+                if let type = WebSocketOutboundQueue.frameType(in: data) {
+                    if type == "event", let seq = WebSocketOutboundQueue.eventSequence(in: data) {
+                        label = "event:\(seq)"
+                    } else {
+                        label = type
+                    }
+                } else {
+                    label = "opaque"
+                }
+                recorded.append(label)
+                if label == "event:1" {
+                    firstWriteEntered.signal()
+                    _ = releaseFirstWrite.wait(timeout: .now() + 2)
+                }
+                return true
+            },
+            controlWriter: { _, _ in true },
+            writeFailureClosingData: Data(),
+            onTerminal: { _ in XCTFail("must not terminate") },
+            didSendTerminal: {}
+        )
+
+        let first = try eventJSON(seq: 1, kind: "agent.run.completed", payload: ["t": "1"])
+        XCTAssertEqual(owner.enqueueApplication(first), .accepted)
+        XCTAssertEqual(firstWriteEntered.wait(timeout: .now() + 2), .success)
+
+        let snapshot = try JSONSerialization.data(withJSONObject: [
+            "type": "snapshot", "sequence": 10, "payload": String(repeating: "x", count: 64),
+        ])
+        let bulk = try eventJSON(seq: 2, kind: "surface.output",
+                                 payload: ["surface_id": "s", "base64": "QQ=="])
+        let completion = try eventJSON(seq: 3, kind: "agent.run.completed",
+                                       payload: ["thread_id": "t"])
+        let baseline = try JSONSerialization.data(withJSONObject: [
+            "type": "baselineRequired",
+            "reason": "outbound_queue_pressure",
+            "currentSequence": 3,
+        ])
+
+        XCTAssertEqual(owner.enqueueApplication(snapshot), .accepted)
+        XCTAssertEqual(owner.enqueueApplication(bulk), .accepted)
+        XCTAssertEqual(owner.enqueueApplication(completion), .accepted)
+        XCTAssertEqual(owner.enqueueApplication(baseline), .accepted)
+
+        releaseFirstWrite.signal()
+        owner.finish()
+
+        XCTAssertEqual(recorded.snapshot, [
+            "event:1",
+            "baselineRequired",
+            "snapshot",
+            "event:2",
+            "event:3",
+        ], "baselineRequired overtakes bulk/events not yet writing; event seq order stays FIFO")
+    }
+
+    func test_bulkOccupancyCap_leavesRoomForCompletionAndControlReserve() throws {
+        // WHY: Snapshot/replay bulk must not fill the entire outbound budget or
+        // interactive completions and pongs starve. Capacity reservations are
+        // classified from existing wire fields only.
+        let stall = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let owner = WebSocketOutboundQueue(
+            maxQueuedBytes: 1_024,
+            applicationWriter: { data in
+                if WebSocketOutboundQueue.eventSequence(in: data) == 1 {
+                    stall.signal()
+                    _ = release.wait(timeout: .now() + 2)
+                }
+                return true
+            },
+            controlWriter: { _, _ in true },
+            writeFailureClosingData: Data(),
+            onTerminal: { _ in XCTFail("must not terminate") },
+            didSendTerminal: {}
+        )
+
+        // Hold the drain on the first normal frame so subsequent bulk stays queued.
+        let hold = try eventJSON(seq: 1, kind: "agent.run.completed", payload: ["t": "hold"])
+        XCTAssertEqual(owner.enqueueApplication(hold), .accepted)
+        XCTAssertEqual(stall.wait(timeout: .now() + 2), .success)
+
+        var bulkAccepted = 0
+        for i in 0..<64 {
+            // ~200-byte bulk snapshots to pressure the bulk ceiling quickly.
+            let snapshot = try JSONSerialization.data(withJSONObject: [
+                "type": "snapshot",
+                "sequence": 100 + i,
+                "blob": String(repeating: "Z", count: 180),
+            ])
+            if owner.enqueueApplication(snapshot) == .accepted {
+                bulkAccepted += 1
+            } else {
+                break
+            }
+        }
+        XCTAssertGreaterThan(bulkAccepted, 0, "at least one bulk frame must queue")
+        XCTAssertEqual(
+            owner.enqueueApplication(try JSONSerialization.data(withJSONObject: [
+                "type": "snapshot",
+                "sequence": 999,
+                "blob": String(repeating: "Z", count: 180),
+            ])),
+            .queueFull,
+            "bulk must hit its occupancy cap before the full application budget"
+        )
+
+        let completion = try eventJSON(seq: 2, kind: "agent.run.completed",
+                                       payload: ["thread_id": "t"])
+        XCTAssertEqual(owner.enqueueApplication(completion), .accepted,
+                       "interactive/completion must still fit in reserved interactive capacity")
+
+        let baseline = try JSONSerialization.data(withJSONObject: [
+            "type": "baselineRequired",
+            "reason": "outbound_queue_pressure",
+        ])
+        XCTAssertEqual(owner.enqueueApplication(baseline), .accepted,
+                       "baseline recovery must enqueue under bulk backlog")
+
+        XCTAssertEqual(owner.enqueueControl(opcode: 0xA, data: Data([0xAA])),
+                       .accepted,
+                       "control reserve must accept pong while application holds bulk")
+
+        release.signal()
+        owner.finish()
+    }
+
+    func test_degradeShedsSnapshotBulkThenBaselineRecoversCapacity() throws {
+        // WHY: When the queue is saturated with snapshot bulk, degrade must free
+        // capacity and surface baseline_required so sequence authority recovers
+        // without closing the socket.
+        let stall = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let owner = WebSocketOutboundQueue(
+            maxQueuedBytes: 4_096,
+            applicationWriter: { data in
+                if WebSocketOutboundQueue.eventSequence(in: data) == 1 {
+                    stall.signal()
+                    _ = release.wait(timeout: .now() + 2)
+                }
+                return true
+            },
+            controlWriter: { _, _ in true },
+            writeFailureClosingData: Data(),
+            onTerminal: { _ in XCTFail("degrade must never terminate") },
+            didSendTerminal: { XCTFail("degrade must never shut down") }
+        )
+
+        let hold = try eventJSON(seq: 1, kind: "agent.run.completed", payload: [:])
+        XCTAssertEqual(owner.enqueueApplication(hold), .accepted)
+        XCTAssertEqual(stall.wait(timeout: .now() + 2), .success)
+
+        for i in 0..<20 {
+            let snapshot = try JSONSerialization.data(withJSONObject: [
+                "type": "snapshot",
+                "sequence": 50 + i,
+                "blob": String(repeating: "S", count: 200),
+            ])
+            _ = owner.enqueueApplication(snapshot)
+        }
+        let before = owner.queuedFrameCountForTests
+        XCTAssertGreaterThan(before, 1)
+
+        let outcome = owner.degrade()
+        XCTAssertGreaterThan(outcome.discardedBulkFrames, 0,
+                             "snapshots must be sheddable bulk under pressure")
+        XCTAssertTrue(outcome.needsBaselineRequired,
+                      "shedding accepted bulk requires client rebaseline")
+        XCTAssertLessThan(owner.queuedFrameCountForTests, before)
+
+        let baseline = try JSONSerialization.data(withJSONObject: [
+            "type": "baselineRequired",
+            "reason": "outbound_queue_pressure",
+        ])
+        XCTAssertEqual(owner.enqueueApplication(baseline), .accepted,
+                       "after degrade, baseline recovery frames must enqueue")
+
+        release.signal()
+        owner.finish()
+    }
+}
+
+/// Thread-safe string log for outbound writer tests.
+private final class LockedStringArray: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    func append(_ value: String) {
+        lock.lock(); storage.append(value); lock.unlock()
+    }
+
+    var snapshot: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return storage
+    }
 }
