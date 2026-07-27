@@ -519,6 +519,27 @@ final class HTTPServerTests: XCTestCase {
         )
     }
 
+    func test_coalescingWindowNegotiationPreservesDefaultsAndClampsProposal() {
+        // WHY: legacy clients must retain current latency, while measured 3G
+        // clients may request a bounded aggregation window without unbounded UI delay.
+        XCTAssertEqual(
+            DirectHTTPServer.negotiateCoalescingWindowMs(filter: .full, proposedMs: nil),
+            DirectHTTPServer.wsCoalescingWindowWiFiMs
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.negotiateCoalescingWindowMs(filter: .cellularSafe(), proposedMs: nil),
+            DirectHTTPServer.wsCoalescingWindowCellularMs
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.negotiateCoalescingWindowMs(filter: .full, proposedMs: 1),
+            DirectHTTPServer.wsCoalescingWindowMinMs
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.negotiateCoalescingWindowMs(filter: .cellularSafe(), proposedMs: 999_999),
+            DirectHTTPServer.wsCoalescingWindowMaxMs
+        )
+    }
+
     func test_heartbeatNegotiationAcceptsClientProposalWithinProfile() {
         let accepted = DirectHTTPServer.negotiateHeartbeatProfile(
             filter: .cellularSafe(),

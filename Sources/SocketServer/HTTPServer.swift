@@ -539,6 +539,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// Cellular / Low Data (`X-RC2-WS-Filter: cellular-safe`): tolerate 3G RRC promotion
     /// and allow the radio to sleep between bursts (C-06).
     public static let wsHeartbeatProfileCellular = WebSocketHeartbeatProfile(interval: 25, timeout: 90)
+    /// Short adaptive application-event coalescing window. Clients may propose
+    /// a larger bounded value for measured degraded/severe links; absent/legacy
+    /// proposals keep these defaults (15 ms Wi-Fi, 100 ms cellular-safe).
+    public static let wsCoalescingWindowWiFiMs = 15
+    public static let wsCoalescingWindowCellularMs = 100
+    public static let wsCoalescingWindowMinMs = 5
+    public static let wsCoalescingWindowMaxMs = 250
     /// Back-compat aliases → Wi-Fi profile (default when no filter is negotiated).
     public static let wsHeartbeatInterval: TimeInterval = wsHeartbeatProfileWiFi.interval
     public static let wsHeartbeatTimeout: TimeInterval = wsHeartbeatProfileWiFi.timeout
@@ -567,6 +574,22 @@ public final class DirectHTTPServer: @unchecked Sendable {
         experimentEnabled
             ? httpKeepAliveIdleTimeoutExperimentSeconds
             : httpKeepAliveIdleTimeoutSeconds
+    }
+
+    /// Accept an optional client coalescing proposal while preserving the
+    /// filter-specific legacy default and a strict latency/aggregation bound.
+    nonisolated public static func negotiateCoalescingWindowMs(
+        filter: EventStreamFilter,
+        proposedMs: Int64?
+    ) -> Int {
+        let fallback = filter.isCellularSafe
+            ? wsCoalescingWindowCellularMs
+            : wsCoalescingWindowWiFiMs
+        guard let proposedMs, proposedMs > 0 else { return fallback }
+        return Int(min(
+            Int64(wsCoalescingWindowMaxMs),
+            max(Int64(wsCoalescingWindowMinMs), proposedMs)
+        ))
     }
 
     /// Select the host heartbeat offer from the client's WS filter proposal.
@@ -1393,6 +1416,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 filter: wsFilter,
                 proposedMs: proposedSnapshotTimeoutMs
             )
+            let proposedCoalescingWindowMs = headers["x-rc2-ws-coalesce-window-ms"]
+                .flatMap { Int64($0.trimmingCharacters(in: .whitespaces)) }
+            let coalescingWindowMs = Self.negotiateCoalescingWindowMs(
+                filter: wsFilter,
+                proposedMs: proposedCoalescingWindowMs
+            )
             // RFC ping/pong + inbound traffic own liveness. SO_RCVTIMEO is only a
             // fallback and must exceed the negotiated timeout so 1012 remains the
             // authoritative dead-peer close (not a silent read timeout).
@@ -1615,11 +1644,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // terminal.output.summary per surface → ≥5× fewer summaries/sec).
             // C-15: coalesce agent.item.delta on all links; cellular uses a longer
             // window (100ms) so ~10× fewer frames than one-frame-per-token.
-            let coalescingDelayMs = wsFilter.isCellularSafe ? 100 : 15
             let batcher = WebSocketEventBatcher(
                 enabled: wsFilter.isCellularSafe,
                 filter: wsFilter,
-                delay: TimeInterval(coalescingDelayMs) / 1000.0,
+                delay: TimeInterval(coalescingWindowMs) / 1000.0,
                 // PERF: coalesce per-token agent.item.delta frames; non-delta
                 // events flush immediately when only streaming coalescing is active.
                 coalescesStreamingDeltas: true,
