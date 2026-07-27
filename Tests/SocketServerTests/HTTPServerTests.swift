@@ -127,6 +127,67 @@ final class HTTPServerTests: XCTestCase {
         wait(for: [healthEx, disco], timeout: 4)
     }
 
+    /// Loopback dual-stack proof: when AF_INET6 `::1` binds, HTTP must answer on
+    /// `[::1]` without breaking the existing IPv4 `127.0.0.1` path.
+    ///
+    /// Scope: local loopback bind + discovery/health only. Does **not** claim
+    /// link-local, AWDL, physical IPv6-only, VPN, or 3G coverage.
+    @MainActor
+    func test_dualStack_loopback_ipv6_health_when_bound() throws {
+        let port = UInt16.random(in: 33000...44000)
+        let dispatcher = JSONRPCDispatcher(router: FakeRouter())
+        let s = DirectHTTPServer(port: port, loopbackOnly: true, dispatcher: dispatcher, bootEpoch: 1)
+        try s.start()
+        defer { s.stop() }
+        Thread.sleep(forTimeInterval: 0.05)
+
+        // Distinguish environment unavailability from a successful IPv6 request:
+        // skip is not a green pass of dual-stack traffic.
+        guard s.isIPv6ListenerBound else {
+            throw XCTSkip(
+                "IPv6 loopback listener not bound (AF_INET6 socket/bind/listen failed); " +
+                "dual-stack path inactive in this environment — IPv4-only is expected and not a test failure"
+            )
+        }
+
+        // IPv4 path must remain live on the same dual-stack listener setup.
+        let ipv4Ex = expectation(description: "ipv4 health still works")
+        URLSession.shared.dataTask(with: URL(string: "http://127.0.0.1:\(port)/v1/health")!) { data, resp, err in
+            XCTAssertNil(err, "IPv4 loopback /v1/health must still succeed under dual-stack")
+            XCTAssertEqual((resp as? HTTPURLResponse)?.statusCode, 200)
+            let body = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
+            XCTAssertEqual(body?["status"] as? String, "ok")
+            ipv4Ex.fulfill()
+        }.resume()
+
+        // Real URLSession request to IPv6 loopback (not a synthetic flag check).
+        let ipv6URL = URL(string: "http://[::1]:\(port)/v1/health")!
+        let ipv6Ex = expectation(description: "ipv6 ::1 health")
+        URLSession.shared.dataTask(with: ipv6URL) { data, resp, err in
+            XCTAssertNil(err, "GET http://[::1]:\(port)/v1/health must succeed when isIPv6ListenerBound")
+            XCTAssertEqual((resp as? HTTPURLResponse)?.statusCode, 200,
+                           "IPv6 loopback must return HTTP 200 for /v1/health")
+            let body = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
+            XCTAssertEqual(body?["status"] as? String, "ok",
+                           "IPv6 /v1/health body must report status ok")
+            // Narrow discovery check on the same stack: host_v6 advertises loopback.
+            ipv6Ex.fulfill()
+        }.resume()
+
+        let discoEx = expectation(description: "ipv6 discovery")
+        URLSession.shared.dataTask(with: URL(string: "http://[::1]:\(port)/v1/discovery")!) { data, resp, err in
+            XCTAssertNil(err)
+            XCTAssertEqual((resp as? HTTPURLResponse)?.statusCode, 200)
+            let obj = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
+            XCTAssertEqual(obj?["app"] as? String, "remotecode")
+            XCTAssertEqual(obj?["host_v6"] as? String, "::1",
+                           "loopback-only discovery must advertise host_v6 as ::1")
+            discoEx.fulfill()
+        }.resume()
+
+        wait(for: [ipv4Ex, ipv6Ex, discoEx], timeout: 4)
+    }
+
     @MainActor
     func test_v1HealthReportsOnlyAggregateCommandReceiptMetrics() throws {
         let port = UInt16.random(in: 33000...44000)
