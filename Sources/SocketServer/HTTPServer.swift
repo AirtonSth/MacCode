@@ -512,6 +512,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
     public static let baselineWelcomeCapabilities: [String] = [
         "events.replay", "jsonrpc.batch", "snapshot.v3",
         "rpc.websocket", "snapshot.incremental", "resume.v1",
+        SnapshotChunkCapability.wireName,
     ]
 
     /// Wire name for mid-session interest control (iOS sends `rc2.interest` only
@@ -729,6 +730,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// Live connection-level metrics surfaced via /v1/health.
     let wsTracker = WSConnectionTracker()
     private let activeWebSocketConnections = ActiveWebSocketConnectionRegistry()
+    /// TTL/memory-bounded cache for opt-in resumable `sync.snapshot` chunks.
+    let snapshotChunkTransfers = SnapshotChunkTransferCache()
     private let receiveTimeoutSeconds: Int
     private let webSocketOutboundMaxQueuedBytes: Int
 
@@ -2199,12 +2202,34 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
         // C-24: `sync.snapshot` is the largest payload. Encode the full JSON-RPC
         // envelope once with the wire `id` included — no Data→Any→Data cycle.
+        // Chunk begin/chunk are also owned here so they share the same
+        // host/boot/owner/watermark gates as the legacy full path.
         if let object = root as? [String: Any],
-           object["method"] as? String == "sync.snapshot" {
-            return await dispatchSyncSnapshotRPCData(
-                object,
-                ownerFingerprint: ownerFingerprint
-            )
+           let method = object["method"] as? String {
+            switch method {
+            case "sync.snapshot":
+                return await dispatchSyncSnapshotRPCData(
+                    object,
+                    ownerFingerprint: ownerFingerprint
+                )
+            case "sync.snapshot.begin":
+                return await dispatchSyncSnapshotBeginRPCData(
+                    object,
+                    ownerFingerprint: ownerFingerprint
+                )
+            case "sync.snapshot.chunk":
+                return await dispatchSyncSnapshotChunkRPCData(
+                    object,
+                    ownerFingerprint: ownerFingerprint
+                )
+            case "sync.snapshot.commit":
+                return await dispatchSyncSnapshotCommitRPCData(
+                    object,
+                    ownerFingerprint: ownerFingerprint
+                )
+            default:
+                break
+            }
         }
 
         return rpcJSONData(await dispatchStrictRPCItem(
@@ -2256,6 +2281,48 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 wireID: wireID,
                 ownerFingerprint: ownerFingerprint
             )
+        }
+        if method == "sync.snapshot.begin" {
+            guard let rawParams else {
+                return rpcErrorObject(.invalidParams, id: wireID)
+            }
+            let data = await encodeSyncSnapshotBeginResponse(
+                rawParams: rawParams,
+                wireID: wireID,
+                ownerFingerprint: ownerFingerprint
+            )
+            if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                return object
+            }
+            return rpcErrorObject(.internalError, id: wireID)
+        }
+        if method == "sync.snapshot.chunk" {
+            guard let rawParams else {
+                return rpcErrorObject(.invalidParams, id: wireID)
+            }
+            let data = encodeSyncSnapshotChunkResponse(
+                rawParams: rawParams,
+                wireID: wireID,
+                ownerFingerprint: ownerFingerprint
+            )
+            if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                return object
+            }
+            return rpcErrorObject(.internalError, id: wireID)
+        }
+        if method == "sync.snapshot.commit" {
+            guard let rawParams else {
+                return rpcErrorObject(.invalidParams, id: wireID)
+            }
+            let data = encodeSyncSnapshotCommitResponse(
+                rawParams: rawParams,
+                wireID: wireID,
+                ownerFingerprint: ownerFingerprint
+            )
+            if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                return object
+            }
+            return rpcErrorObject(.internalError, id: wireID)
         }
         let params = rawParams?.mapValues(JSONValue.from)
         let requestID: JSONRPCID?
@@ -2511,6 +2578,468 @@ public final class DirectHTTPServer: @unchecked Sendable {
             return rpcJSONData(rpcErrorObject(error, id: wireID))
         } catch {
             return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
+        }
+    }
+
+    // MARK: - Resumable snapshot chunks (`snapshot.chunks.v1`)
+
+    private func dispatchSyncSnapshotBeginRPCData(
+        _ object: [String: Any],
+        ownerFingerprint: String
+    ) async -> Data {
+        let fallbackID = strictRPCID(
+            object["id"],
+            keyIsPresent: object.keys.contains("id")
+        )?.0 ?? NSNull()
+        let expectedKeys: Set<String> = object.keys.contains("params")
+            ? ["jsonrpc", "id", "method", "params"]
+            : ["jsonrpc", "id", "method"]
+        guard Set(object.keys) == expectedKeys,
+              object["jsonrpc"] as? String == "2.0",
+              let (wireID, _) = strictRPCID(
+                  object["id"],
+                  keyIsPresent: object.keys.contains("id")
+              ),
+              let rawParams = object["params"] as? [String: Any] else {
+            return rpcJSONData(rpcErrorObject(.invalidRequest, id: fallbackID))
+        }
+        return await encodeSyncSnapshotBeginResponse(
+            rawParams: rawParams,
+            wireID: wireID,
+            ownerFingerprint: ownerFingerprint
+        )
+    }
+
+    private func dispatchSyncSnapshotChunkRPCData(
+        _ object: [String: Any],
+        ownerFingerprint: String
+    ) async -> Data {
+        let fallbackID = strictRPCID(
+            object["id"],
+            keyIsPresent: object.keys.contains("id")
+        )?.0 ?? NSNull()
+        let expectedKeys: Set<String> = object.keys.contains("params")
+            ? ["jsonrpc", "id", "method", "params"]
+            : ["jsonrpc", "id", "method"]
+        guard Set(object.keys) == expectedKeys,
+              object["jsonrpc"] as? String == "2.0",
+              let (wireID, _) = strictRPCID(
+                  object["id"],
+                  keyIsPresent: object.keys.contains("id")
+              ),
+              let rawParams = object["params"] as? [String: Any] else {
+            return rpcJSONData(rpcErrorObject(.invalidRequest, id: fallbackID))
+        }
+        return encodeSyncSnapshotChunkResponse(
+            rawParams: rawParams,
+            wireID: wireID,
+            ownerFingerprint: ownerFingerprint
+        )
+    }
+
+    /// Opt-in chunked baseline: same host/boot/owner gates as `sync.snapshot`,
+    /// but only *reserves* the watermark (`beginSnapshot`). Sequence authority
+    /// advances only in `sync.snapshot.commit` after the client has assembled
+    /// and digest-verified every chunk. Returns a secret-free manifest and
+    /// caches bounded frame bytes for granular resume via `sync.snapshot.chunk`.
+    private func encodeSyncSnapshotBeginResponse(
+        rawParams: [String: Any],
+        wireID: Any,
+        ownerFingerprint: String
+    ) async -> Data {
+        let allowedKeys: Set<String> = [
+            "connectionId", "expectedHostId", "expectedBootEpoch", "supportedStateVersion",
+            "knownDomainRevisions", "preferredChunkBytes",
+        ]
+        guard Set(rawParams.keys).isSubset(of: allowedKeys),
+              rawParams.keys.contains("connectionId"),
+              rawParams.keys.contains("expectedHostId"),
+              rawParams.keys.contains("expectedBootEpoch"),
+              rawParams.keys.contains("supportedStateVersion"),
+              let connectionID = rawParams["connectionId"] as? String,
+              !connectionID.isEmpty,
+              let expectedHostID = rawParams["expectedHostId"] as? String,
+              expectedHostID == serverId,
+              let expectedBootEpoch = Self.strictUInt64(rawParams["expectedBootEpoch"]),
+              expectedBootEpoch == bootEpoch,
+              let supportedStateVersion = Self.strictInt64(rawParams["supportedStateVersion"]),
+              supportedStateVersion == 3 else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+
+        let preferredChunkBytes: Int?
+        if rawParams.keys.contains("preferredChunkBytes") {
+            guard let value = Self.strictInt64(rawParams["preferredChunkBytes"]),
+                  value > 0,
+                  value <= Int64(SnapshotChunkSizePolicy.maximumBytes * 4) else {
+                return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+            }
+            preferredChunkBytes = Int(value)
+        } else {
+            preferredChunkBytes = nil
+        }
+
+        guard Self.hybridConnectionAuthorized(
+            connectionID: connectionID,
+            ownerFingerprint: ownerFingerprint,
+            registeredOwner: {
+                activeWebSocketConnections.ownerFingerprint(for: connectionID)
+            },
+            ownerHasLiveConnection: {
+                activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
+            }
+        ) else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+        // Drop TTL-expired transfers first so a abandoned chunk reservation
+        // cannot permanently fence beginSnapshot.
+        releaseExpiredChunkTransferReservations()
+        let watermark = activeWebSocketConnections.watermark(
+            for: connectionID,
+            ownerFingerprint: ownerFingerprint
+        )
+        if let watermark, !watermark.beginSnapshot() {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+
+        let knownRevisions: ConnectionDomainRevisions?
+        if rawParams.keys.contains("knownDomainRevisions") {
+            guard let parsed = ConnectionDomainRevisions.parse(rawParams["knownDomainRevisions"]) else {
+                if let watermark { watermark.cancelSnapshot() }
+                return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+            }
+            knownRevisions = parsed
+        } else {
+            knownRevisions = nil
+        }
+
+        // Reservation held only after cache insert succeeds. Unlike full
+        // `sync.snapshot`, begin must NOT adopt/advance the watermark.
+        var reservationHeld = false
+        defer {
+            if let watermark, !reservationHeld { watermark.cancelSnapshot() }
+        }
+        do {
+            let snapshot = try await dispatcher.readConnectionSnapshot()
+            if let watermark {
+                guard activeWebSocketConnections.watermark(
+                    for: connectionID,
+                    ownerFingerprint: ownerFingerprint
+                ) === watermark else {
+                    return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+                }
+            }
+            let hostRevisions = snapshot.metadata.domainRevisions
+            let includeDomains: Set<String>?
+            if let knownRevisions {
+                let changed = hostRevisions.domainsChanged(since: knownRevisions)
+                includeDomains = changed.isEmpty ? [] : changed
+            } else {
+                includeDomains = nil
+            }
+            let state = snapshot.state.jsonValue(
+                domainRevisions: hostRevisions,
+                includeDomains: includeDomains
+            )
+            let frame = ConnectionSnapshotFrame(
+                protocolVersion: ConnectionTransportFrame.protocolVersion,
+                type: "snapshot",
+                connectionId: connectionID,
+                hostId: serverId,
+                bootEpoch: bootEpoch,
+                sequence: snapshot.metadata.sequence,
+                snapshotId: UUID().uuidString,
+                generatedAtEpochMs: Int64(Date().timeIntervalSince1970 * 1_000),
+                stateVersion: 3,
+                state: state
+            )
+            // Encode the authoritative frame once — chunks resume these bytes.
+            let frameBytes = try JSONEncoder().encode(frame)
+            guard frameBytes.count <= ConnectionTransportFrame.maximumEncodedBytes else {
+                return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
+            }
+            let inserted = try snapshotChunkTransfers.insert(
+                frameBytes: frameBytes,
+                ownerFingerprint: ownerFingerprint,
+                connectionId: connectionID,
+                hostId: serverId,
+                bootEpoch: bootEpoch,
+                snapshotId: frame.snapshotId,
+                sequence: frame.sequence,
+                generatedAtEpochMs: frame.generatedAtEpochMs,
+                stateVersion: frame.stateVersion,
+                preferredChunkBytes: preferredChunkBytes
+            )
+            // Pressure/TTL evictions release prior reservations without adopt.
+            for released in inserted.releasedReservations {
+                cancelChunkSnapshotReservation(
+                    connectionID: released.connectionId,
+                    ownerFingerprint: released.ownerFingerprint
+                )
+            }
+            // Keep watermark in-flight until commit (or cancel on expiry/failure).
+            reservationHeld = true
+            return rpcJSONData([
+                "jsonrpc": "2.0",
+                "id": wireID,
+                "result": inserted.record.manifest.jsonObject,
+            ])
+        } catch let error as SnapshotChunkTransferFailure {
+            switch error {
+            case .payloadTooLarge, .cachePressure:
+                return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
+            default:
+                return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+            }
+        } catch let error as JSONRPCError {
+            return rpcJSONData(rpcErrorObject(error, id: wireID))
+        } catch {
+            return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
+        }
+    }
+
+    private func dispatchSyncSnapshotCommitRPCData(
+        _ object: [String: Any],
+        ownerFingerprint: String
+    ) async -> Data {
+        let fallbackID = strictRPCID(
+            object["id"],
+            keyIsPresent: object.keys.contains("id")
+        )?.0 ?? NSNull()
+        let expectedKeys: Set<String> = object.keys.contains("params")
+            ? ["jsonrpc", "id", "method", "params"]
+            : ["jsonrpc", "id", "method"]
+        guard Set(object.keys) == expectedKeys,
+              object["jsonrpc"] as? String == "2.0",
+              let (wireID, _) = strictRPCID(
+                  object["id"],
+                  keyIsPresent: object.keys.contains("id")
+              ),
+              let rawParams = object["params"] as? [String: Any] else {
+            return rpcJSONData(rpcErrorObject(.invalidRequest, id: fallbackID))
+        }
+        return encodeSyncSnapshotCommitResponse(
+            rawParams: rawParams,
+            wireID: wireID,
+            ownerFingerprint: ownerFingerprint
+        )
+    }
+
+    /// Finalize a chunked transfer: validate identity + digest, adopt sequence
+    /// exactly once, and release the transfer. Must not run before the client
+    /// has assembled/verified every chunk (client contracts enforce ordering).
+    private func encodeSyncSnapshotCommitResponse(
+        rawParams: [String: Any],
+        wireID: Any,
+        ownerFingerprint: String
+    ) -> Data {
+        let allowedKeys: Set<String> = [
+            "transferId", "snapshotId", "digest",
+            "connectionId", "expectedHostId", "expectedBootEpoch",
+        ]
+        guard Set(rawParams.keys) == allowedKeys,
+              let transferId = rawParams["transferId"] as? String,
+              !transferId.isEmpty,
+              let snapshotId = rawParams["snapshotId"] as? String,
+              !snapshotId.isEmpty,
+              let digest = rawParams["digest"] as? String,
+              digest.count == 64,
+              digest.allSatisfy({ $0.isHexDigit }),
+              let connectionID = rawParams["connectionId"] as? String,
+              !connectionID.isEmpty,
+              let expectedHostID = rawParams["expectedHostId"] as? String,
+              expectedHostID == serverId,
+              let expectedBootEpoch = Self.strictUInt64(rawParams["expectedBootEpoch"]),
+              expectedBootEpoch == bootEpoch else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+
+        guard Self.hybridConnectionAuthorized(
+            connectionID: connectionID,
+            ownerFingerprint: ownerFingerprint,
+            registeredOwner: {
+                activeWebSocketConnections.ownerFingerprint(for: connectionID)
+            },
+            ownerHasLiveConnection: {
+                activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
+            }
+        ) else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+
+        let watermark = activeWebSocketConnections.watermark(
+            for: connectionID,
+            ownerFingerprint: ownerFingerprint
+        )
+
+        do {
+            let record = try snapshotChunkTransfers.takeForCommit(
+                transferId: transferId,
+                snapshotId: snapshotId,
+                digest: digest,
+                ownerFingerprint: ownerFingerprint,
+                connectionId: connectionID,
+                hostId: serverId,
+                bootEpoch: bootEpoch
+            )
+            if let watermark {
+                switch watermark.adoptSnapshot(sequence: record.sequence) {
+                case .adopted:
+                    break
+                case .gap(let expected, let received):
+                    return rpcJSONData(rpcErrorObject(JSONRPCError(
+                        code: -32010,
+                        message: "Event sequence gap detected; reconnect and request a new baseline.",
+                        data: .object([
+                            "expectedSequence": .number(Double(expected)),
+                            "receivedSequence": .number(Double(received)),
+                        ])
+                    ), id: wireID))
+                }
+            }
+            return rpcJSONData([
+                "jsonrpc": "2.0",
+                "id": wireID,
+                "result": [
+                    "transferId": record.transferId,
+                    "snapshotId": record.snapshotId,
+                    "sequence": NSNumber(value: record.sequence),
+                    "committed": true,
+                ] as [String: Any],
+            ])
+        } catch let failure as SnapshotChunkTransferFailure {
+            switch failure {
+            case .transferExpired:
+                // Reservation must not outlive the transfer cache entry.
+                cancelChunkSnapshotReservation(
+                    connectionID: connectionID,
+                    ownerFingerprint: ownerFingerprint
+                )
+                return rpcJSONData(rpcErrorObject(JSONRPCError(
+                    code: -32041,
+                    message: "Snapshot chunk transfer expired or unknown; request a new baseline.",
+                    data: .object(["reason": .string("transfer_expired")])
+                ), id: wireID))
+            case .transferUnknown:
+                // Already committed (single-flight) or never existed — do not
+                // cancel a live reservation that may belong to another transfer
+                // lifecycle. Double-commit is fail-closed and non-advancing.
+                return rpcJSONData(rpcErrorObject(JSONRPCError(
+                    code: -32041,
+                    message: "Snapshot chunk transfer expired or unknown; request a new baseline.",
+                    data: .object(["reason": .string("transfer_unknown")])
+                ), id: wireID))
+            case .identityMismatch, .commitMismatch, .invalidParams, .chunkOutOfRange:
+                return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+            case .payloadTooLarge, .cachePressure:
+                return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
+            }
+        } catch {
+            return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
+        }
+    }
+
+    /// Serve one cached chunk. Auth + identity gates match `sync.snapshot`;
+    /// never returns secrets from the original request.
+    private func encodeSyncSnapshotChunkResponse(
+        rawParams: [String: Any],
+        wireID: Any,
+        ownerFingerprint: String
+    ) -> Data {
+        let allowedKeys: Set<String> = [
+            "transferId", "chunkIndex",
+            "connectionId", "expectedHostId", "expectedBootEpoch",
+        ]
+        guard Set(rawParams.keys) == allowedKeys,
+              let transferId = rawParams["transferId"] as? String,
+              !transferId.isEmpty,
+              let chunkIndex = Self.strictInt64(rawParams["chunkIndex"]),
+              chunkIndex >= 0,
+              chunkIndex <= Int64(SnapshotChunkSizePolicy.maximumChunkCount),
+              let connectionID = rawParams["connectionId"] as? String,
+              !connectionID.isEmpty,
+              let expectedHostID = rawParams["expectedHostId"] as? String,
+              expectedHostID == serverId,
+              let expectedBootEpoch = Self.strictUInt64(rawParams["expectedBootEpoch"]),
+              expectedBootEpoch == bootEpoch else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+
+        guard Self.hybridConnectionAuthorized(
+            connectionID: connectionID,
+            ownerFingerprint: ownerFingerprint,
+            registeredOwner: {
+                activeWebSocketConnections.ownerFingerprint(for: connectionID)
+            },
+            ownerHasLiveConnection: {
+                activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
+            }
+        ) else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+
+        do {
+            let chunk = try snapshotChunkTransfers.fetchChunk(
+                transferId: transferId,
+                chunkIndex: Int(chunkIndex),
+                ownerFingerprint: ownerFingerprint,
+                connectionId: connectionID,
+                hostId: serverId,
+                bootEpoch: bootEpoch
+            )
+            return rpcJSONData([
+                "jsonrpc": "2.0",
+                "id": wireID,
+                "result": chunk.jsonObject,
+            ])
+        } catch let failure as SnapshotChunkTransferFailure {
+            switch failure {
+            case .transferExpired:
+                cancelChunkSnapshotReservation(
+                    connectionID: connectionID,
+                    ownerFingerprint: ownerFingerprint
+                )
+                return rpcJSONData(rpcErrorObject(JSONRPCError(
+                    code: -32041,
+                    message: "Snapshot chunk transfer expired or unknown; request a new baseline.",
+                    data: .object(["reason": .string("transfer_expired")])
+                ), id: wireID))
+            case .transferUnknown:
+                return rpcJSONData(rpcErrorObject(JSONRPCError(
+                    code: -32041,
+                    message: "Snapshot chunk transfer expired or unknown; request a new baseline.",
+                    data: .object(["reason": .string("transfer_unknown")])
+                ), id: wireID))
+            case .identityMismatch, .chunkOutOfRange, .invalidParams, .commitMismatch:
+                return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+            case .payloadTooLarge, .cachePressure:
+                return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
+            }
+        } catch {
+            return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
+        }
+    }
+
+    /// Drop an in-flight watermark reservation without advancing sequence.
+    private func cancelChunkSnapshotReservation(
+        connectionID: String,
+        ownerFingerprint: String
+    ) {
+        activeWebSocketConnections.watermark(
+            for: connectionID,
+            ownerFingerprint: ownerFingerprint
+        )?.cancelSnapshot()
+    }
+
+    /// Evict TTL-expired chunk transfers and cancel any watermark reservations
+    /// they still held (no cursor advance).
+    private func releaseExpiredChunkTransferReservations() {
+        let released = snapshotChunkTransfers.evictExpired()
+        for record in released {
+            cancelChunkSnapshotReservation(
+                connectionID: record.connectionId,
+                ownerFingerprint: record.ownerFingerprint
+            )
         }
     }
 
