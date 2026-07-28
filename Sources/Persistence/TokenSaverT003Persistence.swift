@@ -2463,6 +2463,16 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
         }
     }
 
+    /// Global row count for startup diagnostics (empty table = silent-death for admission).
+    public func countAll() throws -> Int {
+        try db.performSync { database in
+            let statement = try database.prepare("SELECT COUNT(*) FROM token_saver_lane_state;")
+            defer { statement.reset() }
+            guard try statement.step() else { return 0 }
+            return Int(statement.columnInt64(0))
+        }
+    }
+
     public func list(projectID: String) throws -> [TokenSaverLaneStateRecord] {
         try db.performSync { database in
             let statement = try database.prepare("""
@@ -2619,6 +2629,66 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
             try statement.bind(8, item.killSwitch)
             try statement.bind(9, Int64(now.timeIntervalSince1970 * 1_000))
             _ = try statement.step()
+        }
+    }
+}
+
+// MARK: - Audit events
+
+/// Append-only Token Saver audit trail (`token_saver_audit_events`).
+/// WHY: Admission denials and lifecycle/ops events must be durable and queryable
+/// so operators can see silent-death / deny conditions instead of empty ledgers.
+public final class TokenSaverAuditEventRepository: @unchecked Sendable {
+    private let db: SQLiteDB
+    public init(db: SQLiteDB) { self.db = db }
+
+    public func append(
+        eventKind: String,
+        projectID: String? = nil,
+        threadID: String? = nil,
+        attemptID: String? = nil,
+        objectID: String? = nil,
+        countValue: Int64? = nil,
+        reason: String? = nil,
+        at date: Date = Date()
+    ) throws {
+        let kind = eventKind.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !kind.isEmpty else { return }
+        let ms = Int64(date.timeIntervalSince1970 * 1_000)
+        try db.performSync { database in
+            let statement = try database.prepare("""
+                INSERT INTO token_saver_audit_events
+                    (event_kind, project_id, thread_id, attempt_id, object_id, count_value, reason, created_at_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            """)
+            defer { statement.reset() }
+            try statement.bind(1, kind)
+            try statement.bind(2, projectID)
+            try statement.bind(3, threadID)
+            try statement.bind(4, attemptID)
+            try statement.bind(5, objectID)
+            try statement.bind(6, countValue)
+            try statement.bind(7, reason)
+            try statement.bind(8, ms)
+            _ = try statement.step()
+        }
+    }
+
+    public func count(eventKind: String? = nil) throws -> Int {
+        try db.performSync { database in
+            if let eventKind {
+                let statement = try database.prepare(
+                    "SELECT COUNT(*) FROM token_saver_audit_events WHERE event_kind = ?;"
+                )
+                defer { statement.reset() }
+                try statement.bind(1, eventKind)
+                guard try statement.step() else { return 0 }
+                return Int(statement.columnInt64(0))
+            }
+            let statement = try database.prepare("SELECT COUNT(*) FROM token_saver_audit_events;")
+            defer { statement.reset() }
+            guard try statement.step() else { return 0 }
+            return Int(statement.columnInt64(0))
         }
     }
 }

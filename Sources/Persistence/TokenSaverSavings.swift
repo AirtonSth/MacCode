@@ -73,6 +73,11 @@ public struct TokenSaverModeSavings: Sendable, Equatable {
 /// retained event rows and feed the short-term reports/chart. Mode rows carry the
 /// same permanent totals split by (provider, mode) for the breakdown table.
 /// `windowByMode` is the same retained-window technique mix as `daily` (not all-time).
+///
+/// `attributedSavedTokens` / `unattributedSavedTokens` are the honesty split: only
+/// rows matching ``TokenSaverSavingsRepository.displayedSavingsEligibilitySQL``
+/// contribute, then attributed vs unattributed is applied. Existing fields keep
+/// their pre-honesty semantics (sum of the permanent accumulator as written).
 public struct TokenSaverSavingsSummary: Sendable, Equatable {
     public let providers: [TokenSaverProviderSavings]
     public let daily: [TokenSaverDailySavings]
@@ -85,19 +90,35 @@ public struct TokenSaverSavingsSummary: Sendable, Equatable {
     /// Per-(provider, mode) totals over the retained report window only. Sum of
     /// `savedTokens` across all rows equals sum of `daily.savedTokens` by construction.
     public let windowByMode: [TokenSaverModeSavings]
+    /// All-time saved tokens that are display-eligible and attributed
+    /// (`prompt_bound` or a real non-`unknown` provider).
+    public let attributedSavedTokens: Int
+    public let attributedRuns: Int
+    /// All-time saved tokens that are display-eligible but not attributed
+    /// (no real provider and not `prompt_bound`).
+    public let unattributedSavedTokens: Int
+    public let unattributedRuns: Int
 
     public init(
         providers: [TokenSaverProviderSavings],
         daily: [TokenSaverDailySavings],
         modes: [TokenSaverModeSavings] = [],
         dailyByProvider: [TokenSaverProviderDailySavings] = [],
-        windowByMode: [TokenSaverModeSavings] = []
+        windowByMode: [TokenSaverModeSavings] = [],
+        attributedSavedTokens: Int = 0,
+        attributedRuns: Int = 0,
+        unattributedSavedTokens: Int = 0,
+        unattributedRuns: Int = 0
     ) {
         self.providers = providers
         self.daily = daily
         self.modes = modes
         self.dailyByProvider = dailyByProvider
         self.windowByMode = windowByMode
+        self.attributedSavedTokens = attributedSavedTokens
+        self.attributedRuns = attributedRuns
+        self.unattributedSavedTokens = unattributedSavedTokens
+        self.unattributedRuns = unattributedRuns
     }
 
     public var totalSavedTokens: Int { providers.reduce(0) { $0 + $1.savedTokens } }
@@ -132,7 +153,11 @@ public struct TokenSaverSavingsSummary: Sendable, Equatable {
         daily: [],
         modes: [],
         dailyByProvider: [],
-        windowByMode: []
+        windowByMode: [],
+        attributedSavedTokens: 0,
+        attributedRuns: 0,
+        unattributedSavedTokens: 0,
+        unattributedRuns: 0
     )
 }
 
@@ -146,6 +171,28 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
     private let retentionDays: Int
     private let calendar: Calendar
     private static let isoFormatter = ISO8601DateFormatter()
+
+    /// HISTORICAL-ROW RULE — single SQL fragment for every honesty read path.
+    ///
+    /// WHY: A row is display-eligible when `delivered = 1` (compressed bytes
+    /// actually replaced the original). Pre-migration rows never received a
+    /// class: migration defaults leave `delivered = 0` and
+    /// `attributability = 'unknown'`. Those unclassed rows must still count
+    /// when the provider is a real (non-`unknown`) provider so the all-time
+    /// figure cannot regress to zero. Explicit `delivered = 0` with a known
+    /// attributability (fail-open / verbatim) is excluded.
+    ///
+    /// Values for `attributability`: `prompt_bound` | `not_prompt_bound` | `unknown`.
+    public static let displayedSavingsEligibilitySQL = """
+        (delivered = 1 OR (attributability = 'unknown' AND provider != 'unknown'))
+        """
+
+    /// Among display-eligible rows: counts toward the *attributed* figure when
+    /// the row is `prompt_bound` OR the provider is a real (non-`unknown`) provider.
+    /// Compose with ``displayedSavingsEligibilitySQL``; do not copy-paste either.
+    public static let attributedSavingsSQL = """
+        (attributability = 'prompt_bound' OR (provider IS NOT NULL AND provider != '' AND provider != 'unknown'))
+        """
 
     public init(db: SQLiteDB, retentionDays: Int = 7, calendar: Calendar = .current) {
         self.db = db
@@ -168,6 +215,11 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
         inputTokens: Int,
         outputTokens: Int,
         cacheState: String = "unknown",
+        contentType: String = "unknown",
+        engine: String = "unknown",
+        attributability: String = "unknown",
+        delivered: Bool = false,
+        governance: String = "{}",
         at date: Date = Date()
     ) throws -> Int {
         let saved = max(inputTokens - outputTokens, 0)
@@ -178,6 +230,11 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
             outputTokens: outputTokens,
             savedTokens: saved,
             cacheState: cacheState,
+            contentType: contentType,
+            engine: engine,
+            attributability: attributability,
+            delivered: delivered,
+            governance: governance,
             at: date
         )
     }
@@ -193,17 +250,30 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
         outputTokens: Int,
         savedTokens: Int,
         cacheState: String = "unknown",
+        contentType: String = "unknown",
+        engine: String = "unknown",
+        attributability: String = "unknown",
+        delivered: Bool = false,
+        governance: String = "{}",
         at date: Date = Date()
     ) throws -> Int {
         let saved = max(savedTokens, 0)
         let ms = Int64(date.timeIntervalSince1970 * 1000)
         let iso = Self.isoFormatter.string(from: date)
         let cutoff = ms - retentionMs
+        let deliveredFlag = delivered ? 1 : 0
+        let attr = Self.normalizedAttributability(attributability)
+        let gov = governance.isEmpty ? "{}" : governance
+        let trimmedContent = contentType.trimmingCharacters(in: .whitespacesAndNewlines)
+        let content = trimmedContent.isEmpty ? "unknown" : trimmedContent
+        let trimmedEngine = engine.trimmingCharacters(in: .whitespacesAndNewlines)
+        let eng = trimmedEngine.isEmpty ? "unknown" : trimmedEngine
         try db.performSync { database in
             let insert = try database.prepare("""
                 INSERT INTO token_saver_savings
-                    (provider, mode, input_tokens, output_tokens, saved_tokens, created_at, created_at_ms, cache_state)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                    (provider, mode, input_tokens, output_tokens, saved_tokens, created_at, created_at_ms,
+                     cache_state, content_type, engine, attributability, delivered, governance_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """)
             defer { insert.reset() }
             try insert.bind(1, provider)
@@ -214,18 +284,33 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
             try insert.bind(6, iso)
             try insert.bind(7, ms)
             try insert.bind(8, cacheState)
+            try insert.bind(9, content)
+            try insert.bind(10, eng)
+            try insert.bind(11, attr)
+            try insert.bind(12, deliveredFlag)
+            try insert.bind(13, gov)
             _ = try insert.step()
 
             let total = try database.prepare("""
                 INSERT INTO token_saver_savings_totals
-                    (provider, mode, input_tokens, output_tokens, saved_tokens, runs, updated_at)
-                VALUES (?, ?, ?, ?, ?, 1, ?)
+                    (provider, mode, input_tokens, output_tokens, saved_tokens, runs, updated_at,
+                     attributability, delivered, governance_json)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
                 ON CONFLICT(provider, mode) DO UPDATE SET
                     input_tokens = token_saver_savings_totals.input_tokens + excluded.input_tokens,
                     output_tokens = token_saver_savings_totals.output_tokens + excluded.output_tokens,
                     saved_tokens = token_saver_savings_totals.saved_tokens + excluded.saved_tokens,
                     runs = token_saver_savings_totals.runs + excluded.runs,
-                    updated_at = excluded.updated_at;
+                    updated_at = excluded.updated_at,
+                    delivered = MAX(token_saver_savings_totals.delivered, excluded.delivered),
+                    attributability = CASE
+                        WHEN excluded.attributability != 'unknown' THEN excluded.attributability
+                        ELSE token_saver_savings_totals.attributability
+                    END,
+                    governance_json = CASE
+                        WHEN excluded.governance_json != '{}' THEN excluded.governance_json
+                        ELSE token_saver_savings_totals.governance_json
+                    END;
             """)
             defer { total.reset() }
             try total.bind(1, provider)
@@ -234,6 +319,9 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
             try total.bind(4, max(0, outputTokens))
             try total.bind(5, saved)
             try total.bind(6, iso)
+            try total.bind(7, attr)
+            try total.bind(8, deliveredFlag)
+            try total.bind(9, gov)
             _ = try total.step()
 
             let prune = try database.prepare("DELETE FROM token_saver_savings WHERE created_at_ms < ?;")
@@ -242,6 +330,16 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
             _ = try prune.step()
         }
         return saved
+    }
+
+    private static func normalizedAttributability(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch trimmed {
+        case "prompt_bound", "not_prompt_bound", "unknown":
+            return trimmed
+        default:
+            return "unknown"
+        }
     }
 
     /// Delete any rows older than the retention window. Safe to call on launch.
@@ -379,12 +477,50 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
                 ))
             }
 
+            // Honesty split: one eligibility predicate + attributed classifier.
+            // Existing `providers` / `totalSavedTokens` semantics are unchanged.
+            let honesty = try database.prepare("""
+                SELECT
+                    COALESCE(SUM(CASE
+                        WHEN \(Self.displayedSavingsEligibilitySQL)
+                             AND \(Self.attributedSavingsSQL)
+                        THEN saved_tokens ELSE 0 END), 0),
+                    COALESCE(SUM(CASE
+                        WHEN \(Self.displayedSavingsEligibilitySQL)
+                             AND \(Self.attributedSavingsSQL)
+                        THEN runs ELSE 0 END), 0),
+                    COALESCE(SUM(CASE
+                        WHEN \(Self.displayedSavingsEligibilitySQL)
+                             AND NOT (\(Self.attributedSavingsSQL))
+                        THEN saved_tokens ELSE 0 END), 0),
+                    COALESCE(SUM(CASE
+                        WHEN \(Self.displayedSavingsEligibilitySQL)
+                             AND NOT (\(Self.attributedSavingsSQL))
+                        THEN runs ELSE 0 END), 0)
+                FROM token_saver_savings_totals;
+            """)
+            defer { honesty.reset() }
+            var attributedSaved = 0
+            var attributedRuns = 0
+            var unattributedSaved = 0
+            var unattributedRuns = 0
+            if try honesty.step() {
+                attributedSaved = Int(honesty.columnInt64(0))
+                attributedRuns = Int(honesty.columnInt64(1))
+                unattributedSaved = Int(honesty.columnInt64(2))
+                unattributedRuns = Int(honesty.columnInt64(3))
+            }
+
             return TokenSaverSavingsSummary(
                 providers: providers,
                 daily: daily,
                 modes: modes,
                 dailyByProvider: dailyByProvider,
-                windowByMode: windowByMode
+                windowByMode: windowByMode,
+                attributedSavedTokens: attributedSaved,
+                attributedRuns: attributedRuns,
+                unattributedSavedTokens: unattributedSaved,
+                unattributedRuns: unattributedRuns
             )
         }
     }

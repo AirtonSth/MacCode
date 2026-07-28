@@ -89,19 +89,13 @@ struct RemoteCodeDistillServiceMain {
                 appSupportDirectory: configuration.appSupportDirectory
             )
             let statsProvider = SidecarDistillStatsProvider(repository: savingsRepo)
+            // Same DB as the savings ledger: forfeited-compression denial audits
+            // land in token_saver_audit_events for operator visibility.
+            let auditEventsRepo = TokenSaverAuditEventRepository(db: db)
             let eventWriter = DistillSidecarEventWriter()
-            let server = DistillHTTPServer(
-                configuration: configuration,
-                scheduler: scheduler,
-                reversibleStore: reversibleStore,
-                scopedRecoveryStore: scopedRecoveryStore,
-                statsProvider: statsProvider,
-                startsReady: false,
-                metricsRecorder: sharedMetrics
-            ) { request, response in
-                guard let record = DistillSavingsCalculator.record(for: request, response: response) else {
-                    return
-                }
+            // Shared fail-open persist for DistillSavingsRecord (success + forfeit).
+            // Persistence errors must never block or crash the HTTP response path.
+            let persistSavings: DistillHTTPServer.SavingsRecordHandler = { record in
                 do {
                     _ = try savingsRepo.record(
                         provider: record.provider,
@@ -109,13 +103,49 @@ struct RemoteCodeDistillServiceMain {
                         inputTokens: record.inputTokens,
                         outputTokens: record.outputTokens,
                         savedTokens: record.savedTokens,
-                        cacheState: record.cacheState
+                        cacheState: record.cacheState,
+                        contentType: "unknown",
+                        engine: record.routeStage?.rawValue ?? "unknown",
+                        attributability: record.attributability,
+                        delivered: record.delivered
                     )
-                    eventWriter.writeSavingsRecorded(record)
                 } catch {
                     FileHandle.standardError.write(Data("RemoteCodeDistillService savings record failed: \(error)\n".utf8))
                 }
             }
+            let server = DistillHTTPServer(
+                configuration: configuration,
+                scheduler: scheduler,
+                reversibleStore: reversibleStore,
+                scopedRecoveryStore: scopedRecoveryStore,
+                statsProvider: statsProvider,
+                startsReady: false,
+                metricsRecorder: sharedMetrics,
+                onSuccess: { request, response in
+                    guard let record = DistillSavingsCalculator.record(for: request, response: response) else {
+                        return
+                    }
+                    await persistSavings(record)
+                    eventWriter.writeSavingsRecorded(record)
+                },
+                // WHY: DistillCore emitForfeitedCompression only fires these optional
+                // seams. Without them, delivered=0 forfeit rows and token_saver_denial
+                // audits exist only in unit tests — production operators see nothing.
+                onSavingsRecord: { record in
+                    await persistSavings(record)
+                },
+                onAuditEvent: { eventKind, reason, countValue in
+                    do {
+                        try auditEventsRepo.append(
+                            eventKind: eventKind,
+                            countValue: countValue,
+                            reason: reason
+                        )
+                    } catch {
+                        FileHandle.standardError.write(Data("RemoteCodeDistillService audit event failed: \(error)\n".utf8))
+                    }
+                }
+            )
             let ready = try await server.start()
             // Pay the model cold-start NOW, while /readyz still reports 503, so the
             // first real agent turn never awaits a cold model. Only after warmup do

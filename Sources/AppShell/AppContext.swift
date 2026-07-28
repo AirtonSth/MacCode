@@ -7,6 +7,163 @@ import SocketServer
 import Surfaces
 import DistillCore
 
+// MARK: - Token Saver per-lane kill switch + governance snapshot
+
+/// WHY: Operators need a per-lane incident control point without full Token Saver
+/// rollback. The same pure decision is reachable from the app and from child
+/// `distill` processes via env (`RC_TOKEN_SAVER_DISABLED_LANES` /
+/// `RC_TOKEN_SAVER_ENABLED_LANES`) and the shared DistillCLIState.json overlay.
+/// New/experimental lanes default DISABLED until explicitly enabled.
+public enum TokenSaverLaneKillSwitch: Sendable {
+    public static let disabledEnvKey = "RC_TOKEN_SAVER_DISABLED_LANES"
+    public static let enabledEnvKey = "RC_TOKEN_SAVER_ENABLED_LANES"
+
+    /// Lanes that ship in factory defaults / production inventory. Everything
+    /// else is experimental and defaults to DISABLED.
+    public static let knownStableLanes: Set<String> = [
+        "measurement",
+        "provider_native",
+        "deterministic_wrapper",
+        "exact_repetition",
+        "lexical_retrieval",
+        "rollover_capsule",
+        "session_learn",
+        "semantic_prose",
+        "adaptive_effort",
+        "visual_artifact",
+        "sr1-humanize",
+        "sr1_humanize",
+    ]
+
+    public struct CLIStateOverlay: Sendable, Equatable {
+        public var disabledLanes: Set<String>
+        public var enabledLanes: Set<String>
+
+        public static let empty = CLIStateOverlay(disabledLanes: [], enabledLanes: [])
+
+        public init(disabledLanes: Set<String> = [], enabledLanes: Set<String> = []) {
+            self.disabledLanes = disabledLanes
+            self.enabledLanes = enabledLanes
+        }
+    }
+
+    public static func parseLaneList(_ raw: String?) -> Set<String> {
+        guard let raw else { return [] }
+        return Set(
+            raw.split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        )
+    }
+
+    /// Read optional `disabled_lanes` / `enabled_lanes` from DistillCLIState.json
+    /// without requiring the sidecar writer to know about them yet.
+    public static func loadCLIStateOverlay(from url: URL?) -> CLIStateOverlay {
+        guard let url,
+              let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return .empty
+        }
+        func set(from key: String) -> Set<String> {
+            if let arr = obj[key] as? [String] {
+                return Set(
+                    arr.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                )
+            }
+            if let s = obj[key] as? String {
+                return parseLaneList(s)
+            }
+            return []
+        }
+        return CLIStateOverlay(
+            disabledLanes: set(from: "disabled_lanes"),
+            enabledLanes: set(from: "enabled_lanes")
+        )
+    }
+
+    /// Pure resolver: is `lane` disabled given env + CLI state overlay.
+    public static func isDisabled(
+        _ lane: String,
+        environment: [String: String],
+        cliState: CLIStateOverlay = .empty
+    ) -> Bool {
+        let laneKey = lane.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !laneKey.isEmpty else { return true }
+        let envDisabled = parseLaneList(environment[disabledEnvKey])
+        let envEnabled = parseLaneList(environment[enabledEnvKey])
+        let disabled = envDisabled.union(cliState.disabledLanes)
+        let enabled = envEnabled.union(cliState.enabledLanes)
+        // Incident kill switch always wins over enable lists.
+        if disabled.contains(laneKey) { return true }
+        if enabled.contains(laneKey) { return false }
+        if knownStableLanes.contains(laneKey) { return false }
+        // New/experimental lanes default DISABLED.
+        return true
+    }
+
+    /// Resolved disabled set for known + mentioned lanes (for child env export).
+    public static func resolvedDisabledLanes(
+        environment: [String: String],
+        cliState: CLIStateOverlay = .empty
+    ) -> Set<String> {
+        let mentioned = parseLaneList(environment[disabledEnvKey])
+            .union(parseLaneList(environment[enabledEnvKey]))
+            .union(cliState.disabledLanes)
+            .union(cliState.enabledLanes)
+            .union(knownStableLanes)
+        return Set(mentioned.filter { isDisabled($0, environment: environment, cliState: cliState) })
+    }
+
+    public static func resolvedEnabledLanes(
+        environment: [String: String],
+        cliState: CLIStateOverlay = .empty
+    ) -> Set<String> {
+        parseLaneList(environment[enabledEnvKey]).union(cliState.enabledLanes)
+    }
+}
+
+/// Compact governance snapshot attached to measurement rows so ungating savings
+/// from project admission stays auditable.
+public struct TokenSaverGovernanceSnapshot: Sendable, Equatable, Codable {
+    public var projectId: String?
+    public var admissionAllowed: Bool
+    public var admissionReason: String
+    public var evidenceLevel: String?
+    public var governedWrite: Bool
+
+    public init(
+        projectId: String?,
+        admissionAllowed: Bool,
+        admissionReason: String,
+        evidenceLevel: String?,
+        governedWrite: Bool
+    ) {
+        self.projectId = projectId
+        self.admissionAllowed = admissionAllowed
+        self.admissionReason = admissionReason
+        self.evidenceLevel = evidenceLevel
+        self.governedWrite = governedWrite
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case admissionAllowed = "admission_allowed"
+        case admissionReason = "admission_reason"
+        case evidenceLevel = "evidence_level"
+        case governedWrite = "governed_write"
+    }
+
+    public func jsonString() -> String {
+        let encoder = JSONEncoder()
+        guard let data = try? encoder.encode(self),
+              let text = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return text
+    }
+}
+
 struct ProjectScriptRunOutcome: Sendable, Equatable {
     let workspaceID: WorkspaceID
     let surfaceID: SurfaceID
@@ -134,6 +291,7 @@ public final class AppContext {
     public let tokenSaverLaneStateRepo: TokenSaverLaneStateRepository
     public let tokenSaverRolloverRepo: TokenSaverRolloverCapsuleRepository
     public let tokenSaverProjectDataRepo: TokenSaverProjectDataRepository
+    public let tokenSaverAuditEventsRepo: TokenSaverAuditEventRepository
     public private(set) var tokenSaverLifecycleDegradedReason: String?
     public let privateNotificationBridge: PrivateNotificationBridge
     public let liveActivityHostIdentity: LiveActivityHostIdentity
@@ -219,6 +377,8 @@ public final class AppContext {
     private static let tokenSaverDistillStartupPolls = 300
     private static let tokenSaverPromptSkipSetTTL: TimeInterval = 1_800
     private static let tokenSaverUsageNotificationMinimumInterval: TimeInterval = 2
+    /// Process-local once flag for empty lane_state diagnostic (silent-death condition).
+    private static var didLogEmptyTokenSaverLaneState = false
     /// Debounce window for coalescing per-token usage writes into one disk write.
     private static let tokenSaverUsageDebounceInterval: TimeInterval = 0.75
 
@@ -278,6 +438,7 @@ public final class AppContext {
         self.tokenSaverLaneStateRepo = TokenSaverLaneStateRepository(db: db)
         self.tokenSaverRolloverRepo = TokenSaverRolloverCapsuleRepository(db: db)
         self.tokenSaverProjectDataRepo = TokenSaverProjectDataRepository(db: db)
+        self.tokenSaverAuditEventsRepo = TokenSaverAuditEventRepository(db: db)
         do {
             _ = try self.tokenSaverProjectDataRepo.performLifecycleSweep()
         } catch {
@@ -285,6 +446,13 @@ public final class AppContext {
             self.tokenSaverLifecycleDegradedReason = reason
             NSLog("RemoteCode Token Saver launch lifecycle sweep entered degraded verbatim mode: \(reason)")
         }
+        // WHY: production installs historically had 0 token_saver_lane_state rows while
+        // Token Saver was enabled — every project-admission governed write silently no-op'd.
+        // Log once so the silent-death condition is visible in unified logs.
+        Self.logEmptyLaneStateIfNeeded(
+            tokenSaverEnabled: SettingsStore(db: db).load().tokenSaverEnabled,
+            laneStateCount: (try? self.tokenSaverLaneStateRepo.countAll()) ?? 0
+        )
         let privatePushTargetStore = PrivatePushTargetStore(repo: self.settingsRepo)
         let privateNotificationBridge = PrivateNotificationBridge(
             accountStore: PrivateAccountSessionStore(repo: self.settingsRepo),
@@ -1145,6 +1313,26 @@ public final class AppContext {
         // Activate waves that have passed E2E live rollout (process-local).
         TokenSaverWaveLiveRollout.activateAll()
         var env: [String: String] = [:]
+        // WHY: per-lane kill switch must reach child `distill` so an operator can
+        // disable one compression lane during an incident without full rollback.
+        // Exported even when managed install is degraded — the decision is independent.
+        let cliState = TokenSaverLaneKillSwitch.loadCLIStateOverlay(
+            from: tokenSaverDistillCLIStateURL
+        )
+        let disabled = TokenSaverLaneKillSwitch.resolvedDisabledLanes(
+            environment: baseEnvironment,
+            cliState: cliState
+        )
+        if !disabled.isEmpty {
+            env[TokenSaverLaneKillSwitch.disabledEnvKey] = disabled.sorted().joined(separator: ",")
+        }
+        let enabled = TokenSaverLaneKillSwitch.resolvedEnabledLanes(
+            environment: baseEnvironment,
+            cliState: cliState
+        )
+        if !enabled.isEmpty {
+            env[TokenSaverLaneKillSwitch.enabledEnvKey] = enabled.sorted().joined(separator: ",")
+        }
         // Expose managed distill CLI + wrappers on PATH only while Token Saver is on.
         if managedDistillSkillInstallError == nil {
             env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1"
@@ -1698,6 +1886,78 @@ public final class AppContext {
         return runAs.uid == getuid()
     }
 
+    private var tokenSaverDistillCLIStateURL: URL {
+        appSupportDirectory
+            .appendingPathComponent("Distill", isDirectory: true)
+            .appendingPathComponent("DistillCLIState.json")
+    }
+
+    private func tokenSaverLaneIsDisabled(_ lane: String) -> Bool {
+        let cliState = TokenSaverLaneKillSwitch.loadCLIStateOverlay(from: tokenSaverDistillCLIStateURL)
+        return TokenSaverLaneKillSwitch.isDisabled(
+            lane,
+            environment: ProcessInfo.processInfo.environment,
+            cliState: cliState
+        )
+    }
+
+    /// WHY: Admission denials were previously silent early-returns — operators could not
+    /// see that project_id NULL / empty lane_state blocked every governed write.
+    private func recordTokenSaverAdmissionDenial(
+        threadId: AgentThreadID,
+        lane: String,
+        decision: TokenSaverAdmissionDecision,
+        count: Int = 1
+    ) {
+        guard !decision.allowed else { return }
+        let projectID = (try? threadRepo.get(id: threadId))?.projectId?.value.uuidString
+        NSLog(
+            "RemoteCode Token Saver admission DENIED lane=\(lane) reason=\(decision.reason) thread=\(threadId.value.uuidString) project=\(projectID ?? "nil")"
+        )
+        try? tokenSaverAuditEventsRepo.append(
+            eventKind: "token_saver_denial",
+            projectID: projectID,
+            threadID: threadId.value.uuidString,
+            objectID: decision.reason,
+            countValue: Int64(max(1, count)),
+            reason: lane
+        )
+    }
+
+    /// Build a compact governance snapshot for measurement rows (admission kept for audit).
+    private func tokenSaverGovernanceSnapshot(
+        threadId: AgentThreadID,
+        lane: String,
+        governedWrite: Bool
+    ) -> TokenSaverGovernanceSnapshot {
+        let thread = try? threadRepo.get(id: threadId)
+        let projectID = thread?.projectId?.value.uuidString
+        let admission = tokenSaverProjectAdmission(threadId: threadId, lane: lane)
+        var evidence: String?
+        if let projectID,
+           let laneRow = try? tokenSaverLaneStateRepo.get(projectID: projectID, lane: lane) {
+            evidence = laneRow.evidenceLevel
+        }
+        return TokenSaverGovernanceSnapshot(
+            projectId: projectID,
+            admissionAllowed: admission.allowed,
+            admissionReason: admission.reason,
+            evidenceLevel: evidence,
+            governedWrite: governedWrite
+        )
+    }
+
+    /// WHY: empty lane_state + Token Saver enabled is the silent-death condition observed
+    /// on real installs (0 projects, 0 lane rows, all threads project_id NULL).
+    static func logEmptyLaneStateIfNeeded(tokenSaverEnabled: Bool, laneStateCount: Int) {
+        guard tokenSaverEnabled, laneStateCount == 0 else { return }
+        guard !didLogEmptyTokenSaverLaneState else { return }
+        didLogEmptyTokenSaverLaneState = true
+        NSLog(
+            "RemoteCode Token Saver ALERT: tokenSaverEnabled=true but token_saver_lane_state is EMPTY — project-admission governed writes will deny until lanes are promoted (silent-death condition). Measurement continues independently."
+        )
+    }
+
     func tokenSaverCompress(
         prompt: String,
         provider: AgentProvider,
@@ -1713,7 +1973,22 @@ public final class AppContext {
         ) else {
             return prompt
         }
-        guard tokenSaverProjectAdmission(threadId: threadId, lane: "deterministic_wrapper").allowed else {
+        // Operator per-lane kill switch (incident control) — same decision child env exports.
+        if tokenSaverLaneIsDisabled("deterministic_wrapper") {
+            recordTokenSaverAdmissionDenial(
+                threadId: threadId,
+                lane: "deterministic_wrapper",
+                decision: .init(allowed: false, reason: "operator_lane_disabled")
+            )
+            return prompt
+        }
+        let admission = tokenSaverProjectAdmission(threadId: threadId, lane: "deterministic_wrapper")
+        guard admission.allowed else {
+            recordTokenSaverAdmissionDenial(
+                threadId: threadId,
+                lane: "deterministic_wrapper",
+                decision: admission
+            )
             return prompt
         }
         // NetPositiveGate (G3): there is no app-side cached prefix to preserve (resume sends
@@ -2077,9 +2352,26 @@ public final class AppContext {
         runId: AgentRunID?
     ) -> String {
         let settings = SettingsStore(db: db).load()
-        guard settings.sessionLearnEnabled,
-              tokenSaverProjectAdmission(threadId: threadId, lane: "session_learn").allowed,
-              let thread = try? threadRepo.get(id: threadId),
+        guard settings.sessionLearnEnabled else { return prompt }
+        // WHY: session_learn retains scoped text — keep project admission; make denials loud.
+        if tokenSaverLaneIsDisabled("session_learn") {
+            recordTokenSaverAdmissionDenial(
+                threadId: threadId,
+                lane: "session_learn",
+                decision: .init(allowed: false, reason: "operator_lane_disabled")
+            )
+            return prompt
+        }
+        let sessionAdmission = tokenSaverProjectAdmission(threadId: threadId, lane: "session_learn")
+        guard sessionAdmission.allowed else {
+            recordTokenSaverAdmissionDenial(
+                threadId: threadId,
+                lane: "session_learn",
+                decision: sessionAdmission
+            )
+            return prompt
+        }
+        guard let thread = try? threadRepo.get(id: threadId),
               let workspaceID = thread.workspaceId?.value.uuidString,
               let projectID = thread.projectId?.value.uuidString else {
             return prompt
@@ -2791,15 +3083,35 @@ public final class AppContext {
         cacheState: String = "unknown",
         routeStage: TokenSaverRouteStage? = nil
     ) {
-        guard tokenSaverProjectAdmission(threadId: threadId, lane: "deterministic_wrapper").allowed else { return }
+        // WHY: Measurement/accounting must not depend on project admission. Real installs
+        // have project_id NULL on all threads and 0 lane_state rows, which made every
+        // savings write (including sr1-humanize) silently dead. Lossy/governed paths
+        // still use tokenSaverProjectAdmission; this path only needs paid feature + same-user.
+        guard SettingsStore(db: db).load().tokenSaverEnabled else { return }
+        guard tokenSaverIsSameUser(threadId: threadId) else { return }
+        let laneForGovernance = mode == "sr1-humanize" ? "sr1-humanize" : "deterministic_wrapper"
+        // Keep admission decision for audit snapshot (do not gate the write on it).
+        let governance = tokenSaverGovernanceSnapshot(
+            threadId: threadId,
+            lane: laneForGovernance,
+            governedWrite: false
+        )
         do {
+            // WHY: defaults are attributability="unknown" / delivered=false — the
+            // displayedSavingsEligibilitySQL legacy escape hatch for PRE-MIGRATION
+            // rows. New app-side rows must not land there or delivered can never
+            // filter and forfeited/unknown rows look like attributed savings.
+            // These are delivered compressions that are not proven prompt-bound.
             _ = try tokenSaverSavingsRepo.record(
                 provider: provider.rawValue,
                 mode: TokenSaverEngineLabel.mode(base: mode, stage: routeStage),
                 inputTokens: inputTokens,
                 outputTokens: outputTokens,
                 savedTokens: savedTokens,
-                cacheState: cacheState
+                cacheState: cacheState,
+                attributability: "not_prompt_bound",
+                delivered: true,
+                governance: governance.jsonString()
             )
             recomputeTokenSaverDailyEconomyToday()
             NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
@@ -2814,6 +3126,12 @@ public final class AppContext {
         let settings = SettingsStore(db: db).load()
         let usage = TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).load()
         let windowUsage = TokenSaverBareUserEstimator.todayProviderTokens(daily: usage.daily, now: now)
+        // WHY: fail-closed — pass known day billed only; never substitute raw windowUsage.
+        // nil keeps usage-anchored legs unavailable rather than re-inflating ~8×.
+        let windowBilled = TokenSaverBareUserEstimator.todayProviderBilledTokenUnits(
+            daily: usage.daily,
+            now: now
+        )
         let dayStartMs = tokenSaverDailyEconomyRepo.dayStartMs(for: now)
         let dayEndMs = tokenSaverDailyEconomyRepo.dayEndMsExclusive(for: now)
         do {
@@ -2837,6 +3155,7 @@ public final class AppContext {
                 orchestrationActive: false,
                 observation: TokenSaverBareUserObservation(
                     windowProviderTokens: windowUsage,
+                    windowProviderBilledTokenUnits: windowBilled,
                     graphifySignalCount: signalCount,
                     graphifyAnswerTokens: answerSum,
                     medianExplorationTokens: medianExploration
@@ -2855,7 +3174,10 @@ public final class AppContext {
                     formulaVersion: TokenSaverDailyEconomyRepository.formulaVersion,
                     appliedOutputShare: breakdown.appliedOutputShare,
                     graphifySignalCount: signalCount,
-                    updatedAt: iso
+                    updatedAt: iso,
+                    // Persistence stores 0 when billed is unknown (field is non-optional).
+                    // WHY: same fail-closed rule — do not write raw tokens as billed.
+                    windowUsageBilledUnits: windowBilled ?? 0
                 )
             )
         } catch {

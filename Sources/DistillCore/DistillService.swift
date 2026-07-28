@@ -624,6 +624,15 @@ public actor DistillServiceMetricsRecorder {
 
 public final class DistillHTTPServer: @unchecked Sendable {
     public typealias SuccessHandler = @Sendable (DistillRequest, DistillResponse) async -> Void
+    /// Optional ledger seam for forfeited (not-delivered) savings. DistillCore stays
+    /// Persistence-free; the sidecar wires this to `TokenSaverSavingsRepository`.
+    public typealias SavingsRecordHandler = @Sendable (DistillSavingsRecord) async -> Void
+    /// Optional audit seam for coverage/denial rows (`token_saver_audit_events`).
+    public typealias AuditEventHandler = @Sendable (
+        _ eventKind: String,
+        _ reason: String?,
+        _ countValue: Int64?
+    ) async -> Void
 
     private struct HTTPRequest {
         let method: String
@@ -666,6 +675,8 @@ public final class DistillHTTPServer: @unchecked Sendable {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let onSuccess: SuccessHandler?
+    private let onSavingsRecord: SavingsRecordHandler?
+    private let onAuditEvent: AuditEventHandler?
     private let reversibleStore: ReversibleStoring?
     private let scopedRecoveryStore: TokenSaverScopedRecoveryStoring?
     private let statsProvider: DistillStatsProviding?
@@ -686,7 +697,9 @@ public final class DistillHTTPServer: @unchecked Sendable {
         requestBodyLimitBytes: Int = DistillHTTPServer.maxRequestBodyBytes,
         startsReady: Bool = true,
         metricsRecorder: DistillServiceMetricsRecorder? = nil,
-        onSuccess: SuccessHandler? = nil
+        onSuccess: SuccessHandler? = nil,
+        onSavingsRecord: SavingsRecordHandler? = nil,
+        onAuditEvent: AuditEventHandler? = nil
     ) {
         self.configuration = configuration
         self.scheduler = scheduler
@@ -698,6 +711,8 @@ public final class DistillHTTPServer: @unchecked Sendable {
         self._ready = startsReady
         self.metrics = metricsRecorder ?? DistillServiceMetricsRecorder()
         self.onSuccess = onSuccess
+        self.onSavingsRecord = onSavingsRecord
+        self.onAuditEvent = onAuditEvent
     }
 
     /// Flip readiness on once the runtime is warm. Until then /readyz returns 503
@@ -1015,6 +1030,140 @@ public final class DistillHTTPServer: @unchecked Sendable {
         return (requiresOperationID ? context.hasCompleteMutationContext : context.hasCompleteScope) ? context : nil
     }
 
+    /// LOSSLESS-ONLY UNSCOPED TIER.
+    /// Prefer the scheduler candidate when it is already a byte-exact expandable
+    /// reduction; otherwise (command-output only) attempt a fresh LogCollapser RLE.
+    /// WHY command-output-only for the fresh pass: long-text containment tests use
+    /// collapsible repeated lines with a lossy runtime and require byte-exact
+    /// fail-open; re-running RLE on those would change their security probes.
+    /// JSON minify is semantic-only (not byte-exact) and must not skip store-before-loss.
+    /// Returns nil when no proven-lossless gain exists — caller fails open.
+    private static func losslessUnscopedDelivery(
+        original: String,
+        compressed: DistillResponse,
+        mode: DistillMode
+    ) -> DistillResponse? {
+        if isByteExactLosslessReduction(original: original, reduced: compressed.output) {
+            // Serve the already-computed lossless bytes; never attach a handle.
+            return DistillResponse(
+                requestID: compressed.requestID,
+                output: compressed.output,
+                inputCharacters: compressed.inputCharacters,
+                inputTokens: compressed.inputTokens,
+                outputTokens: compressed.outputTokens,
+                originalHandle: nil,
+                recoveryIdempotencyKey: nil,
+                runMode: compressed.runMode ?? .optimize,
+                auditReport: compressed.auditReport,
+                routeStage: compressed.routeStage ?? .deterministic
+            )
+        }
+        // Fresh lossless pass: only for command-output (bare `cmd | distill` path),
+        // where EncoderFirst may not be in the test runtime and LocalDistillRuntime
+        // skips the content router for this mode.
+        guard mode == .commandOutput,
+              let reduced = attemptLosslessOnlyReduction(input: original) else {
+            return nil
+        }
+        return DistillResponse(
+            requestID: compressed.requestID,
+            output: reduced,
+            inputCharacters: original.count,
+            inputTokens: compressed.inputTokens > 0
+                ? compressed.inputTokens
+                : TokenEstimator.estimate(original),
+            outputTokens: TokenEstimator.estimate(reduced),
+            originalHandle: nil,
+            recoveryIdempotencyKey: nil,
+            runMode: compressed.runMode ?? .optimize,
+            auditReport: compressed.auditReport,
+            // Distinct stage so the ledger can attribute lossless-unscoped savings.
+            routeStage: .deterministic
+        )
+    }
+
+    /// True when `reduced` expands byte-exactly to `original` (LogCollapser RLE).
+    private static func isByteExactLosslessReduction(original: String, reduced: String) -> Bool {
+        guard reduced != original, reduced.utf8.count < original.utf8.count else {
+            return false
+        }
+        // expand(collapse(x)) == x is the store-before-loss-trivial proof.
+        return LogCollapser.expand(reduced) == original
+    }
+
+    /// Fresh lossless-only attempt with the same invertibility proof.
+    private static func attemptLosslessOnlyReduction(input: String) -> String? {
+        guard let collapsed = LogCollapser.collapse(input),
+              collapsed.utf8.count < input.utf8.count,
+              LogCollapser.expand(collapsed) == input else {
+            return nil
+        }
+        return collapsed
+    }
+
+    /// Mode base matching DistillSavingsCalculator display labels.
+    private static func savingsModeBase(for mode: DistillMode) -> String {
+        switch mode {
+        case .commandOutput: return "command-output"
+        case .longText: return "longText"
+        case .watchSummary: return "watchSummary"
+        case .sr1Humanize: return "sr1-humanize"
+        }
+    }
+
+    private static func savingsAttributability(for mode: DistillMode) -> String {
+        switch mode {
+        case .longText: return "prompt_bound"
+        case .commandOutput, .watchSummary, .sr1Humanize: return "not_prompt_bound"
+        }
+    }
+
+    private static func savingsCacheState(for request: DistillRequest) -> String {
+        if let explicit = request.cacheState { return explicit }
+        switch request.mode {
+        case .commandOutput: return "tool_output_oneshot"
+        case .longText: return "prompt"
+        case .watchSummary: return "watch"
+        case .sr1Humanize: return "sr1_humanize"
+        }
+    }
+
+    /// Emit delivered=0 forfeit row + denial audit when lossy compression is discarded.
+    private func emitForfeitedCompression(
+        request: DistillRequest,
+        compressed: DistillResponse
+    ) async {
+        let base = Self.savingsModeBase(for: request.mode)
+        let trimmedProvider = request.provider?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let provider = trimmedProvider.isEmpty ? "unknown" : trimmedProvider
+        // Keep the scheduler's compressed token counts so the forfeit is visible
+        // as would-have-saved rather than a silent zero.
+        let record = DistillSavingsRecord(
+            provider: provider,
+            mode: "\(base) (discarded-no-handle)",
+            inputTokens: compressed.inputTokens,
+            outputTokens: compressed.outputTokens,
+            savedTokens: compressed.savedTokens,
+            cacheState: Self.savingsCacheState(for: request),
+            routeStage: compressed.routeStage,
+            attributability: Self.savingsAttributability(for: request.mode),
+            delivered: false
+        )
+        if let onSavingsRecord {
+            await onSavingsRecord(record)
+        }
+        if let onAuditEvent {
+            // Coverage/denial audit: operators query token_saver_audit_events for
+            // how much compression was forfeited for lack of a recovery handle.
+            await onAuditEvent(
+                "token_saver_denial",
+                "discarded_no_handle",
+                Int64(max(0, compressed.savedTokens))
+            )
+        }
+    }
+
     private func handleDistill(request: HTTPRequest, connection: NWConnection) async {
         await metrics.recordRequest()
         guard request.body.count <= requestBodyLimitBytes else {
@@ -1082,7 +1231,9 @@ public final class DistillHTTPServer: @unchecked Sendable {
                 // that would bypass opt-out / kill / retention=0 governance and
                 // emit handles that bearer-only retrieve must default-deny.
                 // Missing/incomplete scope, prepare failure, or readback failure
-                // all fail open to the byte-exact original.
+                // all fail open to the byte-exact original — except for a
+                // lossless-only unscoped tier (byte-exact round-trip proof),
+                // which needs no handle because nothing becomes unrecoverable.
                 var deliveredWithHandle = false
                 if let scopedContext, let scopedRecoveryStore {
                     do {
@@ -1114,7 +1265,25 @@ public final class DistillHTTPServer: @unchecked Sendable {
                     }
                 }
                 if !deliveredWithHandle {
-                    response = compressed.verbatimFallback(input: distillRequest.input)
+                    if let lossless = Self.losslessUnscopedDelivery(
+                        original: distillRequest.input,
+                        compressed: compressed,
+                        mode: distillRequest.mode
+                    ) {
+                        // WHY: byte-exact expandable reduction satisfies store-before-loss
+                        // trivially — expand recovers the original, so no handle/grant.
+                        response = lossless
+                    } else {
+                        // Existing fail-open: never serve unrecoverable lossy bytes.
+                        response = compressed.verbatimFallback(input: distillRequest.input)
+                        // WHY: previously this path looked like saved_tokens=0 with no
+                        // signal that the scheduler had already found a reduction. Emit
+                        // a delivered=0 forfeit row + denial audit so operators see it.
+                        await emitForfeitedCompression(
+                            request: distillRequest,
+                            compressed: compressed
+                        )
+                    }
                 }
             }
             if distillRequest.mode == .commandOutput, response.output != distillRequest.input {

@@ -9,8 +9,9 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    /// Must equal the highest SchemaStep version (step 53 economy + 54 graphify usage).
-    public static let currentVersion: Int = 54
+    /// Must equal the highest SchemaStep version (step 53 economy + 54 graphify usage
+    /// + 55 savings honesty axes + 56 credible_v4 cap evidence).
+    public static let currentVersion: Int = 56
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -936,6 +937,27 @@ public enum Schema {
             ON graphify_usage_events(created_at_ms);
         CREATE INDEX IF NOT EXISTS idx_graphify_usage_ok_created
             ON graphify_usage_events(ok, created_at_ms);
+        """),
+        // Honesty axes for Token Saver savings: whether compressed bytes were
+        // actually delivered, whether the row is prompt-bound, and a governance
+        // snapshot. Additive only — defaults keep pre-migration rows unclassed.
+        SchemaStep(55, """
+        ALTER TABLE token_saver_savings ADD COLUMN attributability TEXT NOT NULL DEFAULT 'unknown';
+        ALTER TABLE token_saver_savings ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE token_saver_savings ADD COLUMN governance_json TEXT NOT NULL DEFAULT '{}';
+        ALTER TABLE token_saver_savings_totals ADD COLUMN attributability TEXT NOT NULL DEFAULT 'unknown';
+        ALTER TABLE token_saver_savings_totals ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE token_saver_savings_totals ADD COLUMN governance_json TEXT NOT NULL DEFAULT '{}';
+        """),
+        // credible_v4 evidence: keep the pre-cap estimated legs and the cap that actually
+        // bound the result, plus the billed-unit window the caps were computed against.
+        // WHY: credible_v3 stored only the post-cap number, so a collapse (estimate scaled
+        // down by orders of magnitude) was indistinguishable from a genuinely small day.
+        SchemaStep(56, """
+        ALTER TABLE token_saver_daily_economy ADD COLUMN dialect_raw_tokens INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE token_saver_daily_economy ADD COLUMN graphify_raw_tokens INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE token_saver_daily_economy ADD COLUMN cap_binding TEXT NOT NULL DEFAULT 'none';
+        ALTER TABLE token_saver_daily_economy ADD COLUMN window_usage_billed_units REAL NOT NULL DEFAULT 0;
         """)
     ]
 
