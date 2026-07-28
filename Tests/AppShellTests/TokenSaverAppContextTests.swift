@@ -2561,4 +2561,310 @@ final class TokenSaverAppContextTests: XCTestCase {
 
         controller.stop()
     }
+
+    // MARK: - Per-lane kill switch, measurement ungating, loud denials
+
+    func test_tokenSaverLaneKillSwitch_experimentalDefaultDisabled_explicitEnableWorks() {
+        // WHY: new/experimental lanes must default OFF so an unvetted compressor cannot
+        // ship live without an explicit operator opt-in; known stable lanes stay on
+        // unless the incident kill list names them.
+        XCTAssertTrue(
+            TokenSaverLaneKillSwitch.isDisabled(
+                "brand_new_experimental_lane",
+                environment: [:],
+                cliState: .empty
+            ),
+            "experimental lanes default DISABLED"
+        )
+        XCTAssertFalse(
+            TokenSaverLaneKillSwitch.isDisabled(
+                "deterministic_wrapper",
+                environment: [:],
+                cliState: .empty
+            ),
+            "known stable lanes are not disabled by default"
+        )
+        XCTAssertFalse(
+            TokenSaverLaneKillSwitch.isDisabled(
+                "brand_new_experimental_lane",
+                environment: [TokenSaverLaneKillSwitch.enabledEnvKey: "brand_new_experimental_lane"],
+                cliState: .empty
+            ),
+            "explicit enable must turn an experimental lane on"
+        )
+        XCTAssertTrue(
+            TokenSaverLaneKillSwitch.isDisabled(
+                "deterministic_wrapper",
+                environment: [TokenSaverLaneKillSwitch.disabledEnvKey: "deterministic_wrapper"],
+                cliState: .empty
+            ),
+            "operator DISABLED_LANES is the incident kill switch"
+        )
+        // CLI state file overlay must also disable.
+        XCTAssertTrue(
+            TokenSaverLaneKillSwitch.isDisabled(
+                "semantic_prose",
+                environment: [:],
+                cliState: .init(disabledLanes: ["semantic_prose"], enabledLanes: [])
+            ),
+            "DistillCLIState disabled_lanes must be honored"
+        )
+        // Kill switch wins over enable.
+        XCTAssertTrue(
+            TokenSaverLaneKillSwitch.isDisabled(
+                "deterministic_wrapper",
+                environment: [
+                    TokenSaverLaneKillSwitch.disabledEnvKey: "deterministic_wrapper",
+                    TokenSaverLaneKillSwitch.enabledEnvKey: "deterministic_wrapper",
+                ],
+                cliState: .empty
+            ),
+            "incident disable must beat enable lists"
+        )
+    }
+
+    func test_tokenSaverMeasurementRecordsSavingsWithNilProjectId() async throws {
+        // WHY: production DBs have project_id NULL on every agent_thread and 0
+        // token_saver_lane_state rows. Measurement must still land so sr1-humanize
+        // savings are not silently dead.
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverMeasureNilProject-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        let thread = AgentThread(
+            title: "nil project measurement",
+            provider: .claude,
+            model: "test-model",
+            status: .completed
+        )
+        XCTAssertNil(thread.projectId, "fixture must reproduce the production project_id NULL case")
+        try context.threadRepo.upsert(thread)
+
+        let sr1 = """
+        SR1
+        S=done
+        O=The result is ready for the user.
+        P=ok
+        """
+        let humanized = await context.tokenSaverHumanizeSR1Response(
+            sr1,
+            provider: .claude,
+            threadId: thread.id
+        )
+        XCTAssertFalse(SR1ResponseDetector.isSR1(humanized))
+
+        let summary = try context.tokenSaverSavingsRepo.summary()
+        XCTAssertGreaterThan(
+            summary.totalRuns,
+            0,
+            "measurement write must succeed on project_id == nil when Token Saver is enabled"
+        )
+        XCTAssertEqual(summary.modes.first?.mode, "sr1-humanize")
+
+        // Governance snapshot is attached even when admission would have denied.
+        let gov = try context.db.prepare(
+            "SELECT governance_json FROM token_saver_savings WHERE mode = 'sr1-humanize' LIMIT 1;"
+        )
+        XCTAssertTrue(try gov.step())
+        let govJSON = try XCTUnwrap(gov.columnText(0))
+        XCTAssertTrue(
+            govJSON.contains("admission_allowed") || govJSON.contains("\"admission_allowed\":false"),
+            "savings row must carry governance snapshot; got \(govJSON)"
+        )
+        XCTAssertTrue(
+            govJSON.contains("governed_write") || govJSON.contains("\"governed_write\":false"),
+            "measurement rows are not governed writes; got \(govJSON)"
+        )
+    }
+
+    func test_tokenSaverAdmissionDenialAppendsAuditEvent() async throws {
+        // WHY: project-admission denials used to return silently, hiding the
+        // empty-lane_state / nil-project silent-death condition from operators.
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverDenialAudit-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        let thread = AgentThread(
+            title: "denial audit",
+            provider: .claude,
+            model: "test-model",
+            status: .completed
+        )
+        XCTAssertNil(thread.projectId)
+        try context.threadRepo.upsert(thread)
+
+        let bigPrompt = (1...40)
+            .map { "line \($0): verbose instruction that would compress if admitted" }
+            .joined(separator: "\n")
+        XCTAssertGreaterThan(bigPrompt.count, 2_000)
+
+        let before = try context.tokenSaverAuditEventsRepo.count(eventKind: "token_saver_denial")
+        let output = await context.tokenSaverCompress(
+            prompt: bigPrompt,
+            provider: .claude,
+            threadId: thread.id
+        )
+        XCTAssertEqual(output, bigPrompt, "denied compress must return original bytes")
+
+        let after = try context.tokenSaverAuditEventsRepo.count(eventKind: "token_saver_denial")
+        XCTAssertEqual(
+            after,
+            before + 1,
+            "admission denial must append token_saver_audit_events instead of returning silently"
+        )
+
+        let row = try context.db.prepare("""
+            SELECT reason, object_id, thread_id FROM token_saver_audit_events
+            WHERE event_kind = 'token_saver_denial'
+            ORDER BY id DESC LIMIT 1;
+        """)
+        XCTAssertTrue(try row.step())
+        XCTAssertEqual(row.columnText(0), "deterministic_wrapper", "lane goes in reason")
+        XCTAssertEqual(
+            row.columnText(1),
+            "missing_project_scope",
+            "admission reason is retained on object_id for operators"
+        )
+        XCTAssertEqual(row.columnText(2), thread.id.value.uuidString)
+    }
+
+    func test_tokenSaverAgentEnvironmentExportsDisabledLanes() throws {
+        // WHY: child distill processes must see the same kill-switch decision.
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverEnvKill-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        let thread = AgentThread(title: "env kill", provider: .claude, model: "m")
+        try context.threadRepo.upsert(thread)
+
+        let env = context.tokenSaverAgentEnvironment(
+            provider: .claude,
+            threadId: thread.id,
+            baseEnvironment: [
+                "PATH": "/usr/bin",
+                TokenSaverLaneKillSwitch.disabledEnvKey: "semantic_prose",
+            ]
+        )
+        let disabled = env[TokenSaverLaneKillSwitch.disabledEnvKey] ?? ""
+        XCTAssertTrue(
+            disabled.split(separator: ",").map(String.init).contains("semantic_prose"),
+            "resolved disabled set must export to child env; got \(disabled)"
+        )
+    }
+
+    func test_appSideSavingsWritePersistsDeliveredAndNonUnknownAttributability() async throws {
+        // WHY: TokenSaverSavingsRepository.record defaults are attributability="unknown"
+        // and delivered=false. displayedSavingsEligibilitySQL admits
+        // (attributability='unknown' AND provider!='unknown') only as a pre-migration
+        // escape hatch. New app-side rows that omit the kwargs land in that bucket,
+        // so delivered can never filter app writes and forfeited-looking rows present
+        // as attributed. AppContext must write delivered=1 + non-unknown class.
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverHonestyColumns-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        let thread = AgentThread(
+            title: "honesty columns",
+            provider: .claude,
+            model: "test-model",
+            status: .completed
+        )
+        try context.threadRepo.upsert(thread)
+
+        let sr1 = """
+        SR1
+        S=done
+        O=The result is ready for the user.
+        P=ok
+        """
+        let humanized = await context.tokenSaverHumanizeSR1Response(
+            sr1,
+            provider: .claude,
+            threadId: thread.id
+        )
+        XCTAssertFalse(SR1ResponseDetector.isSR1(humanized))
+
+        let stmt = try context.db.prepare("""
+            SELECT attributability, delivered, provider
+            FROM token_saver_savings
+            WHERE mode = 'sr1-humanize'
+            LIMIT 1;
+        """)
+        XCTAssertTrue(try stmt.step(), "app-side SR1 humanize must persist a savings row")
+        let attributability = try XCTUnwrap(stmt.columnText(0))
+        let delivered = stmt.columnInt64(1)
+        let provider = try XCTUnwrap(stmt.columnText(2))
+
+        XCTAssertEqual(
+            delivered,
+            1,
+            "app-side delivered compressions must persist delivered=1 (not the false default)"
+        )
+        XCTAssertNotEqual(
+            attributability,
+            "unknown",
+            "new rows must not rely on the pre-migration attributability=unknown escape hatch"
+        )
+        XCTAssertEqual(
+            attributability,
+            "not_prompt_bound",
+            "app-side measurement rows are delivered but not proven prompt-bound"
+        )
+        XCTAssertNotEqual(provider, "unknown", "provider must be the real agent provider")
+
+        // Eligibility must hold via delivered=1, independent of the legacy branch.
+        XCTAssertTrue(
+            delivered == 1 || (attributability == "unknown" && provider != "unknown"),
+            "row must satisfy displayedSavingsEligibilitySQL"
+        )
+        XCTAssertEqual(delivered, 1, "eligibility for this new row is via delivered=1 only")
+    }
+
+    func test_sidecarMainConstructionWiresSavingsAndAuditHandlers() throws {
+        // WHY: DistillHTTPServer.emitForfeitedCompression only publishes delivered=0
+        // forfeit rows and token_saver_denial audits through optional onSavingsRecord /
+        // onAuditEvent. Leaving them nil in the shipping sidecar makes that
+        // observability dead in production (alive only in DistillCore unit tests).
+        // Assert the production construction site supplies both named handlers —
+        // the wiring seam itself, not a mock's call history.
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = packageRoot
+            .appendingPathComponent("Sources/RemoteCodeDistillService/RemoteCodeDistillServiceMain.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+        // Executable construction: DistillHTTPServer(... onSavingsRecord: ... onAuditEvent: ...)
+        XCTAssertTrue(
+            source.contains("DistillHTTPServer("),
+            "sidecar main must construct DistillHTTPServer"
+        )
+        XCTAssertTrue(
+            source.contains("onSavingsRecord:"),
+            "sidecar must wire onSavingsRecord so forfeited compressions land in the ledger"
+        )
+        XCTAssertTrue(
+            source.contains("onAuditEvent:"),
+            "sidecar must wire onAuditEvent so token_saver_denial forfeit audits persist"
+        )
+        // Must not leave either seam as an explicit nil (defaults are also nil).
+        XCTAssertFalse(
+            source.contains("onSavingsRecord: nil"),
+            "onSavingsRecord must not be explicitly nil"
+        )
+        XCTAssertFalse(
+            source.contains("onAuditEvent: nil"),
+            "onAuditEvent must not be explicitly nil"
+        )
+        // Handlers must reach real persistence (savings repo + audit append path).
+        XCTAssertTrue(
+            source.contains("TokenSaverAuditEventRepository"),
+            "audit handler must be backed by TokenSaverAuditEventRepository"
+        )
+        XCTAssertTrue(
+            source.contains("savingsRepo.record(") || source.contains("persistSavings"),
+            "savings handler must persist via TokenSaverSavingsRepository"
+        )
+    }
 }

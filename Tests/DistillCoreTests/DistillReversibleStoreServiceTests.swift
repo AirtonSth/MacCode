@@ -539,6 +539,134 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
         ]
     }
 
+    /// WHY: bare `cmd | distill` has no recovery scope. When the only available
+    /// reduction is byte-exact expandable (LogCollapser RLE), store-before-loss is
+    /// trivial — serve the reduced bytes without requiring a handle.
+    func test_unscopedOptimize_losslesslyReducibleCommandOutput_isServedReducedWithoutHandle() async throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "tok",
+            appSupportDirectory: NSTemporaryDirectory()
+        )
+        // Runtime returns a lossy discard; the unscoped lossless tier must still
+        // apply LogCollapser on the original (command-output fresh pass).
+        let scheduler = DistillScheduler(runtime: DiscardingRuntime(), maxConcurrentRequests: 2)
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: scheduler,
+            reversibleStoreMinBytes: 1
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let original = String(repeating: "build step ok\n", count: 80)
+        let expected = try XCTUnwrap(
+            LogCollapser.collapse(original),
+            "precondition: payload must be losslessly collapsible"
+        )
+        XCTAssertNotEqual(expected, original)
+        XCTAssertEqual(LogCollapser.expand(expected), original, "precondition: expand round-trip")
+
+        let distill = try await http(
+            ready.baseURL + "/v1/distill",
+            method: "POST",
+            token: "tok",
+            body: try JSONEncoder().encode(DistillRequest(
+                mode: .commandOutput,
+                input: original,
+                runMode: .optimize,
+                maxOutputCharacters: 4_000
+            ))
+        )
+        XCTAssertEqual(distill.status, 200)
+        let response = try JSONDecoder().decode(DistillResponse.self, from: distill.data)
+        XCTAssertEqual(response.output, expected, "unscoped lossless tier must serve the reduced form")
+        XCTAssertNotEqual(response.output, original, "must not fall open to byte-exact original when lossless gain exists")
+        XCTAssertNotEqual(response.output, "X", "lossy runtime discard must not leak when a lossless tier applies")
+        XCTAssertNil(response.originalHandle, "lossless reduction needs no recovery handle")
+        XCTAssertEqual(response.routeStage, .deterministic)
+        XCTAssertLessThan(response.outputCharacters, response.inputCharacters)
+    }
+
+    /// WHY: when compression is lossy and no scope-bound handle exists, fail-open
+    /// still returns the original — but the forfeited saving must be visible in
+    /// telemetry (delivered=0, distinct mode) instead of a silent zero.
+    func test_unscopedOptimize_lossyOnly_forfeitsSavingsWithDeliveredZero() async throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "tok",
+            appSupportDirectory: NSTemporaryDirectory()
+        )
+        final class SavingsCapture: @unchecked Sendable {
+            private let lock = NSLock()
+            private var _records: [DistillSavingsRecord] = []
+            private var _audits: [(String, String?, Int64?)] = []
+            var records: [DistillSavingsRecord] {
+                lock.lock(); defer { lock.unlock() }
+                return _records
+            }
+            var audits: [(String, String?, Int64?)] {
+                lock.lock(); defer { lock.unlock() }
+                return _audits
+            }
+            func appendRecord(_ r: DistillSavingsRecord) {
+                lock.lock(); _records.append(r); lock.unlock()
+            }
+            func appendAudit(kind: String, reason: String?, count: Int64?) {
+                lock.lock(); _audits.append((kind, reason, count)); lock.unlock()
+            }
+        }
+        let capture = SavingsCapture()
+        // Unique lines: LogCollapser cannot collapse; only lossy discard applies.
+        let original = (0..<40).map { "unique lossy line \($0) with distinct content" }.joined(separator: "\n")
+        XCTAssertNil(LogCollapser.collapse(original), "precondition: no lossless gain on this payload")
+
+        let scheduler = DistillScheduler(runtime: DiscardingRuntime(), maxConcurrentRequests: 2)
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: scheduler,
+            reversibleStoreMinBytes: 1,
+            onSavingsRecord: { record in
+                capture.appendRecord(record)
+            },
+            onAuditEvent: { kind, reason, count in
+                capture.appendAudit(kind: kind, reason: reason, count: count)
+            }
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let distill = try await http(
+            ready.baseURL + "/v1/distill",
+            method: "POST",
+            token: "tok",
+            body: try JSONEncoder().encode(DistillRequest(
+                mode: .commandOutput,
+                input: original,
+                provider: "cli-pipe",
+                recordSavings: true,
+                runMode: .optimize,
+                maxOutputCharacters: 64
+            ))
+        )
+        XCTAssertEqual(distill.status, 200)
+        let response = try JSONDecoder().decode(DistillResponse.self, from: distill.data)
+        XCTAssertEqual(response.output, original, "lossy unscoped must still fail open to the exact original")
+        XCTAssertNil(response.originalHandle)
+        XCTAssertEqual(response.routeStage, .verbatim)
+        XCTAssertNotEqual(response.output, "X")
+
+        let forfeited = try XCTUnwrap(capture.records.first, "forfeited savings record must be emitted")
+        XCTAssertEqual(forfeited.mode, "command-output (discarded-no-handle)")
+        XCTAssertFalse(forfeited.delivered, "forfeit is not a delivered saving")
+        XCTAssertEqual(forfeited.provider, "cli-pipe")
+        XCTAssertGreaterThan(forfeited.inputTokens, forfeited.outputTokens, "record the compressed size the scheduler achieved")
+        XCTAssertGreaterThan(forfeited.savedTokens, 0, "forfeited would-have-saved must be non-zero")
+
+        let audit = try XCTUnwrap(capture.audits.first, "denial audit row must be emitted")
+        XCTAssertEqual(audit.0, "token_saver_denial")
+        XCTAssertEqual(audit.1, "discarded_no_handle")
+        XCTAssertEqual(audit.2, Int64(forfeited.savedTokens))
+    }
+
     /// Wave -1 containment (T-003): a reversible store alone is not authorization.
     /// Without scope/capability grants, lossy optimize must never persist originals or emit handles.
     /// Fail-open keeps provider turns usable by returning the exact input verbatim.

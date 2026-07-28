@@ -21,6 +21,11 @@ public struct TokenSaverProviderUsage: Codable, Sendable, Equatable {
     public var weeklyUsedPercent: Double?
     public var weeklyWindowDurationMinutes: Int?
     public var weeklyResetsAt: Date?
+    /// True when `actualProviderBilledTokenUnits` came from an explicit init/JSON value
+    /// rather than the raw-token default. Not persisted as its own key.
+    /// WHY: estimator must refuse raw fallback when billed is unknown; the defaulted
+    /// Double alone cannot distinguish "known billed" from "silently re-inflated".
+    fileprivate var billedUnitsExplicitlyProvided: Bool
 
     public init(
         provider: AgentProvider,
@@ -35,12 +40,22 @@ public struct TokenSaverProviderUsage: Codable, Sendable, Equatable {
         currentSessionResetsAt: Date? = nil,
         weeklyUsedPercent: Double? = nil,
         weeklyWindowDurationMinutes: Int? = nil,
-        weeklyResetsAt: Date? = nil
+        weeklyResetsAt: Date? = nil,
+        /// Override known/defaulted bit when re-aggregating stored Doubles.
+        /// nil → derive from whether `actualProviderBilledTokenUnits` was non-nil.
+        billedUnitsExplicitlyProvided: Bool? = nil
     ) {
         self.provider = provider
         self.actualProviderTokens = max(0, actualProviderTokens)
         self.estimatedRawTokens = max(0, estimatedRawTokens)
-        self.actualProviderBilledTokenUnits = max(0, actualProviderBilledTokenUnits ?? Double(max(0, actualProviderTokens)))
+        // Existing contract: missing billed defaults to raw (other callers depend on this).
+        if let billed = actualProviderBilledTokenUnits {
+            self.actualProviderBilledTokenUnits = max(0, billed)
+            self.billedUnitsExplicitlyProvided = billedUnitsExplicitlyProvided ?? true
+        } else {
+            self.actualProviderBilledTokenUnits = Double(max(0, actualProviderTokens))
+            self.billedUnitsExplicitlyProvided = false
+        }
         self.estimatedRawBilledTokenUnits = max(
             self.actualProviderBilledTokenUnits,
             estimatedRawBilledTokenUnits ?? Double(max(0, estimatedRawTokens))
@@ -76,10 +91,14 @@ public struct TokenSaverProviderUsage: Codable, Sendable, Equatable {
         provider = try container.decode(AgentProvider.self, forKey: .provider)
         actualProviderTokens = max(0, try container.decodeIfPresent(Int.self, forKey: .actualProviderTokens) ?? 0)
         estimatedRawTokens = max(0, try container.decodeIfPresent(Int.self, forKey: .estimatedRawTokens) ?? 0)
-        actualProviderBilledTokenUnits = max(
-            0,
-            try container.decodeIfPresent(Double.self, forKey: .actualProviderBilledTokenUnits) ?? Double(actualProviderTokens)
-        )
+        if let billed = try container.decodeIfPresent(Double.self, forKey: .actualProviderBilledTokenUnits) {
+            actualProviderBilledTokenUnits = max(0, billed)
+            billedUnitsExplicitlyProvided = true
+        } else {
+            // Missing key → defaulted from raw; not a known billed measurement.
+            actualProviderBilledTokenUnits = Double(actualProviderTokens)
+            billedUnitsExplicitlyProvided = false
+        }
         estimatedRawBilledTokenUnits = max(
             actualProviderBilledTokenUnits,
             try container.decodeIfPresent(Double.self, forKey: .estimatedRawBilledTokenUnits) ?? Double(estimatedRawTokens)
@@ -92,6 +111,30 @@ public struct TokenSaverProviderUsage: Codable, Sendable, Equatable {
         weeklyUsedPercent = Self.clampedPercent(try container.decodeIfPresent(Double.self, forKey: .weeklyUsedPercent))
         weeklyWindowDurationMinutes = try container.decodeIfPresent(Int.self, forKey: .weeklyWindowDurationMinutes).map { max(0, $0) }
         weeklyResetsAt = try container.decodeIfPresent(Date.self, forKey: .weeklyResetsAt)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(provider, forKey: .provider)
+        try container.encode(actualProviderTokens, forKey: .actualProviderTokens)
+        try container.encode(estimatedRawTokens, forKey: .estimatedRawTokens)
+        // Persist the defaulted Double as before (does not encode the known/defaulted flag).
+        try container.encode(actualProviderBilledTokenUnits, forKey: .actualProviderBilledTokenUnits)
+        try container.encode(estimatedRawBilledTokenUnits, forKey: .estimatedRawBilledTokenUnits)
+        try container.encode(eligibleRuns, forKey: .eligibleRuns)
+        try container.encode(currentSessionTokens, forKey: .currentSessionTokens)
+        try container.encode(currentSessionLimitTokens, forKey: .currentSessionLimitTokens)
+        try container.encodeIfPresent(currentSessionUsedPercent, forKey: .currentSessionUsedPercent)
+        try container.encodeIfPresent(currentSessionResetsAt, forKey: .currentSessionResetsAt)
+        try container.encodeIfPresent(weeklyUsedPercent, forKey: .weeklyUsedPercent)
+        try container.encodeIfPresent(weeklyWindowDurationMinutes, forKey: .weeklyWindowDurationMinutes)
+        try container.encodeIfPresent(weeklyResetsAt, forKey: .weeklyResetsAt)
+    }
+
+    /// Billed units only when explicitly provided (init arg or JSON key present).
+    /// nil means defaulted-from-raw / unknown — estimator must not use this as billed.
+    public var knownActualProviderBilledTokenUnits: Double? {
+        billedUnitsExplicitlyProvided ? actualProviderBilledTokenUnits : nil
     }
 
     public var measuredSavedTokens: Int {
@@ -168,17 +211,24 @@ public struct TokenSaverDayUsage: Codable, Sendable, Equatable, Identifiable {
     public var actualProviderTokens: Int
     public var estimatedRawTokens: Int
     public var eligibleRuns: Int
+    /// Known billed provider units for this calendar day (cache reads ~0.1×).
+    /// WHY: optional so historical buckets without a recorded billed value stay
+    /// UNKNOWN (nil) rather than silently defaulting to raw tokens. Fail-closed:
+    /// never invent billed from raw; estimator refuses raw as usage denominator.
+    public var actualProviderBilledTokenUnits: Double?
 
     public init(
         dayStart: Date,
         actualProviderTokens: Int = 0,
         estimatedRawTokens: Int = 0,
-        eligibleRuns: Int = 0
+        eligibleRuns: Int = 0,
+        actualProviderBilledTokenUnits: Double? = nil
     ) {
         self.dayStart = dayStart
         self.actualProviderTokens = max(0, actualProviderTokens)
         self.estimatedRawTokens = max(0, estimatedRawTokens)
         self.eligibleRuns = max(0, eligibleRuns)
+        self.actualProviderBilledTokenUnits = actualProviderBilledTokenUnits.map { max(0, $0) }
     }
 
     public var id: Date { dayStart }
@@ -362,7 +412,8 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
                 currentSessionResetsAt: current.currentSessionResetsAt,
                 weeklyUsedPercent: 0,
                 weeklyWindowDurationMinutes: current.weeklyWindowDurationMinutes,
-                weeklyResetsAt: current.weeklyResetsAt
+                weeklyResetsAt: current.weeklyResetsAt,
+                billedUnitsExplicitlyProvided: current.billedUnitsExplicitlyProvided
             )
         } else {
             providers.append(TokenSaverProviderUsage(
@@ -431,6 +482,7 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
                 provider: provider,
                 actualProviderTokens: current.actualProviderTokens + delta.actualProviderTokens,
                 estimatedRawTokens: current.estimatedRawTokens + delta.estimatedRawTokens,
+                // Keep stored Double sum for existing callers; known only if both sides known.
                 actualProviderBilledTokenUnits: current.actualProviderBilledTokenUnits + delta.actualProviderBilledTokenUnits,
                 estimatedRawBilledTokenUnits: current.estimatedRawBilledTokenUnits + delta.estimatedRawBilledTokenUnits,
                 eligibleRuns: current.eligibleRuns + delta.eligibleRuns,
@@ -440,7 +492,8 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
                 currentSessionResetsAt: current.currentSessionResetsAt,
                 weeklyUsedPercent: current.weeklyUsedPercent,
                 weeklyWindowDurationMinutes: current.weeklyWindowDurationMinutes,
-                weeklyResetsAt: current.weeklyResetsAt
+                weeklyResetsAt: current.weeklyResetsAt,
+                billedUnitsExplicitlyProvided: current.billedUnitsExplicitlyProvided && delta.billedUnitsExplicitlyProvided
             )
         } else {
             providers.append(delta)
@@ -484,7 +537,8 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
                 currentSessionResetsAt: currentSessionResetsAt ?? current.currentSessionResetsAt,
                 weeklyUsedPercent: weeklyUsedPercent,
                 weeklyWindowDurationMinutes: weeklyWindowDurationMinutes ?? current.weeklyWindowDurationMinutes,
-                weeklyResetsAt: weeklyResetsAt ?? current.weeklyResetsAt
+                weeklyResetsAt: weeklyResetsAt ?? current.weeklyResetsAt,
+                billedUnitsExplicitlyProvided: current.billedUnitsExplicitlyProvided
             )
         } else {
             providers.append(TokenSaverProviderUsage(
@@ -507,12 +561,45 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
         return max(Int((Double(usedTokens) * (1.0 - boundedRatio)).rounded()), 0)
     }
 
+    /// Explicit optional billed units for a provider: nil when defaulted-from-raw / unknown.
+    /// WHY: estimator must not treat `actualProviderBilledTokenUnits` alone as billed —
+    /// that field defaults missing values to raw and silently re-inflates the denominator.
+    public func knownActualProviderBilledTokenUnits(
+        provider: AgentProvider,
+        period: TokenSaverPeriod = .sevenDays
+    ) -> Double? {
+        load(period: period)
+            .providers
+            .first(where: { $0.provider == provider })?
+            .knownActualProviderBilledTokenUnits
+    }
+
+    /// Sum of known billed units across providers. nil if any provider with raw usage
+    /// lacks an explicit billed value (refuse partial raw fallback).
+    public func knownTotalActualProviderBilledTokenUnits(
+        period: TokenSaverPeriod = .sevenDays
+    ) -> Double? {
+        let providers = load(period: period).providers
+        var total: Double = 0
+        for usage in providers {
+            if let known = usage.knownActualProviderBilledTokenUnits {
+                total += known
+            } else if usage.actualProviderTokens > 0 {
+                return nil
+            }
+        }
+        return total
+    }
+
     private func updatedDailyBuckets(
         from existing: [TokenSaverDayUsage],
         delta: TokenSaverProviderUsage,
         period: TokenSaverPeriod
     ) -> [TokenSaverDayUsage] {
         let dayStart = calendar.startOfDay(for: now())
+        // WHY: day billed must track only known billed deltas. Never substitute
+        // raw (delta.actualProviderBilledTokenUnits defaults missing → raw).
+        let deltaKnownBilled = delta.knownActualProviderBilledTokenUnits
         var buckets = existing
         if let index = buckets.firstIndex(where: { calendar.isDate($0.dayStart, inSameDayAs: dayStart) }) {
             let current = buckets[index]
@@ -520,14 +607,21 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
                 dayStart: current.dayStart,
                 actualProviderTokens: current.actualProviderTokens + delta.actualProviderTokens,
                 estimatedRawTokens: current.estimatedRawTokens + delta.estimatedRawTokens,
-                eligibleRuns: current.eligibleRuns + delta.eligibleRuns
+                eligibleRuns: current.eligibleRuns + delta.eligibleRuns,
+                // WHY: fail-closed — any unknown contribution makes the day UNKNOWN;
+                // partial known sums must not stand in for a full-window billed total.
+                actualProviderBilledTokenUnits: Self.mergedDayBilledUnits(
+                    current: current.actualProviderBilledTokenUnits,
+                    incomingKnown: deltaKnownBilled
+                )
             )
         } else {
             buckets.append(TokenSaverDayUsage(
                 dayStart: dayStart,
                 actualProviderTokens: delta.actualProviderTokens,
                 estimatedRawTokens: delta.estimatedRawTokens,
-                eligibleRuns: delta.eligibleRuns
+                eligibleRuns: delta.eligibleRuns,
+                actualProviderBilledTokenUnits: deltaKnownBilled
             ))
         }
 
@@ -544,5 +638,16 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
         return buckets
             .filter { $0.dayStart >= cutoff }
             .sorted { $0.dayStart < $1.dayStart }
+    }
+
+    /// Sum known day billed only when both sides are known; otherwise nil.
+    /// WHY: fail-closed — mixed known/unknown contributions must not become a
+    /// partial sum that looks like a complete billed window.
+    fileprivate static func mergedDayBilledUnits(
+        current: Double?,
+        incomingKnown: Double?
+    ) -> Double? {
+        guard let current, let incomingKnown else { return nil }
+        return max(0, current) + max(0, incomingKnown)
     }
 }

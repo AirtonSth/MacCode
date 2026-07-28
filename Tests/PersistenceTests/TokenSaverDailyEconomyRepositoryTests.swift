@@ -97,4 +97,36 @@ final class TokenSaverDailyEconomyRepositoryTests: XCTestCase {
         XCTAssertEqual(result.economyDays, 1)
         XCTAssertEqual(result.measuredOnlyDays, 1)
     }
+
+    func test_v4_roundTripsDialectRawCapBindingAndFormulaVersion() throws {
+        // WHY: collapse detection needs pre-cap legs + which bound applied; mixed
+        // formula versions must be labelled (credible_v4), never silently compared.
+        let db = try makeDB()
+        let repo = TokenSaverDailyEconomyRepository(db: db)
+        let dayMs = repo.dayStartMs()
+        XCTAssertEqual(TokenSaverDailyEconomyRepository.formulaVersion, "credible_v4")
+        let record = TokenSaverDailyEconomyRecord(
+            dayStartMs: dayMs,
+            measuredTokens: 2,
+            dialectTokens: 8,
+            graphifyTokens: 0,
+            totalCredible: 10,
+            windowUsageTokens: 78_658_351,
+            formulaVersion: TokenSaverDailyEconomyRepository.formulaVersion,
+            appliedOutputShare: 0.007,
+            updatedAt: "2026-07-28T00:00:00Z",
+            dialectRawTokens: 550_608,
+            graphifyRawTokens: 12_345,
+            capBinding: "no_proof_allowance",
+            windowUsageBilledUnits: 9_832_294.0
+        )
+        _ = try repo.upsert(record)
+        let loaded = try XCTUnwrap(repo.record(dayStartMs: dayMs))
+        XCTAssertEqual(loaded.dialectRawTokens, 550_608)
+        XCTAssertEqual(loaded.graphifyRawTokens, 12_345)
+        XCTAssertEqual(loaded.capBinding, "no_proof_allowance")
+        XCTAssertEqual(loaded.windowUsageBilledUnits, 9_832_294.0, accuracy: 0.001)
+        XCTAssertEqual(loaded.formulaVersion, "credible_v4")
+        XCTAssertEqual(loaded.totalCredible, 10)
+    }
 }

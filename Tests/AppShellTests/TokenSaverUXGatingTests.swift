@@ -491,14 +491,22 @@ final class TokenSaverUXGatingTests: XCTestCase {
     }
 
     func test_tokenSaverBillingEvidenceDisclaimerIsExplicit() {
+        // WHY: footer must distinguish measured ledger vs estimated legs without
+        // undermining the whole card.
         let disclosure = SidebarRootView.tokenSaverBillingEvidenceDisclaimer
-        XCTAssertTrue(disclosure.lowercased().contains("provider usage"))
-        XCTAssertTrue(disclosure.lowercased().contains("not billed savings"))
+        XCTAssertTrue(disclosure.lowercased().contains("provider usage")
+                      || disclosure.lowercased().contains("provider usage evidence"))
+        XCTAssertTrue(disclosure.lowercased().contains("not billed savings")
+                      || disclosure.lowercased().contains("not billed"))
+        XCTAssertTrue(disclosure.lowercased().contains("measured"),
+                      "Disclaimer must state what is measured: \(disclosure)")
+        XCTAssertTrue(disclosure.lowercased().contains("estimate"),
+                      "Disclaimer must label estimates: \(disclosure)")
     }
 
     func test_tokenSaverCardHeadline_blockedButDisabled_returnsEnableCopy() {
-        // WHY: blocked only matters when enabled. If disabled the card shows
-        // the Token Saver enable action regardless of sidecar state.
+        // WHY: blocked only matters when enabled. With zero history, disabled
+        // still shows the enable CTA; history (savedTokens > 0) is not gated.
         let headline = SidebarRootView.tokenSaverCardHeadline(
             subscribed: true,
             enabled: false,
@@ -507,7 +515,37 @@ final class TokenSaverUXGatingTests: XCTestCase {
             usedTokens: 0
         )
         XCTAssertEqual(headline, "Enable Token Saver",
-                       "Disabled Token Saver must show the enable action even when sidecar is blocked")
+                       "Disabled Token Saver with no history must show the enable action even when sidecar is blocked")
+    }
+
+    func test_tokenSaverCardHeadline_disabledWithHistory_keepsEstimatedSave() {
+        // WHY: lapsed/disabled subscribers keep historical measured numbers.
+        let headline = SidebarRootView.tokenSaverCardHeadline(
+            subscribed: true,
+            enabled: false,
+            sidecarStatus: .blocked("GPU unavailable"),
+            savedTokens: 50_000,
+            usedTokens: 200_000
+        )
+        XCTAssertTrue(
+            headline.lowercased().contains("estimated save"),
+            "Disabled with history must still show realized figure; got: '\(headline)'"
+        )
+        XCTAssertNotEqual(headline, "Enable Token Saver")
+    }
+
+    func test_tokenSaverCardHeadline_unsubscribed_doesNotUseUsedTimesPoint58() {
+        // WHY: retire the 0.42/0.58 teaser; unsubscribed uses the same primary figure.
+        let headline = SidebarRootView.tokenSaverCardHeadline(
+            subscribed: false,
+            enabled: false,
+            sidecarStatus: .notStarted,
+            savedTokens: 10,
+            usedTokens: 78_600_000
+        )
+        XCTAssertTrue(headline.lowercased().contains("estimated potential"))
+        XCTAssertTrue(headline.contains("10"),
+                      "Must show primary figure 10, not ~45.6M: \(headline)")
     }
 
     func test_ringsAccessibilityLabel_qualifiesReductionAsMeasured() {

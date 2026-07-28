@@ -1,5 +1,14 @@
 import Foundation
 
+/// Which attributed-cap component bound the dialect+graphify scale (audit).
+/// Stored as TEXT on daily economy rows (`cap_binding`).
+public enum TokenSaverAttributedCapBinding: String, Sendable, Equatable {
+    case none
+    case noProofAllowance = "no_proof_allowance"
+    case measuredMultiple = "measured_multiple"
+    case usageShare = "usage_share"
+}
+
 /// Counterfactual vs a **bare agent** (no RemoteCode: no pipes/dialect, no Graphify,
 /// no model-auto). Designed for a **daily-replicable credible total**:
 ///
@@ -26,6 +35,16 @@ public struct TokenSaverBareUserBreakdown: Sendable, Equatable {
     public let appliedOutputShare: Double
     /// True when dialect/graphify used calibrated defaults vs live stream shares.
     public let usedCalibratedDefaults: Bool
+    /// Pre-cap dialect estimate (evidence; may exceed post-cap dialect).
+    public let dialectRawTokens: Int
+    /// Pre-cap graphify estimate (evidence).
+    public let graphifyRawTokens: Int
+    /// Which cap bound the attributed scale (audit).
+    public let capBinding: TokenSaverAttributedCapBinding
+    /// Billed units used for usage-anchored legs; nil when unknown.
+    public let windowUsageBilledUnits: Double?
+    /// False when billed units were unknown — usage-anchored allowances refused.
+    public let usageAnchoredAvailable: Bool
 
     public init(
         measuredToolOutput: Int,
@@ -33,7 +52,12 @@ public struct TokenSaverBareUserBreakdown: Sendable, Equatable {
         estimatedGraphify: Int,
         estimatedOrchestration: Int = 0,
         appliedOutputShare: Double = 0,
-        usedCalibratedDefaults: Bool = true
+        usedCalibratedDefaults: Bool = true,
+        dialectRawTokens: Int = 0,
+        graphifyRawTokens: Int = 0,
+        capBinding: TokenSaverAttributedCapBinding = .none,
+        windowUsageBilledUnits: Double? = nil,
+        usageAnchoredAvailable: Bool = false
     ) {
         self.measuredToolOutput = max(0, measuredToolOutput)
         self.estimatedDialect = max(0, estimatedDialect)
@@ -41,18 +65,27 @@ public struct TokenSaverBareUserBreakdown: Sendable, Equatable {
         self.estimatedOrchestration = max(0, estimatedOrchestration)
         self.appliedOutputShare = min(max(appliedOutputShare, 0), 1)
         self.usedCalibratedDefaults = usedCalibratedDefaults
+        self.dialectRawTokens = max(0, dialectRawTokens)
+        self.graphifyRawTokens = max(0, graphifyRawTokens)
+        self.capBinding = capBinding
+        self.windowUsageBilledUnits = windowUsageBilledUnits.map { max(0, $0) }
+        self.usageAnchoredAvailable = usageAnchoredAvailable
     }
 
     /// Credible total for headline/ring: measured + dialect + graphify only.
     public var totalCredible: Int {
-        measuredToolOutput + estimatedDialect + estimatedGraphify
+        TokenSaverBareUserEstimator.saturatingAdd(
+            measuredToolOutput,
+            estimatedDialect,
+            estimatedGraphify
+        )
     }
 
     /// Alias for product UI — bare-user total is the credible stack, not orch.
     public var totalEstimatedVsBareUser: Int { totalCredible }
 
     public var attributedOnly: Int {
-        estimatedDialect + estimatedGraphify
+        TokenSaverBareUserEstimator.saturatingAdd(estimatedDialect, estimatedGraphify)
     }
 
     public static let empty = TokenSaverBareUserBreakdown(
@@ -67,8 +100,12 @@ public struct TokenSaverBareUserBreakdown: Sendable, Equatable {
 
 /// Window-aligned usage + optional stream observations for daily replication.
 public struct TokenSaverBareUserObservation: Sendable, Equatable {
-    /// Provider tokens in the **same** calendar window as measured savings.
+    /// Provider tokens in the **same** calendar window as measured savings (raw count).
     public let windowProviderTokens: Int
+    /// Known **billed** provider units for the same window (cache reads ~0.1×).
+    /// WHY: cap legs and dialect output-share base must use billed units, not raw.
+    /// nil = unknown — do **not** fall back to raw; usage-anchored legs are unavailable.
+    public let windowProviderBilledTokenUnits: Double?
     /// Sum of outputTokens from provider stream samples in the window (optional).
     public let observedOutputTokens: Int?
     /// Sum of inputTokens from the same samples (optional).
@@ -87,6 +124,7 @@ public struct TokenSaverBareUserObservation: Sendable, Equatable {
 
     public init(
         windowProviderTokens: Int,
+        windowProviderBilledTokenUnits: Double? = nil,
         observedOutputTokens: Int? = nil,
         observedInputTokens: Int? = nil,
         observationSampleCount: Int = 0,
@@ -96,6 +134,7 @@ public struct TokenSaverBareUserObservation: Sendable, Equatable {
         medianExplorationTokens: Int? = nil
     ) {
         self.windowProviderTokens = max(0, windowProviderTokens)
+        self.windowProviderBilledTokenUnits = windowProviderBilledTokenUnits.map { max(0, $0) }
         self.observedOutputTokens = observedOutputTokens.map { max(0, $0) }
         self.observedInputTokens = observedInputTokens.map { max(0, $0) }
         self.observationSampleCount = max(0, observationSampleCount)
@@ -151,12 +190,17 @@ public enum TokenSaverBareUserEstimator {
     /// Attributed (dialect+graphify) ≤ max(measured × this, …).
     public static let attributedCapMultipleOfMeasured: Double = 4.0
 
-    /// Attributed ≤ this × window usage (hard ceiling for credibility).
+    /// Attributed ≤ this × window **billed** usage (hard ceiling for credibility).
     public static let attributedCapShareOfUsed: Double = 0.12
+
+    /// No-proof usage allowance when pipes are empty (and floor for all measured).
+    /// WHY: must stay available for measured > 0 so totals are monotone in measured.
+    public static let noProofAttributedShareOfUsed: Double = 0.02
 
     // MARK: - Estimate
 
     /// Backward-compatible entry: usage-only, calibrated defaults, no live stream.
+    /// Billed units are **unknown** here — usage-anchored legs are refused (not raw-token based).
     public static func estimate(
         measuredToolOutputSaved: Int,
         actualProviderTokens: Int,
@@ -189,22 +233,39 @@ public enum TokenSaverBareUserEstimator {
                 estimatedGraphify: 0,
                 estimatedOrchestration: 0,
                 appliedOutputShare: 0,
-                usedCalibratedDefaults: true
+                usedCalibratedDefaults: true,
+                dialectRawTokens: 0,
+                graphifyRawTokens: 0,
+                capBinding: .none,
+                windowUsageBilledUnits: observation.windowProviderBilledTokenUnits,
+                usageAnchoredAvailable: observation.windowProviderBilledTokenUnits != nil
             )
         }
 
-        let used = max(0, observation.windowProviderTokens)
+        // WHY: every usage-derived quantity uses BILLED units. When billed is
+        // unknown, refuse raw-token fallback — allowance and share-base become 0.
+        // Non-finite / astronomical JSON doubles must degrade, not trap on Int().
+        let billedKnown = observation.windowProviderBilledTokenUnits
+        let usageAnchoredAvailable = billedKnown != nil
+        let usedBilled = billedKnown.map { sanitizedNonNegativeFinite($0) } ?? 0
+        let usedBilledInt = clampedInt(from: usedBilled)
+
         let (share, usedDefault) = resolveOutputShare(observation)
-        let outputTokens = resolveOutputTokens(used: used, share: share, observation: observation)
+        let outputTokens = resolveOutputTokens(
+            usedBilled: usedBilled,
+            share: share,
+            observation: observation,
+            usageAnchoredAvailable: usageAnchoredAvailable
+        )
 
         // dialect_saved = O × (V − 1). With V=2 → save one bare-equivalent of output.
-        let dialectRaw = Int((Double(outputTokens) * max(0, dialectVerbosityMultiplier - 1)).rounded())
+        let dialectRaw = clampedInt(from: Double(outputTokens) * max(0, dialectVerbosityMultiplier - 1))
 
         let graphifyRaw: Int
-        if graphifyActive, observation.graphifySignalCount > 0, used > 0 {
+        if graphifyActive, observation.graphifySignalCount > 0, usageAnchoredAvailable, usedBilledInt > 0 {
             graphifyRaw = estimateGraphifyRaw(
                 signalCount: observation.graphifySignalCount,
-                used: used,
+                used: usedBilledInt,
                 share: share,
                 answerTokensSum: observation.graphifyAnswerTokens,
                 medianExplorationTokens: observation.medianExplorationTokens
@@ -213,9 +274,10 @@ public enum TokenSaverBareUserEstimator {
             graphifyRaw = 0
         }
 
-        let (dialect, graphify) = applyAttributedCaps(
+        let capped = applyAttributedCaps(
             measured: measured,
-            used: used,
+            usedBilled: usedBilled,
+            usageAnchoredAvailable: usageAnchoredAvailable,
             dialect: dialectRaw,
             graphify: graphifyRaw
         )
@@ -227,11 +289,16 @@ public enum TokenSaverBareUserEstimator {
 
         return TokenSaverBareUserBreakdown(
             measuredToolOutput: measured,
-            estimatedDialect: dialect,
-            estimatedGraphify: graphify,
+            estimatedDialect: capped.dialect,
+            estimatedGraphify: capped.graphify,
             estimatedOrchestration: orchestration,
             appliedOutputShare: share,
-            usedCalibratedDefaults: usedDefault
+            usedCalibratedDefaults: usedDefault,
+            dialectRawTokens: dialectRaw,
+            graphifyRawTokens: graphifyRaw,
+            capBinding: capped.binding,
+            windowUsageBilledUnits: billedKnown,
+            usageAnchoredAvailable: usageAnchoredAvailable
         )
     }
 
@@ -271,6 +338,64 @@ public enum TokenSaverBareUserEstimator {
         daily.reduce(0) { $0 + max(0, $1.actualProviderTokens) }
     }
 
+    /// Known billed units for the window, or nil if any contributing day is unknown.
+    /// WHY: fail-closed — never sum partial known days or fall back to raw tokens.
+    public static func windowProviderBilledTokenUnits(
+        daily: [TokenSaverDayUsage],
+        includeDayStartingAtOrAfter earliest: Date?,
+        includeDayStartingBefore latestExclusive: Date?,
+        calendar: Calendar = .current
+    ) -> Double? {
+        var total: Double = 0
+        for day in daily {
+            if let earliest, day.dayStart < calendar.startOfDay(for: earliest) {
+                continue
+            }
+            if let latestExclusive, day.dayStart >= calendar.startOfDay(for: latestExclusive) {
+                continue
+            }
+            guard let billed = day.actualProviderBilledTokenUnits else {
+                return nil
+            }
+            total += max(0, billed)
+        }
+        return total
+    }
+
+    /// Today's known billed units, or nil when today's bucket is unknown.
+    /// WHY: estimator usage-anchored legs require known billed — never raw.
+    public static func todayProviderBilledTokenUnits(
+        daily: [TokenSaverDayUsage],
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> Double? {
+        let start = calendar.startOfDay(for: now)
+        var total: Double = 0
+        var sawDay = false
+        for day in daily where calendar.isDate(day.dayStart, inSameDayAs: start) {
+            sawDay = true
+            guard let billed = day.actualProviderBilledTokenUnits else {
+                return nil
+            }
+            total += max(0, billed)
+        }
+        // No day row yet → known empty window (0), not unknown.
+        return sawDay ? total : 0
+    }
+
+    /// Week known billed units across retained daily buckets, or nil if any day unknown.
+    /// WHY: fail-closed — a single historical day without billed must not be raw-filled.
+    public static func weekProviderBilledTokenUnits(daily: [TokenSaverDayUsage]) -> Double? {
+        var total: Double = 0
+        for day in daily {
+            guard let billed = day.actualProviderBilledTokenUnits else {
+                return nil
+            }
+            total += max(0, billed)
+        }
+        return total
+    }
+
     // MARK: - Internals
 
     static func resolveOutputShare(
@@ -287,12 +412,19 @@ public enum TokenSaverBareUserEstimator {
     }
 
     static func resolveOutputTokens(
-        used: Int,
+        usedBilled: Double,
         share: Double,
-        observation: TokenSaverBareUserObservation
+        observation: TokenSaverBareUserObservation,
+        usageAnchoredAvailable: Bool
     ) -> Int {
-        let fromShare = Int((Double(used) * share).rounded())
-        let fromAssistant = Int((Double(observation.assistantChars) / charsPerToken).rounded())
+        // WHY: dialect output-share base is usage-derived → billed only; unknown billed → 0.
+        let fromShare: Int
+        if usageAnchoredAvailable {
+            fromShare = clampedInt(from: usedBilled * share)
+        } else {
+            fromShare = 0
+        }
+        let fromAssistant = clampedInt(from: Double(observation.assistantChars) / charsPerToken)
         // Prefer max(share-scaled usage, assistant floor) so a quiet stream day
         // with real assistant text still gets some dialect credit.
         return max(0, max(fromShare, fromAssistant))
@@ -306,6 +438,7 @@ public enum TokenSaverBareUserEstimator {
     /// graphify   = min(shareModel, avoided) when answer sum > 0, else shareModel
     /// ```
     /// Prefer under-count: no answer data → share model only (never invent answers).
+    /// `used` must be **billed** units (caller responsibility).
     public static func estimateGraphifyRaw(
         signalCount: Int,
         used: Int,
@@ -317,12 +450,12 @@ public enum TokenSaverBareUserEstimator {
         guard count > 0, used > 0 else { return 0 }
         let intensity = min(1.0, Double(count) / graphifySignalSoftCap)
         let inputTokens = Double(used) * (1.0 - min(max(share, 0), 1))
-        let shareModel = Int((inputTokens * graphifyInputAvoidanceRate * intensity).rounded())
+        let shareModel = clampedInt(from: inputTokens * graphifyInputAvoidanceRate * intensity)
         guard shareModel > 0 else { return 0 }
 
         let median = medianExplorationTokens ?? graphifyDefaultExplorationTokens
         let replacedPerQuery = clampExploration(
-            Int((Double(median) * graphifyReplacedExplorationFactor).rounded())
+            clampedInt(from: Double(median) * graphifyReplacedExplorationFactor)
         )
         let avoided = max(0, count * replacedPerQuery - max(0, answerTokensSum))
         // When we have no measured answers yet, keep share-model only so a day of
@@ -337,38 +470,164 @@ public enum TokenSaverBareUserEstimator {
         min(max(tokens, graphifyExplorationMinTokens), graphifyExplorationMaxTokens)
     }
 
+    /// Caps attributed (dialect+graphify) with:
+    /// 1. **Monotonicity** in measured at fixed billed usage (no-proof floor always),
+    /// 2. **Displacement**: at most 1 estimated token displaced per measured token,
+    ///    never above the zero-measured (no-proof) grant or the usage ceiling.
     static func applyAttributedCaps(
         measured: Int,
-        used: Int,
+        usedBilled: Double,
+        usageAnchoredAvailable: Bool,
         dialect: Int,
         graphify: Int
-    ) -> (dialect: Int, graphify: Int) {
+    ) -> (dialect: Int, graphify: Int, binding: TokenSaverAttributedCapBinding) {
         var d = max(0, dialect)
         var g = max(0, graphify)
-        let attributed = d + g
-        let capMeasured = Int((Double(measured) * attributedCapMultipleOfMeasured).rounded())
-        let capUsed = Int((Double(used) * attributedCapShareOfUsed).rounded())
-        // Credible ceiling:
-        // - no pipe proof → at most 2% of used (stops 66%×usage fantasy)
-        // - with pipes → min(4× measured, 12% of used)
+        // Double sum avoids Int overflow when both legs clamp to Int.max from corrupt billed.
+        let attributedDouble = Double(d) + Double(g)
+        let attributed = saturatingAdd(d, g)
+        let m = max(0, measured)
+
+        // Usage-anchored legs unavailable when billed unknown → allowance 0.
+        // Clamp Double→Int so corrupt billed units cannot trap.
+        let used = usageAnchoredAvailable ? sanitizedNonNegativeFinite(usedBilled) : 0
+        let capMeasured = clampedInt(from: Double(m) * attributedCapMultipleOfMeasured)
+        let capUsed = clampedInt(from: used * attributedCapShareOfUsed)
+        let noProofAllowance = clampedInt(from: used * noProofAttributedShareOfUsed)
+
+        // Credible ceiling (monotone non-decreasing in measured at fixed usage):
+        //   tightCap = max(noProofAllowance(used), min(max(capMeasured, measured), capUsed))
+        // WHY: pre-v4 dropped the no-proof floor once measured > 0, so recording a
+        // few real pipe tokens collapsed dialect from ~0.5M to ~8 (55,061× smaller).
         let tightCap: Int
-        if measured == 0 && used == 0 {
+        let bindingForTight: TokenSaverAttributedCapBinding
+        if m == 0 && used == 0 {
             tightCap = 0
-        } else if measured == 0 {
-            tightCap = min(capUsed, Int((Double(used) * 0.02).rounded()))
-        } else if capUsed > 0 {
-            tightCap = min(max(capMeasured, measured), capUsed)
+            bindingForTight = .none
         } else {
-            tightCap = max(capMeasured, measured)
+            let measuredBound = max(capMeasured, m)
+            let usageLimited = min(measuredBound, capUsed)
+            tightCap = max(noProofAllowance, usageLimited)
+            bindingForTight = classifyCapBinding(
+                tightCap: tightCap,
+                noProofAllowance: noProofAllowance,
+                measuredBound: measuredBound,
+                capUsed: capUsed
+            )
         }
-        if attributed <= tightCap { return (d, g) }
-        if attributed == 0 || tightCap == 0 { return (0, 0) }
-        let scale = Double(tightCap) / Double(attributed)
-        d = Int((Double(d) * scale).rounded())
-        g = Int((Double(g) * scale).rounded())
-        let drift = (d + g) - tightCap
+
+        // Zero-measured (no-proof) grant for the same `used`. Displacement may only
+        // protect that no-proof envelope — never the uncapped raw estimate.
+        // tightCap(m=0) = max(noProof, min(0, capUsed)) = noProofAllowance.
+        let tightCapAtZeroMeasured = noProofAllowance
+
+        // Displacement: ≥ max(0, min(raw, no-proof) − m) so each measured token
+        // displaces at most one *granted* estimated token, not fantasy raw.
+        let displacementFloor = max(0, min(attributed, tightCapAtZeroMeasured) - m)
+        // effectiveCap never exceeds usage ceiling; displacement cannot bypass it.
+        let raisedCap = max(tightCap, displacementFloor)
+        let effectiveCap = min(raisedCap, capUsed)
+
+        if attributedDouble <= Double(effectiveCap) {
+            // No scale: either under tightCap, or displacement forbids any cut.
+            return (d, g, .none)
+        }
+        if attributedDouble == 0 || effectiveCap == 0 {
+            return (0, 0, bindingForActualCap(
+                effectiveCap: effectiveCap,
+                tightCap: tightCap,
+                raisedCap: raisedCap,
+                capUsed: capUsed,
+                bindingForTight: bindingForTight
+            ))
+        }
+        let scale = Double(effectiveCap) / attributedDouble
+        d = clampedInt(from: Double(d) * scale)
+        g = clampedInt(from: Double(g) * scale)
+        let sumAfter = saturatingAdd(d, g)
+        let drift = sumAfter - effectiveCap
         if drift > 0 { d = max(0, d - drift) }
-        return (d, g)
+
+        // Report the component that actually bound the scaled result — never claim
+        // measuredMultiple for a usage-ceiling or no-proof outcome.
+        let binding = bindingForActualCap(
+            effectiveCap: effectiveCap,
+            tightCap: tightCap,
+            raisedCap: raisedCap,
+            capUsed: capUsed,
+            bindingForTight: bindingForTight
+        )
+        return (d, g, binding)
+    }
+
+    /// Prefer the binding of the component that actually set `effectiveCap`.
+    private static func bindingForActualCap(
+        effectiveCap: Int,
+        tightCap: Int,
+        raisedCap: Int,
+        capUsed: Int,
+        bindingForTight: TokenSaverAttributedCapBinding
+    ) -> TokenSaverAttributedCapBinding {
+        // Usage ceiling clipped a higher raised floor.
+        if raisedCap > capUsed && effectiveCap == capUsed {
+            return .usageShare
+        }
+        // Displacement alone raised the floor above pure tightCap.
+        if effectiveCap > tightCap {
+            return .measuredMultiple
+        }
+        return bindingForTight
+    }
+
+    /// Non-finite → 0; otherwise non-negative finite.
+    private static func sanitizedNonNegativeFinite(_ value: Double) -> Double {
+        guard value.isFinite else { return 0 }
+        return max(0, value)
+    }
+
+    /// Rounded Double→Int that never traps on NaN/Inf/out-of-range values.
+    static func clampedInt(from value: Double) -> Int {
+        guard value.isFinite else { return 0 }
+        let rounded = value.rounded()
+        if rounded >= Double(Int.max) { return Int.max }
+        if rounded <= Double(Int.min) { return Int.min }
+        return Int(rounded)
+    }
+
+    /// Non-negative Int addition that saturates at `Int.max` instead of trapping.
+    static func saturatingAdd(_ values: Int...) -> Int {
+        var total = 0
+        for value in values {
+            let v = max(0, value)
+            let (sum, overflow) = total.addingReportingOverflow(v)
+            if overflow { return Int.max }
+            total = sum
+        }
+        return total
+    }
+
+    /// Prefer the most restrictive component when values tie.
+    private static func classifyCapBinding(
+        tightCap: Int,
+        noProofAllowance: Int,
+        measuredBound: Int,
+        capUsed: Int
+    ) -> TokenSaverAttributedCapBinding {
+        if tightCap == 0 { return .none }
+        // tightCap = max(noProof, min(measuredBound, capUsed))
+        let usageLimited = min(measuredBound, capUsed)
+        if noProofAllowance >= usageLimited && tightCap == noProofAllowance {
+            return .noProofAllowance
+        }
+        if capUsed <= measuredBound && tightCap == capUsed {
+            return .usageShare
+        }
+        if tightCap == measuredBound || tightCap == max(measuredBound, 0) {
+            return .measuredMultiple
+        }
+        if tightCap == noProofAllowance { return .noProofAllowance }
+        if tightCap == capUsed { return .usageShare }
+        return .measuredMultiple
     }
 
     private static func clampShare(_ share: Double) -> Double {
