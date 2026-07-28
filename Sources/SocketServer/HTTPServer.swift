@@ -246,6 +246,8 @@ public enum OutboundLatencyPressureClassifier {
     public static let reasonElevatedQueueWait = "elevated_queue_wait"
     public static let reasonNoElevatedQueueSignals = "no_elevated_queue_signals"
     public static let reasonInsufficientWaitSamples = "insufficient_wait_samples"
+    /// Public snapshot had negative or non-finite wait total/max on a lane.
+    public static let reasonInvalidWaitSamples = "invalid_wait_samples"
 
     /// Classify from existing process/live gauges. Inputs are clamped so
     /// negative race samples cannot invent pressure.
@@ -292,9 +294,17 @@ public enum OutboundLatencyPressureClassifier {
         var totalMs: Double = 0
         var maxMs: Double = 0
         for lane in lanes {
+            // Malformed public metrics must fail neutral: never clamp bad
+            // totals/maxes into a false no_queue_pressure exoneration.
+            let total = lane.totalMilliseconds
+            let laneMax = lane.maxMilliseconds
+            if !total.isFinite || total < 0 || !laneMax.isFinite || laneMax < 0 {
+                return OutboundLatencyPressureSnapshot(
+                    classification: .insufficientSamples,
+                    reason: reasonInvalidWaitSamples
+                )
+            }
             sampleCount &+= lane.count
-            let total = lane.totalMilliseconds.isFinite ? max(0, lane.totalMilliseconds) : 0
-            let laneMax = lane.maxMilliseconds.isFinite ? max(0, lane.maxMilliseconds) : 0
             totalMs += total
             maxMs = max(maxMs, laneMax)
         }
@@ -341,11 +351,17 @@ public func connectionMetricsJSON(
     framesRejectedOrEvicted: Int = 0,
     outboundQueueWait: OutboundQueueWaitMetricsSnapshot = .zero
 ) -> [String: Any] {
+    /// JSONSerialization rejects NaN/Inf; clamp negative/non-finite wait
+    /// aggregates to finite 0 so a malformed public snapshot cannot break
+    /// /v1/health. Classifier still sees raw inputs for invalid_wait_samples.
+    func finiteNonNegativeMilliseconds(_ value: Double) -> Double {
+        (value.isFinite && value >= 0) ? value : 0
+    }
     func laneJSON(_ metrics: OutboundQueueWaitLaneMetrics) -> [String: Any] {
         [
             "count": metrics.count,
-            "total": max(0, metrics.totalMilliseconds),
-            "max": max(0, metrics.maxMilliseconds)
+            "total": finiteNonNegativeMilliseconds(metrics.totalMilliseconds),
+            "max": finiteNonNegativeMilliseconds(metrics.maxMilliseconds)
         ]
     }
     let pressure = OutboundLatencyPressureClassifier.classify(

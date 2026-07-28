@@ -171,6 +171,73 @@ final class WSConnectionMetricsTests: XCTestCase {
         XCTAssertNotNil(pressure?["reason"] as? String)
     }
 
+    func test_connectionMetricsJSON_nonFiniteWaitLane_isJSONSerializable() {
+        // WHY: JSONSerialization fails on NaN/Inf. A malformed public wait
+        // snapshot must not break /v1/health — lane total/max clamp to finite
+        // 0 while the classifier still reports invalid_wait_samples on raw input.
+        let min = OutboundLatencyPressureClassifier.minimumWaitSamples
+        let wait = OutboundQueueWaitMetricsSnapshot(
+            priority: OutboundQueueWaitLaneMetrics(
+                count: min,
+                totalMilliseconds: .nan,
+                maxMilliseconds: .infinity
+            ),
+            normal: OutboundQueueWaitLaneMetrics(
+                count: min,
+                totalMilliseconds: -.infinity,
+                maxMilliseconds: .nan
+            ),
+            bulk: OutboundQueueWaitLaneMetrics(
+                count: 1,
+                totalMilliseconds: -12,
+                maxMilliseconds: .infinity
+            )
+        )
+        let result = connectionMetricsJSON(
+            activeClients: 1,
+            totalQueuedBytes: 0,
+            slowClientDrops: 0,
+            outboundQueueWait: wait
+        )
+
+        XCTAssertNoThrow(
+            try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]),
+            "health connections dictionary must remain JSON-serializable with non-finite wait inputs"
+        )
+        guard let encoded = try? JSONSerialization.data(
+            withJSONObject: result,
+            options: [.sortedKeys]
+        ) else {
+            return XCTFail("connections JSON must serialize after non-finite wait sanitization")
+        }
+        XCTAssertFalse(encoded.isEmpty)
+
+        let waitJSON = result["outbound_queue_wait_ms"] as? [String: Any]
+        for lane in ["priority", "normal", "bulk"] {
+            let laneJSON = waitJSON?[lane] as? [String: Any]
+            let total = jsonDouble(laneJSON?["total"])
+            let maxVal = jsonDouble(laneJSON?["max"])
+            XCTAssertEqual(total, 0, "\(lane) total must sanitize non-finite/negative to finite 0")
+            XCTAssertEqual(maxVal, 0, "\(lane) max must sanitize non-finite/negative to finite 0")
+            XCTAssertEqual(total?.isFinite, true, "\(lane) total must be finite")
+            XCTAssertEqual(maxVal?.isFinite, true, "\(lane) max must be finite")
+            XCTAssertGreaterThanOrEqual(total ?? -1, 0, "\(lane) total must be bounded nonnegative")
+            XCTAssertGreaterThanOrEqual(maxVal ?? -1, 0, "\(lane) max must be bounded nonnegative")
+        }
+
+        let pressure = result["outbound_latency_pressure"] as? [String: Any]
+        XCTAssertEqual(
+            pressure?["class"] as? String,
+            OutboundLatencyPressureClass.insufficientSamples.rawValue,
+            "sanitized JSON must not change classifier invalid_wait_samples class"
+        )
+        XCTAssertEqual(
+            pressure?["reason"] as? String,
+            OutboundLatencyPressureClassifier.reasonInvalidWaitSamples,
+            "classifier must still see raw non-finite waits as invalid_wait_samples"
+        )
+    }
+
     func test_connectionMetricsJSON_queueWait_isSecretFreeBoundedShape() {
         // WHY: diagnostics must never leak payloads/tokens/host identity into
         // /v1/health.connections — only fixed lane labels and numeric aggregates.
@@ -360,6 +427,98 @@ final class WSConnectionMetricsTests: XCTestCase {
         )
         XCTAssertEqual(sparse.classification, .insufficientSamples,
                        "fewer than minimum wait samples stays insufficient")
+    }
+
+    func test_classifier_insufficientSamples_negativeWaitTotalOrMax() {
+        // WHY: a public metrics snapshot with negative wait totals/max must not
+        // clamp into no_queue_pressure — telemetry fails neutral, not exonerate.
+        let min = OutboundLatencyPressureClassifier.minimumWaitSamples
+        let wait = OutboundQueueWaitMetricsSnapshot(
+            priority: .zero,
+            normal: OutboundQueueWaitLaneMetrics(
+                count: min,
+                totalMilliseconds: -10,
+                maxMilliseconds: 5
+            ),
+            bulk: .zero
+        )
+        let snap = OutboundLatencyPressureClassifier.classify(
+            totalQueuedBytes: 0,
+            maxObservedOutboundQueuedBytes: 0,
+            framesRejectedOrEvicted: 0,
+            slowClientDrops: 0,
+            outboundQueueWait: wait
+        )
+        XCTAssertEqual(snap.classification, .insufficientSamples,
+                       "negative wait total with enough count must not exonerate queue")
+        XCTAssertEqual(snap.reason,
+                       OutboundLatencyPressureClassifier.reasonInvalidWaitSamples)
+
+        let negativeMax = OutboundQueueWaitMetricsSnapshot(
+            priority: OutboundQueueWaitLaneMetrics(
+                count: min,
+                totalMilliseconds: 12,
+                maxMilliseconds: -1
+            ),
+            normal: .zero,
+            bulk: .zero
+        )
+        let maxSnap = OutboundLatencyPressureClassifier.classify(
+            totalQueuedBytes: 0,
+            maxObservedOutboundQueuedBytes: 0,
+            framesRejectedOrEvicted: 0,
+            slowClientDrops: 0,
+            outboundQueueWait: negativeMax
+        )
+        XCTAssertEqual(maxSnap.classification, .insufficientSamples)
+        XCTAssertEqual(maxSnap.reason,
+                       OutboundLatencyPressureClassifier.reasonInvalidWaitSamples)
+    }
+
+    func test_classifier_insufficientSamples_nonFiniteWaitTotalOrMax() {
+        // WHY: NaN/Inf wait aggregates on a public snapshot are unusable;
+        // classifying no_queue_pressure would falsely clear the queue.
+        let min = OutboundLatencyPressureClassifier.minimumWaitSamples
+        let nanTotal = OutboundQueueWaitMetricsSnapshot(
+            priority: .zero,
+            normal: .zero,
+            bulk: OutboundQueueWaitLaneMetrics(
+                count: min,
+                totalMilliseconds: .nan,
+                maxMilliseconds: 4
+            )
+        )
+        let nanSnap = OutboundLatencyPressureClassifier.classify(
+            totalQueuedBytes: 0,
+            maxObservedOutboundQueuedBytes: 0,
+            framesRejectedOrEvicted: 0,
+            slowClientDrops: 0,
+            outboundQueueWait: nanTotal
+        )
+        XCTAssertEqual(nanSnap.classification, .insufficientSamples,
+                       "non-finite wait total with enough count stays insufficient")
+        XCTAssertEqual(nanSnap.reason,
+                       OutboundLatencyPressureClassifier.reasonInvalidWaitSamples)
+
+        let infMax = OutboundQueueWaitMetricsSnapshot(
+            priority: OutboundQueueWaitLaneMetrics(
+                count: min,
+                totalMilliseconds: 9,
+                maxMilliseconds: .infinity
+            ),
+            normal: .zero,
+            bulk: .zero
+        )
+        let infSnap = OutboundLatencyPressureClassifier.classify(
+            totalQueuedBytes: 0,
+            maxObservedOutboundQueuedBytes: 0,
+            framesRejectedOrEvicted: 0,
+            slowClientDrops: 0,
+            outboundQueueWait: infMax
+        )
+        XCTAssertEqual(infSnap.classification, .insufficientSamples)
+        XCTAssertEqual(infSnap.reason,
+                       OutboundLatencyPressureClassifier.reasonInvalidWaitSamples)
     }
 
     func test_classifier_isEquatableSendableAndSecretFreeInHealthJSON() {
