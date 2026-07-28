@@ -62,6 +62,12 @@ final class WSConnectionMetricsTests: XCTestCase {
         let bulk = waitJSON?["bulk"] as? [String: Any]
         XCTAssertEqual(jsonUInt64(bulk?["count"]), 1)
         XCTAssertEqual(jsonDouble(bulk?["max"]), 90)
+        let pressure = result["outbound_latency_pressure"] as? [String: Any]
+        XCTAssertEqual(pressure?["class"] as? String,
+                       OutboundLatencyPressureClass.backpressureDominated.rawValue,
+                       "rejects must surface as backpressure-dominated latency class")
+        XCTAssertEqual(pressure?["reason"] as? String,
+                       OutboundLatencyPressureClassifier.reasonFramesRejectedOrEvicted)
     }
 
     func test_connectionMetricsJSON_zeroState_isValid() {
@@ -88,12 +94,16 @@ final class WSConnectionMetricsTests: XCTestCase {
             XCTAssertEqual(jsonDouble(laneJSON?["total"]), 0, "\(lane) total zero at cold start")
             XCTAssertEqual(jsonDouble(laneJSON?["max"]), 0, "\(lane) max zero at cold start")
         }
+        let pressure = result["outbound_latency_pressure"] as? [String: Any]
+        XCTAssertEqual(pressure?["class"] as? String,
+                       OutboundLatencyPressureClass.insufficientSamples.rawValue,
+                       "cold start must not claim no-pressure without samples")
     }
 
     func test_connectionMetricsJSON_keysOnly_noExtraKeys() {
         // WHY: health response schema must be stable; unexpected keys
-        // break iOS client decoding contracts. Additive wait aggregates are
-        // the only intentional extension for queue-time diagnostics.
+        // break iOS client decoding contracts. Additive wait aggregates and
+        // latency-pressure classification are intentional diagnostic extensions.
         let result = connectionMetricsJSON(
             activeClients: 0,
             totalQueuedBytes: 0,
@@ -106,7 +116,8 @@ final class WSConnectionMetricsTests: XCTestCase {
             "max_observed_outbound_queued_bytes",
             "max_observed_frame_bytes",
             "frames_rejected_or_evicted",
-            "outbound_queue_wait_ms"
+            "outbound_queue_wait_ms",
+            "outbound_latency_pressure"
         ]
         XCTAssertEqual(Set(result.keys), expected,
                        "connectionMetricsJSON must return exactly the documented keys")
@@ -118,6 +129,9 @@ final class WSConnectionMetricsTests: XCTestCase {
             XCTAssertEqual(Set((laneJSON ?? [:]).keys), Set(["count", "total", "max"]),
                            "\(lane) wait object must stay count/total/max only")
         }
+        let pressure = result["outbound_latency_pressure"] as? [String: Any]
+        XCTAssertEqual(Set((pressure ?? [:]).keys), Set(["class", "reason"]),
+                       "latency pressure object must stay class/reason only")
     }
 
     func test_connectionMetricsJSON_clampsNegativeInputs() {
@@ -139,7 +153,8 @@ final class WSConnectionMetricsTests: XCTestCase {
             framesRejectedOrEvicted: -3,
             outboundQueueWait: wait
         )
-        for key in result.keys where key != "outbound_queue_wait_ms" {
+        for key in result.keys
+            where key != "outbound_queue_wait_ms" && key != "outbound_latency_pressure" {
             XCTAssertGreaterThanOrEqual(result[key] as? Int ?? -1, 0,
                                         "\(key) must be nonnegative in health JSON")
         }
@@ -151,6 +166,9 @@ final class WSConnectionMetricsTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(jsonDouble(laneJSON?["max"]) ?? -1, 0,
                                         "\(lane) max must clamp nonnegative")
         }
+        let pressure = result["outbound_latency_pressure"] as? [String: Any]
+        XCTAssertNotNil(pressure?["class"] as? String)
+        XCTAssertNotNil(pressure?["reason"] as? String)
     }
 
     func test_connectionMetricsJSON_queueWait_isSecretFreeBoundedShape() {
@@ -188,6 +206,202 @@ final class WSConnectionMetricsTests: XCTestCase {
         XCTAssertEqual(jsonUInt64(bulk?["count"]), 2)
         XCTAssertEqual(jsonDouble(bulk?["total"]), 75)
         XCTAssertEqual(jsonDouble(bulk?["max"]), 50)
+        let pressure = result["outbound_latency_pressure"] as? [String: Any]
+        XCTAssertEqual(pressure?["class"] as? String,
+                       OutboundLatencyPressureClass.noQueuePressure.rawValue,
+                       "low waits with enough samples mean latency is not queue-dominated")
+    }
+
+    // MARK: - OutboundLatencyPressureClassifier
+
+    func test_classifier_queuePressure_fromElevatedWait() {
+        // WHY: operators need to know when observed connection latency is
+        // dominated by outbound enqueue→dequeue wait (queue backlog) even
+        // when the server has not yet refused/shed frames.
+        var wait = OutboundQueueWaitMetricsSnapshot.zero
+        wait.normal.record(waitMilliseconds: 120)
+        wait.normal.record(waitMilliseconds: 80)
+        wait.bulk.record(waitMilliseconds: 150)
+        let snap = OutboundLatencyPressureClassifier.classify(
+            totalQueuedBytes: 0,
+            maxObservedOutboundQueuedBytes: 0,
+            framesRejectedOrEvicted: 0,
+            slowClientDrops: 0,
+            outboundQueueWait: wait
+        )
+        XCTAssertEqual(snap.classification, .queuePressureDominated,
+                       "elevated wait with enough samples must classify as queue pressure")
+        XCTAssertEqual(snap.reason,
+                       OutboundLatencyPressureClassifier.reasonElevatedQueueWait)
+    }
+
+    func test_classifier_queuePressure_fromElevatedQueuedBytes() {
+        // WHY: a large live or high-water outbound queue is itself evidence
+        // that latency is queue-dominated, without needing wait samples.
+        let live = OutboundLatencyPressureClassifier.classify(
+            totalQueuedBytes: OutboundLatencyPressureClassifier.elevatedQueuedBytes,
+            maxObservedOutboundQueuedBytes: 0,
+            framesRejectedOrEvicted: 0,
+            slowClientDrops: 0,
+            outboundQueueWait: .zero
+        )
+        XCTAssertEqual(live.classification, .queuePressureDominated)
+        XCTAssertEqual(live.reason,
+                       OutboundLatencyPressureClassifier.reasonElevatedQueuedBytes)
+
+        let highWater = OutboundLatencyPressureClassifier.classify(
+            totalQueuedBytes: 0,
+            maxObservedOutboundQueuedBytes: OutboundLatencyPressureClassifier.elevatedQueuedBytes,
+            framesRejectedOrEvicted: 0,
+            slowClientDrops: 0,
+            outboundQueueWait: .zero
+        )
+        XCTAssertEqual(highWater.classification, .queuePressureDominated,
+                       "process high-water queue depth must still diagnose queue pressure")
+        XCTAssertEqual(highWater.reason,
+                       OutboundLatencyPressureClassifier.reasonElevatedQueuedBytes)
+    }
+
+    func test_classifier_backpressure_fromRejectedOrEvictedFrames() {
+        // WHY: frames_rejected_or_evicted is the hard backpressure signal —
+        // the queue refused or shed work. Operators must distinguish this
+        // from pure wait/depth pressure so they know degrade already fired.
+        var wait = OutboundQueueWaitMetricsSnapshot.zero
+        wait.normal.record(waitMilliseconds: 5)
+        wait.normal.record(waitMilliseconds: 5)
+        wait.normal.record(waitMilliseconds: 5)
+        let snap = OutboundLatencyPressureClassifier.classify(
+            totalQueuedBytes: 0,
+            maxObservedOutboundQueuedBytes: 0,
+            framesRejectedOrEvicted: 2,
+            slowClientDrops: 0,
+            outboundQueueWait: wait
+        )
+        XCTAssertEqual(snap.classification, .backpressureDominated,
+                       "reject/evict counters must classify as backpressure-dominated")
+        XCTAssertEqual(snap.reason,
+                       OutboundLatencyPressureClassifier.reasonFramesRejectedOrEvicted)
+    }
+
+    func test_classifier_backpressure_fromSlowClientDrops() {
+        // WHY: slow_client_drops is a distinct backpressure path (queue dropped
+        // a slow client). It must not be collapsed into generic queue pressure.
+        let snap = OutboundLatencyPressureClassifier.classify(
+            totalQueuedBytes: 0,
+            maxObservedOutboundQueuedBytes: 0,
+            framesRejectedOrEvicted: 0,
+            slowClientDrops: 1,
+            outboundQueueWait: .zero
+        )
+        XCTAssertEqual(snap.classification, .backpressureDominated)
+        XCTAssertEqual(snap.reason,
+                       OutboundLatencyPressureClassifier.reasonSlowClientDrops)
+    }
+
+    func test_classifier_backpressure_outranksQueuePressure() {
+        // WHY: when both depth pressure and shed signals exist, operators
+        // should see backpressure (harder fault) not the weaker queue label.
+        let snap = OutboundLatencyPressureClassifier.classify(
+            totalQueuedBytes: OutboundLatencyPressureClassifier.elevatedQueuedBytes * 2,
+            maxObservedOutboundQueuedBytes: OutboundLatencyPressureClassifier.elevatedQueuedBytes * 2,
+            framesRejectedOrEvicted: 1,
+            slowClientDrops: 1,
+            outboundQueueWait: .zero
+        )
+        XCTAssertEqual(snap.classification, .backpressureDominated)
+        XCTAssertEqual(snap.reason,
+                       OutboundLatencyPressureClassifier.reasonFramesRejectedOrEvicted,
+                       "rejects outrank drops when both are present")
+    }
+
+    func test_classifier_noQueuePressure_withEnoughQuietSamples() {
+        // WHY: when wait samples are sufficient and all queue gauges are calm,
+        // operators must conclude latency is NOT outbound-queue-dominated
+        // (look elsewhere: RTT, radio, client, app work).
+        var wait = OutboundQueueWaitMetricsSnapshot.zero
+        wait.priority.record(waitMilliseconds: 2)
+        wait.normal.record(waitMilliseconds: 4)
+        wait.bulk.record(waitMilliseconds: 6)
+        let snap = OutboundLatencyPressureClassifier.classify(
+            totalQueuedBytes: 128,
+            maxObservedOutboundQueuedBytes: 512,
+            framesRejectedOrEvicted: 0,
+            slowClientDrops: 0,
+            outboundQueueWait: wait
+        )
+        XCTAssertEqual(snap.classification, .noQueuePressure,
+                       "quiet waits + sub-threshold depth = no observed queue pressure")
+        XCTAssertEqual(snap.reason,
+                       OutboundLatencyPressureClassifier.reasonNoElevatedQueueSignals)
+    }
+
+    func test_classifier_insufficientSamples_neutralColdStart() {
+        // WHY: zero/near-zero evidence must not claim "no pressure" — that
+        // would mislead support into ruling out the queue before any traffic.
+        let empty = OutboundLatencyPressureClassifier.classify(
+            totalQueuedBytes: 0,
+            maxObservedOutboundQueuedBytes: 0,
+            framesRejectedOrEvicted: 0,
+            slowClientDrops: 0,
+            outboundQueueWait: .zero
+        )
+        XCTAssertEqual(empty.classification, .insufficientSamples)
+        XCTAssertEqual(empty.reason,
+                       OutboundLatencyPressureClassifier.reasonInsufficientWaitSamples)
+
+        var oneSample = OutboundQueueWaitMetricsSnapshot.zero
+        oneSample.normal.record(waitMilliseconds: 1)
+        let sparse = OutboundLatencyPressureClassifier.classify(
+            totalQueuedBytes: 0,
+            maxObservedOutboundQueuedBytes: 0,
+            framesRejectedOrEvicted: 0,
+            slowClientDrops: 0,
+            outboundQueueWait: oneSample
+        )
+        XCTAssertEqual(sparse.classification, .insufficientSamples,
+                       "fewer than minimum wait samples stays insufficient")
+    }
+
+    func test_classifier_isEquatableSendableAndSecretFreeInHealthJSON() {
+        // WHY: classification must be a pure value (Sendable/Equatable) and
+        // the health payload must never embed host/token/payload identity.
+        let a = OutboundLatencyPressureClassifier.classify(
+            totalQueuedBytes: 0,
+            maxObservedOutboundQueuedBytes: 0,
+            framesRejectedOrEvicted: 0,
+            slowClientDrops: 0,
+            outboundQueueWait: .zero
+        )
+        let b = OutboundLatencyPressureClassifier.classify(
+            totalQueuedBytes: 0,
+            maxObservedOutboundQueuedBytes: 0,
+            framesRejectedOrEvicted: 0,
+            slowClientDrops: 0,
+            outboundQueueWait: .zero
+        )
+        XCTAssertEqual(a, b)
+        XCTAssertEqual(a.classification, .insufficientSamples)
+
+        let result = connectionMetricsJSON(
+            activeClients: 0,
+            totalQueuedBytes: 0,
+            slowClientDrops: 0
+        )
+        guard let encoded = try? JSONSerialization.data(
+            withJSONObject: result["outbound_latency_pressure"] as Any,
+            options: [.sortedKeys]
+        ),
+              let text = String(data: encoded, encoding: .utf8) else {
+            return XCTFail("pressure JSON must serialize")
+        }
+        for secretish in ["token", "host", "127.0.0.1", "password", "payload", "Bearer"] {
+            XCTAssertFalse(
+                text.localizedCaseInsensitiveContains(secretish),
+                "pressure diagnostic must not contain \(secretish)"
+            )
+        }
+        XCTAssertTrue(text.contains("insufficient_samples"))
+        XCTAssertTrue(text.contains("insufficient_wait_samples"))
     }
 
     // MARK: - WSConnectionTracker

@@ -186,6 +186,142 @@ public final class WSConnectionTracker: @unchecked Sendable {
     }
 }
 
+/// Operator-facing class for whether observed WS connection latency is
+/// dominated by outbound queue/backpressure, or there is no observed queue
+/// pressure (or too little evidence to decide).
+///
+/// Observability only — pure classification of existing counters. Does not
+/// change queue scheduling, wire protocol, authentication, or retries.
+/// Secret-free fixed string codes only (no hosts, tokens, payloads).
+public enum OutboundLatencyPressureClass: String, Sendable, Equatable {
+    /// Frames refused/shed or slow-client drops: the queue hit its wall.
+    case backpressureDominated = "backpressure_dominated"
+    /// Elevated enqueue→dequeue wait and/or queued bytes without shed signals.
+    case queuePressureDominated = "queue_pressure_dominated"
+    /// Enough samples and no elevated queue/backpressure signals.
+    case noQueuePressure = "no_queue_pressure"
+    /// Too few wait samples and no elevated depth/reject signals to decide.
+    case insufficientSamples = "insufficient_samples"
+}
+
+/// Result of `OutboundLatencyPressureClassifier.classify`.
+/// Fixed `reason` codes only (documented constants on the classifier).
+public struct OutboundLatencyPressureSnapshot: Sendable, Equatable {
+    public let classification: OutboundLatencyPressureClass
+    public let reason: String
+
+    public init(classification: OutboundLatencyPressureClass, reason: String) {
+        self.classification = classification
+        self.reason = reason
+    }
+}
+
+/// Pure, deterministic classifier over existing WS outbound health counters.
+///
+/// Thresholds are intentionally conservative and bounded:
+/// - Wait floors sit far below the ~8s target backlog used to size the queue,
+///   so only material enqueue delay trips pressure without flagging normal
+///   local drain (sub-ms to a few ms).
+/// - Queued-byte floor matches `WebSocketOutboundQueue.minimumQueuedBytes`
+///   (64 KiB), the soft floor for dynamic sizing — below that is normal buffer.
+/// - Minimum wait samples avoid classifying from a single noisy frame.
+public enum OutboundLatencyPressureClassifier {
+    /// Combined wait samples across lanes required for wait-based verdicts.
+    public static let minimumWaitSamples: UInt64 = 3
+
+    /// Per-frame max enqueue→dequeue wait (ms) that indicates queue pressure.
+    public static let elevatedWaitMaxMilliseconds: Double = 100
+
+    /// Average wait (ms) across all samples that indicates sustained pressure.
+    public static let elevatedWaitAverageMilliseconds: Double = 50
+
+    /// Live or high-water queued bytes that indicate material backlog.
+    /// Matches `WebSocketOutboundQueue.minimumQueuedBytes`.
+    public static let elevatedQueuedBytes: Int = 64 * 1_024
+
+    // Fixed reason codes (stable for operators / support tooling).
+    public static let reasonFramesRejectedOrEvicted = "frames_rejected_or_evicted"
+    public static let reasonSlowClientDrops = "slow_client_drops"
+    public static let reasonElevatedQueuedBytes = "elevated_queued_bytes"
+    public static let reasonElevatedQueueWait = "elevated_queue_wait"
+    public static let reasonNoElevatedQueueSignals = "no_elevated_queue_signals"
+    public static let reasonInsufficientWaitSamples = "insufficient_wait_samples"
+
+    /// Classify from existing process/live gauges. Inputs are clamped so
+    /// negative race samples cannot invent pressure.
+    public static func classify(
+        totalQueuedBytes: Int,
+        maxObservedOutboundQueuedBytes: Int,
+        framesRejectedOrEvicted: Int,
+        slowClientDrops: Int,
+        outboundQueueWait: OutboundQueueWaitMetricsSnapshot
+    ) -> OutboundLatencyPressureSnapshot {
+        let rejects = max(0, framesRejectedOrEvicted)
+        let drops = max(0, slowClientDrops)
+        let liveQueued = max(0, totalQueuedBytes)
+        let maxQueued = max(0, maxObservedOutboundQueuedBytes)
+
+        // Strongest signal first: the queue refused work or shed a client.
+        if rejects > 0 {
+            return OutboundLatencyPressureSnapshot(
+                classification: .backpressureDominated,
+                reason: reasonFramesRejectedOrEvicted
+            )
+        }
+        if drops > 0 {
+            return OutboundLatencyPressureSnapshot(
+                classification: .backpressureDominated,
+                reason: reasonSlowClientDrops
+            )
+        }
+
+        // Depth high-water / live gauge — independent of wait sample count.
+        if liveQueued >= elevatedQueuedBytes || maxQueued >= elevatedQueuedBytes {
+            return OutboundLatencyPressureSnapshot(
+                classification: .queuePressureDominated,
+                reason: reasonElevatedQueuedBytes
+            )
+        }
+
+        let lanes = [
+            outboundQueueWait.priority,
+            outboundQueueWait.normal,
+            outboundQueueWait.bulk
+        ]
+        var sampleCount: UInt64 = 0
+        var totalMs: Double = 0
+        var maxMs: Double = 0
+        for lane in lanes {
+            sampleCount &+= lane.count
+            let total = lane.totalMilliseconds.isFinite ? max(0, lane.totalMilliseconds) : 0
+            let laneMax = lane.maxMilliseconds.isFinite ? max(0, lane.maxMilliseconds) : 0
+            totalMs += total
+            maxMs = max(maxMs, laneMax)
+        }
+
+        if sampleCount < minimumWaitSamples {
+            return OutboundLatencyPressureSnapshot(
+                classification: .insufficientSamples,
+                reason: reasonInsufficientWaitSamples
+            )
+        }
+
+        let averageMs = totalMs / Double(sampleCount)
+        if maxMs >= elevatedWaitMaxMilliseconds
+            || averageMs >= elevatedWaitAverageMilliseconds {
+            return OutboundLatencyPressureSnapshot(
+                classification: .queuePressureDominated,
+                reason: reasonElevatedQueueWait
+            )
+        }
+
+        return OutboundLatencyPressureSnapshot(
+            classification: .noQueuePressure,
+            reason: reasonNoElevatedQueueSignals
+        )
+    }
+}
+
 /// Pure helper: assembles the `connections` sub-object for /v1/health from
 /// plain counter inputs. No I/O, no actor, fully unit-testable.
 /// Values are clamped nonnegative so health never emits negative gauges.
@@ -193,6 +329,9 @@ public final class WSConnectionTracker: @unchecked Sendable {
 /// `outbound_queue_wait_ms` is additive diagnostics only (count/total/max per
 /// existing application lane). It never includes payloads, tokens, hosts, or
 /// request bodies.
+///
+/// `outbound_latency_pressure` is additive operator diagnostics derived only
+/// from the same counters (class + fixed reason code). No secrets/hosts.
 public func connectionMetricsJSON(
     activeClients: Int,
     totalQueuedBytes: Int,
@@ -209,6 +348,13 @@ public func connectionMetricsJSON(
             "max": max(0, metrics.maxMilliseconds)
         ]
     }
+    let pressure = OutboundLatencyPressureClassifier.classify(
+        totalQueuedBytes: totalQueuedBytes,
+        maxObservedOutboundQueuedBytes: maxObservedOutboundQueuedBytes,
+        framesRejectedOrEvicted: framesRejectedOrEvicted,
+        slowClientDrops: slowClientDrops,
+        outboundQueueWait: outboundQueueWait
+    )
     return [
         "active_clients": max(0, activeClients),
         "total_queued_bytes": max(0, totalQueuedBytes),
@@ -220,6 +366,10 @@ public func connectionMetricsJSON(
             "priority": laneJSON(outboundQueueWait.priority),
             "normal": laneJSON(outboundQueueWait.normal),
             "bulk": laneJSON(outboundQueueWait.bulk)
+        ],
+        "outbound_latency_pressure": [
+            "class": pressure.classification.rawValue,
+            "reason": pressure.reason
         ]
     ]
 }
