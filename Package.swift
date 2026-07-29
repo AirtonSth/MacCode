@@ -172,7 +172,8 @@ let package = Package(
         ),
         .testTarget(
             name: "AgentRuntimeTests",
-            dependencies: ["AgentRuntime", "CoreModel", "GitTestSupport"],
+            // DistillCore: ProviderProxyLifecycleTests imports it directly.
+            dependencies: ["AgentRuntime", "CoreModel", "GitTestSupport", "DistillCore"],
             path: "Tests/AgentRuntimeTests",
             resources: [
                 .copy("Fixtures")
