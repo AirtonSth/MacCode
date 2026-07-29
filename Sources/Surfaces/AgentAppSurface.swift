@@ -4611,14 +4611,27 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             : nil
         // Graphify: same host path as AppCommandRouter RPC send — resolve roots,
         // kick refresh, inject RC_GRAPHIFY_* into provider environment (fail-open).
-        let graphifyEnv = GraphifyWorkspaceService.shared.applyToAgentEnvironment(
-            base: launchConfig?.environment ?? [:],
-            threadId: tid.value,
-            threadCwd: cwd,
-            worktreePath: persistedThread?.worktreePath,
-            workspaceCwd: cwd,
-            attachmentPaths: attached.map(\.path)
-        ).environment
+        // Root resolution shells out to `git rev-parse` twice per candidate
+        // directory (blocking Process + waitUntilExit). When the workspace root
+        // is not itself a repo, classify() walks the tree to depth 2, so that is
+        // hundreds of spawns — measured at 2.7s of blocked MainActor on send,
+        // i.e. the macOS spinner before the run started. Resolve off the main
+        // actor; send still awaits it, so the run environment is unchanged.
+        let graphifyBase = launchConfig?.environment ?? [:]
+        let graphifyThreadId = tid.value
+        let graphifyCwd = cwd
+        let graphifyWorktreePath = persistedThread?.worktreePath
+        let graphifyAttachmentPaths = attached.map(\.path)
+        let graphifyEnv = await Task.detached(priority: .userInitiated) {
+            GraphifyWorkspaceService.shared.applyToAgentEnvironment(
+                base: graphifyBase,
+                threadId: graphifyThreadId,
+                threadCwd: graphifyCwd,
+                worktreePath: graphifyWorktreePath,
+                workspaceCwd: graphifyCwd,
+                attachmentPaths: graphifyAttachmentPaths
+            ).environment
+        }.value
         let req = AgentRunRequest(
             runId: runId,
             threadId: tid,

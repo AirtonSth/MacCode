@@ -2913,7 +2913,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let m = t.model
         let cwd = try prepareAgentExecutionCwd(thread: &t)
         // Graphify: authoritative resolve after cwd is known. Fail-open; never blocks the run.
-        let graphifyEnv = applyGraphifyOnSend(
+        let graphifyEnv = await applyGraphifyOnSend(
             thread: t,
             cwd: cwd,
             attachments: resolvedAttachments,
@@ -3323,21 +3323,30 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         cwd: String,
         attachments: [AgentAttachment],
         baseEnvironment: [String: String]
-    ) -> [String: String] {
+    ) async -> [String: String] {
         guard let ctx = context else { return baseEnvironment }
         let settings = SettingsStore(db: ctx.db).load()
         guard settings.isGraphifyRuntimeActive else { return baseEnvironment }
         configureGraphifyService(from: settings)
 
         let workspaceCwd = ctx.state.workspaces.first { $0.value.id == thread.workspaceId }?.value.cwd ?? cwd
-        let applied = GraphifyWorkspaceService.shared.applyToAgentEnvironment(
-            base: baseEnvironment,
-            threadId: thread.id.value,
-            threadCwd: cwd,
-            worktreePath: thread.worktreePath,
-            workspaceCwd: workspaceCwd,
-            attachmentPaths: attachments.map(\.path)
-        )
+        // Root resolution blocks on `git rev-parse` subprocesses (two per
+        // candidate directory, whole-tree walk when the workspace root is not a
+        // repo). Must not run on the MainActor — same beachball the Agent App
+        // composer path had. Awaited, so the run environment is unchanged.
+        let graphifyThreadId = thread.id.value
+        let graphifyWorktreePath = thread.worktreePath
+        let graphifyAttachmentPaths = attachments.map(\.path)
+        let applied = await Task.detached(priority: .userInitiated) {
+            GraphifyWorkspaceService.shared.applyToAgentEnvironment(
+                base: baseEnvironment,
+                threadId: graphifyThreadId,
+                threadCwd: cwd,
+                worktreePath: graphifyWorktreePath,
+                workspaceCwd: workspaceCwd,
+                attachmentPaths: graphifyAttachmentPaths
+            )
+        }.value
         publishGraphifyWorkingSet(applied.workingSet, threadId: thread.id)
         return applied.environment
     }

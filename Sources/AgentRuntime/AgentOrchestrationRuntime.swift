@@ -474,9 +474,10 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
         let details: [String]
         switch storage {
         case .database(let repository):
-            details = try repository.listAuditLog(limit: max(1, limit) * 4)
-                .filter { $0.action == Self.ledgerAction }
-                .compactMap(\.detail)
+            details = try repository.listAuditLogDetails(
+                actions: [Self.ledgerAction],
+                limit: max(1, limit) * 4
+            )
         case .file(let url):
             lock.lock()
             defer { lock.unlock() }
@@ -522,12 +523,13 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
         let records: [AgentOrchestrationAdmissionReceipt]
         switch storage {
         case .database(let repository):
-            records = try repository.listAuditLog(limit: max(1, limit) * 4)
-                .filter { $0.action == Self.admissionAction || $0.action == Self.lifecycleAction }
-                .compactMap { entry in
-                    guard let detail = entry.detail, let data = detail.data(using: .utf8) else { return nil }
-                    return try? decoder.decode(AgentOrchestrationAdmissionReceipt.self, from: data)
-                }
+            records = try repository.listAuditLogDetails(
+                actions: [Self.admissionAction, Self.lifecycleAction],
+                limit: max(1, limit) * 4
+            ).compactMap { detail in
+                guard let data = detail.data(using: .utf8) else { return nil }
+                return try? decoder.decode(AgentOrchestrationAdmissionReceipt.self, from: data)
+            }
         case .file(let url):
             lock.lock()
             defer { lock.unlock() }

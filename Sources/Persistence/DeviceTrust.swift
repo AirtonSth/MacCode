@@ -604,6 +604,31 @@ public final class DeviceTrustRepository {
         return out
     }
 
+    /// Audit `detail` payloads for specific actions, newest first.
+    ///
+    /// Readers that only need `detail` (orchestration receipts / ledger) used to
+    /// call `listAuditLog` and discard every timestamp — yet each row still paid
+    /// an `NSISO8601DateFormatter` parse, and the action filter ran in Swift
+    /// after unrelated rows had already been loaded. Under a MainActor refresh
+    /// that made the cost scale with the entire audit log (measured ~1.3s of the
+    /// ~2.0s Subagents refresh). Filter in SQL and skip date decoding entirely.
+    public func listAuditLogDetails(actions: [String], limit: Int) throws -> [String] {
+        guard !actions.isEmpty else { return [] }
+        let placeholders = Array(repeating: "?", count: actions.count).joined(separator: ",")
+        let st = try db.prepare(
+            "SELECT detail FROM audit_log WHERE action IN (\(placeholders)) ORDER BY id DESC LIMIT ?;"
+        )
+        for (offset, action) in actions.enumerated() {
+            try st.bind(Int32(offset + 1), action)
+        }
+        try st.bind(Int32(actions.count + 1), limit)
+        var out: [String] = []
+        while try st.step() {
+            if let detail = st.columnText(0) { out.append(detail) }
+        }
+        return out
+    }
+
     /// Prune unbounded device-trust tables so they cannot grow without limit
     /// over long-lived server sessions.
     ///

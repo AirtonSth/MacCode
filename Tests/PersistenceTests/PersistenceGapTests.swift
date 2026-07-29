@@ -293,6 +293,52 @@ final class PersistenceGapTests: XCTestCase {
             "listAuditLog(limit:) must cap results at the given limit so callers never pull unbounded rows")
     }
 
+    /// WHY: the Subagents rail refreshes on every send and every 2s poll. It only
+    /// needs `detail`, but reading through `listAuditLog` parsed an ISO8601 `ts`
+    /// for every row in the table and filtered actions in Swift — ~1.3s of blocked
+    /// MainActor, growing with the whole audit log. This asserts the details query
+    /// selects ONLY the requested actions, so an unrelated action can never be
+    /// loaded and decoded just to be thrown away again.
+    func test_auditLogDetails_returnsOnlyRequestedActions_newestFirst() throws {
+        let repo = try freshTrustRepo()
+        try repo.audit(actor: nil, action: "agent.orchestration.admitted", detail: "admit-1")
+        try repo.audit(actor: nil, action: "pairing.request", detail: "unrelated")
+        try repo.audit(actor: nil, action: "agent.orchestration.ledger", detail: "ledger-1")
+        try repo.audit(actor: nil, action: "agent.orchestration.admitted", detail: "admit-2")
+
+        let details = try repo.listAuditLogDetails(
+            actions: ["agent.orchestration.admitted", "agent.orchestration.ledger"],
+            limit: 50
+        )
+        XCTAssertEqual(details, ["admit-2", "ledger-1", "admit-1"],
+            "details must be newest-first and exclude non-requested actions entirely — filtering in Swift after the read is what made the Subagents refresh scale with the whole audit log")
+    }
+
+    /// WHY: the limit is the only bound on how much the MainActor refresh decodes.
+    /// It must cap rows AFTER the action filter, so unrelated rows cannot consume
+    /// the budget and silently starve the caller of real receipts.
+    func test_auditLogDetails_limitCountsOnlyMatchingActions() throws {
+        let repo = try freshTrustRepo()
+        for index in 0..<5 {
+            try repo.audit(actor: nil, action: "noise.\(index)", detail: "noise-\(index)")
+            try repo.audit(actor: nil, action: "agent.orchestration.ledger", detail: "ledger-\(index)")
+        }
+
+        let details = try repo.listAuditLogDetails(actions: ["agent.orchestration.ledger"], limit: 3)
+        XCTAssertEqual(details, ["ledger-4", "ledger-3", "ledger-2"],
+            "limit must apply to matching rows only; counting interleaved unrelated rows would drop real receipts the rail needs")
+    }
+
+    /// WHY: an empty action list must not build `IN ()` (invalid SQL) nor degrade
+    /// into an unfiltered whole-table read.
+    func test_auditLogDetails_emptyActionsReturnsEmptyWithoutReadingTable() throws {
+        let repo = try freshTrustRepo()
+        try repo.audit(actor: nil, action: "agent.orchestration.ledger", detail: "ledger-1")
+
+        XCTAssertEqual(try repo.listAuditLogDetails(actions: [], limit: 50), [],
+            "no requested actions must mean no rows — never a fallback to an unfiltered scan")
+    }
+
     // MARK: - T037: NotificationRepository round-trip + dismissed-exclusion + limit
 
     /// WHY: dismissed rows are excluded by the WHERE clause; if the exclusion
