@@ -193,6 +193,11 @@ public final class WSConnectionTracker: @unchecked Sendable {
 /// Observability only — pure classification of existing counters. Does not
 /// change queue scheduling, wire protocol, authentication, or retries.
 /// Secret-free fixed string codes only (no hosts, tokens, payloads).
+///
+/// Queue/backpressure classes describe **where pressure was observed in the
+/// outbound path**. They do **not** prove TCP (or any L4 path) is the root
+/// cause — client drain rate, radio, CPU, and app produce rate share the same
+/// gauges. See `TransportLimiterEvidenceBucket` and fixed non-claims.
 public enum OutboundLatencyPressureClass: String, Sendable, Equatable {
     /// Frames refused/shed or slow-client drops: the queue hit its wall.
     case backpressureDominated = "backpressure_dominated"
@@ -202,17 +207,59 @@ public enum OutboundLatencyPressureClass: String, Sendable, Equatable {
     case noQueuePressure = "no_queue_pressure"
     /// Too few wait samples and no elevated depth/reject signals to decide.
     case insufficientSamples = "insufficient_samples"
+
+    /// Coarse three-way evidence bucket for the open "is TCP/WebSocket the
+    /// limiter?" question — never a path-layer root-cause verdict.
+    public var limiterEvidenceBucket: TransportLimiterEvidenceBucket {
+        switch self {
+        case .insufficientSamples:
+            return .insufficientEvidence
+        case .backpressureDominated, .queuePressureDominated:
+            return .queueOrBackpressure
+        case .noQueuePressure:
+            return .nonQueueOrUnknown
+        }
+    }
+}
+
+/// Coarse evidence bucket for whether the **outbound WebSocket queue** is
+/// implicated in observed latency — not a proof that TCP is the limiter.
+///
+/// Maps the finer `OutboundLatencyPressureClass` into the three operator
+/// questions: not enough data, queue/backpressure pressure present, or
+/// non-queue/unknown (latency not explained by outbound queue gauges).
+public enum TransportLimiterEvidenceBucket: String, Sendable, Equatable {
+    /// Too little wait/depth/reject evidence to decide.
+    case insufficientEvidence = "insufficient_evidence"
+    /// Rejects, slow-client drops, elevated queue depth, or elevated wait.
+    case queueOrBackpressure = "queue_or_backpressure"
+    /// Enough quiet samples: not outbound-queue-dominated (true limiter
+    /// elsewhere remains unknown — RTT, radio, client, app work, etc.).
+    case nonQueueOrUnknown = "non_queue_or_unknown"
 }
 
 /// Result of `OutboundLatencyPressureClassifier.classify`.
 /// Fixed `reason` codes only (documented constants on the classifier).
+/// Always carries fixed non-claim codes so pressure is never misread as a
+/// proven TCP root cause or path-layer isolation result.
 public struct OutboundLatencyPressureSnapshot: Sendable, Equatable {
     public let classification: OutboundLatencyPressureClass
     public let reason: String
+    /// Coarse three-way evidence bucket (derived from `classification`).
+    public let evidence: TransportLimiterEvidenceBucket
+    /// Stable fixed codes asserting what this snapshot does **not** claim.
+    public let nonClaims: [String]
 
-    public init(classification: OutboundLatencyPressureClass, reason: String) {
+    public init(
+        classification: OutboundLatencyPressureClass,
+        reason: String,
+        evidence: TransportLimiterEvidenceBucket? = nil,
+        nonClaims: [String] = OutboundLatencyPressureClassifier.fixedNonClaims
+    ) {
         self.classification = classification
         self.reason = reason
+        self.evidence = evidence ?? classification.limiterEvidenceBucket
+        self.nonClaims = nonClaims
     }
 }
 
@@ -248,6 +295,16 @@ public enum OutboundLatencyPressureClassifier {
     public static let reasonInsufficientWaitSamples = "insufficient_wait_samples"
     /// Public snapshot had negative or non-finite wait total/max on a lane.
     public static let reasonInvalidWaitSamples = "invalid_wait_samples"
+
+    /// Fixed non-claim codes always attached to every pressure snapshot.
+    /// Queue/backpressure evidence never upgrades into a TCP root-cause proof,
+    /// path-layer isolation, or QUIC/performance verdict.
+    public static let fixedNonClaims: [String] = [
+        "no_tcp_root_cause_claim",
+        "no_path_layer_isolation_claim",
+        "no_quic_performance_claim",
+        "observability_only",
+    ]
 
     /// Classify from existing process/live gauges. Inputs are clamped so
     /// negative race samples cannot invent pressure.
@@ -341,7 +398,8 @@ public enum OutboundLatencyPressureClassifier {
 /// request bodies.
 ///
 /// `outbound_latency_pressure` is additive operator diagnostics derived only
-/// from the same counters (class + fixed reason code). No secrets/hosts.
+/// from the same counters (class + reason + coarse evidence bucket + fixed
+/// non-claim codes). No secrets/hosts. Never claims TCP is the proven limiter.
 public func connectionMetricsJSON(
     activeClients: Int,
     totalQueuedBytes: Int,
@@ -385,7 +443,9 @@ public func connectionMetricsJSON(
         ],
         "outbound_latency_pressure": [
             "class": pressure.classification.rawValue,
-            "reason": pressure.reason
+            "reason": pressure.reason,
+            "evidence": pressure.evidence.rawValue,
+            "non_claims": pressure.nonClaims
         ]
     ]
 }
@@ -2141,7 +2201,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let registry = acceptedSockets
             let rpcLeftover = leftoverBuffer
             let rpcClientClose = clientRequestsClose
-            Task { [weak self] in
+            // Scheduler admission only: bulk snapshot/replay runs at utility
+            // priority so stop/input/control Tasks can preempt on the host.
+            // Does not change wire fields, response routing, or method behavior.
+            let rpcTaskPriority = RPCDispatchSchedulerClass.taskPriority(for: bodyData)
+            Task(priority: rpcTaskPriority) { [weak self] in
                 guard let self else {
                     registry.close(fd)
                     return
@@ -3285,6 +3349,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return false
     }
 
+    /// Swift Task priority for dispatching `bodyData` (pure; secret-free).
+    /// Convenience over `RPCDispatchSchedulerClass.taskPriority(for:)`.
+    nonisolated static func rpcDispatchTaskPriority(for bodyData: Data) -> TaskPriority {
+        RPCDispatchSchedulerClass.taskPriority(for: bodyData)
+    }
+
     static func connectionOwnerFingerprint(token: String?) -> String {
         let material = Data("rc2.connection-owner.v1:\(token ?? "trusted-local")".utf8)
         return SHA256.hash(data: material)
@@ -3550,7 +3620,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     if Self.looksLikeJSONRPCRequest(payload) {
                         let body = payload
                         let fingerprint = ownerFingerprint
-                        Task { [weak self] in
+                        // Scheduler admission only: classify request body so
+                        // large snapshot/replay dispatch does not contend at
+                        // the same Swift Task priority as stop/input/control.
+                        let rpcTaskPriority = RPCDispatchSchedulerClass.taskPriority(for: body)
+                        Task(priority: rpcTaskPriority) { [weak self] in
                             guard let self else { return }
                             let response = await self.dispatchRPC(
                                 bodyData: body,
@@ -4004,6 +4078,91 @@ public final class DirectStaticFileRegistry: @unchecked Sendable {
         case "txt": return "text/plain; charset=utf-8"
         default: return "application/octet-stream"
         }
+    }
+}
+
+// MARK: - RPC dispatch Task scheduler admission
+
+/// Host-side scheduler admission class for JSON-RPC `dispatchRPC` Tasks.
+///
+/// Pure, secret-free classification of the **encoded request body only**.
+/// Used solely to choose a Swift `TaskPriority` when launching HTTP `/v1/rpc`
+/// and WebSocket JSON-RPC handlers — does **not** change wire fields, response
+/// routing, outbound queue lanes, authentication, or method behavior.
+///
+/// Conservative default is interactive: any malformed body, mutation,
+/// stop/input/control, or mixed batch must not run at bulk/utility priority.
+public enum RPCDispatchSchedulerClass: String, Sendable, Equatable {
+    /// Read-only bulk snapshot / replay work. Maps to `TaskPriority.utility`.
+    case bulk
+    /// Stop/input/control, mutations, mixed batches, unknown methods, malformed.
+    /// Maps to `TaskPriority.userInitiated`.
+    case interactive
+
+    /// Exact read-only bulk methods eligible for lower scheduler priority.
+    /// Intentionally narrow: only known large snapshot/replay surfaces.
+    public static let bulkMethods: Set<String> = [
+        "sync.snapshot",
+        "sync.snapshot.begin",
+        "sync.snapshot.chunk",
+        "sync.snapshot.commit",
+        "events.recent",
+    ]
+
+    /// Pure classifier for an encoded JSON-RPC request body (single or batch).
+    ///
+    /// - Bulk: single call whose `method` is in `bulkMethods`, or a non-empty
+    ///   batch where **every** item is bulk (snapshot-only batches).
+    /// - Interactive: malformed JSON, empty batch, non-object items, missing
+    ///   method, any non-bulk method (mutations, stop/input/control, etc.),
+    ///   or a mixed batch containing any interactive item.
+    public static func classify(bodyData: Data) -> RPCDispatchSchedulerClass {
+        let root: Any
+        do {
+            root = try JSONSerialization.jsonObject(with: bodyData, options: [.fragmentsAllowed])
+        } catch {
+            return .interactive
+        }
+
+        if let batch = root as? [Any] {
+            // Empty batch is invalid request shape → treat conservatively.
+            guard !batch.isEmpty else { return .interactive }
+            for item in batch {
+                guard isBulkRequestObject(item) else { return .interactive }
+            }
+            return .bulk
+        }
+
+        if isBulkRequestObject(root) {
+            return .bulk
+        }
+        return .interactive
+    }
+
+    /// Swift Task priority for a classified body. Bulk → utility (lower);
+    /// interactive → userInitiated (higher). No semaphores or thread parking.
+    public static func taskPriority(for bodyData: Data) -> TaskPriority {
+        switch classify(bodyData: bodyData) {
+        case .bulk: return .utility
+        case .interactive: return .userInitiated
+        }
+    }
+
+    /// Task priority for an already-classified admission class.
+    public var taskPriority: TaskPriority {
+        switch self {
+        case .bulk: return .utility
+        case .interactive: return .userInitiated
+        }
+    }
+
+    /// True when `value` is a JSON-RPC request object whose `method` is bulk.
+    private static func isBulkRequestObject(_ value: Any) -> Bool {
+        guard let object = value as? [String: Any],
+              let method = object["method"] as? String else {
+            return false
+        }
+        return bulkMethods.contains(method)
     }
 }
 

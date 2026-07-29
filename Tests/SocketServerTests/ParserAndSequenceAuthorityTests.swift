@@ -813,6 +813,143 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
         ], "baselineRequired overtakes bulk/events not yet writing; event seq order stays FIFO")
     }
 
+    func test_controlAndRecoveryDrainAheadOfBulkPreservingSequencedFIFOAndSecretFreeMetrics() throws {
+        // WHY: Composite macOS outbound invariant for open P1 priority TODOs
+        // ("Aplicar prioridade…", "Impedir snapshot grande de bloquear stop/input"):
+        // queued control (stop/input-style RPC + pong) and recovery
+        // (baselineRequired) must drain ahead of sheddable snapshot/bulk
+        // application frames; sequenced normal events stay FIFO relative to
+        // each other (no reordering or duplication); wait metrics stay
+        // secret-free on existing priority/normal/bulk lanes only.
+        let recorded = LockedStringArray()
+        let clock = LockedMonotonicClock(start: 500)
+        let firstWriteEntered = DispatchSemaphore(value: 0)
+        let releaseFirstWrite = DispatchSemaphore(value: 0)
+        let owner = WebSocketOutboundQueue(
+            maxQueuedBytes: 64 * 1024,
+            applicationWriter: { data in
+                let label: String
+                if WebSocketOutboundQueue.isSnapshotRPCSuccessEnvelope(data) {
+                    label = "snapshot-rpc"
+                } else if let type = WebSocketOutboundQueue.frameType(in: data) {
+                    if type == "event", let seq = WebSocketOutboundQueue.eventSequence(in: data) {
+                        label = "event:\(seq)"
+                    } else {
+                        label = type
+                    }
+                } else {
+                    label = "opaque"
+                }
+                recorded.append(label)
+                if label == "event:1" {
+                    firstWriteEntered.signal()
+                    _ = releaseFirstWrite.wait(timeout: .now() + 2)
+                }
+                return true
+            },
+            controlWriter: { opcode, data in
+                if opcode == 0xA {
+                    recorded.append("pong")
+                } else if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          object["jsonrpc"] as? String == "2.0" {
+                    let idValue: Int
+                    if let n = object["id"] as? Int {
+                        idValue = n
+                    } else if let n = object["id"] as? NSNumber {
+                        idValue = n.intValue
+                    } else {
+                        idValue = -1
+                    }
+                    recorded.append("rpc-control:\(idValue)")
+                } else {
+                    recorded.append("control:\(opcode)")
+                }
+                return true
+            },
+            writeFailureClosingData: Data(),
+            onTerminal: { _ in XCTFail("must not terminate") },
+            didSendTerminal: {},
+            now: { clock.now }
+        )
+
+        let hold = try eventJSON(seq: 1, kind: "agent.run.completed", payload: ["t": "hold"])
+        XCTAssertEqual(owner.enqueueApplication(hold), .accepted)
+        XCTAssertEqual(firstWriteEntered.wait(timeout: .now() + 2), .success)
+
+        // Application bulk + sequenced normal share one FIFO (seq authority).
+        let snapshotRPC = try JSONSerialization.data(withJSONObject: [
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [
+                "type": "snapshot",
+                "sequence": 99,
+                "blob": String(repeating: "S", count: 128),
+                "token": "must-not-appear-in-metrics",
+            ],
+        ])
+        let bulkEvent = try eventJSON(seq: 2, kind: "surface.output",
+                                      payload: ["surface_id": "s", "base64": "QQ=="])
+        let completion = try eventJSON(seq: 3, kind: "agent.run.completed",
+                                       payload: ["thread_id": "t"])
+        let baseline = try JSONSerialization.data(withJSONObject: [
+            "type": "baselineRequired",
+            "reason": "outbound_queue_pressure",
+            "host": "secret.example",
+        ])
+        let stopRPC = try JSONSerialization.data(withJSONObject: [
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": ["ok": true, "stopped": true],
+        ])
+
+        clock.advance(by: 0.010)
+        XCTAssertEqual(owner.enqueueApplication(snapshotRPC), .accepted)
+        XCTAssertEqual(owner.enqueueApplication(bulkEvent), .accepted)
+        XCTAssertEqual(owner.enqueueApplication(completion), .accepted)
+        // Recovery arrives after bulk but must overtake on the priority lane.
+        XCTAssertEqual(owner.enqueueApplication(baseline), .accepted)
+        // Production stop/input path: interactive RPC replies + pong on control.
+        XCTAssertEqual(owner.enqueueControl(opcode: 0x1, data: stopRPC), .accepted)
+        XCTAssertEqual(owner.enqueueControl(opcode: 0xA, data: Data([0x01])), .accepted)
+
+        releaseFirstWrite.signal()
+        owner.finish()
+
+        let labels = recorded.snapshot
+        XCTAssertEqual(labels, [
+            "event:1",
+            "rpc-control:2",
+            "pong",
+            "baselineRequired",
+            "snapshot-rpc",
+            "event:2",
+            "event:3",
+        ], "control then recovery then shared app FIFO; no reordering/duplication")
+
+        // Wait metrics attributed only to existing application lanes; control excluded.
+        let wait = owner.queueWaitMetricsSnapshot
+        XCTAssertEqual(wait.priority.count, 1, "baselineRequired only")
+        XCTAssertEqual(wait.bulk.count, 2, "snapshot-rpc + surface.output bulk")
+        XCTAssertGreaterThanOrEqual(wait.normal.count, 2, "hold + completion")
+        let health = connectionMetricsJSON(
+            activeClients: 1,
+            totalQueuedBytes: owner.queuedByteCount,
+            slowClientDrops: 0,
+            outboundQueueWait: wait
+        )
+        guard let encoded = try? JSONSerialization.data(withJSONObject: health),
+              let text = String(data: encoded, encoding: .utf8) else {
+            return XCTFail("health connections JSON must encode")
+        }
+        for leak in ["must-not-appear-in-metrics", "secret.example", "baselineRequired",
+                     "snapshot", "stopped", "surface.output"] {
+            XCTAssertFalse(text.contains(leak),
+                           "queue wait health metrics must not leak \(leak)")
+        }
+        let waitJSON = health["outbound_queue_wait_ms"] as? [String: Any]
+        XCTAssertEqual(Set((waitJSON ?? [:]).keys), Set(["priority", "normal", "bulk"]))
+    }
+
     func test_bulkOccupancyCap_leavesRoomForCompletionAndControlReserve() throws {
         // WHY: Snapshot/replay bulk must not fill the entire outbound budget or
         // interactive completions and pongs starve. Capacity reservations are

@@ -68,6 +68,11 @@ final class WSConnectionMetricsTests: XCTestCase {
                        "rejects must surface as backpressure-dominated latency class")
         XCTAssertEqual(pressure?["reason"] as? String,
                        OutboundLatencyPressureClassifier.reasonFramesRejectedOrEvicted)
+        XCTAssertEqual(pressure?["evidence"] as? String,
+                       TransportLimiterEvidenceBucket.queueOrBackpressure.rawValue,
+                       "rejects map to queue/backpressure evidence, not a TCP root-cause claim")
+        XCTAssertEqual(pressure?["non_claims"] as? [String],
+                       OutboundLatencyPressureClassifier.fixedNonClaims)
     }
 
     func test_connectionMetricsJSON_zeroState_isValid() {
@@ -98,6 +103,11 @@ final class WSConnectionMetricsTests: XCTestCase {
         XCTAssertEqual(pressure?["class"] as? String,
                        OutboundLatencyPressureClass.insufficientSamples.rawValue,
                        "cold start must not claim no-pressure without samples")
+        XCTAssertEqual(pressure?["evidence"] as? String,
+                       TransportLimiterEvidenceBucket.insufficientEvidence.rawValue,
+                       "cold start is insufficient evidence, not a non-queue exoneration")
+        XCTAssertEqual(pressure?["non_claims"] as? [String],
+                       OutboundLatencyPressureClassifier.fixedNonClaims)
     }
 
     func test_connectionMetricsJSON_keysOnly_noExtraKeys() {
@@ -130,8 +140,11 @@ final class WSConnectionMetricsTests: XCTestCase {
                            "\(lane) wait object must stay count/total/max only")
         }
         let pressure = result["outbound_latency_pressure"] as? [String: Any]
-        XCTAssertEqual(Set((pressure ?? [:]).keys), Set(["class", "reason"]),
-                       "latency pressure object must stay class/reason only")
+        XCTAssertEqual(
+            Set((pressure ?? [:]).keys),
+            Set(["class", "reason", "evidence", "non_claims"]),
+            "latency pressure must stay class/reason/evidence/non_claims only"
+        )
     }
 
     func test_connectionMetricsJSON_clampsNegativeInputs() {
@@ -277,6 +290,11 @@ final class WSConnectionMetricsTests: XCTestCase {
         XCTAssertEqual(pressure?["class"] as? String,
                        OutboundLatencyPressureClass.noQueuePressure.rawValue,
                        "low waits with enough samples mean latency is not queue-dominated")
+        XCTAssertEqual(pressure?["evidence"] as? String,
+                       TransportLimiterEvidenceBucket.nonQueueOrUnknown.rawValue,
+                       "quiet waits map to non-queue/unknown — not a named alternate root cause")
+        XCTAssertEqual(pressure?["non_claims"] as? [String],
+                       OutboundLatencyPressureClassifier.fixedNonClaims)
     }
 
     // MARK: - OutboundLatencyPressureClassifier
@@ -300,6 +318,13 @@ final class WSConnectionMetricsTests: XCTestCase {
                        "elevated wait with enough samples must classify as queue pressure")
         XCTAssertEqual(snap.reason,
                        OutboundLatencyPressureClassifier.reasonElevatedQueueWait)
+        XCTAssertEqual(snap.evidence, .queueOrBackpressure,
+                       "elevated wait is queue/backpressure evidence only")
+        XCTAssertEqual(snap.nonClaims, OutboundLatencyPressureClassifier.fixedNonClaims)
+        XCTAssertFalse(
+            snap.nonClaims.contains(where: { $0.contains("tcp_proven") }),
+            "must never emit a TCP-proven claim code"
+        )
     }
 
     func test_classifier_queuePressure_fromElevatedQueuedBytes() {
@@ -315,6 +340,7 @@ final class WSConnectionMetricsTests: XCTestCase {
         XCTAssertEqual(live.classification, .queuePressureDominated)
         XCTAssertEqual(live.reason,
                        OutboundLatencyPressureClassifier.reasonElevatedQueuedBytes)
+        XCTAssertEqual(live.evidence, .queueOrBackpressure)
 
         let highWater = OutboundLatencyPressureClassifier.classify(
             totalQueuedBytes: 0,
@@ -327,6 +353,7 @@ final class WSConnectionMetricsTests: XCTestCase {
                        "process high-water queue depth must still diagnose queue pressure")
         XCTAssertEqual(highWater.reason,
                        OutboundLatencyPressureClassifier.reasonElevatedQueuedBytes)
+        XCTAssertEqual(highWater.evidence, .queueOrBackpressure)
     }
 
     func test_classifier_backpressure_fromRejectedOrEvictedFrames() {
@@ -348,6 +375,9 @@ final class WSConnectionMetricsTests: XCTestCase {
                        "reject/evict counters must classify as backpressure-dominated")
         XCTAssertEqual(snap.reason,
                        OutboundLatencyPressureClassifier.reasonFramesRejectedOrEvicted)
+        XCTAssertEqual(snap.evidence, .queueOrBackpressure,
+                       "backpressure is queue/backpressure evidence without TCP proof")
+        XCTAssertEqual(snap.nonClaims, OutboundLatencyPressureClassifier.fixedNonClaims)
     }
 
     func test_classifier_backpressure_fromSlowClientDrops() {
@@ -363,6 +393,7 @@ final class WSConnectionMetricsTests: XCTestCase {
         XCTAssertEqual(snap.classification, .backpressureDominated)
         XCTAssertEqual(snap.reason,
                        OutboundLatencyPressureClassifier.reasonSlowClientDrops)
+        XCTAssertEqual(snap.evidence, .queueOrBackpressure)
     }
 
     func test_classifier_backpressure_outranksQueuePressure() {
@@ -379,6 +410,7 @@ final class WSConnectionMetricsTests: XCTestCase {
         XCTAssertEqual(snap.reason,
                        OutboundLatencyPressureClassifier.reasonFramesRejectedOrEvicted,
                        "rejects outrank drops when both are present")
+        XCTAssertEqual(snap.evidence, .queueOrBackpressure)
     }
 
     func test_classifier_noQueuePressure_withEnoughQuietSamples() {
@@ -400,6 +432,9 @@ final class WSConnectionMetricsTests: XCTestCase {
                        "quiet waits + sub-threshold depth = no observed queue pressure")
         XCTAssertEqual(snap.reason,
                        OutboundLatencyPressureClassifier.reasonNoElevatedQueueSignals)
+        XCTAssertEqual(snap.evidence, .nonQueueOrUnknown,
+                       "non-queue bucket must not invent RTT/radio/client as the cause")
+        XCTAssertEqual(snap.nonClaims, OutboundLatencyPressureClassifier.fixedNonClaims)
     }
 
     func test_classifier_insufficientSamples_neutralColdStart() {
@@ -415,6 +450,8 @@ final class WSConnectionMetricsTests: XCTestCase {
         XCTAssertEqual(empty.classification, .insufficientSamples)
         XCTAssertEqual(empty.reason,
                        OutboundLatencyPressureClassifier.reasonInsufficientWaitSamples)
+        XCTAssertEqual(empty.evidence, .insufficientEvidence)
+        XCTAssertEqual(empty.nonClaims, OutboundLatencyPressureClassifier.fixedNonClaims)
 
         var oneSample = OutboundQueueWaitMetricsSnapshot.zero
         oneSample.normal.record(waitMilliseconds: 1)
@@ -427,6 +464,7 @@ final class WSConnectionMetricsTests: XCTestCase {
         )
         XCTAssertEqual(sparse.classification, .insufficientSamples,
                        "fewer than minimum wait samples stays insufficient")
+        XCTAssertEqual(sparse.evidence, .insufficientEvidence)
     }
 
     func test_classifier_insufficientSamples_negativeWaitTotalOrMax() {
@@ -540,6 +578,7 @@ final class WSConnectionMetricsTests: XCTestCase {
         )
         XCTAssertEqual(a, b)
         XCTAssertEqual(a.classification, .insufficientSamples)
+        XCTAssertEqual(a.evidence, .insufficientEvidence)
 
         let result = connectionMetricsJSON(
             activeClients: 0,
@@ -561,6 +600,54 @@ final class WSConnectionMetricsTests: XCTestCase {
         }
         XCTAssertTrue(text.contains("insufficient_samples"))
         XCTAssertTrue(text.contains("insufficient_wait_samples"))
+        XCTAssertTrue(text.contains("insufficient_evidence"))
+        XCTAssertTrue(text.contains("no_tcp_root_cause_claim"))
+        XCTAssertTrue(text.contains("no_path_layer_isolation_claim"))
+        XCTAssertTrue(text.contains("no_quic_performance_claim"))
+        XCTAssertTrue(text.contains("observability_only"))
+        XCTAssertFalse(text.contains("tcp_proven"), "must not claim TCP is proven")
+        XCTAssertFalse(text.contains("winner"), "must not declare a transport winner")
+    }
+
+    func test_limiterEvidenceBucket_mapsThreeWayWithoutTCPClaim() {
+        // WHY: the open "is TCP/WebSocket the limiter?" item needs three
+        // operator-facing buckets. Finer class labels stay, but evidence must
+        // never upgrade queue signals into a TCP root-cause proof.
+        XCTAssertEqual(
+            OutboundLatencyPressureClass.insufficientSamples.limiterEvidenceBucket,
+            .insufficientEvidence
+        )
+        XCTAssertEqual(
+            OutboundLatencyPressureClass.backpressureDominated.limiterEvidenceBucket,
+            .queueOrBackpressure
+        )
+        XCTAssertEqual(
+            OutboundLatencyPressureClass.queuePressureDominated.limiterEvidenceBucket,
+            .queueOrBackpressure
+        )
+        XCTAssertEqual(
+            OutboundLatencyPressureClass.noQueuePressure.limiterEvidenceBucket,
+            .nonQueueOrUnknown
+        )
+
+        let nonClaims = OutboundLatencyPressureClassifier.fixedNonClaims
+        XCTAssertEqual(
+            Set(nonClaims),
+            [
+                "no_tcp_root_cause_claim",
+                "no_path_layer_isolation_claim",
+                "no_quic_performance_claim",
+                "observability_only",
+            ]
+        )
+
+        // Snapshot default derivation must stay consistent with class.
+        let snap = OutboundLatencyPressureSnapshot(
+            classification: .queuePressureDominated,
+            reason: OutboundLatencyPressureClassifier.reasonElevatedQueueWait
+        )
+        XCTAssertEqual(snap.evidence, .queueOrBackpressure)
+        XCTAssertEqual(snap.nonClaims, nonClaims)
     }
 
     // MARK: - WSConnectionTracker

@@ -4059,7 +4059,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 text: slash.argument,
                 attached: attachedForSend,
                 recordHistory: false,
-                interactionMode: interactionMode
+                interactionMode: interactionMode,
+                recoveryDisplayText: originalPrompt
             ) == nil {
                 restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
             }
@@ -4076,7 +4077,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             text: text,
             attached: attachedForSend,
             recordHistory: false,
-            interactionMode: interactionMode
+            interactionMode: interactionMode,
+            recoveryDisplayText: originalPrompt
         ) == nil {
             restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
         }
@@ -4225,7 +4227,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         resumeInterrupted: Bool = false,
         requestedRunId: AgentRunID? = nil,
         routingConfiguration: AgentRoutingConfiguration? = nil,
-        queuedRoutingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil
+        queuedRoutingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil,
+        /// Exact pre-normalization composer text for post-start draft-cleanup recovery.
+        /// Provider still receives `text`; omit for non-send callers.
+        recoveryDisplayText: String? = nil
     ) async -> AgentRunID? {
         let baseRouting = queuedRoutingSnapshot?.configuration
             ?? routingConfiguration
@@ -4423,6 +4428,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 attachments = []
                 prompt = ""
             } catch {
+                // Provider already started — do not drop the visible recovery draft.
+                // send() clears the composer optimistically before start; only blank it
+                // after durable delete succeeds. Attachments were not cleared yet.
+                // Prefer the pre-normalization visible input (`$goal`/whitespace) so
+                // recovery matches what the user typed, not the provider-run command.
+                if prompt.isEmpty {
+                    prompt = recoveryDisplayText ?? text
+                }
                 statusMessage = "Provider started, but draft cleanup failed: \(error)"
             }
             let runStatus = (try? coordinator.runStatus(runId)) ?? .running

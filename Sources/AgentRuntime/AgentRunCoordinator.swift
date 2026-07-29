@@ -494,6 +494,32 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         try beginExclusiveThreadMutation(request.threadId, operation: "provider run start")
         defer { endExclusiveThreadMutation(request.threadId) }
+        // A Stop/terminal callback may have already claimed the old run's
+        // terminal slot while SQLite was busy. Its stream tail can commit
+        // before the terminal graph retry gets a scheduling turn, leaving the
+        // one-shot adapter's summary temporarily `.running`. Drive that
+        // retained terminal through the same durability path before checking
+        // the provider session; otherwise a valid next turn is rejected even
+        // though the prior run's stream is durable. If the barrier is still
+        // unavailable, fail closed and let the caller retry rather than ever
+        // allowing two in-flight turns on one thread.
+        reconcilePendingTerminalBeforeStart(threadId: request.threadId)
+        let terminalStillPending = !pendingTerminalRunIds(for: request.threadId).isEmpty
+        if terminalStillPending {
+            throw NSError(
+                domain: "RemoteCode.AgentRunCoordinator",
+                code: 503,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "A prior provider terminal is still waiting for durable persistence."
+                ]
+            )
+        }
+        // A Stop that committed durably may leave a one-shot adapter summary still
+        // marked running (coordinator-synthesized `.finished` never re-enters the
+        // adapter callback). Reconcile only when durable terminal state proves the
+        // prior turn is over — never while this thread still owns an active run or
+        // a pending terminal durability barrier.
+        reconcileGhostLiveProviderSessionIfDurableTerminal(threadId: request.threadId)
         guard !hasProviderSession(threadId: request.threadId) else {
             throw AgentProviderAdapterError.unsupported("Provider session already has an in-flight turn")
         }
@@ -734,6 +760,42 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         if shouldCancel { handle.cancel() }
         return runId
+    }
+
+    /// Re-drive a terminal retained by a previous Stop/provider callback before
+    /// admitting another turn on the same thread. This is intentionally
+    /// synchronous: the start gate must observe the durability result, not race
+    /// the detached retry task that normally services the same barrier.
+    private func reconcilePendingTerminalBeforeStart(threadId: AgentThreadID) {
+        for runId in pendingTerminalRunIds(for: threadId) {
+            guard let pending = pendingTerminalEvent(runId: runId) else { continue }
+            handle(
+                event: .finished(
+                    pending.status,
+                    finalMessage: pending.finalMessage,
+                    providerThreadId: pending.providerThreadId
+                ),
+                runId: runId,
+                threadId: threadId,
+                allowFinalResponseTranslation: false,
+                providerTerminalAcknowledged: pending.providerTerminalAcknowledged
+            )
+        }
+    }
+
+    private func pendingTerminalRunIds(for threadId: AgentThreadID) -> [AgentRunID] {
+        lock.lock()
+        let runIds = Array(pendingTerminalEvents.keys)
+        lock.unlock()
+        return runIds.filter { runId in
+            (try? runRepo.get(id: runId)?.threadId == threadId) ?? false
+        }
+    }
+
+    private func pendingTerminalEvent(runId: AgentRunID) -> PendingTerminalEvent? {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingTerminalEvents[runId]
     }
 
     private func scheduleOrchestrationDeadline(_ deadlineAt: Date?, runId: AgentRunID) {
@@ -1168,6 +1230,57 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return summary.status == .running || summary.status == .pending
     }
 
+    /// After a durable terminal commit (or a proven-safe start gate), repair
+    /// adapter summaries that still claim an in-flight turn. One-shot adapters
+    /// only learn terminal status via their event callback; coordinator-
+    /// synthesized Stop cancellation never re-enters that path.
+    private func reconcileProviderSessionAfterDurableTerminal(
+        threadId: AgentThreadID,
+        status: AgentRunStatus,
+        providerThreadId: String?
+    ) {
+        guard Self.isTerminalThreadStatus(status) else { return }
+        guard let adapter = try? adapterForThread(threadId) else { return }
+        guard providerSessionIsLive(adapter, threadId: threadId) else { return }
+        if let oneShot = adapter as? OneShotProviderAdapter {
+            oneShot.noteCoordinatorTerminal(
+                threadId: threadId,
+                status: status,
+                providerThreadId: providerThreadId
+            )
+            return
+        }
+        // Multi-turn adapters clear in-flight on their own interrupt/finish
+        // path. If they still report live after durable terminal, leave them:
+        // stopSession would destroy resume state without identity proof here.
+    }
+
+    /// Start-gate variant: only reconcile a ghost live adapter turn when
+    /// durable rows and in-memory ownership both prove the prior turn is over.
+    private func reconcileGhostLiveProviderSessionIfDurableTerminal(threadId: AgentThreadID) {
+        guard hasProviderSession(threadId: threadId) else { return }
+        lock.lock()
+        let hasActiveRun = activeThreads[threadId] != nil
+        let streamOwner = pendingStreamRunIds[threadId]
+        let terminalBarrierPending = streamOwner.map {
+            pendingTerminalEvents[$0] != nil
+                || deferredProviderTerminalEvents[$0] != nil
+                || finishingRuns.contains($0)
+        } ?? false
+        lock.unlock()
+        guard !hasActiveRun, !terminalBarrierPending else { return }
+        guard let thread = try? threadRepo.get(id: threadId),
+              Self.isTerminalThreadStatus(thread.status) else { return }
+        if (try? runRepo.latestActive(for: threadId)) != nil {
+            return
+        }
+        reconcileProviderSessionAfterDurableTerminal(
+            threadId: threadId,
+            status: thread.status,
+            providerThreadId: thread.providerThreadId
+        )
+    }
+
     /// F19: release a thread's resident provider adapter session WITHOUT emitting
     /// any run-lifecycle events. For the idle-session reaper: the reaped thread
     /// finished long ago, so routing the release through stopRun/markStopRequested
@@ -1383,6 +1496,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let status = preferredStatus
             ?? (try? runRepo.get(id: runId))?.status
             ?? .cancelled
+        reconcileProviderSessionAfterDurableTerminal(
+            threadId: threadId,
+            status: status,
+            providerThreadId: providerThreadId
+        )
         agentRunLog.info(
             "run.stale_ownership_released thread=\(threadId.value.uuidString, privacy: .public) run=\(runId.value.uuidString, privacy: .public) status=\(status.rawValue, privacy: .public)"
         )
@@ -2952,6 +3070,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lastPersistedAssistantContent.removeValue(forKey: threadId)
             let activeProjection = activeRunProjectionLocked()
             lock.unlock()
+            // Durable terminal is committed and in-memory ownership released.
+            // Align any adapter still reporting a live turn (Stop path).
+            reconcileProviderSessionAfterDurableTerminal(
+                threadId: threadId,
+                status: status,
+                providerThreadId: providerThreadId
+            )
             // UX-MAC_AGENT-BG-AWAIT / incomplete-turn: schedule only AFTER the
             // finishing run is removed from activeThreads. Zero-delay workflow
             // continuations would otherwise fail the idle validity check and

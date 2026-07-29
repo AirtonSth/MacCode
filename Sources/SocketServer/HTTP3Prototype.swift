@@ -76,6 +76,68 @@ public enum HTTP3PrototypeFailure: Error, Sendable, Equatable {
     case unsupported
 }
 
+/// Stable reason codes explaining why the seam keeps the production HTTP/WebSocket path.
+///
+/// Inspectable by tests and diagnostics. These are **not** wire schema values and
+/// do not change listeners or transport selection in `DirectHTTPServer`.
+public enum HTTP3PrototypeFallbackReason: String, Sendable, Equatable, CaseIterable {
+    /// Opt-in is false — default-off deployment posture.
+    case defaultOff = "default_off"
+    /// Host/port failed local validation.
+    case invalidEndpoint = "invalid_endpoint"
+    /// QUIC is TLS-bound; cleartext configuration was refused.
+    case tlsRequired = "tls_required"
+    /// Network.framework QUIC options unavailable on this OS (compatibility gate).
+    case unsupportedOS = "unsupported_os"
+
+    /// Human-readable explanation for logs and assertion messages.
+    public var reasonDescription: String {
+        switch self {
+        case .defaultOff:
+            return "HTTP/3 prototype is disabled by default; keep HTTP+WebSocket"
+        case .invalidEndpoint:
+            return "invalid host/port; keep HTTP+WebSocket fallback"
+        case .tlsRequired:
+            return "QUIC requires TLS; keep HTTP+WebSocket fallback"
+        case .unsupportedOS:
+            return "QUIC options unavailable on this OS; keep HTTP+WebSocket fallback"
+        }
+    }
+}
+
+/// Deployment disposition for the default-off HTTP/3 prototype seam.
+///
+/// Pure selection result: maps configuration assessment to the path callers
+/// should honor. Never opens sockets, never wires QUIC into production listeners,
+/// never selects QUIC in `DirectHTTPServer`, and never handles bearer tokens.
+public enum HTTP3PrototypeDisposition: Sendable, Equatable {
+    /// Retain production HTTP (reliable) + WebSocket (realtime) as the functional path.
+    case httpWebSocketFallback(reason: HTTP3PrototypeFallbackReason)
+    /// Configuration is prototype-ready for offline evaluation only.
+    /// Does **not** authorize production transport selection or live connections.
+    case prototypeReady(host: String, port: UInt16)
+
+    /// `true` when the production HTTP+WebSocket path remains the selected fallback.
+    public var usesHTTPWebSocketFallback: Bool {
+        switch self {
+        case .httpWebSocketFallback:
+            return true
+        case .prototypeReady:
+            return false
+        }
+    }
+
+    /// Stable inspectable reason string for diagnostics and tests.
+    public var reasonCode: String {
+        switch self {
+        case .httpWebSocketFallback(let reason):
+            return reason.rawValue
+        case .prototypeReady:
+            return "prototype_ready"
+        }
+    }
+}
+
 /// Public SocketServer entry point for the Phase 5 QUIC/HTTP-3 prototype seam.
 public enum HTTP3Prototype {
     /// ALPN token used when constructing prototype options (`h3` per RFC 9114).
@@ -107,6 +169,36 @@ public enum HTTP3Prototype {
         }
         let host = configuration.host.trimmingCharacters(in: .whitespacesAndNewlines)
         return .configured(host: host, port: configuration.port)
+    }
+
+    /// Map a configuration assessment to the deployment disposition.
+    ///
+    /// Pure and side-effect free: no sockets, no `NWProtocolQUIC.Options` construction,
+    /// no listener changes. Disabled / invalid / TLS-refused / unsupported-OS all
+    /// select the reliable HTTP+WebSocket fallback. `.configured` maps only to
+    /// `.prototypeReady` (evaluation seam — not production transport selection).
+    public static func disposition(
+        from assessment: HTTP3PrototypeAssessment
+    ) -> HTTP3PrototypeDisposition {
+        switch assessment {
+        case .disabled:
+            return .httpWebSocketFallback(reason: .defaultOff)
+        case .invalidEndpoint:
+            return .httpWebSocketFallback(reason: .invalidEndpoint)
+        case .tlsRequired:
+            return .httpWebSocketFallback(reason: .tlsRequired)
+        case .unsupported:
+            return .httpWebSocketFallback(reason: .unsupportedOS)
+        case .configured(let host, let port):
+            return .prototypeReady(host: host, port: port)
+        }
+    }
+
+    /// Assess configuration then map to deployment disposition (pure).
+    public static func disposition(
+        for configuration: HTTP3PrototypeConfiguration
+    ) -> HTTP3PrototypeDisposition {
+        disposition(from: assess(configuration))
     }
 
     /// Create and lightly configure `NWProtocolQUIC.Options` when assessment is

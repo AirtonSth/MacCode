@@ -6610,6 +6610,60 @@ final class AgentAppViewModelTests: XCTestCase {
                       "the surface must not present silent send success when draft durability failed")
     }
 
+    // WHY: send() normalizes `$goal` → `/goal` before startProviderRun. When
+    // durable draft deletion fails after provider start, recovery must restore
+    // the exact pre-normalization visible input — not the provider command.
+    func test_sendKeepsExactPreNormalizationDraftWhenDurableDraftDeletionFailsAfterStart() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-draft-delete-norm-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let draftRepo = AgentThreadDraftRepository(db: db)
+        let runner = CapturingProviderRunner(provider: .codex)
+        let workspaceID = WorkspaceID()
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: runner]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            draftRepo: draftRepo
+        )
+        vm.providerSnapshots = [AgentProviderSnapshotFactory.snapshot(
+            provider: .codex,
+            models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+            binaryPath: "/usr/local/bin/codex",
+            slashCommands: ["/goal"]
+        )]
+        vm.createThread(title: "draft norm failure")
+        let visibleInput = "  $goal ship the recovery fix  "
+        vm.prompt = visibleInput
+        vm.promptWasEdited()
+        try db.execute("DROP TABLE agent_thread_drafts;")
+
+        await vm.send()
+
+        XCTAssertEqual(vm.prompt, visibleInput,
+                       "draft-cleanup failure after start must restore the exact visible input, not the normalized /goal command")
+        XCTAssertNotEqual(vm.prompt, "/goal ship the recovery fix",
+                          "must not restore the provider-normalized form as the recovery draft")
+        XCTAssertTrue(vm.statusMessage.contains("draft cleanup failed"),
+                      "the surface must report draft durability failure")
+        await waitAsync("provider received exactly one normalized start") {
+            runner.prompts == ["/goal ship the recovery fix"]
+        }
+        XCTAssertEqual(runner.prompts, ["/goal ship the recovery fix"],
+                       "provider must receive the normalized command once; recovery must not re-send")
+        XCTAssertFalse(runner.prompts.contains(where: { $0.contains("$goal") }),
+                       "literal $goal must not reach the provider")
+    }
+
     func test_rejectLatestPlanStartsAPlanRevisionWithoutMarkingImplementation() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-plan-reject-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
