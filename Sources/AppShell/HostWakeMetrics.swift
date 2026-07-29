@@ -8,6 +8,9 @@ public enum HostWakeMetricKey: String, Sendable, CaseIterable {
     case silent429 = "silent_429"
     case silentSent = "silent_sent"
     case silentFailed = "silent_failed"
+    /// Attempt never left the host: unsubscribed account and/or no push target.
+    /// Distinguishes "host pushed nothing" from a successful silent send.
+    case wakeNotSent = "wake_not_sent"
 }
 
 public final class HostWakeMetrics: @unchecked Sendable {

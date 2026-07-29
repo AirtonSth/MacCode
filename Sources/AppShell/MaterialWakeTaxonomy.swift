@@ -17,37 +17,63 @@ public enum MaterialWakeClass: String, Sendable, Equatable, CaseIterable {
     case streamOnly = "stream_only"
 }
 
+/// Coalesce bucket identity for silent catch-up. Separate classes so a
+/// run-progress wake cannot swallow an attention wake in the same 30s window.
+public enum MaterialWakeCoalesceClass: String, Sendable, Equatable, CaseIterable {
+    /// Approval / question / error — highest non-force priority.
+    case attention = "attention"
+    /// Run started/completed lifecycle (progress, not blocking UI).
+    case runProgress = "run_progress"
+    /// In-app notification created.
+    case notification = "notification"
+    /// Host boot/identity rebaseline (force path).
+    case boot = "boot"
+    /// Phase B git material kinds.
+    case git = "git"
+    /// Fallback bucket for unclassified silent reasons.
+    case other = "other"
+}
+
 /// Frozen kind → wake class map (plan A-003 default). Expansions only via phase flags.
 public enum MaterialWakeTaxonomy: Sendable {
-    /// Phase A kinds that may emit silent catch-up when flag `wake_phase_a` is on.
-    public static let phaseAKinds: Set<String> = [
+    /// Core Phase A lifecycle kinds that already have producers under `wake_phase_a`.
+    public static let phaseACoreKinds: Set<String> = [
         "agent.run.started",
         "agent.run.completed",
         "agent.run.failed",
-        "agent.run.cancelled",
-        "agent.attention",
-        "agent.approval",
-        "agent.question",
         "host.boot_epoch",
-        "host.identity",
         "device.revoke",
-        "session.unauthorized",
     ]
+
+    /// Kinds the host actually publishes for user-facing attention states.
+    /// Gated by `wake_published_kinds` (default on; kill switch = false).
+    /// Replaces the former phantom allowlist (agent.approval / agent.question /
+    /// agent.attention / agent.run.cancelled / host.identity / session.unauthorized)
+    /// which had zero publishers and therefore never woke a phone.
+    public static let publishedAttentionKinds: Set<String> = [
+        "agent.request.opened",
+        "agent.user_input.requested",
+        "agent.run.error",
+        "notification.created",
+    ]
+
+    /// Union used by tests / inventory: core + published attention kinds.
+    public static let phaseAKinds: Set<String> = phaseACoreKinds.union(publishedAttentionKinds)
 
     public static func classification(forEventKind kind: String) -> MaterialWakeClass {
         switch kind {
         case "agent.run.started",
              "agent.run.completed",
              "agent.run.failed",
-             "agent.attention",
-             "agent.approval",
-             "agent.question":
+             "agent.request.opened",
+             "agent.user_input.requested",
+             "agent.run.error":
             return .criticalAlertAndSilent
-        case "agent.run.cancelled":
+        case "notification.created":
             return .silent
-        case "host.boot_epoch", "host.identity":
+        case "host.boot_epoch":
             return .silentForce
-        case "device.revoke", "session.unauthorized":
+        case "device.revoke":
             return .criticalAlert
         case "git.commit", "git.push", "git.conflict", "git.checkout", "git.branch_created":
             return .silentOrAlert // Phase B
@@ -61,6 +87,7 @@ public enum MaterialWakeTaxonomy: Sendable {
             return .streamOnly
         default:
             // Unknown kinds default to stream_only — never auto-push (fail closed on flood).
+            // Includes retired phantom names (agent.approval, agent.question, …).
             return .streamOnly
         }
     }
@@ -77,5 +104,33 @@ public enum MaterialWakeTaxonomy: Sendable {
 
     public static func shouldForceSilent(_ class: MaterialWakeClass) -> Bool {
         `class` == .silentForce
+    }
+
+    /// Map event kind → coalesce class so attention is never bucket-shared with run progress.
+    public static func coalesceClass(forEventKind kind: String) -> MaterialWakeCoalesceClass {
+        switch kind {
+        case "agent.request.opened",
+             "agent.user_input.requested",
+             "agent.run.error",
+             "agent.run.failed":
+            return .attention
+        case "agent.run.started", "agent.run.completed":
+            return .runProgress
+        case "notification.created":
+            return .notification
+        case "host.boot_epoch":
+            return .boot
+        case "git.commit", "git.push", "git.conflict", "git.checkout", "git.branch_created":
+            return .git
+        default:
+            return .other
+        }
+    }
+
+    /// Opaque `rc2_reason` token for silent_catchup.v1 (sanitized downstream).
+    public static func silentReason(forEventKind kind: String) -> String {
+        // Keep reason = kind so iOS / metrics can attribute wakes; contract
+        // sanitizer maps dots to underscores and caps length.
+        kind
     }
 }

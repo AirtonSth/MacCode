@@ -471,6 +471,17 @@ public final class AppContext {
             bootEpochProvider: { String(liveActivityIdentity.bootEpoch) },
             watermarkProvider: { String(EventBus.shared.currentSeq) }
         )
+        // WHY: Mac relaunch invalidates every cached iOS surface/session view.
+        // `host.boot_epoch` is the only `.silentForce` producer; without this
+        // publish the force class has zero runtime coverage and suspended
+        // phones never rebaseline on host restart.
+        EventBus.shared.publish(
+            kind: "host.boot_epoch",
+            payload: .object([
+                "boot_epoch": .number(Double(liveActivityIdentity.bootEpoch)),
+                "server_id": .string(liveActivityIdentity.serverId),
+            ])
+        )
         let settingsRepo = self.settingsRepo
         let liveActivityAcceptanceOutbox = LiveActivityAcceptanceOutbox(
             store: LiveActivityAcceptanceOutboxStore(settings: settingsRepo),

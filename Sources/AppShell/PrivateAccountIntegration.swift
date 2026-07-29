@@ -968,8 +968,18 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
     }
 
     public func deliver(_ content: RemoteCodeNotificationContent) async {
-        guard let session = accountStore.load(), session.user.subscribed,
-              let target = pushTargetStore.load() else { return }
+        guard let session = accountStore.load() else {
+            recordWakeNotSent(reason: "no_session")
+            return
+        }
+        guard session.user.subscribed else {
+            recordWakeNotSent(reason: "unsubscribed")
+            return
+        }
+        guard let target = pushTargetStore.load() else {
+            recordWakeNotSent(reason: "no_push_target")
+            return
+        }
         var alertDelivered = false
         do {
             let result = try await sessionRefresher.perform(session: session) { accessToken in
@@ -994,7 +1004,8 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             // Alert failed: still attempt a silent wake so iOS can catch up.
             await deliverSilentCatchUp(
                 hostHint: content.userInfo["workspaceId"] ?? content.identifier,
-                force: true
+                force: true,
+                coalesceClass: .other
             )
             return
         }
@@ -1003,38 +1014,107 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         // bucket cannot swallow the only remaining catch-up path.
         await deliverSilentCatchUp(
             hostHint: content.userInfo["workspaceId"] ?? content.identifier,
-            force: !alertDelivered
+            force: !alertDelivered,
+            coalesceClass: .other
         )
     }
 
-    private static let silentCatchUpDefaultsKey = "private.silentCatchUp.lastBucket"
+    /// Legacy single-bucket key (pre per-class coalesce). Kept for cleanup only.
+    private static let silentCatchUpLegacyBucketKey = "private.silentCatchUp.lastBucket"
+    /// Per-reason-class last 30s bucket map: [coalesceClass.rawValue: bucketInt].
+    private static let silentCatchUpBucketsKey = "private.silentCatchUp.lastBuckets"
     private static let silentCatchUpLock = NSLock()
+    private static let silentCatchUpBucketSeconds: TimeInterval = 30
+
+    /// Pure coalesce decision: per-class 30s buckets so attention is never
+    /// swallowed by a prior run-progress wake in the same wall-clock window.
+    /// Force always admits. Returns updated bucket map when send is allowed.
+    public static func shouldAdmitSilentCatchUp(
+        force: Bool,
+        coalesceClass: MaterialWakeCoalesceClass,
+        now: Date = Date(),
+        lastBuckets: [String: Int]
+    ) -> (shouldSend: Bool, updatedBuckets: [String: Int]) {
+        let bucket = Int(now.timeIntervalSince1970 / silentCatchUpBucketSeconds)
+        var updated = lastBuckets
+        let classKey = coalesceClass.rawValue
+        if !force, updated[classKey] == bucket {
+            return (false, lastBuckets)
+        }
+        updated[classKey] = bucket
+        return (true, updated)
+    }
+
+    /// UserDefaults returns NSNumber for ints; a raw `[String: Int]` cast fails.
+    static func loadBucketMap(from defaults: UserDefaults) -> [String: Int] {
+        guard let raw = defaults.dictionary(forKey: silentCatchUpBucketsKey) else { return [:] }
+        var out: [String: Int] = [:]
+        out.reserveCapacity(raw.count)
+        for (key, value) in raw {
+            if let i = value as? Int {
+                out[key] = i
+            } else if let n = value as? NSNumber {
+                out[key] = n.intValue
+            }
+        }
+        return out
+    }
+
+    private func recordWakeNotSent(reason: String) {
+        HostWakeMetrics.shared.increment(.wakeNotSent)
+        Self.log.info("wake_not_sent reason=\(reason, privacy: .public)")
+    }
 
     /// Silent APNs background wake: iOS `didReceiveRemoteNotification` runs
-    /// `BackgroundSyncCoordinator` catch-up. Coalesced per 30s bucket to stay
-    /// under private push rate limits when many runs finish in a burst.
+    /// `BackgroundSyncCoordinator` catch-up. Coalesced per reason-class 30s
+    /// bucket so an attention wake cannot be suppressed by run-progress traffic.
     /// Payload is `silent_catchup.v1` only (no agent text/titles in data).
     public func deliverSilentCatchUp(
         hostHint: String = "host",
         force: Bool = false,
-        payload: SilentCatchUpV1 = SilentCatchUpV1(reason: "catch_up")
+        payload: SilentCatchUpV1 = SilentCatchUpV1(reason: "catch_up"),
+        coalesceClass: MaterialWakeCoalesceClass = .other
     ) async {
-        guard let session = accountStore.load(), session.user.subscribed,
-              let target = pushTargetStore.load() else { return }
-        let bucket = Int(Date().timeIntervalSince1970 / 30)
+        guard let session = accountStore.load() else {
+            recordWakeNotSent(reason: "no_session")
+            return
+        }
+        guard session.user.subscribed else {
+            recordWakeNotSent(reason: "unsubscribed")
+            return
+        }
+        guard let target = pushTargetStore.load() else {
+            recordWakeNotSent(reason: "no_push_target")
+            return
+        }
+        let now = Date()
+        let bucket = Int(now.timeIntervalSince1970 / Self.silentCatchUpBucketSeconds)
         // Serialize check/set: concurrent run outcomes must not both send.
-        Self.silentCatchUpLock.lock()
         let shouldSend: Bool = {
+            Self.silentCatchUpLock.lock()
+            defer { Self.silentCatchUpLock.unlock() }
             let defaults = UserDefaults.standard
-            if !force, defaults.integer(forKey: Self.silentCatchUpDefaultsKey) == bucket {
-                return false
+            // Drop legacy global key so old installs do not share one bucket forever.
+            if defaults.object(forKey: Self.silentCatchUpLegacyBucketKey) != nil {
+                defaults.removeObject(forKey: Self.silentCatchUpLegacyBucketKey)
             }
-            defaults.set(bucket, forKey: Self.silentCatchUpDefaultsKey)
-            return true
+            let stored = Self.loadBucketMap(from: defaults)
+            let decision = Self.shouldAdmitSilentCatchUp(
+                force: force,
+                coalesceClass: coalesceClass,
+                now: now,
+                lastBuckets: stored
+            )
+            if decision.shouldSend {
+                defaults.set(decision.updatedBuckets, forKey: Self.silentCatchUpBucketsKey)
+            }
+            return decision.shouldSend
         }()
-        Self.silentCatchUpLock.unlock()
         if !shouldSend {
             HostWakeMetrics.shared.increment(.outboxCoalesced)
+            Self.log.info(
+                "silent_catchup coalesced class=\(coalesceClass.rawValue, privacy: .public) hostHint=\(hostHint, privacy: .public)"
+            )
             return
         }
         var contract = payload
@@ -1050,7 +1130,7 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                     data: data,
                     pushToken: target.pushToken,
                     pushTokenType: target.pushTokenType,
-                    idempotencyKey: "catchup.\(hostHint).\(bucket)",
+                    idempotencyKey: "catchup.\(coalesceClass.rawValue).\(hostHint).\(bucket)",
                     silent: true
                 )
             }
