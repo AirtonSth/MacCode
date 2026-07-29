@@ -3,16 +3,56 @@ import XCTest
 
 final class MaterialWakeTaxonomyTests: XCTestCase {
     func testPhaseACriticalLifecycleClassifications() {
+        // WHY: run lifecycle kinds already have producers; they must keep waking
+        // a suspended phone for started/completed/failed transitions.
         XCTAssertEqual(MaterialWakeTaxonomy.classification(forEventKind: "agent.run.started"), .criticalAlertAndSilent)
         XCTAssertEqual(MaterialWakeTaxonomy.classification(forEventKind: "agent.run.completed"), .criticalAlertAndSilent)
         XCTAssertEqual(MaterialWakeTaxonomy.classification(forEventKind: "agent.run.failed"), .criticalAlertAndSilent)
-        XCTAssertEqual(MaterialWakeTaxonomy.classification(forEventKind: "agent.run.cancelled"), .silent)
-        XCTAssertEqual(MaterialWakeTaxonomy.classification(forEventKind: "agent.attention"), .criticalAlertAndSilent)
         XCTAssertEqual(MaterialWakeTaxonomy.classification(forEventKind: "host.boot_epoch"), .silentForce)
         XCTAssertEqual(MaterialWakeTaxonomy.classification(forEventKind: "device.revoke"), .criticalAlert)
     }
 
+    func testPublishedAttentionKindsReplacePhantoms() {
+        // WHY: AppContext publishes these kinds for approval / question / error /
+        // notification UX. The old phantom names (agent.approval, …) had zero
+        // publishers, so phones never woke on those user-facing states.
+        XCTAssertEqual(
+            MaterialWakeTaxonomy.classification(forEventKind: "agent.request.opened"),
+            .criticalAlertAndSilent
+        )
+        XCTAssertEqual(
+            MaterialWakeTaxonomy.classification(forEventKind: "agent.user_input.requested"),
+            .criticalAlertAndSilent
+        )
+        XCTAssertEqual(
+            MaterialWakeTaxonomy.classification(forEventKind: "agent.run.error"),
+            .criticalAlertAndSilent
+        )
+        XCTAssertEqual(
+            MaterialWakeTaxonomy.classification(forEventKind: "notification.created"),
+            .silent
+        )
+
+        // Retired phantom allowlist entries must fail closed (streamOnly).
+        for phantom in [
+            "agent.approval",
+            "agent.question",
+            "agent.attention",
+            "agent.run.cancelled",
+            "host.identity",
+            "session.unauthorized",
+        ] {
+            XCTAssertEqual(
+                MaterialWakeTaxonomy.classification(forEventKind: phantom),
+                .streamOnly,
+                "\(phantom) has no host publisher and must not wake"
+            )
+        }
+    }
+
     func testStreamOnlyNeverPush() {
+        // WHY: surface.output / agent.item.delta fire per chunk; prefix matching
+        // them would push on every keystroke of model output.
         XCTAssertEqual(MaterialWakeTaxonomy.classification(forEventKind: "surface.output"), .streamOnly)
         XCTAssertEqual(MaterialWakeTaxonomy.classification(forEventKind: "agent.item.delta"), .streamOnly)
         XCTAssertEqual(MaterialWakeTaxonomy.classification(forEventKind: "heartbeat"), .streamOnly)
@@ -20,7 +60,50 @@ final class MaterialWakeTaxonomyTests: XCTestCase {
     }
 
     func testUnknownDefaultsStreamOnly() {
+        // WHY: fail-closed on flood — unknown kinds must never auto-push.
         XCTAssertEqual(MaterialWakeTaxonomy.classification(forEventKind: "totally.unknown.event"), .streamOnly)
+    }
+
+    func testCoalesceClassesKeepAttentionSeparateFromRunProgress() {
+        // WHY: a single global 30s bucket let run.completed swallow the next
+        // approval/question/error. Separate classes make that impossible.
+        XCTAssertEqual(
+            MaterialWakeTaxonomy.coalesceClass(forEventKind: "agent.run.completed"),
+            .runProgress
+        )
+        XCTAssertEqual(
+            MaterialWakeTaxonomy.coalesceClass(forEventKind: "agent.run.started"),
+            .runProgress
+        )
+        XCTAssertEqual(
+            MaterialWakeTaxonomy.coalesceClass(forEventKind: "agent.request.opened"),
+            .attention
+        )
+        XCTAssertEqual(
+            MaterialWakeTaxonomy.coalesceClass(forEventKind: "agent.user_input.requested"),
+            .attention
+        )
+        XCTAssertEqual(
+            MaterialWakeTaxonomy.coalesceClass(forEventKind: "agent.run.error"),
+            .attention
+        )
+        XCTAssertEqual(
+            MaterialWakeTaxonomy.coalesceClass(forEventKind: "agent.run.failed"),
+            .attention
+        )
+        XCTAssertEqual(
+            MaterialWakeTaxonomy.coalesceClass(forEventKind: "notification.created"),
+            .notification
+        )
+        XCTAssertEqual(
+            MaterialWakeTaxonomy.coalesceClass(forEventKind: "host.boot_epoch"),
+            .boot
+        )
+        XCTAssertNotEqual(
+            MaterialWakeTaxonomy.coalesceClass(forEventKind: "agent.run.completed"),
+            MaterialWakeTaxonomy.coalesceClass(forEventKind: "agent.request.opened"),
+            "attention must not share a coalesce bucket with run progress"
+        )
     }
 
     func testSilentCatchUpV1PayloadPrivacyAndParse() {
@@ -59,5 +142,74 @@ final class MaterialWakeTaxonomyTests: XCTestCase {
         XCTAssertFalse(MaterialWakeTaxonomy.phaseAAllowsSilent(.criticalAlert))
         XCTAssertFalse(MaterialWakeTaxonomy.phaseAAllowsSilent(.silentOrAlert))
         XCTAssertTrue(MaterialWakeTaxonomy.shouldForceSilent(.silentForce))
+    }
+
+    func testPublishedAttentionKindsAnchoredToHostEventBusPublishSites() throws {
+        // WHY: the kill-switch set must track kinds the host actually publishes.
+        // A hand-copied literal of `publishedAttentionKinds` is tautological —
+        // it cannot fail when the constant drifts away from real producers.
+        // Anchor: scan the host publish sites (AppContext agent attention +
+        // notification.created publishers) and require exact set equality.
+        let hostAttentionProducerKinds: Set<String> = [
+            // AppContext.swift — agent.request.opened / user_input / run.error
+            "agent.request.opened",
+            "agent.user_input.requested",
+            "agent.run.error",
+            // AppCommandRouter.swift + AppDelegate.swift — notification.created
+            "notification.created",
+        ]
+
+        let publishedInHostSources = try Self.eventBusPublishKinds(inRelativePaths: [
+            "Sources/AppShell/AppContext.swift",
+            "Sources/AppShell/AppCommandRouter.swift",
+            "Sources/AppShell/AppDelegate.swift",
+        ])
+
+        for kind in hostAttentionProducerKinds {
+            XCTAssertTrue(
+                publishedInHostSources.contains(kind),
+                "host source must still publish \(kind); allowlist is useless without a producer"
+            )
+        }
+
+        XCTAssertEqual(
+            MaterialWakeTaxonomy.publishedAttentionKinds,
+            hostAttentionProducerKinds,
+            "kill-switch set must equal the host attention EventBus producer kinds"
+        )
+        XCTAssertTrue(MaterialWakeTaxonomy.phaseAKinds.isSuperset(of: MaterialWakeTaxonomy.publishedAttentionKinds))
+        XCTAssertTrue(MaterialWakeTaxonomy.phaseAKinds.contains("host.boot_epoch"))
+
+        // Boot-identity force wake is also a real host publish (AppContext start).
+        XCTAssertTrue(
+            publishedInHostSources.contains("host.boot_epoch"),
+            "AppContext must still publish host.boot_epoch after MaterialWakeCoordinator.start"
+        )
+    }
+
+    /// Extract `EventBus.shared.publish(kind: "…")` string literals from host sources.
+    private static func eventBusPublishKinds(inRelativePaths paths: [String]) throws -> Set<String> {
+        // Tests/AppShellTests/ThisFile.swift → repo root.
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let pattern = try NSRegularExpression(
+            pattern: #"EventBus\.shared\.publish\(\s*kind:\s*"([^"]+)""#,
+            options: []
+        )
+        var kinds = Set<String>()
+        for relative in paths {
+            let url = repoRoot.appendingPathComponent(relative)
+            let text = try String(contentsOf: url, encoding: .utf8)
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            pattern.enumerateMatches(in: text, options: [], range: range) { match, _, _ in
+                guard let match, match.numberOfRanges >= 2,
+                      let swiftRange = Range(match.range(at: 1), in: text) else { return }
+                kinds.insert(String(text[swiftRange]))
+            }
+        }
+        XCTAssertFalse(kinds.isEmpty, "expected to find EventBus.publish sites in host sources")
+        return kinds
     }
 }
