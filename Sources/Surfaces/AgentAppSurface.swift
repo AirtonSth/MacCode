@@ -547,6 +547,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // bursts into a single refresh after a short trailing delay.
     private var pendingGitRefresh: Task<Void, Never>?
     private var providerSnapshotLoadCount = 0
+    /// When the last successful `loadProviderSnapshots` finished. Used with
+    /// `ModelListTTLDecision` so send/auto-admit reuses a fresh catalog instead
+    /// of re-probing on every keystroke-to-send.
+    private var providerSnapshotsLoadedAt: Date?
 
     public func loadGitBranchThrottled() {
         guard pendingGitRefresh == nil else { return }
@@ -631,11 +635,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func reloadThreads() {
         guard !isDisposed else { return }
+        // Ghost Working: durable finishedAt must free coordinator ownership before
+        // the rail counts active threads (missed/filtered didFinish left spinners).
+        _ = coordinator.reconcileStaleActiveOwnershipWithDurableState()
         do {
             // Cap first so oversized workspaces (scheduled runs, long sessions)
             // shrink before the rail reads. CASCADE removes messages.
             _ = try threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspaceID)
             threads = try threadRepo.list(workspaceId: workspaceID)
+            pruneStaleRunThreadProjections()
             // Clear Stopping… once a LaunchAgent-owned run is no longer active.
             if isStopping,
                let selectedThreadId,
@@ -665,6 +673,47 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             selectedThreadId = nil
             publishInterestedThreadId(nil)
             onSelectedThreadChanged?(nil)
+        }
+    }
+
+    /// Drop surface `runThreads` entries that no longer match a live coordinator
+    /// or durable active run for the same runId. Generation-safe: never clears
+    /// by threadId alone (a newer run B on the same thread stays mapped).
+    ///
+    /// WHY: the rail spinner is driven by `trackedRunId` → `runThreads`, which
+    /// can survive a missed workspace-filtered didFinish and leave "Threads · N
+    /// active" after the work is done.
+    private func pruneStaleRunThreadProjections() {
+        let snapshot = runThreads
+        guard !snapshot.isEmpty else { return }
+        var clearedSelected = false
+        for (runId, threadId) in snapshot {
+            if coordinator.activeRunId(threadId: threadId) == runId {
+                continue
+            }
+            if let durable = try? coordinator.durableActiveRun(threadId: threadId),
+               durable.id == runId {
+                continue
+            }
+            if isScheduledThreadRunning?(threadId) == true,
+               let durable = try? coordinator.durableActiveRun(threadId: threadId),
+               durable.id == runId {
+                continue
+            }
+            runThreads[runId] = nil
+            if currentRunId == runId {
+                currentRunId = nil
+                if selectedThreadId == threadId {
+                    clearedSelected = true
+                }
+            }
+        }
+        if clearedSelected, let sel = selectedThreadId, !isThreadStartingOrRunning(sel) {
+            runStartedAt = nil
+            if let durableStatus = threads.first(where: { $0.id == sel })?.status {
+                status = durableStatus
+            }
+            isStopping = false
         }
     }
 
@@ -1736,6 +1785,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return "Waiting on a background task — send to redirect…"
         case .workflowHandoff:
             return "Paused mid-workflow — send to redirect…"
+        case .uncalledToolInvocation:
+            return "Tool call was not executed — send to redirect…"
         }
     }
 
@@ -2177,13 +2228,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
-    public func loadProviderSnapshots() async {
+    public func loadProviderSnapshots(forceCatalogRefresh: Bool = false) async {
         providerSnapshotLoadCount += 1
         providerSnapshotsLoading = true
         defer {
             providerSnapshotLoadCount = max(0, providerSnapshotLoadCount - 1)
             providerSnapshotsLoading = providerSnapshotLoadCount > 0
         }
+        // Capture MainActor-only inputs, then verify provenance off the main
+        // actor so Process/URLSession catalog probes cannot beachball send().
+        let launchConfig = providerLaunchConfig
+        let cwdSnapshot = cwd
         do {
             let loadedSnapshots: [AgentProviderSnapshot]
             if let providerSnapshotLoader {
@@ -2191,22 +2246,34 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             } else {
                 loadedSnapshots = await Self.localFallbackProviderSnapshots()
             }
-            let snapshots = await snapshotsWithVerifiedCatalogProvenance(loadedSnapshots)
-            await MainActor.run {
-                self.providerSnapshotStatusMessage = nil
-                self.applyProviderSnapshots(snapshots)
-            }
+            let snapshots = await Self.snapshotsWithVerifiedCatalogProvenance(
+                loadedSnapshots,
+                cwd: cwdSnapshot,
+                launchConfig: launchConfig,
+                forceRefresh: forceCatalogRefresh
+            )
+            self.providerSnapshotStatusMessage = nil
+            self.applyProviderSnapshots(snapshots)
+            self.providerSnapshotsLoadedAt = Date()
         } catch {
             // Fail open for composer usability: keep a resolved binary fallback so
             // send is not stuck on missingSnapshot after a transient probe failure.
             let fallback = await Self.localFallbackProviderSnapshots()
-            await MainActor.run {
-                self.providerSnapshotStatusMessage = "Provider snapshot failed. Retry from the model menu."
-                if self.providerSnapshots.isEmpty {
-                    self.applyProviderSnapshots(fallback)
-                }
+            self.providerSnapshotStatusMessage = "Provider snapshot failed. Retry from the model menu."
+            if self.providerSnapshots.isEmpty {
+                self.applyProviderSnapshots(fallback)
             }
         }
+    }
+
+    /// True when a successful snapshot load finished inside the catalog TTL.
+    /// Send and Auto-admit use this so a fresh cache is not re-probed per message.
+    private var providerSnapshotsAreFresh: Bool {
+        !ModelListTTLDecision.shouldRefetch(
+            lastFetchedAt: providerSnapshotsLoadedAt,
+            ttl: ModelListTTLDecision.defaultCatalogTTL,
+            now: Date()
+        )
     }
 
     private func applyProviderSnapshots(_ snapshots: [AgentProviderSnapshot]) {
@@ -2301,7 +2368,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if provider == .claude {
             _ = await AnthropicModelDiscovery.refresh()
         }
-        await loadProviderSnapshots()
+        await loadProviderSnapshots(forceCatalogRefresh: true)
         await loadModels()
     }
 
@@ -2352,8 +2419,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return rows
     }
 
-    private func snapshotsWithVerifiedCatalogProvenance(
-        _ snapshots: [AgentProviderSnapshot]
+    /// Live catalog verification for untagged claude/codex rows. `nonisolated`
+    /// so Process/URLSession probes never run under `AgentAppViewModel`'s
+    /// MainActor isolation (send-path beachball). Results are TTL-cached via
+    /// `ModelListTTLDecision` so a second send within the window reuses the
+    /// last live list instead of re-spawning CLI / network discovery.
+    nonisolated static func snapshotsWithVerifiedCatalogProvenance(
+        _ snapshots: [AgentProviderSnapshot],
+        cwd: String,
+        launchConfig: ((AgentProvider, String?) -> (binary: String?, environment: [String: String]))?,
+        forceRefresh: Bool,
+        now: Date = Date()
     ) async -> [AgentProviderSnapshot] {
         var resolved: [AgentProviderSnapshot] = []
         resolved.reserveCapacity(snapshots.count)
@@ -2363,23 +2439,47 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 resolved.append(snapshot)
                 continue
             }
-            let launch = providerLaunchConfig?(snapshot.provider, snapshot.id)
+            let launch = launchConfig?(snapshot.provider, snapshot.id)
             let binary = launch?.binary ?? snapshot.binaryPath ?? snapshot.provider.rawValue
             let environment = launch?.environment ?? [:]
+            let cacheKey = CatalogVerificationCache.key(
+                provider: snapshot.provider,
+                binary: binary,
+                cwd: cwd,
+                environment: environment,
+                instanceId: snapshot.id
+            )
             let liveModels: [AgentModelDescriptor]
-            switch snapshot.provider {
-            case .claude:
-                let result = await ClaudeRunner(binaryNameOverride: binary)
-                    .listModelsResult(environment: environment)
-                liveModels = result.isFallback ? [] : result.models
-            case .codex:
-                liveModels = await CodexAppServerModelDiscovery.listModels(
-                    binary: binary,
-                    cwd: cwd,
-                    environment: environment
-                )
-            case .grok:
-                liveModels = []
+            if !forceRefresh,
+               let cached = CatalogVerificationCache.shared.models(
+                for: cacheKey,
+                ttl: ModelListTTLDecision.defaultCatalogTTL,
+                now: now
+               ) {
+                liveModels = cached
+            } else {
+                Self.catalogVerificationProbeCountForTesting &+= 1
+                if let probe = Self.catalogVerificationLiveProbeForTesting {
+                    liveModels = await probe(snapshot.provider, binary, environment, cwd)
+                } else {
+                    switch snapshot.provider {
+                    case .claude:
+                        let result = await ClaudeRunner(binaryNameOverride: binary)
+                            .listModelsResult(environment: environment)
+                        liveModels = result.isFallback ? [] : result.models
+                    case .codex:
+                        liveModels = await CodexAppServerModelDiscovery.listModels(
+                            binary: binary,
+                            cwd: cwd,
+                            environment: environment
+                        )
+                    case .grok:
+                        liveModels = []
+                    }
+                }
+                // Cache live hits and empty failures alike so a flapping CLI
+                // does not re-block the next send within the TTL.
+                CatalogVerificationCache.shared.store(liveModels, for: cacheKey, at: now)
             }
             let capabilityVerified = snapshot.installed
                 && snapshot.status == .available
@@ -2397,6 +2497,62 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             ))
         }
         return resolved
+    }
+
+    /// Testing seam: increments once per live catalog verification probe
+    /// (cache misses only). Used to prove send reuses a fresh TTL cache.
+    nonisolated(unsafe) static var catalogVerificationProbeCountForTesting = 0
+    /// Testing seam: optional live-probe override so hermetic tests never
+    /// touch a real CLI or network during catalog verification.
+    nonisolated(unsafe) static var catalogVerificationLiveProbeForTesting:
+        (@Sendable (AgentProvider, String, [String: String], String) async -> [AgentModelDescriptor])?
+
+    /// Process-wide TTL cache for untagged-snapshot catalog verification.
+    private final class CatalogVerificationCache: @unchecked Sendable {
+        static let shared = CatalogVerificationCache()
+        private let lock = NSLock()
+        private var entries: [String: (models: [AgentModelDescriptor], fetchedAt: Date)] = [:]
+
+        static func key(
+            provider: AgentProvider,
+            binary: String,
+            cwd: String,
+            environment: [String: String],
+            instanceId: String
+        ) -> String {
+            let envFingerprint = environment.keys.sorted().joined(separator: ",")
+            return "\(provider.rawValue)|\(instanceId)|\(binary)|\(cwd)|\(envFingerprint)"
+        }
+
+        func models(for key: String, ttl: TimeInterval, now: Date) -> [AgentModelDescriptor]? {
+            lock.lock(); defer { lock.unlock() }
+            guard let entry = entries[key],
+                  !ModelListTTLDecision.shouldRefetch(
+                    lastFetchedAt: entry.fetchedAt,
+                    ttl: ttl,
+                    now: now
+                  ) else {
+                return nil
+            }
+            return entry.models
+        }
+
+        func store(_ models: [AgentModelDescriptor], for key: String, at date: Date) {
+            lock.lock(); defer { lock.unlock() }
+            entries[key] = (models, date)
+        }
+
+        func resetForTesting() {
+            lock.lock(); defer { lock.unlock() }
+            entries.removeAll()
+        }
+    }
+
+    /// Test-only: clear the process-wide catalog verification cache.
+    nonisolated static func resetCatalogVerificationCacheForTesting() {
+        CatalogVerificationCache.shared.resetForTesting()
+        catalogVerificationProbeCountForTesting = 0
+        catalogVerificationLiveProbeForTesting = nil
     }
 
     nonisolated private static func snapshot(
@@ -4048,12 +4204,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // first; restore the draft only if the turn never starts.
         let attachedForSend = attachments
         prompt = ""
+        // At most one snapshot load per send. Catalog probes (CLI Process /
+        // network discovery) are expensive and must not run 2–3× on the
+        // MainActor-isolated send path. A fresh TTL cache covers the rest.
+        var didLoadProviderSnapshotsThisSend = false
         // Snapshots can still be empty on first send (seed/load race). Load once
         // before the fail-closed gate so a ready Grok/Codex install is not blocked.
         // Also needed before `$goal` → `/goal` rewrite so provider slash catalogs
         // (Codex `/goal`) are available for normalization.
         if selectedProviderSnapshot == nil {
             await loadProviderSnapshots()
+            didLoadProviderSnapshotsThisSend = true
         }
         // Canonical first-token triggers for every provider:
         // commands (`$goal`/`/goal`) → `/…`; skills (`/sam-work`/`$sam-work`) → `$…`.
@@ -4070,8 +4231,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // must be runnable (install/auth/models). The old Auto bypass left users
         // with a late generic preferredSourceUnavailable after a failed admit.
         if !selectedProviderCanRun {
-            // One refresh covers stale seed rows and run-as-user probe lag.
-            await loadProviderSnapshots()
+            // One refresh covers stale seed rows and run-as-user probe lag —
+            // but only when this send has not already loaded and the catalog
+            // TTL says the cache is stale.
+            if !didLoadProviderSnapshotsThisSend,
+               !providerSnapshotsAreFresh {
+                await loadProviderSnapshots()
+                didLoadProviderSnapshotsThisSend = true
+            }
             if !selectedProviderCanRun {
                 statusMessage = providerExecutionUnavailableReason ?? "The selected provider is unavailable."
                 restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
@@ -4310,13 +4477,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 }
                 // Prefer a fresh probe when the Source is not yet Auto-admittable
                 // (stale seed / run-as-user home not reflected in the last load).
+                // Skip when the catalog is still inside the shared TTL — send()
+                // may have just loaded, and a third MainActor-bound probe is what
+                // beachballed the composer.
                 var admitSnapshots = providerSnapshots
                 if AgentOrchestrationRuntime.autoAdmitSnapshot(
                     provider: effectiveRouting.manualSelection.provider,
                     preferredInstanceId: effectiveRouting.manualProviderInstanceId ?? runProviderInstanceId,
                     providerSnapshots: admitSnapshots,
                     requireLiveCatalog: false
-                ) == nil {
+                ) == nil,
+                   !providerSnapshotsAreFresh {
                     await loadProviderSnapshots()
                     admitSnapshots = providerSnapshots
                 }
@@ -4755,6 +4926,34 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func stop() {
         let tid = selectedThreadId
         let localRunId = currentRunId ?? tid.flatMap { trackedRunId(for: $0) }
+        // Second click while already Stopping: hard-await termination so a
+        // stuck soft interrupt cannot leave the button disabled forever.
+        if isStopping, let tid {
+            Task { @MainActor in
+                do {
+                    try await self.coordinator.stopAndAwaitTermination(threadId: tid)
+                } catch {
+                    self.statusMessage = "Force stop: \(error.localizedDescription)"
+                }
+                // If the coordinator still owns the run after the hard deadline,
+                // clear the UI latch so the user is not stuck on Stopping…
+                if self.trackedRunId(for: tid) == nil {
+                    self.isStopping = false
+                    if self.selectedThreadId == tid {
+                        self.currentRunId = nil
+                        self.runStartedAt = nil
+                    }
+                } else {
+                    // Loud failure: hard timeout still left ownership — drop the
+                    // latch so Stop is usable again and surface the error.
+                    self.isStopping = false
+                    if self.statusMessage.isEmpty {
+                        self.statusMessage = "Stop is taking longer than expected. Try again or restart the agent."
+                    }
+                }
+            }
+            return
+        }
         // Path B: scheduled runs are owned by the LaunchAgent. Prefer XPC stop
         // when SQLite says this thread has an active scheduled occurrence.
         if let tid, isScheduledThreadRunning?(tid) == true, let stopScheduledThread {
@@ -4776,7 +4975,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             coordinator.stopRun(threadId: tid)
         }
         // UX-MAC_AGENT-STOP: signal that the interrupt was sent so the UI can
-        // show "Stopping..." and disable the button until the run terminates.
+        // show "Stopping..." until the run terminates. Keep the control enabled
+        // so a second click can force-stop if soft cancel stalls.
         isStopping = true
     }
 
@@ -5331,21 +5531,39 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     )
                     self.isStopping = false  // UX-MAC_AGENT-STOP: new run started; clear any stale stopping flag
                 } else if Self.isTerminalRunStatus(status) {
-                    // Terminal provider status can arrive immediately before
-                    // `.finished`; keep the UI in running state until the
-                    // coordinator has released the active handle.
+                    // Always record the terminal runId so late stream events cannot
+                    // re-inflate runThreads / Working after cancel/complete (ghost
+                    // "Threads · N active"). Full selected-thread idle paint still
+                    // waits until the coordinator releases active ownership.
+                    self.terminalRunIds = Self.boundedTerminalRunIds(existing: self.terminalRunIds, adding: runId)
+                    self.runThreads[runId] = nil
                     if !self.coordinator.activeThreadIdsSnapshot().contains(threadId) {
                         self.status = status
-                        self.terminalRunIds = Self.boundedTerminalRunIds(existing: self.terminalRunIds, adding: runId)
                         self.currentRunId = nil
                         self.runStartedAt = nil
                         self.clearActivePlanFollowUpSuppressionIfSafe()
-                        self.runThreads[runId] = nil
                         self.isStopping = false  // UX-MAC_AGENT-STOP: terminal; clear stopping flag
+                    } else {
+                        // Ownership still held: nudge durable reconcile so a
+                        // finishedAt row cannot leave activeThreads ghosted.
+                        _ = self.coordinator.reconcileStaleActiveOwnershipWithDurableState()
+                        if !self.coordinator.activeThreadIdsSnapshot().contains(threadId) {
+                            self.status = status
+                            self.currentRunId = nil
+                            self.runStartedAt = nil
+                            self.clearActivePlanFollowUpSuppressionIfSafe()
+                            self.isStopping = false
+                        }
                     }
                 } else {
                     self.status = status
                 }
+            } else if Self.isTerminalRunStatus(status) {
+                // Non-selected threads: still clear the rail projection so the
+                // active count and spinner drop when this run ends.
+                self.terminalRunIds = Self.boundedTerminalRunIds(existing: self.terminalRunIds, adding: runId)
+                self.runThreads[runId] = nil
+                _ = self.coordinator.reconcileStaleActiveOwnershipWithDurableState()
             }
             self.onRunStateChange?()
         }
@@ -5951,12 +6169,21 @@ public enum AgentContextStatusPresentation {
         guard let usage else {
             return compacted?.isEmpty == false ? "Context compacted: \(compacted!)" : nil
         }
+        // Occupancy percentage must come from per-request `contextTokens` only.
+        // `totalTokens` can be session-cumulative billing (Claude modelUsage cache
+        // re-reads) and must never drive "Context N%" — that produced 999%.
         let tokenText: String
-        if let window = usage.contextWindow, window > 0 {
-            let pct = min(999, max(0, Int((Double(usage.totalTokens) / Double(window) * 100).rounded())))
-            tokenText = "Context \(pct)% · \(usage.totalTokens) / \(window) tokens"
+        if let occupancy = usage.contextTokens {
+            if let window = usage.contextWindow, window > 0 {
+                let pct = min(100, max(0, Int((Double(occupancy) / Double(window) * 100).rounded())))
+                tokenText = "Context \(pct)% · \(occupancy) / \(window) tokens"
+            } else {
+                tokenText = "Context \(occupancy) tokens"
+            }
+        } else if let window = usage.contextWindow, window > 0 {
+            tokenText = "Session \(usage.totalTokens) / \(window) tokens"
         } else {
-            tokenText = "Context \(usage.totalTokens) tokens"
+            tokenText = "Session \(usage.totalTokens) tokens"
         }
         var parts = [tokenText]
         if usage.compactsAutomatically == true {
@@ -8473,14 +8700,25 @@ public struct AgentAppView: View {
                     .font(.system(size: 12))
                     .foregroundColor(DS.Palette.warning)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(reason == .workflowHandoff
-                         ? "Agent stopped mid-workflow"
-                         : "Agent is waiting on a background task")
+                    Text({
+                        switch reason {
+                        case .workflowHandoff: return "Agent stopped mid-workflow"
+                        case .uncalledToolInvocation: return "Agent emitted an unexecuted tool call"
+                        case .backgroundAwait: return "Agent is waiting on a background task"
+                        }
+                    }())
                         .font(DS.Font.caption.weight(.semibold))
                         .foregroundColor(DS.Palette.textSecondary)
-                    Text(reason == .workflowHandoff
-                         ? "The run ended between phases. Resume it to finish the original task."
-                         : "The run ended while standing by. Resume it to check the task and finish.")
+                    Text({
+                        switch reason {
+                        case .workflowHandoff:
+                            return "The run ended between phases. Resume it to finish the original task."
+                        case .uncalledToolInvocation:
+                            return "The run ended after printing tool markup instead of calling a tool. Resume it to continue."
+                        case .backgroundAwait:
+                            return "The run ended while standing by. Resume it to check the task and finish."
+                        }
+                    }())
                         .font(DS.Font.caption2)
                         .foregroundColor(DS.Palette.textTertiary)
                 }
@@ -9063,12 +9301,13 @@ public struct AgentAppView: View {
                         runActive: vm.selectedThreadRunIsStartingOrRunning,
                         isStopping: vm.isStopping
                     )
-                    Button(inlineState == .stopping ? "Stopping..." : "Stop") { vm.stop() }
+                    Button(inlineState == .stopping ? "Stopping… (click to force)" : "Stop") { vm.stop() }
                         .buttonStyle(.plain)
                         .font(DS.Font.body.weight(.medium))
-                        .foregroundColor(inlineState == .stopping ? DS.Palette.textTertiary : DS.Palette.danger)
-                        .disabled(inlineState == .stopping)
-                        .help(inlineState == .stopping ? "Stopping..." : "Stop running agent (press Esc to interrupt)")
+                        .foregroundColor(DS.Palette.danger)
+                        .help(inlineState == .stopping
+                              ? "Still stopping — click again to force-stop the provider"
+                              : "Stop running agent (press Esc to interrupt)")
                         .accessibilityIdentifier("agent.working.stop")
                 }
             }
@@ -11371,6 +11610,8 @@ public struct AgentAppView: View {
             runActive: vm.selectedThreadRunIsStartingOrRunning,
             isStopping: vm.isStopping
         )
+        // Keep clickable while Stopping so a second click force-stops; do not
+        // latch the control disabled forever if soft cancel stalls.
         return Button { vm.stop() } label: {
             ZStack {
                 Circle()
@@ -11388,10 +11629,11 @@ public struct AgentAppView: View {
             }
         }
         .buttonStyle(.plain)
-        .disabled(btnState == .stopping)
-        .accessibilityLabel(btnState == .stopping ? "Stopping..." : "Stop running agent")
+        .accessibilityLabel(btnState == .stopping ? "Force stop running agent" : "Stop running agent")
         .accessibilityIdentifier("agent.composer.stop")
-        .help(btnState == .stopping ? "Stopping..." : "Stop running agent")
+        .help(btnState == .stopping
+              ? "Still stopping — click again to force-stop the provider"
+              : "Stop running agent")
     }
 
     // P3: thumbnail for image attachments; falls back to doc icon for non-images.

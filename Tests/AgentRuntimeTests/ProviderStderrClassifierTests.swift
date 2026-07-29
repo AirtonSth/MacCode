@@ -136,4 +136,105 @@ final class ProviderStderrClassifierTests: XCTestCase {
                         "Fatal socket errors must remain visible for codex; " +
                         "suppressing them hides network-level provider failures from the user")
     }
+
+    // MARK: - terminal reason resolution
+
+    /// WHY: abnormal ends used to leave agent_runs.error_message nil. A failed
+    /// stream with real stderr must keep that detail (not a vague "failed").
+    func test_resolveTerminal_failed_prefersObservedStderrDetail() {
+        let resolved = ProviderStderrClassifier.resolveTerminal(
+            provider: .claude,
+            status: .failed,
+            observedDetail: "Error: authentication token expired",
+            producedAssistantOutput: false
+        )
+        XCTAssertEqual(resolved.status, .failed)
+        XCTAssertEqual(resolved.errorMessage, "Error: authentication token expired",
+                       "real provider stderr detail must become the durable error_message")
+    }
+
+    /// WHY: when the provider dies with no stderr and no terminal success event,
+    /// the user still needs a specific provider-named reason (not "unknown error").
+    func test_resolveTerminal_failed_withoutDetail_namesProviderAndObservation() {
+        for provider in [AgentProvider.claude, .codex, .grok] {
+            let resolved = ProviderStderrClassifier.resolveTerminal(
+                provider: provider,
+                status: .failed,
+                observedDetail: nil,
+                producedAssistantOutput: false
+            )
+            XCTAssertEqual(resolved.status, .failed)
+            let message = resolved.errorMessage ?? ""
+            XCTAssertFalse(message.isEmpty, "\(provider) failed terminal must store a non-empty reason")
+            XCTAssertTrue(message.contains(ProviderStderrClassifier.displayName(provider)),
+                          "fallback must name \(provider); got: \(message)")
+            XCTAssertTrue(
+                message.localizedCaseInsensitiveContains("stream")
+                    || message.localizedCaseInsensitiveContains("terminal"),
+                "fallback must describe the observation, not a vague 'failed'; got: \(message)"
+            )
+            XCTAssertNotEqual(message.lowercased(), "failed")
+            XCTAssertNotEqual(message.lowercased(), "unknown error")
+        }
+    }
+
+    /// WHY: user Stop is a legitimate silent ending — never invent error_message.
+    func test_resolveTerminal_cancelled_storesNoError() {
+        let resolved = ProviderStderrClassifier.resolveTerminal(
+            provider: .codex,
+            status: .cancelled,
+            observedDetail: "should-not-surface",
+            producedAssistantOutput: false
+        )
+        XCTAssertEqual(resolved.status, .cancelled)
+        XCTAssertNil(resolved.errorMessage,
+                     "user Stop must not invent or promote an error_message")
+    }
+
+    /// WHY: a silent green "completed" with no assistant answer is the second
+    /// production bug (user prompt is last message). Reclassify so UI can explain.
+    func test_resolveTerminal_completedWithoutAssistantOutput_isNotSilentSuccess() {
+        let resolved = ProviderStderrClassifier.resolveTerminal(
+            provider: .grok,
+            status: .completed,
+            observedDetail: nil,
+            producedAssistantOutput: false
+        )
+        XCTAssertNotEqual(resolved.status, .completed,
+                          "empty completed must not remain a plain silent success")
+        XCTAssertEqual(resolved.status, .failed)
+        let message = resolved.errorMessage ?? ""
+        XCTAssertFalse(message.isEmpty)
+        XCTAssertTrue(message.contains("Grok"))
+        XCTAssertTrue(message.localizedCaseInsensitiveContains("assistant"))
+    }
+
+    /// WHY: incomplete-turn handoffs keep a non-empty final and must stay completed
+    /// so IncompleteTurnContinuation auto-nudge can fire (do not invent a parallel path).
+    func test_resolveTerminal_completedWithAssistantOutput_staysSuccessWithoutError() {
+        let resolved = ProviderStderrClassifier.resolveTerminal(
+            provider: .claude,
+            status: .completed,
+            observedDetail: nil,
+            producedAssistantOutput: true
+        )
+        XCTAssertEqual(resolved.status, .completed)
+        XCTAssertNil(resolved.errorMessage)
+    }
+
+    /// WHY: interrupted relaunch/orphans also owed the user a reason when no detail
+    /// was captured — same class of silent failure as failed.
+    func test_resolveTerminal_interrupted_withoutDetail_namesProvider() {
+        let resolved = ProviderStderrClassifier.resolveTerminal(
+            provider: .codex,
+            status: .interrupted,
+            observedDetail: nil,
+            producedAssistantOutput: false
+        )
+        XCTAssertEqual(resolved.status, .interrupted)
+        XCTAssertEqual(
+            resolved.errorMessage,
+            "Codex run was interrupted without a recorded reason"
+        )
+    }
 }

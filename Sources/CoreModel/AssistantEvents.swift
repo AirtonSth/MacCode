@@ -236,6 +236,11 @@ public struct AssistantTokenUsage: Codable, Sendable, Equatable {
     /// Provider-reported billed cost in micros. Nil means this provider/runtime
     /// did not return a verifiable monetary amount for the turn.
     public var reportedCostMicros: Int?
+    /// Current context-window occupancy for a single request/turn.
+    /// Distinct from `totalTokens`, which may be session-cumulative billing
+    /// (e.g. Claude/Grok `modelUsage` cache re-reads summed across the session).
+    /// nil when the payload is only cumulative, or when older rows omit the key.
+    public var contextTokens: Int?
 
     public init(
         inputTokens: Int = 0,
@@ -246,7 +251,8 @@ public struct AssistantTokenUsage: Codable, Sendable, Equatable {
         uncachedInputTokens: Int? = nil,
         cacheCreationInputTokens: Int? = nil,
         cacheReadInputTokens: Int? = nil,
-        reportedCostMicros: Int? = nil
+        reportedCostMicros: Int? = nil,
+        contextTokens: Int? = nil
     ) {
         self.inputTokens = inputTokens
         self.outputTokens = outputTokens
@@ -257,6 +263,7 @@ public struct AssistantTokenUsage: Codable, Sendable, Equatable {
         self.cacheCreationInputTokens = cacheCreationInputTokens
         self.cacheReadInputTokens = cacheReadInputTokens
         self.reportedCostMicros = reportedCostMicros
+        self.contextTokens = contextTokens
     }
 
     public var billedInputTokenUnits: Double {
@@ -272,6 +279,30 @@ public struct AssistantTokenUsage: Codable, Sendable, Equatable {
 
     public var billedTotalTokenUnits: Double {
         billedInputTokenUnits + (Double(max(0, outputTokens)) * TokenBillingWeights.default.output)
+    }
+
+    /// Merge a later tokenUsage event with the one already on the timeline.
+    /// - `contextTokens`: latest non-nil wins (a cumulative event must not erase
+    ///   a known per-request occupancy).
+    /// - Billing totals (`totalTokens` / cache split / cost): the larger
+    ///   `totalTokens` wins so a small per-request payload cannot wipe
+    ///   session-cumulative modelUsage figures used by Token Saver.
+    public static func merging(_ existing: AssistantTokenUsage, with incoming: AssistantTokenUsage) -> AssistantTokenUsage {
+        let preferIncomingBilling = incoming.totalTokens >= existing.totalTokens
+        let billing = preferIncomingBilling ? incoming : existing
+        let other = preferIncomingBilling ? existing : incoming
+        return AssistantTokenUsage(
+            inputTokens: billing.inputTokens,
+            outputTokens: billing.outputTokens,
+            totalTokens: billing.totalTokens,
+            contextWindow: incoming.contextWindow ?? existing.contextWindow,
+            compactsAutomatically: incoming.compactsAutomatically ?? existing.compactsAutomatically,
+            uncachedInputTokens: billing.uncachedInputTokens ?? other.uncachedInputTokens,
+            cacheCreationInputTokens: billing.cacheCreationInputTokens ?? other.cacheCreationInputTokens,
+            cacheReadInputTokens: billing.cacheReadInputTokens ?? other.cacheReadInputTokens,
+            reportedCostMicros: billing.reportedCostMicros ?? other.reportedCostMicros,
+            contextTokens: incoming.contextTokens ?? existing.contextTokens
+        )
     }
 }
 
@@ -1062,7 +1093,11 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             }
             trimPendingUserInputs()
         case .tokenUsage(let usage):
-            tokenUsage = usage
+            if let existing = tokenUsage {
+                tokenUsage = AssistantTokenUsage.merging(existing, with: usage)
+            } else {
+                tokenUsage = usage
+            }
         case .accountUsage:
             break
         case .contextCompaction(let summary):

@@ -145,17 +145,36 @@ public enum BackgroundAwaitContinuation {
         return backgroundNouns.contains(where: { text.contains($0) })
     }
 
-    /// Removes `awaitingMarker` from user-facing text. Detection keys on the marker,
-    /// but the transcript must never show it — mirrors `RetrieveHandleSanitizer`.
+    /// Removes host-internal incomplete-turn markers from user-facing text.
+    /// Detection keys on the markers, but the transcript must never show them —
+    /// mirrors `RetrieveHandleSanitizer`.
     ///
-    /// A true no-op when the marker is absent, so it never reflows normal assistant
-    /// prose (it runs on every rendered message).
+    /// Strips `awaitingMarker` and `AssistantToolMarkupSanitizer.uncalledToolMarker`
+    /// (the durable signal left after raw tool-invocation markup is removed).
+    ///
+    /// A true no-op when neither marker is present, so it never reflows normal
+    /// assistant prose (it runs on every rendered message).
     public static func strippingAwaitingMarker(_ text: String) -> String {
-        guard text.range(of: awaitingMarker, options: .caseInsensitive) != nil else { return text }
-        let pattern = NSRegularExpression.escapedPattern(for: awaitingMarker)
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return text }
-        let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        let stripped = regex.stringByReplacingMatches(in: text, range: range, withTemplate: "")
+        let hasAwaiting = text.range(of: awaitingMarker, options: .caseInsensitive) != nil
+        let hasUncalled = text.range(
+            of: AssistantToolMarkupSanitizer.uncalledToolMarker,
+            options: .caseInsensitive
+        ) != nil
+        guard hasAwaiting || hasUncalled else { return text }
+        var stripped = text
+        if hasAwaiting {
+            let pattern = NSRegularExpression.escapedPattern(for: awaitingMarker)
+            if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
+                let range = NSRange(stripped.startIndex..<stripped.endIndex, in: stripped)
+                stripped = regex.stringByReplacingMatches(in: stripped, range: range, withTemplate: "")
+            }
+        }
+        if hasUncalled {
+            stripped = AssistantToolMarkupSanitizer.strippingUncalledToolMarker(stripped)
+            // strippingUncalledToolMarker already tidies; avoid double-trim path below
+            // only when awaiting was absent.
+            if !hasAwaiting { return stripped }
+        }
         return stripped
             .replacingOccurrences(of: #"[ \t]+\n"#, with: "\n", options: .regularExpression)
             .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)

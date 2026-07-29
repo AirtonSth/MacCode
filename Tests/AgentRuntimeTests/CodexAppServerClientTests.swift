@@ -274,7 +274,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             CodexAppServerClient.requiresFreshClientAfterThreadResumeFailure(
                 CodexAppServerError.requestTimedOut(method: "thread/resume", timeout: 30)
             ),
-            "the client deadline intentionally stops a silent resume peer, so only a new client may safely start a fresh thread"
+            "the client deadline intentionally stops a silent resume peer, so only a new client may safely retry resume"
         )
         XCTAssertFalse(
             CodexAppServerClient.requiresFreshClientAfterThreadResumeFailure(
@@ -282,6 +282,29 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             ),
             "a turn-start timeout is not a context-loss signal and must not be converted into a new-thread fallback"
         )
+        XCTAssertTrue(
+            CodexAppServerClient.isDeadAppServerFailure(
+                CodexAppServerError.processExited(stderrTail: "panic")
+            ),
+            "a dead app-server must fail fast instead of spending the slow-resume budget"
+        )
+        XCTAssertFalse(
+            CodexAppServerClient.isDeadAppServerFailure(
+                CodexAppServerError.requestTimedOut(method: "thread/resume", timeout: 30)
+            ),
+            "a still-alive but slow resume is retriable, not a dead-peer signal"
+        )
+        let timeoutMessage = String(describing: CodexAppServerError.requestTimedOut(method: "thread/resume", timeout: 30))
+        XCTAssertTrue(timeoutMessage.contains("thread/resume"), timeoutMessage)
+        XCTAssertTrue(timeoutMessage.contains("30s") || timeoutMessage.contains("30"), timeoutMessage)
+        XCTAssertTrue(
+            timeoutMessage.localizedCaseInsensitiveContains("retry")
+                || timeoutMessage.localizedCaseInsensitiveContains("new thread"),
+            "timeout text must tell the user what to do: \(timeoutMessage)"
+        )
+        let exhausted = String(describing: CodexAppServerError.threadResumeUnavailable(attempts: 3, elapsedBound: 91.5))
+        XCTAssertTrue(exhausted.contains("thread/resume"), exhausted)
+        XCTAssertTrue(exhausted.contains("3"), exhausted)
     }
 
     func test_forkThread_usesNativeProviderBranchAndReturnsChildThreadId() async throws {

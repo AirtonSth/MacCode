@@ -195,6 +195,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private var providerTurnScopes: [AgentThreadID: ProviderTurnScope] = [:]
     private var activeTurnIds: [AgentRunID: String] = [:]
     private var latestTokenUsage: [AgentRunID: AssistantTokenUsage] = [:]
+    /// Last provider `.error` (or stderr-derived) detail for the live run. Used when
+    /// committing failed/interrupted terminals so `agent_runs.error_message` is not
+    /// left nil after an abnormal end.
+    private var latestRunErrorMessages: [AgentRunID: String] = [:]
     private var orchestrationDeadlineWorkItems: [AgentRunID: DispatchWorkItem] = [:]
     private var activeAssistantMessageIds: [AgentRunID: AgentMessageID] = [:]
     private var activeProviderTextItemTypes: [AgentRunID: [String: AssistantItemType]] = [:]
@@ -1124,9 +1128,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let runId = activeThreads[threadId]
         let handle = runId.flatMap { active[$0] }
         let pendingStart = pendingProviderStarts[threadId]
-        let terminalDurabilityPending = runId.map {
-            pendingTerminalEvents[$0] != nil || deferredProviderTerminalEvents[$0] != nil
-        } ?? false
         lock.unlock()
         _ = pendingStart?.invalidateAcceptance()
         if let runId, let handle {
@@ -1163,12 +1164,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             } else {
                 handle.cancel()
             }
-            // The provider has already acknowledged a terminal state, but its
-            // buffered stream tail is still waiting for the SQLite durability
-            // barrier. Stop may terminate any surviving provider process, but it
-            // must not publish a competing `.cancelled` state ahead of the
-            // retained terminal event.
-            if terminalDurabilityPending { return }
+            // Always route through markStopRequested: when a terminal is already
+            // claimed it re-arms the durability retry (and clears the SR1/distill
+            // translation gate so Stop cannot stick on "Stopping…"). When only a
+            // deferred provider terminal is waiting on in-flight humanize, cancel
+            // still claims the slot. Never skip markStopRequested for user Stop.
             markStopRequested(threadId: threadId, runId: runId)
             return
         }
@@ -1542,26 +1542,42 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // becomes the retained event and retries until the buffered stream tail
             // commits. This prevents Stop-first from evicting active ownership or
             // publishing `.cancelled` while SQLite still holds uncommitted events.
+            //
+            // User Stop must never wait on SR1/distill humanize. In-flight text
+            // translations used to defer `.finished(.cancelled)` forever (or until
+            // distill startup timed out ~60s), leaving the UI on "Stopping…" with
+            // the button disabled. Clear that gate on every Stop claim/retry.
             lock.lock()
-            let durabilityPending = finishingRuns.contains(runId) || pendingTerminalEvents[runId] != nil
-            guard !durabilityPending else {
-                let needsRetry = pendingTerminalEvents[runId] != nil
+            providerTextTranslationsInFlight.removeValue(forKey: runId)
+            // Drop a deferred provider terminal waiting on humanize — user cancel
+            // supersedes it when the durability slot is still free. If a terminal
+            // is already claimed below, the deferred entry is obsolete either way.
+            deferredProviderTerminalEvents.removeValue(forKey: runId)
+
+            if pendingTerminalEvents[runId] != nil {
+                // Provider (or a prior Stop) already owns the durability slot.
+                // Do not replace a retained `.completed` with `.cancelled` — see
+                // test_stopCannotOvertakeTerminalWaitingForDurabilityBarrier.
+                // Re-arm retry so a stuck flush cannot leave activeThreads owned.
                 lock.unlock()
-                // Already finishing: re-arm durability retry so a stuck flush cannot
-                // leave activeThreads owned forever after the user hits Stop.
-                if needsRetry {
-                    scheduleTerminalDurabilityRetry(runId: runId, threadId: threadId)
-                }
+                scheduleTerminalDurabilityRetry(runId: runId, threadId: threadId)
                 return
             }
+
+            // finishingRuns alone must NOT block user cancel. That flag is also
+            // set while final-response SR1 translation runs (before any
+            // pendingTerminalEvent exists); treating it as durabilityPending made
+            // Stop a no-op until humanize returned — Working/Stopping stuck.
             finishingRuns.insert(runId)
+            // User Stop is a legitimate silent ending — never invent an error_message.
             pendingTerminalEvents[runId] = PendingTerminalEvent(
                 status: .cancelled,
                 finalMessage: nil,
                 providerThreadId: nil,
                 assistantMessage: nil,
                 finishedAt: Date(),
-                providerTerminalAcknowledged: false
+                providerTerminalAcknowledged: false,
+                errorMessage: nil
             )
             lock.unlock()
             handle(
@@ -1653,6 +1669,35 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Scan in-memory active ownership against durable agent_runs and release any
+    /// ghost where `finishedAt` is already set. Surfaces call this on rail reload
+    /// so "Threads · N active" / Working cannot stick after a missed or filtered
+    /// terminal callback (durable completion is authoritative for that runId).
+    ///
+    /// Returns the number of runs released. Generation-safe: only the exact
+    /// (threadId, runId) pair still owned in memory and durable-terminal is freed;
+    /// a newer live run B on the same thread is untouched.
+    @discardableResult
+    public func reconcileStaleActiveOwnershipWithDurableState() -> Int {
+        lock.lock()
+        let snapshot = activeThreads
+        lock.unlock()
+        var released = 0
+        for (threadId, runId) in snapshot {
+            guard let row = try? runRepo.get(id: runId), row.finishedAt != nil else { continue }
+            if releaseStaleInMemoryOwnershipIfDurableTerminal(
+                runId: runId,
+                threadId: threadId,
+                preferredStatus: row.status,
+                finalMessage: nil,
+                providerThreadId: nil
+            ) {
+                released += 1
+            }
+        }
+        return released
+    }
+
     /// When SQLite already has a terminal run row but this process still lists the
     /// run in `active` / `activeThreads`, release in-memory ownership and fan out
     /// `didFinish` exactly once. No-op when the run is not owned in memory (avoids
@@ -1679,6 +1724,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         activeRunMetadata.removeValue(forKey: runId)
         latestTokenUsage.removeValue(forKey: runId)
+        latestRunErrorMessages.removeValue(forKey: runId)
         activeTurnIds.removeValue(forKey: runId)
         activeAssistantMessageIds.removeValue(forKey: runId)
         activeProviderTextItemTypes.removeValue(forKey: runId)
@@ -2763,7 +2809,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     }
 
     private func sanitizeFinalAssistantText(_ text: String) -> String {
-        RetrieveHandleSanitizer.strip(text)
+        // Shared provider-agnostic choke point for final assistant text: strip
+        // unresolved CCR handles, then strip raw tool-invocation markup (and leave
+        // the uncalled-tool incomplete-turn signal). Covers claude / codex / grok.
+        AssistantToolMarkupSanitizer.sanitize(RetrieveHandleSanitizer.strip(text))
     }
 
     private func sanitizeFinalAssistantText(_ text: String?) -> String? {
@@ -3060,6 +3109,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     payload.activePlan = plan
                     payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
                 }
+            case .error(let message, _):
+                // Same durable reason seam as AgentRunEvent.error — stream-level
+                // error rows must also fill agent_runs.error_message on terminal.
+                lock.lock()
+                latestRunErrorMessages[runId] = message
+                lock.unlock()
             default:
                 break
             }
@@ -3073,25 +3128,35 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             for observer in observersSnapshot() {
                 observer.runCoordinator(self, didChangeStatus: st, runId: runId, threadId: threadId)
             }
-        case .finished(let status, let rawFinalMessage, let providerThreadId):
+        case .finished(let reportedStatus, let rawFinalMessage, let providerThreadId):
             lock.lock()
             if (providerTextTranslationsInFlight[runId] ?? 0) > 0 {
-                if var deferred = deferredProviderTerminalEvents[runId] {
-                    deferred.providerTerminalAcknowledged = deferred.providerTerminalAcknowledged
-                        || providerTerminalAcknowledged
-                    deferredProviderTerminalEvents[runId] = deferred
+                // User-initiated cancel (markStopRequested) must not wait for
+                // SR1 humanize / distill. Provider-completed terminals still defer
+                // so the translated final can land before ownership is released.
+                let isUserStopCancel = reportedStatus == .cancelled && !providerTerminalAcknowledged
+                if isUserStopCancel {
+                    providerTextTranslationsInFlight.removeValue(forKey: runId)
+                    deferredProviderTerminalEvents.removeValue(forKey: runId)
+                    // Fall through and finish as cancelled immediately.
                 } else {
-                    deferredProviderTerminalEvents[runId] = DeferredProviderTerminalEvent(
-                        status: status,
-                        finalMessage: rawFinalMessage,
-                        providerThreadId: providerThreadId,
-                        threadId: threadId,
-                        allowFinalResponseTranslation: allowFinalResponseTranslation,
-                        providerTerminalAcknowledged: providerTerminalAcknowledged
-                    )
+                    if var deferred = deferredProviderTerminalEvents[runId] {
+                        deferred.providerTerminalAcknowledged = deferred.providerTerminalAcknowledged
+                            || providerTerminalAcknowledged
+                        deferredProviderTerminalEvents[runId] = deferred
+                    } else {
+                        deferredProviderTerminalEvents[runId] = DeferredProviderTerminalEvent(
+                            status: reportedStatus,
+                            finalMessage: rawFinalMessage,
+                            providerThreadId: providerThreadId,
+                            threadId: threadId,
+                            allowFinalResponseTranslation: allowFinalResponseTranslation,
+                            providerTerminalAcknowledged: providerTerminalAcknowledged
+                        )
+                    }
+                    lock.unlock()
+                    return
                 }
-                lock.unlock()
-                return
             }
             lock.unlock()
             // AG-002: mark the provider-side terminal acknowledgement before the
@@ -3116,7 +3181,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 _ = releaseStaleInMemoryOwnershipIfDurableTerminal(
                     runId: runId,
                     threadId: threadId,
-                    preferredStatus: status,
+                    preferredStatus: reportedStatus,
                     finalMessage: sanitizeFinalAssistantText(rawFinalMessage),
                     providerThreadId: providerThreadId
                 )
@@ -3135,7 +3200,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
             let finalMessage = sanitizeFinalAssistantText(rawFinalMessage)
             if allowFinalResponseTranslation,
-               status == .completed,
+               reportedStatus == .completed,
                let finalMessage,
                shouldTranslateFinalResponse(finalMessage) {
                 Task { [weak self] in
@@ -3165,7 +3230,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                         )
                     }
                     self.handle(
-                        event: .finished(status, finalMessage: translated, providerThreadId: providerThreadId),
+                        event: .finished(reportedStatus, finalMessage: translated, providerThreadId: providerThreadId),
                         runId: runId,
                         threadId: threadId,
                         allowFinalResponseTranslation: false
@@ -3180,11 +3245,37 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 	                return
 	            }
             lock.lock()
-            if pendingTerminalEvents[runId] == nil {
+            let needsTerminalClaim = pendingTerminalEvents[runId] == nil
+            let producedAssistantOutput =
+                (finalMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+                || activeAssistantMessageIds[runId] != nil
+            let providerFromMeta = activeRunMetadata[runId]?.provider
+            let observedFromMemory = latestRunErrorMessages[runId]
+            let assistantMessageIdHint = activeAssistantMessageIds[runId]
+            // Snapshot usage while ownership is still held. A concurrent stale-
+            // ownership release (a Stop or a duplicate `.finished` landing in the
+            // lock-free persist window below) can remove `latestTokenUsage[runId]`
+            // before the second lock region reads it; this early snapshot is the
+            // fallback so the finalized receipt never loses usage.
+            let capturedTokenUsage = latestTokenUsage[runId]
+            lock.unlock()
+
+            if needsTerminalClaim {
+                let provider = providerFromMeta
+                    ?? (try? threadRepo.get(id: threadId))?.provider
+                    ?? .codex
+                let observedDetail = observedFromMemory
+                    ?? (try? providerSessionRepo?.get(threadId: threadId))?.lastErrorMessage
+                let resolved = ProviderStderrClassifier.resolveTerminal(
+                    provider: provider,
+                    status: reportedStatus,
+                    observedDetail: observedDetail,
+                    producedAssistantOutput: producedAssistantOutput
+                )
                 let assistantMessage: AgentMessage?
-                if status == .completed, let finalMessage, !finalMessage.isEmpty {
+                if resolved.status == .completed, let finalMessage, !finalMessage.isEmpty {
                     assistantMessage = AgentMessage(
-                        id: activeAssistantMessageIds[runId]
+                        id: assistantMessageIdHint
                             ?? Self.terminalAssistantMessageId(runId: runId),
                         threadId: threadId,
                         role: .assistant,
@@ -3193,23 +3284,31 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 } else {
                     assistantMessage = nil
                 }
-                pendingTerminalEvents[runId] = PendingTerminalEvent(
-                    status: status,
-                    finalMessage: finalMessage,
-                    providerThreadId: providerThreadId,
-                    assistantMessage: assistantMessage,
-                    finishedAt: Date(),
-                    providerTerminalAcknowledged: providerTerminalAcknowledged
-                )
+                lock.lock()
+                // Cancel may have claimed the durability slot while we resolved.
+                if pendingTerminalEvents[runId] == nil {
+                    pendingTerminalEvents[runId] = PendingTerminalEvent(
+                        status: resolved.status,
+                        finalMessage: finalMessage,
+                        providerThreadId: providerThreadId,
+                        assistantMessage: assistantMessage,
+                        finishedAt: Date(),
+                        providerTerminalAcknowledged: providerTerminalAcknowledged,
+                        errorMessage: resolved.errorMessage
+                    )
+                }
+                lock.unlock()
             }
-            let pendingTerminal = pendingTerminalEvents[runId]!
-            // Snapshot usage while ownership is still held. A concurrent stale-
-            // ownership release (a Stop or a duplicate `.finished` landing in the
-            // lock-free persist window below) can remove `latestTokenUsage[runId]`
-            // before the second lock region reads it; this early snapshot is the
-            // fallback so the finalized receipt never loses usage.
-            let capturedTokenUsage = latestTokenUsage[runId]
+
+            lock.lock()
+            let pendingTerminal = pendingTerminalEvents[runId]
             lock.unlock()
+            guard let pendingTerminal else {
+                // Slot vanished (ownership released elsewhere); nothing to commit.
+                return
+            }
+            // Use the resolved terminal (may reclassify empty "completed" → failed).
+            let status = pendingTerminal.status
             // PERF-MAC_AGENT-007: drain any buffered stream writes before the run
             // tears down, so the tail of a fast stream is durably persisted (and
             // visible to latestStreamEvents/reload) once the run finishes.
@@ -3289,6 +3388,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             activeProviderTextItemTypes.removeValue(forKey: runId)
             bufferedProviderTextItems.removeValue(forKey: runId)
             activeDistillOutputRuns.remove(runId)
+            latestRunErrorMessages.removeValue(forKey: runId)
             finishingRuns.remove(runId)
             pendingTerminalEvents.removeValue(forKey: runId)
             terminalRetryScheduled.remove(runId)
@@ -3368,6 +3468,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // Provider callbacks may arrive concurrently. Serialize the resume
             // cursor read with `.threadStarted` persistence so a crash cannot be
             // mislabeled unrecoverable while its durable cursor is being stored.
+            lock.lock()
+            latestRunErrorMessages[runId] = m
+            lock.unlock()
             mirrorEventLock.lock()
             let persistedSession = try? providerSessionRepo?.get(threadId: threadId)
             let persistedThread = try? threadRepo.get(id: threadId)
@@ -3418,7 +3521,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let finishedModel = runMetadata?.model ?? thread.model
         run.status = pending.status
         run.finishedAt = pending.finishedAt
-        run.errorMessage = nil
+        // Persist the resolved reason for abnormal ends. User cancel leaves this nil.
+        run.errorMessage = pending.errorMessage
 
         thread.status = pending.status
         thread.hasUnread = Self.hasUnread(for: pending.status)
@@ -4580,6 +4684,8 @@ private struct PendingTerminalEvent {
     var assistantMessage: AgentMessage?
     var finishedAt: Date
     var providerTerminalAcknowledged: Bool
+    /// Durable `agent_runs.error_message` for this terminal (nil for cancel/success).
+    var errorMessage: String?
 }
 
 private struct DeferredProviderTerminalEvent {

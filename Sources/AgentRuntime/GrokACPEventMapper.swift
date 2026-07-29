@@ -327,13 +327,20 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         let output = int(raw["outputTokens"]) ?? int(raw["output_tokens"]) ?? 0
         let total = int(raw["totalTokens"]) ?? int(raw["total_tokens"]) ?? input + output
         let cached = int(raw["cachedReadTokens"]) ?? int(raw["cache_read_input_tokens"])
+            ?? int(raw["cacheReadInputTokens"])
+        let window = int(raw["contextWindow"]) ?? int(raw["context_window"]) ?? int(raw["modelContextWindow"])
         guard total > 0 || input > 0 || output > 0 else { return nil }
+        // ACP usage_update / finishTurn usage is per-request occupancy, not the
+        // cumulative modelUsage shape from the CLI end event.
+        let contextTokens = total > 0 ? total : (input + output)
         return AssistantTokenUsage(
             inputTokens: input,
             outputTokens: output,
             totalTokens: total,
+            contextWindow: window,
             uncachedInputTokens: cached.map { max(0, input - $0) },
-            cacheReadInputTokens: cached
+            cacheReadInputTokens: cached,
+            contextTokens: contextTokens > 0 ? contextTokens : nil
         )
     }
 

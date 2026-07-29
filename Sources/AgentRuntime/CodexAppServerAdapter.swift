@@ -188,6 +188,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     // covers recover/read/settings; `rollbackTimeout` the longer rollback.
     private let openTimeout: TimeInterval
     private let rollbackTimeout: TimeInterval
+    /// Bounded resume retries after a desynchronized `thread/resume` timeout.
+    private let threadResumeRetryPolicy: CodexThreadResumeRetryPolicy
 
     // Model-list cache (guarded by `lock`).
     private var cachedModels: [AgentModelDescriptor]? = nil
@@ -202,12 +204,14 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 rollbackTimeout: TimeInterval = 30,
                 modelCacheTTL: TimeInterval = 300,
                 modelListDiscovery: (@Sendable () async -> [AgentModelDescriptor])? = nil,
-                forkProtocolSupportOverride: CodexForkProtocolSupport? = nil) {
+                forkProtocolSupportOverride: CodexForkProtocolSupport? = nil,
+                threadResumeRetryPolicy: CodexThreadResumeRetryPolicy = .production) {
         self.binaryNameOverride = binaryNameOverride
         self.usesCustomClientFactory = clientFactory != nil
         self.forkProtocolSupportOverride = forkProtocolSupportOverride
         self.openTimeout = openTimeout
         self.rollbackTimeout = rollbackTimeout
+        self.threadResumeRetryPolicy = threadResumeRetryPolicy
         self.modelCacheTTL = modelCacheTTL
         if let modelListDiscovery {
             self.modelListDiscovery = modelListDiscovery
@@ -840,24 +844,61 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         for request: AgentRunRequest,
         onEvent: @escaping @Sendable (AgentRunEvent) -> Void
     ) async throws -> OpenedClient {
-        let client = try clientFor(request: request, onEvent: onEvent)
-        installTerminationHandler(for: client, threadId: request.threadId)
-        do {
-            _ = try await client.initialize(clientName: "remotecode", clientTitle: "RemoteCode", clientVersion: "0.0.0")
-            let opened = try await client.openThread(for: request)
-            return OpenedClient(
-                client: client,
-                result: opened,
-                resumeFellBackToStart: opened.resumeFellBackToStart
-            )
-        } catch {
-            client.stop()
-            guard request.providerThreadId?.isEmpty == false,
-                  CodexAppServerClient.requiresFreshClientAfterThreadResumeFailure(error) else {
-                throw error
+        let wantsResume = request.providerThreadId?.isEmpty == false
+        // Only spend the multi-attempt resume budget when we are actually
+        // resuming. A cold start still uses a single attempt.
+        let maxResumeAttempts = wantsResume ? threadResumeRetryPolicy.maxAttempts : 1
+        var resumeTimeoutAttempts = 0
+        var lastResumeTimeout: Error?
+
+        for attempt in 1...maxResumeAttempts {
+            try Task.checkCancellation()
+            if attempt > 1 {
+                let delay = threadResumeRetryPolicy.backoffNanoseconds(beforeAttempt: attempt)
+                if delay > 0 {
+                    try await Task.sleep(nanoseconds: delay)
+                }
+                try Task.checkCancellation()
+            }
+
+            let client = try clientFor(request: request, onEvent: onEvent)
+            installTerminationHandler(for: client, threadId: request.threadId)
+            do {
+                _ = try await client.initialize(clientName: "remotecode", clientTitle: "RemoteCode", clientVersion: "0.0.0")
+                let opened = try await client.openThread(for: request)
+                return OpenedClient(
+                    client: client,
+                    result: opened,
+                    resumeFellBackToStart: opened.resumeFellBackToStart
+                )
+            } catch is CancellationError {
+                client.stop()
+                throw CancellationError()
+            } catch {
+                client.stop()
+                // Dead peer: do not burn the slow-resume budget. Surface the
+                // typed death error immediately so the run fails fast.
+                if CodexAppServerClient.isDeadAppServerFailure(error) {
+                    throw error
+                }
+                guard wantsResume,
+                      CodexAppServerClient.requiresFreshClientAfterThreadResumeFailure(error) else {
+                    throw error
+                }
+                // Timeout desynchronized this client. Retry resume on a fresh
+                // peer — `thread/resume` is safe to re-issue (same thread id).
+                resumeTimeoutAttempts += 1
+                lastResumeTimeout = error
             }
         }
 
+        // Resume retries exhausted: last chance is a fresh thread/start so a
+        // slow-but-recoverable peer does not destroy the user turn entirely.
+        guard wantsResume, lastResumeTimeout != nil else {
+            throw lastResumeTimeout ?? CodexAppServerError.responseTypeMismatch
+        }
+
+        try Task.checkCancellation()
         let freshRequest = Self.requestStartingFreshThread(from: request)
         let replacement = try clientFor(request: freshRequest, onEvent: onEvent)
         installTerminationHandler(for: replacement, threadId: request.threadId)
@@ -865,9 +906,20 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             _ = try await replacement.initialize(clientName: "remotecode", clientTitle: "RemoteCode", clientVersion: "0.0.0")
             let opened = try await replacement.openThread(for: freshRequest)
             return OpenedClient(client: replacement, result: opened, resumeFellBackToStart: true)
+        } catch is CancellationError {
+            replacement.stop()
+            throw CancellationError()
         } catch {
             replacement.stop()
-            throw error
+            if CodexAppServerClient.isDeadAppServerFailure(error) {
+                throw error
+            }
+            // Both bounded resume retries and the start-fresh fallback failed.
+            // Prefer an actionable resume-budget error over a bare timeout.
+            throw CodexAppServerError.threadResumeUnavailable(
+                attempts: resumeTimeoutAttempts,
+                elapsedBound: threadResumeRetryPolicy.elapsedBoundHint
+            )
         }
     }
 
@@ -2907,6 +2959,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let container = payload["tokenUsage"] as? [String: Any] ?? payload["usage"] as? [String: Any] ?? payload
         let last = container["last"] as? [String: Any]
         let total = container["total"] as? [String: Any]
+        // Prefer per-turn `last` for reported input/output/totalTokens (existing
+        // Token Saver / cost accounting contract). Keep that source unchanged.
         let source = last ?? total ?? container
         let input = int(source["inputTokens"]) ?? int(source["input_tokens"]) ?? 0
         let output = int(source["outputTokens"]) ?? int(source["output_tokens"]) ?? 0
@@ -2914,7 +2968,29 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         guard totalTokens > 0 || input > 0 || output > 0 else { return nil }
         let contextWindow = int(container["modelContextWindow"]) ?? int(container["contextWindow"]) ?? int(container["maxTokens"])
         let reportedCostMicros = costMicros(from: source) ?? costMicros(from: container)
-        return AssistantTokenUsage(inputTokens: input, outputTokens: output, totalTokens: totalTokens, contextWindow: contextWindow, compactsAutomatically: true, reportedCostMicros: reportedCostMicros)
+        // Context occupancy is always the per-turn `last` bucket when present.
+        // Never use session-cumulative `total` (can be tens of millions).
+        let contextTokens: Int?
+        if let last {
+            let lastInput = int(last["inputTokens"]) ?? int(last["input_tokens"]) ?? 0
+            let lastOutput = int(last["outputTokens"]) ?? int(last["output_tokens"]) ?? 0
+            let lastTotal = int(last["totalTokens"]) ?? int(last["total_tokens"]) ?? (lastInput + lastOutput)
+            contextTokens = (lastTotal > 0 || lastInput > 0 || lastOutput > 0) ? lastTotal : nil
+        } else if total == nil {
+            // Flat per-request shape (no last/total split).
+            contextTokens = totalTokens > 0 ? totalTokens : nil
+        } else {
+            contextTokens = nil
+        }
+        return AssistantTokenUsage(
+            inputTokens: input,
+            outputTokens: output,
+            totalTokens: totalTokens,
+            contextWindow: contextWindow,
+            compactsAutomatically: true,
+            reportedCostMicros: reportedCostMicros,
+            contextTokens: contextTokens
+        )
     }
 
     private static func goalDetail(from payload: [String: Any]) -> String {

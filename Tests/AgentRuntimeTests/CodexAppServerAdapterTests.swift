@@ -860,18 +860,28 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
     }
 
     func test_adapterReplacesTimedOutResumeClientBeforeStartingFreshThread() async throws {
+        // WHY: a single timed-out resume used to start a brand-new thread and
+        // drop context. Recovery now retries resume on a fresh client first;
+        // start-fresh is only the last resort after the bounded resume budget.
         let timedOut = MockCodexAppServerClient(
             autoComplete: false,
             openThreadError: CodexAppServerError.requestTimedOut(method: "thread/resume", timeout: 30)
         )
-        let fresh = MockCodexAppServerClient(autoComplete: false)
+        let recovered = MockCodexAppServerClient(autoComplete: false)
         let factoryCalls = LockedCounter()
-        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
-            factoryCalls.increment()
-            let client = factoryCalls.value == 1 ? timedOut : fresh
-            client.notificationHandler = notificationHandler
-            return client
-        }
+        let adapter = CodexAppServerAdapter(
+            clientFactory: { _, notificationHandler, _ in
+                factoryCalls.increment()
+                let client = factoryCalls.value == 1 ? timedOut : recovered
+                client.notificationHandler = notificationHandler
+                return client
+            },
+            threadResumeRetryPolicy: CodexThreadResumeRetryPolicy(
+                maxAttempts: 2,
+                backoffNanoseconds: [],
+                perAttemptTimeoutHint: 30
+            )
+        )
         let threadId = AgentThreadID()
 
         _ = try await adapter.sendTurn(AgentRunRequest(
@@ -887,27 +897,190 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                       "the deadline-stopped resume client must never receive a fallback request")
         XCTAssertEqual(timedOut.openedRequests.map(\.providerThreadId), ["persisted-thread"],
                        "the first client must attempt the persisted resume exactly once")
-        XCTAssertEqual(fresh.openedRequests.map(\.providerThreadId), [nil],
-                       "the replacement client must start fresh instead of replaying the timed-out resume")
-        XCTAssertEqual(fresh.startedTurns.map(\.providerThreadId), ["codex-thread-1"],
-                       "only the replacement client may begin the requested provider turn")
+        XCTAssertEqual(recovered.openedRequests.map(\.providerThreadId), ["persisted-thread"],
+                       "the replacement client must retry the same thread/resume, not drop context immediately")
+        XCTAssertEqual(recovered.startedTurns.map(\.providerThreadId), ["persisted-thread"],
+                       "only the recovered resume client may begin the requested provider turn")
+    }
+
+    func test_slowThreadResumeThenSuccessDoesNotFailTheRun() async throws {
+        // WHY: a single slow thread/resume used to hard-fail the run. One
+        // transient timeout must not destroy a continue-on-existing-thread turn.
+        let timedOut = MockCodexAppServerClient(
+            autoComplete: false,
+            openThreadError: CodexAppServerError.requestTimedOut(method: "thread/resume", timeout: 0.05)
+        )
+        let recovered = MockCodexAppServerClient(autoComplete: false)
+        let factoryCalls = LockedCounter()
+        let adapter = CodexAppServerAdapter(
+            clientFactory: { _, notificationHandler, _ in
+                factoryCalls.increment()
+                let client = factoryCalls.value == 1 ? timedOut : recovered
+                client.notificationHandler = notificationHandler
+                return client
+            },
+            threadResumeRetryPolicy: CodexThreadResumeRetryPolicy(
+                maxAttempts: 3,
+                backoffNanoseconds: [],
+                perAttemptTimeoutHint: 0.05
+            )
+        )
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        let handle = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "continue after a slow resume",
+            providerThreadId: "slow-thread"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        XCTAssertEqual(factoryCalls.value, 2, "one timed-out resume client plus one successful retry")
+        XCTAssertEqual(recovered.openedRequests.map(\.providerThreadId), ["slow-thread"])
+        XCTAssertEqual(recovered.startedTurns.map(\.providerThreadId), ["slow-thread"])
+        XCTAssertTrue(adapter.hasSession(threadId: threadId),
+                      "a recovered resume must leave a live session instead of failing the run")
+        handle.cancel()
+    }
+
+    func test_permanentlyUnresponsiveResumeTerminatesWithActionableMessage() async throws {
+        // WHY: a dead/silent app-server must not hang or retry forever. The
+        // bounded budget ends with a message that names the operation and bound.
+        let factoryCalls = LockedCounter()
+        let adapter = CodexAppServerAdapter(
+            clientFactory: { _, notificationHandler, _ in
+                factoryCalls.increment()
+                let client = MockCodexAppServerClient(
+                    autoComplete: false,
+                    openThreadError: CodexAppServerError.requestTimedOut(method: "thread/resume", timeout: 0.05)
+                )
+                client.notificationHandler = notificationHandler
+                return client
+            },
+            threadResumeRetryPolicy: CodexThreadResumeRetryPolicy(
+                maxAttempts: 2,
+                backoffNanoseconds: [],
+                perAttemptTimeoutHint: 0.05
+            )
+        )
+        let startedAt = Date()
+
+        do {
+            _ = try await adapter.sendTurn(AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: "/tmp/remotecode-app-server-adapter",
+                prompt: "must not hang",
+                providerThreadId: "dead-thread"
+            )) { _ in }
+            XCTFail("an unresponsive app-server must terminate within the resume bound")
+        } catch let error as CodexAppServerError {
+            guard case .threadResumeUnavailable(let attempts, let elapsedBound) = error else {
+                return XCTFail("expected threadResumeUnavailable, got \(error)")
+            }
+            XCTAssertEqual(attempts, 2)
+            XCTAssertEqual(elapsedBound, 0.1, accuracy: 0.000_1)
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("thread/resume"), "error must name the operation: \(message)")
+            XCTAssertTrue(message.contains("0.1s") || message.contains("0.1"),
+                          "error must name the elapsed bound: \(message)")
+            XCTAssertTrue(message.localizedCaseInsensitiveContains("retry")
+                            || message.localizedCaseInsensitiveContains("new"),
+                          "error must tell the user what to do: \(message)")
+            XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1,
+                              "must not hang or retry unbounded")
+            // 2 resume attempts + 1 start-fresh fallback
+            XCTAssertEqual(factoryCalls.value, 3)
+        }
+    }
+
+    func test_cancellationDuringResumeRetryStopsPromptly() async throws {
+        // WHY: user Stop (Task cancel) during a resume retry/backoff must not
+        // wait out the full multi-attempt budget.
+        let openEntered = expectation(description: "first openThread entered")
+        let factoryCalls = LockedCounter()
+        let adapter = CodexAppServerAdapter(
+            clientFactory: { _, notificationHandler, _ in
+                factoryCalls.increment()
+                let client = MockCodexAppServerClient(
+                    autoComplete: false,
+                    openThreadBehavior: .hangUntilCancelled(onEnter: {
+                        if factoryCalls.value == 1 {
+                            openEntered.fulfill()
+                        }
+                    })
+                )
+                client.notificationHandler = notificationHandler
+                return client
+            },
+            threadResumeRetryPolicy: CodexThreadResumeRetryPolicy(
+                maxAttempts: 3,
+                backoffNanoseconds: [5_000_000_000, 5_000_000_000],
+                perAttemptTimeoutHint: 30
+            )
+        )
+        let threadId = AgentThreadID()
+        let startedAt = Date()
+        let task = Task {
+            try await adapter.sendTurn(AgentRunRequest(
+                threadId: threadId,
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: "/tmp/remotecode-app-server-adapter",
+                prompt: "cancel me during resume",
+                providerThreadId: "cancel-thread"
+            )) { _ in }
+        }
+
+        await fulfillment(of: [openEntered], timeout: 1)
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("cancelled resume open must not succeed")
+        } catch is CancellationError {
+            // expected
+        } catch {
+            // Some paths wrap cancellation; accept either shape if the run ends promptly.
+            let message = String(describing: error).lowercased()
+            XCTAssertTrue(
+                error is CancellationError || message.contains("cancel"),
+                "expected cancellation, got \(error)"
+            )
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1,
+                          "cancel during resume retry must stop promptly, not wait out backoff/timeouts")
+        XCTAssertEqual(factoryCalls.value, 1,
+                       "cancel must not continue spawning further resume retry clients")
     }
 
     func test_adapterIgnoresDelayedTerminationFromReplacedTimedOutResumeClient() async throws {
         // WHY: stopping the timed-out resume client does not guarantee its
-        // process-exit callback cannot arrive after the fresh session is stored.
+        // process-exit callback cannot arrive after the recovered session is stored.
         let timedOut = MockCodexAppServerClient(
             autoComplete: false,
             openThreadError: CodexAppServerError.requestTimedOut(method: "thread/resume", timeout: 30)
         )
-        let fresh = MockCodexAppServerClient(autoComplete: false)
+        let recovered = MockCodexAppServerClient(autoComplete: false)
         let factoryCalls = LockedCounter()
-        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
-            factoryCalls.increment()
-            let client = factoryCalls.value == 1 ? timedOut : fresh
-            client.notificationHandler = notificationHandler
-            return client
-        }
+        let adapter = CodexAppServerAdapter(
+            clientFactory: { _, notificationHandler, _ in
+                factoryCalls.increment()
+                let client = factoryCalls.value == 1 ? timedOut : recovered
+                client.notificationHandler = notificationHandler
+                return client
+            },
+            threadResumeRetryPolicy: CodexThreadResumeRetryPolicy(
+                maxAttempts: 2,
+                backoffNanoseconds: [],
+                perAttemptTimeoutHint: 30
+            )
+        )
         let threadId = AgentThreadID()
 
         _ = try await adapter.sendTurn(AgentRunRequest(
@@ -922,26 +1095,34 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         timedOut.simulateTermination()
 
         XCTAssertTrue(adapter.hasSession(threadId: threadId),
-                      "a delayed callback from the stopped resume client must not remove the fresh session")
-        XCTAssertFalse(fresh.didStop,
+                      "a delayed callback from the stopped resume client must not remove the recovered session")
+        XCTAssertFalse(recovered.didStop,
                        "the replacement client must remain usable after the old client exits late")
     }
 
     func test_adapterRecoveryFallbackDoesNotRestoreStaleActiveTurn() async throws {
-        // WHY: the persisted active turn belongs to the timed-out thread/resume
-        // client, not the replacement thread/start session.
+        // WHY: when resume keeps timing out and we fall back to thread/start, the
+        // persisted active turn belongs to the old peer, not the replacement session.
         let timedOut = MockCodexAppServerClient(
             autoComplete: false,
             openThreadError: CodexAppServerError.requestTimedOut(method: "thread/resume", timeout: 30)
         )
-        let fresh = MockCodexAppServerClient(autoComplete: false)
+        let freshStart = MockCodexAppServerClient(autoComplete: false)
         let factoryCalls = LockedCounter()
-        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
-            factoryCalls.increment()
-            let client = factoryCalls.value == 1 ? timedOut : fresh
-            client.notificationHandler = notificationHandler
-            return client
-        }
+        let adapter = CodexAppServerAdapter(
+            clientFactory: { _, notificationHandler, _ in
+                factoryCalls.increment()
+                // Exhaust the resume budget with timeouts, then allow start-fresh.
+                let client = factoryCalls.value <= 2 ? timedOut : freshStart
+                client.notificationHandler = notificationHandler
+                return client
+            },
+            threadResumeRetryPolicy: CodexThreadResumeRetryPolicy(
+                maxAttempts: 2,
+                backoffNanoseconds: [],
+                perAttemptTimeoutHint: 30
+            )
+        )
         let threadId = AgentThreadID()
         let sink = EventSink()
 
@@ -959,10 +1140,10 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         try adapter.interruptTurn(threadId: threadId)
 
         XCTAssertTrue(timedOut.didStop)
-        XCTAssertEqual(fresh.openedRequests.map(\.providerThreadId), [nil])
+        XCTAssertEqual(freshStart.openedRequests.map(\.providerThreadId), [nil])
         XCTAssertEqual(adapter.listSessions().first?.status, .completed,
                        "a fresh fallback has no recovered active turn and must not be marked running")
-        XCTAssertTrue(fresh.interruptedTurns.isEmpty,
+        XCTAssertTrue(freshStart.interruptedTurns.isEmpty,
                       "Stop must not send the stale turn id to the new provider thread")
         let events = try await waitForEvents(in: sink) { events in
             events.contains {
@@ -2499,6 +2680,8 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(usage.reportedCostMicros, 4_200,
                        "Codex monetary receipts must be preserved when the app-server provides one")
         XCTAssertEqual(usage.contextWindow, 258400)
+        XCTAssertEqual(usage.contextTokens, 126,
+                       "context occupancy must come from the per-turn last bucket, not session-cumulative total")
         XCTAssertEqual(usage.compactsAutomatically, true,
                        "Codex app-server context windows auto-compact; RemoteCode must preserve that capability in the same context status surface as T3Code")
         let events = try await waitForEvents(in: sink) { events in
@@ -2511,6 +2694,81 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(events.contains { if case .contextCompaction(let summary) = $0 { return summary == "Context compaction" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.type == .contextCompaction && item.summary == "Context compacted" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "native-context-compaction" && item.type == .contextCompaction && item.summary == "Context compaction" } else { return false } })
+    }
+
+    /// Live Codex rows can expose a multi-million `total.totalTokens` while `last`
+    /// is the true per-turn occupancy. contextTokens must never take the cumulative
+    /// total (that is what produced Claude-style 999% gauges when misread).
+    func test_adapterTokenUsage_contextTokensFromLast_notHugeCumulativeTotal() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter-context-tokens",
+            prompt: "telemetry"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.notificationHandler?("thread/tokenUsage/updated", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-ctx",
+            "tokenUsage": [
+                "total": ["inputTokens": 66_000_000, "outputTokens": 78_449, "totalTokens": 66_078_449],
+                "last": ["inputTokens": 167_400, "outputTokens": 151, "totalTokens": 167_551],
+                "modelContextWindow": 258_400
+            ]
+        ])
+
+        let usage = try await waitForTokenUsage(in: sink)
+        XCTAssertEqual(usage.totalTokens, 167_551,
+                       "existing last-preferred totalTokens contract must not change")
+        XCTAssertEqual(usage.contextTokens, 167_551)
+        XCTAssertNotEqual(usage.contextTokens, 66_078_449)
+        XCTAssertEqual(usage.contextWindow, 258_400)
+    }
+
+    func test_adapterTokenUsage_totalOnly_leavesContextTokensNil() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter-total-only",
+            prompt: "telemetry"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.notificationHandler?("thread/tokenUsage/updated", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-total-only",
+            "tokenUsage": [
+                "total": ["inputTokens": 66_000_000, "outputTokens": 78_449, "totalTokens": 66_078_449],
+                "modelContextWindow": 258_400
+            ]
+        ])
+
+        let usage = try await waitForTokenUsage(in: sink)
+        XCTAssertEqual(usage.totalTokens, 66_078_449,
+                       "without last, totalTokens still falls back to total for billing")
+        XCTAssertNil(usage.contextTokens,
+                     "cumulative total-only payload must not claim context occupancy")
     }
 
     func test_adapterRendersTurnCompletedFinalPayloadWhenOnlyRuntimeItemsStreamed() async throws {
@@ -3531,6 +3789,13 @@ private func waitForItemCompleted(in sink: EventSink, itemId: String) async thro
     throw CodexAdapterTestWaitError.timedOut("item completion \(itemId)")
 }
 
+private enum MockOpenThreadBehavior: Sendable {
+    case succeed
+    case throwError(Error)
+    /// Deterministic cancel path: await until the surrounding Task is cancelled.
+    case hangUntilCancelled(onEnter: @Sendable () -> Void)
+}
+
 private final class MockCodexAppServerClient: CodexAppServerControlling, @unchecked Sendable {
     struct StartedTurn {
         let providerThreadId: String
@@ -3561,7 +3826,7 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     let autoComplete: Bool
     let interruptDelayNanoseconds: UInt64
     let startTurnError: Error?
-    let openThreadError: Error?
+    let openThreadBehavior: MockOpenThreadBehavior
     let updateSettingsError: Error?
     private let lock = NSLock()
     private var _didStop = false
@@ -3581,13 +3846,20 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
         interruptDelayNanoseconds: UInt64 = 0,
         startTurnError: Error? = nil,
         openThreadError: Error? = nil,
+        openThreadBehavior: MockOpenThreadBehavior? = nil,
         updateSettingsError: Error? = nil,
         supportsForkReconciliation: Bool = false
     ) {
         self.autoComplete = autoComplete
         self.interruptDelayNanoseconds = interruptDelayNanoseconds
         self.startTurnError = startTurnError
-        self.openThreadError = openThreadError
+        if let openThreadBehavior {
+            self.openThreadBehavior = openThreadBehavior
+        } else if let openThreadError {
+            self.openThreadBehavior = .throwError(openThreadError)
+        } else {
+            self.openThreadBehavior = .succeed
+        }
         self.updateSettingsError = updateSettingsError
         self.forkProtocolSupport = supportsForkReconciliation
             ? CodexForkProtocolSupport(isSupported: true, reason: "test schema")
@@ -3669,7 +3941,20 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
 
     func openThread(for request: AgentRunRequest) async throws -> CodexAppServerThreadOpenResult {
         recordOpened(request)
-        if let openThreadError { throw openThreadError }
+        switch openThreadBehavior {
+        case .succeed:
+            break
+        case .throwError(let error):
+            throw error
+        case .hangUntilCancelled(let onEnter):
+            onEnter()
+            // Cooperative cancel: Task.sleep throws CancellationError when the
+            // parent Task is cancelled — no wall-clock timeout dependency.
+            while !Task.isCancelled {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            throw CancellationError()
+        }
         let providerThreadId = request.providerThreadId?.isEmpty == false ? request.providerThreadId! : "codex-thread-1"
         return CodexAppServerThreadOpenResult(providerThreadId: providerThreadId, response: ["id": providerThreadId])
     }

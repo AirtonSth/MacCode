@@ -247,6 +247,7 @@ public final class GrokParser {
             var uncached = 0
             var read = 0
             var output = 0
+            var window: Int?
             var modelCostUSD = 0.0
             var modelCostComplete = true
             var modelCount = 0
@@ -261,10 +262,16 @@ public final class GrokParser {
                 } else {
                     modelCostComplete = false
                 }
+                if let contextWindow = intValue(usage["contextWindow"]) ?? intValue(usage["context_window"]) {
+                    window = max(window ?? 0, contextWindow)
+                }
             }
             // Prefer top-level usage for cache-read when modelUsage omitted it.
             if read == 0, let top = obj["usage"] as? [String: Any] {
                 read = intValue(top["cache_read_input_tokens"]) ?? intValue(top["cacheReadInputTokens"]) ?? 0
+            }
+            if window == nil, let top = obj["usage"] as? [String: Any] {
+                window = intValue(top["context_window"]) ?? intValue(top["contextWindow"])
             }
             let input = uncached + read
             let total = input + output
@@ -274,13 +281,18 @@ public final class GrokParser {
                     ?? (modelCount > 0 && modelCostComplete ? modelCostUSD : nil)
                     ?? costUSD(from: obj["usage"] as? [String: Any])
             )
+            // modelUsage is session-cumulative (cache re-reads sum across the
+            // session). Leave contextTokens nil so the gauge cannot treat it as
+            // current context occupancy.
             return AssistantTokenUsage(
                 inputTokens: input,
                 outputTokens: output,
                 totalTokens: total,
+                contextWindow: window,
                 uncachedInputTokens: uncached,
                 cacheReadInputTokens: read > 0 ? read : nil,
-                reportedCostMicros: reportedCostMicros
+                reportedCostMicros: reportedCostMicros,
+                contextTokens: nil
             )
         }
 
@@ -297,18 +309,24 @@ public final class GrokParser {
             ?? intValue(usage["totalTokens"])
             ?? (input + output + reasoning)
         guard total > 0 || input > 0 || output > 0 else { return nil }
+        let window = intValue(usage["context_window"]) ?? intValue(usage["contextWindow"])
         let reportedCostMicros = costMicros(
             fromUSD: doubleValue(obj["total_cost_usd"] ?? obj["totalCostUSD"])
                 ?? doubleValue(usage["costUSD"] ?? usage["cost_usd"])
                 ?? costUSD(from: usage)
         )
+        // Per-request occupancy: uncached + cache read + output (+ reasoning when
+        // billed separately). Not the cumulative modelUsage path.
+        let contextTokens = uncached + read + max(output, reasoning > 0 && output == 0 ? reasoning : output)
         return AssistantTokenUsage(
             inputTokens: input,
             outputTokens: max(output, reasoning > 0 && output == 0 ? reasoning : output),
             totalTokens: total,
+            contextWindow: window,
             uncachedInputTokens: uncached,
             cacheReadInputTokens: read > 0 ? read : nil,
-            reportedCostMicros: reportedCostMicros
+            reportedCostMicros: reportedCostMicros,
+            contextTokens: contextTokens > 0 ? contextTokens : nil
         )
     }
 

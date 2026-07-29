@@ -9,6 +9,8 @@ public enum CodexAppServerError: Error, CustomStringConvertible {
     case processExited(stderrTail: String)
     case responseTypeMismatch
     case requestTimedOut(method: String, timeout: TimeInterval)
+    /// Resume (and optional start-fresh fallback) exhausted its bounded budget.
+    case threadResumeUnavailable(attempts: Int, elapsedBound: TimeInterval)
 
     public var description: String {
         switch self {
@@ -22,8 +24,65 @@ public enum CodexAppServerError: Error, CustomStringConvertible {
                 : "Codex app-server process exited: \(stderrTail)"
         case .responseTypeMismatch: return "Codex app-server response had an unexpected shape"
         case .requestTimedOut(let method, let timeout):
-            return "Codex app-server RPC \(method) timed out after \(timeout)s"
+            // Actionable: name the RPC, the elapsed bound, and what the user can do.
+            // Intermediate timeouts may still be retried by the adapter; this string
+            // is also what is stored when recovery cannot continue.
+            return "Codex app-server RPC \(method) timed out after \(Self.formatTimeout(timeout)). The app-server did not answer in time (large threads can be slow, or Codex may be stuck). Retry the run; if it keeps failing, verify Codex is healthy or start a new thread."
+        case .threadResumeUnavailable(let attempts, let elapsedBound):
+            return "Codex thread/resume did not succeed after \(attempts) attempt(s) within \(Self.formatTimeout(elapsedBound)). The app-server stayed unresponsive. Stop and retry, check that the `codex` binary is installed and responsive, or start a new Codex thread."
         }
+    }
+
+    private static func formatTimeout(_ timeout: TimeInterval) -> String {
+        if timeout == timeout.rounded() && timeout >= 1 {
+            return "\(Int(timeout))s"
+        }
+        return String(format: "%.1fs", timeout)
+    }
+}
+
+/// Bounded retry policy for a slow/transient `thread/resume` on a desynchronized
+/// peer. Each attempt uses a fresh app-server client because a timed-out JSON-RPC
+/// stream must not be reused. Never retries forever.
+public struct CodexThreadResumeRetryPolicy: Sendable, Equatable {
+    public let maxAttempts: Int
+    /// Backoff before attempts 2...N (index 0 = delay before 2nd attempt).
+    public let backoffNanoseconds: [UInt64]
+    /// Per-attempt RPC deadline used only to compute the actionable elapsed bound
+    /// in the final error (the live client still owns its own `requestTimeout`).
+    public let perAttemptTimeoutHint: TimeInterval
+
+    public static let production = CodexThreadResumeRetryPolicy(
+        maxAttempts: 3,
+        backoffNanoseconds: [500_000_000, 1_000_000_000],
+        perAttemptTimeoutHint: 30
+    )
+
+    public init(
+        maxAttempts: Int,
+        backoffNanoseconds: [UInt64] = [],
+        perAttemptTimeoutHint: TimeInterval = 30
+    ) {
+        self.maxAttempts = max(1, maxAttempts)
+        self.backoffNanoseconds = backoffNanoseconds
+        self.perAttemptTimeoutHint = max(0.001, perAttemptTimeoutHint)
+    }
+
+    public func backoffNanoseconds(beforeAttempt attempt: Int) -> UInt64 {
+        // `attempt` is 1-based; backoff applies before attempt 2+.
+        let index = attempt - 2
+        guard index >= 0 else { return 0 }
+        if index < backoffNanoseconds.count {
+            return backoffNanoseconds[index]
+        }
+        return backoffNanoseconds.last ?? 0
+    }
+
+    public var elapsedBoundHint: TimeInterval {
+        let backoffs = backoffNanoseconds.reduce(TimeInterval(0)) { partial, ns in
+            partial + TimeInterval(ns) / 1_000_000_000
+        }
+        return (perAttemptTimeoutHint * TimeInterval(maxAttempts)) + backoffs
     }
 }
 
@@ -684,14 +743,28 @@ public final class CodexAppServerClient: @unchecked Sendable {
     }
 
     /// A timed-out request stops this client because its JSON-RPC stream may be
-    /// desynchronized. The adapter may only recover a timed-out resume by
-    /// creating a new client and starting a fresh thread.
+    /// desynchronized. The adapter recovers a timed-out `thread/resume` by
+    /// creating a new client and retrying resume (bounded), then falling back
+    /// to `thread/start` only after those retries are exhausted.
     public static func requiresFreshClientAfterThreadResumeFailure(_ error: Error) -> Bool {
         guard let appServerError = error as? CodexAppServerError,
               case .requestTimedOut(let method, _) = appServerError else {
             return false
         }
         return method == "thread/resume"
+    }
+
+    /// Process death / spawn failure is not a "slow resume" signal — fail fast
+    /// with the existing typed error rather than spending the multi-attempt
+    /// resume budget waiting on a dead peer.
+    public static func isDeadAppServerFailure(_ error: Error) -> Bool {
+        guard let appServerError = error as? CodexAppServerError else { return false }
+        switch appServerError {
+        case .processExited, .spawnFailed, .missingBinary:
+            return true
+        default:
+            return false
+        }
     }
 
     private static func threadId(from response: JSONObject) throws -> String {

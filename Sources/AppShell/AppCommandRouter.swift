@@ -35,7 +35,7 @@ private struct ProviderProbeCacheKey: Hashable {
     }
 }
 
-private struct ProviderProbeCapabilities {
+private struct ProviderProbeCapabilities: Sendable {
     var version: String?
     var authenticated: Bool?
     var accountLabel: String?
@@ -3945,7 +3945,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     provider: instance.provider,
                     runAsUser: runAsUser
                 )
-                let capabilities = providerProbeCapabilities(
+                let capabilities = await providerProbeCapabilities(
                     provider: instance.provider,
                     binaryPath: binaryPath,
                     environment: env,
@@ -4070,7 +4070,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             let binary = configuredProviderBinary(provider) ?? provider.rawValue
             let binaryPath = Self.resolveProviderBinaryPath(binary: binary, runAsUser: runAsUser)
             let env = Self.probeEnvironment(base: [:], provider: provider, runAsUser: runAsUser)
-            let capabilities = providerProbeCapabilities(
+            let capabilities = await providerProbeCapabilities(
                 provider: provider,
                 binaryPath: binaryPath,
                 environment: env,
@@ -4248,12 +4248,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
+    /// CLI auth/version probes spawn `Process` and block until exit. Must not
+    /// run under `@MainActor` (the Agent App send path awaits snapshot loads
+    /// through this router). Cache hits stay on MainActor; misses hop to a
+    /// detached task and only the dictionary write returns to MainActor.
     private func providerProbeCapabilities(
         provider: AgentProvider,
         binaryPath: String,
         environment: [String: String],
         runAsUser: AgentRunAsUser? = nil
-    ) -> ProviderProbeCapabilities {
+    ) async -> ProviderProbeCapabilities {
         // Cache key includes the run-as-user so airtonempat and airtonjunior
         // never share a stale authenticated flag.
         let runAsKey = runAsUser.map { "\($0.uid):\($0.shortName)" } ?? "self"
@@ -4270,24 +4274,35 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // Foreign identity: probe via sudo -n -u (same as spawn, non-interactive).
         // Avoids HOME-only false "not authenticated" that blocked Auto while
         // Manual + sudo -A would still run.
-        let auth = ProviderCLIProbe.authStatus(
+        let skillsRoot = Self.providerSkillsRoot(
             provider: provider,
-            binaryPath: binaryPath,
             environment: environment,
-            runAsUser: runAsUser
+            defaultHome: FileManager.default.homeDirectoryForCurrentUser.path
         )
-        let version = ProviderCLIProbe.versionStatus(binaryPath: binaryPath, environment: environment)
-        let capabilities = ProviderProbeCapabilities(
-            version: version.version,
-            authenticated: auth.authenticated,
-            accountLabel: auth.accountLabel,
-            accountAuthMethod: auth.accountAuthMethod,
-            updateState: version.updateState,
-            advisory: version.advisory,
-            slashCommands: ProviderCLIProbe.slashCommands(provider: provider, binaryPath: binaryPath, environment: environment),
-            skills: providerSkills(provider: provider, environment: environment),
-            capturedAt: now
-        )
+        let capabilities = await Task.detached(priority: .userInitiated) {
+            let auth = ProviderCLIProbe.authStatus(
+                provider: provider,
+                binaryPath: binaryPath,
+                environment: environment,
+                runAsUser: runAsUser
+            )
+            let version = ProviderCLIProbe.versionStatus(binaryPath: binaryPath, environment: environment)
+            return ProviderProbeCapabilities(
+                version: version.version,
+                authenticated: auth.authenticated,
+                accountLabel: auth.accountLabel,
+                accountAuthMethod: auth.accountAuthMethod,
+                updateState: version.updateState,
+                advisory: version.advisory,
+                slashCommands: ProviderCLIProbe.slashCommands(
+                    provider: provider,
+                    binaryPath: binaryPath,
+                    environment: environment
+                ),
+                skills: Self.discoverSkillNames(in: skillsRoot),
+                capturedAt: now
+            )
+        }.value
         providerProbeCache[key] = capabilities
         return capabilities
     }
@@ -4300,7 +4315,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         ))
     }
 
-    static func providerSkillsRoot(
+    nonisolated static func providerSkillsRoot(
         provider: AgentProvider,
         environment: [String: String],
         defaultHome: String
@@ -4322,7 +4337,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private static func discoverSkillNames(in root: URL) -> [String] {
+    nonisolated private static func discoverSkillNames(in root: URL) -> [String] {
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: root,
             includingPropertiesForKeys: [.isDirectoryKey],

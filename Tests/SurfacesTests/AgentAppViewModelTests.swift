@@ -1098,7 +1098,15 @@ final class AgentAppViewModelTests: XCTestCase {
 
     func test_contextHealthMessageShowsTokenBudgetAndCompaction() throws {
         let (vm, _) = try makeVM()
-        vm.timeline.apply(.tokenUsage(AssistantTokenUsage(inputTokens: 400, outputTokens: 100, totalTokens: 500, contextWindow: 1_000, compactsAutomatically: true)))
+        // Percentage is driven by per-request contextTokens, not cumulative totalTokens.
+        vm.timeline.apply(.tokenUsage(AssistantTokenUsage(
+            inputTokens: 400,
+            outputTokens: 100,
+            totalTokens: 500,
+            contextWindow: 1_000,
+            compactsAutomatically: true,
+            contextTokens: 500
+        )))
 
         XCTAssertEqual(vm.contextHealthMessage, "Context 50% · 500 / 1000 tokens · auto-compacts",
                        "macOS Agent App must expose context usage and automatic compaction capability so long agent runs do not silently approach the context limit")
@@ -7187,7 +7195,8 @@ private final class ContextTelemetryRunner: AgentProviderRunner, @unchecked Send
                 outputTokens: 100,
                 totalTokens: 500,
                 contextWindow: 1_000,
-                compactsAutomatically: true
+                compactsAutomatically: true,
+                contextTokens: 500
             ))))
             onEvent(.event(.contextCompaction(summary: "older turns summarized")))
             onEvent(.event(.turnCompleted(turnId: turnId, finalMessage: "context ready")))

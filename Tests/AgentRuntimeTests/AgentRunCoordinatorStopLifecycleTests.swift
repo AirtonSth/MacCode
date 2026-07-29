@@ -653,6 +653,248 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
             XCTAssertTrue(String(describing: error).contains("did not terminate"))
         }
     }
+
+    // MARK: - Stop must not stick on in-flight SR1/distill humanize
+
+    /// Runner that streams an SR1 assistant item then holds the run open until
+    /// cancel (or a long hang). Mirrors the live case: Token Saver is humanizing
+    /// streamed dialect while the user hits Stop.
+    private final class SR1StreamThenHangRunner: AgentProviderRunner, @unchecked Sendable {
+        let provider: AgentProvider = .claude
+        private let lock = NSLock()
+        private var onEvent: (@Sendable (AgentRunEvent) -> Void)?
+
+        func listModels() async -> [AgentModelDescriptor] { [] }
+        func startRun(
+            _ request: AgentRunRequest,
+            onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+        ) async throws -> AgentRunHandle {
+            lock.lock(); self.onEvent = onEvent; lock.unlock()
+            let providerThreadId = request.providerThreadId ?? UUID().uuidString
+            let itemId = "sr1-item-1"
+            onEvent(.status(.running))
+            onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
+            onEvent(.event(.turnStarted(turnId: "t-sr1")))
+            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+            onEvent(.event(.itemStarted(item: AssistantItem(
+                id: itemId,
+                turnId: "t-sr1",
+                type: .assistantMessage,
+                state: .streaming,
+                body: "",
+                startedAtMs: nowMs
+            ))))
+            // Prefix that mustBufferProviderTextPrefix treats as SR1 dialect.
+            onEvent(.event(.itemDelta(
+                itemId: itemId,
+                bodyAppend: "S: build pass. P: unit tests green.",
+                outputAppend: nil,
+                summary: nil
+            )))
+            onEvent(.event(.itemCompleted(itemId: itemId, finalState: .completed)))
+            return AgentRunHandle(runId: request.runId, process: nil) { [weak self] in
+                guard let self else { return }
+                self.lock.lock(); let emit = self.onEvent; self.lock.unlock()
+                emit?(.finished(.cancelled, finalMessage: nil, providerThreadId: providerThreadId))
+            }
+        }
+    }
+
+    /// WHY: Stop used to set isStopping=true then no-op while
+    /// providerTextTranslationsInFlight > 0 (SR1 humanize via distill). The
+    /// finished(.cancelled) path deferred forever, so Working/Stopping stuck and
+    /// the Stop button stayed disabled. User cancel must clear that gate and
+    /// reach a terminal cancelled state without waiting for distill.
+    func test_stopRun_whileSR1HumanizeInFlight_cancelsWithoutWaitingForTranslator() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("stop-during-sr1")
+        let thread = AgentThread(title: "sr1 stop", provider: .claude, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let runner = SR1StreamThenHangRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.claude: runner]
+        )
+        let hangGate = DispatchSemaphore(value: 0)
+        var translatorEntered = false
+        coordinator.finalResponseTranslator = { response, _, _, _ in
+            translatorEntered = true
+            // Simulate a stuck/slow distill sidecar. Stop must not wait on this.
+            hangGate.wait()
+            return "Humanized: \(response)"
+        }
+        let recorder = LifecycleRecorder()
+        coordinator.addObserver(recorder)
+        coordinator.onRunFinished = { tid, _, status in
+            recorder.recordRunFinished(threadId: tid, status: status)
+        }
+
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .claude,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "do work"
+        ))
+        // Let the SR1 item complete path schedule translation.
+        try await Task.sleep(nanoseconds: 80_000_000)
+        XCTAssertTrue(translatorEntered,
+                      "precondition: SR1 item completion must start humanize so the gate is live")
+
+        let stopStarted = Date()
+        coordinator.stopRun(threadId: thread.id)
+
+        await waitUntil(2) {
+            recorder.runFinishedCallbacks.contains { $0.0 == thread.id && $0.1 == .cancelled }
+        }
+        let elapsed = Date().timeIntervalSince(stopStarted)
+        hangGate.signal() // release the hung translator so the Task can exit
+
+        XCTAssertLessThan(elapsed, 1.0,
+                          "Stop must finish as cancelled without waiting on hung SR1 humanize (took \(elapsed)s)")
+        XCTAssertNil(coordinator.activeRunId(threadId: thread.id),
+                     "Stop must release active ownership even when humanize was in flight")
+        XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .cancelled)
+        XCTAssertEqual(recorder.runFinishedCallbacks.filter { $0.0 == thread.id }.count, 1,
+                       "exactly one terminal lifecycle callback for the user Stop")
+    }
+
+    /// WHY: rail "Threads · N active" / Working spinners key off
+    /// activeRunId/runThreads. When finishedAt is durable but activeThreads was
+    /// never released (missed finish / filtered observer), ghosts remain until
+    /// reconcile. Must free only run A, never a newer live run B.
+    func test_reconcileStaleActiveOwnership_releasesDurableTerminalGhostsOnly() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("reconcile-ghost")
+        final class HangRunner: AgentProviderRunner, @unchecked Sendable {
+            let provider: AgentProvider = .codex
+            func listModels() async -> [AgentModelDescriptor] { [] }
+            func startRun(
+                _ request: AgentRunRequest,
+                onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+            ) async throws -> AgentRunHandle {
+                onEvent(.status(.running))
+                return AgentRunHandle(runId: request.runId, process: nil) {
+                    // Cancel does not finish — ownership stays until reconcile.
+                }
+            }
+        }
+        let ghostThread = AgentThread(title: "ghost", provider: .codex, model: "fake-model")
+        let liveThread = AgentThread(title: "live", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(ghostThread)
+        try threadRepo.upsert(liveThread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: HangRunner()]
+        )
+        let recorder = LifecycleRecorder()
+        coordinator.addObserver(recorder)
+
+        let ghostRunId = try await coordinator.startRun(AgentRunRequest(
+            threadId: ghostThread.id, provider: .codex, model: "fake-model", cwd: tmp, prompt: "ghost"
+        ))
+        let liveRunId = try await coordinator.startRun(AgentRunRequest(
+            threadId: liveThread.id, provider: .codex, model: "fake-model", cwd: tmp, prompt: "live"
+        ))
+        // Simulate durable terminal without the normal finish path releasing memory.
+        try runRepo.markStopped(id: ghostRunId, status: .completed)
+        XCTAssertNotNil(coordinator.activeRunId(threadId: ghostThread.id),
+                        "precondition: ghost still owned in memory")
+        XCTAssertEqual(coordinator.activeRunId(threadId: liveThread.id), liveRunId)
+
+        let released = coordinator.reconcileStaleActiveOwnershipWithDurableState()
+        XCTAssertEqual(released, 1, "exactly one durable-terminal ghost must be released")
+        XCTAssertNil(coordinator.activeRunId(threadId: ghostThread.id),
+                     "ghost Working ownership must clear when finishedAt is durable")
+        XCTAssertEqual(coordinator.activeRunId(threadId: liveThread.id), liveRunId,
+                       "reconcile must not clear a still-live run on another thread")
+        XCTAssertEqual(recorder.finished.filter { $0.0 == ghostRunId }.count, 1,
+                       "stale release must fan out didFinish once for the ghost run")
+        XCTAssertFalse(recorder.finished.contains { $0.0 == liveRunId },
+                       "live run must not receive a terminal fan-out from reconcile")
+    }
+
+    /// WHY: finishingRuns was set while final-response SR1 translation ran, but
+    /// pendingTerminalEvents was still empty. markStopRequested treated
+    /// finishingRuns as durabilityPending and returned without claiming cancel —
+    /// pure no-op Stop until humanize returned.
+    func test_stopRun_duringFinalResponseSR1Translation_claimsCancelImmediately() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("stop-final-sr1")
+        final class SR1FinalThenHangRunner: AgentProviderRunner, @unchecked Sendable {
+            let provider: AgentProvider = .claude
+            func listModels() async -> [AgentModelDescriptor] { [] }
+            func startRun(
+                _ request: AgentRunRequest,
+                onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+            ) async throws -> AgentRunHandle {
+                let providerThreadId = request.providerThreadId ?? UUID().uuidString
+                onEvent(.status(.running))
+                onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
+                onEvent(.event(.turnStarted(turnId: "t-final")))
+                // Provider terminal with SR1 final — triggers finishingRuns + async translate.
+                onEvent(.finished(
+                    .completed,
+                    finalMessage: "S: build pass. P: unit tests green.",
+                    providerThreadId: providerThreadId
+                ))
+                return AgentRunHandle(runId: request.runId, process: nil) {}
+            }
+        }
+        let thread = AgentThread(title: "final sr1 stop", provider: .claude, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.claude: SR1FinalThenHangRunner()]
+        )
+        let hangGate = DispatchSemaphore(value: 0)
+        var translatorEntered = false
+        coordinator.finalResponseTranslator = { response, _, _, _ in
+            translatorEntered = true
+            hangGate.wait()
+            return "Humanized final: \(response)"
+        }
+        let recorder = LifecycleRecorder()
+        coordinator.addObserver(recorder)
+        coordinator.onRunFinished = { tid, _, status in
+            recorder.recordRunFinished(threadId: tid, status: status)
+        }
+
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .claude,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "finish with sr1"
+        ))
+        try await Task.sleep(nanoseconds: 80_000_000)
+        XCTAssertTrue(translatorEntered,
+                      "precondition: final SR1 response must enter humanize before Stop")
+        // Ownership may still be held while translation runs.
+        XCTAssertNotNil(coordinator.activeRunId(threadId: thread.id),
+                        "precondition: final SR1 humanize must still own the run in memory")
+
+        let stopStarted = Date()
+        coordinator.stopRun(threadId: thread.id)
+        await waitUntil(2) {
+            recorder.runFinishedCallbacks.contains { $0.0 == thread.id }
+        }
+        let elapsed = Date().timeIntervalSince(stopStarted)
+        hangGate.signal()
+
+        XCTAssertLessThan(elapsed, 1.0,
+                          "Stop during final SR1 humanize must not no-op until distill returns")
+        XCTAssertNil(coordinator.activeRunId(threadId: thread.id))
+        let terminal = recorder.runFinishedCallbacks.first { $0.0 == thread.id }?.1
+        XCTAssertEqual(terminal, .cancelled,
+                       "user Stop during final humanize must publish cancelled, not wait for completed")
+    }
 }
 
 private final class PendingStopStressRunner: AgentProviderRunner, @unchecked Sendable {

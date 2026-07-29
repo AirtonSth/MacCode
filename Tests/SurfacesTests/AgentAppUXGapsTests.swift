@@ -304,7 +304,7 @@ final class AgentAppUXGapsTests: XCTestCase {
     func test_stopButtonState_activeAndStopping_returnsStopping() {
         let state = AgentAppViewModel.stopButtonState(runActive: true, isStopping: true)
         XCTAssertEqual(state, .stopping,
-                       "active run after Stop clicked must return .stopping so button is disabled and labelled 'Stopping...'")
+                       "active run after Stop clicked must return .stopping so UI can label force-stop affordance")
     }
 
     func test_stopButtonState_notActive_returnsHidden() {
@@ -327,7 +327,7 @@ final class AgentAppUXGapsTests: XCTestCase {
         // Calling stop() on a VM with no real coordinator handle must still set the flag.
         vm.stop()
         XCTAssertTrue(vm.isStopping,
-                      "stop() must set isStopping=true immediately so the UI can disable the button")
+                      "stop() must set isStopping=true immediately so the UI can show Stopping feedback")
 
         // Simulate the coordinator finishing the run (as didFinish would).
         vm.status = .cancelled

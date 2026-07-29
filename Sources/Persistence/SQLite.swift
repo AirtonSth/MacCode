@@ -17,6 +17,34 @@ public enum SQLiteError: Error, CustomStringConvertible {
         case .execute(let m): return "sqlite execute: \(m)"
         }
     }
+
+    /// True when the failure is SQLite lock contention that may clear if retried
+    /// (SQLITE_BUSY / SQLITE_LOCKED and extended forms such as BUSY_SNAPSHOT).
+    public var isTransientLockContention: Bool {
+        switch self {
+        case .open(let m), .prepare(let m), .step(let m), .execute(let m):
+            return Self.messageIndicatesTransientLock(m)
+        case .bind:
+            return false
+        }
+    }
+
+    fileprivate static func messageIndicatesTransientLock(_ message: String) -> Bool {
+        let lower = message.lowercased()
+        // sqlite3_errmsg for BUSY/LOCKED is typically "database is locked" or
+        // "database table is locked". Match those and the common "database is locked"
+        // surface form already stored on failed agent runs.
+        return lower.contains("database is locked")
+            || lower.contains("database table is locked")
+    }
+
+    fileprivate static func isTransientLockCode(_ rc: Int32) -> Bool {
+        // Primary result codes: SQLITE_BUSY (5), SQLITE_LOCKED (6). Extended
+        // codes (BUSY_SNAPSHOT, BUSY_TIMEOUT, LOCKED_SHAREDCACHE, …) keep the
+        // same primary byte in the low 8 bits.
+        let primary = rc & 0xFF
+        return primary == SQLITE_BUSY || primary == SQLITE_LOCKED
+    }
 }
 
 public final class SQLiteDB {
@@ -51,10 +79,99 @@ public final class SQLiteDB {
     private var stmtCache: [String: OpaquePointer] = [:]
     var beforeStatementStepForTesting: ((String) -> Void)?
 
+    // Nesting depth for `transaction`. While > 0, individual execute/step calls
+    // must NOT retry: a mid-transaction retry would re-run only one statement and
+    // could double-apply earlier work. Retry is owned by `transaction` itself so
+    // the whole BEGIN…COMMIT unit restarts after ROLLBACK.
+    fileprivate var transactionDepth = 0
+
+    // MARK: - Transient lock retry (test hooks + policy)
+    //
+    // `PRAGMA busy_timeout` already waits for ordinary SQLITE_BUSY, but it does
+    // not cover every contention case (notably SQLITE_BUSY_SNAPSHOT and some
+    // upgrade/deadlock paths return immediately). Application-level retry is a
+    // second, bounded backstop so a brief lock does not fail an agent run.
+    private enum BusyRetryDefaults {
+        static let maxAttempts = 8
+        /// Extra sleep budget after each failed attempt (busy_timeout waits are
+        /// inside SQLite and do not count against this).
+        static let maxSleepNanoseconds: UInt64 = 2_000_000_000
+        static let initialSleepNanoseconds: UInt64 = 1_000_000
+        static let maxSingleSleepNanoseconds: UInt64 = 100_000_000
+    }
+
+    /// When non-empty, the next executeDirect/step pops a code and treats it as
+    /// the SQLite result without calling into the C API. Deterministic tests use
+    /// this to inject SQLITE_BUSY once (retry succeeds) or repeatedly (exhaust).
+    var injectedResultCodesForTesting: [Int32] = []
+    /// Counts entry into the transient-lock retry loop body (including the first
+    /// attempt). Tests assert non-transient errors do not inflate this.
+    private(set) var transientLockAttemptCountForTesting = 0
+    var busyRetryMaxAttemptsForTesting: Int?
+    var busyRetryMaxSleepNanosecondsForTesting: UInt64?
+
     func withSerializedOperation<T>(_ block: () throws -> T) rethrows -> T {
         operationLock.lock()
         defer { operationLock.unlock() }
         return try block()
+    }
+
+    fileprivate func takeInjectedResultCodeForTesting() -> Int32? {
+        guard !injectedResultCodesForTesting.isEmpty else { return nil }
+        return injectedResultCodesForTesting.removeFirst()
+    }
+
+    fileprivate func withTransientLockRetry<T>(
+        onRetry: (() -> Void)? = nil,
+        _ operation: () throws -> T
+    ) throws -> T {
+        let maxAttempts = max(1, busyRetryMaxAttemptsForTesting ?? BusyRetryDefaults.maxAttempts)
+        let maxSleep = busyRetryMaxSleepNanosecondsForTesting ?? BusyRetryDefaults.maxSleepNanoseconds
+        var attempt = 0
+        var slept: UInt64 = 0
+        var sleepStep = BusyRetryDefaults.initialSleepNanoseconds
+        transientLockAttemptCountForTesting = 0
+
+        while true {
+            transientLockAttemptCountForTesting += 1
+            do {
+                return try operation()
+            } catch {
+                let transient: Bool
+                if let sqliteError = error as? SQLiteError {
+                    transient = sqliteError.isTransientLockContention
+                } else {
+                    transient = false
+                }
+                attempt += 1
+                let budgetLeft = slept < maxSleep
+                guard transient, attempt < maxAttempts, budgetLeft else { throw error }
+
+                onRetry?()
+
+                let remaining = maxSleep - slept
+                let delay = min(sleepStep, remaining, BusyRetryDefaults.maxSingleSleepNanoseconds)
+                if delay > 0 {
+                    // Short park only — total sleep is hard-capped by maxSleep.
+                    Thread.sleep(forTimeInterval: TimeInterval(delay) / 1_000_000_000)
+                    slept += delay
+                }
+                sleepStep = min(
+                    sleepStep * 2,
+                    BusyRetryDefaults.maxSingleSleepNanoseconds
+                )
+            }
+        }
+    }
+
+    fileprivate func releaseReadSnapshotForRetry() {
+        // Ending cached statement VMs drops any implicit WAL read snapshot so a
+        // subsequent BEGIN IMMEDIATE is less likely to hit BUSY_SNAPSHOT again.
+        if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
+            resetCachedStatements()
+        } else {
+            queue.sync { resetCachedStatements() }
+        }
     }
 
     private func resetCachedStatements() {
@@ -146,15 +263,35 @@ public final class SQLiteDB {
 
     public func execute(_ sql: String) throws {
         try withSerializedOperation {
+            // Inside an open transaction, surface lock errors immediately so the
+            // transaction owner can ROLLBACK and retry the whole unit.
+            let run: () throws -> Void = { [self] in
+                if transactionDepth > 0 {
+                    try executeDirect(sql)
+                } else {
+                    try withTransientLockRetry(onRetry: { [self] in
+                        releaseReadSnapshotForRetry()
+                    }) {
+                        try executeDirect(sql)
+                    }
+                }
+            }
             if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
-                try executeDirect(sql)
+                try run()
                 return
             }
-            try queue.sync { try executeDirect(sql) }
+            try queue.sync { try run() }
         }
     }
 
     private func executeDirect(_ sql: String) throws {
+        if let injected = takeInjectedResultCodeForTesting(),
+           injected != SQLITE_OK {
+            if SQLiteError.isTransientLockCode(injected) {
+                throw SQLiteError.execute("database is locked")
+            }
+            throw SQLiteError.execute("injected sqlite error (\(injected))")
+        }
         var err: UnsafeMutablePointer<CChar>?
         let rc = sqlite3_exec(handle, sql, nil, nil, &err)
         if rc != SQLITE_OK {
@@ -202,14 +339,22 @@ public final class SQLiteDB {
 
     public func transaction<T>(_ block: () throws -> T) throws -> T {
         try withSerializedOperation {
-            try execute("BEGIN IMMEDIATE;")
-            do {
-                let r = try block()
-                try execute("COMMIT;")
-                return r
-            } catch {
-                try? execute("ROLLBACK;")
-                throw error
+            // Retry the whole BEGIN…COMMIT unit only. Never re-enter a partially
+            // applied multi-statement transaction: every failure ROLLBACKs first.
+            try withTransientLockRetry(onRetry: { [self] in
+                releaseReadSnapshotForRetry()
+            }) {
+                transactionDepth += 1
+                defer { transactionDepth -= 1 }
+                try execute("BEGIN IMMEDIATE;")
+                do {
+                    let r = try block()
+                    try execute("COMMIT;")
+                    return r
+                } catch {
+                    try? execute("ROLLBACK;")
+                    throw error
+                }
             }
         }
     }
@@ -279,11 +424,35 @@ public final class SQLiteStatement {
     public func step() throws -> Bool {
         guard let db else { throw SQLiteError.step("database closed") }
         return try db.withSerializedOperation {
-            db.beforeStatementStepForTesting?(sql)
-            let rc = sqlite3_step(handle)
-            if rc == SQLITE_ROW { return true }
-            if rc == SQLITE_DONE { return false }
-            throw SQLiteError.step(db.lastErrorMessage())
+            let once: () throws -> Bool = { [self] in
+                db.beforeStatementStepForTesting?(self.sql)
+                if let injected = db.takeInjectedResultCodeForTesting() {
+                    if injected == SQLITE_ROW { return true }
+                    if injected == SQLITE_DONE { return false }
+                    if SQLiteError.isTransientLockCode(injected) {
+                        // Preserve bindings so a retry can re-step the same write.
+                        sqlite3_reset(self.handle)
+                        throw SQLiteError.step("database is locked")
+                    }
+                    throw SQLiteError.step("injected sqlite error (\(injected))")
+                }
+                let rc = sqlite3_step(self.handle)
+                if rc == SQLITE_ROW { return true }
+                if rc == SQLITE_DONE { return false }
+                if SQLiteError.isTransientLockCode(rc) {
+                    // Statement did not complete; reset for a safe re-step. Do not
+                    // clear bindings — the caller's bind values must remain.
+                    sqlite3_reset(self.handle)
+                }
+                throw SQLiteError.step(db.lastErrorMessage())
+            }
+            // Mid-transaction steps must not self-retry (partial apply risk).
+            if db.transactionDepth > 0 {
+                return try once()
+            }
+            return try db.withTransientLockRetry(onRetry: {
+                db.releaseReadSnapshotForRetry()
+            }, once)
         }
     }
 

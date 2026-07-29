@@ -76,6 +76,70 @@ final class IncompleteTurnContinuationTests: XCTestCase {
         )
     }
 
+    func test_uncalledToolMarkup_classifiesAsUncalledToolInvocation() {
+        // Exact mangled incident payload (fact 2): turn ended by printing a tool
+        // invocation as text. After sanitize, the durable marker remains so
+        // classify still raises the incomplete-turn reason (not silent completed).
+        let mangled = """
+        <ScheduleWakeup>
+        <parameter name="delaySeconds">10</parameter>
+        <parameter name="reason">Waiting for sam-plan skill to complete execution</parameter>
+        <parameter name="prompt">/sam-task https://linear.app/empathmsp/issue/DEV-3983</parameter>
+        </invoke>
+        """
+        XCTAssertEqual(
+            IncompleteTurnContinuation.classify(mangled),
+            .uncalledToolInvocation,
+            "raw mangled tool markup must classify as incomplete (pre-sanitize path)"
+        )
+        let sanitized = AssistantToolMarkupSanitizer.sanitize(mangled)
+        XCTAssertEqual(
+            IncompleteTurnContinuation.classify(sanitized),
+            .uncalledToolInvocation,
+            "post-sanitize durable marker must still raise uncalledToolInvocation"
+        )
+        XCTAssertTrue(IncompleteTurnContinuation.isIncompleteTurn(sanitized))
+        XCTAssertEqual(
+            IncompleteTurnContinuation.prompt(for: .uncalledToolInvocation),
+            IncompleteTurnContinuation.uncalledToolContinuationPrompt
+        )
+        XCTAssertNotEqual(
+            IncompleteTurnContinuation.prompt(for: .uncalledToolInvocation),
+            BackgroundAwaitContinuation.continuationPrompt,
+            "uncalled-tool recovery must not send the BashOutput/background prompt"
+        )
+        XCTAssertEqual(
+            IncompleteTurnContinuation.delay(for: .uncalledToolInvocation, backgroundDelay: 45),
+            0,
+            "no external job to wait on — resume immediately after terminal cleanup"
+        )
+        XCTAssertEqual(
+            IncompleteTurnContinuation.shouldAutoContinue(
+                status: .completed,
+                finalMessage: sanitized,
+                isAutonomous: true,
+                priorAutoContinuations: 0
+            ),
+            .uncalledToolInvocation
+        )
+    }
+
+    func test_uncalledTool_doesNotWinOverWorkflowHandoff() {
+        // Load-bearing order: a phase handoff that also carries the uncalled-tool
+        // marker must still get the workflow prompt (same spirit as misused
+        // [[RC_AWAITING]] on Phase 1).
+        let hybrid = """
+        **Next: Phase 3 — Review**
+
+        \(AssistantToolMarkupSanitizer.uncalledToolMarker)
+        """
+        XCTAssertEqual(
+            IncompleteTurnContinuation.classify(hybrid),
+            .workflowHandoff,
+            "workflow handoff must outrank uncalled-tool signal"
+        )
+    }
+
     func test_markerOnlyNovelBackground_classifiesAsBackground() {
         let novel = "\(BackgroundAwaitContinuation.awaitingMarker)\nHolding here until the canary bake finishes."
         XCTAssertEqual(IncompleteTurnContinuation.classify(novel), .backgroundAwait)

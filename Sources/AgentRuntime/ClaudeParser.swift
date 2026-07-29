@@ -257,6 +257,15 @@ public final class ClaudeParser {
                     break
                 }
             }
+            // Per-request occupancy lives on assistant → message.usage (Anthropic
+            // API shape). The later CLI `result` modelUsage is session-cumulative
+            // billing only — do not treat it as context occupancy.
+            if !isUserMessage {
+                if let msgUsage = msg["usage"] as? [String: Any],
+                   let usage = tokenUsage(from: ["usage": msgUsage]) {
+                    out.append(.tokenUsage(usage))
+                }
+            }
         case "result":
             // Authoritative final answer is the top-level `result` string.
             let isError = (obj["is_error"] as? Bool) ?? ((obj["subtype"] as? String).map { $0 != "success" } ?? false)
@@ -582,6 +591,9 @@ public final class ClaudeParser {
                 fromUSD: doubleValue(obj["total_cost_usd"] ?? obj["totalCostUSD"])
                     ?? (modelCount > 0 && modelCostComplete ? modelCostUSD : nil)
             )
+            // modelUsage on CLI `result` is session-cumulative (cache re-reads sum
+            // across the whole session). Do NOT set contextTokens — that would
+            // inflate the context gauge (e.g. 2.8M / 200k → 999%).
             return AssistantTokenUsage(
                 inputTokens: input,
                 outputTokens: output,
@@ -591,7 +603,8 @@ public final class ClaudeParser {
                 uncachedInputTokens: uncached,
                 cacheCreationInputTokens: creation,
                 cacheReadInputTokens: read,
-                reportedCostMicros: reportedCostMicros
+                reportedCostMicros: reportedCostMicros,
+                contextTokens: nil
             )
         }
         let usage = obj["usage"] as? [String: Any] ?? obj["token_usage"] as? [String: Any] ?? obj
@@ -605,6 +618,15 @@ public final class ClaudeParser {
             fromUSD: doubleValue(obj["total_cost_usd"] ?? obj["totalCostUSD"])
                 ?? doubleValue(usage["costUSD"] ?? usage["cost_usd"])
         )
+        // Per-request occupancy: uncached + cache write + cache read + output
+        // for this single request (not session-cumulative modelUsage).
+        let creation = intValue(usage["cache_creation_input_tokens"])
+            ?? intValue(usage["cacheCreationInputTokens"])
+            ?? 0
+        let read = intValue(usage["cache_read_input_tokens"])
+            ?? intValue(usage["cacheReadInputTokens"])
+            ?? 0
+        let contextTokens = input + creation + read + output
         return AssistantTokenUsage(
             inputTokens: input,
             outputTokens: output,
@@ -612,7 +634,8 @@ public final class ClaudeParser {
             contextWindow: window,
             compactsAutomatically: compactsAutomatically,
             uncachedInputTokens: input,
-            reportedCostMicros: reportedCostMicros
+            reportedCostMicros: reportedCostMicros,
+            contextTokens: contextTokens > 0 ? contextTokens : nil
         )
     }
 
