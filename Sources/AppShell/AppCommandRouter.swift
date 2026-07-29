@@ -4467,20 +4467,35 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 threadId: threadId
             )
             env.merge(telemetryEnv) { _, new in new }
+            // Nested provider proxies (`grok`/`claude`/`codex` in managed bin) must resolve
+            // for every thread-scoped provider environment — not only when Token Saver is on.
+            // Token Saver command-compression wrappers remain gated by admission below.
+            let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+            let basePath = env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
+            env["PATH"] = Self.providerPathWithManagedWrappers(
+                currentPath: basePath,
+                managedBin: managedBin
+            )
             // task-08: Token Saver PATH/hint only when same-user admission allows.
             let tokenSaverEnv = context.tokenSaverAgentEnvironment(provider: provider, threadId: threadId)
             if tokenSaverEnv.isEmpty {
-                // Cross-user / raw-only: scrub Token Saver keys and managed distill PATH;
-                // always-on Subagents telemetry remains content-free and scoped.
-                return Self.scrubTokenSaverEnvironment(env)
-            }
-            if tokenSaverEnv["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
-                env["PATH"] = Self.providerPathWithManagedWrappers(
-                    currentPath: env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? "",
-                    managedBin: AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+                // Cross-user / raw-only: scrub Token Saver optimization keys, but keep
+                // managed bin on PATH so nested provider proxies + Subagents telemetry work.
+                var cleaned = TokenSaverExecutionReceiptSeam.scrub(env)
+                cleaned["PATH"] = Self.providerPathWithManagedWrappers(
+                    currentPath: cleaned["PATH"] ?? basePath,
+                    managedBin: managedBin
                 )
+                return cleaned
             }
             env.merge(tokenSaverEnv) { _, new in new }
+            // Re-assert managed bin first after any Token Saver PATH rewrite.
+            if let path = env["PATH"] {
+                env["PATH"] = Self.providerPathWithManagedWrappers(
+                    currentPath: path,
+                    managedBin: managedBin
+                )
+            }
         } else {
             // No thread context: keep provider tag only; scrub any residual TS keys.
             return Self.scrubTokenSaverEnvironment(env)
@@ -4488,7 +4503,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return env
     }
 
-    /// Removes Token Saver env keys and managed distill bin from PATH (task-08 raw-only).
+    /// Removes Token Saver env keys. For no-thread contexts also drops managed bin from
+    /// PATH (no nested provider interception without thread scope). Thread-scoped paths
+    /// re-apply managed bin after scrub so provider proxies stay available.
     nonisolated static func scrubTokenSaverEnvironment(_ env: [String: String]) -> [String: String] {
         var cleaned = TokenSaverExecutionReceiptSeam.scrub(env)
         let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
@@ -4499,6 +4516,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return cleaned
     }
 
+    /// Prepends the managed CLI bin (`~/.remote-code/bin`) so nested provider proxies
+    /// and (when Token Saver is on) command-compression wrappers win PATH lookup inside
+    /// the provider process. Host top-level launches use absolute binaries via
+    /// `ProcessLocator` and skip provider proxy shims.
     static func providerPathWithManagedWrappers(currentPath: String, managedBin: String) -> String {
         let trimmed = managedBin.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return currentPath }

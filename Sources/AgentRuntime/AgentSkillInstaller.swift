@@ -533,6 +533,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// wrapped command in the managed bin dir (`~/.remote-code/bin`, PREPENDED to the agent
     /// PATH only). Exact-output tools (sed, rg, grep, cat, …) are never wrapped — agents
     /// need full stdout. Also removes any legacy exact-output symlinks from older installs.
+    /// Provider basenames (`grok`/`claude`/`codex`) are **not** part of this catalog —
+    /// see `installProviderProxies()`.
     @discardableResult
     public func installCommandWrappers(serviceBinaryURL: URL? = nil) throws -> [String] {
         try fileManager.createDirectory(at: cliBinDirectory, withIntermediateDirectories: true)
@@ -565,11 +567,62 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// Remove the command-wrapper symlinks — but only those still pointing at our service binary,
     /// so a user's own command on the managed path (unexpected) is never deleted.
     /// Includes legacy exact-output basenames so Token Saver off cleans old sed/rg wrappers.
+    /// Does **not** remove nested provider proxies (`installProviderProxies`).
     @discardableResult
     public func uninstallCommandWrappers() throws -> [String] {
         let binaryPath = Self.resolveServiceBinary(fileManager: fileManager)?.path
         return try removeManagedWrapperSymlinks(
             basenames: WrappedCommandCatalog.symlinkBasenamesToRemove,
+            binaryPath: binaryPath
+        )
+    }
+
+    /// Install nested provider PATH proxies for `claude` / `codex` / `grok`.
+    ///
+    /// Ownership-safe and idempotent: never clobbers a user-owned regular file in the
+    /// managed bin directory. Only creates a symlink when a real provider executable
+    /// exists outside the managed bin (so we never shadow a missing CLI). Independent
+    /// of Token Saver — available for every thread-scoped provider environment.
+    ///
+    /// - Parameter searchDirectoriesOverride: test seam; production always discovers
+    ///   system PATH minus the managed bin.
+    @discardableResult
+    public func installProviderProxies(
+        serviceBinaryURL: URL? = nil,
+        searchDirectoriesOverride: [String]? = nil
+    ) throws -> [String] {
+        try fileManager.createDirectory(at: cliBinDirectory, withIntermediateDirectories: true)
+        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
+            throw AgentSkillCLIError.serviceBinaryUnavailable
+        }
+        let searchDirectories = searchDirectoriesOverride ?? systemCommandSearchDirectories()
+        var installed: [String] = []
+        for command in ProviderProxyCatalog.providers {
+            guard commandExistsOnSystem(command, searchDirectories: searchDirectories) else { continue }
+            let link = cliBinDirectory.appendingPathComponent(command)
+            if let dest = try? fileManager.destinationOfSymbolicLink(atPath: link.path) {
+                if dest == binary.path
+                    || (dest as NSString).lastPathComponent == "RemoteCodeDistillService" {
+                    installed.append(command)
+                    continue
+                }
+                try? fileManager.removeItem(at: link) // replace a stale managed symlink
+            } else if fileManager.fileExists(atPath: link.path) {
+                // A real (non-symlink) file we did not create — never clobber it.
+                continue
+            }
+            try fileManager.createSymbolicLink(at: link, withDestinationURL: binary)
+            installed.append(command)
+        }
+        return installed
+    }
+
+    /// Remove provider-proxy symlinks that still point at our service binary only.
+    @discardableResult
+    public func uninstallProviderProxies() throws -> [String] {
+        let binaryPath = Self.resolveServiceBinary(fileManager: fileManager)?.path
+        return try removeManagedWrapperSymlinks(
+            basenames: ProviderProxyCatalog.providers,
             binaryPath: binaryPath
         )
     }

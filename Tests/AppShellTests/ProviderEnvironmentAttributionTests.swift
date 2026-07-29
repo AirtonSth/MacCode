@@ -208,4 +208,47 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         XCTAssertTrue(codexPath.hasPrefix(managedBin + ":"), "Codex provider shell must resolve wrapped commands through managed bin first")
         XCTAssertTrue(claudePath.hasPrefix(managedBin + ":"), "Claude provider shell must resolve wrapped commands through managed bin first")
     }
+
+    /// Nested provider proxies must resolve even when Token Saver is off: Subagents
+    /// telemetry is always-on, and bare `grok`/`claude`/`codex` shell calls need the
+    /// managed PATH controller without any distillation lane.
+    @MainActor
+    func test_providerEnvironmentPrependsManagedBin_whenTokenSaverOff() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2ProvProxyPathOff-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = false }
+        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        let router = AppCommandRouter(context: ctx)
+        let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+
+        for provider in AgentProvider.allCases {
+            let thread = try admittedThread(in: ctx, provider: provider)
+            let env = router.providerEnvironment(provider: provider, instanceId: nil, threadId: thread.id)
+            let path = try XCTUnwrap(env["PATH"], "\(provider) must expose PATH with managed bin")
+            XCTAssertTrue(
+                path.hasPrefix(managedBin + ":") || path == managedBin,
+                "\(provider): managed bin must lead PATH when Token Saver is off for nested provider proxies"
+            )
+            XCTAssertEqual(env["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"], thread.id.value.uuidString)
+            XCTAssertNil(env["RC_TOKEN_SAVER_DISTILL_HINT"])
+        }
+    }
+
+    /// Without a thread id there is no nested-provider interception scope.
+    @MainActor
+    func test_providerEnvironment_withoutThreadDoesNotRequireManagedPath() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2ProvProxyNoThread-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let router = AppCommandRouter(context: ctx)
+        let env = router.providerEnvironment(provider: .codex, instanceId: nil, threadId: nil)
+        XCTAssertEqual(env["REMOTE_CODE_AGENT_PROVIDER"], "codex")
+        XCTAssertNil(env["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"])
+        if let path = env["PATH"] {
+            let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+            XCTAssertFalse(
+                path.split(separator: ":").map(String.init).contains(managedBin),
+                "no-thread env must not inject managed bin (scrubbed raw path)"
+            )
+        }
+    }
 }

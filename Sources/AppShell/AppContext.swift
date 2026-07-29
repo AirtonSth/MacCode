@@ -1517,11 +1517,18 @@ public final class AppContext {
     /// `~/.claude` / `~/.codex` skill trees). CLI, command wrappers, and retrieve
     /// MCP are installed only while Token Saver is enabled; disabled removes them
     /// so free/unsubscribed runs never get token-economy hooks.
+    ///
+    /// Nested provider PATH proxies (`grok`/`claude`/`codex`) are always installed
+    /// when reconcile runs: they are not a Token Saver lane. They only intercept
+    /// shell-launched bare provider names inside a thread-scoped environment;
+    /// host top-level turns keep absolute resolved binaries via ProcessLocator.
     public func reconcileManagedDistillSkills(tokenSaverEnabled: Bool) {
         let installer = makeAgentSkillInstaller()
         do {
             // Always scrub legacy per-provider home skill / AGENTS.md blocks.
             try installer.uninstallLegacyProviderDistillSkills()
+            // Always-on nested provider controller (independent of Token Saver).
+            try? installer.installProviderProxies()
             if tokenSaverEnabled {
                 let appPrivate = try installer.installAppPrivateDistillSkill(
                     sourceRevision: "github-main-remote-code-template-v2"

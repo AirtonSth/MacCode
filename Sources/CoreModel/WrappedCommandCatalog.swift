@@ -12,6 +12,9 @@ import Foundation
 ///   Never install wrappers; agent instructions must skip `| distill`.
 /// - **compressible family**: listings, builds, CI, noisy logs — safe to wrap/compress when
 ///   the invocation is read-only (mutating subcommands rejected by `CommandWrapPolicy`).
+///
+/// Provider basenames (`grok` / `claude` / `codex`) are **not** listed here. Nested
+/// provider interception is a separate always-on controller — see `ProviderProxyCatalog`.
 public enum WrappedCommandCatalog {
     // MARK: Exact-output (no wrap, no | distill)
 

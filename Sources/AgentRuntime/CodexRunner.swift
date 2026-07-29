@@ -42,11 +42,24 @@ public enum ProcessLocator {
                 if FileManager.default.isExecutableFile(atPath: path) { return path }
             }
         }
+        // Host top-level turns must resolve the REAL provider CLI, never the
+        // nested-provider PATH proxy installed under ~/.remote-code/bin.
+        let managedBin = "\(homeDirectory)/.remote-code/bin"
+        let skipManagedProviderProxy = ProviderProxyCatalog.isProviderProxyCommand(trimmed)
         for component in searchPath(environmentPath: environmentPath, homeDirectory: homeDirectory) {
+            if skipManagedProviderProxy, Self.normalizedDirectory(component) == Self.normalizedDirectory(managedBin) {
+                continue
+            }
             let full = component + "/" + trimmed
             if FileManager.default.isExecutableFile(atPath: full) { return full }
         }
         return nil
+    }
+
+    private static func normalizedDirectory(_ path: String) -> String {
+        var p = path
+        while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
+        return p
     }
 
     /// Binary resolution for Auto admission + sudo -u execution (same rules).

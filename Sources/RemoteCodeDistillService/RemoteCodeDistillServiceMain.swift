@@ -37,6 +37,18 @@ struct RemoteCodeDistillServiceMain {
             await runMCP()
             return
         }
+        // Nested provider PATH controller: invoked via managed symlinks
+        // (~/.remote-code/bin/{grok,claude,codex}) or explicit `provider-proxy <name> …`.
+        // Records content-free Subagents receipts and execs the real CLI outside managed bin.
+        // Independent of Token Saver command-compression wrappers.
+        if ProviderProxyPolicy.isProviderProxy(programName) {
+            let code = ProviderProxyRunner.run(command: programName, arguments: Array(rawArgs.dropFirst()))
+            Darwin.exit(code)
+        }
+        if rawArgs.dropFirst().first == "provider-proxy", rawArgs.count >= 3 {
+            let code = ProviderProxyRunner.run(command: rawArgs[2], arguments: Array(rawArgs.dropFirst(3)))
+            Darwin.exit(code)
+        }
         // RTK-style transparent command wrappers: invoked via a symlink whose basename is a
         // wrapped command (e.g. ~/.remote-code/bin/rg), or explicitly as `… wrap <cmd> <args>`.
         if CommandWrapPolicy.isWrapped(programName) {
@@ -220,10 +232,12 @@ struct RemoteCodeDistillServiceMain {
         Darwin.exit(code)
     }
 
-    /// Provider-neutral begin/end bridge for skill-controlled nested workers.
-    /// It records metadata only; prompts, output, and secrets never enter the
-    /// orchestration ledger. The managed `distill` executable is used as the
-    /// transport because every Token Saver-enabled provider already receives it.
+    /// Provider-neutral begin/end bridge for skill-controlled nested workers
+    /// that are **not** a bare `grok`/`claude`/`codex` shell invocation.
+    /// Nested provider CLIs are handled automatically by the PATH provider
+    /// proxy (`ProviderProxyRunner`); skills should not wrap those basenames
+    /// manually. This CLI still records metadata only — prompts, output, and
+    /// secrets never enter the orchestration ledger.
     private static func runSubagentTelemetry(arguments: [String]) async {
         let env = ProcessInfo.processInfo.environment
         let appSupportOverride = env["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"]

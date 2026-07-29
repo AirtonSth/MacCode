@@ -22,8 +22,17 @@ denied, cross-user, or mismatched receipts remain raw. Prompts, transcripts,
 tool output, and secrets never enter the receipt; Skills and exact-output
 commands remain lossless.
 
-For every controlled nested worker, use the provider-neutral telemetry command
-around the actual lifetime: `${REMOTE_CODE_SUBAGENT_TELEMETRY_COMMAND:-distill}
+**Nested provider CLIs are automatic.** Shell-invoking `grok`, `claude`, or
+`codex` by bare name inside a RemoteCode agent environment resolves through the
+host-managed PATH controller (`~/.remote-code/bin` → RemoteCode provider proxy).
+That controller inherits the parent environment/receipt as-is, records a
+content-free Subagents lifecycle receipt, and execs the real provider binary
+outside the managed bin. Skills must not wrap those basenames with a manual
+bridge call, and must not invent Token Saver admission.
+
+For controlled nested workers that are **not** a bare provider CLI (custom
+scripts, non-provider tools), use the provider-neutral telemetry command around
+the actual lifetime: `${REMOTE_CODE_SUBAGENT_TELEMETRY_COMMAND:-distill}
 subagent begin --node <stable-id>` before spawn and the matching `subagent end
 --run-id <id> --status <completed|failed|cancelled>` on terminal exit. The app
 sets `REMOTE_CODE_SUBAGENT_TELEMETRY_COMMAND` to its co-located service even
