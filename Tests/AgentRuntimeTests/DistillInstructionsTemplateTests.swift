@@ -22,10 +22,15 @@ final class DistillInstructionsTemplateTests: XCTestCase {
                        "the provider must not guess output size before deciding to distill")
         XCTAssertFalse(t.lowercased().contains("bias to compress"),
                        "bias-to-compress was replaced by the fidelity predicate; reinstating it re-breaks exact-output tools")
-        XCTAssertTrue(t.contains("subagent, worker, reviewer"),
-                      "delegated prompts must carry the same distill contract")
-        XCTAssertTrue(t.contains("descendants"),
-                      "nested subagents must not lose the distill contract")
+        // Skill content is protected verbatim — never Distill, summarize, or handle it.
+        XCTAssertTrue(t.contains("NEVER Distill skill content"),
+                      "canonical policy must exempt skill content before any Distill path")
+        XCTAssertTrue(t.contains("complete/verbatim") || t.lowercased().contains("must stay complete"),
+                      "requested/returned skill content must stay complete")
+        XCTAssertTrue(t.contains("do not require every worker prompt to restate"),
+                      "workers must not be forced to restate Distill rules inside skill prompts")
+        XCTAssertFalse(t.contains("Every subagent, worker, reviewer, or delegated prompt MUST repeat"),
+                       "removed: requiring every worker to restate Distill")
         // Sparse dialect: R0 micro O-only + R1 work O-first (token savings vs 6-line tax).
         XCTAssertTrue(t.contains("R0 micro"), "R0 micro register present")
         XCTAssertTrue(t.contains("R1 work"), "R1 work register present")
@@ -43,13 +48,31 @@ final class DistillInstructionsTemplateTests: XCTestCase {
         XCTAssertTrue(t.contains("distill retrieve <handle>"), "retrieve command documented")
         XCTAssertTrue(t.contains("[[rc:<handle>]]"), "handle marker documented so the agent knows how to recover originals")
         // F10: keep the always-loaded config block compact; examples live in SKILL.md.
-        XCTAssertLessThan(t.count, 1_800, "provider config must stay compact (sparse dialect may be slightly larger than 1500)")
+        XCTAssertLessThan(t.count, 2_000, "provider config must stay compact (skill-complete rule may add a few lines)")
         XCTAssertFalse(t.contains("bun test 2>&1 | distill"), "examples belong in the managed skill")
         XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("bun test 2>&1 | distill"))
         XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("R0 micro"),
                       "full skill carries R0 dialect details")
+        XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("NEVER Distill skill content"),
+                      "full skill body also protects skill content as a verbatim category")
         // Bounded by the managed markers.
         XCTAssertTrue(t.hasPrefix(AgentSkillInstaller.distillInstructionsBeginMarker))
         XCTAssertTrue(t.contains("<!-- distill skill: end -->"))
+    }
+
+    func test_tokenSaverOffDoesNotInjectDistillPolicy() {
+        // WHY: Token Saver off must fail open with no Distill dialect injection.
+        let off = AgentSkillInstaller.tokenSaverProviderPrompt("base only", environment: [:])
+        XCTAssertEqual(off, "base only")
+        XCTAssertFalse(off.contains("| distill"))
+        XCTAssertFalse(off.contains(AgentSkillInstaller.distillAgentInstructionsBody))
+
+        let on = AgentSkillInstaller.tokenSaverProviderPrompt(
+            "base only",
+            environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
+        )
+        XCTAssertTrue(on.contains("NEVER Distill skill content"))
+        XCTAssertTrue(on.contains("| distill") || on.contains("distill"),
+                      "Token Saver on still injects ordinary-output Distill eligibility")
     }
 }

@@ -104,6 +104,9 @@ public enum TokenSaverTypedCrushers {
         func retrieve(id: String) throws -> Data
     }
 
+    /// Process-local in-memory store for unit tests / same-process readback only.
+    /// Blobs die with the process — never back production `[[rc:handle]]` markers that
+    /// a separate sidecar must resolve via `/v1/retrieve` (T-003 store-before-loss).
     public final class MemoryStore: BlobStore, @unchecked Sendable {
         private let lock = NSLock()
         private var blobs: [String: Data] = [:]
@@ -119,8 +122,12 @@ public enum TokenSaverTypedCrushers {
         public enum StoreError: Error { case missing }
     }
 
+    /// Shared process-local store. Suitable for hermetic unit tests only.
+    /// WHY: CLI prepass must not use this for `[[rc:handle]]` — the sidecar cannot
+    /// retrieve blobs that lived only in a short-lived CLI process (T-003).
     public static let sharedMemory = MemoryStore()
 
+    /// Durable store backed by encrypted originals that outlive the CLI process.
     public final class EncryptedStore: BlobStore, @unchecked Sendable {
         private let originals: TokenSaverLossyOriginalStoring
 
@@ -147,11 +154,19 @@ public enum TokenSaverTypedCrushers {
         }
     }
 
+    /// True when `store` is process-local (`MemoryStore`). Such stores must not back
+    /// `[[rc:handle]]` markers served outside this process (T-003 store-before-loss).
+    public static func isProcessLocalStore(_ store: BlobStore) -> Bool {
+        store is MemoryStore
+    }
+
     public static func handleID(for data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     /// Store-before-loss with verified byte-exact readback. Returns nil on any failure.
+    /// Callers that emit `[[rc:handle]]` outside this process must pass a durable store
+    /// (not `MemoryStore` / `sharedMemory`) so retrieval survives process exit (T-003).
     public static func storeVerified(_ plaintext: Data, store: BlobStore) -> String? {
         let id = handleID(for: plaintext)
         do {

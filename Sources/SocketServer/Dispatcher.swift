@@ -3089,6 +3089,10 @@ public final class JSONRPCDispatcher {
         object["position"] = .number(Double(message.position))
         object["created_at"] = .string(iso8601(message.createdAt))
         object["updated_at"] = .string(iso8601(message.updatedAt))
+        if let durableState = message.durableState {
+            object["durable_state"] = .string(durableState.rawValue)
+            object["durableState"] = .string(durableState.rawValue)
+        }
         return .object(object)
     }
 

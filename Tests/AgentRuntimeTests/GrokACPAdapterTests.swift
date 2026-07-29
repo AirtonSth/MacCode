@@ -156,6 +156,283 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(adapter.listSessions().first?.providerThreadId, "saved-session")
     }
 
+    func test_replacingRecoveredSessionIgnoresLateOldProcessTermination() async throws {
+        // WHY: replacing a recovered Grok process stops the old transport. Its
+        // asynchronous termination callback must not evict the new session
+        // stored under the same host thread.
+        let peer = try FakeGrokACPPeer(mode: .load)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path)
+        let threadId = AgentThreadID()
+
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: "old-session"
+        )) { _ in }
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: "replacement-session"
+        )) { _ in }
+
+        XCTAssertEqual(peer.launchCount, 2)
+        XCTAssertTrue(adapter.hasSession(threadId: threadId))
+        XCTAssertEqual(
+            adapter.listSessions().first { $0.threadId == threadId }?.providerThreadId,
+            "replacement-session"
+        )
+        adapter.stopAll()
+    }
+
+    func test_sendTurnDoesNotPublishStartedWhenRecoveredSessionDiesBeforePromptWrite() async throws {
+        let peer = try FakeGrokACPPeer(mode: .load)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path)
+        let threadId = AgentThreadID()
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: "saved-session"
+        )) { _ in }
+        let failed = GrokACPEventBox()
+        adapter.beforePromptWriteForTesting = {
+            try? adapter.stopSession(threadId: threadId)
+        }
+
+        do {
+            _ = try await adapter.sendTurn(makeRequest(
+                threadId: threadId,
+                providerThreadId: "saved-session"
+            )) { failed.append($0) }
+            XCTFail("a dead cached transport must fail before provider acceptance")
+        } catch {}
+
+        XCTAssertEqual(failed.turnStartedCount, 0)
+        XCTAssertFalse(adapter.hasSession(threadId: threadId))
+
+        adapter.beforePromptWriteForTesting = nil
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: "saved-session"
+        )) { _ in }
+        XCTAssertTrue(adapter.hasSession(threadId: threadId))
+        XCTAssertEqual(peer.launchCount, 2)
+        adapter.stopAll()
+    }
+
+    func test_promptWriteFailureBeforeAcceptanceEmitsNoTurnLifecycle() async throws {
+        // WHY: a failed stdin write is start failure evidence, not evidence that
+        // the provider accepted and later failed the turn.
+        let peer = try FakeGrokACPPeer(mode: .promptWriteFailure)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path)
+        let events = GrokACPEventBox()
+
+        do {
+            _ = try await adapter.startSession(makeRequest()) { events.append($0) }
+            XCTFail("a prompt write to a closed ACP stdin must fail the start")
+        } catch {}
+
+        XCTAssertEqual(adapter.promptWriteAcceptanceCountForTesting, 0)
+        XCTAssertEqual(events.turnStartedCount, 0)
+        XCTAssertEqual(events.runningStatusCount, 0)
+        XCTAssertEqual(events.finishedCount, 0)
+        adapter.stopAll()
+    }
+
+    func test_invalidatedAcceptancePermitBlocksGrokPromptBeforeWireAcceptance() async throws {
+        let peer = try FakeGrokACPPeer(mode: .immediateResponse)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path)
+        let permit = AgentRunAcceptancePermit()
+        permit.invalidate()
+        var request = makeRequest()
+        request.acceptancePermit = permit
+        let events = GrokACPEventBox()
+
+        do {
+            _ = try await adapter.startSession(request) { events.append($0) }
+            XCTFail("suppression must win before the Grok session/prompt write")
+        } catch is AgentRunAcceptanceError {}
+        catch {}
+
+        XCTAssertEqual(adapter.promptWriteAcceptanceCountForTesting, 0)
+        XCTAssertEqual(events.turnStartedCount, 0)
+        XCTAssertEqual(events.runningStatusCount, 0)
+        XCTAssertEqual(events.finishedCount, 0)
+        adapter.stopAll()
+    }
+
+    func test_globalShutdownAfterPromptGuardCannotPublishAcceptanceOrTerminal() async throws {
+        let peer = try FakeGrokACPPeer(mode: .load)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path)
+        let threadId = AgentThreadID()
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: "saved-session"
+        )) { _ in }
+        let events = GrokACPEventBox()
+        adapter.beforePromptWriteForTesting = {
+            adapter.stopAllForAppTermination()
+        }
+
+        do {
+            _ = try await adapter.sendTurn(makeRequest(
+                threadId: threadId,
+                providerThreadId: "saved-session"
+            )) { events.append($0) }
+            XCTFail("global shutdown must invalidate the guarded session before write")
+        } catch {}
+
+        XCTAssertEqual(events.turnStartedCount, 0)
+        XCTAssertEqual(events.runningStatusCount, 0)
+        XCTAssertEqual(events.finishedCount, 0)
+        XCTAssertEqual(adapter.promptWriteAcceptanceCountForTesting, 0)
+    }
+
+    func test_replacementAfterPromptGuardCannotAcceptOnOldSession() async throws {
+        let peer = try FakeGrokACPPeer(mode: .load)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path)
+        let threadId = AgentThreadID()
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: "old-session"
+        )) { _ in }
+        let entered = expectation(description: "old send reached pre-write barrier")
+        let release = DispatchSemaphore(value: 0)
+        adapter.beforePromptWriteForTesting = {
+            entered.fulfill()
+            release.wait()
+        }
+        let events = GrokACPEventBox()
+        let oldSend = Task {
+            try await adapter.sendTurn(makeRequest(
+                threadId: threadId,
+                providerThreadId: "old-session"
+            )) { events.append($0) }
+        }
+        await fulfillment(of: [entered], timeout: 3)
+
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: "replacement-session"
+        )) { _ in }
+        release.signal()
+        do {
+            _ = try await oldSend.value
+            XCTFail("the replaced session must not accept the old prompt")
+        } catch {}
+
+        XCTAssertEqual(events.turnStartedCount, 0)
+        XCTAssertEqual(events.runningStatusCount, 0)
+        XCTAssertEqual(events.finishedCount, 0)
+        XCTAssertEqual(adapter.promptWriteAcceptanceCountForTesting, 0)
+        XCTAssertEqual(adapter.listSessions().first?.providerThreadId, "replacement-session")
+        adapter.stopAll()
+    }
+
+    func test_replacementAfterFinalGuardInvalidatesPhysicalWritePermitBeforeOldPeerBytes() async throws {
+        let peer = try FakeGrokACPPeer(mode: .load)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path)
+        let threadId = AgentThreadID()
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: "old-session"
+        )) { _ in }
+        let entered = GrokACPAsyncSignal()
+        let release = DispatchSemaphore(value: 0)
+        adapter.beforePhysicalPromptWriteForTesting = {
+            Task { await entered.signal() }
+            release.wait()
+        }
+        let events = GrokACPEventBox()
+        let oldSend = Task {
+            try await adapter.sendTurn(makeRequest(
+                threadId: threadId,
+                providerThreadId: "old-session"
+            )) { events.append($0) }
+        }
+        await entered.wait()
+
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: "replacement-session"
+        )) { _ in }
+        release.signal()
+        do {
+            _ = try await oldSend.value
+            XCTFail("the replaced session must fail its old physical prompt write")
+        } catch {}
+
+        XCTAssertEqual(peer.promptCount, 0,
+                       "replacement after the adapter guard must invalidate the permit before old-peer bytes")
+        XCTAssertEqual(events.turnStartedCount, 0)
+        XCTAssertEqual(events.runningStatusCount, 0)
+        XCTAssertEqual(events.finishedCount, 0)
+        XCTAssertEqual(adapter.promptWriteAcceptanceCountForTesting, 0)
+        XCTAssertEqual(adapter.listSessions().first?.providerThreadId, "replacement-session")
+        adapter.stopAll()
+    }
+
+    func test_sendTurnKeepsSuccessfulPromptWriteAcceptedWhenSessionDiesImmediatelyAfterward() async throws {
+        // WHY: once the ACP prompt is registered and written, provider
+        // acceptance is positive evidence. A transport death after that point
+        // must not make queue recovery replay the same prompt.
+        let peer = try FakeGrokACPPeer(mode: .load)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path)
+        let threadId = AgentThreadID()
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: "saved-session"
+        )) { _ in }
+        let accepted = GrokACPEventBox()
+        adapter.afterPromptWriteForTesting = {
+            try? adapter.stopSession(threadId: threadId)
+        }
+
+        _ = try await adapter.sendTurn(makeRequest(
+            threadId: threadId,
+            providerThreadId: "saved-session"
+        )) { accepted.append($0) }
+
+        XCTAssertEqual(accepted.runningStatusCount, 1,
+                       "a successful ACP stdin write must publish provider acceptance exactly once")
+        XCTAssertFalse(adapter.hasSession(threadId: threadId))
+        XCTAssertEqual(adapter.promptWriteAcceptanceCountForTesting, 1)
+
+        adapter.afterPromptWriteForTesting = nil
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: "saved-session"
+        )) { _ in }
+        XCTAssertEqual(peer.launchCount, 2)
+        XCTAssertEqual(adapter.promptWriteAcceptanceCountForTesting, 1,
+                       "recovering the dead session must not replay an already accepted prompt")
+        adapter.stopAll()
+    }
+
+    func test_immediatePromptResponseCannotOvertakeWriteAcceptance() async throws {
+        // WHY: an ACP peer may respond in the same scheduler slice as stdin
+        // write. The accepted/running evidence must exist before completion so
+        // queue recovery never mistakes accepted work for a replay candidate.
+        let peer = try FakeGrokACPPeer(mode: .immediateResponse)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path)
+        let events = GrokACPEventBox()
+
+        _ = try await adapter.startSession(makeRequest()) { events.append($0) }
+        let finished = try await events.waitFinished(timeout: 3)
+
+        XCTAssertEqual(finished.status, .completed)
+        XCTAssertEqual(events.lifecycleLabels, ["turn_started", "running", "turn_completed", "finished"])
+        XCTAssertEqual(adapter.promptWriteAcceptanceCountForTesting, 1)
+        XCTAssertEqual(adapter.promptWriteAcceptanceCountForTesting, 1)
+        XCTAssertEqual(peer.launchCount, 1)
+        adapter.stopAll()
+    }
+
     func test_cancelThenProcessDeathRecoversContextThroughSessionLoad() async throws {
         let peer = try FakeGrokACPPeer(mode: .cancel)
         defer { peer.remove() }
@@ -192,6 +469,35 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(peer.launchCount, 2,
                        "recovery proof must use a new ACP process and the prior provider session identity")
         relaunched.stopAll()
+    }
+
+    func test_forcedCancelEvictsDeadSessionBeforeSavedIdentityRecovery() async throws {
+        // WHY: if Grok ignores session/cancel, the grace-period kill ends the
+        // process. Keeping that dead client cached makes the next turn write to
+        // a zombie transport instead of loading the durable ACP session.
+        let peer = try FakeGrokACPPeer(mode: .ignoreCancel)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path, cancellationGracePeriod: 0.05)
+        let threadId = AgentThreadID()
+        let box = GrokACPEventBox()
+        let handle = try await adapter.startSession(makeRequest(threadId: threadId)) { box.append($0) }
+        handle.cancel()
+        let cancelled = try await box.waitFinished(timeout: 3)
+        let savedProviderThreadId = try XCTUnwrap(cancelled.providerThreadId)
+        XCTAssertEqual(cancelled.status, .cancelled)
+        XCTAssertFalse(adapter.hasSession(threadId: threadId),
+                       "a process that was force-killed cannot remain a reusable live session")
+
+        let recovered = GrokACPEventBox()
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: savedProviderThreadId
+        )) { recovered.append($0) }
+
+        XCTAssertTrue(recovered.assistantText.contains("replayed"),
+                      "recovery must load the saved ACP identity into a fresh process")
+        XCTAssertEqual(peer.launchCount, 2)
+        adapter.stopAll()
     }
 
     func test_authenticatedDiscoveryUsesSessionModelsInsteadOfStaticCatalog() async throws {
@@ -499,6 +805,43 @@ private final class GrokACPEventBox: @unchecked Sendable {
     private var events: [AgentRunEvent] = []
     var errors: [String] { lock.withLock { events.compactMap { if case .error(let text) = $0 { return text }; return nil } } }
     var assistantText: String { lock.withLock { events.compactMap { if case .event(.itemDelta(_, let body, _, _)) = $0 { return body }; return nil }.joined() } }
+    var turnStartedCount: Int {
+        lock.withLock {
+            events.filter {
+                if case .event(.turnStarted) = $0 { return true }
+                return false
+            }.count
+        }
+    }
+    var runningStatusCount: Int {
+        lock.withLock {
+            events.filter {
+                if case .status(.running) = $0 { return true }
+                return false
+            }.count
+        }
+    }
+    var finishedCount: Int {
+        lock.withLock {
+            events.filter {
+                if case .finished = $0 { return true }
+                return false
+            }.count
+        }
+    }
+    var lifecycleLabels: [String] {
+        lock.withLock {
+            events.compactMap { event in
+                switch event {
+                case .event(.turnStarted): return "turn_started"
+                case .status(.running): return "running"
+                case .event(.turnCompleted): return "turn_completed"
+                case .finished: return "finished"
+                default: return nil
+                }
+            }
+        }
+    }
     var hasProposedPlan: Bool {
         lock.withLock { events.contains { if case .event(.proposedPlan) = $0 { return true }; return false } }
     }
@@ -529,15 +872,19 @@ private final class GrokACPEventBox: @unchecked Sendable {
 
 private final class FakeGrokACPPeer {
     enum Mode: String {
-        case permission, cancel, crash, load, discovery, plan
-        case auth, rateLimit, network, invalidResume, invalidJSON
+        case permission, cancel, ignoreCancel, crash, load, discovery, plan
+        case auth, rateLimit, network, invalidResume, invalidJSON, immediateResponse, promptWriteFailure
     }
     let root: URL
     let path: String
     let launchCountPath: String
+    let promptCountPath: String
 
     var launchCount: Int {
         ((try? String(contentsOfFile: launchCountPath, encoding: .utf8)) ?? "").count
+    }
+    var promptCount: Int {
+        ((try? String(contentsOfFile: promptCountPath, encoding: .utf8)) ?? "").count
     }
 
     init(mode: Mode) throws {
@@ -545,6 +892,7 @@ private final class FakeGrokACPPeer {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let script = root.appendingPathComponent("grok")
         launchCountPath = root.appendingPathComponent("launch-count").path
+        promptCountPath = root.appendingPathComponent("prompt-count").path
         let body = #"""
         #!/bin/sh
         mode="MODE"
@@ -556,10 +904,16 @@ private final class FakeGrokACPPeer {
               printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":true},"sessionCapabilities":{}},"_meta":{"agentVersion":"0.2.101"}}}\n' "$id"
           elif printf '%s' "$line" | grep -q '"method":"session.*new"'; then
               id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
+              if [ "$mode" = promptWriteFailure ]; then
+                exec 0<&-
+              fi
               if [ "$mode" = plan ]; then
                 printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"session-fixed","models":{"currentModelId":"account-live-model","availableModels":[{"modelId":"account-live-model","name":"Live"}]},"modes":{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"},{"id":"plan","name":"Plan"}]}}}\n' "$id"
               else
                 printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"session-fixed","models":{"currentModelId":"account-live-model","availableModels":[{"modelId":"account-live-model","name":"Live"}]}}}\n' "$id"
+              fi
+              if [ "$mode" = promptWriteFailure ]; then
+                exec tail -f "COUNT_PATH" >/dev/null
               fi
           elif printf '%s' "$line" | grep -q '"method":"session.*load"'; then
               id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
@@ -578,9 +932,10 @@ private final class FakeGrokACPPeer {
               current_mode=$(printf '%s' "$line" | sed -E 's/.*"modeId":"([^"]+)".*/\1/')
               printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
           elif printf '%s' "$line" | grep -q '"method":"session.*prompt"'; then
+              printf p >> "PROMPT_COUNT_PATH"
               id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
               if [ "$mode" = crash ]; then kill -ABRT $$; fi
-              if [ "$mode" = cancel ]; then prompt_id="$id"; continue; fi
+              if [ "$mode" = cancel ] || [ "$mode" = ignoreCancel ]; then prompt_id="$id"; continue; fi
               if [ "$mode" = auth ]; then
                 printf '{"jsonrpc":"2.0","id":%s,"error":{"code":401,"message":"Unauthorized access_token=fake-secret-value at /Users/example/.grok/config"}}\n' "$id"
                 continue
@@ -595,6 +950,11 @@ private final class FakeGrokACPPeer {
               fi
               if [ "$mode" = invalidJSON ]; then
                 printf 'not-json\n'
+                continue
+              fi
+              if [ "$mode" = immediateResponse ]; then
+                printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"immediate"}}}}\n'
+                printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
                 continue
               fi
               if [ "$mode" = plan ] && [ "$current_mode" = plan ]; then
@@ -614,11 +974,13 @@ private final class FakeGrokACPPeer {
               printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}}}}\n'
               printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$prompt_id"
           elif printf '%s' "$line" | grep -q '"method":"session.*cancel"'; then
-              printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"cancelled"}}\n' "$prompt_id"
+            if [ "$mode" = ignoreCancel ]; then continue; fi
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"cancelled"}}\n' "$prompt_id"
           fi
         done
         """#
             .replacingOccurrences(of: "MODE", with: mode.rawValue)
+            .replacingOccurrences(of: "PROMPT_COUNT_PATH", with: promptCountPath)
             .replacingOccurrences(of: "COUNT_PATH", with: launchCountPath)
         try body.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
@@ -626,6 +988,23 @@ private final class FakeGrokACPPeer {
     }
 
     func remove() { try? FileManager.default.removeItem(at: root) }
+}
+
+private actor GrokACPAsyncSignal {
+    private var signalled = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func signal() {
+        signalled = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.resume() }
+    }
+
+    func wait() async {
+        guard !signalled else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
 }
 
 private extension NSLock {

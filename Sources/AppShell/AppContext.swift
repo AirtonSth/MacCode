@@ -7,6 +7,163 @@ import SocketServer
 import Surfaces
 import DistillCore
 
+// MARK: - Token Saver per-lane kill switch + governance snapshot
+
+/// WHY: Operators need a per-lane incident control point without full Token Saver
+/// rollback. The same pure decision is reachable from the app and from child
+/// `distill` processes via env (`RC_TOKEN_SAVER_DISABLED_LANES` /
+/// `RC_TOKEN_SAVER_ENABLED_LANES`) and the shared DistillCLIState.json overlay.
+/// New/experimental lanes default DISABLED until explicitly enabled.
+public enum TokenSaverLaneKillSwitch: Sendable {
+    public static let disabledEnvKey = "RC_TOKEN_SAVER_DISABLED_LANES"
+    public static let enabledEnvKey = "RC_TOKEN_SAVER_ENABLED_LANES"
+
+    /// Lanes that ship in factory defaults / production inventory. Everything
+    /// else is experimental and defaults to DISABLED.
+    public static let knownStableLanes: Set<String> = [
+        "measurement",
+        "provider_native",
+        "deterministic_wrapper",
+        "exact_repetition",
+        "lexical_retrieval",
+        "rollover_capsule",
+        "session_learn",
+        "semantic_prose",
+        "adaptive_effort",
+        "visual_artifact",
+        "sr1-humanize",
+        "sr1_humanize",
+    ]
+
+    public struct CLIStateOverlay: Sendable, Equatable {
+        public var disabledLanes: Set<String>
+        public var enabledLanes: Set<String>
+
+        public static let empty = CLIStateOverlay(disabledLanes: [], enabledLanes: [])
+
+        public init(disabledLanes: Set<String> = [], enabledLanes: Set<String> = []) {
+            self.disabledLanes = disabledLanes
+            self.enabledLanes = enabledLanes
+        }
+    }
+
+    public static func parseLaneList(_ raw: String?) -> Set<String> {
+        guard let raw else { return [] }
+        return Set(
+            raw.split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        )
+    }
+
+    /// Read optional `disabled_lanes` / `enabled_lanes` from DistillCLIState.json
+    /// without requiring the sidecar writer to know about them yet.
+    public static func loadCLIStateOverlay(from url: URL?) -> CLIStateOverlay {
+        guard let url,
+              let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return .empty
+        }
+        func set(from key: String) -> Set<String> {
+            if let arr = obj[key] as? [String] {
+                return Set(
+                    arr.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                )
+            }
+            if let s = obj[key] as? String {
+                return parseLaneList(s)
+            }
+            return []
+        }
+        return CLIStateOverlay(
+            disabledLanes: set(from: "disabled_lanes"),
+            enabledLanes: set(from: "enabled_lanes")
+        )
+    }
+
+    /// Pure resolver: is `lane` disabled given env + CLI state overlay.
+    public static func isDisabled(
+        _ lane: String,
+        environment: [String: String],
+        cliState: CLIStateOverlay = .empty
+    ) -> Bool {
+        let laneKey = lane.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !laneKey.isEmpty else { return true }
+        let envDisabled = parseLaneList(environment[disabledEnvKey])
+        let envEnabled = parseLaneList(environment[enabledEnvKey])
+        let disabled = envDisabled.union(cliState.disabledLanes)
+        let enabled = envEnabled.union(cliState.enabledLanes)
+        // Incident kill switch always wins over enable lists.
+        if disabled.contains(laneKey) { return true }
+        if enabled.contains(laneKey) { return false }
+        if knownStableLanes.contains(laneKey) { return false }
+        // New/experimental lanes default DISABLED.
+        return true
+    }
+
+    /// Resolved disabled set for known + mentioned lanes (for child env export).
+    public static func resolvedDisabledLanes(
+        environment: [String: String],
+        cliState: CLIStateOverlay = .empty
+    ) -> Set<String> {
+        let mentioned = parseLaneList(environment[disabledEnvKey])
+            .union(parseLaneList(environment[enabledEnvKey]))
+            .union(cliState.disabledLanes)
+            .union(cliState.enabledLanes)
+            .union(knownStableLanes)
+        return Set(mentioned.filter { isDisabled($0, environment: environment, cliState: cliState) })
+    }
+
+    public static func resolvedEnabledLanes(
+        environment: [String: String],
+        cliState: CLIStateOverlay = .empty
+    ) -> Set<String> {
+        parseLaneList(environment[enabledEnvKey]).union(cliState.enabledLanes)
+    }
+}
+
+/// Compact governance snapshot attached to measurement rows so ungating savings
+/// from project admission stays auditable.
+public struct TokenSaverGovernanceSnapshot: Sendable, Equatable, Codable {
+    public var projectId: String?
+    public var admissionAllowed: Bool
+    public var admissionReason: String
+    public var evidenceLevel: String?
+    public var governedWrite: Bool
+
+    public init(
+        projectId: String?,
+        admissionAllowed: Bool,
+        admissionReason: String,
+        evidenceLevel: String?,
+        governedWrite: Bool
+    ) {
+        self.projectId = projectId
+        self.admissionAllowed = admissionAllowed
+        self.admissionReason = admissionReason
+        self.evidenceLevel = evidenceLevel
+        self.governedWrite = governedWrite
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case admissionAllowed = "admission_allowed"
+        case admissionReason = "admission_reason"
+        case evidenceLevel = "evidence_level"
+        case governedWrite = "governed_write"
+    }
+
+    public func jsonString() -> String {
+        let encoder = JSONEncoder()
+        guard let data = try? encoder.encode(self),
+              let text = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return text
+    }
+}
+
 struct ProjectScriptRunOutcome: Sendable, Equatable {
     let workspaceID: WorkspaceID
     let surfaceID: SurfaceID
@@ -134,6 +291,7 @@ public final class AppContext {
     public let tokenSaverLaneStateRepo: TokenSaverLaneStateRepository
     public let tokenSaverRolloverRepo: TokenSaverRolloverCapsuleRepository
     public let tokenSaverProjectDataRepo: TokenSaverProjectDataRepository
+    public let tokenSaverAuditEventsRepo: TokenSaverAuditEventRepository
     public private(set) var tokenSaverLifecycleDegradedReason: String?
     public let privateNotificationBridge: PrivateNotificationBridge
     public let liveActivityHostIdentity: LiveActivityHostIdentity
@@ -183,6 +341,26 @@ public final class AppContext {
     /// Test seam: when set, used instead of resolving a client from the live
     /// sidecar status. Production code never sets this.
     var distillClientOverrideForTesting: DistillServiceClient?
+    var queueDrainProviderIdleTimeout: TimeInterval = 10
+    var queueDrainBeforeDispatchForTesting: (() async -> Void)?
+    /// Test seam for the single warning deadline; queue progress is causal.
+    var queueDrainSleepForTesting: ((AgentThreadID, Duration) async throws -> Duration)?
+    var queueDrainSuppressionAcquiredForTesting: ((AgentThreadID) async -> Void)?
+    private struct QueueDrainWaiter {
+        let token: UUID
+        let task: Task<Void, Never>
+    }
+    private var queueDrainWaiters: [AgentThreadID: QueueDrainWaiter] = [:]
+    private var queueDrainSuppressionLeases: [AgentThreadID: Set<UUID>] = [:]
+    private var queueDispatchAcceptancePermits: [AgentThreadID: AgentRunAcceptancePermit] = [:]
+    private struct DeferredQueuePromotion {
+        let ownerId: AgentQueuedMessageID
+        let targetId: AgentQueuedMessageID
+    }
+    private var deferredQueuePromotions: [AgentThreadID: DeferredQueuePromotion] = [:]
+    private var isTerminating = false
+    var queueDrainWaiterCountForTesting: Int { queueDrainWaiters.count }
+    var queueDrainSuppressedThreadCountForTesting: Int { queueDrainSuppressionLeases.count }
     /// Test seam: sandbox the SessionLearn target instruction files so tests never write
     /// into the developer's real ~/.claude/CLAUDE.md or ~/.codex/AGENTS.md.
     var sessionLearnInstructionFilesOverrideForTesting: [URL]?
@@ -199,6 +377,8 @@ public final class AppContext {
     private static let tokenSaverDistillStartupPolls = 300
     private static let tokenSaverPromptSkipSetTTL: TimeInterval = 1_800
     private static let tokenSaverUsageNotificationMinimumInterval: TimeInterval = 2
+    /// Process-local once flag for empty lane_state diagnostic (silent-death condition).
+    private static var didLogEmptyTokenSaverLaneState = false
     /// Debounce window for coalescing per-token usage writes into one disk write.
     private static let tokenSaverUsageDebounceInterval: TimeInterval = 0.75
 
@@ -258,6 +438,7 @@ public final class AppContext {
         self.tokenSaverLaneStateRepo = TokenSaverLaneStateRepository(db: db)
         self.tokenSaverRolloverRepo = TokenSaverRolloverCapsuleRepository(db: db)
         self.tokenSaverProjectDataRepo = TokenSaverProjectDataRepository(db: db)
+        self.tokenSaverAuditEventsRepo = TokenSaverAuditEventRepository(db: db)
         do {
             _ = try self.tokenSaverProjectDataRepo.performLifecycleSweep()
         } catch {
@@ -265,6 +446,13 @@ public final class AppContext {
             self.tokenSaverLifecycleDegradedReason = reason
             NSLog("RemoteCode Token Saver launch lifecycle sweep entered degraded verbatim mode: \(reason)")
         }
+        // WHY: production installs historically had 0 token_saver_lane_state rows while
+        // Token Saver was enabled — every project-admission governed write silently no-op'd.
+        // Log once so the silent-death condition is visible in unified logs.
+        Self.logEmptyLaneStateIfNeeded(
+            tokenSaverEnabled: SettingsStore(db: db).load().tokenSaverEnabled,
+            laneStateCount: (try? self.tokenSaverLaneStateRepo.countAll()) ?? 0
+        )
         let privatePushTargetStore = PrivatePushTargetStore(repo: self.settingsRepo)
         let privateNotificationBridge = PrivateNotificationBridge(
             accountStore: PrivateAccountSessionStore(repo: self.settingsRepo),
@@ -733,45 +921,48 @@ public final class AppContext {
                 EventBus.shared.publish(kind: "agent.run.error", payload: .object(errorPayload))
             }
         }
-        coordinator.onRunFinished = { tid, rid, status in
-            let kind = (status == .completed) ? "agent.run.completed" : "agent.run.failed"
-            EventBus.shared.publish(kind: kind, payload: agentRunPayload(threadId: tid, runId: rid, status: status))
-            EventBus.shared.publish(kind: "agent.run.finished", payload: agentRunPayload(threadId: tid, runId: rid, status: status))
-            // Flush any debounced usage for this run now that the run is done so
-            // the final token batch is never stranded in the accumulator.
-            self.flushPendingTokenSaverUsage(runId: rid)
-            self.recordSessionLearnFromRun(runId: rid, status: status) // P5 SessionLearn (off by default)
-            // Grok has no live `.accountUsage` stream (Claude/Codex do). Re-read
-            // the local billing snapshot after each Grok run so the Token Saver
-            // purple ring updates without waiting for the 5-minute periodic probe.
-            if let run = try? self.runRepo.get(id: rid), run.provider == .grok {
-                self.refreshGrokTokenSaverAccountUsage(reason: "run_finished")
-            }
-            // Drain the next queued message after ANY terminal status. A run that
-            // ended .failed previously stranded queued messages (no run to pick
-            // them up); drainNextQueuedAgentMessage re-checks the thread is not
-            // running/pending before sending, so an unconditional drain is safe
-            // and onRunFinished only fires on terminal statuses.
-            Task { @MainActor in
-                do {
-                    try await self.router?.drainNextQueuedAgentMessage(thread: tid)
-                } catch {
-                    EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
-                        "thread_id": .string(tid.value.uuidString),
-                        "message": .string(String(describing: error))
-                    ]))
+        coordinator.onRunFinished = { [weak self] tid, rid, status in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let kind = (status == .completed) ? "agent.run.completed" : "agent.run.failed"
+                EventBus.shared.publish(kind: kind, payload: agentRunPayload(threadId: tid, runId: rid, status: status))
+                EventBus.shared.publish(kind: "agent.run.finished", payload: agentRunPayload(threadId: tid, runId: rid, status: status))
+                // Flush any debounced usage for this run now that the run is done so
+                // the final token batch is never stranded in the accumulator.
+                self.flushPendingTokenSaverUsage(runId: rid)
+                self.recordSessionLearnFromRun(runId: rid, status: status) // P5 SessionLearn (off by default)
+                // Grok has no live `.accountUsage` stream (Claude/Codex do). Re-read
+                // the local billing snapshot after each Grok run so the Token Saver
+                // purple ring updates without waiting for the 5-minute periodic probe.
+                if let run = try? self.runRepo.get(id: rid), run.provider == .grok {
+                    self.refreshGrokTokenSaverAccountUsage(reason: "run_finished")
+                }
+                // Drain the next queued message after ANY terminal status. stopRun
+                // can publish its host terminal before a provider-native interrupt
+                // makes the adapter idle. Wait through that bounded cancellation
+                // window; otherwise Force gets one premature drain and the promoted
+                // message remains stranded with no later lifecycle callback.
+                self.ensureQueueDrainWaiterIfNeeded(threadId: tid)
+                if let content = RemoteCodeNotificationContent.threadOutcome(
+                    threadId: tid.value.uuidString,
+                    workspaceId: (try? self.threadRepo.get(id: tid)?.workspaceId)?.value.uuidString,
+                    title: try? self.threadRepo.get(id: tid)?.title,
+                    phase: status
+                ) {
+                    SystemNotifier.shared.post(content)
+                    Task {
+                        await self.privateNotificationBridge.deliver(content)
+                    }
                 }
             }
-            if let content = RemoteCodeNotificationContent.threadOutcome(
-                threadId: tid.value.uuidString,
-                workspaceId: (try? self.threadRepo.get(id: tid)?.workspaceId)?.value.uuidString,
-                title: try? self.threadRepo.get(id: tid)?.title,
-                phase: status
-            ) {
-                SystemNotifier.shared.post(content)
-                Task {
-                    await self.privateNotificationBridge.deliver(content)
-                }
+        }
+        coordinator.onProviderIdle = { [weak self] threadId in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                // Adapters finalize their resident-session status immediately
+                // after returning from the terminal callback.
+                await Task.yield()
+                await self.providerBecameIdle(threadId: threadId)
             }
         }
 
@@ -852,7 +1043,9 @@ public final class AppContext {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                self?.flushPendingTokenSaverUsage()
+                MainActor.assumeIsolated {
+                    _ = self?.prepareForApplicationTermination()
+                }
             }
         }
 
@@ -860,6 +1053,230 @@ public final class AppContext {
         if let snap = try snapshotRepo.latest() {
             self.state = snap.layout
         }
+    }
+
+    func ensureQueueDrainWaiterIfNeeded(threadId: AgentThreadID) {
+        guard queueDrainAllowsWork(threadId: threadId) else { return }
+        guard let queuedMessages = try? queuedMessageRepo.list(threadId: threadId),
+              !queuedMessages.isEmpty else {
+            cancelQueueDrainWaiterIfQueueEmpty(threadId: threadId)
+            return
+        }
+        guard queueDrainWaiters[threadId] == nil else { return }
+        let timeout = Duration.seconds(max(0.001, queueDrainProviderIdleTimeout))
+        let token = UUID()
+
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                if let queueDrainSleepForTesting = self.queueDrainSleepForTesting {
+                    _ = try await queueDrainSleepForTesting(threadId, timeout)
+                } else {
+                    try await ContinuousClock().sleep(for: timeout)
+                }
+            } catch {
+                return
+            }
+            guard self.queueDrainWaiters[threadId]?.token == token,
+                  self.queueDrainAllowsWork(threadId: threadId),
+                  self.coordinator.hasProviderSession(threadId: threadId) else { return }
+            switch (try? self.threadRepo.get(id: threadId))?.status {
+            case .completed, .failed, .cancelled, .interrupted:
+                EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
+                    "thread_id": .string(threadId.value.uuidString),
+                    "message": .string("Provider is still stopping. The queued message remains safe and will start when the provider becomes idle.")
+                ]))
+            case .pending, .running, nil:
+                break
+            }
+        }
+        queueDrainWaiters[threadId] = QueueDrainWaiter(token: token, task: task)
+        if !coordinator.hasProviderSession(threadId: threadId) {
+            Task { @MainActor [weak self] in
+                await self?.finishScheduledQueueDrain(threadId: threadId, token: token)
+            }
+        }
+    }
+
+    private func providerBecameIdle(threadId: AgentThreadID) async {
+        guard let waiter = queueDrainWaiters[threadId],
+              !coordinator.hasProviderSession(threadId: threadId) else { return }
+        await finishScheduledQueueDrain(threadId: threadId, token: waiter.token)
+    }
+
+    private func finishScheduledQueueDrain(threadId: AgentThreadID, token: UUID) async {
+        guard queueDrainWaiters[threadId]?.token == token,
+              queueDrainAllowsWork(threadId: threadId),
+              !Task.isCancelled else {
+            removeQueueDrainWaiter(threadId: threadId, token: token)
+            return
+        }
+        defer { removeQueueDrainWaiter(threadId: threadId, token: token) }
+        if let queueDrainBeforeDispatchForTesting {
+            await queueDrainBeforeDispatchForTesting()
+        }
+        guard queueDrainAllowsWork(threadId: threadId), !Task.isCancelled else { return }
+        do {
+            try await router?.drainNextQueuedAgentMessage(thread: threadId)
+        } catch is CancellationError {
+            return
+        } catch {
+            EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
+                "thread_id": .string(threadId.value.uuidString),
+                "message": .string(String(describing: error))
+            ]))
+        }
+    }
+
+    func cancelQueueDrainWaiterIfQueueEmpty(threadId: AgentThreadID) {
+        guard ((try? queuedMessageRepo.list(threadId: threadId)) ?? []).isEmpty else { return }
+        deferredQueuePromotions.removeValue(forKey: threadId)
+        cancelQueueDrainWaiter(threadId: threadId)
+    }
+
+    func cancelQueueDrainWaiter(threadId: AgentThreadID) {
+        queueDrainWaiters.removeValue(forKey: threadId)?.task.cancel()
+    }
+
+    func registerQueueDispatchAcceptancePermit(
+        _ permit: AgentRunAcceptancePermit,
+        threadId: AgentThreadID
+    ) {
+        queueDispatchAcceptancePermits[threadId]?.invalidate()
+        queueDispatchAcceptancePermits[threadId] = permit
+    }
+
+    func unregisterQueueDispatchAcceptancePermit(
+        _ permit: AgentRunAcceptancePermit,
+        threadId: AgentThreadID
+    ) {
+        guard queueDispatchAcceptancePermits[threadId] === permit else { return }
+        queueDispatchAcceptancePermits.removeValue(forKey: threadId)
+    }
+
+    func deferQueuePromotion(
+        id: AgentQueuedMessageID,
+        after ownerId: AgentQueuedMessageID,
+        threadId: AgentThreadID
+    ) {
+        deferredQueuePromotions[threadId] = DeferredQueuePromotion(
+            ownerId: ownerId,
+            targetId: id
+        )
+    }
+
+    func deferredQueuePromotion(
+        threadId: AgentThreadID,
+        ownerId: AgentQueuedMessageID
+    ) -> AgentQueuedMessageID? {
+        guard deferredQueuePromotions[threadId]?.ownerId == ownerId else { return nil }
+        return deferredQueuePromotions[threadId]?.targetId
+    }
+
+    func clearDeferredQueuePromotion(
+        threadId: AgentThreadID,
+        ownerId: AgentQueuedMessageID
+    ) {
+        guard deferredQueuePromotions[threadId]?.ownerId == ownerId else { return }
+        deferredQueuePromotions.removeValue(forKey: threadId)
+    }
+
+    func acquireQueueDrainSuppression(threadId: AgentThreadID) async -> UUID {
+        await acquireQueueDrainSuppressions(threadIds: [threadId])[0].1
+    }
+
+    /// Installs every lease and invalidates every pending provider acceptance
+    /// before awaiting any one drain task. This prevents an idle sibling thread
+    /// from starting while a stuck sibling is still cancelling.
+    func acquireQueueDrainSuppressions(
+        threadIds: [AgentThreadID]
+    ) async -> [(AgentThreadID, UUID)] {
+        var seen: Set<AgentThreadID> = []
+        let ordered = threadIds.filter { seen.insert($0).inserted }
+        var leases: [(AgentThreadID, UUID)] = []
+        var waiters: [Task<Void, Never>] = []
+        var acceptanceAttempts: [(AgentThreadID, AgentRunAcceptanceAttempt)] = []
+        for threadId in ordered {
+            let lease = UUID()
+            queueDrainSuppressionLeases[threadId, default: []].insert(lease)
+            leases.append((threadId, lease))
+            if let attempt = queueDispatchAcceptancePermits
+                .removeValue(forKey: threadId)?
+                .invalidate() {
+                acceptanceAttempts.append((threadId, attempt))
+            }
+            if let waiter = queueDrainWaiters.removeValue(forKey: threadId) {
+                waiter.task.cancel()
+                waiters.append(waiter.task)
+            }
+        }
+        // A claimed write linearized before suppression. Stop every affected
+        // provider before awaiting any write completion so a stuck pipe cannot
+        // delay cancellation of its siblings.
+        for (threadId, _) in acceptanceAttempts {
+            coordinator.stopRun(threadId: threadId)
+        }
+        if let queueDrainSuppressionAcquiredForTesting {
+            for threadId in ordered {
+                await queueDrainSuppressionAcquiredForTesting(threadId)
+            }
+        }
+        let acceptanceWaiters = acceptanceAttempts.map { _, attempt in
+            Task.detached {
+                await attempt.wait()
+            }
+        }
+        for waiter in waiters {
+            await waiter.value
+        }
+        for waiter in acceptanceWaiters {
+            await waiter.value
+        }
+        return leases
+    }
+
+    func releaseQueueDrainSuppression(threadId: AgentThreadID, lease: UUID) {
+        guard var leases = queueDrainSuppressionLeases[threadId],
+              leases.remove(lease) != nil else { return }
+        if leases.isEmpty {
+            queueDrainSuppressionLeases.removeValue(forKey: threadId)
+            ensureQueueDrainWaiterIfNeeded(threadId: threadId)
+        } else {
+            queueDrainSuppressionLeases[threadId] = leases
+        }
+    }
+
+    func queueDrainAllowsWork(threadId: AgentThreadID) -> Bool {
+        !isTerminating && queueDrainSuppressionLeases[threadId]?.isEmpty != false
+    }
+
+    private func removeQueueDrainWaiter(threadId: AgentThreadID, token: UUID) {
+        guard queueDrainWaiters[threadId]?.token == token else { return }
+        queueDrainWaiters.removeValue(forKey: threadId)?.task.cancel()
+    }
+
+    private func cancelAllQueueDrainWaiters() -> [Task<Void, Never>] {
+        let permits = queueDispatchAcceptancePermits
+        queueDispatchAcceptancePermits.removeAll()
+        var tasks = queueDrainWaiters.values.map(\.task)
+        queueDrainWaiters.removeAll()
+        for task in tasks { task.cancel() }
+        for (threadId, permit) in permits {
+            guard let attempt = permit.invalidate() else { continue }
+            coordinator.stopRun(threadId: threadId)
+            tasks.append(Task.detached {
+                await attempt.wait()
+            })
+        }
+        return tasks
+    }
+
+    @discardableResult
+    func prepareForApplicationTermination() -> [Task<Void, Never>] {
+        isTerminating = true
+        flushPendingTokenSaverUsage()
+        flushWriterQueue()
+        return cancelAllQueueDrainWaiters()
     }
 
     /// Managed `/distill` state is only useful while Token Saver is on, so the skill
@@ -896,6 +1313,26 @@ public final class AppContext {
         // Activate waves that have passed E2E live rollout (process-local).
         TokenSaverWaveLiveRollout.activateAll()
         var env: [String: String] = [:]
+        // WHY: per-lane kill switch must reach child `distill` so an operator can
+        // disable one compression lane during an incident without full rollback.
+        // Exported even when managed install is degraded — the decision is independent.
+        let cliState = TokenSaverLaneKillSwitch.loadCLIStateOverlay(
+            from: tokenSaverDistillCLIStateURL
+        )
+        let disabled = TokenSaverLaneKillSwitch.resolvedDisabledLanes(
+            environment: baseEnvironment,
+            cliState: cliState
+        )
+        if !disabled.isEmpty {
+            env[TokenSaverLaneKillSwitch.disabledEnvKey] = disabled.sorted().joined(separator: ",")
+        }
+        let enabled = TokenSaverLaneKillSwitch.resolvedEnabledLanes(
+            environment: baseEnvironment,
+            cliState: cliState
+        )
+        if !enabled.isEmpty {
+            env[TokenSaverLaneKillSwitch.enabledEnvKey] = enabled.sorted().joined(separator: ",")
+        }
         // Expose managed distill CLI + wrappers on PATH only while Token Saver is on.
         if managedDistillSkillInstallError == nil {
             env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1"
@@ -1449,6 +1886,78 @@ public final class AppContext {
         return runAs.uid == getuid()
     }
 
+    private var tokenSaverDistillCLIStateURL: URL {
+        appSupportDirectory
+            .appendingPathComponent("Distill", isDirectory: true)
+            .appendingPathComponent("DistillCLIState.json")
+    }
+
+    private func tokenSaverLaneIsDisabled(_ lane: String) -> Bool {
+        let cliState = TokenSaverLaneKillSwitch.loadCLIStateOverlay(from: tokenSaverDistillCLIStateURL)
+        return TokenSaverLaneKillSwitch.isDisabled(
+            lane,
+            environment: ProcessInfo.processInfo.environment,
+            cliState: cliState
+        )
+    }
+
+    /// WHY: Admission denials were previously silent early-returns — operators could not
+    /// see that project_id NULL / empty lane_state blocked every governed write.
+    private func recordTokenSaverAdmissionDenial(
+        threadId: AgentThreadID,
+        lane: String,
+        decision: TokenSaverAdmissionDecision,
+        count: Int = 1
+    ) {
+        guard !decision.allowed else { return }
+        let projectID = (try? threadRepo.get(id: threadId))?.projectId?.value.uuidString
+        NSLog(
+            "RemoteCode Token Saver admission DENIED lane=\(lane) reason=\(decision.reason) thread=\(threadId.value.uuidString) project=\(projectID ?? "nil")"
+        )
+        try? tokenSaverAuditEventsRepo.append(
+            eventKind: "token_saver_denial",
+            projectID: projectID,
+            threadID: threadId.value.uuidString,
+            objectID: decision.reason,
+            countValue: Int64(max(1, count)),
+            reason: lane
+        )
+    }
+
+    /// Build a compact governance snapshot for measurement rows (admission kept for audit).
+    private func tokenSaverGovernanceSnapshot(
+        threadId: AgentThreadID,
+        lane: String,
+        governedWrite: Bool
+    ) -> TokenSaverGovernanceSnapshot {
+        let thread = try? threadRepo.get(id: threadId)
+        let projectID = thread?.projectId?.value.uuidString
+        let admission = tokenSaverProjectAdmission(threadId: threadId, lane: lane)
+        var evidence: String?
+        if let projectID,
+           let laneRow = try? tokenSaverLaneStateRepo.get(projectID: projectID, lane: lane) {
+            evidence = laneRow.evidenceLevel
+        }
+        return TokenSaverGovernanceSnapshot(
+            projectId: projectID,
+            admissionAllowed: admission.allowed,
+            admissionReason: admission.reason,
+            evidenceLevel: evidence,
+            governedWrite: governedWrite
+        )
+    }
+
+    /// WHY: empty lane_state + Token Saver enabled is the silent-death condition observed
+    /// on real installs (0 projects, 0 lane rows, all threads project_id NULL).
+    static func logEmptyLaneStateIfNeeded(tokenSaverEnabled: Bool, laneStateCount: Int) {
+        guard tokenSaverEnabled, laneStateCount == 0 else { return }
+        guard !didLogEmptyTokenSaverLaneState else { return }
+        didLogEmptyTokenSaverLaneState = true
+        NSLog(
+            "RemoteCode Token Saver ALERT: tokenSaverEnabled=true but token_saver_lane_state is EMPTY — project-admission governed writes will deny until lanes are promoted (silent-death condition). Measurement continues independently."
+        )
+    }
+
     func tokenSaverCompress(
         prompt: String,
         provider: AgentProvider,
@@ -1464,7 +1973,22 @@ public final class AppContext {
         ) else {
             return prompt
         }
-        guard tokenSaverProjectAdmission(threadId: threadId, lane: "deterministic_wrapper").allowed else {
+        // Operator per-lane kill switch (incident control) — same decision child env exports.
+        if tokenSaverLaneIsDisabled("deterministic_wrapper") {
+            recordTokenSaverAdmissionDenial(
+                threadId: threadId,
+                lane: "deterministic_wrapper",
+                decision: .init(allowed: false, reason: "operator_lane_disabled")
+            )
+            return prompt
+        }
+        let admission = tokenSaverProjectAdmission(threadId: threadId, lane: "deterministic_wrapper")
+        guard admission.allowed else {
+            recordTokenSaverAdmissionDenial(
+                threadId: threadId,
+                lane: "deterministic_wrapper",
+                decision: admission
+            )
             return prompt
         }
         // NetPositiveGate (G3): there is no app-side cached prefix to preserve (resume sends
@@ -1828,9 +2352,26 @@ public final class AppContext {
         runId: AgentRunID?
     ) -> String {
         let settings = SettingsStore(db: db).load()
-        guard settings.sessionLearnEnabled,
-              tokenSaverProjectAdmission(threadId: threadId, lane: "session_learn").allowed,
-              let thread = try? threadRepo.get(id: threadId),
+        guard settings.sessionLearnEnabled else { return prompt }
+        // WHY: session_learn retains scoped text — keep project admission; make denials loud.
+        if tokenSaverLaneIsDisabled("session_learn") {
+            recordTokenSaverAdmissionDenial(
+                threadId: threadId,
+                lane: "session_learn",
+                decision: .init(allowed: false, reason: "operator_lane_disabled")
+            )
+            return prompt
+        }
+        let sessionAdmission = tokenSaverProjectAdmission(threadId: threadId, lane: "session_learn")
+        guard sessionAdmission.allowed else {
+            recordTokenSaverAdmissionDenial(
+                threadId: threadId,
+                lane: "session_learn",
+                decision: sessionAdmission
+            )
+            return prompt
+        }
+        guard let thread = try? threadRepo.get(id: threadId),
               let workspaceID = thread.workspaceId?.value.uuidString,
               let projectID = thread.projectId?.value.uuidString else {
             return prompt
@@ -2542,15 +3083,35 @@ public final class AppContext {
         cacheState: String = "unknown",
         routeStage: TokenSaverRouteStage? = nil
     ) {
-        guard tokenSaverProjectAdmission(threadId: threadId, lane: "deterministic_wrapper").allowed else { return }
+        // WHY: Measurement/accounting must not depend on project admission. Real installs
+        // have project_id NULL on all threads and 0 lane_state rows, which made every
+        // savings write (including sr1-humanize) silently dead. Lossy/governed paths
+        // still use tokenSaverProjectAdmission; this path only needs paid feature + same-user.
+        guard SettingsStore(db: db).load().tokenSaverEnabled else { return }
+        guard tokenSaverIsSameUser(threadId: threadId) else { return }
+        let laneForGovernance = mode == "sr1-humanize" ? "sr1-humanize" : "deterministic_wrapper"
+        // Keep admission decision for audit snapshot (do not gate the write on it).
+        let governance = tokenSaverGovernanceSnapshot(
+            threadId: threadId,
+            lane: laneForGovernance,
+            governedWrite: false
+        )
         do {
+            // WHY: defaults are attributability="unknown" / delivered=false — the
+            // displayedSavingsEligibilitySQL legacy escape hatch for PRE-MIGRATION
+            // rows. New app-side rows must not land there or delivered can never
+            // filter and forfeited/unknown rows look like attributed savings.
+            // These are delivered compressions that are not proven prompt-bound.
             _ = try tokenSaverSavingsRepo.record(
                 provider: provider.rawValue,
                 mode: TokenSaverEngineLabel.mode(base: mode, stage: routeStage),
                 inputTokens: inputTokens,
                 outputTokens: outputTokens,
                 savedTokens: savedTokens,
-                cacheState: cacheState
+                cacheState: cacheState,
+                attributability: "not_prompt_bound",
+                delivered: true,
+                governance: governance.jsonString()
             )
             recomputeTokenSaverDailyEconomyToday()
             NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
@@ -2565,6 +3126,12 @@ public final class AppContext {
         let settings = SettingsStore(db: db).load()
         let usage = TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).load()
         let windowUsage = TokenSaverBareUserEstimator.todayProviderTokens(daily: usage.daily, now: now)
+        // WHY: fail-closed — pass known day billed only; never substitute raw windowUsage.
+        // nil keeps usage-anchored legs unavailable rather than re-inflating ~8×.
+        let windowBilled = TokenSaverBareUserEstimator.todayProviderBilledTokenUnits(
+            daily: usage.daily,
+            now: now
+        )
         let dayStartMs = tokenSaverDailyEconomyRepo.dayStartMs(for: now)
         let dayEndMs = tokenSaverDailyEconomyRepo.dayEndMsExclusive(for: now)
         do {
@@ -2588,6 +3155,7 @@ public final class AppContext {
                 orchestrationActive: false,
                 observation: TokenSaverBareUserObservation(
                     windowProviderTokens: windowUsage,
+                    windowProviderBilledTokenUnits: windowBilled,
                     graphifySignalCount: signalCount,
                     graphifyAnswerTokens: answerSum,
                     medianExplorationTokens: medianExploration
@@ -2606,7 +3174,10 @@ public final class AppContext {
                     formulaVersion: TokenSaverDailyEconomyRepository.formulaVersion,
                     appliedOutputShare: breakdown.appliedOutputShare,
                     graphifySignalCount: signalCount,
-                    updatedAt: iso
+                    updatedAt: iso,
+                    // Persistence stores 0 when billed is unknown (field is non-optional).
+                    // WHY: same fail-closed rule — do not write raw tokens as billed.
+                    windowUsageBilledUnits: windowBilled ?? 0
                 )
             )
         } catch {

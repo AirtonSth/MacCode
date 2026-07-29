@@ -157,6 +157,110 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         XCTAssertEqual(by[.codex]?.weeklyUsedPercent, 23)
     }
 
+    func test_record_knownBilledDelta_populatesDayBucketAndWindow() throws {
+        // WHY: production must supply known windowed billed units end-to-end;
+        // day buckets are the only windowed source (provider totals are cumulative).
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ts-day-billed-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let fixedNow = Date(timeIntervalSince1970: 1_784_000_000)
+        let store = TokenSaverUsageStore(
+            appSupportDirectory: dir,
+            calendar: Calendar(identifier: .gregorian),
+            now: { fixedNow }
+        )
+        _ = try store.record(
+            provider: .claude,
+            actualProviderTokens: 8_000,
+            estimatedRawTokens: 8_000,
+            actualProviderBilledTokenUnits: 1_000,
+            estimatedRawBilledTokenUnits: 1_000,
+            eligibleRuns: 1
+        )
+        _ = try store.record(
+            provider: .claude,
+            actualProviderTokens: 2_000,
+            estimatedRawTokens: 2_000,
+            actualProviderBilledTokenUnits: 250,
+            estimatedRawBilledTokenUnits: 250,
+            eligibleRuns: 1
+        )
+        let day = try XCTUnwrap(store.load().daily.first)
+        XCTAssertEqual(day.actualProviderTokens, 10_000)
+        XCTAssertEqual(day.actualProviderBilledTokenUnits ?? -1, 1_250, accuracy: 0.001)
+        XCTAssertEqual(
+            TokenSaverBareUserEstimator.todayProviderBilledTokenUnits(
+                daily: store.load().daily,
+                now: fixedNow
+            ) ?? -1,
+            1_250,
+            accuracy: 0.001
+        )
+    }
+
+    func test_record_unknownBilledContribution_makesDayBilledNil() throws {
+        // WHY: fail-closed — mixing known and unknown billed on one day must not
+        // keep a partial sum that pretends to be a complete billed window.
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ts-day-billed-mixed-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let fixedNow = Date(timeIntervalSince1970: 1_784_000_000)
+        let store = TokenSaverUsageStore(
+            appSupportDirectory: dir,
+            calendar: Calendar(identifier: .gregorian),
+            now: { fixedNow }
+        )
+        _ = try store.record(
+            provider: .claude,
+            actualProviderTokens: 8_000,
+            estimatedRawTokens: 8_000,
+            actualProviderBilledTokenUnits: 1_000,
+            eligibleRuns: 1
+        )
+        // Omit billed → provider usage defaults billed-from-raw, but known is nil.
+        _ = try store.record(
+            provider: .claude,
+            actualProviderTokens: 2_000,
+            estimatedRawTokens: 2_000,
+            eligibleRuns: 1
+        )
+        let day = try XCTUnwrap(store.load().daily.first)
+        XCTAssertEqual(day.actualProviderTokens, 10_000)
+        XCTAssertNil(day.actualProviderBilledTokenUnits)
+        XCTAssertNil(
+            TokenSaverBareUserEstimator.todayProviderBilledTokenUnits(
+                daily: store.load().daily,
+                now: fixedNow
+            )
+        )
+    }
+
+    func test_dayUsage_decodeMissingBilledKey_yieldsNilNotRaw() throws {
+        // WHY: historical usage.json without the billed key must stay UNKNOWN
+        // (nil), never decode as raw-derived billed and silently re-inflate.
+        let seed = TokenSaverDayUsage(
+            dayStart: Date(timeIntervalSince1970: 1_784_000_000),
+            actualProviderTokens: 8_000,
+            estimatedRawTokens: 8_000,
+            eligibleRuns: 1,
+            actualProviderBilledTokenUnits: 999
+        )
+        let encoded = try JSONEncoder().encode(seed)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object.removeValue(forKey: "actualProviderBilledTokenUnits")
+        let stripped = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(TokenSaverDayUsage.self, from: stripped)
+        XCTAssertEqual(decoded.actualProviderTokens, 8_000)
+        XCTAssertNil(
+            decoded.actualProviderBilledTokenUnits,
+            "missing JSON key must decode to nil, not Double(actualProviderTokens)"
+        )
+    }
+
     /// WHY: bare session 0% from a probe miss painted every Today ring as empty
     /// even when weekly usage was 80%+. Only a live unexpired session window may
     /// keep a true 0%; otherwise session % is missing so the UI can fall back.

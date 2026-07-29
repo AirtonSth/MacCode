@@ -701,7 +701,17 @@ public final class AgentThreadRepository {
     }
 
     public func delete(ids: [AgentThreadID]) throws {
-        for id in ids { try delete(id: id) }
+        guard !ids.isEmpty else { return }
+        try db.performSync { database in
+            try database.transaction {
+                let statement = try database.prepare("DELETE FROM agent_threads WHERE id = ?;")
+                for id in ids {
+                    statement.reset()
+                    try statement.bind(1, id.value.uuidString)
+                    _ = try statement.step()
+                }
+            }
+        }
     }
 
     /// PERF-008: returns the subset of the given workspace ids that have at
@@ -1475,7 +1485,8 @@ public final class AgentQueuedMessageRepository {
 
     public func list(threadId: AgentThreadID) throws -> [AgentQueuedMessage] {
         let st = try db.prepare("""
-            SELECT id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at
+            SELECT id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at,
+                   dispatch_state
             FROM agent_queued_messages
             WHERE thread_id = ?
             ORDER BY position ASC, created_at ASC;
@@ -1483,21 +1494,22 @@ public final class AgentQueuedMessageRepository {
         try st.bind(1, threadId.value.uuidString)
         var out: [AgentQueuedMessage] = []
         while try st.step() {
-            out.append(decodeRow(st))
+            out.append(decodeRow(st, durableStateColumn: 8))
         }
         return out
     }
 
     public func first(threadId: AgentThreadID) throws -> AgentQueuedMessage? {
         let st = try db.prepare("""
-            SELECT id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at
+            SELECT id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at,
+                   dispatch_state
             FROM agent_queued_messages
             WHERE thread_id = ?
             ORDER BY position ASC, created_at ASC
             LIMIT 1;
         """)
         try st.bind(1, threadId.value.uuidString)
-        return try st.step() ? decodeRow(st) : nil
+        return try st.step() ? decodeRow(st, durableStateColumn: 8) : nil
     }
 
     public func threadIdsWithQueuedMessages() throws -> [AgentThreadID] {
@@ -1523,6 +1535,16 @@ public final class AgentQueuedMessageRepository {
         var lease: AgentQueuedMessageLease?
         try db.performSync { database in try database.transaction {
             let cutoff = now.addingTimeInterval(-leaseTimeout)
+            let activeLease = try database.prepare("""
+                SELECT 1
+                FROM agent_queued_messages
+                WHERE thread_id = ? AND lease_id IS NOT NULL
+                  AND lease_started_at IS NOT NULL AND lease_started_at > ?
+                LIMIT 1;
+            """)
+            try activeLease.bind(1, threadId.value.uuidString)
+            try activeLease.bind(2, iso.string(from: cutoff))
+            guard try !activeLease.step() else { return }
             let select = try database.prepare("""
                 SELECT id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at,
                        lease_id, lease_started_at, dispatch_state, dispatch_run_id
@@ -1647,7 +1669,11 @@ public final class AgentQueuedMessageRepository {
     }
 
     @discardableResult
-    public func releasePrepared(_ lease: AgentQueuedMessageLease, runId: AgentRunID) throws -> Bool {
+    public func releasePrepared(
+        _ lease: AgentQueuedMessageLease,
+        runId: AgentRunID,
+        promoting promotedId: AgentQueuedMessageID? = nil
+    ) throws -> Bool {
         try db.performSync { database in try database.transaction {
             let st = try database.prepare("""
                 UPDATE agent_queued_messages
@@ -1660,7 +1686,28 @@ public final class AgentQueuedMessageRepository {
             try st.bind(3, runId.value.uuidString)
             _ = try st.step()
             guard try changedRowCount() == 1 else { return false }
-            try normalizePositions(threadId: lease.message.threadId)
+            if let promotedId,
+               let target = try get(id: promotedId),
+               target.threadId == lease.message.threadId,
+               target.id != lease.message.id,
+               try !threadHasActiveLease(target.threadId) {
+                let ordered = [target] + (try list(threadId: target.threadId))
+                    .filter { $0.id != target.id }
+                let now = Date()
+                for (index, message) in ordered.enumerated() {
+                    let update = try database.prepare("""
+                        UPDATE agent_queued_messages
+                        SET position = ?, updated_at = ?
+                        WHERE id = ? AND lease_id IS NULL;
+                    """)
+                    try update.bind(1, Int64(index + 1))
+                    try update.bind(2, iso.string(from: now))
+                    try update.bind(3, message.id.value.uuidString)
+                    _ = try update.step()
+                }
+            } else {
+                try normalizePositions(threadId: lease.message.threadId)
+            }
             return true
         } }
     }
@@ -1699,7 +1746,11 @@ public final class AgentQueuedMessageRepository {
         guard try st.step() else { return nil }
         let state = AgentQueuedMessageDispatchState(rawValue: st.columnText(8) ?? "") ?? .queued
         let runId = st.columnText(9).flatMap(UUID.init(uuidString:)).map(AgentRunID.init)
-        return AgentQueuedMessageDispatch(message: decodeRow(st), state: state, runId: runId)
+        return AgentQueuedMessageDispatch(
+            message: decodeRow(st, durableStateColumn: 8),
+            state: state,
+            runId: runId
+        )
     }
 
     /// Reconciles a crash after `prepareDispatch` only when the caller has proved
@@ -1826,12 +1877,13 @@ public final class AgentQueuedMessageRepository {
 
     public func get(id: AgentQueuedMessageID) throws -> AgentQueuedMessage? {
         let st = try db.prepare("""
-            SELECT id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at
+            SELECT id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at,
+                   dispatch_state
             FROM agent_queued_messages
             WHERE id = ?;
         """)
         try st.bind(1, id.value.uuidString)
-        return try st.step() ? decodeRow(st) : nil
+        return try st.step() ? decodeRow(st, durableStateColumn: 8) : nil
     }
 
     public func update(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) throws -> AgentQueuedMessage? {
@@ -1873,11 +1925,48 @@ public final class AgentQueuedMessageRepository {
         }
     }
 
+    /// Explicitly abandons an ambiguous prepared intent. Unlike generic queue
+    /// deletion, this CAS cannot remove queued or provider-confirmed dispatched
+    /// work and requires the exact durable lease/run identity observed here.
+    public func abandonPrepared(id: AgentQueuedMessageID) throws -> AgentQueuedMessage? {
+        try db.performSync { database in
+            try database.transaction {
+                let select = try database.prepare("""
+                    SELECT id, thread_id, text, attachments_json, interaction_mode,
+                           position, created_at, updated_at, lease_id, dispatch_run_id
+                    FROM agent_queued_messages
+                    WHERE id = ? AND dispatch_state = 'prepared';
+                """)
+                try select.bind(1, id.value.uuidString)
+                guard try select.step(),
+                      let leaseId = select.columnText(8),
+                      let runId = select.columnText(9) else {
+                    return nil
+                }
+                var queued = decodeRow(select)
+                queued.durableState = .prepared
+
+                let delete = try database.prepare("""
+                    DELETE FROM agent_queued_messages
+                    WHERE id = ? AND lease_id = ? AND dispatch_state = 'prepared'
+                      AND dispatch_run_id = ?;
+                """)
+                try delete.bind(1, id.value.uuidString)
+                try delete.bind(2, leaseId)
+                try delete.bind(3, runId)
+                _ = try delete.step()
+                guard try changedRowCount() == 1 else { return nil }
+                try normalizePositions(threadId: queued.threadId)
+                return queued
+            }
+        }
+    }
+
     public func promoteToFront(id: AgentQueuedMessageID) throws -> AgentQueuedMessage? {
         try db.performSync { database in
             try database.transaction {
-            guard let target = try get(id: id),
-                  try !threadHasActiveLease(target.threadId) else { return nil }
+            guard let target = try get(id: id) else { return nil }
+            guard try !threadHasActiveLease(target.threadId) else { return nil }
             let ordered = [target] + (try list(threadId: target.threadId)).filter { $0.id != id }
             let now = Date()
             for (index, message) in ordered.enumerated() {
@@ -1955,7 +2044,10 @@ public final class AgentQueuedMessageRepository {
         return attachments
     }
 
-    private func decodeRow(_ st: SQLiteStatement) -> AgentQueuedMessage {
+    private func decodeRow(
+        _ st: SQLiteStatement,
+        durableStateColumn: Int32? = nil
+    ) -> AgentQueuedMessage {
         var message = AgentQueuedMessage(
             id: AgentQueuedMessageID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID()),
             threadId: AgentThreadID(UUID(uuidString: st.columnText(1) ?? "") ?? UUID()),
@@ -1966,6 +2058,11 @@ public final class AgentQueuedMessageRepository {
             createdAt: parseDate(st.columnText(6)),
             updatedAt: parseDate(st.columnText(7))
         )
+        if let durableStateColumn {
+            message.durableState = AgentQueuedMessageDurableState(
+                rawValue: st.columnText(durableStateColumn) ?? ""
+            ) ?? .queued
+        }
         message.routingSnapshot = try? routingSnapshot(id: message.id)
         return message
     }

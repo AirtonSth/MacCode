@@ -3,6 +3,42 @@ import XCTest
 import CoreModel
 
 final class GrokACPProtocolTests: XCTestCase {
+    func test_launchArgumentsAreExactlyNoLeaderStdioWithNoDuplication() {
+        // WHY: Grok 0.2.112 shared-leader mode dies (exit 143) looking for
+        // client_id. Every ACP launch must use isolated agent stdio only.
+        let args = GrokACPClient.launchArguments
+        XCTAssertEqual(args, ["agent", "--no-leader", "stdio"])
+        XCTAssertEqual(Set(args).count, args.count, "ACP argv must not duplicate flags or subcommands")
+        XCTAssertFalse(args.contains("client_id"))
+        XCTAssertEqual(args.filter { $0 == "--no-leader" }.count, 1)
+        XCTAssertEqual(args.filter { $0 == "stdio" }.count, 1)
+        XCTAssertEqual(args.filter { $0 == "agent" }.count, 1)
+        // initialize params stay free of client_id — auth is CLI-side.
+        let params = GrokACPClient.initializeParams(clientVersion: "test")
+        XCTAssertNil(params["client_id"])
+        XCTAssertNil((params["clientInfo"] as? [String: Any])?["client_id"])
+    }
+
+    func test_spawnedProcessUsesExactLaunchArgumentsSeam() throws {
+        // WHY: the static seam only helps if GrokACPClient.init wires it through.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("grok-acp-argv-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("grok")
+        try #"""
+        #!/bin/sh
+        # Consume stdin until closed; mirror nothing.
+        cat >/dev/null
+        """#.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let client = try GrokACPClient(binary: script.path, cwd: root.path, tagProcess: false)
+        defer { client.stop() }
+        XCTAssertEqual(client.runningProcess.arguments, GrokACPClient.launchArguments)
+        XCTAssertEqual(client.runningProcess.arguments, ["agent", "--no-leader", "stdio"])
+    }
+
     func test_initializeAdvertisesOnlyImplementedClientCapabilities() {
         let params = GrokACPClient.initializeParams(clientVersion: "test")
         XCTAssertEqual(params["protocolVersion"] as? Int, 1)

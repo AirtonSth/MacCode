@@ -14,6 +14,15 @@ public struct TokenSaverDailyEconomyRecord: Sendable, Equatable {
     public let appliedOutputShare: Double
     public let graphifySignalCount: Int
     public let updatedAt: String
+    /// Pre-cap dialect estimate (evidence; collapse detection).
+    public let dialectRawTokens: Int
+    /// Pre-cap graphify estimate (evidence).
+    public let graphifyRawTokens: Int
+    /// Which cap bound the attributed scale: none | no_proof_allowance |
+    /// measured_multiple | usage_share.
+    public let capBinding: String
+    /// Billed window units used for usage-anchored legs; 0 when unknown/unavailable.
+    public let windowUsageBilledUnits: Double
 
     public init(
         dayStartMs: Int64,
@@ -26,7 +35,11 @@ public struct TokenSaverDailyEconomyRecord: Sendable, Equatable {
         formulaVersion: String,
         appliedOutputShare: Double,
         graphifySignalCount: Int = 0,
-        updatedAt: String
+        updatedAt: String,
+        dialectRawTokens: Int = 0,
+        graphifyRawTokens: Int = 0,
+        capBinding: String = "none",
+        windowUsageBilledUnits: Double = 0
     ) {
         self.dayStartMs = dayStartMs
         self.measuredTokens = max(0, measuredTokens)
@@ -39,15 +52,19 @@ public struct TokenSaverDailyEconomyRecord: Sendable, Equatable {
         self.appliedOutputShare = appliedOutputShare
         self.graphifySignalCount = max(0, graphifySignalCount)
         self.updatedAt = updatedAt
+        self.dialectRawTokens = max(0, dialectRawTokens)
+        self.graphifyRawTokens = max(0, graphifyRawTokens)
+        self.capBinding = capBinding
+        self.windowUsageBilledUnits = max(0, windowUsageBilledUnits)
     }
 }
 
 /// Persists per-day credible totals so Week = Σ(day.total_credible).
 /// Does **not** backfill historical days; only upserts days that are recomputed going forward.
 public final class TokenSaverDailyEconomyRepository: @unchecked Sendable {
-    /// v3: Graphify leg uses measured signal counts + optional answer/exploration
-    /// counterfactual (min of share-model and avoided exploration).
-    public static let formulaVersion = "credible_v3"
+    /// v4: monotone caps + billed denominator + displacement bound + raw/cap evidence columns.
+    /// WHY: label mixed v3/v4 rows so they are never silently compared.
+    public static let formulaVersion = "credible_v4"
 
     private let db: SQLiteDB
     private let calendar: Calendar
@@ -79,7 +96,8 @@ public final class TokenSaverDailyEconomyRepository: @unchecked Sendable {
             let stmt = try database.prepare("""
                 SELECT day_start_ms, measured_tokens, dialect_tokens, graphify_tokens,
                        orchestration_tokens, total_credible, window_usage_tokens,
-                       formula_version, applied_output_share, graphify_signal_count, updated_at
+                       formula_version, applied_output_share, graphify_signal_count, updated_at,
+                       dialect_raw_tokens, graphify_raw_tokens, cap_binding, window_usage_billed_units
                 FROM token_saver_daily_economy
                 WHERE day_start_ms = ?
                 LIMIT 1;
@@ -96,7 +114,8 @@ public final class TokenSaverDailyEconomyRepository: @unchecked Sendable {
             let stmt = try database.prepare("""
                 SELECT day_start_ms, measured_tokens, dialect_tokens, graphify_tokens,
                        orchestration_tokens, total_credible, window_usage_tokens,
-                       formula_version, applied_output_share, graphify_signal_count, updated_at
+                       formula_version, applied_output_share, graphify_signal_count, updated_at,
+                       dialect_raw_tokens, graphify_raw_tokens, cap_binding, window_usage_billed_units
                 FROM token_saver_daily_economy
                 WHERE day_start_ms >= ? AND day_start_ms <= ?
                 ORDER BY day_start_ms ASC;
@@ -200,8 +219,9 @@ public final class TokenSaverDailyEconomyRepository: @unchecked Sendable {
                 INSERT INTO token_saver_daily_economy (
                     day_start_ms, measured_tokens, dialect_tokens, graphify_tokens,
                     orchestration_tokens, total_credible, window_usage_tokens,
-                    formula_version, applied_output_share, graphify_signal_count, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    formula_version, applied_output_share, graphify_signal_count, updated_at,
+                    dialect_raw_tokens, graphify_raw_tokens, cap_binding, window_usage_billed_units
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(day_start_ms) DO UPDATE SET
                     measured_tokens = excluded.measured_tokens,
                     dialect_tokens = excluded.dialect_tokens,
@@ -212,7 +232,11 @@ public final class TokenSaverDailyEconomyRepository: @unchecked Sendable {
                     formula_version = excluded.formula_version,
                     applied_output_share = excluded.applied_output_share,
                     graphify_signal_count = excluded.graphify_signal_count,
-                    updated_at = excluded.updated_at;
+                    updated_at = excluded.updated_at,
+                    dialect_raw_tokens = excluded.dialect_raw_tokens,
+                    graphify_raw_tokens = excluded.graphify_raw_tokens,
+                    cap_binding = excluded.cap_binding,
+                    window_usage_billed_units = excluded.window_usage_billed_units;
             """)
             defer { stmt.reset() }
             try stmt.bind(1, record.dayStartMs)
@@ -226,6 +250,10 @@ public final class TokenSaverDailyEconomyRepository: @unchecked Sendable {
             try stmt.bind(9, record.appliedOutputShare)
             try stmt.bind(10, Int64(record.graphifySignalCount))
             try stmt.bind(11, record.updatedAt)
+            try stmt.bind(12, Int64(record.dialectRawTokens))
+            try stmt.bind(13, Int64(record.graphifyRawTokens))
+            try stmt.bind(14, record.capBinding)
+            try stmt.bind(15, record.windowUsageBilledUnits)
             _ = try stmt.step()
         }
     }
@@ -242,7 +270,11 @@ public final class TokenSaverDailyEconomyRepository: @unchecked Sendable {
             formulaVersion: stmt.columnText(7) ?? TokenSaverDailyEconomyRepository.formulaVersion,
             appliedOutputShare: stmt.columnDouble(8),
             graphifySignalCount: Int(stmt.columnInt64(9)),
-            updatedAt: stmt.columnText(10) ?? ""
+            updatedAt: stmt.columnText(10) ?? "",
+            dialectRawTokens: Int(stmt.columnInt64(11)),
+            graphifyRawTokens: Int(stmt.columnInt64(12)),
+            capBinding: stmt.columnText(13) ?? "none",
+            windowUsageBilledUnits: stmt.columnDouble(14)
         )
     }
 }

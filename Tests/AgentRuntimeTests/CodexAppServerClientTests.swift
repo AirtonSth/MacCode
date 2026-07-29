@@ -40,6 +40,38 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertFalse(store.aggregates()[0].isValidForGate)
     }
 
+    func test_invalidatedAcceptancePermitBlocksTurnStartBeforeWireWrite() async throws {
+        let script = try makeFakeAppServerPeer()
+        let store = TokenSaverCensusStore()
+        TokenSaverCensusSeam.sharedStore = store
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path,
+            tokenSaverCensusAllowed: true
+        )
+        defer { client.stop() }
+        _ = try await client.initialize()
+        let permit = AgentRunAcceptancePermit()
+        permit.invalidate()
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "test-model",
+            cwd: FileManager.default.temporaryDirectory.path,
+            prompt: "must not cross turn/start",
+            acceptancePermit: permit
+        )
+
+        do {
+            _ = try await client.startTurn(providerThreadId: "thread-1", for: request)
+            XCTFail("suppression must win before the Codex turn/start write")
+        } catch is AgentRunAcceptanceError {}
+
+        XCTAssertTrue(store.snapshot().isEmpty,
+                      "the provider-visible census proves no turn/start bytes were written")
+    }
+
     func test_rpcDeadlineFailsAndStopsSilentAppServer() async throws {
         let script = try makeSilentAppServerPeer()
         let client = try CodexAppServerClient(
@@ -235,6 +267,21 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual(params["serviceTier"] as? String, "fast")
         XCTAssertEqual(params["approvalPolicy"] as? String, "never")
         XCTAssertEqual(params["sandbox"] as? String, "danger-full-access")
+    }
+
+    func test_timedOutThreadResumeRequiresFreshClientRecovery() {
+        XCTAssertTrue(
+            CodexAppServerClient.requiresFreshClientAfterThreadResumeFailure(
+                CodexAppServerError.requestTimedOut(method: "thread/resume", timeout: 30)
+            ),
+            "the client deadline intentionally stops a silent resume peer, so only a new client may safely start a fresh thread"
+        )
+        XCTAssertFalse(
+            CodexAppServerClient.requiresFreshClientAfterThreadResumeFailure(
+                CodexAppServerError.requestTimedOut(method: "turn/start", timeout: 30)
+            ),
+            "a turn-start timeout is not a context-loss signal and must not be converted into a new-thread fallback"
+        )
     }
 
     func test_forkThread_usesNativeProviderBranchAndReturnsChildThreadId() async throws {

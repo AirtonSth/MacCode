@@ -35,15 +35,20 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
         let threadRepo = AgentThreadRepository(db: db)
         let messageRepo = AgentMessageRepository(db: db)
         let runRepo = AgentRunRepository(db: db)
+        let providerSessionRepo = ProviderSessionRuntimeRepository(db: db)
         let queuedRepo = withQueue ? AgentQueuedMessageRepository(db: db) : nil
+        var providers: [AgentProvider: AgentProviderRunner] = [
+            .codex: FakeProviderRunner(provider: .codex),
+            .claude: FakeProviderRunner(provider: .claude),
+            .grok: FakeProviderRunner(provider: .grok)
+        ]
+        if let provider { providers[provider.provider] = provider }
         let coord = AgentRunCoordinator(
             runRepo: runRepo,
             messageRepo: messageRepo,
             threadRepo: threadRepo,
-            providers: [
-                .codex: provider ?? FakeProviderRunner(provider: .codex),
-                .claude: FakeProviderRunner(provider: .claude)
-            ]
+            providerSessionRepo: providerSessionRepo,
+            providers: providers
         )
         let vm = AgentAppViewModel(
             workspaceID: WorkspaceID(),
@@ -51,8 +56,10 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
             coordinator: coord,
             threadRepo: threadRepo,
             messageRepo: messageRepo,
-            queuedMessageRepo: queuedRepo
+            queuedMessageRepo: queuedRepo,
+            providerSessionRepo: providerSessionRepo
         )
+        vm.provider = provider?.provider ?? .codex
         vm.providerSnapshots = [operationalSnapshot(for: provider?.provider ?? .codex)]
         return (vm, queuedRepo)
     }
@@ -168,7 +175,8 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
                       "queueing behind the live adapter turn must not persist a second user bubble")
         XCTAssertFalse(vm.messages.contains { $0.role == .user && $0.content == "queue exactly once" },
                        "queued follow-ups must stay out of the transcript until the turn starts")
-        XCTAssertEqual(vm.queueStatusMessage, "Queued — will run after the current turn.")
+        XCTAssertEqual(vm.queuedMessages.map(\.text), ["queue exactly once"],
+                       "the selected thread must render the queued follow-up after Send delegates persistence")
         XCTAssertFalse(vm.statusMessage.contains("Failed to start"))
         adapter.stopAll()
     }
@@ -244,8 +252,7 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
     // MARK: - T007: forceQueuedMessageNow when thread is idle
 
     func test_forceQueuedMessageNow_whenIdle_acknowledgesOnlyAfterConfirmedStart() async throws {
-        let runner = QueueStartProbeRunner()
-        let (vm, repo) = try makeVM(withQueue: true, provider: runner)
+        let (vm, repo) = try makeVM(withQueue: true)
         let queuedRepo = try XCTUnwrap(repo)
         vm.createThread(title: "t")
         let threadId = try XCTUnwrap(vm.selectedThreadId)
@@ -255,175 +262,281 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
         vm.reloadQueuedMessages()
         msg = vm.queuedMessages[0]
 
-        var eventKinds: [String] = []
-        vm.onQueuedMessageEvent = { kind, _ in eventKinds.append(kind) }
+        var delegatedIDs: [AgentQueuedMessageID] = []
+        vm.forceQueuedMessage = { id in
+            delegatedIDs.append(id)
+            _ = try queuedRepo.delete(id: id)
+            return AgentMessageSendResult(status: .started, runId: AgentRunID(id.value))
+        }
 
         await vm.forceQueuedMessageNow(msg)
 
         XCTAssertTrue((try queuedRepo.list(threadId: threadId)).isEmpty,
-                      "a confirmed provider start must acknowledge and remove the claimed queue row")
+                      "the canonical host mutation must be reflected after the Surface reloads")
         XCTAssertTrue(vm.queuedMessages.isEmpty,
                       "forceQueuedMessageNow must update the visible queue immediately")
-        XCTAssertEqual(runner.startedRunIDs, [AgentRunID(msg.id.value)],
-                       "force-now must derive a stable run id from the queue id so retries cannot duplicate the user message")
-        XCTAssertEqual(eventKinds.filter { $0 == AgentQueueEventKinds.drained }.count, 1,
-                       "drained must publish exactly once and only after the provider accepted the run")
-        XCTAssertEqual(try vm.messageRepo.list(threadId: threadId).filter { $0.role == .user && $0.content == "run now" }.count, 1,
-                       "a confirmed force-now start must persist exactly one user message")
+        XCTAssertEqual(delegatedIDs, [msg.id],
+                       "the Surface must delegate the exact queue identity once; AppShell owns acceptance and acknowledgement")
+        XCTAssertNil(vm.queueStatusMessage)
     }
 
-    func test_forceQueuedMessageNow_whenStartFailsLeavesOnlyDurableRunRetrySurface() async throws {
-        let runner = QueueStartProbeRunner(failuresBeforeSuccess: 1)
-        let (vm, repo) = try makeVM(withQueue: true, provider: runner)
+    func test_forceQueuedMessageNow_whenHostFailsPreservesPerThreadStatusAndVisibleRow() async throws {
+        // WHY: AppShell owns whether a failed Force is replayable or ambiguous.
+        // Surface must preserve the host's thread-scoped explanation and reload
+        // the durable row without attempting a second local dispatch.
+        let (vm, repo) = try makeVM(withQueue: true)
         let queuedRepo = try XCTUnwrap(repo)
         vm.createThread(title: "t")
         let threadId = try XCTUnwrap(vm.selectedThreadId)
         let queued = AgentQueuedMessage(threadId: threadId, text: "retry me", position: 1)
         try queuedRepo.upsert(queued)
         vm.reloadQueuedMessages()
-        var eventKinds: [String] = []
-        vm.onQueuedMessageEvent = { kind, _ in eventKinds.append(kind) }
+        var delegationCount = 0
+        vm.forceQueuedMessage = { [weak vm] _ in
+            delegationCount += 1
+            vm?.handleQueueLifecycleEvent(
+                kind: "agent.message.queue.failed",
+                threadId: threadId.value.uuidString,
+                message: "Provider start remains unresolved."
+            )
+            throw QueueForceDelegationError.rejected
+        }
 
         await vm.forceQueuedMessageNow(queued)
 
-        XCTAssertTrue(try queuedRepo.list(threadId: threadId).isEmpty,
-                      "the durable failed run owns Retry; retaining the queue would create a second replay surface")
-        XCTAssertEqual(eventKinds.filter { $0 == AgentQueueEventKinds.drained }.count, 1,
-                       "removing the redundant queue intent must publish one drained event")
-        XCTAssertEqual(try vm.messageRepo.list(threadId: threadId).filter { $0.role == .user && $0.content == "retry me" }.count, 1,
-                       "the failed attempt must retain exactly one durable user row for Retry")
-        XCTAssertEqual(try vm.coordinator.runStatus(AgentRunID(queued.id.value)), .failed)
-        XCTAssertEqual(runner.startedRunIDs, [AgentRunID(queued.id.value)])
+        XCTAssertEqual(try queuedRepo.list(threadId: threadId).map(\.id), [queued.id],
+                       "Surface reload must preserve the row left by the canonical host")
+        XCTAssertEqual(vm.queuedMessages.map(\.id), [queued.id])
+        XCTAssertEqual(delegationCount, 1)
+        XCTAssertEqual(vm.queueStatusMessage, "Provider start remains unresolved.",
+                       "the host's per-thread lifecycle status must survive the post-error queue reload")
     }
 
-    func test_forceQueuedMessageNow_ackFailureAfterAcceptedStartRecoversAckOnlyWithoutProviderReplay() async throws {
-        let runner = QueueStartProbeRunner(finishSynchronously: true)
-        let (vm, repo) = try makeVM(withQueue: true, provider: runner)
-        let queuedRepo = try XCTUnwrap(repo)
-        vm.createThread(title: "t")
+    func test_queueLifecycleEventsSurfaceTimeoutAndClearOnLateDrainForSelectedThread() throws {
+        let (vm, _) = try makeVM(withQueue: true)
+        vm.createThread(title: "selected")
         let threadId = try XCTUnwrap(vm.selectedThreadId)
-        let queued = AgentQueuedMessage(threadId: threadId, text: "external side effect", position: 1)
-        try queuedRepo.upsert(queued)
-        try queuedRepo.db.execute("""
-            CREATE TRIGGER fail_queue_ack
-            BEFORE DELETE ON agent_queued_messages
-            WHEN OLD.id = '\(queued.id.value.uuidString)'
-            BEGIN SELECT RAISE(ABORT, 'injected ack failure'); END;
-            """)
-        vm.reloadQueuedMessages()
-        var eventKinds: [String] = []
-        vm.onQueuedMessageEvent = { kind, _ in eventKinds.append(kind) }
+        vm.queueStatusMessage = "Stopping current run to start this now."
+        vm.handleQueueLifecycleEvent(
+            kind: "agent.message.queue.failed",
+            threadId: threadId.value.uuidString,
+            message: "Provider is still stopping."
+        )
+        XCTAssertEqual(vm.queueStatusMessage, "Provider is still stopping.")
 
-        await vm.forceQueuedMessageNow(queued)
+        vm.handleQueueLifecycleEvent(
+            kind: AgentQueueEventKinds.drained,
+            threadId: threadId.value.uuidString,
+            message: nil
+        )
+        XCTAssertNil(vm.queueStatusMessage)
 
-        XCTAssertEqual(runner.startedRunIDs, [AgentRunID(queued.id.value)])
-        XCTAssertEqual(try queuedRepo.dispatch(id: queued.id)?.state, .dispatched,
-                       "after provider acceptance, ack failure must retain durable dispatched proof instead of releasing into replay")
-        XCTAssertFalse(eventKinds.contains(AgentQueueEventKinds.drained))
-
-        try queuedRepo.db.execute("DROP TRIGGER fail_queue_ack;")
-        await vm.forceQueuedMessageNow(queued)
-
-        XCTAssertEqual(runner.startedRunIDs.count, 1,
-                       "recovery of a dispatched row must perform ack-only and never call the provider again")
-        XCTAssertNil(try queuedRepo.get(id: queued.id))
-        XCTAssertEqual(eventKinds.filter { $0 == AgentQueueEventKinds.drained }.count, 1,
-                       "only the successful recovery delete may publish drained")
+        vm.queueStatusMessage = "unchanged"
+        vm.handleQueueLifecycleEvent(
+            kind: "agent.message.queue.failed",
+            threadId: AgentThreadID().value.uuidString,
+            message: "foreign"
+        )
+        XCTAssertEqual(vm.queueStatusMessage, "unchanged")
     }
 
-    func test_forceQueuedMessageNow_acceptedToMarkCrashWindowAcknowledgesRunEvidenceWithoutReplay() async throws {
-        let runner = QueueStartProbeRunner(finishSynchronously: true)
-        let (vm, repo) = try makeVM(withQueue: true, provider: runner)
-        let queuedRepo = try XCTUnwrap(repo)
-        vm.createThread(title: "t")
-        let threadId = try XCTUnwrap(vm.selectedThreadId)
-        let queued = AgentQueuedMessage(threadId: threadId, text: "ambiguous acceptance", position: 1)
-        try queuedRepo.upsert(queued)
-        try queuedRepo.db.execute("""
-            CREATE TRIGGER fail_mark_dispatched
-            BEFORE UPDATE OF dispatch_state ON agent_queued_messages
-            WHEN NEW.id = '\(queued.id.value.uuidString)' AND NEW.dispatch_state = 'dispatched'
-            BEGIN SELECT RAISE(ABORT, 'injected accepted-to-mark crash'); END;
-            """)
+    func test_queueLifecycleStatusIsClearedAndRestoredWhenSwitchingThreads() throws {
+        // WHY: a timeout belongs to the thread whose Force is waiting. Carrying
+        // that copy onto another thread falsely reports that unrelated work is stuck.
+        let (vm, _) = try makeVM(withQueue: true)
+        vm.createThread(title: "A")
+        let threadA = try XCTUnwrap(vm.selectedThreadId)
+        vm.createThread(title: "B")
+        let threadB = try XCTUnwrap(vm.selectedThreadId)
+        vm.selectThread(threadA)
+        vm.handleQueueLifecycleEvent(
+            kind: "agent.message.queue.failed",
+            threadId: threadA.value.uuidString,
+            message: "A provider is still stopping."
+        )
         vm.reloadQueuedMessages()
+        XCTAssertEqual(
+            vm.queueStatusMessage,
+            "A provider is still stopping.",
+            "reloading the durable queue must not erase a thread-local lifecycle warning"
+        )
 
-        await vm.forceQueuedMessageNow(queued)
-        XCTAssertEqual(runner.startedRunIDs.count, 1)
-        XCTAssertEqual(try queuedRepo.dispatch(id: queued.id)?.state, .prepared,
-                       "if durable dispatched marking cannot commit after acceptance, the row must remain visibly ambiguous")
+        vm.selectThread(threadB)
+        XCTAssertNil(vm.queueStatusMessage)
 
-        try queuedRepo.db.execute("DROP TRIGGER fail_mark_dispatched;")
-        await vm.forceQueuedMessageNow(queued)
+        vm.selectThread(threadA)
+        XCTAssertEqual(vm.queueStatusMessage, "A provider is still stopping.")
+    }
 
-        XCTAssertEqual(runner.startedRunIDs.count, 1,
-                       "matching run evidence must reconcile prepared intent without replaying a potentially accepted provider turn")
-        XCTAssertNil(try queuedRepo.get(id: queued.id),
-                     "the durable run owns subsequent Retry/Continue and the redundant queue intent must not poison the head")
+    func test_queueLifecycleWarningForHiddenThreadAppearsWhenSelected() throws {
+        // WHY: Force can time out while its thread is not selected. Dropping the
+        // event makes the preserved row look silently stuck when the user returns.
+        let (vm, _) = try makeVM(withQueue: true)
+        vm.createThread(title: "hidden")
+        let hiddenThread = try XCTUnwrap(vm.selectedThreadId)
+        vm.createThread(title: "visible")
+        let visibleThread = try XCTUnwrap(vm.selectedThreadId)
+
+        vm.handleQueueLifecycleEvent(
+            kind: "agent.message.queue.failed",
+            threadId: hiddenThread.value.uuidString,
+            message: "Hidden provider is still stopping."
+        )
+        vm.reloadQueuedMessages()
+        XCTAssertNil(vm.queueStatusMessage)
+
+        vm.selectThread(hiddenThread)
+        XCTAssertEqual(vm.queueStatusMessage, "Hidden provider is still stopping.")
+        vm.selectThread(visibleThread)
         XCTAssertNil(vm.queueStatusMessage)
     }
 
-    func test_forceQueuedMessageNow_doesNotRecoverLivePreparedLeaseWithoutRunEvidence() async throws {
-        let runner = QueueStartProbeRunner(finishSynchronously: true)
-        let (vm, repo) = try makeVM(withQueue: true, provider: runner)
+    func test_preparedQueuedMessageExposesDurableStateAndOffersSafeStatusCheck() throws {
+        // WHY: a prepared row has ambiguous provider acceptance. Presenting the
+        // normal Force action invites replay, while a status check can reconcile
+        // the existing intent without sending the prompt again.
+        let (vm, repo) = try makeVM(withQueue: true)
         let queuedRepo = try XCTUnwrap(repo)
-        vm.createThread(title: "t")
-        let queued = AgentQueuedMessage(
-            threadId: try XCTUnwrap(vm.selectedThreadId),
-            text: "first dispatcher still owns this",
-            position: 1
-        )
+        vm.createThread(title: "ambiguous")
+        let threadId = try XCTUnwrap(vm.selectedThreadId)
+        let queued = AgentQueuedMessage(threadId: threadId, text: "possibly accepted", position: 1)
         try queuedRepo.upsert(queued)
-        let lease = try XCTUnwrap(queuedRepo.claim(id: queued.id, leaseId: "live-dispatcher"))
+        let lease = try XCTUnwrap(queuedRepo.claim(id: queued.id))
         XCTAssertTrue(try queuedRepo.prepareDispatch(lease, runId: AgentRunID(queued.id.value)))
+
         vm.reloadQueuedMessages()
 
-        await vm.forceQueuedMessageNow(queued)
-
-        XCTAssertTrue(runner.startedRunIDs.isEmpty,
-                      "normal Force must never treat a live prepared lease as a prior-process crash window")
-        XCTAssertEqual(try queuedRepo.dispatch(id: queued.id)?.state, .prepared)
-        XCTAssertTrue(vm.queueStatusMessage?.contains("Already processing") == true)
+        let reloaded = try XCTUnwrap(vm.queuedMessages.first)
+        XCTAssertEqual(reloaded.durableState, .prepared)
+        XCTAssertTrue(vm.canForceQueuedMessage(reloaded))
+        XCTAssertEqual(vm.queuedMessageForceLabel(reloaded), "Check status")
+        XCTAssertEqual(
+            vm.queuedMessagePrimaryActionAccessibilityLabel(reloaded),
+            "Check queued message 1 provider status"
+        )
+        XCTAssertEqual(
+            vm.queueStatusMessage,
+            "Start confirmation is pending. Check status before deciding whether to remove this queue record."
+        )
     }
 
-    func test_forceQueuedMessageNow_oneHundredConcurrentCallsStartProviderExactlyOnce() async throws {
-        let runner = QueueStartProbeRunner(finishSynchronously: true)
-        let (vm, repo) = try makeVM(withQueue: true, provider: runner)
+    func test_reloadQueuedMessagesClearsPreparedBannerWhenPreparedHeadResolves() throws {
+        // WHY: older builds only SET the "Start confirmation is pending" banner
+        // when the head was prepared and never cleared it. After the row is
+        // acknowledged/abandoned the sticky banner still showed with Copy/Retry
+        // even though the queue was empty (standalone banner path).
+        let (vm, repo) = try makeVM(withQueue: true)
         let queuedRepo = try XCTUnwrap(repo)
-        vm.createThread(title: "t")
-        let queued = AgentQueuedMessage(threadId: try XCTUnwrap(vm.selectedThreadId), text: "one owner", position: 1)
+        vm.createThread(title: "clear prepared banner")
+        let threadId = try XCTUnwrap(vm.selectedThreadId)
+        let queued = AgentQueuedMessage(threadId: threadId, text: "resolve me", position: 1)
         try queuedRepo.upsert(queued)
+        let lease = try XCTUnwrap(queuedRepo.claim(id: queued.id))
+        let runId = AgentRunID(queued.id.value)
+        XCTAssertTrue(try queuedRepo.prepareDispatch(lease, runId: runId))
         vm.reloadQueuedMessages()
-        var drainedCount = 0
-        vm.onQueuedMessageEvent = { kind, _ in
-            if kind == AgentQueueEventKinds.drained { drainedCount += 1 }
-        }
+        XCTAssertEqual(
+            vm.queueStatusMessage,
+            "Start confirmation is pending. Check status before deciding whether to remove this queue record."
+        )
 
-        await withTaskGroup(of: Void.self) { group in
-            for _ in 0..<100 {
-                group.addTask { @MainActor in
-                    await vm.forceQueuedMessageNow(queued)
-                }
-            }
-        }
+        XCTAssertNotNil(try queuedRepo.acknowledgePreparedWithRunEvidence(id: queued.id, runId: runId))
+        vm.reloadQueuedMessages()
 
-        XCTAssertEqual(runner.startedRunIDs.count, 1,
-                       "the actor-local gate plus SQLite CAS must admit one provider start across concurrent Force Now actions")
-        XCTAssertEqual(drainedCount, 1)
-        XCTAssertNil(try queuedRepo.get(id: queued.id))
+        XCTAssertTrue(vm.queuedMessages.isEmpty)
+        XCTAssertNil(
+            vm.queueStatusMessage,
+            "prepared status must not stick after the durable prepared head is gone"
+        )
+    }
+
+    func test_removePreparedUsesPreparedCASWhileDispatchedRemainsRecoverable() throws {
+        // WHY: an inconclusive prepared intent may be explicitly abandoned after
+        // warning the user, but a provider-confirmed dispatch must remain until
+        // acknowledgement cleanup finishes.
+        let (vm, repo) = try makeVM(withQueue: true)
+        let queuedRepo = try XCTUnwrap(repo)
+        vm.createThread(title: "durable queue removal")
+        let threadId = try XCTUnwrap(vm.selectedThreadId)
+
+        let prepared = AgentQueuedMessage(threadId: threadId, text: "ambiguous", position: 1)
+        try queuedRepo.upsert(prepared)
+        let preparedLease = try XCTUnwrap(queuedRepo.claim(id: prepared.id))
+        XCTAssertTrue(try queuedRepo.prepareDispatch(
+            preparedLease,
+            runId: AgentRunID(prepared.id.value)
+        ))
+        vm.reloadQueuedMessages()
+
+        vm.removeQueuedMessage(try XCTUnwrap(vm.queuedMessages.first))
+        XCTAssertNil(try queuedRepo.get(id: prepared.id),
+                     "the prepared-only CAS must remove the exact ambiguous intent")
+
+        let dispatched = AgentQueuedMessage(threadId: threadId, text: "confirmed", position: 1)
+        try queuedRepo.upsert(dispatched)
+        let dispatchedLease = try XCTUnwrap(queuedRepo.claim(id: dispatched.id))
+        let dispatchedRun = AgentRunID(dispatched.id.value)
+        XCTAssertTrue(try queuedRepo.prepareDispatch(dispatchedLease, runId: dispatchedRun))
+        XCTAssertTrue(try queuedRepo.markDispatched(dispatchedLease, runId: dispatchedRun))
+        vm.reloadQueuedMessages()
+        let confirmed = try XCTUnwrap(vm.queuedMessages.first)
+
+        XCTAssertEqual(confirmed.durableState, .dispatched)
+        XCTAssertEqual(vm.queuedMessageForceLabel(confirmed), "Finish cleanup")
+        XCTAssertEqual(
+            vm.queuedMessagePrimaryActionAccessibilityLabel(confirmed),
+            "Finish queued message 1 cleanup"
+        )
+        vm.removeQueuedMessage(confirmed)
+        XCTAssertNotNil(try queuedRepo.get(id: dispatched.id),
+                        "a dispatched intent must not be removable as a queue draft")
+        XCTAssertTrue(vm.queueStatusMessage?.contains("Finish cleanup") == true)
+    }
+
+    func test_cancelLifecycleClearsFailureOnlyAfterFinalQueuedRowIsGone() throws {
+        // WHY: cancelling the final failed queue intent removes Retry/Copy's
+        // subject, while cancelling one of several rows must preserve status
+        // relevant to the work that remains.
+        let (vm, repo) = try makeVM(withQueue: true)
+        let queuedRepo = try XCTUnwrap(repo)
+        vm.createThread(title: "cancel lifecycle")
+        let threadId = try XCTUnwrap(vm.selectedThreadId)
+        let first = AgentQueuedMessage(threadId: threadId, text: "first", position: 1)
+        let second = AgentQueuedMessage(threadId: threadId, text: "second", position: 2)
+        try queuedRepo.upsert(first)
+        try queuedRepo.upsert(second)
+        vm.reloadQueuedMessages()
+        vm.onQueuedMessageEvent = { [weak vm] kind, queued in
+            vm?.handleQueueLifecycleEvent(
+                kind: kind,
+                threadId: queued.threadId.value.uuidString,
+                message: nil
+            )
+        }
+        vm.handleQueueLifecycleEvent(
+            kind: "agent.message.queue.failed",
+            threadId: threadId.value.uuidString,
+            message: "Provider is still stopping. Retry or Copy."
+        )
+
+        vm.cancelQueuedMessage(first)
+
+        XCTAssertEqual(vm.queueStatusMessage, "Provider is still stopping. Retry or Copy.")
+        XCTAssertEqual(try queuedRepo.list(threadId: threadId).map(\.id), [second.id])
+
+        vm.cancelQueuedMessage(second)
+
+        XCTAssertNil(vm.queueStatusMessage)
+        XCTAssertTrue(try queuedRepo.list(threadId: threadId).isEmpty)
     }
 
     // MARK: - T008: forceQueuedMessageNow when thread is running promotes to front
 
     func test_forceQueuedMessageNow_whenRunning_promotesToFront() async throws {
-        let (vm, repo) = try makeVM(withQueue: true, provider: ActiveQueueRunner())
+        let (vm, repo) = try makeVM(withQueue: true)
         let queuedRepo = try XCTUnwrap(repo)
         vm.createThread(title: "t")
         let threadId = try XCTUnwrap(vm.selectedThreadId)
-
-        vm.prompt = "keep current turn active"
-        await vm.send()
-        XCTAssertNotNil(vm.coordinator.activeRunId(threadId: threadId),
-                        "Force Now must be exercised against a real coordinator-owned run")
 
         // Put two messages in queue at positions 1 and 2.
         let msg1 = AgentQueuedMessage(threadId: threadId, text: "first", position: 1)
@@ -433,21 +546,24 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
         vm.reloadQueuedMessages()
 
         let second = try XCTUnwrap(vm.queuedMessages.first { $0.text == "second" })
+        var delegatedIDs: [AgentQueuedMessageID] = []
+        vm.forceQueuedMessage = { id in
+            delegatedIDs.append(id)
+            guard let promoted = try queuedRepo.promoteToFront(id: id) else {
+                throw QueueForceDelegationError.rejected
+            }
+            return AgentMessageSendResult(status: .queued, queuedMessage: promoted)
+        }
         await vm.forceQueuedMessageNow(second)
 
-        vm.reloadQueuedMessages()
         // After promote, "second" must appear before "first" in the queue.
         let texts = vm.queuedMessages.map(\.text)
         XCTAssertTrue(texts.prefix(1).contains("second"),
-                      "forceQueuedMessageNow while running must promote the message to the front of the queue")
+                      "Surface must reload the queue ordering persisted by the canonical host")
         XCTAssertEqual(vm.queueStatusMessage, "Stopping current run to start this now.",
                        "forceQueuedMessageNow while running must surface a confirmation message")
-        // WHY: "Force … now" must actually run the message, not just reorder it.
-        // It does so by interrupting the in-flight turn; the cancelled run then
-        // drains the now-front message. Proof the current run was preempted: the
-        // thread row transitions from .running to .cancelled.
-        XCTAssertEqual(try vm.threadRepo.get(id: threadId)?.status, .cancelled,
-                       "forceQueuedMessageNow while running must interrupt the current run so the promoted message can start now")
+        XCTAssertEqual(delegatedIDs, [second.id],
+                       "Surface must delegate Force once; AppShell owns provider interruption and drain")
     }
 
     func test_reorderQueuedMessage_persistsPositionsAndReloadsInNewOrder() throws {
@@ -835,42 +951,6 @@ private final class ActiveQueueRunner: AgentProviderRunner, @unchecked Sendable 
     }
 }
 
-private final class QueueStartProbeRunner: AgentProviderRunner, @unchecked Sendable {
-    let provider: AgentProvider = .codex
-    private let lock = NSLock()
-    private var failuresRemaining: Int
-    private let finishSynchronously: Bool
-    private var _startedRunIDs: [AgentRunID] = []
-
-    init(failuresBeforeSuccess: Int = 0, finishSynchronously: Bool = false) {
-        failuresRemaining = failuresBeforeSuccess
-        self.finishSynchronously = finishSynchronously
-    }
-
-    var startedRunIDs: [AgentRunID] {
-        lock.withLock { _startedRunIDs }
-    }
-
-    func listModels() async -> [AgentModelDescriptor] { [] }
-
-    func startRun(
-        _ request: AgentRunRequest,
-        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
-    ) async throws -> AgentRunHandle {
-        let shouldFail = lock.withLock { () -> Bool in
-            _startedRunIDs.append(request.runId)
-            guard failuresRemaining > 0 else { return false }
-            failuresRemaining -= 1
-            return true
-        }
-        if shouldFail { throw QueueStartProbeError.rejected }
-        if finishSynchronously {
-            onEvent(.finished(.completed, finalMessage: "done", providerThreadId: "queue-probe"))
-        }
-        return AgentRunHandle(runId: request.runId, process: nil, cancel: {})
-    }
-}
-
-private enum QueueStartProbeError: Error {
+private enum QueueForceDelegationError: Error {
     case rejected
 }

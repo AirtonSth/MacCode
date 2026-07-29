@@ -3,6 +3,114 @@ import CoreModel
 @testable import AgentRuntime
 
 final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
+    func test_agentSDKBridgeInvalidatedAcceptancePermitBlocksTurnBeforeWireWrite() async throws {
+        guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-sdk-acceptance-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+        let commandLog = tmp.appendingPathComponent("commands.jsonl")
+        let acceptanceMarker = tmp.appendingPathComponent("prompt-accepted")
+        try """
+        import fs from 'node:fs';
+        import readline from 'node:readline';
+        const commandLog = process.argv[2];
+        const acceptanceMarker = process.argv[3];
+        const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+        function write(obj) { process.stdout.write(JSON.stringify(obj) + '\\n'); }
+        for await (const line of rl) {
+          if (!line.trim()) continue;
+          const command = JSON.parse(line);
+          fs.appendFileSync(commandLog, JSON.stringify(command) + '\\n');
+          if (command.type === 'rc_configure') {
+            write({ type: 'system', subtype: 'init', session_id: 'sdk-acceptance-session' });
+          } else if (command.type === 'rc_turn') {
+            fs.writeFileSync(acceptanceMarker, command.prompt);
+          } else if (command.type === 'rc_close') {
+            process.exit(0);
+          }
+        }
+        """.write(to: bridge, atomically: true, encoding: .utf8)
+
+        let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
+        let permit = AgentRunAcceptancePermit()
+        permit.invalidate()
+        let events = LockedAgentRunEventSink()
+
+        do {
+            _ = try await adapter.sendTurn(AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .claude,
+                model: "claude-haiku-4-5-20251001",
+                cwd: tmp.path,
+                prompt: "must not cross the SDK bridge",
+                providerBinary: "/usr/bin/true",
+                extraArgs: [commandLog.path, acceptanceMarker.path],
+                acceptancePermit: permit
+            )) { event in
+                events.record(event)
+            }
+            XCTFail("suppression must win before the Claude SDK rc_turn write")
+        } catch is AgentRunAcceptanceError {}
+
+        let commands = try String(contentsOf: commandLog, encoding: .utf8)
+        XCTAssertTrue(commands.contains(#""type":"rc_configure""#),
+                      "the fake SDK bridge must complete its deterministic initialization handshake")
+        XCTAssertFalse(commands.contains(#""type":"rc_turn""#),
+                       "a revoked permit must block the SDK writeTurn closure itself")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: acceptanceMarker.path),
+                       "the fake SDK bridge must never accept the prompt")
+        XCTAssertTrue(events.snapshot().isEmpty,
+                      "a rejected SDK turn must emit no running or terminal lifecycle")
+        adapter.stopAll()
+    }
+
+    func test_invalidatedAcceptancePermitBlocksClaudePromptBeforeWireWrite() async throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-acceptance-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let script = tmp.appendingPathComponent("fake-claude")
+        let marker = tmp.appendingPathComponent("prompt-written")
+        try """
+        #!/usr/bin/env python3
+        import json, pathlib, sys
+        marker = pathlib.Path("\(marker.path)")
+        print(json.dumps({"type":"system","subtype":"init","session_id":"acceptance-session"}), flush=True)
+        for line in sys.stdin:
+            if line.strip():
+                marker.write_text(line)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let adapter = ClaudeStreamingCLIAdapter(binaryNameOverride: script.path)
+        let permit = AgentRunAcceptancePermit()
+        permit.invalidate()
+        let events = EventSink()
+
+        do {
+            _ = try await adapter.sendTurn(AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .claude,
+                model: "claude-haiku-4-5-20251001",
+                cwd: tmp.path,
+                prompt: "must not cross stdin",
+                acceptancePermit: permit
+            )) { event in
+                Task { await events.record(event) }
+            }
+            XCTFail("suppression must win before the Claude stdin write")
+        } catch is AgentRunAcceptanceError {}
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        let recorded = await events.snapshot()
+        XCTAssertFalse(recorded.contains {
+            if case .status(.running) = $0 { return true }
+            return false
+        })
+        adapter.stopAll()
+    }
+
     func test_adapterSendsMultipleTurnsThroughOneStreamingProcess() async throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-streaming-adapter-\(UUID().uuidString)", isDirectory: true)
@@ -1687,7 +1795,8 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
 
     // The Claude PostToolUse fallback must distill EVERY tool (no 4-tool
     // allowlist) once output passes its hook threshold, excluding only the
-    // exact-byte file tools. Explicit `| distill` is governed by the system prompt.
+    // exact-byte file tools and Skill content. Explicit `| distill` is governed
+    // by the system prompt for ordinary eligible output.
     func test_agentSDKBridgeTokenSaverCompressesAllToolsAbovePolicyThreshold() throws {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -1710,14 +1819,90 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         // small"); it must remain AND so output compresses when EITHER threshold trips.
         XCTAssertTrue(source.contains("<= TOKEN_SAVER_MIN_BYTES && lineCount(output) <= TOKEN_SAVER_MIN_LINES"),
                       "skip guard must stay AND so a >1KB OR >10-line output is compressed")
-        XCTAssertTrue(source.contains("TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['read', 'edit', 'write', 'multiedit', 'notebookedit', 'grep'])"),
-                      "exact-byte file tools and Grep are exempt (compressing them would break line-level agent work)")
+        XCTAssertTrue(source.contains("TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['read', 'edit', 'write', 'multiedit', 'notebookedit', 'grep', 'skill'])"),
+                      "exact-byte file tools, Grep, and Skill are exempt (skill content must stay complete)")
+        XCTAssertTrue(source.contains("skill_content"),
+                      "Skill exclusion must use a dedicated skip reason so PostToolUse never compresses skill bodies")
         XCTAssertTrue(source.contains("TOKEN_SAVER_EXACT_OUTPUT_BASH"),
                       "Bash must skip exact-output shell tools (rg/grep/sed/...) per AGENTS.md")
         XCTAssertTrue(source.contains("isExactOutputBashCommand"),
                       "Bash exact-output detection must inspect command segments, not only the first token")
         XCTAssertTrue(source.contains("updatedToolOutput"),
                       "PostToolUse must use updatedToolOutput so built-in tools actually receive compressed output")
+    }
+
+    /// Behavioral pin: Skill tool output must bypass PostToolUse Distill even when
+    /// the payload is large enough that ordinary tools would compress.
+    func test_agentSDKBridgeTokenSaverSkipsSkillToolOutputRegardlessOfSize() throws {
+        let node = try XCTUnwrap(
+            ProcessLocator.resolve("node"),
+            "node is required for the bridge decision contract test"
+        )
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+        let source = try String(contentsOf: bridge, encoding: .utf8)
+
+        // WHY: run the same decision function the bridge uses against a large skill
+        // fixture so we prove exclusion is behavioral, not just a string pin.
+        // Concatenate (no JS template literal) so bridge source with special chars
+        // cannot break Function construction.
+        let harness = """
+        import { readFileSync } from 'fs';
+        // argv[0]=node argv[1]=this harness argv[2]=bridge path
+        const src = readFileSync(process.argv[2], 'utf8');
+        const start = src.indexOf('const TOKEN_SAVER_MIN_BYTES');
+        const end = src.indexOf('function tokenSaverContractQuestion');
+        if (start < 0 || end < 0) throw new Error('helper slice not found: ' + start + '/' + end);
+        const slice = src.slice(start, end);
+        const mod = new Function(slice + '; return { tokenSaverToolDecision, TOKEN_SAVER_EXCLUDED_TOOLS };')();
+        const largeSkill = 'SKILL_FIXTURE_BEGIN\\n' + ('x'.repeat(8000)) + '\\nSKILL_FIXTURE_END';
+        const skill = mod.tokenSaverToolDecision('Skill', { skill: 'remote-code-orchestrate' }, largeSkill);
+        const ordinary = mod.tokenSaverToolDecision('Bash', { command: 'swift test' }, largeSkill);
+        const exact = mod.tokenSaverToolDecision('Bash', { command: 'rg -n foo Sources' }, largeSkill);
+        console.log(JSON.stringify({
+          skillShouldCompress: skill.shouldCompress,
+          skillSkipReason: skill.skipReason,
+          ordinaryShouldCompress: ordinary.shouldCompress,
+          exactShouldCompress: exact.shouldCompress,
+          exactSkipReason: exact.skipReason,
+          skillExcluded: mod.TOKEN_SAVER_EXCLUDED_TOOLS.has('skill'),
+          skillLen: largeSkill.length,
+        }));
+        """
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-skill-distill-decision-\(UUID().uuidString).mjs")
+        try harness.write(to: tmp, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: node)
+        process.arguments = [tmp.path, bridge.path]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        process.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        XCTAssertEqual(process.terminationStatus, 0, "node harness failed: \(out)")
+        guard let data = out.data(using: .utf8),
+              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return XCTFail("expected JSON decision payload, got: \(out)")
+        }
+        XCTAssertEqual(json["skillShouldCompress"] as? Bool, false,
+                       "Skill tool output must never enter Distill PostToolUse compression")
+        XCTAssertEqual(json["skillSkipReason"] as? String, "skill_content")
+        XCTAssertEqual(json["ordinaryShouldCompress"] as? Bool, true,
+                       "ordinary large Bash output remains Distill-eligible")
+        XCTAssertEqual(json["exactShouldCompress"] as? Bool, false,
+                       "exact-output Bash (rg) stays excluded")
+        XCTAssertEqual(json["skillExcluded"] as? Bool, true)
+        XCTAssertGreaterThan(json["skillLen"] as? Int ?? 0, 6000,
+                             "fixture must exceed presentation truncation limit to prove completeness path")
+        // Ensure the harness is grounded in the live bridge (no silent fallback).
+        XCTAssertTrue(source.contains("'skill'"), "bridge source must list skill exclusion")
     }
 
     func test_agentSDKBridgeRecoversRawNewlineSplitPromptCommand() throws {
@@ -2329,6 +2514,19 @@ private actor EventSink {
     private var events: [AgentRunEvent] = []
     func record(_ event: AgentRunEvent) { events.append(event) }
     func snapshot() -> [AgentRunEvent] { events }
+}
+
+private final class LockedAgentRunEventSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [AgentRunEvent] = []
+
+    func record(_ event: AgentRunEvent) {
+        lock.withLock { events.append(event) }
+    }
+
+    func snapshot() -> [AgentRunEvent] {
+        lock.withLock { events }
+    }
 }
 
 /// Thread-safe accumulator for draining a child process's stdout off the main

@@ -2,7 +2,7 @@ import XCTest
 @testable import AgentRuntime
 
 final class RemoteCodeOrchestrateInstallTests: XCTestCase {
-    func testWorkerPromptContractRequiresDistillForWorkersAndDescendants() throws {
+    func testWorkerPromptContractProtectsSkillContentAndOrdinaryDistillOnly() throws {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -13,18 +13,51 @@ final class RemoteCodeOrchestrateInstallTests: XCTestCase {
             ),
             encoding: .utf8
         )
+        let skill = try String(
+            contentsOf: packageRoot.appendingPathComponent(
+                "Sources/AgentRuntime/Resources/remote-code-orchestrate/SKILL.md"
+            ),
+            encoding: .utf8
+        )
 
         XCTAssertTrue(promptContract.contains("Distill:"))
-        XCTAssertTrue(promptContract.contains("| distill"))
-        XCTAssertTrue(promptContract.contains("descendants"))
+        XCTAssertTrue(promptContract.contains("never Distill skill content")
+                      || promptContract.contains("Never Distill skill"),
+                      "prompt contract must protect skill bodies")
+        XCTAssertTrue(promptContract.contains("must stay complete")
+                      || promptContract.contains("skill content must stay complete"),
+                      "requested/returned skill content must be complete")
+        XCTAssertTrue(promptContract.contains("do not require every worker")
+                      || promptContract.contains("Do not require every worker"),
+                      "workers must not restate Distill rules")
+        XCTAssertFalse(promptContract.contains("repeat this rule in every descendant prompt"),
+                       "removed: requiring Distill restatement in every descendant")
+
+        XCTAssertTrue(skill.contains("Never Distill skill content")
+                      || skill.contains("never Distill skill content"))
+        XCTAssertTrue(skill.contains("stay complete"),
+                      "SKILL.md must require complete skill bodies")
+        XCTAssertTrue(skill.contains("requested/returned skill bodies")
+                      || skill.contains("requested/returned skill content"),
+                      "SKILL.md must cover requested and returned skill content")
+        XCTAssertFalse(skill.contains("Put the Distill rule in every worker/reviewer prompt"))
     }
 
-    func testPinnedManifestMatchesVerifiedUpstream() {
+    func testPinnedManifestMatchesEmbeddedResourceTreeDigest() throws {
         let package = AgentSkillInstaller.remoteCodeOrchestratePinnedPackage
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let embedded = packageRoot.appendingPathComponent(
+            "Sources/AgentRuntime/Resources/remote-code-orchestrate",
+            isDirectory: true
+        )
 
         XCTAssertEqual(package.skillID, "remote-code-orchestrate")
         XCTAssertEqual(package.sourceRevision, "2c77fa48431bc20e5dc841652079594a3ea918c9")
-        XCTAssertEqual(package.sourceTreeSHA256, "c9d7eb11b83d3fd4a7be38e4de2e7acac0100be11a27441b435b41006709a0eb")
+        XCTAssertEqual(package.localVersion, "2")
+        XCTAssertEqual(package.sourceTreeSHA256, "920c6cd819b285332a8381526552e08b47fd28ba55a1f4392b57f71010ce19c8")
         XCTAssertEqual(package.allowedPaths, [
             "SKILL.md",
             "agents/openai.yaml",
@@ -35,6 +68,22 @@ final class RemoteCodeOrchestrateInstallTests: XCTestCase {
             "scripts/test_orchestration_harness.py",
             "scripts/validate_orchestration.py"
         ])
+
+        // WHY: pin must match the on-disk embedded package byte-for-byte tree digest.
+        // Inventing a digest would let reconcile fail open against the resource bundle.
+        var entries: [RemoteCodeOrchestrateFile] = []
+        for relativePath in package.allowedPaths {
+            let url = embedded.appendingPathComponent(relativePath)
+            let data = try Data(contentsOf: url)
+            entries.append(RemoteCodeOrchestrateFile(
+                relativePath: relativePath,
+                byteCount: data.count,
+                sha256: AgentSkillInstaller.sha256Hex(data)
+            ))
+        }
+        let actual = AgentSkillInstaller.remoteCodeOrchestrateTreeDigest(entries)
+        XCTAssertEqual(actual, package.sourceTreeSHA256,
+                       "embedded resource tree digest must match the pin (recompute; do not invent)")
     }
 
     func testInstallIsIdempotentAndReportsReadyStatus() throws {

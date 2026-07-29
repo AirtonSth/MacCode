@@ -3,6 +3,11 @@ import CoreModel
 
 /// Applies live Wave A / Wave B lossless transforms before the Distill sidecar call.
 /// Fail-open: returns nil when no transform applies or when live rollout is off.
+///
+/// Early-return is reserved for transforms with a **byte-exact** round-trip proof.
+/// `ManagedDistillCLI` skips the sidecar POST (and its recoverable store path) when
+/// this prepass returns — so non-byte-exact or lossy transforms must return nil and
+/// fall through (T-003 store-before-loss).
 public enum TokenSaverWaveLosslessPrepass {
     public struct Result: Sendable, Equatable {
         public let output: String
@@ -18,8 +23,45 @@ public enum TokenSaverWaveLosslessPrepass {
         }
     }
 
-    /// Try Wave A + Wave B crushers. First accepted transform wins.
-    public static func apply(input: String, toolHint: String? = nil) -> Result? {
+    // MARK: - Lossy Wave B opt-in (default OFF)
+
+    /// Env flag for explicit opt-in to lossy Wave B crushers in this prepass.
+    /// Value `"1"` / `"true"` / `"yes"` enables; anything else (or unset) is off.
+    /// Distinct from `RC_TOKEN_SAVER_WAVE_LIVE` — does not alter `TokenSaverWaveLiveRollout`.
+    public static let lossyCrushersOptInEnvKey = "RC_TOKEN_SAVER_PREPASS_LOSSY_CRUSHERS"
+
+    private static let optInLock = NSLock()
+    /// Test override; `nil` means read environment (production path).
+    private static var _lossyCrushersOptInOverride: Bool?
+
+    /// Explicit opt-in for lossy Wave B crushers. **Default false.**
+    /// Required *in addition to* `TokenSaverWaveLiveRollout.isLive(.waveBCrushers)`.
+    /// WHY: Wave B crushers are lossy and embed `[[rc:handle]]`; without opt-in + durable
+    /// store those handles die with the CLI process and become unrecoverable (T-003).
+    public static var lossyCrushersOptIn: Bool {
+        optInLock.lock(); defer { optInLock.unlock() }
+        if let override = _lossyCrushersOptInOverride { return override }
+        let raw = ProcessInfo.processInfo.environment[lossyCrushersOptInEnvKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return raw == "1" || raw == "true" || raw == "yes"
+    }
+
+    /// Test hook: force opt-in on/off; pass `nil` to re-read the environment.
+    public static func setLossyCrushersOptInForTesting(_ value: Bool?) {
+        optInLock.lock()
+        _lossyCrushersOptInOverride = value
+        optInLock.unlock()
+    }
+
+    /// Try Wave A (byte-exact only) + optional Wave B crushers (opt-in + durable store).
+    /// - Parameter durableStore: Optional durable `BlobStore` for lossy crushers. Process-local
+    ///   `MemoryStore` is refused — blobs would not survive the CLI process for `/v1/retrieve` (T-003).
+    public static func apply(
+        input: String,
+        toolHint: String? = nil,
+        durableStore: TokenSaverTypedCrushers.BlobStore? = nil
+    ) -> Result? {
         let originalBytes = input.utf8.count
         guard originalBytes > 0 else { return nil }
 
@@ -29,8 +71,19 @@ public enum TokenSaverWaveLosslessPrepass {
             }
         }
 
-        if TokenSaverWaveLiveRollout.isLive(.waveBCrushers) {
-            if let r = applyCrushers(input: input, toolHint: toolHint, originalBytes: originalBytes) {
+        // Lossy Wave B: live rollout alone is insufficient — need explicit opt-in AND a
+        // durable (non-process-local) store. Otherwise return nil so the sidecar handles
+        // compression with recoverable store-before-loss (T-003).
+        if TokenSaverWaveLiveRollout.isLive(.waveBCrushers),
+           lossyCrushersOptIn,
+           let store = durableStore,
+           !TokenSaverTypedCrushers.isProcessLocalStore(store) {
+            if let r = applyCrushers(
+                input: input,
+                toolHint: toolHint,
+                originalBytes: originalBytes,
+                store: store
+            ) {
                 return r
             }
         }
@@ -40,9 +93,13 @@ public enum TokenSaverWaveLosslessPrepass {
 
     // MARK: - Wave A
 
+    /// Only transforms with a byte-exact round-trip proof may return a `Result`.
+    /// - repeated-log: `expandStorelessLog(collapse(x)) == x` → may early-return
+    /// - structured-JSON: sorted-key deep equality only (not byte-exact) → must not early-return
     private static func applyWaveA(input: String, originalBytes: Int) -> Result? {
         let modes = TokenSaverWaveALossless.defaults
 
+        // Byte-exact: storeless RLE with proven expand(collapse(x)) == x.
         if modes[.repeatedLog] == .active,
            TokenSaverWaveALossless.repeatedLogAllows(original: input),
            let collapsed = TokenSaverWaveALossless.collapseStorelessLog(input),
@@ -62,6 +119,9 @@ public enum TokenSaverWaveLosslessPrepass {
         }
 
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Semantic-equality only: compact JSON reorders keys, drops whitespace/number
+        // formatting/duplicate keys. NOT byte-exact — must NOT early-return or
+        // ManagedDistillCLI would skip the sidecar recover path (T-003).
         if modes[.structuredJSON] == .active,
            TokenSaverWaveALossless.isHomogeneousJSON(trimmed),
            let compact = compactJSON(trimmed),
@@ -72,13 +132,7 @@ public enum TokenSaverWaveLosslessPrepass {
                 eligible: true,
                 wouldAccept: true
             )
-            return Result(
-                output: compact,
-                waveID: TokenSaverWaveLiveRollout.WaveID.waveA.rawValue,
-                trigger: TokenSaverWaveALossless.Trigger.structuredJSON.rawValue,
-                originalBytes: originalBytes,
-                compressedBytes: compact.utf8.count
-            )
+            // Deliberately no Result — fall through to sidecar.
         }
 
         return nil
@@ -86,8 +140,14 @@ public enum TokenSaverWaveLosslessPrepass {
 
     // MARK: - Wave B crushers
 
-    private static func applyCrushers(input: String, toolHint: String?, originalBytes: Int) -> Result? {
-        let store = TokenSaverTypedCrushers.sharedMemory
+    /// Lossy crushers: only called when opt-in is on and a durable store was injected.
+    /// Never binds `sharedMemory` — process-local blobs cannot be retrieved by the sidecar (T-003).
+    private static func applyCrushers(
+        input: String,
+        toolHint: String?,
+        originalBytes: Int,
+        store: TokenSaverTypedCrushers.BlobStore
+    ) -> Result? {
         let reg = TokenSaverTypedCrushers.sharedRegistry
 
         if input.range(of: #"\d+\s+failed"#, options: .regularExpression) != nil

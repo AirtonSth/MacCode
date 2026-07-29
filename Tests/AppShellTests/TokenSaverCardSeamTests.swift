@@ -259,8 +259,9 @@ final class TokenSaverCardSeamTests: XCTestCase {
                       "Rings label must include Grok used percent: \(label)")
     }
 
-    func test_ringsAccessibilityLabel_namesFixedGoalProgress() {
-        // WHY: product rule is fixed 2M/day and 10M/week goals for the green ring.
+    func test_ringsAccessibilityLabel_namesSelfNormalizingWindowMix() {
+        // WHY: green ring uses saved/(saved+used), not fixed 2M/10M — a11y must
+        // name the window mix so VoiceOver matches the visible fill.
         let label = SidebarRootView.ringsAccessibilityLabel(
             scope: "week",
             savedTokens: 10_000_000,
@@ -273,9 +274,9 @@ final class TokenSaverCardSeamTests: XCTestCase {
         XCTAssertTrue(label.lowercased().contains("measured save") || label.lowercased().contains("est."),
                       "Rings label must describe estimated/measured save: \(label)")
         XCTAssertTrue(label.contains("100%") || label.contains("~100%"),
-                      "Rings label must include goal percent: \(label)")
-        XCTAssertTrue(label.lowercased().contains("goal") || label.contains("10M"),
-                      "Rings label must name the fixed goal: \(label)")
+                      "Rings label must include progress percent: \(label)")
+        XCTAssertTrue(label.lowercased().contains("window mix") || label.contains("10M"),
+                      "Rings label must name the self-normalizing mix denominator: \(label)")
         XCTAssertFalse(label.contains("provider spend"),
                        "Rings label must not describe the old denominator: \(label)")
     }
@@ -415,6 +416,155 @@ final class TokenSaverCardSeamTests: XCTestCase {
         XCTAssertEqual(SidebarRootView.savingsAvoidanceRatio(savedTokens: 10, usedTokens: 0), 1)
     }
 
+    // MARK: - Green ring: billed units only (never raw)
+
+    func test_savingsRingFraction_unknownBilled_reportsUnavailableNotRawRatio() {
+        // WHY: raw provider tokens overstate the window (~8× cache reads). When
+        // billed units are unknown the ring must be explicitly unavailable —
+        // never savingsAvoidanceRatio(saved, raw).
+        let saved = 100_000
+        let rawTokens = 800_000 // would produce a non-zero raw-derived ratio
+        let fraction = SidebarRootView.tokenSaverSavingsRingFraction(
+            savedTokens: saved,
+            knownBilledUnits: nil,
+            hasComparableUsageWindow: true
+        )
+        XCTAssertEqual(fraction, .billedUnavailable)
+        XCTAssertFalse(fraction.isComparable)
+        XCTAssertEqual(fraction.progress, 0)
+        XCTAssertNil(fraction.mixTokens)
+        XCTAssertEqual(fraction.unavailableReason, "billed usage unknown")
+
+        let rawDerived = SidebarRootView.savingsAvoidanceRatio(
+            savedTokens: saved,
+            usedTokens: rawTokens
+        )
+        XCTAssertGreaterThan(rawDerived, 0)
+        XCTAssertNotEqual(fraction.progress, rawDerived,
+                          "Unavailable ring must not paint a raw-derived ratio")
+
+        let label = SidebarRootView.ringsAccessibilityLabel(
+            scope: "week",
+            savedTokens: saved,
+            savedProgress: fraction.progress,
+            savedGoalTokens: 0,
+            savingsRingComparable: fraction.isComparable,
+            savingsRingUnavailableReason: fraction.unavailableReason,
+            claudeUsedProgress: 0,
+            codexUsedProgress: 0,
+            grokUsedProgress: 0
+        )
+        XCTAssertTrue(label.lowercased().contains("unavailable"),
+                      "A11y must say savings share is unavailable: \(label)")
+        XCTAssertTrue(label.lowercased().contains("billed"),
+                      "A11y must name billed-unknown reason: \(label)")
+        XCTAssertFalse(label.contains("~") && label.lowercased().contains("window mix"),
+                       "Must not claim a window-mix percent when billed is unknown: \(label)")
+    }
+
+    func test_savingsRingFraction_knownBilled_usesAvoidanceRatio() {
+        // WHY: when billed is known, fill is saved/(saved+billed) — the honest mix.
+        let fraction = SidebarRootView.tokenSaverSavingsRingFraction(
+            savedTokens: 50_000,
+            knownBilledUnits: 50_000,
+            hasComparableUsageWindow: true
+        )
+        guard case .comparable(let progress, let mix) = fraction else {
+            return XCTFail("Expected comparable ring, got \(fraction)")
+        }
+        XCTAssertEqual(progress, 0.5, accuracy: 0.000_001)
+        XCTAssertEqual(mix, 100_000)
+        XCTAssertTrue(fraction.isComparable)
+    }
+
+    func test_savingsRingFraction_allTime_notFullForNonZeroAttributed() {
+        // WHY: all-time used=0 previously forced savingsAvoidanceRatio(saved, 0)=1.0
+        // and VoiceOver "~100% of window mix" — an unfalsifiable claim.
+        let attributed = 96_041_366
+        let fraction = SidebarRootView.tokenSaverSavingsRingFraction(
+            savedTokens: attributed,
+            knownBilledUnits: nil,
+            hasComparableUsageWindow: false
+        )
+        XCTAssertEqual(fraction, .noComparableUsageWindow)
+        XCTAssertFalse(fraction.isComparable)
+        XCTAssertEqual(fraction.progress, 0,
+                       "All-time must not paint a full green ring from used=0")
+        XCTAssertNotEqual(fraction.progress, 1.0)
+        XCTAssertEqual(fraction.unavailableReason, "no comparable usage window")
+
+        // Contrasting the forbidden self-normalize-against-zero path:
+        let forbidden = SidebarRootView.savingsAvoidanceRatio(
+            savedTokens: attributed,
+            usedTokens: 0
+        )
+        XCTAssertEqual(forbidden, 1.0)
+        XCTAssertNotEqual(fraction.progress, forbidden)
+
+        let label = SidebarRootView.ringsAccessibilityLabel(
+            scope: "all time",
+            savedTokens: attributed,
+            savedProgress: fraction.progress,
+            savedGoalTokens: 0,
+            savingsRingComparable: fraction.isComparable,
+            savingsRingUnavailableReason: fraction.unavailableReason,
+            claudeUsedProgress: 0.2,
+            codexUsedProgress: 0.1,
+            grokUsedProgress: 0
+        )
+        XCTAssertTrue(label.lowercased().contains("unavailable"),
+                      "All-time a11y must not claim 100% mix: \(label)")
+        XCTAssertTrue(label.lowercased().contains("no comparable usage window"),
+                      "All-time a11y must name the reason: \(label)")
+        XCTAssertFalse(label.contains("~100%") || label.contains("100% of window mix"),
+                       "Must not claim ~100% of window mix for all-time: \(label)")
+    }
+
+    func test_allTime_visibleRowsPlusUnattributed_equalHonestyHeadline() {
+        // WHY: all-time managed rows must use attributed per-provider figures so
+        // visible rows + unattributed reconcile with the honesty totals (headline
+        // attributed + unattributed). Unknown-provider savings land only in unattributed.
+        let claudeAttributed = 80_000
+        let codexAttributed = 40_000
+        let grokAttributed = 20_000
+        let unattributedUnknownProvider = 500_000
+        let attributedHeadline = claudeAttributed + codexAttributed + grokAttributed
+
+        let claudeRow = SidebarRootView.tokenSaverAllTimeProviderAttributedSaved(
+            attributedSavedForProvider: claudeAttributed
+        )
+        let codexRow = SidebarRootView.tokenSaverAllTimeProviderAttributedSaved(
+            attributedSavedForProvider: codexAttributed
+        )
+        let grokRow = SidebarRootView.tokenSaverAllTimeProviderAttributedSaved(
+            attributedSavedForProvider: grokAttributed
+        )
+        XCTAssertEqual(claudeRow + codexRow + grokRow, attributedHeadline)
+
+        XCTAssertTrue(
+            SidebarRootView.tokenSaverAllTimeRowsReconcileWithHeadline(
+                managedProviderAttributedSaved: [claudeRow, codexRow, grokRow],
+                unattributedSaved: unattributedUnknownProvider,
+                attributedHeadline: attributedHeadline
+            ),
+            "Managed attributed rows + unattributed must equal headline + unattributed"
+        )
+
+        // Counter-example the defect encodes: permanent aggregate that folds in
+        // unknown would break reconciliation if used as provider rows.
+        let permanentClaudeIncludingNoise = claudeAttributed + 10_000
+        XCTAssertFalse(
+            SidebarRootView.tokenSaverAllTimeRowsReconcileWithHeadline(
+                managedProviderAttributedSaved: [
+                    permanentClaudeIncludingNoise, codexAttributed, grokAttributed
+                ],
+                unattributedSaved: unattributedUnknownProvider,
+                attributedHeadline: attributedHeadline
+            ),
+            "Unfiltered permanent aggregate must not reconcile with attributed headline"
+        )
+    }
+
     func test_tokenSaverCardHeadline_showsEstimatedSaveWithCredibleTotal() {
         // WHY: design is the original "Estimated save N tokens" copy; only the
         // number is the scope credible total (not a technique-stack redesign).
@@ -443,6 +593,175 @@ final class TokenSaverCardSeamTests: XCTestCase {
         XCTAssertTrue(headline.lowercased().contains("measuring"),
                       "Zero savings must keep measuring copy; got: '\(headline)'")
         XCTAssertFalse(headline.lowercased().contains("all-time"))
+    }
+
+    func test_tokenSaverCardHeadline_unsubscribed_usesSamePrimaryFigureNotUsageHeuristic() {
+        // WHY: teaser must use the same primary figure the caller computed — never
+        // re-inflate from usedTokens via used*(1-0.42).
+        let headline = SidebarRootView.tokenSaverCardHeadline(
+            subscribed: false,
+            enabled: false,
+            sidecarStatus: .notStarted,
+            savedTokens: 12_000,
+            usedTokens: 78_600_000
+        )
+        XCTAssertTrue(headline.lowercased().contains("estimated potential"),
+                      "Unsubscribed teaser label; got: '\(headline)'")
+        XCTAssertTrue(headline.contains("12") || headline.lowercased().contains("12k"),
+                      "Teaser must show the passed primary figure, not ~45M from usage: \(headline)")
+        XCTAssertFalse(headline.contains("45") && headline.lowercased().contains("m"),
+                       "Must not show used*0.58-scale teaser: \(headline)")
+    }
+
+    func test_tokenSaverCardHeadline_lapsedSubscriberKeepsHistoricalFigure() {
+        // WHY: gate the toggle, not history — subscribed+disabled still shows realized N.
+        let headline = SidebarRootView.tokenSaverCardHeadline(
+            subscribed: true,
+            enabled: false,
+            sidecarStatus: .notStarted,
+            savedTokens: 96_000,
+            usedTokens: 0
+        )
+        XCTAssertTrue(headline.lowercased().contains("estimated save"),
+                      "Lapsed/disabled must keep historical figure; got: '\(headline)'")
+        XCTAssertTrue(headline.contains("96") || headline.lowercased().contains("96k"))
+        XCTAssertNotEqual(headline, "Enable Token Saver")
+    }
+
+    // MARK: - All-time attributed primary + unattributed row + inversion
+
+    func test_allTimePrimary_usesAttributedNotAggregate() {
+        // WHY: 85%+ of permanent aggregate can be provider-unknown; headline must
+        // never fold unattributed into the all-time primary.
+        let attributed = 96_041_366
+        let unattributed = 569_918_221
+        let primary = SidebarRootView.tokenSaverAllTimePrimaryTokens(
+            attributedSavedTokens: attributed
+        )
+        XCTAssertEqual(primary, attributed)
+        XCTAssertNotEqual(primary, attributed + unattributed,
+                          "All-time primary must not equal attributed+unattributed aggregate")
+        XCTAssertEqual(
+            SidebarRootView.tokenSaverAllTimePrimaryTokens(attributedSavedTokens: 0),
+            0
+        )
+    }
+
+    func test_unattributedRow_rendersWhenWindowIsZero() {
+        // WHY: suppressing the row at window==0 hid all-time unattributed forever.
+        let value = SidebarRootView.tokenSaverUnattributedRowValue(
+            windowSaved: 0,
+            allTimeSaved: 569_918_221
+        )
+        XCTAssertTrue(value.hasPrefix("0 this window"),
+                      "Zero window must still render; got: \(value)")
+        XCTAssertTrue(value.lowercased().contains("all time"),
+                      "Must show all-time unattributed; got: \(value)")
+        XCTAssertFalse(value.isEmpty)
+        let caption = SidebarRootView.tokenSaverUnattributedRunsCaption(
+            windowRuns: 0,
+            allTimeRuns: 40_000
+        )
+        XCTAssertTrue(caption.lowercased().contains("not provider-attributed"),
+                      "Label must state bytes are not provider-attributed: \(caption)")
+    }
+
+    func test_enabledPrimaryFigure_neverBelowDisabledTeaser_forUsageMeasuredSweep() {
+        // WHY: enabling Token Saver must never lower the card figure for the same
+        // measured/used window (closes the non-payer > payer inversion).
+        let measuredSamples = [0, 10, 1_000, 35_000, 250_000, 2_000_000]
+        let usedSamples = [0, 1_000, 100_000, 1_000_000, 78_600_000]
+        for measured in measuredSamples {
+            for used in usedSamples {
+                let enabled = SidebarRootView.tokenSaverCardPrimaryFigure(
+                    measuredSaved: measured,
+                    usedTokens: used,
+                    tokenSaverEnabled: true
+                )
+                let disabled = SidebarRootView.tokenSaverCardPrimaryFigure(
+                    measuredSaved: measured,
+                    usedTokens: used,
+                    tokenSaverEnabled: false
+                )
+                XCTAssertGreaterThanOrEqual(
+                    enabled,
+                    disabled,
+                    "enabled (\(enabled)) < disabled teaser (\(disabled)) for measured=\(measured) used=\(used)"
+                )
+                // Headline path must not reintroduce used*0.58 as the unsubscribed number.
+                let unsubscribedHeadline = SidebarRootView.tokenSaverCardHeadline(
+                    subscribed: false,
+                    enabled: false,
+                    sidecarStatus: .notStarted,
+                    savedTokens: disabled,
+                    usedTokens: used
+                )
+                let heuristic = Int((Double(used) * 0.58).rounded())
+                if disabled > 0 {
+                    XCTAssertTrue(
+                        unsubscribedHeadline.lowercased().contains("estimated potential"),
+                        "Unsubscribed uses potential label with same-estimator figure"
+                    )
+                    // Teaser string is built from `disabled`, never from used*0.58.
+                    if heuristic > disabled * 2 && heuristic >= 1_000 {
+                        let heuristicStr = SidebarRootView.formatTokenCountPublic(heuristic)
+                        XCTAssertFalse(
+                            unsubscribedHeadline.contains(heuristicStr),
+                            "Unsubscribed headline must not embed used*0.58 (\(heuristicStr)): \(unsubscribedHeadline)"
+                        )
+                    }
+                } else if used > 10_000 {
+                    // No measured history: teaser is empty / ready, not ~0.58*used.
+                    XCTAssertEqual(disabled, 0)
+                    XCTAssertFalse(
+                        unsubscribedHeadline.lowercased().contains("m tokens")
+                            && unsubscribedHeadline.contains("45"),
+                        "Zero-measured teaser must not print usage-heuristic millions: \(unsubscribedHeadline)"
+                    )
+                    XCTAssertEqual(unsubscribedHeadline, "Estimate ready")
+                }
+            }
+        }
+    }
+
+    func test_cardPathSource_hasNoCompressionHeuristic() throws {
+        // WHY: 0.42/0.58 must not re-enter the card path as a savings estimator
+        // (opacity 0.42 stroke is unrelated UI chrome and may remain).
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = root
+            .appendingPathComponent("Sources/AppShell/SidebarView.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        XCTAssertFalse(
+            source.contains("estimatePotentialSavings"),
+            "Card path must not call estimatePotentialSavings (usage-fraction teaser)"
+        )
+        XCTAssertFalse(
+            source.contains("compressionRatio"),
+            "Card path must not reference compressionRatio"
+        )
+        // Guard executable savings math only (UI opacity 0.42 stroke is unrelated).
+        let codeLines = source.split(separator: "\n").filter { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            return !trimmed.hasPrefix("//") && !trimmed.hasPrefix("///") && !trimmed.hasPrefix("*")
+        }.joined(separator: "\n")
+        XCTAssertFalse(
+            codeLines.contains("* 0.58") || codeLines.contains("*0.58") || codeLines.contains("1.0 - 0.42"),
+            "Card path must not hardcode usage-fraction savings math in executable code"
+        )
+    }
+
+    func test_sinceInstallLine_usesAttributedOnly() {
+        let line = SidebarRootView.tokenSaverSinceInstallLine(
+            attributedSavedTokens: 96_041_366,
+            attributedRuns: 10_000
+        )
+        XCTAssertTrue(line.lowercased().contains("since install"))
+        XCTAssertTrue(line.lowercased().contains("attributed"))
+        XCTAssertTrue(line.contains("10") || line.lowercased().contains("10k"))
+        XCTAssertTrue(line.lowercased().contains("avg"))
     }
 
     func test_dayAndWeek_useSameBareUserEstimatorPath() {

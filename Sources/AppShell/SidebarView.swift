@@ -2189,6 +2189,9 @@ public struct SidebarRootView: View {
     private enum TokenSaverUsageScope: String, CaseIterable {
         case currentSession
         case week
+        // WHY: permanent attributed accumulator was unreachable with only Today/Week;
+        // All time is the only scope that surfaces the ledger's attributed all-time figure.
+        case allTime
     }
 
     @ObservedObject var vm: SidebarViewModel
@@ -2746,14 +2749,10 @@ public struct SidebarRootView: View {
         let ringVals = tokenSaverActivityRingValues
         // :195 -- build the label outside the label closure so it is
         // available both for the rings and for the button's own a11y value.
-        let ringsLabel = Self.ringsAccessibilityLabel(
-            scope: tokenSaverLimitScopeTitle(for: tokenSaverDetailsScope),
-            savedTokens: tokenSaverSavedOrPotential(in: vm.tokenSaverUsageSnapshot, scope: tokenSaverDetailsScope),
-            savedProgress: ringVals.tokenSaverProgress,
-            savedGoalTokens: tokenSaverSavingsGoalTokens(for: tokenSaverDetailsScope),
-            claudeUsedProgress: ringVals.claudeUsedProgress,
-            codexUsedProgress: ringVals.codexUsedProgress,
-            grokUsedProgress: ringVals.grokUsedProgress
+        let ringsLabel = tokenSaverRingsAccessibilityLabel(
+            for: vm.tokenSaverUsageSnapshot,
+            scope: tokenSaverDetailsScope,
+            ringVals: ringVals
         )
         return Button {
             toggleTokenSaverDetails(refreshWhenOpening: true)
@@ -2894,8 +2893,10 @@ public struct SidebarRootView: View {
         let claude = tokenSaverProviderUsage(.claude, in: snapshot)
         let codex = tokenSaverProviderUsage(.codex, in: snapshot)
         let grok = tokenSaverProviderUsage(.grok, in: snapshot)
+        let savingsFraction = tokenSaverSavingsRingFraction(for: snapshot, scope: scope)
         return TokenSaverActivityRings.Values(
-            tokenSaverProgress: tokenSaverSavingsProgress(for: snapshot, scope: scope),
+            tokenSaverProgress: savingsFraction.progress,
+            tokenSaverSavingsRingAvailable: savingsFraction.isComparable,
             claudeUsedProgress: tokenSaverUsedLimitProgress(for: claude, provider: .claude, scope: scope) ?? 0,
             codexUsedProgress: tokenSaverUsedLimitProgress(for: codex, provider: .codex, scope: scope) ?? 0,
             grokUsedProgress: tokenSaverUsedLimitProgress(for: grok, provider: .grok, scope: scope) ?? 0
@@ -2914,11 +2915,26 @@ public struct SidebarRootView: View {
     private var tokenSaverActivityAccessibilityValue: String {
         let snapshot = vm.tokenSaverUsageSnapshot
         let ringVals = tokenSaverActivityRingValues(for: snapshot, scope: tokenSaverDetailsScope)
+        return tokenSaverRingsAccessibilityLabel(
+            for: snapshot,
+            scope: tokenSaverDetailsScope,
+            ringVals: ringVals
+        )
+    }
+
+    private func tokenSaverRingsAccessibilityLabel(
+        for snapshot: TokenSaverUsageSnapshot,
+        scope: TokenSaverUsageScope,
+        ringVals: TokenSaverActivityRings.Values
+    ) -> String {
+        let fraction = tokenSaverSavingsRingFraction(for: snapshot, scope: scope)
         return Self.ringsAccessibilityLabel(
-            scope: tokenSaverLimitScopeTitle(for: tokenSaverDetailsScope),
-            savedTokens: tokenSaverSavedOrPotential(in: snapshot, scope: tokenSaverDetailsScope),
+            scope: tokenSaverLimitScopeTitle(for: scope),
+            savedTokens: tokenSaverSavedOrPotential(in: snapshot, scope: scope),
             savedProgress: ringVals.tokenSaverProgress,
-            savedGoalTokens: tokenSaverSavingsGoalTokens(for: tokenSaverDetailsScope),
+            savedGoalTokens: fraction.mixTokens ?? 0,
+            savingsRingComparable: fraction.isComparable,
+            savingsRingUnavailableReason: fraction.unavailableReason,
             claudeUsedProgress: ringVals.claudeUsedProgress,
             codexUsedProgress: ringVals.codexUsedProgress,
             grokUsedProgress: ringVals.grokUsedProgress
@@ -2931,6 +2947,7 @@ public struct SidebarRootView: View {
         // session window.  "today" is the honest label for what is shown.
         case .currentSession: return "today"
         case .week: return "week"
+        case .allTime: return "all time"
         }
     }
 
@@ -2940,12 +2957,13 @@ public struct SidebarRootView: View {
         // not a "session" (which implies start-of-process to now).
         case .currentSession: return "Today"
         case .week: return "Week"
+        case .allTime: return "All time"
         }
     }
 
-    /// Window-aligned provider usage for savings math. Prefer `snapshot.daily`
-    /// buckets (same retention window as the savings ledger). When buckets are
-    /// empty, return 0 so attributed legs do not inflate from all-time/session.
+    /// Window-aligned provider usage for bare-user estimator inputs only.
+    /// Prefer `snapshot.daily` buckets (same retention window as the savings ledger).
+    /// Never use this as a green-ring denominator — ring fill requires known billed units.
     private func tokenSaverScopeUsedTokens(in snapshot: TokenSaverUsageSnapshot, scope: TokenSaverUsageScope) -> Int {
         switch scope {
         case .currentSession:
@@ -2955,6 +2973,31 @@ public struct SidebarRootView: View {
             )
         case .week:
             return TokenSaverBareUserEstimator.weekProviderTokens(daily: snapshot.daily)
+        case .allTime:
+            // WHY: usage.json only retains a short window; all-time has no matched
+            // provider-usage series.
+            return 0
+        }
+    }
+
+    /// Known billed units for the selected scope window, or nil when unknown.
+    /// WHY: green-ring denominator must never fall back to raw tokens (cache reads
+    /// count at full weight and overstate the window ~8×).
+    private func tokenSaverScopeKnownBilledUnits(
+        in snapshot: TokenSaverUsageSnapshot,
+        scope: TokenSaverUsageScope
+    ) -> Double? {
+        switch scope {
+        case .currentSession:
+            return TokenSaverBareUserEstimator.todayProviderBilledTokenUnits(
+                daily: snapshot.daily,
+                now: tokenSaverNow
+            )
+        case .week:
+            return TokenSaverBareUserEstimator.weekProviderBilledTokenUnits(daily: snapshot.daily)
+        case .allTime:
+            // No matched usage window for all-time — not "zero billed".
+            return nil
         }
     }
 
@@ -2965,29 +3008,51 @@ public struct SidebarRootView: View {
         snapshot.providers.first { $0.provider == provider } ?? TokenSaverProviderUsage(provider: provider)
     }
 
+    private func tokenSaverSavingsRingFraction(
+        for snapshot: TokenSaverUsageSnapshot,
+        scope: TokenSaverUsageScope
+    ) -> TokenSaverSavingsRingFraction {
+        let saved = tokenSaverSavedOrPotential(in: snapshot, scope: scope)
+        switch scope {
+        case .allTime:
+            // WHY: all-time has no matched usage window; never self-normalize against 0 used.
+            return Self.tokenSaverSavingsRingFraction(
+                savedTokens: saved,
+                knownBilledUnits: nil,
+                hasComparableUsageWindow: false
+            )
+        case .currentSession, .week:
+            return Self.tokenSaverSavingsRingFraction(
+                savedTokens: saved,
+                knownBilledUnits: tokenSaverScopeKnownBilledUnits(in: snapshot, scope: scope),
+                hasComparableUsageWindow: true
+            )
+        }
+    }
+
     private func tokenSaverSavingsProgress(
         for snapshot: TokenSaverUsageSnapshot,
         scope: TokenSaverUsageScope
     ) -> Double {
-        let saved = tokenSaverSavedOrPotential(in: snapshot, scope: scope)
-        // Fixed product goals: 2M today / 10M week (not avoidance share of traffic).
-        return Self.savingsToGoalProgress(
-            savedTokens: saved,
-            goalTokens: tokenSaverSavingsGoalTokens(for: scope)
-        )
+        tokenSaverSavingsRingFraction(for: snapshot, scope: scope).progress
     }
 
     private func tokenSaverSavedOrPotential(
         in snapshot: TokenSaverUsageSnapshot,
         scope: TokenSaverUsageScope
     ) -> Int {
-        if vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled {
-            // Prefer persisted daily economy: Week = Σ(daily.total_credible).
+        // WHY: one primary axis — same realized/credible estimator for paid and
+        // teaser. Never the retired usage-fraction teaser: that inverted the card
+        // so non-payers saw larger headlines than payers. History is not gated
+        // on the enable toggle.
+        switch scope {
+        case .allTime:
+            return Self.tokenSaverAllTimePrimaryTokens(
+                attributedSavedTokens: vm.tokenSaverSavingsSummary.attributedSavedTokens
+            )
+        case .currentSession, .week:
             return tokenSaverPersistedOrLiveCredible(scope: scope, snapshot: snapshot)
         }
-        return TokenSaverUsageStore.estimatePotentialSavings(
-            usedTokens: tokenSaverScopeUsedTokens(in: snapshot, scope: scope)
-        )
     }
 
     /// Measured tool-output ledger only (no dialect/graphify/orchestration estimates).
@@ -2998,6 +3063,12 @@ public struct SidebarRootView: View {
             return Self.tokenSaverReportWindowSavedTokens(daily: summary.daily)
         case .currentSession:
             return Self.tokenSaverTodaySavedTokens(daily: summary.daily, now: tokenSaverNow)
+        case .allTime:
+            // WHY: all-time primary is attributed; measured-only window helpers stay
+            // on retained daily rows for Today/Week estimator inputs only.
+            return Self.tokenSaverAllTimePrimaryTokens(
+                attributedSavedTokens: summary.attributedSavedTokens
+            )
         }
     }
 
@@ -3020,6 +3091,10 @@ public struct SidebarRootView: View {
                 return vm.tokenSaverDailyEconomyWeekTotal
             }
             return tokenSaverBareUserBreakdown(in: snapshot, scope: scope).totalCredible
+        case .allTime:
+            return Self.tokenSaverAllTimePrimaryTokens(
+                attributedSavedTokens: vm.tokenSaverSavingsSummary.attributedSavedTokens
+            )
         }
     }
 
@@ -3037,6 +3112,20 @@ public struct SidebarRootView: View {
                 estimatedGraphify: today.graphifyTokens,
                 estimatedOrchestration: today.orchestrationTokens,
                 appliedOutputShare: today.appliedOutputShare,
+                usedCalibratedDefaults: true
+            )
+        }
+        // WHY: all-time is the attributed ledger total, not a dialect/graphify estimate.
+        if scope == .allTime {
+            let attributed = Self.tokenSaverAllTimePrimaryTokens(
+                attributedSavedTokens: vm.tokenSaverSavingsSummary.attributedSavedTokens
+            )
+            return TokenSaverBareUserBreakdown(
+                measuredToolOutput: attributed,
+                estimatedDialect: 0,
+                estimatedGraphify: 0,
+                estimatedOrchestration: 0,
+                appliedOutputShare: 0,
                 usedCalibratedDefaults: true
             )
         }
@@ -3093,34 +3182,55 @@ public struct SidebarRootView: View {
             return Self.tokenSaverWindowSaved(forProvider: provider.rawValue, dailyByProvider: summary.dailyByProvider)
         case .currentSession:
             return Self.tokenSaverTodaySaved(forProvider: provider.rawValue, dailyByProvider: summary.dailyByProvider, now: tokenSaverNow)
+        case .allTime:
+            // BLOCKER: Persistence does not expose per-provider attributed figures.
+            // Needed: TokenSaverSavingsSummary.attributedSavedTokens(forProvider:)
+            // (or equivalent on TokenSaverSavingsRepository.summary) applying the
+            // same displayedSavingsEligibilitySQL + attributedSavingsSQL as the
+            // all-time headline. Do not reimplement that predicate in the view.
+            // Until then, use the unfiltered permanent aggregate and surface the gap.
+            return summary.savings(for: provider.rawValue)?.savedTokens ?? 0
         }
     }
 
-    /// Measured saved tokens + runs for the "CLI & other" reconciling row in the
-    /// selected scope. Returns nil when not measuring or when nothing was saved.
-    private func tokenSaverScopedOtherSavings() -> (savedTokens: Int, runs: Int)? {
-        guard vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled else { return nil }
+    /// Window + all-time unattributed savings for the "CLI & other" row.
+    /// WHY: always return values (including zeros) so the row never silently vanishes
+    /// when this window is empty while all-time unattributed still exists.
+    private func tokenSaverScopedOtherSavings() -> (
+        windowSaved: Int,
+        windowRuns: Int,
+        allTimeSaved: Int,
+        allTimeRuns: Int
+    ) {
         let summary = vm.tokenSaverSavingsSummary
-        let result: (savedTokens: Int, runs: Int)
+        let window: (savedTokens: Int, runs: Int)
         switch tokenSaverDetailsScope {
         case .week:
-            result = Self.tokenSaverWindowSaved(
+            window = Self.tokenSaverWindowSaved(
                 forProvidersOtherThan: TokenSaverSavingsDisplay.managedProviderIDs,
                 dailyByProvider: summary.dailyByProvider
             )
         case .currentSession:
-            result = Self.tokenSaverTodaySaved(
+            window = Self.tokenSaverTodaySaved(
                 forProvidersOtherThan: TokenSaverSavingsDisplay.managedProviderIDs,
                 dailyByProvider: summary.dailyByProvider,
                 now: tokenSaverNow
             )
+        case .allTime:
+            window = (summary.unattributedSavedTokens, summary.unattributedRuns)
         }
-        guard result.savedTokens > 0 else { return nil }
-        return result
+        return (
+            windowSaved: window.savedTokens,
+            windowRuns: window.runs,
+            allTimeSaved: summary.unattributedSavedTokens,
+            allTimeRuns: summary.unattributedRuns
+        )
     }
 
+    /// Self-normalizing ring mix (saved + known billed) for a11y when comparable.
+    /// Returns 0 when the ring is in an explicit unavailable state (no raw fallback).
     private func tokenSaverSavingsGoalTokens(for scope: TokenSaverUsageScope) -> Int {
-        Self.tokenSaverSavingsGoalTokens(isDailyScope: scope == .currentSession)
+        tokenSaverSavingsRingFraction(for: tokenSaverDetailsSnapshot, scope: scope).mixTokens ?? 0
     }
 
     private func tokenSaverSavingsSummary(
@@ -3128,6 +3238,7 @@ public struct SidebarRootView: View {
         scope: TokenSaverUsageScope
     ) -> String {
         // Design: original "Estimated save N" legend. Number is scope credible total.
+        // Labels only: same primary figure for paid and teaser (no separate heuristic).
         let prefix = vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled
             ? "Estimated save"
             : "Estimated potential"
@@ -3156,9 +3267,10 @@ public struct SidebarRootView: View {
                 numerator: usage.currentSessionTokens,
                 denominator: usage.currentSessionLimitTokens
             )
-        case .week:
+        case .week, .allTime:
             // Prefer effective % so an expired weekly window (or a zeroed
             // inactive-provider clear) does not keep painting a stale ring.
+            // All-time has no separate rate-limit probe; reuse weekly % when present.
             if let weeklyUsedPercent = usage.effectiveWeeklyUsedPercent() {
                 return min(max(weeklyUsedPercent / 100.0, 0), 1)
             }
@@ -3201,7 +3313,7 @@ public struct SidebarRootView: View {
                 denominator: usage.currentSessionLimitTokens
             )
             return "Session used \(Self.formatPercent(usedProgress))"
-        case .week:
+        case .week, .allTime:
             if let weeklyUsedPercent = usage.effectiveWeeklyUsedPercent() {
                 return "Weekly used \(Self.formatPercent(weeklyUsedPercent / 100.0))"
             }
@@ -3304,6 +3416,18 @@ public struct SidebarRootView: View {
 
             tokenSaverDetailsActivityChart
 
+            // WHY: scope-independent attributed lifetime line — never competes as a
+            // second primary number (caption only); primary stays the scope picker figure.
+            Text(Self.tokenSaverSinceInstallLine(
+                attributedSavedTokens: vm.tokenSaverSavingsSummary.attributedSavedTokens,
+                attributedRuns: vm.tokenSaverSavingsSummary.attributedRuns
+            ))
+            .font(DS.Font.caption2)
+            .foregroundColor(DS.Palette.textTertiary)
+            .lineLimit(2)
+            .minimumScaleFactor(0.85)
+            .accessibilityIdentifier("sidebar.tokenSaver.sinceInstall")
+
             Divider()
 
             VStack(alignment: .leading, spacing: DS.Space.sm) {
@@ -3311,9 +3435,14 @@ public struct SidebarRootView: View {
                 ForEach(tokenSaverProvidersByUsage(in: tokenSaverDetailsSnapshot, scope: tokenSaverDetailsScope), id: \.self) { provider in
                     tokenSaverProviderRow(provider: provider)
                 }
-                if let other = tokenSaverScopedOtherSavings() {
-                    tokenSaverOtherSavingsRow(saved: other.savedTokens, runs: other.runs)
-                }
+                // WHY: always show unattributed — zero this window must not hide all-time.
+                let other = tokenSaverScopedOtherSavings()
+                tokenSaverOtherSavingsRow(
+                    windowSaved: other.windowSaved,
+                    windowRuns: other.windowRuns,
+                    allTimeSaved: other.allTimeSaved,
+                    allTimeRuns: other.allTimeRuns
+                )
             }
 
             Divider()
@@ -3507,14 +3636,10 @@ public struct SidebarRootView: View {
         let detailsRingVals = tokenSaverActivityRingValues(for: snapshot, scope: tokenSaverDetailsScope)
         // :195 -- build label via the seam; replaces the detached
         // .accessibilityLabel/.accessibilityValue pair that never reached the view.
-        let detailsRingsLabel = Self.ringsAccessibilityLabel(
-            scope: tokenSaverLimitScopeTitle(for: tokenSaverDetailsScope),
-            savedTokens: tokenSaverSavedOrPotential(in: snapshot, scope: tokenSaverDetailsScope),
-            savedProgress: detailsRingVals.tokenSaverProgress,
-            savedGoalTokens: tokenSaverSavingsGoalTokens(for: tokenSaverDetailsScope),
-            claudeUsedProgress: detailsRingVals.claudeUsedProgress,
-            codexUsedProgress: detailsRingVals.codexUsedProgress,
-            grokUsedProgress: detailsRingVals.grokUsedProgress
+        let detailsRingsLabel = tokenSaverRingsAccessibilityLabel(
+            for: snapshot,
+            scope: tokenSaverDetailsScope,
+            ringVals: detailsRingVals
         )
         return HStack(alignment: .center, spacing: DS.Space.lg) {
             TokenSaverActivityRings(values: detailsRingVals, a11yLabel: detailsRingsLabel)
@@ -3582,9 +3707,12 @@ public struct SidebarRootView: View {
     private func tokenSaverProviderRow(provider: AgentProvider) -> some View {
         let snapshot = tokenSaverDetailsSnapshot
         let usage = tokenSaverProviderUsage(provider, in: snapshot)
-        let value = vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled
-            ? tokenSaverScopedProviderSaved(provider)
-            : TokenSaverUsageStore.estimatePotentialSavings(usedTokens: usage.actualProviderTokens)
+        // WHY: details rows use measured/attributed ledger only — never the retired
+        // usage-fraction teaser — so they reconcile with the single primary figure.
+        let value = tokenSaverScopedProviderSaved(provider)
+        let prefix = vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled
+            ? "Estimated save "
+            : "Estimated potential "
         return VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
                 Text(tokenSaverProviderTitle(provider))
@@ -3605,7 +3733,7 @@ public struct SidebarRootView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.82)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                Text((vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled ? "Estimated save " : "Estimated potential ") + Self.formatTokenCount(value))
+                Text(prefix + Self.formatTokenCount(value))
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.success)
                     .monospacedDigit()
@@ -3616,29 +3744,35 @@ public struct SidebarRootView: View {
         .accessibilityElement(children: .combine)
     }
 
-    /// Reconciling row for savings not attributed to Claude/Codex/Grok — direct `distill`
-    /// CLI usage (provider "unknown"). Keeps the visible rows summing to the headline.
-    private func tokenSaverOtherSavingsRow(saved: Int, runs: Int) -> some View {
+    /// Unattributed savings (not provider-attributed — CLI / unknown provider).
+    /// Always visible, including when this window is 0.
+    private func tokenSaverOtherSavingsRow(
+        windowSaved: Int,
+        windowRuns: Int,
+        allTimeSaved: Int,
+        allTimeRuns: Int
+    ) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
-                Text("CLI & other")
+                Text("Not provider-attributed")
                     .font(DS.Font.captionStrong)
                     .foregroundColor(DS.Palette.text)
                     .lineLimit(1)
                 Spacer(minLength: 0)
             }
             HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
-                Text(runs == 1 ? "1 direct distill run" : "\(runs) direct distill runs")
+                Text(Self.tokenSaverUnattributedRunsCaption(windowRuns: windowRuns, allTimeRuns: allTimeRuns))
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textSecondary)
-                    .lineLimit(1)
+                    .lineLimit(2)
                     .minimumScaleFactor(0.82)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                Text("Estimated save " + Self.formatTokenCount(saved))
+                Text(Self.tokenSaverUnattributedRowValue(windowSaved: windowSaved, allTimeSaved: allTimeSaved))
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.success)
                     .monospacedDigit()
                     .lineLimit(1)
+                    .minimumScaleFactor(0.8)
             }
         }
         .padding(.vertical, 1)
@@ -3738,7 +3872,9 @@ public struct SidebarRootView: View {
     /// WHY: when the sidecar is blocked the user sees the same reduction estimate
     /// headline as when everything is healthy, giving no signal that compression
     /// has stopped. This seam makes the degraded variant testable and explicit.
-    /// `savedTokens` is the scope credible total (Today/Week), not design-related.
+    /// `savedTokens` is the single primary scope figure (same estimator/cap for paid
+    /// and teaser). `usedTokens` is retained for call-site compatibility; headline
+    /// must not re-derive a separate usage-fraction teaser from it.
     nonisolated public static func tokenSaverCardHeadline(
         subscribed: Bool,
         enabled: Bool,
@@ -3746,6 +3882,7 @@ public struct SidebarRootView: View {
         savedTokens: Int,
         usedTokens: Int
     ) -> String {
+        _ = usedTokens
         if subscribed && enabled {
             if case .blocked = sidecarStatus {
                 return "Token Saver degraded"
@@ -3754,17 +3891,24 @@ public struct SidebarRootView: View {
                 ? "Estimated save \(Self.formatTokenCountPublic(savedTokens)) tokens"
                 : "Measuring local reduction per agent run"
         }
+        // WHY: gate the enable toggle, not history — lapsed/disabled still see the
+        // realized primary figure. Unsubscribed uses the same figure under a
+        // potential label (never a separate compression heuristic).
+        if savedTokens > 0 {
+            if subscribed {
+                return "Estimated save \(Self.formatTokenCountPublic(savedTokens)) tokens"
+            }
+            return "Estimated potential ~\(Self.formatTokenCountPublic(savedTokens)) tokens"
+        }
         if subscribed {
             return "Enable Token Saver"
         }
-        let potential = TokenSaverUsageStore.estimatePotentialSavings(usedTokens: usedTokens)
-        return potential > 0
-            ? "Estimated potential ~\(Self.formatTokenCountPublic(potential)) tokens"
-            : "Estimate ready"
+        return "Estimate ready"
     }
 
+    /// WHY: honest measured-vs-estimated wording instead of undermining the card.
     nonisolated public static let tokenSaverBillingEvidenceDisclaimer =
-        "Local token estimates are diagnostic. They are not billed savings; billing claims require joined provider usage evidence. Experimental lanes remain off or shadow until their gates pass."
+        "Measured savings come from the local compression ledger. Dialect and Graphify legs are estimates under the same cap and are labelled as such — not billed savings. Billing claims require joined provider usage evidence."
 
     // Internal alias exposed for the pure seam above. Mirrors `formatTokenCount`
     // which is private; keeping it nonisolated and public lets tests call it.
@@ -3784,8 +3928,62 @@ public struct SidebarRootView: View {
         formatTokenCountPublic(value)
     }
 
-    /// Legacy absolute goals (2M day / 10M week). Kept for tests that still pin the
-    /// product rule: fixed 2M/day and 10M/week goals for the green Token Saver ring.
+    /// WHY: all-time primary may only headline attributed savings — never the
+    /// permanent aggregate that folds in unattributed/unknown provider bytes.
+    nonisolated public static func tokenSaverAllTimePrimaryTokens(
+        attributedSavedTokens: Int
+    ) -> Int {
+        max(0, attributedSavedTokens)
+    }
+
+    /// Scope-independent caption: attributed lifetime, runs, average per run.
+    nonisolated public static func tokenSaverSinceInstallLine(
+        attributedSavedTokens: Int,
+        attributedRuns: Int
+    ) -> String {
+        let saved = max(0, attributedSavedTokens)
+        let runs = max(0, attributedRuns)
+        let avg = runs > 0 ? Int((Double(saved) / Double(runs)).rounded()) : 0
+        return "Since install · \(formatTokenCountPublic(saved)) attributed · \(runs) runs · avg \(formatTokenCountPublic(avg))/run"
+    }
+
+    /// Unattributed row value: always shows this-window and all-time (including zeros).
+    nonisolated public static func tokenSaverUnattributedRowValue(
+        windowSaved: Int,
+        allTimeSaved: Int
+    ) -> String {
+        "\(formatTokenCountPublic(max(0, windowSaved))) this window · \(formatTokenCountPublic(max(0, allTimeSaved))) all time"
+    }
+
+    nonisolated public static func tokenSaverUnattributedRunsCaption(
+        windowRuns: Int,
+        allTimeRuns: Int
+    ) -> String {
+        let window = max(0, windowRuns)
+        let all = max(0, allTimeRuns)
+        let windowPart = window == 1 ? "1 run this window" : "\(window) runs this window"
+        return "\(windowPart) · \(all) all time · not provider-attributed"
+    }
+
+    /// Pure primary figure for inversion tests: same bare-user estimator as the card.
+    /// Enabled path may include capped dialect/graphify; disabled is measured-only.
+    /// WHY: enabling must never lower the figure for the same measured/used window.
+    nonisolated public static func tokenSaverCardPrimaryFigure(
+        measuredSaved: Int,
+        usedTokens: Int,
+        tokenSaverEnabled: Bool,
+        graphifyActive: Bool = false
+    ) -> Int {
+        tokenSaverBareUserBreakdown(
+            measuredToolOutputSaved: measuredSaved,
+            windowProviderTokens: usedTokens,
+            tokenSaverEnabled: tokenSaverEnabled,
+            graphifyActive: graphifyActive
+        ).totalCredible
+    }
+
+    /// Legacy absolute goals (2M day / 10M week). Retained as a pure constant seam
+    /// for older tests; the green ring no longer uses these fixed denominators.
     nonisolated public static func tokenSaverSavingsGoalTokens(isDailyScope: Bool) -> Int {
         isDailyScope ? 2_000_000 : 10_000_000
     }
@@ -3804,6 +4002,9 @@ public struct SidebarRootView: View {
     /// Share of the measured (saved + used) mix that was locally reduced.
     /// Self-normalizing: a healthy day with small absolute savings still reads as a
     /// meaningful percent instead of 1% of a 2M aspirational goal.
+    ///
+    /// `usedTokens` must be **known billed** units (caller responsibility). Never
+    /// pass raw provider tokens here for a displayed ring fraction.
     nonisolated public static func savingsAvoidanceRatio(
         savedTokens: Int,
         usedTokens: Int
@@ -3813,6 +4014,84 @@ public struct SidebarRootView: View {
         let denom = saved + used
         guard saved > 0, denom > 0 else { return 0 }
         return min(Double(saved) / Double(denom), 1)
+    }
+
+    /// Green savings ring fraction for a scope window.
+    ///
+    /// - Comparable + known billed → `saved / (saved + billed)`.
+    /// - Unknown billed → explicit unavailable (never raw fallback).
+    /// - No comparable usage window (all-time) → explicit unavailable (never 100% from used=0).
+    public enum TokenSaverSavingsRingFraction: Equatable, Sendable {
+        case comparable(progress: Double, mixTokens: Int)
+        case billedUnavailable
+        case noComparableUsageWindow
+
+        public var isComparable: Bool {
+            if case .comparable = self { return true }
+            return false
+        }
+
+        public var progress: Double {
+            if case .comparable(let progress, _) = self { return progress }
+            return 0
+        }
+
+        public var mixTokens: Int? {
+            if case .comparable(_, let mix) = self { return mix }
+            return nil
+        }
+
+        public var unavailableReason: String? {
+            switch self {
+            case .comparable:
+                return nil
+            case .billedUnavailable:
+                return "billed usage unknown"
+            case .noComparableUsageWindow:
+                return "no comparable usage window"
+            }
+        }
+    }
+
+    /// Pure seam: map saved + optional known billed into a ring fraction state.
+    nonisolated public static func tokenSaverSavingsRingFraction(
+        savedTokens: Int,
+        knownBilledUnits: Double?,
+        hasComparableUsageWindow: Bool
+    ) -> TokenSaverSavingsRingFraction {
+        guard hasComparableUsageWindow else {
+            return .noComparableUsageWindow
+        }
+        guard let billed = knownBilledUnits, billed.isFinite, billed >= 0 else {
+            return .billedUnavailable
+        }
+        let saved = max(0, savedTokens)
+        let used = Int(billed.rounded())
+        let progress = savingsAvoidanceRatio(savedTokens: saved, usedTokens: used)
+        return .comparable(progress: progress, mixTokens: max(saved + used, 1))
+    }
+
+    /// All-time reconciliation: managed attributed rows + unattributed must equal
+    /// attributed headline + unattributed (i.e. managed rows sum to the headline).
+    ///
+    /// WHY: production needs per-provider attributed figures from Persistence; this
+    /// pure seam encodes the honesty contract tests can falsify without a DB.
+    nonisolated public static func tokenSaverAllTimeRowsReconcileWithHeadline(
+        managedProviderAttributedSaved: [Int],
+        unattributedSaved: Int,
+        attributedHeadline: Int
+    ) -> Bool {
+        let managed = managedProviderAttributedSaved.reduce(0) { $0 + max(0, $1) }
+        let unattributed = max(0, unattributedSaved)
+        let headline = max(0, attributedHeadline)
+        return managed + unattributed == headline + unattributed
+    }
+
+    /// Pure all-time provider row figure — attributed only (never permanent aggregate).
+    nonisolated public static func tokenSaverAllTimeProviderAttributedSaved(
+        attributedSavedForProvider: Int
+    ) -> Int {
+        max(0, attributedSavedForProvider)
     }
 
     nonisolated public static func tokenSaverDayStartMs(
@@ -4015,11 +4294,17 @@ public struct SidebarRootView: View {
     /// WHY: `TokenSaverActivityRings` was `.accessibilityHidden(true)` so VoiceOver
     /// reported nothing.  This seam produces a non-empty string containing the ring
     /// values so screen readers can convey the same information as the visual rings.
+    ///
+    /// When `savingsRingComparable` is false, the green ring is in an explicit
+    /// unavailable state (unknown billed units or no comparable usage window) —
+    /// never claim a window-mix percent derived from raw tokens or used=0.
     nonisolated public static func ringsAccessibilityLabel(
         scope: String,
         savedTokens: Int,
         savedProgress: Double,
         savedGoalTokens: Int = 10_000_000,
+        savingsRingComparable: Bool = true,
+        savingsRingUnavailableReason: String? = nil,
         claudeUsedProgress: Double,
         codexUsedProgress: Double,
         grokUsedProgress: Double
@@ -4033,10 +4318,23 @@ public struct SidebarRootView: View {
             : savedTokens >= 1_000
                 ? String(format: "%.0fK", Double(savedTokens) / 1_000)
                 : "\(savedTokens)"
-        let goalStr = savedGoalTokens >= 1_000_000
-            ? String(format: "%.0fM", Double(savedGoalTokens) / 1_000_000)
-            : "\(savedGoalTokens)"
-        return "Token Saver rings, \(scope): measured save \(savedStr) local tokens, ~\(savedPct)% of \(goalStr) goal, Claude used \(claudePct)%, Codex used \(codexPct)%, Grok used \(grokPct)%"
+        let savingsPart: String
+        if savingsRingComparable {
+            // WHY: ring is self-normalizing (saved/(saved+known billed)); a11y names
+            // the mix denominator instead of a fixed 2M/10M goal.
+            let mixStr = savedGoalTokens >= 1_000_000
+                ? String(format: "%.0fM", Double(savedGoalTokens) / 1_000_000)
+                : savedGoalTokens >= 1_000
+                    ? String(format: "%.0fK", Double(savedGoalTokens) / 1_000)
+                    : "\(savedGoalTokens)"
+            savingsPart = "measured save \(savedStr) local tokens, ~\(savedPct)% of window mix (\(mixStr))"
+        } else {
+            let reason = (savingsRingUnavailableReason?.isEmpty == false)
+                ? savingsRingUnavailableReason!
+                : "usage window unavailable"
+            savingsPart = "measured save \(savedStr) local tokens, savings share unavailable (\(reason))"
+        }
+        return "Token Saver rings, \(scope): \(savingsPart), Claude used \(claudePct)%, Codex used \(codexPct)%, Grok used \(grokPct)%"
     }
 
     /// WHY: concentric rings must read as "biggest usage outer". Token Saver is
@@ -4068,9 +4366,26 @@ public struct SidebarRootView: View {
     struct TokenSaverActivityRings: View {
         struct Values: Equatable {
             let tokenSaverProgress: Double
+            /// False when billed units are unknown or the scope has no comparable
+            /// usage window — green ring renders dimmed/empty, never a raw ratio.
+            let tokenSaverSavingsRingAvailable: Bool
             let claudeUsedProgress: Double
             let codexUsedProgress: Double
             let grokUsedProgress: Double
+
+            init(
+                tokenSaverProgress: Double,
+                tokenSaverSavingsRingAvailable: Bool = true,
+                claudeUsedProgress: Double,
+                codexUsedProgress: Double,
+                grokUsedProgress: Double
+            ) {
+                self.tokenSaverProgress = tokenSaverProgress
+                self.tokenSaverSavingsRingAvailable = tokenSaverSavingsRingAvailable
+                self.claudeUsedProgress = claudeUsedProgress
+                self.codexUsedProgress = codexUsedProgress
+                self.grokUsedProgress = grokUsedProgress
+            }
 
             /// Managed providers outer → inner after the always-outer Token Saver ring.
             var providersOuterToInner: [AgentProvider] {
@@ -4123,12 +4438,13 @@ public struct SidebarRootView: View {
             let providers = values.providersOuterToInner
             let slots = Self.ringSlots
             return ZStack {
-                // Slot 0: Token Saver always outermost.
+                // Slot 0: Token Saver always outermost (three provider rings inside).
                 TokenSaverActivityRing(
                     progress: values.tokenSaverProgress,
                     color: DS.Palette.success,
                     inset: slots[0].inset * scale,
-                    lineWidth: slots[0].lineWidth * scale
+                    lineWidth: slots[0].lineWidth * scale,
+                    dimmed: !values.tokenSaverSavingsRingAvailable
                 )
                 ForEach(Array(providers.enumerated()), id: \.element) { index, provider in
                     let slot = slots[min(index + 1, slots.count - 1)]
@@ -4156,19 +4472,23 @@ public struct SidebarRootView: View {
         let color: Color
         let inset: CGFloat
         let lineWidth: CGFloat
+        var dimmed: Bool = false
 
         var body: some View {
             ZStack {
                 TokenSaverActivityRingShape(progress: 1)
                     .stroke(
-                        color.opacity(0.18),
+                        color.opacity(dimmed ? 0.08 : 0.18),
                         style: StrokeStyle(lineWidth: lineWidth, lineCap: .round, lineJoin: .round)
                     )
-                TokenSaverActivityRingShape(progress: progress)
-                    .stroke(
-                        color,
-                        style: StrokeStyle(lineWidth: lineWidth, lineCap: .round, lineJoin: .round)
-                    )
+                // Unavailable/dimmed: track only — never paint a raw-derived fill.
+                if !dimmed {
+                    TokenSaverActivityRingShape(progress: progress)
+                        .stroke(
+                            color,
+                            style: StrokeStyle(lineWidth: lineWidth, lineCap: .round, lineJoin: .round)
+                        )
+                }
             }
             .padding(inset)
         }

@@ -456,8 +456,25 @@ public struct DistillSavingsRecord: Sendable, Equatable {
     /// The engine that produced this saving (deterministic / BERT / MLX), raw. `mode`
     /// already folds it in for display; kept here for telemetry/tests.
     public let routeStage: TokenSaverRouteStage?
+    /// Whether this saving is bound to provider-prompt bytes (`prompt_bound`),
+    /// explicitly not (`not_prompt_bound`), or unclassed (`unknown`).
+    public let attributability: String
+    /// True when the compressed bytes actually replaced the original on the
+    /// response path. Verbatim / fail-open (output == input, or routeStage
+    /// `.verbatim`) is false so the ledger does not credit discarded compression.
+    public let delivered: Bool
 
-    public init(provider: String, mode: String, inputTokens: Int, outputTokens: Int, savedTokens: Int, cacheState: String = "unknown", routeStage: TokenSaverRouteStage? = nil) {
+    public init(
+        provider: String,
+        mode: String,
+        inputTokens: Int,
+        outputTokens: Int,
+        savedTokens: Int,
+        cacheState: String = "unknown",
+        routeStage: TokenSaverRouteStage? = nil,
+        attributability: String = "unknown",
+        delivered: Bool = true
+    ) {
         self.provider = provider
         self.mode = mode
         self.inputTokens = max(0, inputTokens)
@@ -465,6 +482,8 @@ public struct DistillSavingsRecord: Sendable, Equatable {
         self.savedTokens = max(0, savedTokens)
         self.cacheState = cacheState
         self.routeStage = routeStage
+        self.attributability = attributability
+        self.delivered = delivered
     }
 }
 
@@ -475,6 +494,9 @@ public enum DistillSavingsCalculator {
         let provider = request.provider?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nilIfEmpty ?? defaultProvider
+        // Verbatim fail-open: compressed bytes never replaced the original.
+        let delivered = response.routeStage != .verbatim
+            && response.output != request.input
 
         switch request.mode {
         case .commandOutput:
@@ -489,7 +511,9 @@ public enum DistillSavingsCalculator {
                 outputTokens: response.outputTokens,
                 savedTokens: response.savedTokens,
                 cacheState: request.cacheState ?? "tool_output_oneshot",
-                routeStage: response.routeStage
+                routeStage: response.routeStage,
+                attributability: "not_prompt_bound",
+                delivered: delivered
             )
         case .sr1Humanize:
             // The agent emitted the compressed SR1 response instead of the full
@@ -503,17 +527,23 @@ public enum DistillSavingsCalculator {
                 inputTokens: estimate.inputTokens,
                 outputTokens: estimate.outputTokens,
                 savedTokens: estimate.savedTokens,
-                cacheState: "sr1_humanize"
+                cacheState: "sr1_humanize",
+                attributability: "not_prompt_bound",
+                delivered: delivered
             )
         case .longText, .watchSummary:
+            let cacheState = request.cacheState ?? (request.mode == .longText ? "prompt" : "watch")
+            let attributability = request.mode == .longText ? "prompt_bound" : "not_prompt_bound"
             return DistillSavingsRecord(
                 provider: provider,
                 mode: TokenSaverEngineLabel.mode(base: request.mode.rawValue, stage: response.routeStage),
                 inputTokens: response.inputTokens,
                 outputTokens: response.outputTokens,
                 savedTokens: response.savedTokens,
-                cacheState: request.cacheState ?? (request.mode == .longText ? "prompt" : "watch"),
-                routeStage: response.routeStage
+                cacheState: cacheState,
+                routeStage: response.routeStage,
+                attributability: attributability,
+                delivered: delivered
             )
         }
     }

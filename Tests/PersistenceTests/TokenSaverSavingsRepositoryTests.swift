@@ -267,4 +267,163 @@ final class TokenSaverSavingsRepositoryTests: XCTestCase {
                        "Claude + Codex + 'CLI & other' must equal the headline 'Saved N'")
         XCTAssertEqual(s.runs(forProvidersOtherThan: ["claude", "codex"]), 9)
     }
+
+    /// Honesty axes persist on the event row so later readers can attribute savings
+    /// without re-deriving from mode/provider alone.
+    func test_recordPersistsHonestyAxesAndEngineContentType() throws {
+        let db = try makeDB()
+        let repo = TokenSaverSavingsRepository(db: db)
+        let now = Date(timeIntervalSince1970: 1_000_000_000)
+
+        _ = try repo.record(
+            provider: "claude",
+            mode: "longText",
+            inputTokens: 500,
+            outputTokens: 100,
+            savedTokens: 400,
+            cacheState: "prompt",
+            contentType: "prose",
+            engine: "encoder_bert",
+            attributability: "prompt_bound",
+            delivered: true,
+            governance: #"{"lane":"longText"}"#,
+            at: now
+        )
+
+        let stmt = try db.prepare("""
+            SELECT content_type, engine, attributability, delivered, governance_json, cache_state
+            FROM token_saver_savings;
+            """)
+        defer { stmt.reset() }
+        XCTAssertTrue(try stmt.step())
+        XCTAssertEqual(stmt.columnText(0), "prose")
+        XCTAssertEqual(stmt.columnText(1), "encoder_bert")
+        XCTAssertEqual(stmt.columnText(2), "prompt_bound")
+        XCTAssertEqual(stmt.columnInt64(3), 1)
+        XCTAssertEqual(stmt.columnText(4), #"{"lane":"longText"}"#)
+        XCTAssertEqual(stmt.columnText(5), "prompt")
+
+        let summary = try repo.summary(now: now)
+        XCTAssertEqual(summary.attributedSavedTokens, 400)
+        XCTAssertEqual(summary.attributedRuns, 1)
+        XCTAssertEqual(summary.unattributedSavedTokens, 0)
+        XCTAssertEqual(summary.unattributedRuns, 0)
+    }
+
+    /// HISTORICAL-ROW RULE: pre-migration rows keep column defaults
+    /// (delivered=0, attributability='unknown'). A real-provider row must still
+    /// count toward the attributed display total so all-time cannot regress to zero.
+    func test_historicalRowRuleKeepsPreMigrationProviderAttributedRowCounted() throws {
+        let db = try makeDB()
+        let repo = TokenSaverSavingsRepository(db: db)
+        let now = Date(timeIntervalSince1970: 1_000_000_000)
+        let iso = ISO8601DateFormatter().string(from: now)
+        let ms = Int64(now.timeIntervalSince1970 * 1000)
+
+        // Simulate a pre-migration write: only the original columns, so honesty
+        // axes take their NOT NULL DEFAULT values (unknown / 0 / '{}').
+        try db.performSync { database in
+            let insert = try database.prepare("""
+                INSERT INTO token_saver_savings
+                    (provider, mode, input_tokens, output_tokens, saved_tokens, created_at, created_at_ms, cache_state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                """)
+            defer { insert.reset() }
+            try insert.bind(1, "claude")
+            try insert.bind(2, "longText")
+            try insert.bind(3, 1000)
+            try insert.bind(4, 200)
+            try insert.bind(5, 800)
+            try insert.bind(6, iso)
+            try insert.bind(7, ms)
+            try insert.bind(8, "unknown")
+            _ = try insert.step()
+
+            let total = try database.prepare("""
+                INSERT INTO token_saver_savings_totals
+                    (provider, mode, input_tokens, output_tokens, saved_tokens, runs, updated_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?);
+                """)
+            defer { total.reset() }
+            try total.bind(1, "claude")
+            try total.bind(2, "longText")
+            try total.bind(3, 1000)
+            try total.bind(4, 200)
+            try total.bind(5, 800)
+            try total.bind(6, iso)
+            _ = try total.step()
+        }
+
+        // Defaults landed as expected for an unclassed historical row.
+        let check = try db.prepare("""
+            SELECT attributability, delivered, governance_json
+            FROM token_saver_savings_totals WHERE provider = 'claude';
+            """)
+        defer { check.reset() }
+        XCTAssertTrue(try check.step())
+        XCTAssertEqual(check.columnText(0), "unknown")
+        XCTAssertEqual(check.columnInt64(1), 0)
+        XCTAssertEqual(check.columnText(2), "{}")
+
+        let summary = try repo.summary(now: now)
+        XCTAssertEqual(summary.totalSavedTokens, 800, "existing total semantics still sum the permanent accumulator")
+        XCTAssertEqual(
+            summary.attributedSavedTokens, 800,
+            "WHY: historical delivered=0 + attributability=unknown + real provider must still count as attributed"
+        )
+        XCTAssertEqual(summary.attributedRuns, 1)
+        XCTAssertEqual(summary.unattributedSavedTokens, 0)
+    }
+
+    /// A measured-but-discarded compression (delivered=0 with a known class) must
+    /// not inflate the honesty display totals even if the event row is stored.
+    func test_deliveredZeroExcludedFromDisplayedHonestyTotals() throws {
+        let db = try makeDB()
+        let repo = TokenSaverSavingsRepository(db: db)
+        let now = Date(timeIntervalSince1970: 1_000_000_000)
+
+        // Delivered compression — counts. Distinct (provider, mode) keys so the
+        // permanent accumulator does not merge delivered/non-delivered classes.
+        _ = try repo.record(
+            provider: "codex",
+            mode: "command-output",
+            inputTokens: 300,
+            outputTokens: 100,
+            savedTokens: 200,
+            attributability: "not_prompt_bound",
+            delivered: true,
+            at: now
+        )
+        // Verbatim fail-open — stored, but excluded from displayed honesty totals.
+        _ = try repo.record(
+            provider: "codex",
+            mode: "command-output-failopen",
+            inputTokens: 500,
+            outputTokens: 500,
+            savedTokens: 0,
+            attributability: "not_prompt_bound",
+            delivered: false,
+            at: now
+        )
+        // Discarded compression with non-zero computed savings still excluded.
+        _ = try repo.record(
+            provider: "unknown",
+            mode: "command-output-discarded",
+            inputTokens: 1000,
+            outputTokens: 100,
+            savedTokens: 900,
+            attributability: "not_prompt_bound",
+            delivered: false,
+            at: now
+        )
+
+        let summary = try repo.summary(now: now)
+        XCTAssertEqual(summary.attributedSavedTokens, 200)
+        XCTAssertEqual(summary.attributedRuns, 1)
+        XCTAssertEqual(summary.unattributedSavedTokens, 0, "delivered=0 rows must not appear in unattributed either")
+        XCTAssertEqual(summary.unattributedRuns, 0)
+        // Permanent accumulator still records every write (existing field semantics).
+        XCTAssertEqual(summary.totalSavedTokens, 1100)
+        XCTAssertEqual(summary.totalRuns, 3)
+    }
 }

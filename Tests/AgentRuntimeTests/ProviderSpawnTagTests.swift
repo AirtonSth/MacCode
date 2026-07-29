@@ -41,7 +41,7 @@ final class ProviderSpawnTagTests: ProviderProcessTestCase {
         let specs: [(AgentProvider, String, [String])] = [
             (.codex, codex, ["app-server"]),
             (.claude, node, [bridge]),
-            (.grok, grok, ["agent", "stdio"]),
+            (.grok, grok, GrokACPClient.launchArguments),
         ]
         let processes = try specs.map { provider, executable, arguments -> (AgentProvider, Process, Pipe, Pipe, Pipe) in
             let process = Process()
