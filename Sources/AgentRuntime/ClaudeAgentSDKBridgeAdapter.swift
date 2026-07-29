@@ -842,14 +842,22 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             )
         }
         let node = try resolvedNodeForLaunch()
-        let process = Process()
         let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: node)
-        process.arguments = [bridgeScriptPath] + request.extraArgs
-        process.currentDirectoryURL = URL(fileURLWithPath: request.cwd)
-        process.environment = CodexRunner.processEnvironment(overrides: request.environment, purpose: .agentTurn(.claude))
+        let isForeignUser = request.runAsUser.map { $0.uid != getuid() } == true
+        let askpass = isForeignUser
+            ? RunAsUserProcessBootstrap.materializeAskpass(targetUser: request.runAsUser!.shortName)
+            : nil
+        let process = try ProviderSubprocessLauncher.makeProcess(
+            provider: .claude,
+            executablePath: node,
+            arguments: [bridgeScriptPath] + request.extraArgs,
+            currentDirectory: request.cwd,
+            environment: request.environment,
+            runAsUser: request.runAsUser,
+            askpassPath: askpass
+        )
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe

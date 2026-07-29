@@ -377,7 +377,7 @@ public final class GrokACPClient: @unchecked Sendable {
 
     private struct Pending { let resume: @Sendable (Result<Any?, Error>) -> Void }
 
-    private let process = Process()
+    private let process: Process
     private let stdinPipe = Pipe()
     private let stdoutPipe = Pipe()
     private let stderrPipe = Pipe()
@@ -419,10 +419,17 @@ public final class GrokACPClient: @unchecked Sendable {
         self.serverRequestHandler = serverRequestHandler
         self.tokenSaverCensusAllowed = tokenSaverCensusAllowed
         parseQueue.setSpecific(key: parseQueueKey, value: 1)
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = Self.launchArguments
-        process.currentDirectoryURL = URL(fileURLWithPath: cwd)
-        process.environment = CodexRunner.processEnvironment(overrides: environment, purpose: .agentTurn(.grok))
+        do {
+            self.process = try ProviderSubprocessLauncher.makeProcess(
+                provider: .grok,
+                executablePath: path,
+                arguments: Self.launchArguments,
+                currentDirectory: cwd,
+                environment: environment
+            )
+        } catch {
+            throw GrokACPError.spawnFailed(error.localizedDescription)
+        }
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe

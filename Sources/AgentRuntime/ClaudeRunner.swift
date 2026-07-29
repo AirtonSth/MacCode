@@ -155,14 +155,14 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         }
 
         let args = Self.buildArgs(request)
-        let environment = CodexRunner.processEnvironment(overrides: request.environment, purpose: .agentTurn(.claude))
-        let launchPlan: RunAsUserProcessBootstrap.LaunchPlan
+        let proc: Process
         do {
-            launchPlan = try RunAsUserProcessBootstrap.plan(
+            proc = try ProviderSubprocessLauncher.makeProcess(
+                provider: .claude,
                 executablePath: path,
                 arguments: args,
-                environment: environment,
                 currentDirectory: request.cwd,
+                environment: request.environment,
                 runAsUser: request.runAsUser
             )
         } catch {
@@ -171,8 +171,6 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             throw AgentRunError.spawnFailed(error.localizedDescription)
         }
 
-        let proc = Process()
-        RunAsUserProcessBootstrap.apply(launchPlan, to: proc)
         let stdoutPipe = Pipe(), stderrPipe = Pipe()
         proc.standardOutput = stdoutPipe
         proc.standardError = stderrPipe

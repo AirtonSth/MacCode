@@ -213,7 +213,6 @@ public final class CodexAppServerClient: @unchecked Sendable {
             throw CodexAppServerError.missingBinary(resolvedBinary)
         }
 
-        self.process = Process()
         self.stdinPipe = Pipe()
         self.stdoutPipe = Pipe()
         self.stderrPipe = Pipe()
@@ -234,10 +233,17 @@ public final class CodexAppServerClient: @unchecked Sendable {
             self.forkProtocolSupport = .unsupported
         }
 
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = arguments
-        process.currentDirectoryURL = URL(fileURLWithPath: cwd)
-        process.environment = CodexRunner.processEnvironment(overrides: environment, purpose: .agentTurn(.codex))
+        do {
+            self.process = try ProviderSubprocessLauncher.makeProcess(
+                provider: .codex,
+                executablePath: path,
+                arguments: arguments,
+                currentDirectory: cwd,
+                environment: environment
+            )
+        } catch {
+            throw CodexAppServerError.spawnFailed(error.localizedDescription)
+        }
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe

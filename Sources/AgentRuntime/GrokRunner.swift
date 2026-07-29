@@ -153,14 +153,14 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
             ? request.providerThreadId
             : UUID().uuidString.lowercased()
         let args = Self.buildArgs(request, newSessionId: request.providerThreadId == nil ? preassignedSessionId : nil)
-        let environment = CodexRunner.processEnvironment(overrides: request.environment, purpose: .agentTurn(.grok))
-        let launchPlan: RunAsUserProcessBootstrap.LaunchPlan
+        let proc: Process
         do {
-            launchPlan = try RunAsUserProcessBootstrap.plan(
+            proc = try ProviderSubprocessLauncher.makeProcess(
+                provider: .grok,
                 executablePath: path,
                 arguments: args,
-                environment: environment,
                 currentDirectory: request.cwd,
+                environment: request.environment,
                 runAsUser: request.runAsUser
             )
         } catch {
@@ -169,8 +169,6 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
             throw AgentRunError.spawnFailed(error.localizedDescription)
         }
 
-        let proc = Process()
-        RunAsUserProcessBootstrap.apply(launchPlan, to: proc)
         let stdoutPipe = Pipe(), stderrPipe = Pipe()
         proc.standardOutput = stdoutPipe
         proc.standardError = stderrPipe

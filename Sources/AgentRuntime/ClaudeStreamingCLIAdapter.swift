@@ -473,7 +473,6 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             throw ClaudeCLIUnavailableError(message: ClaudeRunner.missingBinaryMessage(binary))
         }
 
-        let process = Process()
         let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -493,15 +492,15 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         let askpass = isForeignUser
             ? RunAsUserProcessBootstrap.materializeAskpass(targetUser: request.runAsUser!.shortName)
             : nil
-        let launchPlan = try RunAsUserProcessBootstrap.plan(
+        let process = try ProviderSubprocessLauncher.makeProcess(
+            provider: .claude,
             executablePath: path,
             arguments: ClaudeRunner.buildStreamingArgs(request),
-            environment: baseEnv,
             currentDirectory: request.cwd,
+            environment: request.environment,
             runAsUser: request.runAsUser,
             askpassPath: askpass
         )
-        RunAsUserProcessBootstrap.apply(launchPlan, to: process)
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
@@ -541,7 +540,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             // A run-as-user launch spawns a root `sudo` child whose kernel
             // metadata this non-root app cannot read; tag it owner-anchored so
             // the spawn is not rejected by an unreadable child identity.
-            try ProcessSpawnTagger.tagProcess(process, provider: .claude, foreignUserLaunch: launchPlan.usesHelper)
+            try ProcessSpawnTagger.tagProcess(process, provider: .claude, foreignUserLaunch: foreignUserUID != nil)
         } catch {
             throw AgentRunError.spawnFailed(error.localizedDescription)
         }
