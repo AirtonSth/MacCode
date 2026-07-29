@@ -457,10 +457,14 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             let (ctx, router) = try makeRouter(dir)
             let ws = try router.createWorkspace(name: "RESTORE", cwd: NSTemporaryDirectory())
             workspaceId = ws.id
+            // createWorkspace already adds the default Agent App tab. Bind on
+            // that surface — an extra createSurface would persist a second tab
+            // and make restore restore two (not a production duplicate bug).
             let t = try router.createAgentThread(workspace: ws.id, title: "bound", provider: .codex, model: "fake-model", permissionMode: .supervised, reasoningEffort: .medium)
             threadId = t.id
-            let desc = try router.createSurface(workspace: ws.id, type: .agentApp, paneID: nil, title: "Agent App")
-            let surface = try XCTUnwrap(SurfaceRegistry.shared.surface(desc.id) as? AgentAppSurface)
+            let defaults = agentSurfaces(in: ws.id)
+            XCTAssertEqual(defaults.count, 1, "new workspaces open with exactly one default Agent App tab")
+            let surface = try XCTUnwrap(defaults.first)
             surface.viewModel.selectThread(t.id) // binds + persists via onSelectedThreadChanged
             ctx.saveSnapshot()
             closeAndUnregisterAgentSurfaces(workspace: ws.id)
@@ -472,7 +476,7 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         router2.reinstantiateRestoredSurfaces()
 
         let restored = agentSurfaces(in: workspaceId)
-        XCTAssertEqual(restored.count, 1, "the agent tab restores")
+        XCTAssertEqual(restored.count, 1, "the default agent tab restores (no phantom duplicate)")
         XCTAssertEqual(restored.first?.viewModel.selectedThreadId, threadId,
             "each agent tab must reopen its OWN bound thread after restart, not threads.first.")
     }

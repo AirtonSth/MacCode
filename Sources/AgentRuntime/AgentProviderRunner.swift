@@ -556,6 +556,30 @@ public final class OneShotProviderAdapter: AgentProviderAdapter, @unchecked Send
         handles.removeValue(forKey: threadId)
         lock.unlock()
     }
+
+    /// Align the resident session after a coordinator-synthesized terminal.
+    ///
+    /// Stop claims cancellation through `AgentRunCoordinator.handle` without
+    /// re-entering this adapter's event callback, so `record(.finished)` never
+    /// runs. Without this, `status` stays `.running` and the next `startRun` is
+    /// rejected as an in-flight turn even after durable terminal commit.
+    func noteCoordinatorTerminal(
+        threadId: AgentThreadID,
+        status: AgentRunStatus,
+        providerThreadId: String?
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let existing = sessions[threadId] else { return }
+        guard existing.status == .running || existing.status == .pending else { return }
+        sessions[threadId] = AgentProviderSessionSummary(
+            threadId: existing.threadId,
+            provider: existing.provider,
+            status: status,
+            providerThreadId: providerThreadId ?? existing.providerThreadId
+        )
+        handles.removeValue(forKey: threadId)
+    }
 }
 
 public final class AgentRunHandle: @unchecked Sendable {

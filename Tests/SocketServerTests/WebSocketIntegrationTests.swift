@@ -11,6 +11,44 @@ import CoreModel
 @MainActor
 final class WebSocketIntegrationTests: XCTestCase {
 
+    func testResumeCursorRequiresMatchingHostAndBootEpoch() {
+        XCTAssertEqual(
+            DirectHTTPServer.acceptedResumeSequence(
+                requestedSinceSequence: 12,
+                requestedResumeHost: "host-a",
+                requestedResumeBootEpoch: 7,
+                serverId: "host-a",
+                bootEpoch: 7,
+                currentSequence: 20
+            ),
+            12
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.acceptedResumeSequence(
+                requestedSinceSequence: 12,
+                requestedResumeHost: "host-a",
+                requestedResumeBootEpoch: 6,
+                serverId: "host-a",
+                bootEpoch: 7,
+                currentSequence: 20
+            ),
+            0,
+            "a Mac restart must force a fresh baseline instead of replaying a prior epoch"
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.acceptedResumeSequence(
+                requestedSinceSequence: 12,
+                requestedResumeHost: nil,
+                requestedResumeBootEpoch: nil,
+                serverId: "host-a",
+                bootEpoch: 7,
+                currentSequence: 20
+            ),
+            12,
+            "legacy clients without the optional envelope retain the since-seq contract"
+        )
+    }
+
     private func startServer(
         clientReceiveTimeoutSeconds: Int = 20,
         webSocketOutboundMaxQueuedBytes: Int = DirectHTTPServer.maxWebSocketOutboundQueuedBytes,
@@ -122,10 +160,8 @@ final class WebSocketIntegrationTests: XCTestCase {
         XCTAssertNotEqual((obj["snapshotTimeoutMs"] as? NSNumber)?.int64Value,
                           (obj["heartbeatTimeoutMs"] as? NSNumber)?.int64Value,
                           "C-03: snapshotTimeoutMs must not equal heartbeatTimeoutMs")
-        XCTAssertEqual(obj["capabilities"] as? [String], [
-            "events.replay", "jsonrpc.batch", "snapshot.v3",
-            "rpc.websocket", "snapshot.incremental",
-        ])
+        XCTAssertEqual(obj["capabilities"] as? [String], DirectHTTPServer.welcomeCapabilities(),
+                       "the integration contract must track the server's negotiated capability set")
     }
 
     func test_C06_cellularFilterNegotiatesExtendedHeartbeatBudget() async throws {
@@ -201,6 +237,132 @@ final class WebSocketIntegrationTests: XCTestCase {
             60_000,
             "above maximum clamps down to 60s"
         )
+    }
+
+    // MARK: - X-RC2-WS-Coalesce-Window-Ms (real HTTP → batcher config)
+
+    /// Boundary under test: WS upgrade headers on a live loopback
+    /// `DirectHTTPServer` → negotiation → value passed as
+    /// `WebSocketEventBatcher.delay` (observed via the test seam at construction).
+    /// Does **not** time-measure frame flush latency (flaky); proves configuration.
+    private func connectAndCaptureCoalescingWindowMs(
+        server: DirectHTTPServer,
+        port: UInt16,
+        extraHeaders: [String: String] = [:]
+    ) async throws -> Int {
+        let captured = LockedOptionalInt()
+        let expectation = expectation(description: "coalescing window observed")
+        server.webSocketCoalescingWindowObserverForTests = { ms in
+            captured.value = ms
+            expectation.fulfill()
+        }
+        defer { server.webSocketCoalescingWindowObserverForTests = nil }
+
+        var req = URLRequest(url: URL(string: "ws://127.0.0.1:\(port)/v1/ws")!)
+        req.setValue("\(EventBus.shared.currentSeq)", forHTTPHeaderField: "x-rc2-since-seq")
+        for (key, value) in extraHeaders {
+            req.setValue(value, forHTTPHeaderField: key)
+        }
+        let task = URLSession.shared.webSocketTask(with: req)
+        task.resume()
+        defer { task.cancel(with: .normalClosure, reason: nil) }
+
+        // Ensure the upgrade completed (welcome) so the observer path ran.
+        let welcome = try object(from: await receiveWithTimeout(task))
+        XCTAssertEqual(welcome["type"] as? String, "welcome",
+                       "coalesce-window tests require a successful WS upgrade")
+
+        await fulfillment(of: [expectation], timeout: 2.0)
+        return try XCTUnwrap(captured.value, "batcher config observer must fire on real upgrade path")
+    }
+
+    func test_coalesceWindow_validProposal_reachesBatcherConfig() async throws {
+        // WHY: measured clients must be able to propose a bounded window and have
+        // the real event path configure WebSocketEventBatcher with that value —
+        // not only the pure negotiate helper.
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        let ms = try await connectAndCaptureCoalescingWindowMs(
+            server: server,
+            port: port,
+            extraHeaders: ["X-RC2-WS-Coalesce-Window-Ms": "50"]
+        )
+        XCTAssertEqual(ms, 50,
+                       "valid in-range proposal must be the delay ms configured on the batcher")
+    }
+
+    func test_coalesceWindow_legacyMissingHeader_preservesWiFiDefault() async throws {
+        // WHY: pre-header clients must keep the 15 ms Wi-Fi latency budget.
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        let ms = try await connectAndCaptureCoalescingWindowMs(server: server, port: port)
+        XCTAssertEqual(ms, DirectHTTPServer.wsCoalescingWindowWiFiMs,
+                       "missing header must keep legacy Wi-Fi default (backward compatible)")
+    }
+
+    func test_coalesceWindow_legacyMissingHeader_cellularFilter_preservesCellularDefault() async throws {
+        // WHY: cellular-safe defaults must remain 100 ms when the header is absent.
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        let ms = try await connectAndCaptureCoalescingWindowMs(
+            server: server,
+            port: port,
+            extraHeaders: ["X-RC2-WS-Filter": "cellular-safe"]
+        )
+        XCTAssertEqual(ms, DirectHTTPServer.wsCoalescingWindowCellularMs,
+                       "cellular-safe without proposal must keep the 100 ms legacy default")
+    }
+
+    func test_coalesceWindow_malformedHeader_failsClosedToDefault() async throws {
+        // WHY: garbage / non-numeric proposals must not change latency behavior.
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        let garbage = try await connectAndCaptureCoalescingWindowMs(
+            server: server,
+            port: port,
+            extraHeaders: ["X-RC2-WS-Coalesce-Window-Ms": "not-a-number"]
+        )
+        XCTAssertEqual(garbage, DirectHTTPServer.wsCoalescingWindowWiFiMs,
+                       "malformed header must fail closed to the filter default")
+
+        let zero = try await connectAndCaptureCoalescingWindowMs(
+            server: server,
+            port: port,
+            extraHeaders: ["X-RC2-WS-Coalesce-Window-Ms": "0"]
+        )
+        XCTAssertEqual(zero, DirectHTTPServer.wsCoalescingWindowWiFiMs,
+                       "non-positive proposal must fail closed to the filter default")
+    }
+
+    func test_coalesceWindow_outOfRange_clampsAtBounds() async throws {
+        // WHY: unbounded proposals must not create unbounded UI delay; host clamps.
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        let below = try await connectAndCaptureCoalescingWindowMs(
+            server: server,
+            port: port,
+            extraHeaders: ["X-RC2-WS-Coalesce-Window-Ms": "1"]
+        )
+        XCTAssertEqual(below, DirectHTTPServer.wsCoalescingWindowMinMs,
+                       "below-min proposal must clamp up before batcher config")
+
+        let above = try await connectAndCaptureCoalescingWindowMs(
+            server: server,
+            port: port,
+            extraHeaders: ["X-RC2-WS-Coalesce-Window-Ms": "999999"]
+        )
+        XCTAssertEqual(above, DirectHTTPServer.wsCoalescingWindowMaxMs,
+                       "above-max proposal must clamp down before batcher config")
     }
 
     func testWebSocketSendsImmediateFrameBeforeReceiveTimeout() async throws {
@@ -777,5 +939,15 @@ final class WebSocketIntegrationTests: XCTestCase {
             }
         }
         XCTFail("did not receive the post-connect event within the frame budget")
+    }
+}
+
+/// Thread-safe optional Int capture for WS upgrade test observers.
+private final class LockedOptionalInt: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value: Int?
+    var value: Int? {
+        get { lock.lock(); defer { lock.unlock() }; return _value }
+        set { lock.lock(); defer { lock.unlock() }; _value = newValue }
     }
 }

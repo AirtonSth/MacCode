@@ -64,6 +64,39 @@ final class HTTPServerTests: XCTestCase {
         super.tearDown()
     }
 
+    // MARK: - urlHostLiteral / endpointURLString (IPv6 zone-id URL hosts)
+
+    func test_urlHostLiteral_encodes_bracketed_ipv6_zone_id() {
+        // WHY: Link-local peers arrive already-bracketed from some callers;
+        // bare `%en0` is illegal in a URL host and must become `%25en0`.
+        XCTAssertEqual(urlHostLiteral("[fe80::1%en0]"), "[fe80::1%25en0]")
+        XCTAssertEqual(
+            endpointURLString(scheme: "http", host: "[fe80::1%en0]", port: 18217),
+            "http://[fe80::1%25en0]:18217/"
+        )
+    }
+
+    func test_urlHostLiteral_does_not_double_encode_percent25_zone() {
+        // WHY: Re-encoding `%25` → `%2525` breaks already-correct URL hosts and
+        // would make dual-stack / AWDL discovery strings unroutable.
+        XCTAssertEqual(urlHostLiteral("[fe80::1%25en0]"), "[fe80::1%25en0]")
+        XCTAssertEqual(urlHostLiteral("fe80::1%25en0"), "[fe80::1%25en0]")
+    }
+
+    func test_urlHostLiteral_preserves_global_and_plain_bracketed_ipv6() {
+        // WHY: Global unicast and already-correct bracketed hosts must pass
+        // through without invented zone IDs or extra percent sequences.
+        XCTAssertEqual(urlHostLiteral("[2001:db8::1]"), "[2001:db8::1]")
+        XCTAssertEqual(urlHostLiteral("2001:db8::1"), "[2001:db8::1]")
+        XCTAssertEqual(urlHostLiteral("fe80::1%en0"), "[fe80::1%25en0]")
+        XCTAssertEqual(urlHostLiteral("127.0.0.1"), "127.0.0.1")
+        XCTAssertEqual(urlHostLiteral("localhost"), "localhost")
+        XCTAssertEqual(
+            endpointURLString(scheme: "ws", host: "2001:db8::1", port: 443, path: "/v1/ws"),
+            "ws://[2001:db8::1]:443/v1/ws"
+        )
+    }
+
     @MainActor
     func test_health_and_discovery_loopback() throws {
         let port = UInt16.random(in: 33000...44000)
@@ -86,9 +119,73 @@ final class HTTPServerTests: XCTestCase {
             let obj = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
             XCTAssertEqual(obj?["app"] as? String, "remotecode")
             XCTAssertEqual(obj?["relay"] as? Bool, false)
+            // boot_epoch is the process generation iOS compares before bearer catch-up RPC.
+            XCTAssertEqual(obj?["boot_epoch"] as? Int, 1,
+                           "GET /v1/discovery must advertise server bootEpoch")
             disco.fulfill()
         }.resume()
         wait(for: [healthEx, disco], timeout: 4)
+    }
+
+    /// Loopback dual-stack proof: when AF_INET6 `::1` binds, HTTP must answer on
+    /// `[::1]` without breaking the existing IPv4 `127.0.0.1` path.
+    ///
+    /// Scope: local loopback bind + discovery/health only. Does **not** claim
+    /// link-local, AWDL, physical IPv6-only, VPN, or 3G coverage.
+    @MainActor
+    func test_dualStack_loopback_ipv6_health_when_bound() throws {
+        let port = UInt16.random(in: 33000...44000)
+        let dispatcher = JSONRPCDispatcher(router: FakeRouter())
+        let s = DirectHTTPServer(port: port, loopbackOnly: true, dispatcher: dispatcher, bootEpoch: 1)
+        try s.start()
+        defer { s.stop() }
+        Thread.sleep(forTimeInterval: 0.05)
+
+        // Distinguish environment unavailability from a successful IPv6 request:
+        // skip is not a green pass of dual-stack traffic.
+        guard s.isIPv6ListenerBound else {
+            throw XCTSkip(
+                "IPv6 loopback listener not bound (AF_INET6 socket/bind/listen failed); " +
+                "dual-stack path inactive in this environment — IPv4-only is expected and not a test failure"
+            )
+        }
+
+        // IPv4 path must remain live on the same dual-stack listener setup.
+        let ipv4Ex = expectation(description: "ipv4 health still works")
+        URLSession.shared.dataTask(with: URL(string: "http://127.0.0.1:\(port)/v1/health")!) { data, resp, err in
+            XCTAssertNil(err, "IPv4 loopback /v1/health must still succeed under dual-stack")
+            XCTAssertEqual((resp as? HTTPURLResponse)?.statusCode, 200)
+            let body = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
+            XCTAssertEqual(body?["status"] as? String, "ok")
+            ipv4Ex.fulfill()
+        }.resume()
+
+        // Real URLSession request to IPv6 loopback (not a synthetic flag check).
+        let ipv6URL = URL(string: "http://[::1]:\(port)/v1/health")!
+        let ipv6Ex = expectation(description: "ipv6 ::1 health")
+        URLSession.shared.dataTask(with: ipv6URL) { data, resp, err in
+            XCTAssertNil(err, "GET http://[::1]:\(port)/v1/health must succeed when isIPv6ListenerBound")
+            XCTAssertEqual((resp as? HTTPURLResponse)?.statusCode, 200,
+                           "IPv6 loopback must return HTTP 200 for /v1/health")
+            let body = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
+            XCTAssertEqual(body?["status"] as? String, "ok",
+                           "IPv6 /v1/health body must report status ok")
+            // Narrow discovery check on the same stack: host_v6 advertises loopback.
+            ipv6Ex.fulfill()
+        }.resume()
+
+        let discoEx = expectation(description: "ipv6 discovery")
+        URLSession.shared.dataTask(with: URL(string: "http://[::1]:\(port)/v1/discovery")!) { data, resp, err in
+            XCTAssertNil(err)
+            XCTAssertEqual((resp as? HTTPURLResponse)?.statusCode, 200)
+            let obj = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
+            XCTAssertEqual(obj?["app"] as? String, "remotecode")
+            XCTAssertEqual(obj?["host_v6"] as? String, "::1",
+                           "loopback-only discovery must advertise host_v6 as ::1")
+            discoEx.fulfill()
+        }.resume()
+
+        wait(for: [ipv4Ex, ipv6Ex, discoEx], timeout: 4)
     }
 
     @MainActor
@@ -480,6 +577,27 @@ final class HTTPServerTests: XCTestCase {
         XCTAssertGreaterThan(
             DirectHTTPServer.httpKeepAliveIdleTimeoutExperimentSeconds,
             DirectHTTPServer.httpKeepAliveIdleTimeoutSeconds
+        )
+    }
+
+    func test_coalescingWindowNegotiationPreservesDefaultsAndClampsProposal() {
+        // WHY: legacy clients must retain current latency, while measured 3G
+        // clients may request a bounded aggregation window without unbounded UI delay.
+        XCTAssertEqual(
+            DirectHTTPServer.negotiateCoalescingWindowMs(filter: .full, proposedMs: nil),
+            DirectHTTPServer.wsCoalescingWindowWiFiMs
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.negotiateCoalescingWindowMs(filter: .cellularSafe(), proposedMs: nil),
+            DirectHTTPServer.wsCoalescingWindowCellularMs
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.negotiateCoalescingWindowMs(filter: .full, proposedMs: 1),
+            DirectHTTPServer.wsCoalescingWindowMinMs
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.negotiateCoalescingWindowMs(filter: .cellularSafe(), proposedMs: 999_999),
+            DirectHTTPServer.wsCoalescingWindowMaxMs
         )
     }
 

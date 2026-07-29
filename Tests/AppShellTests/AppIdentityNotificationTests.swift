@@ -1239,7 +1239,11 @@ private final class ConcurrentExpiryPrivateAccountAPI: RecordingPrivateAccountAP
     private var successfulTokens: [String] = []
 
     var refreshCallCount: Int { lock.withLock { refreshCount } }
-    var successfulAlertTokens: [String] { lock.withLock { successfulTokens.sorted() } }
+    /// Non-silent alert successes only. After a visible alert succeeds,
+    /// `PrivateNotificationBridge.deliver` may also send one coalesced silent
+    /// catch-up via the same `deliverAlert` API; that must not be counted as a
+    /// second 401-retry of the original thread-outcome content.
+    var successfulAlertTokens: [String] { lock.withLock { successfulTokens } }
 
     init(refreshFails: Bool = false) {
         self.refreshFails = refreshFails
@@ -1272,7 +1276,9 @@ private final class ConcurrentExpiryPrivateAccountAPI: RecordingPrivateAccountAP
             await gate.arrive()
             throw PrivateAccountAPIError.http(401)
         }
-        lock.withLock { successfulTokens.append(accessToken) }
+        if !silent {
+            lock.withLock { successfulTokens.append(accessToken) }
+        }
         return PrivatePushDeliveryResult(delivered: true, errorCode: nil, shouldDropSubscription: false)
     }
 }

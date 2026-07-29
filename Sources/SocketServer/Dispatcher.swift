@@ -343,6 +343,43 @@ struct BoundedReceiptCache {
     var count: Int { store.count }
 }
 
+/// Bounded fence for unknown mutation outcomes. Stores only owner fingerprint +
+/// params hash (never secrets or arbitrary payloads). Evicts oldest-first.
+struct BoundedUnknownReceiptCache {
+    struct Entry {
+        let ownerFingerprint: String
+        let paramsHash: String
+    }
+    private(set) var cap: Int
+    private var store: [String: Entry] = [:]
+    private var order: [String] = []
+
+    init(cap: Int = 256) {
+        self.cap = max(1, cap)
+    }
+
+    subscript(key: String) -> Entry? {
+        store[key]
+    }
+
+    mutating func insert(
+        key: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) {
+        if store[key] == nil {
+            while order.count >= cap, !order.isEmpty {
+                let oldest = order.removeFirst()
+                store.removeValue(forKey: oldest)
+            }
+            order.append(key)
+        }
+        store[key] = Entry(ownerFingerprint: ownerFingerprint, paramsHash: paramsHash)
+    }
+
+    var count: Int { store.count }
+}
+
 /// Pure coalesce-decision helper for device-initiated pairing requests.
 ///
 /// When a device repeatedly connects (e.g. re-pair-every-connect, IP drift,
@@ -385,7 +422,9 @@ public final class JSONRPCDispatcher {
     public nonisolated let commandReceiptMetrics: CommandReceiptMetrics
     private var volatileCommandReceipts = BoundedReceiptCache()
     @TaskLocal private static var centralMutationExecution = false
-    private var volatileUnknownReceipts: [String: (ownerFingerprint: String, paramsHash: String)] = [:]
+    /// Bounded unknown-outcome fence (same cap as committed receipts). Does not
+    /// store request payloads or secrets — only owner fingerprint + params hash.
+    private var volatileUnknownReceipts = BoundedUnknownReceiptCache()
     public nonisolated static let hostMutationMethods = HostMutationContract.methods
     private nonisolated static let durableSynchronousMutationMethods: Set<String> = [
         "workspace.create",
@@ -891,7 +930,11 @@ public final class JSONRPCDispatcher {
             return await dispatchCore(businessRequest)
         }
         guard response.error == nil, let result = response.result else {
-            volatileUnknownReceipts[key] = (context.ownerFingerprint, paramsHash)
+            volatileUnknownReceipts.insert(
+                key: key,
+                ownerFingerprint: context.ownerFingerprint,
+                paramsHash: paramsHash
+            )
             commandReceiptMetrics.recordUnknownOutcome()
             try? receiptRouter.markCommandReceiptUnknown(
                 method: req.method,
@@ -943,7 +986,11 @@ public final class JSONRPCDispatcher {
                 success: false,
                 latencyMilliseconds: Self.elapsedMilliseconds(since: finalizationStarted)
             )
-            volatileUnknownReceipts[key] = (context.ownerFingerprint, paramsHash)
+            volatileUnknownReceipts.insert(
+                key: key,
+                ownerFingerprint: context.ownerFingerprint,
+                paramsHash: paramsHash
+            )
             commandReceiptMetrics.recordUnknownOutcome()
             try? receiptRouter.markCommandReceiptUnknown(
                 method: req.method,

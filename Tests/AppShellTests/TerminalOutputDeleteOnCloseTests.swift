@@ -24,10 +24,17 @@ final class TerminalOutputDeleteOnCloseTests: XCTestCase {
     }
 
     /// Insert a few chunks so there is measurable stored data for `surfaceID`.
+    /// Live PTY writers start near chunk 1 after prepare; reserve a high band so
+    /// fixture inserts cannot UNIQUE-collide with concurrent shell output.
     private func seedChunks(repo: TerminalOutputRepository, surfaceID: String, count: Int = 3) throws {
+        let base: Int64 = 100_000
         for i in 0..<count {
-            try repo.append(surfaceID: surfaceID, workspaceID: nil,
-                            chunkIndex: Int64(i), data: Data("chunk\(i)".utf8))
+            try repo.append(
+                surfaceID: surfaceID,
+                workspaceID: nil,
+                chunkIndex: base + Int64(i),
+                data: Data("chunk\(i)".utf8)
+            )
         }
     }
 
@@ -125,11 +132,17 @@ final class TerminalOutputDeleteOnCloseTests: XCTestCase {
         let (context, router) = try makeContext()
         try context.db.execute("PRAGMA busy_timeout=25;")
         let workspace = try router.createWorkspace(name: "pending delete", cwd: NSTemporaryDirectory())
-        guard case .pane(let pane) = context.state.workspaces[workspace.id]?.layout,
-              let descriptor = pane.surfaces.first,
-              let surface = SurfaceRegistry.shared.surface(descriptor.id) as? TerminalSurface else {
-            return XCTFail("expected initial terminal surface")
-        }
+        // Terminal history cleanup is type-specific; create an explicit terminal
+        // tab rather than relying on the default Agent App surface.
+        let descriptor = try router.createSurface(
+            workspace: workspace.id,
+            type: .terminal,
+            paneID: nil,
+            title: "pending delete"
+        )
+        let surface = try XCTUnwrap(
+            SurfaceRegistry.shared.surface(descriptor.id) as? TerminalSurface
+        )
         let readyDeadline = Date().addingTimeInterval(2)
         while surface.historyWriterGenerationForTesting == nil, Date() < readyDeadline {
             try await Task.sleep(nanoseconds: 10_000_000)
@@ -185,11 +198,17 @@ final class TerminalOutputDeleteOnCloseTests: XCTestCase {
             name: "pending delete behind clear",
             cwd: NSTemporaryDirectory()
         )
-        guard case .pane(let pane) = context.state.workspaces[workspace.id]?.layout,
-              let descriptor = pane.surfaces.first,
-              let surface = SurfaceRegistry.shared.surface(descriptor.id) as? TerminalSurface else {
-            return XCTFail("expected initial terminal surface")
-        }
+        // Terminal history cleanup is type-specific; create an explicit terminal
+        // tab rather than relying on the default Agent App surface.
+        let descriptor = try router.createSurface(
+            workspace: workspace.id,
+            type: .terminal,
+            paneID: nil,
+            title: "pending delete behind clear"
+        )
+        let surface = try XCTUnwrap(
+            SurfaceRegistry.shared.surface(descriptor.id) as? TerminalSurface
+        )
         let readyDeadline = Date().addingTimeInterval(2)
         while surface.historyWriterGenerationForTesting == nil, Date() < readyDeadline {
             try await Task.sleep(nanoseconds: 10_000_000)
@@ -244,11 +263,17 @@ final class TerminalOutputDeleteOnCloseTests: XCTestCase {
             name: "retained failed delete",
             cwd: NSTemporaryDirectory()
         )
-        guard case .pane(let pane) = context.state.workspaces[workspace.id]?.layout,
-              let descriptor = pane.surfaces.first,
-              let surface = SurfaceRegistry.shared.surface(descriptor.id) as? TerminalSurface else {
-            return XCTFail("expected initial terminal surface")
-        }
+        // Terminal history cleanup is type-specific; create an explicit terminal
+        // tab rather than relying on the default Agent App surface.
+        let descriptor = try router.createSurface(
+            workspace: workspace.id,
+            type: .terminal,
+            paneID: nil,
+            title: "retained failed delete"
+        )
+        let surface = try XCTUnwrap(
+            SurfaceRegistry.shared.surface(descriptor.id) as? TerminalSurface
+        )
         let readyDeadline = Date().addingTimeInterval(2)
         while surface.historyWriterGenerationForTesting == nil, Date() < readyDeadline {
             try await Task.sleep(nanoseconds: 10_000_000)
@@ -353,10 +378,14 @@ final class TerminalOutputDeleteOnCloseTests: XCTestCase {
             name: "durable pending delete",
             cwd: NSTemporaryDirectory()
         )
-        guard case .pane(let pane) = context?.state.workspaces[workspace.id]?.layout,
-              let firstDescriptor = pane.surfaces.first else {
-            return XCTFail("expected first terminal")
-        }
+        // Terminal history cleanup is type-specific; create an explicit terminal
+        // tab rather than relying on the default Agent App surface.
+        let firstDescriptor = try XCTUnwrap(router).createSurface(
+            workspace: workspace.id,
+            type: .terminal,
+            paneID: nil,
+            title: "durable pending delete"
+        )
         let secondDescriptor = try XCTUnwrap(router).createSurface(
             workspace: workspace.id,
             type: .terminal,

@@ -327,7 +327,7 @@ public final class UnixSocketServer: @unchecked Sendable {
     }
 
     private func handleClient(fd: Int32, generation: UInt64) {
-        let streamSubID = LockedSubscriberID()
+        let streamSubscription = UnixStreamSubscriptionState()
         let outboundReference = UnixOutboundQueueReference()
         let outbound = WebSocketOutboundQueue(
             label: "rc2.unix.outbound",
@@ -336,9 +336,8 @@ public final class UnixSocketServer: @unchecked Sendable {
                 self?.write(fd: fd, data: data) ?? false
             },
             onClose: { reason in
-                if let subscription = streamSubID.value {
+                if let subscription = streamSubscription.requestCleanup() {
                     EventBus.shared.unsubscribe(subscription)
-                    streamSubID.value = nil
                 }
                 let queuedBytes = outboundReference.value?.queuedByteCount ?? 0
                 shutdown(fd, SHUT_RDWR)
@@ -351,9 +350,8 @@ public final class UnixSocketServer: @unchecked Sendable {
         )
         outboundReference.value = outbound
         defer {
-            if let subscription = streamSubID.value {
+            if let subscription = streamSubscription.requestCleanup() {
                 EventBus.shared.unsubscribe(subscription)
-                streamSubID.value = nil
             }
             outbound.close()
             shutdown(fd, SHUT_RDWR)
@@ -379,9 +377,8 @@ public final class UnixSocketServer: @unchecked Sendable {
                 if let req = try? JSONDecoder().decode(JSONRPCRequest.self, from: lineData),
                    req.method == "events.stream" {
                     let since: Int64 = req.params?["after_seq"]?.intValue.map(Int64.init) ?? 0
-                    if let existing = streamSubID.value {
+                    if let existing = streamSubscription.removeCurrent() {
                         EventBus.shared.unsubscribe(existing)
-                        streamSubID.value = nil
                     }
                     // Queue the acknowledgement before subscribing. Any replay or
                     // live event delivered by subscribe is then serialized behind
@@ -390,9 +387,13 @@ public final class UnixSocketServer: @unchecked Sendable {
                         "subscribed": .bool(true)
                     ]))
                     guard let ackData = encode(response: ack),
-                          outbound.enqueue(ackData) == .accepted else { return }
+                          outbound.enqueue(ackData) == .accepted else {
+                        _ = outbound.terminate(errorData: nil, closingData: nil, reason: "queue_full")
+                        return
+                    }
                     let id = EventBus.shared.subscribe(since: since) { [weak self] ev in
                         guard let self else { return }
+                        guard !streamSubscription.isCleanupRequested else { return }
                         let payload: [String: JSONValue] = [
                             "seq": .number(Double(ev.seq)),
                             "kind": .string(ev.kind),
@@ -401,9 +402,17 @@ public final class UnixSocketServer: @unchecked Sendable {
                         ]
                         let resp = JSONRPCResponse(id: req.id, result: .object(payload))
                         guard let data = self.encode(response: resp) else { return }
-                        _ = outbound.enqueue(data)
+                        switch outbound.enqueue(data) {
+                        case .accepted, .closed:
+                            break
+                        case .queueFull:
+                            _ = outbound.terminate(errorData: nil, closingData: nil, reason: "queue_full")
+                        }
                     }
-                    streamSubID.value = id
+                    guard streamSubscription.install(id) else {
+                        EventBus.shared.unsubscribe(id)
+                        return
+                    }
                     continue
                 }
                 guard respond(
@@ -489,6 +498,49 @@ public final class UnixSocketServer: @unchecked Sendable {
             }
         }
         return succeeded
+    }
+}
+
+/// Coordinates the EventBus UUID with cleanup that can happen while
+/// `subscribe` is still replaying synchronously. Without this handshake a
+/// queue overflow can close the socket before `subscribe` returns, leaving
+/// the UUID orphaned in EventBus.
+private final class UnixStreamSubscriptionState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var subscriptionID: UUID?
+    private var cleanupRequested = false
+
+    var isCleanupRequested: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return cleanupRequested
+    }
+
+    func install(_ id: UUID) -> Bool {
+        lock.lock()
+        guard !cleanupRequested else {
+            lock.unlock()
+            return false
+        }
+        subscriptionID = id
+        lock.unlock()
+        return true
+    }
+
+    func requestCleanup() -> UUID? {
+        lock.lock()
+        cleanupRequested = true
+        let id = subscriptionID
+        subscriptionID = nil
+        lock.unlock()
+        return id
+    }
+
+    func removeCurrent() -> UUID? {
+        lock.lock()
+        let id = subscriptionID
+        subscriptionID = nil
+        lock.unlock()
+        return id
     }
 }
 

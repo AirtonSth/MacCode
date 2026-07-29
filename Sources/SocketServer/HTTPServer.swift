@@ -52,11 +52,25 @@ public extension DirectAuthProvider {
 /// Thread-safe counters for active WS connections, backpressure, and
 /// slow-client evictions. Used by /v1/health to answer \"why is sync slow\".
 /// Public so the test suite can inject controlled values.
+///
+/// Lifetime counters (`slowClientDrops`, max-observed depths, rejected/evicted
+/// frame counts, outbound queue wait aggregates) are process-scoped and never
+/// decrease. Live gauges (`activeClients`, `totalQueuedBytes`) follow
+/// connect/disconnect samples.
 public final class WSConnectionTracker: @unchecked Sendable {
     private let lock = NSLock()
     private var _activeClients: Int = 0
     private var _totalQueuedBytes: Int = 0
     private var _slowClientDrops: Int = 0
+    /// High-water mark of observed outbound queue depth (per sample and aggregate).
+    private var _maxObservedOutboundQueuedBytes: Int = 0
+    /// High-water mark of observed application frame payload sizes.
+    private var _maxObservedFrameBytes: Int = 0
+    /// Frames refused at enqueue under backpressure or shed by degrade().
+    private var _framesRejectedOrEvicted: Int = 0
+    /// Enqueue→dequeue wait aggregates by existing application priority lane.
+    /// Secret-free: count/total/max milliseconds only.
+    private var _outboundQueueWait = OutboundQueueWaitMetricsSnapshot.zero
 
     public init() {}
 
@@ -75,6 +89,27 @@ public final class WSConnectionTracker: @unchecked Sendable {
         return _slowClientDrops
     }
 
+    public var maxObservedOutboundQueuedBytes: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _maxObservedOutboundQueuedBytes
+    }
+
+    public var maxObservedFrameBytes: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _maxObservedFrameBytes
+    }
+
+    public var framesRejectedOrEvicted: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _framesRejectedOrEvicted
+    }
+
+    /// Process-scoped outbound queue wait aggregates (priority / normal / bulk).
+    var outboundQueueWaitMetrics: OutboundQueueWaitMetricsSnapshot {
+        lock.lock(); defer { lock.unlock() }
+        return _outboundQueueWait
+    }
+
     /// Called when a WS connection is established.
     public func clientConnected() {
         lock.lock(); _activeClients += 1; lock.unlock()
@@ -85,15 +120,39 @@ public final class WSConnectionTracker: @unchecked Sendable {
     public func clientDisconnected(queuedBytes: Int) {
         lock.lock()
         _activeClients = max(0, _activeClients - 1)
-        _totalQueuedBytes = max(0, _totalQueuedBytes - queuedBytes)
+        _totalQueuedBytes = max(0, _totalQueuedBytes - max(0, queuedBytes))
         lock.unlock()
     }
 
     /// Called when the outbound queue for a connection changes (sampled on
-    /// enqueue). Replaces the previous sample for this connection.
+    /// enqueue / degrade). Replaces the previous sample for this connection.
     public func updateQueuedBytes(previous: Int, current: Int) {
         lock.lock()
-        _totalQueuedBytes = max(0, _totalQueuedBytes - previous + current)
+        let prev = max(0, previous)
+        let cur = max(0, current)
+        _totalQueuedBytes = max(0, _totalQueuedBytes - prev + cur)
+        // Max is monotonic: track both per-connection depth and aggregate.
+        _maxObservedOutboundQueuedBytes = max(
+            _maxObservedOutboundQueuedBytes,
+            cur,
+            _totalQueuedBytes
+        )
+        lock.unlock()
+    }
+
+    /// Record an observed application-frame byte size (monotonic high-water).
+    public func recordFrameBytes(_ bytes: Int) {
+        lock.lock()
+        _maxObservedFrameBytes = max(_maxObservedFrameBytes, max(0, bytes))
+        lock.unlock()
+    }
+
+    /// Count frames refused under backpressure or shed by degrade.
+    /// Negative counts are ignored so callers cannot underflow health.
+    public func recordFramesRejectedOrEvicted(_ count: Int = 1) {
+        guard count > 0 else { return }
+        lock.lock()
+        _framesRejectedOrEvicted += count
         lock.unlock()
     }
 
@@ -101,19 +160,293 @@ public final class WSConnectionTracker: @unchecked Sendable {
     public func recordSlowClientDrop() {
         lock.lock(); _slowClientDrops += 1; lock.unlock()
     }
+
+    /// Record one application-frame enqueue→dequeue wait sample for a lane.
+    /// Negative/non-finite waits are clamped; lane labels are fixed enums only.
+    func recordOutboundQueueWait(
+        priority: WebSocketOutboundQueue.ApplicationPriority,
+        waitMilliseconds: Double
+    ) {
+        let bounded: Double
+        if waitMilliseconds.isFinite {
+            bounded = max(0, waitMilliseconds)
+        } else {
+            bounded = 0
+        }
+        lock.lock()
+        switch priority {
+        case .priority:
+            _outboundQueueWait.priority.record(waitMilliseconds: bounded)
+        case .normal:
+            _outboundQueueWait.normal.record(waitMilliseconds: bounded)
+        case .bulk:
+            _outboundQueueWait.bulk.record(waitMilliseconds: bounded)
+        }
+        lock.unlock()
+    }
+}
+
+/// Operator-facing class for whether observed WS connection latency is
+/// dominated by outbound queue/backpressure, or there is no observed queue
+/// pressure (or too little evidence to decide).
+///
+/// Observability only — pure classification of existing counters. Does not
+/// change queue scheduling, wire protocol, authentication, or retries.
+/// Secret-free fixed string codes only (no hosts, tokens, payloads).
+///
+/// Queue/backpressure classes describe **where pressure was observed in the
+/// outbound path**. They do **not** prove TCP (or any L4 path) is the root
+/// cause — client drain rate, radio, CPU, and app produce rate share the same
+/// gauges. See `TransportLimiterEvidenceBucket` and fixed non-claims.
+public enum OutboundLatencyPressureClass: String, Sendable, Equatable {
+    /// Frames refused/shed or slow-client drops: the queue hit its wall.
+    case backpressureDominated = "backpressure_dominated"
+    /// Elevated enqueue→dequeue wait and/or queued bytes without shed signals.
+    case queuePressureDominated = "queue_pressure_dominated"
+    /// Enough samples and no elevated queue/backpressure signals.
+    case noQueuePressure = "no_queue_pressure"
+    /// Too few wait samples and no elevated depth/reject signals to decide.
+    case insufficientSamples = "insufficient_samples"
+
+    /// Coarse three-way evidence bucket for the open "is TCP/WebSocket the
+    /// limiter?" question — never a path-layer root-cause verdict.
+    public var limiterEvidenceBucket: TransportLimiterEvidenceBucket {
+        switch self {
+        case .insufficientSamples:
+            return .insufficientEvidence
+        case .backpressureDominated, .queuePressureDominated:
+            return .queueOrBackpressure
+        case .noQueuePressure:
+            return .nonQueueOrUnknown
+        }
+    }
+}
+
+/// Coarse evidence bucket for whether the **outbound WebSocket queue** is
+/// implicated in observed latency — not a proof that TCP is the limiter.
+///
+/// Maps the finer `OutboundLatencyPressureClass` into the three operator
+/// questions: not enough data, queue/backpressure pressure present, or
+/// non-queue/unknown (latency not explained by outbound queue gauges).
+public enum TransportLimiterEvidenceBucket: String, Sendable, Equatable {
+    /// Too little wait/depth/reject evidence to decide.
+    case insufficientEvidence = "insufficient_evidence"
+    /// Rejects, slow-client drops, elevated queue depth, or elevated wait.
+    case queueOrBackpressure = "queue_or_backpressure"
+    /// Enough quiet samples: not outbound-queue-dominated (true limiter
+    /// elsewhere remains unknown — RTT, radio, client, app work, etc.).
+    case nonQueueOrUnknown = "non_queue_or_unknown"
+}
+
+/// Result of `OutboundLatencyPressureClassifier.classify`.
+/// Fixed `reason` codes only (documented constants on the classifier).
+/// Always carries fixed non-claim codes so pressure is never misread as a
+/// proven TCP root cause or path-layer isolation result.
+public struct OutboundLatencyPressureSnapshot: Sendable, Equatable {
+    public let classification: OutboundLatencyPressureClass
+    public let reason: String
+    /// Coarse three-way evidence bucket (derived from `classification`).
+    public let evidence: TransportLimiterEvidenceBucket
+    /// Stable fixed codes asserting what this snapshot does **not** claim.
+    public let nonClaims: [String]
+
+    public init(
+        classification: OutboundLatencyPressureClass,
+        reason: String,
+        evidence: TransportLimiterEvidenceBucket? = nil,
+        nonClaims: [String] = OutboundLatencyPressureClassifier.fixedNonClaims
+    ) {
+        self.classification = classification
+        self.reason = reason
+        self.evidence = evidence ?? classification.limiterEvidenceBucket
+        self.nonClaims = nonClaims
+    }
+}
+
+/// Pure, deterministic classifier over existing WS outbound health counters.
+///
+/// Thresholds are intentionally conservative and bounded:
+/// - Wait floors sit far below the ~8s target backlog used to size the queue,
+///   so only material enqueue delay trips pressure without flagging normal
+///   local drain (sub-ms to a few ms).
+/// - Queued-byte floor matches `WebSocketOutboundQueue.minimumQueuedBytes`
+///   (64 KiB), the soft floor for dynamic sizing — below that is normal buffer.
+/// - Minimum wait samples avoid classifying from a single noisy frame.
+public enum OutboundLatencyPressureClassifier {
+    /// Combined wait samples across lanes required for wait-based verdicts.
+    public static let minimumWaitSamples: UInt64 = 3
+
+    /// Per-frame max enqueue→dequeue wait (ms) that indicates queue pressure.
+    public static let elevatedWaitMaxMilliseconds: Double = 100
+
+    /// Average wait (ms) across all samples that indicates sustained pressure.
+    public static let elevatedWaitAverageMilliseconds: Double = 50
+
+    /// Live or high-water queued bytes that indicate material backlog.
+    /// Matches `WebSocketOutboundQueue.minimumQueuedBytes`.
+    public static let elevatedQueuedBytes: Int = 64 * 1_024
+
+    // Fixed reason codes (stable for operators / support tooling).
+    public static let reasonFramesRejectedOrEvicted = "frames_rejected_or_evicted"
+    public static let reasonSlowClientDrops = "slow_client_drops"
+    public static let reasonElevatedQueuedBytes = "elevated_queued_bytes"
+    public static let reasonElevatedQueueWait = "elevated_queue_wait"
+    public static let reasonNoElevatedQueueSignals = "no_elevated_queue_signals"
+    public static let reasonInsufficientWaitSamples = "insufficient_wait_samples"
+    /// Public snapshot had negative or non-finite wait total/max on a lane.
+    public static let reasonInvalidWaitSamples = "invalid_wait_samples"
+
+    /// Fixed non-claim codes always attached to every pressure snapshot.
+    /// Queue/backpressure evidence never upgrades into a TCP root-cause proof,
+    /// path-layer isolation, or QUIC/performance verdict.
+    public static let fixedNonClaims: [String] = [
+        "no_tcp_root_cause_claim",
+        "no_path_layer_isolation_claim",
+        "no_quic_performance_claim",
+        "observability_only",
+    ]
+
+    /// Classify from existing process/live gauges. Inputs are clamped so
+    /// negative race samples cannot invent pressure.
+    public static func classify(
+        totalQueuedBytes: Int,
+        maxObservedOutboundQueuedBytes: Int,
+        framesRejectedOrEvicted: Int,
+        slowClientDrops: Int,
+        outboundQueueWait: OutboundQueueWaitMetricsSnapshot
+    ) -> OutboundLatencyPressureSnapshot {
+        let rejects = max(0, framesRejectedOrEvicted)
+        let drops = max(0, slowClientDrops)
+        let liveQueued = max(0, totalQueuedBytes)
+        let maxQueued = max(0, maxObservedOutboundQueuedBytes)
+
+        // Strongest signal first: the queue refused work or shed a client.
+        if rejects > 0 {
+            return OutboundLatencyPressureSnapshot(
+                classification: .backpressureDominated,
+                reason: reasonFramesRejectedOrEvicted
+            )
+        }
+        if drops > 0 {
+            return OutboundLatencyPressureSnapshot(
+                classification: .backpressureDominated,
+                reason: reasonSlowClientDrops
+            )
+        }
+
+        // Depth high-water / live gauge — independent of wait sample count.
+        if liveQueued >= elevatedQueuedBytes || maxQueued >= elevatedQueuedBytes {
+            return OutboundLatencyPressureSnapshot(
+                classification: .queuePressureDominated,
+                reason: reasonElevatedQueuedBytes
+            )
+        }
+
+        let lanes = [
+            outboundQueueWait.priority,
+            outboundQueueWait.normal,
+            outboundQueueWait.bulk
+        ]
+        var sampleCount: UInt64 = 0
+        var totalMs: Double = 0
+        var maxMs: Double = 0
+        for lane in lanes {
+            // Malformed public metrics must fail neutral: never clamp bad
+            // totals/maxes into a false no_queue_pressure exoneration.
+            let total = lane.totalMilliseconds
+            let laneMax = lane.maxMilliseconds
+            if !total.isFinite || total < 0 || !laneMax.isFinite || laneMax < 0 {
+                return OutboundLatencyPressureSnapshot(
+                    classification: .insufficientSamples,
+                    reason: reasonInvalidWaitSamples
+                )
+            }
+            sampleCount &+= lane.count
+            totalMs += total
+            maxMs = max(maxMs, laneMax)
+        }
+
+        if sampleCount < minimumWaitSamples {
+            return OutboundLatencyPressureSnapshot(
+                classification: .insufficientSamples,
+                reason: reasonInsufficientWaitSamples
+            )
+        }
+
+        let averageMs = totalMs / Double(sampleCount)
+        if maxMs >= elevatedWaitMaxMilliseconds
+            || averageMs >= elevatedWaitAverageMilliseconds {
+            return OutboundLatencyPressureSnapshot(
+                classification: .queuePressureDominated,
+                reason: reasonElevatedQueueWait
+            )
+        }
+
+        return OutboundLatencyPressureSnapshot(
+            classification: .noQueuePressure,
+            reason: reasonNoElevatedQueueSignals
+        )
+    }
 }
 
 /// Pure helper: assembles the `connections` sub-object for /v1/health from
 /// plain counter inputs. No I/O, no actor, fully unit-testable.
+/// Values are clamped nonnegative so health never emits negative gauges.
+///
+/// `outbound_queue_wait_ms` is additive diagnostics only (count/total/max per
+/// existing application lane). It never includes payloads, tokens, hosts, or
+/// request bodies.
+///
+/// `outbound_latency_pressure` is additive operator diagnostics derived only
+/// from the same counters (class + reason + coarse evidence bucket + fixed
+/// non-claim codes). No secrets/hosts. Never claims TCP is the proven limiter.
 public func connectionMetricsJSON(
     activeClients: Int,
     totalQueuedBytes: Int,
-    slowClientDrops: Int
+    slowClientDrops: Int,
+    maxObservedOutboundQueuedBytes: Int = 0,
+    maxObservedFrameBytes: Int = 0,
+    framesRejectedOrEvicted: Int = 0,
+    outboundQueueWait: OutboundQueueWaitMetricsSnapshot = .zero
 ) -> [String: Any] {
+    /// JSONSerialization rejects NaN/Inf; clamp negative/non-finite wait
+    /// aggregates to finite 0 so a malformed public snapshot cannot break
+    /// /v1/health. Classifier still sees raw inputs for invalid_wait_samples.
+    func finiteNonNegativeMilliseconds(_ value: Double) -> Double {
+        (value.isFinite && value >= 0) ? value : 0
+    }
+    func laneJSON(_ metrics: OutboundQueueWaitLaneMetrics) -> [String: Any] {
+        [
+            "count": metrics.count,
+            "total": finiteNonNegativeMilliseconds(metrics.totalMilliseconds),
+            "max": finiteNonNegativeMilliseconds(metrics.maxMilliseconds)
+        ]
+    }
+    let pressure = OutboundLatencyPressureClassifier.classify(
+        totalQueuedBytes: totalQueuedBytes,
+        maxObservedOutboundQueuedBytes: maxObservedOutboundQueuedBytes,
+        framesRejectedOrEvicted: framesRejectedOrEvicted,
+        slowClientDrops: slowClientDrops,
+        outboundQueueWait: outboundQueueWait
+    )
     return [
-        "active_clients": activeClients,
-        "total_queued_bytes": totalQueuedBytes,
-        "slow_client_drops": slowClientDrops
+        "active_clients": max(0, activeClients),
+        "total_queued_bytes": max(0, totalQueuedBytes),
+        "slow_client_drops": max(0, slowClientDrops),
+        "max_observed_outbound_queued_bytes": max(0, maxObservedOutboundQueuedBytes),
+        "max_observed_frame_bytes": max(0, maxObservedFrameBytes),
+        "frames_rejected_or_evicted": max(0, framesRejectedOrEvicted),
+        "outbound_queue_wait_ms": [
+            "priority": laneJSON(outboundQueueWait.priority),
+            "normal": laneJSON(outboundQueueWait.normal),
+            "bulk": laneJSON(outboundQueueWait.bulk)
+        ],
+        "outbound_latency_pressure": [
+            "class": pressure.classification.rawValue,
+            "reason": pressure.reason,
+            "evidence": pressure.evidence.rawValue,
+            "non_claims": pressure.nonClaims
+        ]
     ]
 }
 
@@ -132,6 +465,117 @@ public func serverListenerEventPayload(bound: Bool, address: String, port: UInt1
         "address": address,
         "port": Int(port)
     ]
+}
+
+/// Observable publication lifecycle for the TCP listener (and Bonjour supervisors
+/// that mirror the same states). Bounded retries use `ListenerRetryPolicy`.
+public enum ListenerPublicationState: String, Sendable, Equatable {
+    case idle
+    case publishing
+    case published
+    case failed
+}
+
+/// Bounded listen/publish retry schedule. Exhaustion is explicit (`nil` delay)
+/// so supervisors never storm with infinite tight loops.
+public struct ListenerRetryPolicy: Sendable, Equatable {
+    public let delaysSeconds: [TimeInterval]
+
+    /// Default: 1s, 2s, 4s — matches the historical supervisor ladder without
+    /// continuing forever after the third failure.
+    public static let `default` = ListenerRetryPolicy(delaysSeconds: [1, 2, 4])
+
+    public init(delaysSeconds: [TimeInterval]) {
+        self.delaysSeconds = delaysSeconds.filter { $0 >= 0 }
+    }
+
+    public var maxAttempts: Int { delaysSeconds.count }
+
+    /// 0-based failure index → delay before the next attempt, or nil when exhausted.
+    public func delayAfterFailure(attemptIndex: Int) -> TimeInterval? {
+        guard attemptIndex >= 0, attemptIndex < delaysSeconds.count else { return nil }
+        return delaysSeconds[attemptIndex]
+    }
+
+    public func isExhausted(afterFailureCount failures: Int) -> Bool {
+        failures >= delaysSeconds.count
+    }
+}
+
+/// Extended listener publication payload (diagnostics / UI). Does not replace
+/// the stable three-key `serverListenerEventPayload` contract.
+public func listenerPublicationStatusPayload(
+    state: ListenerPublicationState,
+    bound: Bool,
+    address: String,
+    port: UInt16,
+    attempt: Int,
+    maxAttempts: Int,
+    nextRetryMs: Int? = nil,
+    errorCode: Int? = nil
+) -> [String: Any] {
+    var payload: [String: Any] = [
+        "state": state.rawValue,
+        "bound": bound,
+        "address": address,
+        "port": Int(port),
+        "attempt": attempt,
+        "max_attempts": maxAttempts
+    ]
+    if let nextRetryMs { payload["next_retry_ms"] = nextRetryMs }
+    if let errorCode { payload["error_code"] = errorCode }
+    return payload
+}
+
+/// Bracket IPv6 literals (and percent-encode zone IDs) for URL host components.
+/// IPv4 and hostnames pass through unchanged. Does not invent relays.
+///
+/// Already-bracketed hosts still get zone-id encoding (`[fe80::1%en0]` →
+/// `[fe80::1%25en0]`) without double-encoding an existing `%25`.
+public func urlHostLiteral(_ host: String) -> String {
+    if host.hasPrefix("[") {
+        guard host.hasSuffix("]") else { return host }
+        let inner = String(host.dropFirst().dropLast())
+        return "[\(encodeIPv6ZoneIDForURL(inner))]"
+    }
+    // Scope id: fe80::1%en0 → fe80::1%25en0 inside brackets.
+    if host.contains(":") {
+        return "[\(encodeIPv6ZoneIDForURL(host))]"
+    }
+    return host
+}
+
+/// Percent-encode bare IPv6 zone-id `%` for URL hosts; leave existing `%25` alone.
+private func encodeIPv6ZoneIDForURL(_ host: String) -> String {
+    guard host.contains("%") else { return host }
+    var out = String()
+    out.reserveCapacity(host.count + 4)
+    var i = host.startIndex
+    while i < host.endIndex {
+        if host[i] == "%" {
+            let after = host.index(after: i)
+            // Already percent-encoded zone separator: keep "%25" intact.
+            if after < host.endIndex,
+               host[after] == "2",
+               host.index(after: after) < host.endIndex,
+               host[host.index(after: after)] == "5" {
+                out.append(contentsOf: "%25")
+                i = host.index(i, offsetBy: 3)
+            } else {
+                out.append(contentsOf: "%25")
+                i = after
+            }
+        } else {
+            out.append(host[i])
+            i = host.index(after: i)
+        }
+    }
+    return out
+}
+
+public func endpointURLString(scheme: String, host: String, port: UInt16, path: String = "/") -> String {
+    let normalizedPath = path.hasPrefix("/") ? path : "/" + path
+    return "\(scheme)://\(urlHostLiteral(host)):\(port)\(normalizedPath)"
 }
 
 /// Pure helper: builds the JSON error body for pairing HTTP error responses.
@@ -285,13 +729,49 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// 25 MiB decoded attachment + base64 expansion + bounded JSON envelope.
     /// The dispatcher/store still enforce the authoritative decoded-byte cap.
     static let maxAttachmentUploadRequestBodyBytes = 36 * 1024 * 1024
-    static let maxClientFramePayloadBytes = 1024 * 1024
+    static let maxClientFramePayloadBytes = WebSocketClientFrameAssembler.maxFragmentedMessageBytes
     public static let maxWebSocketOutboundQueuedBytes = 1024 * 1024
+
+    /// Baseline welcome capabilities required by old and new peers. Optional
+    /// negotiated controls (e.g. `stream.interest.v1`) are appended only when
+    /// the host actually implements them — see `welcomeCapabilities(streamInterestSupported:)`.
+    public static let baselineWelcomeCapabilities: [String] = [
+        "events.replay", "jsonrpc.batch", "snapshot.v3",
+        "rpc.websocket", "snapshot.incremental", "resume.v1",
+        SnapshotChunkCapability.wireName,
+    ]
+
+    /// Wire name for mid-session interest control (iOS sends `rc2.interest` only
+    /// after seeing this capability on welcome).
+    public static let streamInterestCapability = "stream.interest.v1"
+
+    /// Mac implements `EventStreamFilter.parseInterestControl` + live filter update.
+    public static var supportsStreamInterestControl: Bool { true }
+
+    /// Welcome capability list: baseline always present; `stream.interest.v1`
+    /// only when the host can apply interest control (preserves old-peer shape
+    /// when the flag is false).
+    public static func welcomeCapabilities(
+        streamInterestSupported: Bool = DirectHTTPServer.supportsStreamInterestControl
+    ) -> [String] {
+        var caps = baselineWelcomeCapabilities
+        if streamInterestSupported {
+            caps.append(streamInterestCapability)
+        }
+        return caps
+    }
     /// Wi-Fi / unmetered default: snappy dead-peer detection without thrashing radio idle.
     public static let wsHeartbeatProfileWiFi = WebSocketHeartbeatProfile(interval: 10, timeout: 30)
     /// Cellular / Low Data (`X-RC2-WS-Filter: cellular-safe`): tolerate 3G RRC promotion
     /// and allow the radio to sleep between bursts (C-06).
     public static let wsHeartbeatProfileCellular = WebSocketHeartbeatProfile(interval: 25, timeout: 90)
+    /// Short adaptive application-event coalescing window. Clients may propose
+    /// a larger bounded value for measured degraded/severe links; absent/legacy
+    /// proposals keep these defaults (15 ms Wi-Fi, 100 ms cellular-safe).
+    public static let wsCoalescingWindowWiFiMs = 15
+    public static let wsCoalescingWindowCellularMs = 100
+    public static let wsCoalescingWindowMinMs = 5
+    public static let wsCoalescingWindowMaxMs = 250
     /// Back-compat aliases → Wi-Fi profile (default when no filter is negotiated).
     public static let wsHeartbeatInterval: TimeInterval = wsHeartbeatProfileWiFi.interval
     public static let wsHeartbeatTimeout: TimeInterval = wsHeartbeatProfileWiFi.timeout
@@ -322,6 +802,22 @@ public final class DirectHTTPServer: @unchecked Sendable {
             : httpKeepAliveIdleTimeoutSeconds
     }
 
+    /// Accept an optional client coalescing proposal while preserving the
+    /// filter-specific legacy default and a strict latency/aggregation bound.
+    nonisolated public static func negotiateCoalescingWindowMs(
+        filter: EventStreamFilter,
+        proposedMs: Int64?
+    ) -> Int {
+        let fallback = filter.isCellularSafe
+            ? wsCoalescingWindowCellularMs
+            : wsCoalescingWindowWiFiMs
+        guard let proposedMs, proposedMs > 0 else { return fallback }
+        return Int(min(
+            Int64(wsCoalescingWindowMaxMs),
+            max(Int64(wsCoalescingWindowMinMs), proposedMs)
+        ))
+    }
+
     /// Select the host heartbeat offer from the client's WS filter proposal.
     /// `cellular-safe` → cellular budget; otherwise Wi-Fi. Pure for unit tests.
     nonisolated static func heartbeatProfile(
@@ -347,6 +843,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
             : wsSnapshotTimeoutWiFiMs
         guard let proposedMs, proposedMs > 0 else { return offer }
         return min(wsSnapshotTimeoutMaxMs, max(wsSnapshotTimeoutMinMs, proposedMs))
+    }
+
+    /// Pure resume-contract seam. A cursor is usable only when the optional
+    /// envelope is absent (legacy client) or matches this host's identity and
+    /// current boot epoch; stale envelopes deliberately start at zero.
+    public static func acceptedResumeSequence(
+        requestedSinceSequence: Int64,
+        requestedResumeHost: String?,
+        requestedResumeBootEpoch: Int64?,
+        serverId: String,
+        bootEpoch: Int64,
+        currentSequence: Int64
+    ) -> Int64 {
+        let hasEnvelope = requestedResumeHost != nil || requestedResumeBootEpoch != nil
+        let matches = requestedResumeHost == serverId && requestedResumeBootEpoch == bootEpoch
+        guard !hasEnvelope || matches else { return 0 }
+        return min(max(0, requestedSinceSequence), max(0, currentSequence))
     }
 
     /// Clamp an optional client proposal into the host profile offer.
@@ -448,9 +961,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
     public let dispatcher: JSONRPCDispatcher
     public let commandReceiptMetrics: CommandReceiptMetrics
     public weak var auth: DirectAuthProvider?
-    /// Stable, persisted host identity. iOS pins this (RCA-022); it must
+    /// Stable, persisted **logical** host identity. iOS pins this (RCA-022); it must
     /// survive process restarts or every relaunch looks like a different
     /// Mac and forces a re-pair (GAP-2).
+    ///
+    /// This is not a certificate/public-key identity. The listener is plaintext
+    /// HTTP; cryptographic host proof requires a coordinated protocol change
+    /// (iOS `HostIdentityTrustBoundary.cryptographicVerificationSupported` is
+    /// fail-closed until then).
     public let serverId: String
     public let bootEpoch: UInt64
 
@@ -461,18 +979,41 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// Live connection-level metrics surfaced via /v1/health.
     let wsTracker = WSConnectionTracker()
     private let activeWebSocketConnections = ActiveWebSocketConnectionRegistry()
+    /// TTL/memory-bounded cache for opt-in resumable `sync.snapshot` chunks.
+    let snapshotChunkTransfers = SnapshotChunkTransferCache()
     private let receiveTimeoutSeconds: Int
     private let webSocketOutboundMaxQueuedBytes: Int
 
     private var listenFD: Int32 = -1
+    /// Optional dual-stack IPv6 listener. Failure to bind IPv6 never tears down IPv4.
+    private var listenFD6: Int32 = -1
     private var accept: Thread?
+    private var accept6: Thread?
     private let acceptedSockets = AcceptedSocketRegistry()
+    private let listenerStateLock = NSLock()
+    private var _listenerPublicationState: ListenerPublicationState = .idle
+    private var _listenerPublishAttempt: Int = 0
+    private let listenerRetryPolicy = ListenerRetryPolicy.default
 
     static let maximumAcceptedConnections = AcceptedSocketRegistry.defaultMaximumDescriptors
     var acceptedSocketCountForTests: Int { acceptedSockets.count }
     var afterWelcomeWriteForTests: ((String) -> Void)?
+    /// Test seam: fires once per WS upgrade with the coalescing window (ms)
+    /// that is passed as `WebSocketEventBatcher.delay` after header negotiation.
+    /// Production never sets this; used only to prove `X-RC2-WS-Coalesce-Window-Ms`
+    /// is honored on the real HTTP→WebSocket path (not just the pure helper).
+    var webSocketCoalescingWindowObserverForTests: (@Sendable (Int) -> Void)?
     var acceptedFDObserverForTesting: (@Sendable (Int32) -> Void)?
     var connectionReadWaitObserverForTesting: (@Sendable (Int32, ConnectionReadWaitStageForTesting) -> Void)?
+
+    /// Explicit publication state for diagnostics (idle/publishing/published/failed).
+    public var listenerPublicationState: ListenerPublicationState {
+        listenerStateLock.lock(); defer { listenerStateLock.unlock() }
+        return _listenerPublicationState
+    }
+
+    /// True when the IPv6 listener is bound (dual-stack path active).
+    public var isIPv6ListenerBound: Bool { listenFD6 >= 0 }
 
     public init(port: UInt16 = 18217, loopbackOnly: Bool = true, dispatcher: JSONRPCDispatcher, auth: DirectAuthProvider? = nil, serverId: String = ProcessInfo.processInfo.globallyUniqueString, bootEpoch: UInt64, clientReceiveTimeoutSeconds: Int = DirectHTTPServer.httpKeepAliveIdleTimeoutSeconds, webSocketOutboundMaxQueuedBytes: Int = DirectHTTPServer.maxWebSocketOutboundQueuedBytes) {
         self.port = port
@@ -487,8 +1028,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
     }
 
     public func start() throws {
+        setListenerState(.publishing, attempt: 1)
+        publishListenerStatus(
+            state: .publishing,
+            bound: false,
+            attempt: 1,
+            nextRetryMs: nil,
+            errorCode: nil
+        )
+
         listenFD = socket(AF_INET, SOCK_STREAM, 0)
-        if listenFD < 0 { throw POSIXError(.EIO) }
+        if listenFD < 0 {
+            markListenerFailed(errorCode: Int(errno))
+            throw POSIXError(.EIO)
+        }
         // Close-on-exec: forkpty terminal shells (and any other spawned child)
         // must not inherit the listener, or an orphaned child keeps port 18217
         // bound after the app stops and every rebind fails EADDRINUSE while
@@ -497,6 +1050,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let savedErrno = errno
             close(listenFD)
             listenFD = -1
+            markListenerFailed(errorCode: Int(savedErrno))
             throw POSIXError(POSIXErrorCode(rawValue: savedErrno) ?? .EIO)
         }
         var yes: Int32 = 1
@@ -522,13 +1076,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 if let s = v as? String { return .string(s) }
                 return .string("\(v)")
             }))
+            markListenerFailed(errorCode: Int(savedErrno))
             throw NSError(domain: "RC2.HTTP", code: Int(savedErrno), userInfo: [NSLocalizedDescriptionKey: msg])
         }
         if Darwin.listen(listenFD, 32) < 0 {
             let savedErrno = errno
             close(listenFD); listenFD = -1
+            markListenerFailed(errorCode: Int(savedErrno))
             throw POSIXError(POSIXErrorCode(rawValue: savedErrno) ?? .EIO)
         }
+
+        // Dual-stack: optional IPv6 listener. Failure is non-fatal so IPv4
+        // clients keep working (do not invent a relay or break v4-only paths).
+        listenFD6 = Self.bindIPv6Listener(port: port, loopbackOnly: bindLoopbackOnly)
+
         let acceptanceGeneration = acceptedSockets.activate()
         let listenerDescriptor = listenFD
         let t = Thread { [weak self] in
@@ -540,6 +1101,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
         t.name = "RC2.HTTPAccept"
         t.start()
         accept = t
+
+        if listenFD6 >= 0 {
+            let v6 = listenFD6
+            let t6 = Thread { [weak self] in
+                self?.acceptLoop(
+                    listenerDescriptor: v6,
+                    acceptanceGeneration: acceptanceGeneration
+                )
+            }
+            t6.name = "RC2.HTTPAccept6"
+            t6.start()
+            accept6 = t6
+        }
+
         let bindAddr = bindLoopbackOnly ? "127.0.0.1" : "0.0.0.0"
         let successPayload = serverListenerEventPayload(bound: true, address: bindAddr, port: port)
         EventBus.shared.publish(kind: "server.listener", payload: .object(successPayload.mapValues { v in
@@ -548,6 +1123,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
             if let s = v as? String { return .string(s) }
             return .string("\(v)")
         }))
+        setListenerState(.published, attempt: 1)
+        publishListenerStatus(
+            state: .published,
+            bound: true,
+            attempt: 1,
+            nextRetryMs: nil,
+            errorCode: nil
+        )
     }
 
     public func stop() {
@@ -560,14 +1143,121 @@ public final class DirectHTTPServer: @unchecked Sendable {
             close(listenFD)
             listenFD = -1
         }
+        if listenFD6 >= 0 {
+            shutdown(listenFD6, SHUT_RDWR)
+            close(listenFD6)
+            listenFD6 = -1
+        }
+        accept6 = nil
+        setListenerState(.idle, attempt: 0)
+    }
+
+    /// Pure helper used by supervisors: next delay after `failureCount` failures,
+    /// or nil when the bounded policy is exhausted (no infinite storm).
+    public func nextListenerRetryDelayMs(afterFailureCount failureCount: Int) -> Int? {
+        guard let delay = listenerRetryPolicy.delayAfterFailure(attemptIndex: failureCount) else {
+            return nil
+        }
+        return Int((delay * 1000).rounded())
+    }
+
+    private func setListenerState(_ state: ListenerPublicationState, attempt: Int) {
+        listenerStateLock.lock()
+        _listenerPublicationState = state
+        _listenerPublishAttempt = attempt
+        listenerStateLock.unlock()
+    }
+
+    private func markListenerFailed(errorCode: Int) {
+        let attempt: Int = {
+            listenerStateLock.lock(); defer { listenerStateLock.unlock() }
+            return max(1, _listenerPublishAttempt)
+        }()
+        let next = nextListenerRetryDelayMs(afterFailureCount: attempt - 1)
+        setListenerState(.failed, attempt: attempt)
+        publishListenerStatus(
+            state: .failed,
+            bound: false,
+            attempt: attempt,
+            nextRetryMs: next,
+            errorCode: errorCode
+        )
+    }
+
+    private func publishListenerStatus(
+        state: ListenerPublicationState,
+        bound: Bool,
+        attempt: Int,
+        nextRetryMs: Int?,
+        errorCode: Int?
+    ) {
+        let address = bindLoopbackOnly ? "127.0.0.1" : "0.0.0.0"
+        let raw = listenerPublicationStatusPayload(
+            state: state,
+            bound: bound,
+            address: address,
+            port: port,
+            attempt: attempt,
+            maxAttempts: listenerRetryPolicy.maxAttempts + 1,
+            nextRetryMs: nextRetryMs,
+            errorCode: errorCode
+        )
+        // Correlation id only — never tokens, raw peer content, or credentials.
+        let correlationId = ConnectionTelemetryRedactor.makeCorrelationId()
+        var payload = raw.mapValues { v -> JSONValue in
+            if let b = v as? Bool { return .bool(b) }
+            if let i = v as? Int { return .number(Double(i)) }
+            if let s = v as? String { return .string(s) }
+            return .string("\(v)")
+        }
+        payload["correlation_id"] = .string(correlationId)
+        EventBus.shared.publish(kind: "server.listener.publication", payload: .object(payload))
+    }
+
+    /// Bind an IPv6 listener with `IPV6_V6ONLY` so IPv4-mapped accepts stay on
+    /// the AF_INET socket. Returns -1 when IPv6 is unavailable (non-fatal).
+    static func bindIPv6Listener(port: UInt16, loopbackOnly: Bool) -> Int32 {
+        let fd = socket(AF_INET6, SOCK_STREAM, 0)
+        guard fd >= 0 else { return -1 }
+        guard enableCloseOnExec(fd) else {
+            close(fd)
+            return -1
+        }
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        // Keep v6-only so dual listeners do not fight over IPv4-mapped traffic.
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &yes, socklen_t(MemoryLayout<Int32>.size))
+
+        var addr6 = sockaddr_in6()
+        addr6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+        addr6.sin6_family = sa_family_t(AF_INET6)
+        addr6.sin6_port = in_port_t(port).bigEndian
+        addr6.sin6_addr = loopbackOnly ? in6addr_loopback : in6addr_any
+        let len = socklen_t(MemoryLayout<sockaddr_in6>.size)
+        let rc = withUnsafePointer(to: &addr6) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, len) }
+        }
+        if rc < 0 {
+            close(fd)
+            return -1
+        }
+        if Darwin.listen(fd, 32) < 0 {
+            close(fd)
+            return -1
+        }
+        return fd
     }
 
     private func acceptLoop(listenerDescriptor: Int32, acceptanceGeneration: UInt64) {
         let registry = acceptedSockets
         while registry.isAccepting(generation: acceptanceGeneration) {
-            var caddr = sockaddr()
-            var clen = socklen_t(MemoryLayout<sockaddr>.size)
-            let fd = Darwin.accept(listenerDescriptor, &caddr, &clen)
+            var storage = sockaddr_storage()
+            var clen = socklen_t(MemoryLayout<sockaddr_storage>.size)
+            let fd = withUnsafeMutablePointer(to: &storage) { ptr -> Int32 in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.accept(listenerDescriptor, $0, &clen)
+                }
+            }
             if fd < 0 {
                 if !registry.isAccepting(generation: acceptanceGeneration) { return }
                 continue
@@ -579,7 +1269,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 shutdown(fd, SHUT_RDWR)
                 close(fd)
                 EventBus.shared.publish(kind: "diagnostic.http_cloexec_failed", payload: .object([
-                    "errno": .number(Double(savedErrno))
+                    "errno": .number(Double(savedErrno)),
+                    "correlation_id": .string(ConnectionTelemetryRedactor.makeCorrelationId())
                 ]))
                 continue
             }
@@ -593,12 +1284,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 if shouldPublishDiagnostic {
                     EventBus.shared.publish(kind: "diagnostic.http_connection_limit", payload: .object([
                         "active_connections": .number(Double(active)),
-                        "maximum_connections": .number(Double(limit))
+                        "maximum_connections": .number(Double(limit)),
+                        "correlation_id": .string(ConnectionTelemetryRedactor.makeCorrelationId())
                     ]))
                 }
                 continue
             }
-            let peer = Self.peerIP(caddr)
+            let peer = Self.peerIP(storage)
             acceptedFDObserverForTesting?(fd)
             // C-25: dedicated Thread per accepted connection (not GCD global).
             // WS sessions park for minutes; HTTP keep-alive can too. Pool workers
@@ -725,14 +1417,40 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// Numeric source IP of an accepted connection, used as the throttle key.
     /// Falls back to "unknown" so a peer we can't parse still shares a single
     /// throttle bucket rather than bypassing the limiter.
+    ///
+    /// IPv6 link-local addresses keep their zone/scope suffix when the kernel
+    /// provides `sin6_scope_id` (e.g. `fe80::1%en0`) so dual-stack / AWDL
+    /// endpoints are not stripped to an unroutable bare address.
     static func peerIP(_ addr: sockaddr) -> String {
-        var addr = addr
-        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-        let len = socklen_t(addr.sa_len)
-        let rc = withUnsafePointer(to: &addr) { ptr in
-            getnameinfo(ptr, len, &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
+        var storage = sockaddr_storage()
+        withUnsafeMutableBytes(of: &storage) { dst in
+            withUnsafeBytes(of: addr) { src in
+                let n = min(src.count, dst.count)
+                dst.copyMemory(from: UnsafeRawBufferPointer(start: src.baseAddress, count: n))
+            }
         }
-        return rc == 0 ? String(cString: host) : "unknown"
+        return peerIP(storage)
+    }
+
+    static func peerIP(_ storage: sockaddr_storage) -> String {
+        var storage = storage
+        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        let family = Int32(storage.ss_family)
+        let len: socklen_t
+        if storage.ss_len > 0 {
+            len = socklen_t(storage.ss_len)
+        } else if family == AF_INET6 {
+            len = socklen_t(MemoryLayout<sockaddr_in6>.size)
+        } else {
+            len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        }
+        let rc = withUnsafePointer(to: &storage) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getnameinfo($0, len, &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
+            }
+        }
+        guard rc == 0 else { return "unknown" }
+        return String(cString: host)
     }
 
     private func handle(fd: Int32, peer: String) {
@@ -929,6 +1647,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 filter: wsFilter,
                 proposedMs: proposedSnapshotTimeoutMs
             )
+            let proposedCoalescingWindowMs = headers["x-rc2-ws-coalesce-window-ms"]
+                .flatMap { Int64($0.trimmingCharacters(in: .whitespaces)) }
+            let coalescingWindowMs = Self.negotiateCoalescingWindowMs(
+                filter: wsFilter,
+                proposedMs: proposedCoalescingWindowMs
+            )
             // RFC ping/pong + inbound traffic own liveness. SO_RCVTIMEO is only a
             // fallback and must exceed the negotiated timeout so 1012 remains the
             // authoritative dead-peer close (not a silent read timeout).
@@ -955,7 +1679,18 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let eventSnapshot = EventBus.shared.snapshotMetadata()
             let requestedSinceSequence = headers["x-rc2-since-seq"]
                 .flatMap { Int64($0.trimmingCharacters(in: .whitespaces)) } ?? 0
-            let wsSinceSeq = min(max(0, requestedSinceSequence), eventSnapshot.sequence)
+            let requestedResumeHost = headers["x-rc2-resume-host-id"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let requestedResumeBootEpoch = headers["x-rc2-resume-boot-epoch"]
+                .flatMap { Int64($0.trimmingCharacters(in: .whitespaces)) }
+            let wsSinceSeq = Self.acceptedResumeSequence(
+                requestedSinceSequence: requestedSinceSequence,
+                requestedResumeHost: requestedResumeHost,
+                requestedResumeBootEpoch: requestedResumeBootEpoch,
+                serverId: serverId,
+                bootEpoch: Int64(bootEpoch),
+                currentSequence: eventSnapshot.sequence
+            )
             let sequenceWatermark = ConnectionSequenceWatermark(initialSequence: wsSinceSeq)
             let welcome = ConnectionTransportFrame.welcome(ConnectionWelcomeFrame(
                 protocolVersion: ConnectionTransportFrame.protocolVersion,
@@ -971,10 +1706,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 oldestReplaySequence: eventSnapshot.oldestReplaySequence,
                 // Wave 4: rpc.websocket + snapshot.incremental advertised so
                 // clients can hydrate without new TCP and request domain deltas.
-                capabilities: [
-                    "events.replay", "jsonrpc.batch", "snapshot.v3",
-                    "rpc.websocket", "snapshot.incremental",
-                ]
+                // stream.interest.v1 only when the host applies rc2.interest
+                // (see welcomeCapabilities); old peers ignore unknown caps.
+                capabilities: Self.welcomeCapabilities()
             ))
             activeWebSocketConnections.insert(
                 connectionId,
@@ -1024,6 +1758,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 didSendTerminal: { [weak self] in
                     self?.activeWebSocketConnections.remove(connectionId)
                     shutdown(fd, SHUT_RDWR)
+                },
+                onApplicationQueueWaitRecorded: { [wsTracker] priority, waitMilliseconds in
+                    // Secret-free process aggregates for /v1/health.connections.
+                    wsTracker.recordOutboundQueueWait(
+                        priority: priority,
+                        waitMilliseconds: waitMilliseconds
+                    )
                 }
             )
             // C-04: pressure baseline_required ≤1/s, never as a close reason.
@@ -1075,13 +1816,30 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     }
                 }
             }
+            // METRICS: last per-connection queue sample for /v1/health gauges.
+            // Process-scoped max/reject counters live on wsTracker; this only
+            // keeps the live totalQueuedBytes contribution accurate.
+            let queuedBytesSample = LockedQueuedBytesSample()
+            let sampleOutboundQueuedBytes: @Sendable () -> Void = { [wsTracker] in
+                let current = outbound.queuedByteCount
+                let previous = queuedBytesSample.swap(current)
+                wsTracker.updateQueuedBytes(previous: previous, current: current)
+            }
             /// C-04 degrade ladder: never close on queueFull.
-            let enqueueApplicationOrDegrade: @Sendable (Data) -> Void = { data in
+            let enqueueApplicationOrDegrade: @Sendable (Data) -> Void = { [wsTracker] data in
+                // Transport-limit observability for 3G: frame size + queue depth
+                // + rejected/evicted counts. Does not change enqueue policy.
+                wsTracker.recordFrameBytes(data.count)
                 switch outbound.enqueueApplication(data) {
                 case .accepted:
                     recordAcceptedEvent(data)
+                    sampleOutboundQueuedBytes()
                 case .queueFull:
                     let outcome = outbound.degrade()
+                    if outcome.freedFrames > 0 {
+                        wsTracker.recordFramesRejectedOrEvicted(outcome.freedFrames)
+                        sampleOutboundQueuedBytes()
+                    }
                     if outcome.needsBaselineRequired {
                         emitPressureBaseline()
                     }
@@ -1090,18 +1848,21 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         if let sequence = WebSocketOutboundQueue.eventSequence(in: data) {
                             sequenceWatermark.recordFilteredEvent(sequence: sequence)
                         }
+                        wsTracker.recordFramesRejectedOrEvicted(1)
                         emitPressureBaseline()
                         return
                     }
                     switch outbound.enqueueApplication(data) {
                     case .accepted:
                         recordAcceptedEvent(data)
+                        sampleOutboundQueuedBytes()
                     case .queueFull:
                         // Still saturated after degrade: drop with filtered
                         // watermark accounting; socket stays open.
                         if let sequence = WebSocketOutboundQueue.eventSequence(in: data) {
                             sequenceWatermark.recordFilteredEvent(sequence: sequence)
                         }
+                        wsTracker.recordFramesRejectedOrEvicted(1)
                         emitPressureBaseline()
                     case .closed:
                         break
@@ -1114,11 +1875,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // terminal.output.summary per surface → ≥5× fewer summaries/sec).
             // C-15: coalesce agent.item.delta on all links; cellular uses a longer
             // window (100ms) so ~10× fewer frames than one-frame-per-token.
-            let coalescingDelayMs = wsFilter.isCellularSafe ? 100 : 15
+            // Same value negotiated from `X-RC2-WS-Coalesce-Window-Ms` (or
+            // filter default / clamp) is what the batcher is configured with.
+            webSocketCoalescingWindowObserverForTests?(coalescingWindowMs)
             let batcher = WebSocketEventBatcher(
                 enabled: wsFilter.isCellularSafe,
                 filter: wsFilter,
-                delay: TimeInterval(coalescingDelayMs) / 1000.0,
+                delay: TimeInterval(coalescingWindowMs) / 1000.0,
                 // PERF: coalesce per-token agent.item.delta frames; non-delta
                 // events flush immediately when only streaming coalescing is active.
                 coalescesStreamingDeltas: true,
@@ -1291,7 +2054,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
             batcher.stop()
             outbound.close()
             outbound.finish()
-            wsTracker.clientDisconnected(queuedBytes: outbound.queuedByteCount)
+            // Remove this connection's last sampled contribution (not post-close
+            // residual) so total_queued_bytes stays non-negative and accurate.
+            wsTracker.clientDisconnected(queuedBytes: queuedBytesSample.value)
             return
         }
 
@@ -1382,7 +2147,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "connections": connectionMetricsJSON(
                     activeClients: wsTracker.activeClients,
                     totalQueuedBytes: wsTracker.totalQueuedBytes,
-                    slowClientDrops: wsTracker.slowClientDrops
+                    slowClientDrops: wsTracker.slowClientDrops,
+                    maxObservedOutboundQueuedBytes: wsTracker.maxObservedOutboundQueuedBytes,
+                    maxObservedFrameBytes: wsTracker.maxObservedFrameBytes,
+                    framesRejectedOrEvicted: wsTracker.framesRejectedOrEvicted,
+                    outboundQueueWait: wsTracker.outboundQueueWaitMetrics
                 ),
                 "command_receipts": [
                     "claims_total": receiptMetrics.claimsTotal,
@@ -1432,7 +2201,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let registry = acceptedSockets
             let rpcLeftover = leftoverBuffer
             let rpcClientClose = clientRequestsClose
-            Task { [weak self] in
+            // Scheduler admission only: bulk snapshot/replay runs at utility
+            // priority so stop/input/control Tasks can preempt on the host.
+            // Does not change wire fields, response routing, or method behavior.
+            let rpcTaskPriority = RPCDispatchSchedulerClass.taskPriority(for: bodyData)
+            Task(priority: rpcTaskPriority) { [weak self] in
                 guard let self else {
                     registry.close(fd)
                     return
@@ -1589,9 +2362,15 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "auth_mode": bindLoopbackOnly ? "loopback-anonymous" : "token-required",
                 "transports": ["http", "ws"],
                 "host": bindLoopbackOnly ? "127.0.0.1" : "0.0.0.0",
+                // Dual-stack advertisement; clients may prefer v6 without a relay.
+                "host_v6": bindLoopbackOnly ? "::1" : "::",
+                "ipv6_listener": listenFD6 >= 0,
                 "port": port,
+                "boot_epoch": Int64(bootEpoch),
                 "vpn_required": !bindLoopbackOnly,
                 "relay": false,
+                // Optional stream control negotiated on welcome, not here.
+                "stream_interest_v1": Self.supportsStreamInterestControl,
                 // IMP-MAC_SERVER_SYNC-001: anchor for client clock-drift /
                 // freshness math. Pairs with the WS `heartbeat` frame (ts) so
                 // the client can show an honest "live / last synced Ns ago".
@@ -1689,12 +2468,34 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
         // C-24: `sync.snapshot` is the largest payload. Encode the full JSON-RPC
         // envelope once with the wire `id` included — no Data→Any→Data cycle.
+        // Chunk begin/chunk are also owned here so they share the same
+        // host/boot/owner/watermark gates as the legacy full path.
         if let object = root as? [String: Any],
-           object["method"] as? String == "sync.snapshot" {
-            return await dispatchSyncSnapshotRPCData(
-                object,
-                ownerFingerprint: ownerFingerprint
-            )
+           let method = object["method"] as? String {
+            switch method {
+            case "sync.snapshot":
+                return await dispatchSyncSnapshotRPCData(
+                    object,
+                    ownerFingerprint: ownerFingerprint
+                )
+            case "sync.snapshot.begin":
+                return await dispatchSyncSnapshotBeginRPCData(
+                    object,
+                    ownerFingerprint: ownerFingerprint
+                )
+            case "sync.snapshot.chunk":
+                return await dispatchSyncSnapshotChunkRPCData(
+                    object,
+                    ownerFingerprint: ownerFingerprint
+                )
+            case "sync.snapshot.commit":
+                return await dispatchSyncSnapshotCommitRPCData(
+                    object,
+                    ownerFingerprint: ownerFingerprint
+                )
+            default:
+                break
+            }
         }
 
         return rpcJSONData(await dispatchStrictRPCItem(
@@ -1747,6 +2548,48 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 ownerFingerprint: ownerFingerprint
             )
         }
+        if method == "sync.snapshot.begin" {
+            guard let rawParams else {
+                return rpcErrorObject(.invalidParams, id: wireID)
+            }
+            let data = await encodeSyncSnapshotBeginResponse(
+                rawParams: rawParams,
+                wireID: wireID,
+                ownerFingerprint: ownerFingerprint
+            )
+            if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                return object
+            }
+            return rpcErrorObject(.internalError, id: wireID)
+        }
+        if method == "sync.snapshot.chunk" {
+            guard let rawParams else {
+                return rpcErrorObject(.invalidParams, id: wireID)
+            }
+            let data = encodeSyncSnapshotChunkResponse(
+                rawParams: rawParams,
+                wireID: wireID,
+                ownerFingerprint: ownerFingerprint
+            )
+            if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                return object
+            }
+            return rpcErrorObject(.internalError, id: wireID)
+        }
+        if method == "sync.snapshot.commit" {
+            guard let rawParams else {
+                return rpcErrorObject(.invalidParams, id: wireID)
+            }
+            let data = encodeSyncSnapshotCommitResponse(
+                rawParams: rawParams,
+                wireID: wireID,
+                ownerFingerprint: ownerFingerprint
+            )
+            if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                return object
+            }
+            return rpcErrorObject(.internalError, id: wireID)
+        }
         let params = rawParams?.mapValues(JSONValue.from)
         let requestID: JSONRPCID?
         switch wireID {
@@ -1776,10 +2619,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
             hostId: serverId,
             bootEpoch: bootEpoch,
             activeConnection: { [activeWebSocketConnections] connectionID, ownerFingerprint in
-                activeWebSocketConnections.watermark(
-                    for: connectionID,
-                    ownerFingerprint: ownerFingerprint
-                ) != nil
+                // One host/boot authority for HTTP and WebSocket. Live WS still
+                // pins mutations to the owned connection_id. When that socket is
+                // gone, authenticated HTTP remains usable so retries and
+                // idempotent commands do not depend on a second transport.
+                Self.hybridConnectionAuthorized(
+                    connectionID: connectionID,
+                    ownerFingerprint: ownerFingerprint,
+                    registeredOwner: {
+                        activeWebSocketConnections.ownerFingerprint(for: connectionID)
+                    },
+                    ownerHasLiveConnection: {
+                        activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
+                    }
+                )
             }
         )
         let response = await dispatcher.dispatch(request, mutationContext: mutationContext)
@@ -1837,6 +2690,28 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return rpcErrorObject(.internalError, id: wireID)
     }
 
+    /// Hybrid transport authority for mutations (and snapshot ownership checks).
+    ///
+    /// - If `connectionID` is live: only its registered owner may use it.
+    /// - If this owner has any other live WS: they must use that connection_id
+    ///   (wrong-connection stays fail-closed).
+    /// - If nothing is live for this owner and the id is unregistered: allow
+    ///   authenticated HTTP under the host/boot gate (WS-absent hybrid path).
+    nonisolated static func hybridConnectionAuthorized(
+        connectionID: String,
+        ownerFingerprint: String,
+        registeredOwner: () -> String?,
+        ownerHasLiveConnection: () -> Bool
+    ) -> Bool {
+        _ = connectionID
+        if let registered = registeredOwner() {
+            return registered == ownerFingerprint
+        }
+        // Unregistered connection_id: reject when the owner still holds a live WS.
+        if ownerHasLiveConnection() { return false }
+        return true
+    }
+
     private func encodeSyncSnapshotResponse(
         rawParams: [String: Any],
         wireID: Any,
@@ -1859,17 +2734,36 @@ public final class DirectHTTPServer: @unchecked Sendable {
         let expectedBootEpoch = Self.strictUInt64(rawParams["expectedBootEpoch"]),
         expectedBootEpoch == bootEpoch,
         let supportedStateVersion = Self.strictInt64(rawParams["supportedStateVersion"]),
-        supportedStateVersion == 3,
+        supportedStateVersion == 3 else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+
+        // Hybrid ownership: live connection_id is owner-pinned; unregistered ids
+        // are only accepted when this owner has no live WebSocket (HTTP baseline).
+        guard Self.hybridConnectionAuthorized(
+            connectionID: connectionID,
+            ownerFingerprint: ownerFingerprint,
+            registeredOwner: {
+                activeWebSocketConnections.ownerFingerprint(for: connectionID)
+            },
+            ownerHasLiveConnection: {
+                activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
+            }
+        ) else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
         let watermark = activeWebSocketConnections.watermark(
             for: connectionID,
             ownerFingerprint: ownerFingerprint
-        ),
-        watermark.beginSnapshot() else {
+        )
+        if let watermark, !watermark.beginSnapshot() {
             return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
         }
+
         let knownRevisions: ConnectionDomainRevisions?
         if rawParams.keys.contains("knownDomainRevisions") {
             guard let parsed = ConnectionDomainRevisions.parse(rawParams["knownDomainRevisions"]) else {
+                if let watermark { watermark.cancelSnapshot() }
                 return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
             }
             knownRevisions = parsed
@@ -1879,15 +2773,17 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
         var snapshotAdopted = false
         defer {
-            if !snapshotAdopted { watermark.cancelSnapshot() }
+            if let watermark, !snapshotAdopted { watermark.cancelSnapshot() }
         }
         do {
             let snapshot = try await dispatcher.readConnectionSnapshot()
-            guard activeWebSocketConnections.watermark(
-                for: connectionID,
-                ownerFingerprint: ownerFingerprint
-            ) === watermark else {
-                return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+            if let watermark {
+                guard activeWebSocketConnections.watermark(
+                    for: connectionID,
+                    ownerFingerprint: ownerFingerprint
+                ) === watermark else {
+                    return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+                }
             }
             let hostRevisions = snapshot.metadata.domainRevisions
             let includeDomains: Set<String>?
@@ -1914,18 +2810,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 stateVersion: 3,
                 state: state
             )
-            switch watermark.adoptSnapshot(sequence: snapshot.metadata.sequence) {
-            case .adopted:
+            if let watermark {
+                switch watermark.adoptSnapshot(sequence: snapshot.metadata.sequence) {
+                case .adopted:
+                    snapshotAdopted = true
+                case .gap(let expected, let received):
+                    return rpcJSONData(rpcErrorObject(JSONRPCError(
+                        code: -32010,
+                        message: "Event sequence gap detected; reconnect and request a new baseline.",
+                        data: .object([
+                            "expectedSequence": .number(Double(expected)),
+                            "receivedSequence": .number(Double(received)),
+                        ])
+                    ), id: wireID))
+                }
+            } else {
+                // HTTP-only baseline: no WS gap watermark to adopt.
                 snapshotAdopted = true
-            case .gap(let expected, let received):
-                return rpcJSONData(rpcErrorObject(JSONRPCError(
-                    code: -32010,
-                    message: "Event sequence gap detected; reconnect and request a new baseline.",
-                    data: .object([
-                        "expectedSequence": .number(Double(expected)),
-                        "receivedSequence": .number(Double(received)),
-                    ])
-                ), id: wireID))
             }
             // C-24: one JSONEncoder pass for the full RPC response (id + result).
             // Avoids the prior Data → Any → Data cycle on multi-hundred-KB snapshots.
@@ -1943,6 +2844,468 @@ public final class DirectHTTPServer: @unchecked Sendable {
             return rpcJSONData(rpcErrorObject(error, id: wireID))
         } catch {
             return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
+        }
+    }
+
+    // MARK: - Resumable snapshot chunks (`snapshot.chunks.v1`)
+
+    private func dispatchSyncSnapshotBeginRPCData(
+        _ object: [String: Any],
+        ownerFingerprint: String
+    ) async -> Data {
+        let fallbackID = strictRPCID(
+            object["id"],
+            keyIsPresent: object.keys.contains("id")
+        )?.0 ?? NSNull()
+        let expectedKeys: Set<String> = object.keys.contains("params")
+            ? ["jsonrpc", "id", "method", "params"]
+            : ["jsonrpc", "id", "method"]
+        guard Set(object.keys) == expectedKeys,
+              object["jsonrpc"] as? String == "2.0",
+              let (wireID, _) = strictRPCID(
+                  object["id"],
+                  keyIsPresent: object.keys.contains("id")
+              ),
+              let rawParams = object["params"] as? [String: Any] else {
+            return rpcJSONData(rpcErrorObject(.invalidRequest, id: fallbackID))
+        }
+        return await encodeSyncSnapshotBeginResponse(
+            rawParams: rawParams,
+            wireID: wireID,
+            ownerFingerprint: ownerFingerprint
+        )
+    }
+
+    private func dispatchSyncSnapshotChunkRPCData(
+        _ object: [String: Any],
+        ownerFingerprint: String
+    ) async -> Data {
+        let fallbackID = strictRPCID(
+            object["id"],
+            keyIsPresent: object.keys.contains("id")
+        )?.0 ?? NSNull()
+        let expectedKeys: Set<String> = object.keys.contains("params")
+            ? ["jsonrpc", "id", "method", "params"]
+            : ["jsonrpc", "id", "method"]
+        guard Set(object.keys) == expectedKeys,
+              object["jsonrpc"] as? String == "2.0",
+              let (wireID, _) = strictRPCID(
+                  object["id"],
+                  keyIsPresent: object.keys.contains("id")
+              ),
+              let rawParams = object["params"] as? [String: Any] else {
+            return rpcJSONData(rpcErrorObject(.invalidRequest, id: fallbackID))
+        }
+        return encodeSyncSnapshotChunkResponse(
+            rawParams: rawParams,
+            wireID: wireID,
+            ownerFingerprint: ownerFingerprint
+        )
+    }
+
+    /// Opt-in chunked baseline: same host/boot/owner gates as `sync.snapshot`,
+    /// but only *reserves* the watermark (`beginSnapshot`). Sequence authority
+    /// advances only in `sync.snapshot.commit` after the client has assembled
+    /// and digest-verified every chunk. Returns a secret-free manifest and
+    /// caches bounded frame bytes for granular resume via `sync.snapshot.chunk`.
+    private func encodeSyncSnapshotBeginResponse(
+        rawParams: [String: Any],
+        wireID: Any,
+        ownerFingerprint: String
+    ) async -> Data {
+        let allowedKeys: Set<String> = [
+            "connectionId", "expectedHostId", "expectedBootEpoch", "supportedStateVersion",
+            "knownDomainRevisions", "preferredChunkBytes",
+        ]
+        guard Set(rawParams.keys).isSubset(of: allowedKeys),
+              rawParams.keys.contains("connectionId"),
+              rawParams.keys.contains("expectedHostId"),
+              rawParams.keys.contains("expectedBootEpoch"),
+              rawParams.keys.contains("supportedStateVersion"),
+              let connectionID = rawParams["connectionId"] as? String,
+              !connectionID.isEmpty,
+              let expectedHostID = rawParams["expectedHostId"] as? String,
+              expectedHostID == serverId,
+              let expectedBootEpoch = Self.strictUInt64(rawParams["expectedBootEpoch"]),
+              expectedBootEpoch == bootEpoch,
+              let supportedStateVersion = Self.strictInt64(rawParams["supportedStateVersion"]),
+              supportedStateVersion == 3 else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+
+        let preferredChunkBytes: Int?
+        if rawParams.keys.contains("preferredChunkBytes") {
+            guard let value = Self.strictInt64(rawParams["preferredChunkBytes"]),
+                  value > 0,
+                  value <= Int64(SnapshotChunkSizePolicy.maximumBytes * 4) else {
+                return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+            }
+            preferredChunkBytes = Int(value)
+        } else {
+            preferredChunkBytes = nil
+        }
+
+        guard Self.hybridConnectionAuthorized(
+            connectionID: connectionID,
+            ownerFingerprint: ownerFingerprint,
+            registeredOwner: {
+                activeWebSocketConnections.ownerFingerprint(for: connectionID)
+            },
+            ownerHasLiveConnection: {
+                activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
+            }
+        ) else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+        // Drop TTL-expired transfers first so a abandoned chunk reservation
+        // cannot permanently fence beginSnapshot.
+        releaseExpiredChunkTransferReservations()
+        let watermark = activeWebSocketConnections.watermark(
+            for: connectionID,
+            ownerFingerprint: ownerFingerprint
+        )
+        if let watermark, !watermark.beginSnapshot() {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+
+        let knownRevisions: ConnectionDomainRevisions?
+        if rawParams.keys.contains("knownDomainRevisions") {
+            guard let parsed = ConnectionDomainRevisions.parse(rawParams["knownDomainRevisions"]) else {
+                if let watermark { watermark.cancelSnapshot() }
+                return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+            }
+            knownRevisions = parsed
+        } else {
+            knownRevisions = nil
+        }
+
+        // Reservation held only after cache insert succeeds. Unlike full
+        // `sync.snapshot`, begin must NOT adopt/advance the watermark.
+        var reservationHeld = false
+        defer {
+            if let watermark, !reservationHeld { watermark.cancelSnapshot() }
+        }
+        do {
+            let snapshot = try await dispatcher.readConnectionSnapshot()
+            if let watermark {
+                guard activeWebSocketConnections.watermark(
+                    for: connectionID,
+                    ownerFingerprint: ownerFingerprint
+                ) === watermark else {
+                    return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+                }
+            }
+            let hostRevisions = snapshot.metadata.domainRevisions
+            let includeDomains: Set<String>?
+            if let knownRevisions {
+                let changed = hostRevisions.domainsChanged(since: knownRevisions)
+                includeDomains = changed.isEmpty ? [] : changed
+            } else {
+                includeDomains = nil
+            }
+            let state = snapshot.state.jsonValue(
+                domainRevisions: hostRevisions,
+                includeDomains: includeDomains
+            )
+            let frame = ConnectionSnapshotFrame(
+                protocolVersion: ConnectionTransportFrame.protocolVersion,
+                type: "snapshot",
+                connectionId: connectionID,
+                hostId: serverId,
+                bootEpoch: bootEpoch,
+                sequence: snapshot.metadata.sequence,
+                snapshotId: UUID().uuidString,
+                generatedAtEpochMs: Int64(Date().timeIntervalSince1970 * 1_000),
+                stateVersion: 3,
+                state: state
+            )
+            // Encode the authoritative frame once — chunks resume these bytes.
+            let frameBytes = try JSONEncoder().encode(frame)
+            guard frameBytes.count <= ConnectionTransportFrame.maximumEncodedBytes else {
+                return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
+            }
+            let inserted = try snapshotChunkTransfers.insert(
+                frameBytes: frameBytes,
+                ownerFingerprint: ownerFingerprint,
+                connectionId: connectionID,
+                hostId: serverId,
+                bootEpoch: bootEpoch,
+                snapshotId: frame.snapshotId,
+                sequence: frame.sequence,
+                generatedAtEpochMs: frame.generatedAtEpochMs,
+                stateVersion: frame.stateVersion,
+                preferredChunkBytes: preferredChunkBytes
+            )
+            // Pressure/TTL evictions release prior reservations without adopt.
+            for released in inserted.releasedReservations {
+                cancelChunkSnapshotReservation(
+                    connectionID: released.connectionId,
+                    ownerFingerprint: released.ownerFingerprint
+                )
+            }
+            // Keep watermark in-flight until commit (or cancel on expiry/failure).
+            reservationHeld = true
+            return rpcJSONData([
+                "jsonrpc": "2.0",
+                "id": wireID,
+                "result": inserted.record.manifest.jsonObject,
+            ])
+        } catch let error as SnapshotChunkTransferFailure {
+            switch error {
+            case .payloadTooLarge, .cachePressure:
+                return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
+            default:
+                return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+            }
+        } catch let error as JSONRPCError {
+            return rpcJSONData(rpcErrorObject(error, id: wireID))
+        } catch {
+            return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
+        }
+    }
+
+    private func dispatchSyncSnapshotCommitRPCData(
+        _ object: [String: Any],
+        ownerFingerprint: String
+    ) async -> Data {
+        let fallbackID = strictRPCID(
+            object["id"],
+            keyIsPresent: object.keys.contains("id")
+        )?.0 ?? NSNull()
+        let expectedKeys: Set<String> = object.keys.contains("params")
+            ? ["jsonrpc", "id", "method", "params"]
+            : ["jsonrpc", "id", "method"]
+        guard Set(object.keys) == expectedKeys,
+              object["jsonrpc"] as? String == "2.0",
+              let (wireID, _) = strictRPCID(
+                  object["id"],
+                  keyIsPresent: object.keys.contains("id")
+              ),
+              let rawParams = object["params"] as? [String: Any] else {
+            return rpcJSONData(rpcErrorObject(.invalidRequest, id: fallbackID))
+        }
+        return encodeSyncSnapshotCommitResponse(
+            rawParams: rawParams,
+            wireID: wireID,
+            ownerFingerprint: ownerFingerprint
+        )
+    }
+
+    /// Finalize a chunked transfer: validate identity + digest, adopt sequence
+    /// exactly once, and release the transfer. Must not run before the client
+    /// has assembled/verified every chunk (client contracts enforce ordering).
+    private func encodeSyncSnapshotCommitResponse(
+        rawParams: [String: Any],
+        wireID: Any,
+        ownerFingerprint: String
+    ) -> Data {
+        let allowedKeys: Set<String> = [
+            "transferId", "snapshotId", "digest",
+            "connectionId", "expectedHostId", "expectedBootEpoch",
+        ]
+        guard Set(rawParams.keys) == allowedKeys,
+              let transferId = rawParams["transferId"] as? String,
+              !transferId.isEmpty,
+              let snapshotId = rawParams["snapshotId"] as? String,
+              !snapshotId.isEmpty,
+              let digest = rawParams["digest"] as? String,
+              digest.count == 64,
+              digest.allSatisfy({ $0.isHexDigit }),
+              let connectionID = rawParams["connectionId"] as? String,
+              !connectionID.isEmpty,
+              let expectedHostID = rawParams["expectedHostId"] as? String,
+              expectedHostID == serverId,
+              let expectedBootEpoch = Self.strictUInt64(rawParams["expectedBootEpoch"]),
+              expectedBootEpoch == bootEpoch else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+
+        guard Self.hybridConnectionAuthorized(
+            connectionID: connectionID,
+            ownerFingerprint: ownerFingerprint,
+            registeredOwner: {
+                activeWebSocketConnections.ownerFingerprint(for: connectionID)
+            },
+            ownerHasLiveConnection: {
+                activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
+            }
+        ) else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+
+        let watermark = activeWebSocketConnections.watermark(
+            for: connectionID,
+            ownerFingerprint: ownerFingerprint
+        )
+
+        do {
+            let record = try snapshotChunkTransfers.takeForCommit(
+                transferId: transferId,
+                snapshotId: snapshotId,
+                digest: digest,
+                ownerFingerprint: ownerFingerprint,
+                connectionId: connectionID,
+                hostId: serverId,
+                bootEpoch: bootEpoch
+            )
+            if let watermark {
+                switch watermark.adoptSnapshot(sequence: record.sequence) {
+                case .adopted:
+                    break
+                case .gap(let expected, let received):
+                    return rpcJSONData(rpcErrorObject(JSONRPCError(
+                        code: -32010,
+                        message: "Event sequence gap detected; reconnect and request a new baseline.",
+                        data: .object([
+                            "expectedSequence": .number(Double(expected)),
+                            "receivedSequence": .number(Double(received)),
+                        ])
+                    ), id: wireID))
+                }
+            }
+            return rpcJSONData([
+                "jsonrpc": "2.0",
+                "id": wireID,
+                "result": [
+                    "transferId": record.transferId,
+                    "snapshotId": record.snapshotId,
+                    "sequence": NSNumber(value: record.sequence),
+                    "committed": true,
+                ] as [String: Any],
+            ])
+        } catch let failure as SnapshotChunkTransferFailure {
+            switch failure {
+            case .transferExpired:
+                // Reservation must not outlive the transfer cache entry.
+                cancelChunkSnapshotReservation(
+                    connectionID: connectionID,
+                    ownerFingerprint: ownerFingerprint
+                )
+                return rpcJSONData(rpcErrorObject(JSONRPCError(
+                    code: -32041,
+                    message: "Snapshot chunk transfer expired or unknown; request a new baseline.",
+                    data: .object(["reason": .string("transfer_expired")])
+                ), id: wireID))
+            case .transferUnknown:
+                // Already committed (single-flight) or never existed — do not
+                // cancel a live reservation that may belong to another transfer
+                // lifecycle. Double-commit is fail-closed and non-advancing.
+                return rpcJSONData(rpcErrorObject(JSONRPCError(
+                    code: -32041,
+                    message: "Snapshot chunk transfer expired or unknown; request a new baseline.",
+                    data: .object(["reason": .string("transfer_unknown")])
+                ), id: wireID))
+            case .identityMismatch, .commitMismatch, .invalidParams, .chunkOutOfRange:
+                return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+            case .payloadTooLarge, .cachePressure:
+                return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
+            }
+        } catch {
+            return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
+        }
+    }
+
+    /// Serve one cached chunk. Auth + identity gates match `sync.snapshot`;
+    /// never returns secrets from the original request.
+    private func encodeSyncSnapshotChunkResponse(
+        rawParams: [String: Any],
+        wireID: Any,
+        ownerFingerprint: String
+    ) -> Data {
+        let allowedKeys: Set<String> = [
+            "transferId", "chunkIndex",
+            "connectionId", "expectedHostId", "expectedBootEpoch",
+        ]
+        guard Set(rawParams.keys) == allowedKeys,
+              let transferId = rawParams["transferId"] as? String,
+              !transferId.isEmpty,
+              let chunkIndex = Self.strictInt64(rawParams["chunkIndex"]),
+              chunkIndex >= 0,
+              chunkIndex <= Int64(SnapshotChunkSizePolicy.maximumChunkCount),
+              let connectionID = rawParams["connectionId"] as? String,
+              !connectionID.isEmpty,
+              let expectedHostID = rawParams["expectedHostId"] as? String,
+              expectedHostID == serverId,
+              let expectedBootEpoch = Self.strictUInt64(rawParams["expectedBootEpoch"]),
+              expectedBootEpoch == bootEpoch else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+
+        guard Self.hybridConnectionAuthorized(
+            connectionID: connectionID,
+            ownerFingerprint: ownerFingerprint,
+            registeredOwner: {
+                activeWebSocketConnections.ownerFingerprint(for: connectionID)
+            },
+            ownerHasLiveConnection: {
+                activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
+            }
+        ) else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+
+        do {
+            let chunk = try snapshotChunkTransfers.fetchChunk(
+                transferId: transferId,
+                chunkIndex: Int(chunkIndex),
+                ownerFingerprint: ownerFingerprint,
+                connectionId: connectionID,
+                hostId: serverId,
+                bootEpoch: bootEpoch
+            )
+            return rpcJSONData([
+                "jsonrpc": "2.0",
+                "id": wireID,
+                "result": chunk.jsonObject,
+            ])
+        } catch let failure as SnapshotChunkTransferFailure {
+            switch failure {
+            case .transferExpired:
+                cancelChunkSnapshotReservation(
+                    connectionID: connectionID,
+                    ownerFingerprint: ownerFingerprint
+                )
+                return rpcJSONData(rpcErrorObject(JSONRPCError(
+                    code: -32041,
+                    message: "Snapshot chunk transfer expired or unknown; request a new baseline.",
+                    data: .object(["reason": .string("transfer_expired")])
+                ), id: wireID))
+            case .transferUnknown:
+                return rpcJSONData(rpcErrorObject(JSONRPCError(
+                    code: -32041,
+                    message: "Snapshot chunk transfer expired or unknown; request a new baseline.",
+                    data: .object(["reason": .string("transfer_unknown")])
+                ), id: wireID))
+            case .identityMismatch, .chunkOutOfRange, .invalidParams, .commitMismatch:
+                return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+            case .payloadTooLarge, .cachePressure:
+                return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
+            }
+        } catch {
+            return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
+        }
+    }
+
+    /// Drop an in-flight watermark reservation without advancing sequence.
+    private func cancelChunkSnapshotReservation(
+        connectionID: String,
+        ownerFingerprint: String
+    ) {
+        activeWebSocketConnections.watermark(
+            for: connectionID,
+            ownerFingerprint: ownerFingerprint
+        )?.cancelSnapshot()
+    }
+
+    /// Evict TTL-expired chunk transfers and cancel any watermark reservations
+    /// they still held (no cursor advance).
+    private func releaseExpiredChunkTransferReservations() {
+        let released = snapshotChunkTransfers.evictExpired()
+        for record in released {
+            cancelChunkSnapshotReservation(
+                connectionID: record.connectionId,
+                ownerFingerprint: record.ownerFingerprint
+            )
         }
     }
 
@@ -1984,6 +3347,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 && first["method"] is String
         }
         return false
+    }
+
+    /// Swift Task priority for dispatching `bodyData` (pure; secret-free).
+    /// Convenience over `RPCDispatchSchedulerClass.taskPriority(for:)`.
+    nonisolated static func rpcDispatchTaskPriority(for bodyData: Data) -> TaskPriority {
+        RPCDispatchSchedulerClass.taskPriority(for: bodyData)
     }
 
     static func connectionOwnerFingerprint(token: String?) -> String {
@@ -2167,6 +3536,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
         var offset = 0
         var tmp = [UInt8](repeating: 0, count: 4096)
         var liveFilter = initialFilter
+        // RFC6455 reassembly lives in WebSocketClientFrameAssembler (FIN/
+        // continuation, interleaved control, 1 MiB aggregate, UTF-8).
+        var assembler = WebSocketClientFrameAssembler()
         while acceptedSockets.isActive(fd) {
             connectionReadWaitObserverForTesting?(fd, .webSocket)
             let n = Self.readRetryingInterrupts {
@@ -2189,14 +3561,37 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // Any bytes from the peer prove the path is live (C-06 traffic liveness).
             liveness.noteInboundTraffic(now: Date().timeIntervalSinceReferenceDate)
             buf.append(contentsOf: tmp[0..<n])
-            while let (frame, consumed) = parseClientFrame(buf, from: offset) {
-                offset += consumed
-                switch frame.opcode {
-                case 0x8: // close
+            parseFrames: while offset < buf.count {
+                let (event, consumed) = assembler.consume(buf: buf, from: offset)
+                switch event {
+                case .needMore:
+                    break parseFrames
+                case .fragmentProgress:
+                    offset += consumed
+                    continue
+                case .peerClose:
+                    offset += consumed
                     _ = outbound.terminate(errorData: nil, closingData: nil, reason: "peerClose")
                     return
-                case 0x9: // ping -> pong
-                    guard frame.payload.count <= 125 else {
+                case .mustClose(let closeCode):
+                    offset += consumed
+                    _ = outbound.terminate(
+                        errorData: nil,
+                        closingData: connectionClosingData(
+                            connectionId: connectionId,
+                            reason: "protocolError",
+                            code: Int(closeCode),
+                            retryable: false,
+                            retryAfterMs: nil
+                        ),
+                        reason: "protocolError"
+                    )
+                    return
+                case .ping(let payload):
+                    offset += consumed
+                    // Assembler already rejects control payloads > 125 / fragmented
+                    // control with mustClose(1002); keep defensive cap for safety.
+                    guard payload.count <= 125 else {
                         _ = outbound.terminate(
                             errorData: nil,
                             closingData: connectionClosingData(
@@ -2210,33 +3605,54 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         )
                         return
                     }
-                    _ = outbound.enqueueControl(opcode: 0xA, data: frame.payload)
-                case 0xA: // pong
+                    _ = outbound.enqueueControl(opcode: 0xA, data: payload)
+                case .pong(let payload):
+                    offset += consumed
                     _ = liveness.acceptPong(
-                        frame.payload,
+                        payload,
                         now: Date().timeIntervalSinceReferenceDate
                     )
                     continue
-                case 0x1:
+                case .text(let payload):
+                    offset += consumed
                     // Wave 4: JSON-RPC over the existing WebSocket (capability
                     // `rpc.websocket`). Transport control frames remain rejected.
-                    if Self.looksLikeJSONRPCRequest(frame.payload) {
-                        let body = frame.payload
+                    if Self.looksLikeJSONRPCRequest(payload) {
+                        let body = payload
                         let fingerprint = ownerFingerprint
-                        Task { [weak self] in
+                        // Scheduler admission only: classify request body so
+                        // large snapshot/replay dispatch does not contend at
+                        // the same Swift Task priority as stop/input/control.
+                        let rpcTaskPriority = RPCDispatchSchedulerClass.taskPriority(for: body)
+                        Task(priority: rpcTaskPriority) { [weak self] in
                             guard let self else { return }
                             let response = await self.dispatchRPC(
                                 bodyData: body,
                                 ownerFingerprint: fingerprint
                             )
-                            // Control queue so hydration RPC replies are not
-                            // stuck behind a full application event backlog.
-                            switch outbound.enqueueControl(opcode: 0x1, data: response) {
-                            case .accepted, .closed:
-                                break
-                            case .queueFull:
-                                _ = outbound.degrade()
-                                _ = outbound.enqueueControl(opcode: 0x1, data: response)
+                            // Stop/input and other interactive RPC replies stay
+                            // on the control lane so they drain ahead of events.
+                            // Large `sync.snapshot` success bodies are bulk under
+                            // the existing nested `result.type == "snapshot"`
+                            // shape: put them on the application bulk lane so an
+                            // accepted snapshot backlog cannot indefinitely
+                            // block control (pong / stop / input) traffic.
+                            if WebSocketOutboundQueue.applicationPriority(of: response) == .bulk {
+                                switch outbound.enqueueApplication(response) {
+                                case .accepted, .closed:
+                                    break
+                                case .queueFull:
+                                    _ = outbound.degrade()
+                                    _ = outbound.enqueueApplication(response)
+                                }
+                            } else {
+                                switch outbound.enqueueControl(opcode: 0x1, data: response) {
+                                case .accepted, .closed:
+                                    break
+                                case .queueFull:
+                                    _ = outbound.degrade()
+                                    _ = outbound.enqueueControl(opcode: 0x1, data: response)
+                                }
                             }
                         }
                         continue
@@ -2244,7 +3660,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     // Mid-session interest: update cellular-safe admission without
                     // tearing down the socket. Unknown to older clients; ignored
                     // when filter is full (fail open).
-                    if let interestIds = EventStreamFilter.parseInterestControl(frame.payload) {
+                    if let interestIds = EventStreamFilter.parseInterestControl(payload) {
                         liveFilter = liveFilter.applyingInterestThreadIds(interestIds)
                         if let subId = subscriberIDBox?.value {
                             EventBus.shared.updateSubscriberFilter(subId, filter: liveFilter)
@@ -2253,7 +3669,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     }
                     let code: String
                     do {
-                        _ = try ConnectionTransportFrame.decodeStrict(frame.payload)
+                        _ = try ConnectionTransportFrame.decodeStrict(payload)
                         code = "unsupportedMessage"
                     } catch {
                         code = "protocolError"
@@ -2270,25 +3686,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         reason: "protocolError"
                     )
                     return
-                case 0x2:
+                case .binary:
+                    offset += consumed
                     _ = outbound.terminate(
                         errorData: connectionErrorData(
                             connectionId: connectionId,
                             code: "protocolError"
                         ),
-                        closingData: connectionClosingData(
-                            connectionId: connectionId,
-                            reason: "protocolError",
-                            code: 1002,
-                            retryable: false,
-                            retryAfterMs: nil
-                        ),
-                        reason: "protocolError"
-                    )
-                    return
-                default:
-                    _ = outbound.terminate(
-                        errorData: nil,
                         closingData: connectionClosingData(
                             connectionId: connectionId,
                             reason: "protocolError",
@@ -2314,8 +3718,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
         }
     }
 
-    private struct WSFrame { let opcode: UInt8; let payload: Data }
-
     /// Pure frame-header parse result. No I/O, no actor. `internal` for unit tests.
     ///
     /// - `shouldReject`: true when the frame is invalid regardless of masking
@@ -2333,6 +3735,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
     /// Parses the two-byte fixed header plus extended-length fields from `buf`
     /// starting at `start`. Returns nil when more bytes are needed.
+    /// Kept for unit tests; the live path uses `WebSocketClientFrameAssembler`.
     static func wsFrameHeader(buf: [UInt8], from start: Int) -> WSFrameHeader? {
         let available = buf.count - start
         guard available >= 2 else { return nil }
@@ -2365,36 +3768,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
         }
         return WSFrameHeader(opcode: opcode, masked: masked,
                              payloadLen: len, headerEnd: idx, shouldReject: false)
-    }
-
-    private func parseClientFrame(_ buf: [UInt8], from start: Int) -> (WSFrame, Int)? {
-        guard let hdr = Self.wsFrameHeader(buf: buf, from: start) else { return nil }
-
-        // Oversized / overflow -- close regardless of masking.
-        if hdr.shouldReject {
-            return (WSFrame(opcode: 0x8, payload: Data()), hdr.headerEnd)
-        }
-
-        // RFC6455 s5.3: clients MUST mask all frames sent to the server.
-        // An unmasked client frame is a protocol error; close with 1002.
-        guard hdr.masked else {
-            return (WSFrame(opcode: 0x8, payload: Data()), hdr.headerEnd)
-        }
-
-        var idx = hdr.headerEnd
-        let available = buf.count - start
-        var maskKey: [UInt8] = [0, 0, 0, 0]
-        guard available >= idx + 4 else { return nil }
-        for i in 0..<4 { maskKey[i] = buf[start + idx + i] }
-        idx += 4
-
-        guard available >= idx + hdr.payloadLen else { return nil }
-        let payloadStart = start + idx
-        var payload = [UInt8](repeating: 0, count: hdr.payloadLen)
-        for i in 0..<hdr.payloadLen {
-            payload[i] = buf[payloadStart + i] ^ maskKey[i & 3]
-        }
-        return (WSFrame(opcode: hdr.opcode, payload: Data(payload)), idx + hdr.payloadLen)
     }
 
     static func pongFrame(payload: Data) -> Data {
@@ -2705,6 +4078,91 @@ public final class DirectStaticFileRegistry: @unchecked Sendable {
         case "txt": return "text/plain; charset=utf-8"
         default: return "application/octet-stream"
         }
+    }
+}
+
+// MARK: - RPC dispatch Task scheduler admission
+
+/// Host-side scheduler admission class for JSON-RPC `dispatchRPC` Tasks.
+///
+/// Pure, secret-free classification of the **encoded request body only**.
+/// Used solely to choose a Swift `TaskPriority` when launching HTTP `/v1/rpc`
+/// and WebSocket JSON-RPC handlers — does **not** change wire fields, response
+/// routing, outbound queue lanes, authentication, or method behavior.
+///
+/// Conservative default is interactive: any malformed body, mutation,
+/// stop/input/control, or mixed batch must not run at bulk/utility priority.
+public enum RPCDispatchSchedulerClass: String, Sendable, Equatable {
+    /// Read-only bulk snapshot / replay work. Maps to `TaskPriority.utility`.
+    case bulk
+    /// Stop/input/control, mutations, mixed batches, unknown methods, malformed.
+    /// Maps to `TaskPriority.userInitiated`.
+    case interactive
+
+    /// Exact read-only bulk methods eligible for lower scheduler priority.
+    /// Intentionally narrow: only known large snapshot/replay surfaces.
+    public static let bulkMethods: Set<String> = [
+        "sync.snapshot",
+        "sync.snapshot.begin",
+        "sync.snapshot.chunk",
+        "sync.snapshot.commit",
+        "events.recent",
+    ]
+
+    /// Pure classifier for an encoded JSON-RPC request body (single or batch).
+    ///
+    /// - Bulk: single call whose `method` is in `bulkMethods`, or a non-empty
+    ///   batch where **every** item is bulk (snapshot-only batches).
+    /// - Interactive: malformed JSON, empty batch, non-object items, missing
+    ///   method, any non-bulk method (mutations, stop/input/control, etc.),
+    ///   or a mixed batch containing any interactive item.
+    public static func classify(bodyData: Data) -> RPCDispatchSchedulerClass {
+        let root: Any
+        do {
+            root = try JSONSerialization.jsonObject(with: bodyData, options: [.fragmentsAllowed])
+        } catch {
+            return .interactive
+        }
+
+        if let batch = root as? [Any] {
+            // Empty batch is invalid request shape → treat conservatively.
+            guard !batch.isEmpty else { return .interactive }
+            for item in batch {
+                guard isBulkRequestObject(item) else { return .interactive }
+            }
+            return .bulk
+        }
+
+        if isBulkRequestObject(root) {
+            return .bulk
+        }
+        return .interactive
+    }
+
+    /// Swift Task priority for a classified body. Bulk → utility (lower);
+    /// interactive → userInitiated (higher). No semaphores or thread parking.
+    public static func taskPriority(for bodyData: Data) -> TaskPriority {
+        switch classify(bodyData: bodyData) {
+        case .bulk: return .utility
+        case .interactive: return .userInitiated
+        }
+    }
+
+    /// Task priority for an already-classified admission class.
+    public var taskPriority: TaskPriority {
+        switch self {
+        case .bulk: return .utility
+        case .interactive: return .userInitiated
+        }
+    }
+
+    /// True when `value` is a JSON-RPC request object whose `method` is bulk.
+    private static func isBulkRequestObject(_ value: Any) -> Bool {
+        guard let object = value as? [String: Any],
+              let method = object["method"] as? String else {
+            return false
+        }
+        return bulkMethods.contains(method)
     }
 }
 

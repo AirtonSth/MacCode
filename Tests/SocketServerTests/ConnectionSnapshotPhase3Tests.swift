@@ -179,10 +179,7 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
         defer { socket.cancel(with: .normalClosure, reason: nil) }
         let welcome = try await receiveObject(socket)
         let connectionID = try XCTUnwrap(welcome["connectionId"] as? String)
-        XCTAssertEqual(welcome["capabilities"] as? [String], [
-            "events.replay", "jsonrpc.batch", "snapshot.v3",
-            "rpc.websocket", "snapshot.incremental",
-        ])
+        XCTAssertEqual(welcome["capabilities"] as? [String], DirectHTTPServer.welcomeCapabilities())
 
         let validParams: [String: Any] = [
             "connectionId": connectionID,
