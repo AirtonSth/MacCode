@@ -396,6 +396,83 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
                        "Lifecycle updates must reconcile to one logical receipt per run.")
     }
 
+    func testChildAdmissionPersistsDistinctProviderNeutralWorkerLifecycle() throws {
+        // WHY: the Subagents surface must represent the actual controlled child,
+        // not duplicate the root route as if it were a worker.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false }
+        )
+        let parent = try runtime.admit(
+            runId: AgentRunID(),
+            threadId: AgentThreadID(),
+            configuration: configuration(runtime: runtime),
+            providerSnapshots: snapshots(),
+            interactionMode: .default,
+            permissionMode: .supervised,
+            attachments: []
+        ).receipt
+        let childRun = AgentRunID()
+        let child = try runtime.admitChild(
+            parentReceipt: parent,
+            runId: childRun,
+            nodeId: "deep-worker-plan-writer"
+        )
+
+        XCTAssertEqual(child.parentReceiptId, parent.id)
+        XCTAssertEqual(child.threadId, parent.threadId)
+        XCTAssertEqual(child.provider, parent.provider)
+        XCTAssertEqual(child.nodeId, "deep-worker-plan-writer")
+        XCTAssertEqual(child.lifecycleStatus, .accepted)
+        XCTAssertEqual(Set(try repository.receipts().map(\.id)), Set([parent.id, child.id]))
+
+        try runtime.finalizeReceipt(runId: childRun, status: .completed)
+        let finalized = try XCTUnwrap(repository.receipt(runId: childRun))
+        XCTAssertEqual(finalized.lifecycleStatus, .finalized)
+        XCTAssertEqual(finalized.finalRunStatus, .completed)
+        XCTAssertEqual(finalized.parentReceiptId, parent.id)
+    }
+
+    func testExternalChildBridgeRoundTripsIntoRecentReceipts() throws {
+        // WHY: skill-launched Codex/Claude/Grok workers use the external bridge;
+        // the Subagents surface must read the same durable receipt after the
+        // worker process exits, without requiring the controller process.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false }
+        )
+        let runId = AgentRunID()
+        let threadId = AgentThreadID()
+        let receipt = try runtime.recordExternalChild(
+            runId: runId,
+            threadId: threadId,
+            provider: .grok,
+            providerInstanceId: "fixture-grok",
+            model: "fixture-model",
+            nodeId: "external-worker"
+        )
+
+        XCTAssertNil(receipt.parentReceiptId)
+        XCTAssertEqual(receipt.provider, .grok)
+        XCTAssertEqual(receipt.threadId, threadId)
+        XCTAssertEqual(receipt.lifecycleStatus, .accepted)
+        XCTAssertEqual(try runtime.recentReceipts().map(\.id), [receipt.id])
+
+        try runtime.finalizeReceipt(runId: runId, status: .completed)
+        let finalized = try XCTUnwrap(runtime.recentReceipts().first)
+        XCTAssertEqual(finalized.id, receipt.id)
+        XCTAssertEqual(finalized.lifecycleStatus, .finalized)
+        XCTAssertEqual(finalized.finalRunStatus, .completed)
+    }
+
     func testCatalogProvenanceRequiresVerifiedLiveCatalogAndStreamingCapability() {
         XCTAssertEqual(
             AgentProviderCatalogProvenance.resolvedSource(

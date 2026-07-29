@@ -358,7 +358,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             }
                             return nil
                         }()
-                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: title, initialThreadId: restoredThreadId)
+                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: title, initialThreadId: restoredThreadId, orchestrationRuntime: ctx.orchestrationRuntime)
                         agent.viewModel.onSelectedThreadChanged = { [weak self, weak agent] threadID in
                             guard let self, let agent else { return }
                             self.persistAgentSelectedThread(surfaceID: agent.descriptor.id, threadID: threadID)
@@ -4462,16 +4462,24 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // instead of "unknown". Set unconditionally — even with no instance config.
         env["REMOTE_CODE_AGENT_PROVIDER"] = provider.rawValue
         if let context, let threadId {
+            let telemetryEnv = context.subagentTelemetryEnvironment(
+                provider: provider,
+                threadId: threadId
+            )
+            env.merge(telemetryEnv) { _, new in new }
             // task-08: Token Saver PATH/hint only when same-user admission allows.
             let tokenSaverEnv = context.tokenSaverAgentEnvironment(provider: provider, threadId: threadId)
             if tokenSaverEnv.isEmpty {
-                // Cross-user / raw-only: scrub Token Saver keys and managed distill PATH.
+                // Cross-user / raw-only: scrub Token Saver keys and managed distill PATH;
+                // always-on Subagents telemetry remains content-free and scoped.
                 return Self.scrubTokenSaverEnvironment(env)
             }
-            env["PATH"] = Self.providerPathWithManagedWrappers(
-                currentPath: env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? "",
-                managedBin: AgentSkillInstaller.defaultManagedCLIBinDirectory().path
-            )
+            if tokenSaverEnv["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
+                env["PATH"] = Self.providerPathWithManagedWrappers(
+                    currentPath: env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? "",
+                    managedBin: AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+                )
+            }
             env.merge(tokenSaverEnv) { _, new in new }
         } else {
             // No thread context: keep provider tag only; scrub any residual TS keys.
@@ -4482,10 +4490,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     /// Removes Token Saver env keys and managed distill bin from PATH (task-08 raw-only).
     nonisolated static func scrubTokenSaverEnvironment(_ env: [String: String]) -> [String: String] {
-        var cleaned = env
-        for key in env.keys where key.hasPrefix("RC_TOKEN_SAVER_") || key == "REMOTE_CODE_DISTILL_STATE_PATH" {
-            cleaned.removeValue(forKey: key)
-        }
+        var cleaned = TokenSaverExecutionReceiptSeam.scrub(env)
         let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
         if let path = cleaned["PATH"] {
             let parts = path.split(separator: ":").map(String.init).filter { $0 != managedBin }
@@ -5332,7 +5337,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: nil, title: baseTitle))
             case .agentApp:
                 guard let ctx = context else { return descriptor }
-                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, draftRepo: AgentThreadDraftRepository(db: ctx.db), attachmentStore: AgentAttachmentStore(root: ctx.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)), queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: baseTitle, initialThreadId: initialThreadId)
+                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, draftRepo: AgentThreadDraftRepository(db: ctx.db), attachmentStore: AgentAttachmentStore(root: ctx.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)), queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: baseTitle, initialThreadId: initialThreadId, orchestrationRuntime: ctx.orchestrationRuntime)
                 // Per-surface thread binding: persist this surface's selected
                 // thread into its descriptor metadata so app restart restores it.
                 agent.viewModel.onSelectedThreadChanged = { [weak self, weak agent] threadID in

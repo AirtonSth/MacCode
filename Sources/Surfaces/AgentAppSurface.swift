@@ -219,6 +219,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var currentRunId: AgentRunID?
     @Published public var hasUnreadActivity: Bool = false
     @Published public var showPlanSidebar: Bool = false
+    /// Provider-neutral Subagents activity derived from admission receipts +
+    /// coordinator active runs. Empty until the first refresh; never invents rows.
+    @Published public private(set) var subagentActivity: SubagentActivitySnapshot = .empty
     @Published public var interactionMode: AgentInteractionMode = .default
     @Published public var planNotes: String = ""
     /// C1: git branch + working-tree summary of the agent's dir, for the
@@ -663,6 +666,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
         }
         repairPlaceholderThreadTitles()
+        refreshSubagentActivity()
         // reloadThreads() is a PURE data reload — it must not change the
         // selection. A new/empty tab stays thread-free (fresh composer) instead
         // of auto-adopting threads.first (the new-tab-clone bug). The only
@@ -674,6 +678,27 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             publishInterestedThreadId(nil)
             onSelectedThreadChanged?(nil)
         }
+    }
+
+    /// Rebuild Subagents snapshot from persisted admission receipts and the
+    /// coordinator's current active-run set. Fail open to empty on read errors.
+    public func refreshSubagentActivity() {
+        guard !isDisposed else { return }
+        let receipts = (try? orchestrationRuntime.recentReceipts(
+            limit: SubagentActivityProjection.defaultReceiptFetchLimit
+        )) ?? []
+        let workspaceThreadIds = Set(threads.map(\.id))
+        let activeRunIds = Set(
+            coordinator.activeThreadIdsSnapshot().compactMap { threadId in
+                coordinator.activeRunId(threadId: threadId)
+            }
+        )
+        subagentActivity = SubagentActivityProjection.project(
+            receipts: receipts,
+            workspaceThreadIds: workspaceThreadIds,
+            activeRunIds: activeRunIds,
+            now: clock()
+        )
     }
 
     /// Drop surface `runThreads` entries that no longer match a live coordinator
@@ -5565,6 +5590,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.runThreads[runId] = nil
                 _ = self.coordinator.reconcileStaleActiveOwnershipWithDurableState()
             }
+            // Admission receipts finalize on terminal status; refresh so Active/Done
+            // lists track real lifecycle without a separate poll.
+            self.refreshSubagentActivity()
             self.onRunStateChange?()
         }
     }
@@ -6746,6 +6774,8 @@ public struct AgentAppView: View {
     /// Source/account capsule popover (Codex / Claude / Grok). Always openable so
     /// locked/single-source states fail loud instead of a dead click.
     @State private var showSourceOptions = false
+    /// Subagents activity popover (provider-neutral Active/Done list).
+    @State private var showSubagentActivity = false
     // UX-MAC_AGENT-013: inline custom-model entry replaces the blocking NSAlert.
     @State private var showCustomModelField = false
     @State private var customModelDraft = ""
@@ -7877,6 +7907,15 @@ public struct AgentAppView: View {
                 // populated on startup, not only after a manual retry.
                 await vm.loadModels()
             }
+            // External provider workers write receipts from another process, so
+            // there is no in-process EventBus event to invalidate this view.
+            // Poll only the bounded, content-free local ledger while the surface
+            // is alive; task cancellation stops the timer when the surface closes.
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard !Task.isCancelled else { break }
+                vm.refreshSubagentActivity()
+            }
         }
         .onDeleteCommand { deleteSelectedThreads() }
         // P1: confirm before deleting threads — irreversible and instant otherwise.
@@ -8250,6 +8289,15 @@ public struct AgentAppView: View {
                 .foregroundColor(DS.Palette.textTertiary)
                 .lineLimit(1).truncationMode(.middle)
             Spacer(minLength: 0)
+            // Provider-neutral Subagents activity (admission receipts + coordinator).
+            // Compact badge + popover; does not touch transcript/composer.
+            if !vm.subagentActivity.isEmpty || showSubagentActivity {
+                SubagentActivityBadge(
+                    snapshot: vm.subagentActivity,
+                    now: vm.currentTime(),
+                    isPresented: $showSubagentActivity
+                )
+            }
             // CLAUDE-BG-LIFECYCLE: mirrors the Claude CLI's own "1 shell"
             // status-line indicator, so background shells / async subagents are
             // visible WHILE they run — not only after the turn ends via the
@@ -13117,11 +13165,11 @@ public final class AgentAppSurface: NSObject, Surface {
     /// Set by AppCommandRouter immediately after subscribe (mirrors Feed pattern).
     public var onClose: (() -> Void)?
 
-    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, draftRepo: AgentThreadDraftRepository? = nil, attachmentStore: AgentAttachmentStore? = nil, queuedMessageRepo: AgentQueuedMessageRepository? = nil, providerSessionRepo: ProviderSessionRuntimeRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App", initialThreadId: AgentThreadID? = nil) {
+    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, draftRepo: AgentThreadDraftRepository? = nil, attachmentStore: AgentAttachmentStore? = nil, queuedMessageRepo: AgentQueuedMessageRepository? = nil, providerSessionRepo: ProviderSessionRuntimeRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App", initialThreadId: AgentThreadID? = nil, orchestrationRuntime: AgentOrchestrationRuntime = AgentOrchestrationRuntime()) {
         var metadata = ["workspace": workspaceID.value.uuidString, "cwd": cwd]
         if let initialThreadId { metadata["selected_thread"] = initialThreadId.value.uuidString }
         self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: metadata)
-        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, draftRepo: draftRepo, attachmentStore: attachmentStore, queuedMessageRepo: queuedMessageRepo, providerSessionRepo: providerSessionRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore, initialThreadId: initialThreadId, initialRoutingMode: .auto, newThreadDefaultsStore: .shared)
+        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, draftRepo: draftRepo, attachmentStore: attachmentStore, queuedMessageRepo: queuedMessageRepo, providerSessionRepo: providerSessionRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore, initialThreadId: initialThreadId, initialRoutingMode: .auto, newThreadDefaultsStore: .shared, orchestrationRuntime: orchestrationRuntime)
         let host = NSHostingView(rootView: AgentAppView(vm: viewModel))
         host.translatesAutoresizingMaskIntoConstraints = false
         let container = NSView()

@@ -137,8 +137,470 @@ public enum AgentHostEnvironmentMerge {
     public static func isHostInjectedKey(_ key: String) -> Bool {
         key.hasPrefix("RC_GRAPHIFY_")
             || key.hasPrefix("RC_TOKEN_SAVER_")
-            || key == "RC_TOKEN_SAVER_DISTILL_HINT"
             || key.hasPrefix("RC_DISTILL_")
+            // Claude PostToolUse sidecar path is host-owned Token Saver state (not a secret).
+            || key == "REMOTE_CODE_DISTILL_STATE_PATH"
+    }
+}
+
+// MARK: - Token Saver execution receipt (nested-worker propagation)
+
+/// Host-authoritative, content-free Token Saver capabilities for one provider
+/// root. Child orchestration processes inherit this environment unchanged.
+public struct TokenSaverExecutionReceipt: Codable, Sendable, Equatable {
+    public static let schemaVersion = 1
+    public static let envKey = "RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1"
+
+    public enum DenialReason: String, Codable, Sendable, Equatable {
+        case none
+        case tokenSaverOff = "token_saver_off"
+        case crossUser = "cross_user"
+        case sidecarUnavailable = "sidecar_unavailable"
+    }
+
+    /// `nil` means the provider does not expose that capability. A supported
+    /// capability that is currently unavailable is represented by `false`.
+    public struct Capabilities: Codable, Sendable, Equatable {
+        public let distill: Bool?
+        public let graphify: Bool?
+        public let postToolUse: Bool?
+        public let recoveryScope: Bool?
+        public let managedPath: Bool?
+
+        public init(
+            distill: Bool? = nil,
+            graphify: Bool? = nil,
+            postToolUse: Bool? = nil,
+            recoveryScope: Bool? = nil,
+            managedPath: Bool? = nil
+        ) {
+            self.distill = distill
+            self.graphify = graphify
+            self.postToolUse = postToolUse
+            self.recoveryScope = recoveryScope
+            self.managedPath = managedPath
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case distill, graphify
+            case postToolUse = "post_tool_use"
+            case recoveryScope = "recovery_scope"
+            case managedPath = "managed_path"
+        }
+    }
+
+    public let schemaVersion: Int
+    public let rootRunId: String?
+    public let threadId: String
+    public let attemptId: String?
+    public let provider: String
+    public let admitted: Bool
+    public let sameUser: Bool
+    public let denialReason: DenialReason
+    public let capabilities: Capabilities
+    public let disabledLanes: [String]
+    public let enabledLanes: [String]
+    public let workspaceId: String?
+    public let projectId: String?
+    public let waveLive: String?
+
+    public init(
+        schemaVersion: Int = TokenSaverExecutionReceipt.schemaVersion,
+        rootRunId: String? = nil,
+        threadId: String,
+        attemptId: String? = nil,
+        provider: String,
+        admitted: Bool,
+        sameUser: Bool,
+        denialReason: DenialReason = .none,
+        capabilities: Capabilities = Capabilities(),
+        disabledLanes: [String] = [],
+        enabledLanes: [String] = [],
+        workspaceId: String? = nil,
+        projectId: String? = nil,
+        waveLive: String? = nil
+    ) {
+        self.schemaVersion = schemaVersion
+        self.rootRunId = rootRunId
+        self.threadId = threadId
+        self.attemptId = attemptId
+        self.provider = provider
+        self.admitted = admitted
+        self.sameUser = sameUser
+        self.denialReason = denialReason
+        self.capabilities = capabilities
+        self.disabledLanes = disabledLanes.sorted()
+        self.enabledLanes = enabledLanes.sorted()
+        self.workspaceId = workspaceId
+        self.projectId = projectId
+        self.waveLive = waveLive
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "v"
+        case rootRunId = "root_run_id"
+        case threadId = "thread_id"
+        case attemptId = "attempt_id"
+        case provider, admitted
+        case sameUser = "same_user"
+        case denialReason = "denial_reason"
+        case capabilities
+        case disabledLanes = "disabled_lanes"
+        case enabledLanes = "enabled_lanes"
+        case workspaceId = "workspace_id"
+        case projectId = "project_id"
+        case waveLive = "wave_live"
+    }
+
+    public func encodedJSONString() -> String? {
+        guard TokenSaverExecutionReceiptSeam.isValid(self) else { return nil }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(self),
+              data.count <= TokenSaverExecutionReceiptSeam.maximumEncodedBytes,
+              let text = String(data: data, encoding: .utf8),
+              !TokenSaverExecutionReceiptSeam.containsDisallowedContent(text) else {
+            return nil
+        }
+        return text
+    }
+
+    public static func decode(json: String) -> TokenSaverExecutionReceipt? {
+        guard let data = json.data(using: .utf8),
+              data.count <= TokenSaverExecutionReceiptSeam.maximumEncodedBytes,
+              !TokenSaverExecutionReceiptSeam.containsDisallowedContent(json),
+              TokenSaverExecutionReceiptSeam.hasOnlyReceiptKeys(data),
+              let receipt = try? JSONDecoder().decode(TokenSaverExecutionReceipt.self, from: data),
+              TokenSaverExecutionReceiptSeam.isValid(receipt) else {
+            return nil
+        }
+        return receipt
+    }
+
+    fileprivate func stamping(rootRunId: String, attemptId: String) -> TokenSaverExecutionReceipt {
+        TokenSaverExecutionReceipt(
+            schemaVersion: schemaVersion,
+            rootRunId: rootRunId,
+            threadId: threadId,
+            attemptId: attemptId,
+            provider: provider,
+            admitted: admitted,
+            sameUser: sameUser,
+            denialReason: denialReason,
+            capabilities: capabilities,
+            disabledLanes: disabledLanes,
+            enabledLanes: enabledLanes,
+            workspaceId: workspaceId,
+            projectId: projectId,
+            waveLive: waveLive
+        )
+    }
+}
+
+/// One environment seam for root, resumed, retried, recovered, and inherited
+/// provider processes. It transports capability decisions; it does not decide
+/// skill/exact-output policy or carry provider content.
+public enum TokenSaverExecutionReceiptSeam {
+    public static let disabledLanesEnvKey = "RC_TOKEN_SAVER_DISABLED_LANES"
+    public static let enabledLanesEnvKey = "RC_TOKEN_SAVER_ENABLED_LANES"
+    public static let maximumEncodedBytes = 4_096
+
+    public static func admit(
+        tokenSaverEnabled: Bool,
+        sameUser: Bool,
+        sidecarAvailable: Bool,
+        provider: AgentProvider,
+        threadId: String,
+        rootRunId: String? = nil,
+        attemptId: String? = nil,
+        workspaceId: String? = nil,
+        projectId: String? = nil,
+        disabledLanes: Set<String> = [],
+        enabledLanes: Set<String> = [],
+        waveLive: String? = nil,
+        graphifyActive: Bool = false
+    ) -> TokenSaverExecutionReceipt {
+        if !sameUser {
+            return rawDenied(
+                reason: .crossUser,
+                provider: provider,
+                threadId: threadId,
+                rootRunId: rootRunId,
+                attemptId: attemptId,
+                sameUser: false
+            )
+        }
+        if !tokenSaverEnabled {
+            return rawDenied(
+                reason: .tokenSaverOff,
+                provider: provider,
+                threadId: threadId,
+                rootRunId: rootRunId,
+                attemptId: attemptId,
+                sameUser: true
+            )
+        }
+        let postToolUse: Bool? = {
+            switch provider {
+            case .claude:
+                return sidecarAvailable
+            case .codex, .grok:
+                return nil
+            }
+        }()
+        let effectiveEnabledLanes = enabledLanes.subtracting(disabledLanes)
+        return TokenSaverExecutionReceipt(
+            rootRunId: rootRunId,
+            threadId: threadId,
+            attemptId: attemptId,
+            provider: provider.rawValue,
+            admitted: true,
+            sameUser: true,
+            denialReason: sidecarAvailable ? .none : .sidecarUnavailable,
+            capabilities: .init(
+                distill: sidecarAvailable,
+                graphify: graphifyActive,
+                postToolUse: postToolUse,
+                recoveryScope: workspaceId != nil,
+                managedPath: sidecarAvailable
+            ),
+            disabledLanes: Array(disabledLanes),
+            enabledLanes: Array(effectiveEnabledLanes),
+            workspaceId: workspaceId,
+            projectId: projectId ?? workspaceId,
+            waveLive: sidecarAvailable ? waveLive : nil
+        )
+    }
+
+    /// Denied receipts are useful to test and audit the pure admission decision,
+    /// but are never emitted into a provider environment.
+    public static func environment(from receipt: TokenSaverExecutionReceipt) -> [String: String] {
+        guard receipt.admitted, let encoded = receipt.encodedJSONString() else { return [:] }
+        var env = [TokenSaverExecutionReceipt.envKey: encoded]
+        if !receipt.disabledLanes.isEmpty {
+            env[disabledLanesEnvKey] = receipt.disabledLanes.joined(separator: ",")
+        }
+        if !receipt.enabledLanes.isEmpty {
+            env[enabledLanesEnvKey] = receipt.enabledLanes.joined(separator: ",")
+        }
+        if receipt.capabilities.distill == true {
+            env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1"
+            if let waveLive = receipt.waveLive, !waveLive.isEmpty {
+                env["RC_TOKEN_SAVER_WAVE_LIVE"] = waveLive
+            }
+        }
+        if receipt.capabilities.recoveryScope == true {
+            env["RC_TOKEN_SAVER_WORKSPACE_ID"] = receipt.workspaceId
+            env["RC_TOKEN_SAVER_PROJECT_ID"] = receipt.projectId
+            env["RC_TOKEN_SAVER_THREAD_ID"] = receipt.threadId
+        }
+        if let rootRunId = receipt.rootRunId {
+            env["RC_TOKEN_SAVER_ROOT_RUN_ID"] = rootRunId
+        }
+        if let attemptId = receipt.attemptId,
+           receipt.capabilities.distill == true || receipt.capabilities.recoveryScope == true {
+            env["RC_TOKEN_SAVER_ATTEMPT_ID"] = attemptId
+        }
+        if receipt.capabilities.postToolUse == true {
+            env["RC_TOKEN_SAVER_POST_TOOL_USE"] = "1"
+        }
+        return env.compactMapValues { $0 }
+    }
+
+    public static func receipt(from environment: [String: String]) -> TokenSaverExecutionReceipt? {
+        environment[TokenSaverExecutionReceipt.envKey]
+            .flatMap(TokenSaverExecutionReceipt.decode(json:))
+    }
+
+    /// Rebuild the discrete environment only from the signed-off receipt shape.
+    /// A malformed, denied, or provider-mismatched receipt is scrubbed to raw.
+    public static func propagate(
+        into environment: [String: String],
+        provider: AgentProvider
+    ) -> [String: String] {
+        guard environment[TokenSaverExecutionReceipt.envKey] != nil else {
+            return scrub(environment) // legacy hosts fail open without a receipt
+        }
+        guard let receipt = receipt(from: environment),
+              receipt.admitted,
+              receipt.provider == provider.rawValue else {
+            return scrub(environment)
+        }
+        return applying(receipt, to: environment)
+    }
+
+    /// Bind a new attempt without changing the durable root identity. This is
+    /// used for normal sends, retries/resumes, and crash-recovery launches.
+    public static func stampIdentity(
+        environment: [String: String],
+        rootRunId: String,
+        attemptId: String,
+        provider: AgentProvider
+    ) -> [String: String] {
+        guard environment[TokenSaverExecutionReceipt.envKey] != nil else {
+            var legacy = environment
+            if legacy["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
+                legacy["RC_TOKEN_SAVER_ATTEMPT_ID"] = attemptId
+            }
+            return legacy
+        }
+        guard let receipt = receipt(from: environment),
+              receipt.admitted,
+              receipt.provider == provider.rawValue else {
+            return scrub(environment)
+        }
+        return applying(
+            receipt.stamping(rootRunId: rootRunId, attemptId: attemptId),
+            to: environment
+        )
+    }
+
+    public static func scrub(_ environment: [String: String]) -> [String: String] {
+        var cleaned = environment
+        for key in environment.keys
+        where key.hasPrefix("RC_GRAPHIFY_")
+            || key.hasPrefix("RC_TOKEN_SAVER_")
+            || key.hasPrefix("RC_DISTILL_")
+            || key == "REMOTE_CODE_DISTILL_STATE_PATH" {
+            cleaned.removeValue(forKey: key)
+        }
+        if let path = cleaned["PATH"] {
+            let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+            let rawParts = path.split(separator: ":").map(String.init)
+            let scrubbedParts = rawParts.filter { $0 != managedBin }
+            cleaned["PATH"] = scrubbedParts.joined(separator: ":")
+        }
+        return cleaned
+    }
+
+    public static func containsDisallowedContent(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        let markers = [
+            "prompt", "transcript", "raw_output", "tool_output", "authorization",
+            "password", "secret", "api_key", "private_key", "bootstrap_token",
+            "sidecar_token", "sk-ant-", "sk-or-"
+        ]
+        return text.utf8.count > maximumEncodedBytes
+            || markers.contains { lower.contains($0) }
+    }
+
+    fileprivate static func isValid(_ receipt: TokenSaverExecutionReceipt) -> Bool {
+        guard receipt.schemaVersion == TokenSaverExecutionReceipt.schemaVersion,
+              UUID(uuidString: receipt.threadId) != nil,
+              let provider = AgentProvider(rawValue: receipt.provider),
+              receipt.rootRunId.map({ UUID(uuidString: $0) != nil }) ?? true,
+              receipt.attemptId.map({ UUID(uuidString: $0) != nil }) ?? true,
+              receipt.workspaceId.map({ UUID(uuidString: $0) != nil }) ?? true,
+              receipt.projectId.map({ UUID(uuidString: $0) != nil }) ?? true,
+              receipt.disabledLanes.allSatisfy({ isSafeToken($0, maximumLength: 64) }),
+              receipt.enabledLanes.allSatisfy({ isSafeToken($0, maximumLength: 64) }),
+              receipt.waveLive.map({
+                  $0.split(separator: ",").allSatisfy {
+                      isSafeToken(String($0), maximumLength: 64)
+                  }
+              }) ?? true else {
+            return false
+        }
+        let capabilities = receipt.capabilities
+        if provider != .claude, capabilities.postToolUse != nil {
+            return false
+        }
+        if receipt.sameUser == false {
+            return receipt.admitted == false
+                && receipt.denialReason == .crossUser
+                && capabilities.distill == false
+                && capabilities.graphify == false
+                && capabilities.postToolUse != true
+                && capabilities.recoveryScope == false
+                && capabilities.managedPath == false
+                && receipt.waveLive == nil
+        }
+        guard receipt.admitted || receipt.denialReason == .tokenSaverOff else {
+            return false
+        }
+        if !receipt.admitted {
+            return receipt.denialReason == .tokenSaverOff
+                && capabilities.distill == false
+                && capabilities.graphify == false
+                && capabilities.postToolUse != true
+                && capabilities.recoveryScope == false
+                && capabilities.managedPath == false
+                && receipt.waveLive == nil
+        }
+        if receipt.denialReason == .sidecarUnavailable {
+            return capabilities.distill == false
+                && capabilities.managedPath == false
+                && capabilities.postToolUse != true
+                && receipt.waveLive == nil
+        }
+        return receipt.denialReason == .none
+            && capabilities.distill == true
+            && capabilities.managedPath == true
+    }
+
+    fileprivate static func hasOnlyReceiptKeys(_ data: Data) -> Bool {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        let allowedTopLevel: Set<String> = [
+            "v", "root_run_id", "thread_id", "attempt_id", "provider", "admitted",
+            "same_user", "denial_reason", "capabilities", "disabled_lanes",
+            "enabled_lanes", "workspace_id", "project_id", "wave_live"
+        ]
+        guard Set(object.keys).isSubset(of: allowedTopLevel),
+              let capabilities = object["capabilities"] as? [String: Any] else {
+            return false
+        }
+        let allowedCapabilities: Set<String> = [
+            "distill", "graphify", "post_tool_use", "recovery_scope", "managed_path"
+        ]
+        return Set(capabilities.keys).isSubset(of: allowedCapabilities)
+    }
+
+    private static func applying(
+        _ receipt: TokenSaverExecutionReceipt,
+        to environment: [String: String]
+    ) -> [String: String] {
+        let statePath = environment["REMOTE_CODE_DISTILL_STATE_PATH"]
+        var updated = scrub(environment)
+        updated.merge(self.environment(from: receipt)) { _, receiptValue in receiptValue }
+        if receipt.capabilities.postToolUse == true, let statePath, !statePath.isEmpty {
+            updated["REMOTE_CODE_DISTILL_STATE_PATH"] = statePath
+        }
+        return updated
+    }
+
+    private static func rawDenied(
+        reason: TokenSaverExecutionReceipt.DenialReason,
+        provider: AgentProvider,
+        threadId: String,
+        rootRunId: String?,
+        attemptId: String?,
+        sameUser: Bool
+    ) -> TokenSaverExecutionReceipt {
+        TokenSaverExecutionReceipt(
+            rootRunId: rootRunId,
+            threadId: threadId,
+            attemptId: attemptId,
+            provider: provider.rawValue,
+            admitted: false,
+            sameUser: sameUser,
+            denialReason: reason,
+            capabilities: .init(
+                distill: false,
+                graphify: false,
+                postToolUse: provider == .claude ? false : nil,
+                recoveryScope: false,
+                managedPath: false
+            )
+        )
+    }
+
+    private static func isSafeToken(_ value: String, maximumLength: Int) -> Bool {
+        guard !value.isEmpty, value.count <= maximumLength else { return false }
+        return value.unicodeScalars.allSatisfy {
+            CharacterSet.alphanumerics.contains($0) || "-_.".unicodeScalars.contains($0)
+        }
     }
 }
 
@@ -688,9 +1150,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         var effectiveEnvironment = request.environment
         let scopedEnvironment = await runEnvironmentProvider?(request.provider, request.threadId, request.environment) ?? [:]
         effectiveEnvironment.merge(scopedEnvironment) { _, scoped in scoped }
-        if effectiveEnvironment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
-            effectiveEnvironment["RC_TOKEN_SAVER_ATTEMPT_ID"] = request.runId.value.uuidString
-        }
+        // Host-authoritative attempt identity: stamp discrete keys + compact receipt
+        // so nested Codex/Claude/Grok workers inherit the same attempt for attribution.
+        let attemptId = request.runId.value.uuidString
+        effectiveEnvironment = TokenSaverExecutionReceiptSeam.stampIdentity(
+            environment: effectiveEnvironment,
+            rootRunId: attemptId,
+            attemptId: attemptId,
+            provider: request.provider
+        )
         let effectiveRequest = AgentRunRequest(
             runId: request.runId,
             threadId: request.threadId,
@@ -1035,7 +1503,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 )
             case .preferredSourceUnavailable, .noEligibleProvider, .invalidRoutingMode,
                  .deadlineExpired, .invalidBudget, .costBudgetUnavailable, .quotaExceeded,
-                 .receiptPersistenceFailed:
+                 .receiptPersistenceFailed, .invalidChildAdmission:
                 throw error
             }
         }
@@ -2526,12 +2994,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // Recovered sessions are rebuilt here, bypassing the app shell's providerEnvironment, so
         // re-derive the Token Saver env or distill silently turns off on resume. Always keep the
         // provider tag so `| distill` savings attribute to claude/codex (not "unknown").
+        let recoveryRunID = AgentRunID()
+        let recoveryEventRunId = try recoveryEventRunId(session: session, thread: thread)
         var environment = await recoveryEnvironmentProvider?(thread.provider, threadId) ?? [:]
         environment["REMOTE_CODE_AGENT_PROVIDER"] = thread.provider.rawValue
-        let recoveryRunID = AgentRunID()
-        if environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
-            environment["RC_TOKEN_SAVER_ATTEMPT_ID"] = recoveryRunID.value.uuidString
-        }
+        // Resume bypasses providerEnvironment; re-stamp attempt + receipt so distill
+        // attribution and nested worker inheritance match a normal startRun path.
+        let recoveryAttempt = recoveryRunID.value.uuidString
+        environment = TokenSaverExecutionReceiptSeam.stampIdentity(
+            environment: environment,
+            rootRunId: recoveryEventRunId.value.uuidString,
+            attemptId: recoveryAttempt,
+            provider: thread.provider
+        )
         let request = AgentRunRequest(
             runId: recoveryRunID,
             threadId: threadId,
@@ -2549,7 +3024,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             extraArgs: activeTurnId.map { ["remotecode.recovery.activeTurnId=\($0)"] } ?? [],
             runAsUser: thread.runAsUser
         )
-        let recoveryEventRunId = try recoveryEventRunId(session: session, thread: thread)
         try await adapter.recoverSession(request) { [weak self] event in
             self?.handle(event: event, runId: recoveryEventRunId, threadId: threadId)
         }

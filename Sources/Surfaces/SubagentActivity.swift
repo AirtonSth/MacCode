@@ -1,0 +1,827 @@
+import Foundation
+import SwiftUI
+import CoreModel
+import AgentRuntime
+import DesignSystemKit
+
+// MARK: - Provider-neutral activity model
+//
+// Source of truth: `AgentOrchestrationAdmissionReceipt` lifecycle fields only.
+// Missing values stay nil / `.unknown` — never invented zeros or success.
+
+/// Lifecycle phase shown in the Subagents surface. Distinct from provider identity.
+public enum SubagentActivityPhase: String, Sendable, Equatable, CaseIterable {
+    case working
+    case completed
+    case failed
+    case cancelled
+    case unknown
+}
+
+/// Normalized provider identity for glyph/color. Unknown stays explicit.
+public enum SubagentProviderKind: String, Sendable, Equatable, CaseIterable {
+    case codex
+    case claude
+    case grok
+    case unknown
+}
+
+/// One row in the Subagents Active / Done lists.
+public struct SubagentActivityItem: Identifiable, Sendable, Equatable {
+    public let id: UUID
+    public let runId: AgentRunID?
+    public let threadId: AgentThreadID
+    public let nodeId: String
+    public let displayName: String
+    public let provider: SubagentProviderKind
+    public let model: String?
+    public let phase: SubagentActivityPhase
+    public let lifecycleStatus: AgentOrchestrationReceiptLifecycleStatus
+    public let finalRunStatus: AgentRunStatus?
+    public let admittedAt: Date
+    public let finalizedAt: Date?
+    public let lifecycleUpdatedAt: Date
+    /// True when this row belongs in the Active section (not yet terminal).
+    public let isActive: Bool
+
+    public init(
+        id: UUID,
+        runId: AgentRunID?,
+        threadId: AgentThreadID,
+        nodeId: String,
+        displayName: String,
+        provider: SubagentProviderKind,
+        model: String?,
+        phase: SubagentActivityPhase,
+        lifecycleStatus: AgentOrchestrationReceiptLifecycleStatus,
+        finalRunStatus: AgentRunStatus?,
+        admittedAt: Date,
+        finalizedAt: Date?,
+        lifecycleUpdatedAt: Date,
+        isActive: Bool
+    ) {
+        self.id = id
+        self.runId = runId
+        self.threadId = threadId
+        self.nodeId = nodeId
+        self.displayName = displayName
+        self.provider = provider
+        self.model = model
+        self.phase = phase
+        self.lifecycleStatus = lifecycleStatus
+        self.finalRunStatus = finalRunStatus
+        self.admittedAt = admittedAt
+        self.finalizedAt = finalizedAt
+        self.lifecycleUpdatedAt = lifecycleUpdatedAt
+        self.isActive = isActive
+    }
+
+    /// Secondary line: phase label; model is available for expanded detail.
+    public var statusLabel: String {
+        switch phase {
+        case .working: return "Working"
+        case .completed: return "Done"
+        case .failed: return "Failed"
+        case .cancelled: return "Cancelled"
+        case .unknown: return "Unknown"
+        }
+    }
+
+    public var providerModelLabel: String? {
+        let providerName: String
+        switch provider {
+        case .codex: providerName = "Codex"
+        case .claude: providerName = "Claude"
+        case .grok: providerName = "Grok"
+        case .unknown: providerName = "Unknown"
+        }
+        if let model, !model.isEmpty {
+            return "\(providerName) · \(model)"
+        }
+        return provider == .unknown && model == nil ? nil : providerName
+    }
+}
+
+/// Projected snapshot ready for the compact badge and expanded popover.
+public struct SubagentActivitySnapshot: Sendable, Equatable {
+    public let active: [SubagentActivityItem]
+    public let done: [SubagentActivityItem]
+    public let unknown: [SubagentActivityItem]
+    public let activeVisibleLimit: Int
+    public let doneVisibleLimit: Int
+    public let unknownVisibleLimit: Int
+    public let completedBound: Int
+
+    public static let empty = SubagentActivitySnapshot(
+        active: [],
+        done: [],
+        unknown: [],
+        activeVisibleLimit: SubagentActivityProjection.defaultActiveVisibleLimit,
+        doneVisibleLimit: SubagentActivityProjection.defaultDoneVisibleLimit,
+        unknownVisibleLimit: SubagentActivityProjection.defaultDoneVisibleLimit,
+        completedBound: SubagentActivityProjection.defaultCompletedBound
+    )
+
+    public init(
+        active: [SubagentActivityItem],
+        done: [SubagentActivityItem],
+        unknown: [SubagentActivityItem] = [],
+        activeVisibleLimit: Int = SubagentActivityProjection.defaultActiveVisibleLimit,
+        doneVisibleLimit: Int = SubagentActivityProjection.defaultDoneVisibleLimit,
+        unknownVisibleLimit: Int = SubagentActivityProjection.defaultDoneVisibleLimit,
+        completedBound: Int = SubagentActivityProjection.defaultCompletedBound
+    ) {
+        self.active = active
+        self.done = done
+        self.unknown = unknown
+        self.activeVisibleLimit = max(0, activeVisibleLimit)
+        self.doneVisibleLimit = max(0, doneVisibleLimit)
+        self.unknownVisibleLimit = max(0, unknownVisibleLimit)
+        self.completedBound = max(1, completedBound)
+    }
+
+    public var activeCount: Int { active.count }
+    public var doneCount: Int { done.count }
+    public var unknownCount: Int { unknown.count }
+    public var isEmpty: Bool { active.isEmpty && done.isEmpty && unknown.isEmpty }
+    public var isLive: Bool { !active.isEmpty }
+
+    public func visibleActive(expanded: Bool) -> [SubagentActivityItem] {
+        SubagentActivityProjection.visibleSlice(active, limit: activeVisibleLimit, expanded: expanded)
+    }
+
+    public func hiddenActiveCount(expanded: Bool) -> Int {
+        expanded ? 0 : max(0, active.count - activeVisibleLimit)
+    }
+
+    public func visibleDone(expanded: Bool) -> [SubagentActivityItem] {
+        SubagentActivityProjection.visibleSlice(done, limit: doneVisibleLimit, expanded: expanded)
+    }
+
+    public func hiddenDoneCount(expanded: Bool) -> Int {
+        expanded ? 0 : max(0, done.count - doneVisibleLimit)
+    }
+
+    public func visibleUnknown(expanded: Bool) -> [SubagentActivityItem] {
+        SubagentActivityProjection.visibleSlice(unknown, limit: unknownVisibleLimit, expanded: expanded)
+    }
+
+    public func hiddenUnknownCount(expanded: Bool) -> Int {
+        expanded ? 0 : max(0, unknown.count - unknownVisibleLimit)
+    }
+
+    /// Distinct providers among recent rows for the compact glyph strip (newest first, capped).
+    public var compactGlyphProviders: [SubagentProviderKind] {
+        var seen = Set<SubagentProviderKind>()
+        var ordered: [SubagentProviderKind] = []
+        for item in active + done + unknown {
+            if seen.insert(item.provider).inserted {
+                ordered.append(item.provider)
+            }
+            if ordered.count >= 6 { break }
+        }
+        return ordered
+    }
+}
+
+// MARK: - Pure projection
+
+/// Maps admission receipts + coordinator active-run set into the Subagents snapshot.
+///
+/// WHY: UI must never invent lifecycle; every row and count comes from persisted
+/// receipts, with coordinator state only refining “still active” for accepted work.
+public enum SubagentActivityProjection {
+    public static let defaultActiveVisibleLimit = 4
+    public static let defaultDoneVisibleLimit = 4
+    public static let defaultUnknownVisibleLimit = 4
+    public static let defaultCompletedBound = 50
+    // The audit log is process-global. Scope by workspace before applying the
+    // bounded UI history limits.
+    public static let defaultReceiptFetchLimit = 10_000
+
+    public static func project(
+        receipts: [AgentOrchestrationAdmissionReceipt],
+        workspaceThreadIds: Set<AgentThreadID>? = nil,
+        activeRunIds: Set<AgentRunID> = [],
+        now: Date = Date(),
+        activeVisibleLimit: Int = defaultActiveVisibleLimit,
+        doneVisibleLimit: Int = defaultDoneVisibleLimit,
+        unknownVisibleLimit: Int = defaultUnknownVisibleLimit,
+        completedBound: Int = defaultCompletedBound
+    ) -> SubagentActivitySnapshot {
+        let scoped: [AgentOrchestrationAdmissionReceipt]
+        if let workspaceThreadIds {
+            scoped = receipts.filter { workspaceThreadIds.contains($0.threadId) }
+        } else {
+            scoped = receipts
+        }
+
+        var active: [SubagentActivityItem] = []
+        var done: [SubagentActivityItem] = []
+        var unknown: [SubagentActivityItem] = []
+        active.reserveCapacity(scoped.count)
+        done.reserveCapacity(min(scoped.count, completedBound))
+
+        for receipt in scoped where isSubagentReceipt(receipt) {
+            let item = mapItem(receipt: receipt, activeRunIds: activeRunIds, now: now)
+            if item.isActive {
+                active.append(item)
+            } else if item.phase == .unknown {
+                unknown.append(item)
+            } else {
+                done.append(item)
+            }
+        }
+
+        // Active: most recently updated first so live workers surface at the top.
+        active.sort { lhs, rhs in
+            if lhs.lifecycleUpdatedAt != rhs.lifecycleUpdatedAt {
+                return lhs.lifecycleUpdatedAt > rhs.lifecycleUpdatedAt
+            }
+            return lhs.admittedAt > rhs.admittedAt
+        }
+
+        // Done: newest-first by finalization (fall back to lifecycle update).
+        done.sort { lhs, rhs in
+            let l = lhs.finalizedAt ?? lhs.lifecycleUpdatedAt
+            let r = rhs.finalizedAt ?? rhs.lifecycleUpdatedAt
+            if l != r { return l > r }
+            return lhs.admittedAt > rhs.admittedAt
+        }
+
+        let bound = max(1, completedBound)
+        if done.count > bound {
+            done = Array(done.prefix(bound))
+        }
+        if unknown.count > bound {
+            unknown = Array(unknown.prefix(bound))
+        }
+
+        return SubagentActivitySnapshot(
+            active: active,
+            done: done,
+            unknown: unknown,
+            activeVisibleLimit: activeVisibleLimit,
+            doneVisibleLimit: doneVisibleLimit,
+            unknownVisibleLimit: unknownVisibleLimit,
+            completedBound: bound
+        )
+    }
+
+    public static func mapItem(
+        receipt: AgentOrchestrationAdmissionReceipt,
+        activeRunIds: Set<AgentRunID> = [],
+        now: Date = Date()
+    ) -> SubagentActivityItem {
+        let provider = normalizeProvider(receipt.provider)
+        let model = normalizeModel(receipt.model)
+        let phase = mapPhase(receipt: receipt, activeRunIds: activeRunIds)
+        let isActive = isActiveReceipt(receipt: receipt, activeRunIds: activeRunIds)
+        return SubagentActivityItem(
+            id: receipt.id,
+            runId: receipt.runId,
+            threadId: receipt.threadId,
+            nodeId: receipt.nodeId,
+            displayName: displayName(nodeId: receipt.nodeId, provider: provider, model: model),
+            provider: provider,
+            model: model,
+            phase: phase,
+            lifecycleStatus: receipt.lifecycleStatus,
+            finalRunStatus: receipt.finalRunStatus,
+            admittedAt: receipt.admittedAt,
+            finalizedAt: receipt.finalizedAt,
+            lifecycleUpdatedAt: receipt.lifecycleUpdatedAt,
+            isActive: isActive
+        )
+    }
+
+    /// Root route receipts belong to the Agent App turn, not the nested-worker
+    /// surface. A child is explicit when it has a parent id; the non-root
+    /// fallback keeps older controller receipts visible during migration.
+    public static func isSubagentReceipt(_ receipt: AgentOrchestrationAdmissionReceipt) -> Bool {
+        if receipt.parentReceiptId != nil { return true }
+        return receipt.nodeId.trimmingCharacters(in: .whitespacesAndNewlines)
+            .caseInsensitiveCompare("root") != .orderedSame
+    }
+
+    /// Normalize every provider through the neutral enum. Unknown stays unknown.
+    public static func normalizeProvider(_ provider: AgentProvider) -> SubagentProviderKind {
+        switch provider {
+        case .codex: return .codex
+        case .claude: return .claude
+        case .grok: return .grok
+        }
+    }
+
+    public static func normalizeModel(_ model: String) -> String? {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || trimmed.caseInsensitiveCompare("unknown") == .orderedSame {
+            return nil
+        }
+        return trimmed
+    }
+
+    /// Map lifecycle + final run status without inventing success from absence.
+    public static func mapPhase(
+        receipt: AgentOrchestrationAdmissionReceipt,
+        activeRunIds: Set<AgentRunID> = []
+    ) -> SubagentActivityPhase {
+        switch receipt.lifecycleStatus {
+        case .accepted:
+            return .working
+        case .unknown:
+            if let runId = receipt.runId, activeRunIds.contains(runId) {
+                return .working
+            }
+            return .unknown
+        case .finalized:
+            return mapFinalPhase(receipt.finalRunStatus)
+        }
+    }
+
+    public static func mapFinalPhase(_ status: AgentRunStatus?) -> SubagentActivityPhase {
+        guard let status else { return .unknown }
+        switch status {
+        case .completed: return .completed
+        case .failed: return .failed
+        case .cancelled, .interrupted: return .cancelled
+        case .pending, .running: return .unknown
+        }
+    }
+
+    public static func isActiveReceipt(
+        receipt: AgentOrchestrationAdmissionReceipt,
+        activeRunIds: Set<AgentRunID> = []
+    ) -> Bool {
+        switch receipt.lifecycleStatus {
+        case .accepted:
+            return true
+        case .unknown:
+            // Coordinator still owns the run → treat as active; otherwise stay
+            // out of Done so we do not claim terminal success from uncertainty.
+            if let runId = receipt.runId, activeRunIds.contains(runId) {
+                return true
+            }
+            return false
+        case .finalized:
+            return false
+        }
+    }
+
+    /// Display name from `nodeId` with safe fallbacks (never empty).
+    public static func displayName(
+        nodeId: String,
+        provider: SubagentProviderKind = .unknown,
+        model: String? = nil
+    ) -> String {
+        let trimmed = nodeId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || trimmed.caseInsensitiveCompare("unknown") == .orderedSame {
+            if let model, !model.isEmpty { return model }
+            return "Unknown"
+        }
+        if trimmed.caseInsensitiveCompare("root") == .orderedSame {
+            // Main-route admission: prefer model, else a stable generic label.
+            if let model, !model.isEmpty { return model }
+            switch provider {
+            case .codex: return "Root · Codex"
+            case .claude: return "Root · Claude"
+            case .grok: return "Root · Grok"
+            case .unknown: return "Root"
+            }
+        }
+        return humanizeNodeId(trimmed)
+    }
+
+    /// `deep-worker-plan-writer` / `deep_worker_plan_writer` → "Deep worker plan writer".
+    public static func humanizeNodeId(_ raw: String) -> String {
+        let separators = CharacterSet(charactersIn: "-_./")
+        let parts = raw
+            .components(separatedBy: separators)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !parts.isEmpty else { return raw }
+        let words = parts.enumerated().map { index, part -> String in
+            guard let first = part.first else { return part }
+            // Preserve short ALLCAPS tokens (e.g. "Cp101") casing when mixed.
+            if part.count <= 6, part == part.uppercased(), part.rangeOfCharacter(from: .decimalDigits) != nil {
+                return part
+            }
+            if part == part.uppercased(), part.count <= 4 {
+                return part
+            }
+            let normalized = first.uppercased() + part.dropFirst().lowercased()
+            return index == 0 ? normalized : normalized.lowercased()
+        }
+        return words.joined(separator: " ")
+    }
+
+    public static func visibleSlice(
+        _ items: [SubagentActivityItem],
+        limit: Int,
+        expanded: Bool
+    ) -> [SubagentActivityItem] {
+        if expanded || limit <= 0 || items.count <= limit {
+            return items
+        }
+        return Array(items.prefix(limit))
+    }
+
+    // MARK: Duration formatting
+
+    /// Elapsed wall time for active rows: `17d 10h 8m 37s` (omits zero high units).
+    public static func formatElapsed(from start: Date, to end: Date) -> String {
+        let seconds = max(0, Int(end.timeIntervalSince(start)))
+        return formatElapsedSeconds(seconds)
+    }
+
+    public static func formatElapsedSeconds(_ totalSeconds: Int) -> String {
+        let seconds = max(0, totalSeconds)
+        let days = seconds / 86_400
+        let hours = (seconds % 86_400) / 3_600
+        let minutes = (seconds % 3_600) / 60
+        let secs = seconds % 60
+        if days > 0 {
+            return "\(days)d \(hours)h \(minutes)m \(secs)s"
+        }
+        if hours > 0 {
+            return "\(hours)h \(minutes)m \(secs)s"
+        }
+        if minutes > 0 {
+            return "\(minutes)m \(secs)s"
+        }
+        return "\(secs)s"
+    }
+
+    /// Relative label for completed rows: `1w ago`, `2h ago`, `just now`.
+    public static func formatRelative(from date: Date, now: Date = Date()) -> String {
+        let seconds = max(0, Int(now.timeIntervalSince(date)))
+        if seconds < 10 { return "just now" }
+        if seconds < 60 { return "\(seconds)s ago" }
+        let minutes = seconds / 60
+        if minutes < 60 { return "\(minutes)m ago" }
+        let hours = minutes / 60
+        if hours < 48 { return "\(hours)h ago" }
+        let days = hours / 24
+        if days < 7 { return "\(days)d ago" }
+        let weeks = days / 7
+        if weeks < 8 { return "\(weeks)w ago" }
+        let months = days / 30
+        if months < 24 { return "\(months)mo ago" }
+        let years = days / 365
+        return "\(max(1, years))y ago"
+    }
+
+    /// Trailing time label: elapsed while active, relative when done.
+    public static func trailingTimeLabel(for item: SubagentActivityItem, now: Date = Date()) -> String {
+        if item.isActive {
+            return formatElapsed(from: item.admittedAt, to: now)
+        }
+        let end = item.finalizedAt ?? item.lifecycleUpdatedAt
+        return formatRelative(from: end, now: now)
+    }
+}
+
+// MARK: - Visual tokens (single glyph shape; color from normalized provider)
+
+public enum SubagentActivityStyle {
+    /// Stable colors per normalized provider — not layout branches.
+    public static func glyphColor(for provider: SubagentProviderKind) -> Color {
+        switch provider {
+        case .codex: return Color(hex: 0x3DD6C6)
+        case .claude: return Color(hex: 0xE8A838)
+        case .grok: return Color(hex: 0xF472B6)
+        case .unknown: return DS.Palette.textTertiary
+        }
+    }
+
+    public static let glyphSystemName = "hexagon.fill"
+}
+
+// MARK: - SwiftUI: compact badge + popover panel
+
+/// Compact Subagents control for the Agent App chrome.
+/// Popover holds Active / Done sections with “Show N more”.
+public struct SubagentActivityBadge: View {
+    let snapshot: SubagentActivitySnapshot
+    let now: Date
+    @Binding var isPresented: Bool
+    @State private var activeExpanded = false
+    @State private var doneExpanded = false
+    @State private var unknownExpanded = false
+
+    public init(
+        snapshot: SubagentActivitySnapshot,
+        now: Date = Date(),
+        isPresented: Binding<Bool>
+    ) {
+        self.snapshot = snapshot
+        self.now = now
+        self._isPresented = isPresented
+    }
+
+    public var body: some View {
+        Button {
+            isPresented.toggle()
+        } label: {
+            HStack(spacing: DS.Space.xs) {
+                Image(systemName: "person.2")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(DS.Palette.textSecondary)
+                Text("Subagents")
+                    .font(DS.Font.caption.weight(.semibold))
+                    .foregroundColor(DS.Palette.text)
+                if !snapshot.compactGlyphProviders.isEmpty {
+                    HStack(spacing: 2) {
+                        ForEach(snapshot.compactGlyphProviders, id: \.rawValue) { provider in
+                            SubagentActivityGlyphView(provider: provider, size: 11)
+                        }
+                    }
+                    .accessibilityHidden(true)
+                }
+                if snapshot.isLive {
+                    Circle()
+                        .fill(DS.Palette.accent)
+                        .frame(width: 6, height: 6)
+                        .accessibilityHidden(true)
+                }
+                Text(countLabel)
+                    .font(DS.Font.caption2.monospacedDigit())
+                    .foregroundColor(DS.Palette.textSecondary)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
+            .padding(.horizontal, DS.Space.sm)
+            .padding(.vertical, DS.Space.xs)
+            .background(DS.Palette.surfaceOverlay)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                    .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+            )
+        }
+        .buttonStyle(.plain)
+        .help(helpText)
+        .accessibilityIdentifier("agent.subagents.badge")
+        .accessibilityLabel(accessibilityLabel)
+        .popover(isPresented: $isPresented, arrowEdge: .bottom) {
+            SubagentActivityPopoverPanel(
+                snapshot: snapshot,
+                now: now,
+                activeExpanded: $activeExpanded,
+                doneExpanded: $doneExpanded,
+                unknownExpanded: $unknownExpanded
+            )
+            .frame(width: 320)
+            .padding(DS.Space.md)
+            .background(DS.Palette.surfaceRaised)
+        }
+        .onChange(of: isPresented) { open in
+            if !open {
+                activeExpanded = false
+                doneExpanded = false
+                unknownExpanded = false
+            }
+        }
+    }
+
+    private var countLabel: String {
+        if snapshot.activeCount == 0, snapshot.unknownCount == 0 {
+            return "\(snapshot.doneCount) done"
+        }
+        if snapshot.unknownCount > 0 {
+            return "\(snapshot.activeCount) active · \(snapshot.doneCount) done · ?\(snapshot.unknownCount)"
+        }
+        return "\(snapshot.activeCount) active · \(snapshot.doneCount) done"
+    }
+
+    private var helpText: String {
+        if snapshot.isEmpty {
+            return "No subagent activity yet"
+        }
+        var parts = ["\(snapshot.activeCount) active", "\(snapshot.doneCount) done"]
+        if snapshot.unknownCount > 0 { parts.append("\(snapshot.unknownCount) unknown") }
+        return parts.joined(separator: ", ")
+    }
+
+    private var accessibilityLabel: String {
+        var label = "Subagents, \(snapshot.activeCount) active, \(snapshot.doneCount) done"
+        if snapshot.unknownCount > 0 { label += ", \(snapshot.unknownCount) unknown" }
+        return label
+    }
+}
+
+struct SubagentActivityPopoverPanel: View {
+    let snapshot: SubagentActivitySnapshot
+    let now: Date
+    @Binding var activeExpanded: Bool
+    @Binding var doneExpanded: Bool
+    @Binding var unknownExpanded: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            HStack(spacing: DS.Space.sm) {
+                Text("Subagents")
+                    .font(DS.Font.bodyStrong)
+                    .foregroundColor(DS.Palette.text)
+                Spacer(minLength: 0)
+                if snapshot.isLive {
+                    HStack(spacing: DS.Space.xxs) {
+                        Circle()
+                            .fill(DS.Palette.accent)
+                            .frame(width: 6, height: 6)
+                        Text("Live")
+                            .font(DS.Font.caption2.weight(.semibold))
+                            .foregroundColor(DS.Palette.accent)
+                    }
+                    .accessibilityIdentifier("agent.subagents.live")
+                }
+            }
+
+            Text(summaryText)
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textSecondary)
+                .accessibilityIdentifier("agent.subagents.summary")
+
+            if !snapshot.compactGlyphProviders.isEmpty {
+                HStack(spacing: DS.Space.sm) {
+                    ForEach(snapshot.compactGlyphProviders, id: \.rawValue) { provider in
+                        SubagentActivityGlyphView(provider: provider, size: 16)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .accessibilityHidden(true)
+            }
+
+            if snapshot.isEmpty {
+                Text("No subagent runs recorded yet.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityIdentifier("agent.subagents.empty")
+            } else {
+                if !snapshot.active.isEmpty {
+                    sectionHeader("Active", count: snapshot.activeCount)
+                    VStack(spacing: 0) {
+                        ForEach(snapshot.visibleActive(expanded: activeExpanded)) { item in
+                            SubagentActivityRowView(item: item, now: now)
+                            Divider().background(DS.Palette.line)
+                        }
+                    }
+                    if snapshot.hiddenActiveCount(expanded: activeExpanded) > 0 {
+                        showMoreButton(
+                            count: snapshot.hiddenActiveCount(expanded: activeExpanded),
+                            expanded: $activeExpanded,
+                            identifier: "agent.subagents.active.showMore"
+                        )
+                    }
+                }
+
+                if !snapshot.done.isEmpty {
+                    sectionHeader("Done", count: snapshot.doneCount)
+                    VStack(spacing: 0) {
+                        ForEach(snapshot.visibleDone(expanded: doneExpanded)) { item in
+                            SubagentActivityRowView(item: item, now: now)
+                            Divider().background(DS.Palette.line)
+                        }
+                    }
+                    if snapshot.hiddenDoneCount(expanded: doneExpanded) > 0 {
+                        showMoreButton(
+                            count: snapshot.hiddenDoneCount(expanded: doneExpanded),
+                            expanded: $doneExpanded,
+                            identifier: "agent.subagents.done.showMore"
+                        )
+                    }
+                }
+
+                if !snapshot.unknown.isEmpty {
+                    sectionHeader("Unknown", count: snapshot.unknownCount)
+                    VStack(spacing: 0) {
+                        ForEach(snapshot.visibleUnknown(expanded: unknownExpanded)) { item in
+                            SubagentActivityRowView(item: item, now: now)
+                            Divider().background(DS.Palette.line)
+                        }
+                    }
+                    if snapshot.hiddenUnknownCount(expanded: unknownExpanded) > 0 {
+                        showMoreButton(
+                            count: snapshot.hiddenUnknownCount(expanded: unknownExpanded),
+                            expanded: $unknownExpanded,
+                            identifier: "agent.subagents.unknown.showMore"
+                        )
+                    }
+                }
+            }
+        }
+        .accessibilityIdentifier("agent.subagents.popover")
+    }
+
+    private var summaryText: String {
+        var parts = ["\(snapshot.activeCount) active", "\(snapshot.doneCount) done"]
+        if snapshot.unknownCount > 0 { parts.append("\(snapshot.unknownCount) unknown") }
+        return parts.joined(separator: " · ")
+    }
+
+    private func sectionHeader(_ title: String, count: Int) -> some View {
+        Text("\(title) · \(count)")
+            .font(DS.Font.caption2.weight(.semibold))
+            .tracking(0.4)
+            .foregroundColor(DS.Palette.textTertiary)
+            .padding(.top, DS.Space.xs)
+            .accessibilityIdentifier("agent.subagents.section.\(title.lowercased())")
+    }
+
+    private func showMoreButton(count: Int, expanded: Binding<Bool>, identifier: String) -> some View {
+        Button {
+            expanded.wrappedValue = true
+        } label: {
+            HStack(spacing: DS.Space.xxs) {
+                Text("Show \(count) more")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, DS.Space.xs)
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier(identifier)
+    }
+}
+
+struct SubagentActivityRowView: View {
+    let item: SubagentActivityItem
+    let now: Date
+
+    var body: some View {
+        HStack(alignment: .center, spacing: DS.Space.sm) {
+            SubagentActivityGlyphView(provider: item.provider, size: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.displayName)
+                    .font(DS.Font.bodyDense.weight(.medium))
+                    .foregroundColor(DS.Palette.text)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                HStack(spacing: DS.Space.xs) {
+                    if item.isActive {
+                        Circle()
+                            .fill(DS.Palette.success)
+                            .frame(width: 5, height: 5)
+                            .accessibilityHidden(true)
+                    }
+                    Text(item.statusLabel)
+                        .font(DS.Font.caption2)
+                        .foregroundColor(statusColor)
+                    if let meta = item.providerModelLabel {
+                        Text("·")
+                            .font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.textTertiary)
+                        Text(meta)
+                            .font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+            }
+            Spacer(minLength: DS.Space.sm)
+            Text(SubagentActivityProjection.trailingTimeLabel(for: item, now: now))
+                .font(DS.Font.caption2.monospacedDigit())
+                .foregroundColor(DS.Palette.textTertiary)
+                .lineLimit(1)
+        }
+        .padding(.vertical, DS.Space.sm)
+        .accessibilityIdentifier("agent.subagents.row.\(item.id.uuidString)")
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(rowAccessibilityLabel)
+    }
+
+    private var statusColor: Color {
+        switch item.phase {
+        case .working: return DS.Palette.success
+        case .completed: return DS.Palette.textSecondary
+        case .failed: return DS.Palette.danger
+        case .cancelled: return DS.Palette.warning
+        case .unknown: return DS.Palette.textTertiary
+        }
+    }
+
+    private var rowAccessibilityLabel: String {
+        let time = SubagentActivityProjection.trailingTimeLabel(for: item, now: now)
+        let meta = item.providerModelLabel.map { ", \($0)" } ?? ""
+        return "\(item.displayName), \(item.statusLabel)\(meta), \(time)"
+    }
+}
+
+struct SubagentActivityGlyphView: View {
+    let provider: SubagentProviderKind
+    var size: CGFloat = 16
+
+    var body: some View {
+        Image(systemName: SubagentActivityStyle.glyphSystemName)
+            .font(.system(size: size * 0.85, weight: .semibold))
+            .foregroundColor(SubagentActivityStyle.glyphColor(for: provider))
+            .frame(width: size, height: size)
+            .accessibilityHidden(true)
+    }
+}

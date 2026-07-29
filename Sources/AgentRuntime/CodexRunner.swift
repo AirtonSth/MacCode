@@ -376,6 +376,10 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
             }
         }
 
+        // Token Saver/Graphify admission belongs to the exact host request, not
+        // the RemoteCode process' inherited GUI/login environment. This keeps a
+        // parent shell receipt from leaking into support or cross-user launches.
+        base = AgentHostEnvironmentMerge.stripHostInjects(from: base)
         var env = base.merging(overrides) { _, override in override }
 
         let home = env["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path
@@ -390,6 +394,15 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
 
         if let provider = purpose.provider {
             env["REMOTE_CODE_AGENT_PROVIDER"] = provider.rawValue
+        }
+        // Central Token Saver receipt seam for every controlled nested agent spawn
+        // (Codex/Claude/Grok). Support/probe processes stay raw (no re-stamp).
+        // Re-applies discrete RC_TOKEN_SAVER_* + compact receipt from host overrides;
+        // never invents admission when the host left Token Saver off.
+        if case .agentTurn(let provider) = purpose {
+            env = TokenSaverExecutionReceiptSeam.propagate(into: env, provider: provider)
+        } else {
+            env = AgentHostEnvironmentMerge.stripHostInjects(from: env)
         }
         // Expose the `RefreshMcpTools` tool for Claude turns so the agent can pick
         // up remote MCP servers (Linear, etc.) that finish their async connect a

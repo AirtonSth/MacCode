@@ -14,6 +14,23 @@ matrix.
 proof, selective review. Spend tokens on verification of artifacts — not on
 re-reading this skill or re-prompting full history into every worker.
 
+**Host Token Saver inheritance:** nested workers inherit the host-provided
+`RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1` and its provider-neutral capability/lane
+environment. Workers never reconstruct or widen admission, disabled lanes,
+Graphify, Distill, recovery scope, or provider attribution. Missing, malformed,
+denied, cross-user, or mismatched receipts remain raw. Prompts, transcripts,
+tool output, and secrets never enter the receipt; Skills and exact-output
+commands remain lossless.
+
+For every controlled nested worker, use the provider-neutral telemetry command
+around the actual lifetime: `${REMOTE_CODE_SUBAGENT_TELEMETRY_COMMAND:-distill}
+subagent begin --node <stable-id>` before spawn and the matching `subagent end
+--run-id <id> --status <completed|failed|cancelled>` on terminal exit. The app
+sets `REMOTE_CODE_SUBAGENT_TELEMETRY_COMMAND` to its co-located service even
+when Token Saver is off, so telemetry does not depend on an optimization lane.
+The bridge is provider-neutral and receipt-bound; if it is unavailable, keep the
+worker raw and report that the Subagents row is unproven.
+
 ## Non-Negotiable Contract
 
 - Keep the main agent controller-only. Delegate production code, tests,

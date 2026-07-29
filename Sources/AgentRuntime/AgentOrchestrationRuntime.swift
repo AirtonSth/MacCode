@@ -78,6 +78,9 @@ public enum AgentProviderCatalogProvenance {
 
 public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
     public let id: UUID
+    /// Parent admission for a controlled nested worker. Nil means this is the
+    /// root route or a legacy receipt that predates child telemetry.
+    public let parentReceiptId: UUID?
     public let runId: AgentRunID?
     public let threadId: AgentThreadID
     public let nodeId: String
@@ -110,6 +113,7 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
 
     public init(
         id: UUID = UUID(),
+        parentReceiptId: UUID? = nil,
         runId: AgentRunID? = nil,
         threadId: AgentThreadID,
         nodeId: String = "root",
@@ -141,6 +145,7 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
         qualityOutcome: String? = nil
     ) {
         self.id = id
+        self.parentReceiptId = parentReceiptId
         self.runId = runId
         self.threadId = threadId
         self.nodeId = nodeId
@@ -173,7 +178,7 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, runId, threadId, nodeId, attemptId, routingRevision, policyDigest
+        case id, parentReceiptId, runId, threadId, nodeId, attemptId, routingRevision, policyDigest
         case policyVersion, packageRevision, provider, providerInstanceId, model
         case capabilitySnapshotId, decisionReason, admittedAt, lifecycleStatus
         case lifecycleUpdatedAt, finalizedAt, finalRunStatus, deadlineAt
@@ -186,6 +191,7 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         let admittedAt = try values.decode(Date.self, forKey: .admittedAt)
         id = try values.decode(UUID.self, forKey: .id)
+        parentReceiptId = try values.decodeIfPresent(UUID.self, forKey: .parentReceiptId)
         runId = try values.decodeIfPresent(AgentRunID.self, forKey: .runId)
         threadId = try values.decode(AgentThreadID.self, forKey: .threadId)
         nodeId = try values.decodeIfPresent(String.self, forKey: .nodeId) ?? "unknown"
@@ -227,6 +233,7 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
     ) -> AgentOrchestrationAdmissionReceipt {
         AgentOrchestrationAdmissionReceipt(
             id: id,
+            parentReceiptId: parentReceiptId,
             runId: runId,
             threadId: threadId,
             nodeId: nodeId,
@@ -267,6 +274,7 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
     ) -> AgentOrchestrationAdmissionReceipt {
         AgentOrchestrationAdmissionReceipt(
             id: id,
+            parentReceiptId: parentReceiptId,
             runId: runId,
             threadId: threadId,
             nodeId: nodeId,
@@ -354,6 +362,7 @@ public enum AgentOrchestrationAdmissionError: Error, Sendable, Equatable, Custom
     case quotaExceeded
     case invalidRoutingMode
     case noEligibleProvider
+    case invalidChildAdmission(String)
     /// Source picker host is eligible in policy but not runnable (missing binary,
     /// unauthenticated, empty models). Fail closed — do not silently route to another host.
     /// `detail` is an optional concrete status (e.g. "Claude is not authenticated") so
@@ -383,6 +392,8 @@ public enum AgentOrchestrationAdmissionError: Error, Sendable, Equatable, Custom
             return "Orchestration admission requires an Auto routing configuration."
         case .noEligibleProvider:
             return "No eligible provider has a live model catalog and confirmed streaming capability."
+        case .invalidChildAdmission(let detail):
+            return "Nested worker admission is invalid: \(detail)"
         case .preferredSourceUnavailable(let provider, let detail):
             let reason = (detail?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
                 ?? "that Source is not runnable on this Mac (install/auth/models)"
@@ -728,6 +739,115 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         return (resolved, admittedReceipt)
     }
 
+    /// Records a provider-neutral nested worker under an already-admitted root.
+    /// The controller must call this immediately before spawning the child and
+    /// finalize the returned run id when that child exits. It intentionally
+    /// shares the parent's route/capability decision and does not reserve a
+    /// second root budget.
+    public func admitChild(
+        parentReceipt: AgentOrchestrationAdmissionReceipt,
+        runId: AgentRunID,
+        nodeId: String,
+        attemptId: UUID? = nil,
+        threadId: AgentThreadID? = nil
+    ) throws -> AgentOrchestrationAdmissionReceipt {
+        let trimmedNodeId = nodeId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard parentReceipt.lifecycleStatus == .accepted else {
+            throw AgentOrchestrationAdmissionError.invalidChildAdmission("parent is not active")
+        }
+        guard !trimmedNodeId.isEmpty,
+              trimmedNodeId.caseInsensitiveCompare("root") != .orderedSame,
+              trimmedNodeId.utf8.count <= 128,
+              trimmedNodeId.unicodeScalars.allSatisfy({
+                  CharacterSet.alphanumerics.contains($0) || "-_.".unicodeScalars.contains($0)
+              }) else {
+            throw AgentOrchestrationAdmissionError.invalidChildAdmission("node id must be a non-root safe token")
+        }
+
+        let child = AgentOrchestrationAdmissionReceipt(
+            parentReceiptId: parentReceipt.id,
+            runId: runId,
+            threadId: threadId ?? parentReceipt.threadId,
+            nodeId: trimmedNodeId,
+            attemptId: attemptId ?? runId.value,
+            routingRevision: parentReceipt.routingRevision,
+            policyDigest: parentReceipt.policyDigest,
+            policyVersion: parentReceipt.policyVersion,
+            packageRevision: parentReceipt.packageRevision,
+            provider: parentReceipt.provider,
+            providerInstanceId: parentReceipt.providerInstanceId,
+            model: parentReceipt.model,
+            capabilitySnapshotId: parentReceipt.capabilitySnapshotId,
+            decisionReason: "controlled-child-of-parent",
+            admittedAt: now(),
+            lifecycleStatus: .accepted,
+            deadlineAt: parentReceipt.deadlineAt,
+            permissionMode: parentReceipt.permissionMode
+        )
+        do {
+            try repository.save(child)
+        } catch let error as AgentOrchestrationAdmissionError {
+            throw error
+        } catch {
+            throw AgentOrchestrationAdmissionError.receiptPersistenceFailed(String(describing: error))
+        }
+        return child
+    }
+
+    /// Content-free bridge used by a worker process that cannot hold the
+    /// controller's Swift runtime instance. The caller supplies only identity
+    /// metadata; when a live parent run is present, its policy/provider scope
+    /// is inherited. This is the common begin/end protocol for Codex, Claude,
+    /// and Grok skill workers.
+    public func recordExternalChild(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        provider: AgentProvider,
+        providerInstanceId: String,
+        model: String,
+        nodeId: String,
+        parentRunId: AgentRunID? = nil
+    ) throws -> AgentOrchestrationAdmissionReceipt {
+        let parent = try parentRunId.flatMap { try repository.receipt(runId: $0) }
+        let trimmedNodeId = nodeId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedNodeId.isEmpty,
+              trimmedNodeId.caseInsensitiveCompare("root") != .orderedSame,
+              trimmedNodeId.utf8.count <= 128,
+              trimmedNodeId.unicodeScalars.allSatisfy({
+                  CharacterSet.alphanumerics.contains($0) || "-_.".unicodeScalars.contains($0)
+              }) else {
+            throw AgentOrchestrationAdmissionError.invalidChildAdmission("node id must be a non-root safe token")
+        }
+        let child = AgentOrchestrationAdmissionReceipt(
+            parentReceiptId: parent?.id,
+            runId: runId,
+            threadId: threadId,
+            nodeId: trimmedNodeId,
+            attemptId: runId.value,
+            routingRevision: parent?.routingRevision ?? 0,
+            policyDigest: parent?.policyDigest ?? "external",
+            policyVersion: parent?.policyVersion ?? "external",
+            packageRevision: parent?.packageRevision ?? "external",
+            provider: provider,
+            providerInstanceId: providerInstanceId,
+            model: model,
+            capabilitySnapshotId: parent?.capabilitySnapshotId ?? "external",
+            decisionReason: "external-controlled-child",
+            admittedAt: now(),
+            lifecycleStatus: .accepted,
+            deadlineAt: parent?.deadlineAt,
+            permissionMode: parent?.permissionMode ?? .supervised
+        )
+        do {
+            try repository.save(child)
+        } catch let error as AgentOrchestrationAdmissionError {
+            throw error
+        } catch {
+            throw AgentOrchestrationAdmissionError.receiptPersistenceFailed(String(describing: error))
+        }
+        return child
+    }
+
     public func finalizeReceipt(
         runId: AgentRunID,
         status: AgentRunStatus,
@@ -837,6 +957,12 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             default: try markReceiptUnknown(runId: runId)
             }
         }
+    }
+
+    /// Read-only recent admission receipts for activity surfaces (Subagents badge/panel).
+    /// Newest `lifecycleUpdatedAt` first. Does not mutate ledger or lifecycle state.
+    public func recentReceipts(limit: Int = 10_000) throws -> [AgentOrchestrationAdmissionReceipt] {
+        try repository.receipts(limit: max(1, limit))
     }
 
     public func route(

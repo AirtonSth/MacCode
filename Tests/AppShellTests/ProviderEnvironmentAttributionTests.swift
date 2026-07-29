@@ -95,6 +95,30 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func test_providerEnvironment_alwaysCarriesSubagentTelemetryScope_withoutTokenSaverLanes() throws {
+        // WHY: Subagents activity is user-visible even when Token Saver is off;
+        // telemetry must remain scoped without accidentally enabling compression.
+        let appSupport = NSTemporaryDirectory() + "RC2SubagentTelemetryEnv-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let router = AppCommandRouter(context: ctx)
+
+        for provider in AgentProvider.allCases {
+            let thread = try admittedThread(in: ctx, provider: provider)
+            let environment = router.providerEnvironment(
+                provider: provider,
+                instanceId: nil,
+                threadId: thread.id
+            )
+            XCTAssertEqual(environment["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"], appSupport)
+            XCTAssertEqual(environment["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"], thread.id.value.uuidString)
+            XCTAssertEqual(environment["REMOTE_CODE_AGENT_PROVIDER"], provider.rawValue)
+            XCTAssertEqual(environment["REMOTE_CODE_AGENT_MODEL"], thread.model)
+            XCTAssertNil(environment["RC_TOKEN_SAVER_DISTILL_HINT"])
+            XCTAssertNil(environment["RC_TOKEN_SAVER_POST_TOOL_USE"])
+        }
+    }
+
     /// The Token Saver env is built in ONE place (AppContext.tokenSaverAgentEnvironment) and shared
     /// by both the normal run path (providerEnvironment) and the recovered-session path (the
     /// coordinator rebuilds its own request env, bypassing providerEnvironment). Before this was

@@ -37,8 +37,22 @@ if [[ -n "${RC2_SURFACE_ID:-}" ]]; then
   exit 1
 fi
 
-pkill -x "$APP_NAME" 2>/dev/null || true
-RC2_REPLACE_RUNNING_APP=1 RC2_CONFIG=debug ./scripts/package-app.sh
+# Stop only this worktree's executable. A global `pkill -x RemoteCode` could
+# interrupt another checkout or the user's stable Agent App session.
+app_exec="$PWD/$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+running_pids="$(ps -axo pid=,command= | awk -v exec="$app_exec" '{
+  pid = $1
+  sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
+  if (index($0, exec) == 1) print pid
+}')"
+for pid in $running_pids; do
+  kill "$pid" 2>/dev/null || true
+done
+# Use the debug build while preserving the existing bundle-id override contract.
+# An explicit caller override still wins.
+RC2_REPLACE_RUNNING_APP=1 \
+RC2_CONFIG=debug \
+./scripts/package-app.sh
 /usr/bin/open -n "$APP_BUNDLE"
 
 if [[ "${1:-}" == "--verify" ]]; then

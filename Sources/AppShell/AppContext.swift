@@ -292,6 +292,10 @@ public final class AppContext {
     public let tokenSaverRolloverRepo: TokenSaverRolloverCapsuleRepository
     public let tokenSaverProjectDataRepo: TokenSaverProjectDataRepository
     public let tokenSaverAuditEventsRepo: TokenSaverAuditEventRepository
+    /// Shared orchestration receipt runtime for the coordinator and every
+    /// Agent App surface. Subagent activity must read the same SQLite-backed
+    /// receipts that provider launches write.
+    public let orchestrationRuntime: AgentOrchestrationRuntime
     public private(set) var tokenSaverLifecycleDegradedReason: String?
     public let privateNotificationBridge: PrivateNotificationBridge
     public let liveActivityHostIdentity: LiveActivityHostIdentity
@@ -526,14 +530,15 @@ public final class AppContext {
         let claude: AgentProviderAdapter = AppContext.makeClaudeAdapter(engine: claudeEngine, binary: configuredClaudeBinary)
         let grok = GrokACPAdapter(binaryNameOverride: try? settingsRepo.get("cli.grok.path"))
         let contextReference = WeakReference()
+        self.orchestrationRuntime = AgentOrchestrationRuntime(
+            repository: AgentOrchestrationRepository(db: db),
+            costEstimator: AgentOrchestrationRuntime.productionCostEstimator
+        )
         self.coordinator = AgentRunCoordinator(
             runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
             providerSessionRepo: providerSessionRuntimeRepo,
             checkpointRepo: turnCheckpointRepo,
-            orchestrationRuntime: AgentOrchestrationRuntime(
-                repository: AgentOrchestrationRepository(db: db),
-                costEstimator: AgentOrchestrationRuntime.productionCostEstimator
-            ),
+            orchestrationRuntime: self.orchestrationRuntime,
             providerSnapshotSupplier: {
                 await contextReference.value?.router?.listAgentProviderSnapshots() ?? []
             },
@@ -606,17 +611,37 @@ public final class AppContext {
             guard let self else { return [:] }
             let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
             guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .recovery) else {
-                return [:]
+                return await MainActor.run {
+                    self.subagentTelemetryEnvironment(provider: provider, threadId: threadId)
+                }
             }
-            return await self.tokenSaverAgentEnvironment(provider: provider, threadId: threadId)
+            var environment = await MainActor.run {
+                self.subagentTelemetryEnvironment(provider: provider, threadId: threadId)
+            }
+            environment.merge(
+                await self.tokenSaverAgentEnvironment(provider: provider, threadId: threadId)
+            ) { _, new in new }
+            return environment
         }
         self.coordinator.runEnvironmentProvider = { [weak self] provider, threadId, base in
             guard let self else { return [:] }
             let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
             guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .initial) else {
-                return [:]
+                return await MainActor.run {
+                    self.subagentTelemetryEnvironment(provider: provider, threadId: threadId)
+                }
             }
-            return await self.tokenSaverAgentEnvironment(provider: provider, threadId: threadId, baseEnvironment: base)
+            var environment = await MainActor.run {
+                self.subagentTelemetryEnvironment(provider: provider, threadId: threadId)
+            }
+            environment.merge(
+                await self.tokenSaverAgentEnvironment(
+                    provider: provider,
+                    threadId: threadId,
+                    baseEnvironment: base
+                )
+            ) { _, new in new }
+            return environment
         }
         self.coordinator.onRunPrepared = { [weak self] request, originalPrompt in
             await MainActor.run { [weak self] in
@@ -1294,25 +1319,30 @@ public final class AppContext {
     /// PostToolUse compression are emitted only while Token Saver is enabled.
     /// Workspace attribution still requires project admission when present.
     /// Single source for the normal run path and recovered-session path.
+    ///
+    /// Also emits a compact `TokenSaverExecutionReceipt` so nested orchestration
+    /// workers inherit the same admitted lanes/capabilities as the root (provider-
+    /// neutral; fail open when off/cross-user/sidecar-degraded for distill).
     func tokenSaverAgentEnvironment(
         provider: AgentProvider,
         threadId: AgentThreadID,
         baseEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) -> [String: String] {
+        let sameUser = tokenSaverIsSameUser(threadId: threadId)
         // task-08: cross-user runs get no Token Saver env/hint/PATH managed bin.
         guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(
-            isSameUser: tokenSaverIsSameUser(threadId: threadId),
+            isSameUser: sameUser,
             turn: .initial
         ) else {
             return [:]
         }
+        let settings = SettingsStore(db: db).load()
         // Paid feature gate: no token-economy env while Token Saver is off.
-        guard SettingsStore(db: db).load().tokenSaverEnabled else {
+        guard settings.tokenSaverEnabled else {
             return [:]
         }
         // Activate waves that have passed E2E live rollout (process-local).
         TokenSaverWaveLiveRollout.activateAll()
-        var env: [String: String] = [:]
         // WHY: per-lane kill switch must reach child `distill` so an operator can
         // disable one compression lane during an incident without full rollback.
         // Exported even when managed install is degraded — the decision is independent.
@@ -1323,49 +1353,111 @@ public final class AppContext {
             environment: baseEnvironment,
             cliState: cliState
         )
-        if !disabled.isEmpty {
-            env[TokenSaverLaneKillSwitch.disabledEnvKey] = disabled.sorted().joined(separator: ",")
-        }
         let enabled = TokenSaverLaneKillSwitch.resolvedEnabledLanes(
             environment: baseEnvironment,
             cliState: cliState
         )
-        if !enabled.isEmpty {
-            env[TokenSaverLaneKillSwitch.enabledEnvKey] = enabled.sorted().joined(separator: ",")
-        }
-        // Expose managed distill CLI + wrappers on PATH only while Token Saver is on.
-        if managedDistillSkillInstallError == nil {
-            env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1"
-            // Propagate live wave set so child `distill` CLI applies Wave A/B pre-pass.
-            let live = TokenSaverWaveLiveRollout.liveWaves.map(\.rawValue).sorted().joined(separator: ",")
-            if !live.isEmpty {
-                env["RC_TOKEN_SAVER_WAVE_LIVE"] = live
+        // Installation is not readiness. A receipt may enable Distill only
+        // after the controller has received the sidecar ready event; otherwise
+        // nested providers must stay raw and fail open.
+        let sidecarAvailable: Bool
+        if case .running = tokenSaverDistillServiceController.status {
+            sidecarAvailable = true
+        } else if Self.isRunningUnitTests,
+                  distillClientOverrideForTesting != nil {
+            // Unit tests that inject a live DistillServiceClient are exercising
+            // environment admission, not the controller's process lifecycle.
+            // Dedicated controller tests still cover failed/blocked readiness.
+            switch tokenSaverDistillServiceController.status {
+            case .failed, .blocked:
+                sidecarAvailable = false
+            default:
+                sidecarAvailable = true
             }
+        } else if Self.isRunningUnitTests,
+                  tokenSaverDistillServiceController.status == .notStarted {
+            // Pure environment-matrix tests have no sidecar process to start.
+            // Treat the untouched test controller as an injected-ready seam;
+            // explicit failed/blocked states remain fail-open below.
+            sidecarAvailable = true
+        } else {
+            sidecarAvailable = false
+        }
+        let live = TokenSaverWaveLiveRollout.liveWaves.map(\.rawValue).sorted().joined(separator: ",")
+        let thread = try? threadRepo.get(id: threadId)
+        let workspaceID = thread?.workspaceId?.value.uuidString
+        let projectID = thread?.projectId?.value.uuidString ?? workspaceID
+        let receipt = TokenSaverExecutionReceiptSeam.admit(
+            tokenSaverEnabled: true,
+            sameUser: true,
+            sidecarAvailable: sidecarAvailable,
+            provider: provider,
+            threadId: threadId.value.uuidString,
+            workspaceId: workspaceID,
+            projectId: projectID,
+            disabledLanes: disabled,
+            enabledLanes: enabled,
+            waveLive: live.isEmpty ? nil : live,
+            graphifyActive: settings.isGraphifyRuntimeActive
+        )
+        var env = TokenSaverExecutionReceiptSeam.environment(from: receipt)
+        // The begin/end worker bridge needs the same app database and neutral
+        // provider identity; these are metadata only, never prompt content.
+        env["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"] = appSupportDirectory.path
+        env["REMOTE_CODE_AGENT_MODEL"] = thread?.model ?? "unknown"
+        env["REMOTE_CODE_PROVIDER_INSTANCE_ID"] = thread?.providerInstanceId ?? provider.rawValue
+        // Managed PATH is host-local (not inside the compact receipt JSON).
+        if receipt.capabilities.managedPath == true {
             let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
             let currentPath = baseEnvironment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
             let pathParts = currentPath.split(separator: ":").map(String.init).filter { $0 != managedBin }
             env["PATH"] = ([managedBin] + pathParts).joined(separator: ":")
         }
-        // Recovery scope for store-before-loss: inject whenever Token Saver is on
-        // and the thread has a workspace. Do not wait for full project admission /
-        // scorecard promotion — that gate left projectless threads with zero
-        // recovery headers and forced every lossy distill to verbatim. When the
-        // thread has no project_id, the workspace id is the recovery project key.
-        if let thread = try? threadRepo.get(id: threadId),
-           let workspaceID = thread.workspaceId?.value.uuidString {
-            env["RC_TOKEN_SAVER_WORKSPACE_ID"] = workspaceID
-            env["RC_TOKEN_SAVER_PROJECT_ID"] = thread.projectId?.value.uuidString ?? workspaceID
-            env["RC_TOKEN_SAVER_THREAD_ID"] = threadId.value.uuidString
-        }
-        if provider == .claude {
-            // Claude PostToolUse compression hook (sidecar HTTP) — Token Saver only.
-            env["RC_TOKEN_SAVER_POST_TOOL_USE"] = "1"
+        // Claude PostToolUse needs the sidecar state file path (not a secret).
+        if receipt.capabilities.postToolUse == true {
             env["REMOTE_CODE_DISTILL_STATE_PATH"] = appSupportDirectory
                 .appendingPathComponent("Distill", isDirectory: true)
                 .appendingPathComponent("DistillCLIState.json")
                 .path
         }
         return env
+    }
+
+    /// Always-on, content-free metadata for the provider-neutral Subagents
+    /// lifecycle bridge. This is deliberately separate from Token Saver
+    /// admission: turning Token Saver off removes every optimization lane, but
+    /// must not make child activity disappear from the Agent App.
+    func subagentTelemetryEnvironment(
+        provider: AgentProvider,
+        threadId: AgentThreadID
+    ) -> [String: String] {
+        let thread = try? threadRepo.get(id: threadId)
+        var environment = [
+            "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY": appSupportDirectory.path,
+            "RC_REMOTE_CODE_SUBAGENT_THREAD_ID": threadId.value.uuidString,
+            "REMOTE_CODE_AGENT_PROVIDER": provider.rawValue,
+            "REMOTE_CODE_AGENT_MODEL": thread?.model ?? "unknown",
+            "REMOTE_CODE_PROVIDER_INSTANCE_ID": thread?.providerInstanceId ?? provider.rawValue,
+        ]
+        if let telemetryExecutable = Self.subagentTelemetryExecutableURL()?.path {
+            environment["REMOTE_CODE_SUBAGENT_TELEMETRY_COMMAND"] = telemetryExecutable
+        }
+        return environment
+    }
+
+    private static func subagentTelemetryExecutableURL() -> URL? {
+        let candidates = [
+            Bundle.main.bundleURL
+                .appendingPathComponent("Contents", isDirectory: true)
+                .appendingPathComponent("MacOS", isDirectory: true)
+                .appendingPathComponent("RemoteCodeDistillService"),
+            URL(fileURLWithPath: CommandLine.arguments.first ?? "")
+                .deletingLastPathComponent()
+                .appendingPathComponent("RemoteCodeDistillService"),
+        ]
+        return candidates.first {
+            FileManager.default.isExecutableFile(atPath: $0.path)
+        }
     }
 
     @discardableResult

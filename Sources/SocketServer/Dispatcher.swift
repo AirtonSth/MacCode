@@ -2744,6 +2744,7 @@ public final class JSONRPCDispatcher {
             case .noEligibleProvider: kind = "no_eligible_provider"
             case .preferredSourceUnavailable: kind = "preferred_source_unavailable"
             case .receiptPersistenceFailed: kind = "receipt_persistence_failed"
+            case .invalidChildAdmission: kind = "invalid_child_admission"
             }
             return JSONRPCError(
                 code: -32020,

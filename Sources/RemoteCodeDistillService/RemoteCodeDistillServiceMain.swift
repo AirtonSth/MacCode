@@ -1,4 +1,5 @@
 import AgentRuntime
+import CoreModel
 import DistillCore
 import Darwin
 import Foundation
@@ -12,11 +13,24 @@ struct RemoteCodeDistillServiceMain {
         let rawArgs = CommandLine.arguments
         let programName = (rawArgs.first as NSString?)?.lastPathComponent ?? ""
         if programName == "distill" {
+            if rawArgs.dropFirst().first == "subagent" {
+                await runSubagentTelemetry(arguments: Array(rawArgs.dropFirst(2)))
+                return
+            }
             await runCLI(arguments: Array(rawArgs.dropFirst()))
             return
         }
         if rawArgs.dropFirst().first == "cli" {
+            if rawArgs.dropFirst(2).first == "subagent" {
+                await runSubagentTelemetry(arguments: Array(rawArgs.dropFirst(3)))
+                return
+            }
             await runCLI(arguments: Array(rawArgs.dropFirst(2)))
+            return
+        }
+        if programName == "RemoteCodeDistillService",
+           rawArgs.dropFirst().first == "subagent" {
+            await runSubagentTelemetry(arguments: Array(rawArgs.dropFirst(2)))
             return
         }
         if programName == "rc-retrieve-mcp" || rawArgs.dropFirst().first == "mcp" {
@@ -204,6 +218,76 @@ struct RemoteCodeDistillServiceMain {
         let (out, code) = await cli.run()
         FileHandle.standardOutput.write(out)
         Darwin.exit(code)
+    }
+
+    /// Provider-neutral begin/end bridge for skill-controlled nested workers.
+    /// It records metadata only; prompts, output, and secrets never enter the
+    /// orchestration ledger. The managed `distill` executable is used as the
+    /// transport because every Token Saver-enabled provider already receives it.
+    private static func runSubagentTelemetry(arguments: [String]) async {
+        let env = ProcessInfo.processInfo.environment
+        let appSupportOverride = env["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"]
+        do {
+            let (_, db) = try Bootstrap(
+                channel: .debug,
+                appSupportOverride: appSupportOverride
+            ).run()
+            let runtime = AgentOrchestrationRuntime(
+                repository: AgentOrchestrationRepository(db: db),
+                packageVerification: { true },
+                rolloutGate: { true },
+                killSwitch: { false }
+            )
+            guard let operation = arguments.first else { throw TelemetryError.usage }
+            switch operation {
+            case "begin":
+                let nodeId = try argument(named: "--node", in: arguments)
+                guard let threadUUID = UUID(
+                    uuidString: env["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"] ?? env["RC_TOKEN_SAVER_THREAD_ID"] ?? ""
+                ),
+                      let provider = AgentProvider(rawValue: env["REMOTE_CODE_AGENT_PROVIDER"] ?? "") else {
+                    throw TelemetryError.missingScope
+                }
+                let parentRunId: AgentRunID? = UUID(
+                    uuidString: env["RC_TOKEN_SAVER_ROOT_RUN_ID"] ?? env["RC_TOKEN_SAVER_ATTEMPT_ID"] ?? ""
+                )
+                    .map { AgentRunID($0) }
+                let child = try runtime.recordExternalChild(
+                    runId: AgentRunID(),
+                    threadId: AgentThreadID(threadUUID),
+                    provider: provider,
+                    providerInstanceId: env["REMOTE_CODE_PROVIDER_INSTANCE_ID"] ?? provider.rawValue,
+                    model: env["REMOTE_CODE_AGENT_MODEL"] ?? "unknown",
+                    nodeId: nodeId,
+                    parentRunId: parentRunId
+                )
+                print(child.runId?.value.uuidString ?? child.id.uuidString)
+            case "end":
+                guard let runUUID = UUID(uuidString: try argument(named: "--run-id", in: arguments)) else {
+                    throw TelemetryError.usage
+                }
+                let status = AgentRunStatus(rawValue: try argument(named: "--status", in: arguments)) ?? .failed
+                try runtime.finalizeReceipt(runId: AgentRunID(runUUID), status: status)
+            default:
+                throw TelemetryError.usage
+            }
+        } catch {
+            FileHandle.standardError.write(Data("RemoteCode subagent telemetry unavailable: \(error)\n".utf8))
+            Darwin.exit(1)
+        }
+        Darwin.exit(0)
+    }
+
+    private static func argument(named name: String, in arguments: [String]) throws -> String {
+        guard let index = arguments.firstIndex(of: name), arguments.indices.contains(index + 1) else {
+            throw TelemetryError.usage
+        }
+        return arguments[index + 1]
+    }
+
+    private enum TelemetryError: Error {
+        case usage
+        case missingScope
     }
 
     /// Transparent command-wrapper mode (RTK port). Runs the real command, and when this wrapper
