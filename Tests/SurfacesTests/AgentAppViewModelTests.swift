@@ -3446,6 +3446,78 @@ final class AgentAppViewModelTests: XCTestCase {
         await sendTask.value
     }
 
+    /// WHY: between the user's bubble appearing and a run id existing, the surface
+    /// does real work — transcript load, Graphify root resolution (git subprocesses),
+    /// prompt compression, provider spawn. That window rendered NOTHING, so a slow
+    /// dependency looked like the app had hung. "Loading…" must fill exactly that gap
+    /// and must hand over to "Working for Xs" the moment the run is tracked, never
+    /// showing both and never leaking onto a sibling thread.
+    func test_loadingStatusCoversPrepareWindowThenYieldsToWorking() async throws {
+        let runner = PendingStartRunner()
+        let (vm, _) = try makeVM(provider: runner)
+        vm.createThread(title: "prepare window")
+        let sendingThreadId = vm.selectedThreadId!
+
+        // providerLaunchConfig is invoked mid-prepare: after the bubble, before the
+        // run exists. It is the only synchronous observation point in that window.
+        var preparingMidWindow: Bool?
+        var runActiveMidWindow: Bool?
+        var preparingForSiblingThread: Bool?
+        vm.providerLaunchConfig = { _, _ in
+            preparingMidWindow = vm.selectedThreadIsPreparingRun
+            runActiveMidWindow = vm.selectedThreadRunIsStartingOrRunning
+            let restore = vm.selectedThreadId
+            vm.selectedThreadId = AgentThreadID()
+            preparingForSiblingThread = vm.selectedThreadIsPreparingRun
+            vm.selectedThreadId = restore
+            return (binary: nil, environment: [:])
+        }
+        vm.prompt = "prepare then work"
+
+        let sendTask = Task { await vm.send() }
+        await waitAsync("provider start reached, so the prepare window has closed") {
+            runner.enteredStart
+        }
+
+        XCTAssertEqual(preparingMidWindow, true,
+                       "the prepare window must render Loading… — leaving it blank is what read as a hang while Graphify shelled out to git")
+        XCTAssertEqual(runActiveMidWindow, false,
+                       "precondition: no run is tracked yet mid-prepare, so Working cannot be what covers this window")
+        XCTAssertEqual(preparingForSiblingThread, false,
+                       "Loading… is scoped to the sending thread; switching tabs mid-prepare must not mark a sibling thread busy")
+
+        XCTAssertFalse(vm.selectedThreadIsPreparingRun,
+                       "once the run is tracked, Working takes over — both lines rendering at once would double the status row")
+        XCTAssertTrue(vm.selectedThreadRunIsStartingOrRunning,
+                      "the tracked run is what Working renders from")
+
+        vm.stop()
+        runner.releaseStart()
+        await waitAsync("stop cancels the pending start") { runner.cancelled }
+        await sendTask.value
+
+        XCTAssertNil(vm.preparingRunThreadId,
+                     "the prepare marker must be cleared once send returns, or the thread stays Loading… forever")
+    }
+
+    /// WHY: the prepare marker is set before several failure exits (thread vanished,
+    /// provider start refused). If any of them skips the cleanup the transcript is
+    /// stuck on a spinner with no run behind it and no way to clear it.
+    func test_preparingRunClearsWhenProviderStartFails() async throws {
+        let (vm, _) = try makeVM(provider: ThrowingStartRunner())
+        vm.createThread(title: "refused start")
+        vm.prompt = "this start will be refused"
+
+        await vm.send()
+
+        XCTAssertNil(vm.preparingRunThreadId,
+                     "a refused provider start must clear the prepare marker — otherwise Loading… outlives the failure")
+        XCTAssertFalse(vm.selectedThreadIsPreparingRun,
+                       "no spinner may survive a failed start")
+        XCTAssertEqual(vm.status, .failed,
+                       "precondition: the start really did fail, so this test is exercising the error exit")
+    }
+
     func test_streamEventsFanOutToEveryAgentSurfaceViewingTheThread() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-fanout-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
@@ -7024,6 +7096,18 @@ private final class SlowStartRunner: AgentProviderRunner, @unchecked Sendable {
             self?._cancelled = true
             self?.lock.unlock()
         }
+    }
+}
+
+/// Refuses the provider start so the prepare-window state machine can be checked
+/// on its error exit (the "Loading…" line must not outlive a failed start).
+private final class ThrowingStartRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .codex
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        throw AgentProviderAdapterError.unsupported("provider start refused in test")
     }
 }
 

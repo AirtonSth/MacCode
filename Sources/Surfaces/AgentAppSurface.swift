@@ -332,6 +332,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var queuedMessageDraft: String = ""
     /// When the active run started — drives the "Working for Xs" line.
     @Published public var runStartedAt: Date?
+    /// Thread whose turn is being prepared: transcript load, Graphify root
+    /// resolution, prompt compression, provider spawn — all before a run id
+    /// exists to track. Without this the transcript sits silent for seconds
+    /// after the user bubble appears, which read as the app having hung.
+    /// Drives the "Loading…" line; `workingStatus` takes over the instant the
+    /// run is tracked. Thread-scoped so switching tabs mid-prepare cannot show
+    /// a sibling thread as loading.
+    @Published public private(set) var preparingRunThreadId: AgentThreadID?
     /// UX-MAC_AGENT-009: true while the last surfaced error is recoverable, so
     /// the transcript can offer a Retry of the last prompt instead of forcing a
     /// retype. Cleared when a run starts or any non-error event arrives.
@@ -2965,6 +2973,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         selectedThreadId.map(isThreadStartingOrRunning) ?? false
     }
 
+    /// True only while the selected thread is still assembling its turn and no
+    /// run is tracked yet. Deliberately yields to the running state so the two
+    /// status lines can never both render.
+    public var selectedThreadIsPreparingRun: Bool {
+        guard let preparingRunThreadId, preparingRunThreadId == selectedThreadId else { return false }
+        return !selectedThreadRunIsStartingOrRunning
+    }
+
     /// A fresh thread also uses `.pending` as its persisted idle state. A Stop
     /// affordance therefore needs a run identity, not status alone; otherwise a
     /// never-started thread is rendered as busy and its first prompt is queued.
@@ -4566,6 +4582,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             createThread(title: "New thread")
         }
         guard let tid = selectedThreadId else { return nil }
+        // Everything from here to the tracked run below is preparation the user
+        // cannot see (Graphify roots, prompt compression, provider spawn). Show
+        // "Loading…" for it; the defer covers the failure exits so a thread can
+        // never be left permanently loading.
+        preparingRunThreadId = tid
+        defer {
+            if preparingRunThreadId == tid { preparingRunThreadId = nil }
+        }
         // B5: title a still-default thread from its first message.
         if let t = threads.first(where: { $0.id == tid }),
            AgentThreadTitle.isPlaceholder(t.title),
@@ -8630,6 +8654,7 @@ public struct AgentAppView: View {
                                 emptyConversation
                             }
                             if vm.selectedThreadRunIsStartingOrRunning { workingStatus }
+                            else if vm.selectedThreadIsPreparingRun { loadingStatus }
                             if let err = vm.timeline.error { errorRow(err) }
                             // UX-MAC_AGENT-CONTINUE: show inline Continue only when the
                             // selected thread was interrupted by a relaunch and is not
@@ -9340,6 +9365,25 @@ public struct AgentAppView: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
             .accessibilityIdentifier("agent.continue.interrupted")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // "Loading…" + hairline, for the window between the user's bubble appearing
+    // and the run existing. No elapsed timer (nothing has started yet) and no
+    // Stop (there is no run to stop) — deliberately quieter than workingStatus,
+    // so the swap to "Working for Xs" reads as progress rather than a reset.
+    private var loadingStatus: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            HStack(spacing: DS.Space.sm) {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("Loading")
+                Text("Loading…")
+                    .font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
+                    .accessibilityIdentifier("agent.loading.status")
+            }
+            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
