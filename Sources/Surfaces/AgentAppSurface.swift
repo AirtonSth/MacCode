@@ -8572,11 +8572,15 @@ public struct AgentAppView: View {
             // Provider-neutral Subagents activity for the selected thread only
             // (admission receipts + coordinator). Compact badge + popover; does
             // not touch transcript/composer or aggregate sibling threads.
-            if !vm.subagentActivity.isEmpty || showSubagentActivity {
+            // Auto (orchestrate) always exposes the chrome so delegated workers
+            // are discoverable the moment the first child receipt lands — not
+            // only after the user already knows to look for a hidden badge.
+            if !vm.subagentActivity.isEmpty || showSubagentActivity || vm.routingMode == .auto {
                 SubagentActivityBadge(
                     snapshot: vm.subagentActivity,
                     now: vm.currentTime(),
-                    isPresented: $showSubagentActivity
+                    isPresented: $showSubagentActivity,
+                    orchestrateActive: vm.routingMode == .auto
                 )
             }
             // CLAUDE-BG-LIFECYCLE: mirrors the Claude CLI's own "1 shell"

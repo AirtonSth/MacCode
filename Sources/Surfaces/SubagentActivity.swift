@@ -778,6 +778,9 @@ public enum SubagentActivityStyle {
 public struct SubagentActivityBadge: View {
     let snapshot: SubagentActivitySnapshot
     let now: Date
+    /// When true (Auto/orchestrate), empty chrome still explains that delegated
+    /// workers appear here — so orchestrate never looks like a missing feature.
+    let orchestrateActive: Bool
     @Binding var isPresented: Bool
     @State private var activeExpanded = false
     @State private var doneExpanded = false
@@ -786,10 +789,12 @@ public struct SubagentActivityBadge: View {
     public init(
         snapshot: SubagentActivitySnapshot,
         now: Date = Date(),
-        isPresented: Binding<Bool>
+        isPresented: Binding<Bool>,
+        orchestrateActive: Bool = false
     ) {
         self.snapshot = snapshot
         self.now = now
+        self.orchestrateActive = orchestrateActive
         self._isPresented = isPresented
     }
 
@@ -842,6 +847,7 @@ public struct SubagentActivityBadge: View {
             SubagentActivityPopoverPanel(
                 snapshot: snapshot,
                 now: now,
+                orchestrateActive: orchestrateActive,
                 activeExpanded: $activeExpanded,
                 doneExpanded: $doneExpanded,
                 unknownExpanded: $unknownExpanded
@@ -860,6 +866,9 @@ public struct SubagentActivityBadge: View {
     }
 
     private var countLabel: String {
+        if snapshot.isEmpty {
+            return orchestrateActive ? "waiting" : "0 done"
+        }
         if snapshot.activeCount == 0, snapshot.unknownCount == 0 {
             return "\(snapshot.doneCount) done"
         }
@@ -871,7 +880,9 @@ public struct SubagentActivityBadge: View {
 
     private var helpText: String {
         if snapshot.isEmpty {
-            return "No subagent activity yet"
+            return orchestrateActive
+                ? "Auto orchestrate: delegated workers appear here"
+                : "No subagent activity yet"
         }
         var parts = ["\(snapshot.activeCount) active", "\(snapshot.doneCount) done"]
         if snapshot.unknownCount > 0 { parts.append("\(snapshot.unknownCount) unknown") }
@@ -879,6 +890,9 @@ public struct SubagentActivityBadge: View {
     }
 
     private var accessibilityLabel: String {
+        if snapshot.isEmpty, orchestrateActive {
+            return "Subagents, Auto orchestrate waiting for workers"
+        }
         var label = "Subagents, \(snapshot.activeCount) active, \(snapshot.doneCount) done"
         if snapshot.unknownCount > 0 { label += ", \(snapshot.unknownCount) unknown" }
         return label
@@ -888,6 +902,7 @@ public struct SubagentActivityBadge: View {
 struct SubagentActivityPopoverPanel: View {
     let snapshot: SubagentActivitySnapshot
     let now: Date
+    let orchestrateActive: Bool
     @Binding var activeExpanded: Bool
     @Binding var doneExpanded: Bool
     @Binding var unknownExpanded: Bool
@@ -915,9 +930,10 @@ struct SubagentActivityPopoverPanel: View {
             }
 
             if snapshot.isEmpty {
-                Text("No subagent runs recorded yet.")
+                Text(emptyCopy)
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("agent.subagents.empty")
             } else {
                 if !snapshot.active.isEmpty {
@@ -973,6 +989,13 @@ struct SubagentActivityPopoverPanel: View {
             }
         }
         .accessibilityIdentifier("agent.subagents.popover")
+    }
+
+    private var emptyCopy: String {
+        if orchestrateActive {
+            return "Auto orchestrate is on. Each delegated worker (Agent App nested or native subagent) appears here under this controller."
+        }
+        return "No subagent runs recorded yet."
     }
 
     private func sectionHeader(_ title: String, count: Int) -> some View {

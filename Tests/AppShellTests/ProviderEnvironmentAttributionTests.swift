@@ -38,6 +38,70 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
     }
 
     @MainActor
+    func test_autoAndNestedWorkerEnvironmentsCarryFullTokenSaverTechniqueSurface() async throws {
+        // WHY: product rule — every Auto/orchestrate controller and every
+        // orchestrated worker must receive the full Token Saver technique set
+        // (receipt, DISTILL_HINT, managed PATH, Distill state for Claude,
+        // Subagents lifecycle). providerEnvironment is the building block for
+        // the Auto send base and completeOrchestratedWorkerEnvironment; if it
+        // drops any of these keys, workers inherit a thinned host surface.
+        let appSupport = NSTemporaryDirectory() + "RC2AutoWorkerTS-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let router = AppCommandRouter(context: context)
+        let workspace = try router.createWorkspace(name: "auto-ts", cwd: NSTemporaryDirectory())
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
+
+        for provider in [AgentProvider.claude, .codex, .grok] {
+            let thread = try admittedThread(in: context, provider: provider)
+            // Prefer workspace binding so providerEnvironment scopes recovery.
+            var bound = thread
+            bound.workspaceId = workspace.id
+            try context.threadRepo.upsert(bound)
+
+            let env = router.providerEnvironment(
+                provider: provider,
+                instanceId: bound.providerInstanceId,
+                threadId: bound.id
+            )
+            XCTAssertEqual(
+                env["RC_TOKEN_SAVER_DISTILL_HINT"], "1",
+                "\(provider) primary/Auto controller must admit distill"
+            )
+            XCTAssertNotNil(
+                env[TokenSaverExecutionReceipt.envKey],
+                "\(provider) must carry execution receipt for nested inheritance"
+            )
+            XCTAssertEqual(env["REMOTE_CODE_AGENT_PROVIDER"], provider.rawValue)
+            XCTAssertEqual(
+                env["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"],
+                bound.id.value.uuidString,
+                "\(provider) Subagents lifecycle scope"
+            )
+            let path = env["PATH"] ?? ""
+            let managed = env["RC_REMOTE_CODE_MANAGED_BIN"] ?? ""
+            XCTAssertFalse(managed.isEmpty, "\(provider) managed bin")
+            XCTAssertTrue(
+                path.hasPrefix(managed + ":") || path == managed,
+                "\(provider) PATH must front managed wrappers for | distill / proxies: \(path)"
+            )
+            if provider == .claude {
+                XCTAssertEqual(env["RC_TOKEN_SAVER_POST_TOOL_USE"], "1")
+                XCTAssertNotNil(env["REMOTE_CODE_DISTILL_STATE_PATH"])
+            }
+            let dialect = AgentSkillInstaller.tokenSaverProviderPrompt(
+                "orchestrate work",
+                environment: env
+            )
+            XCTAssertTrue(
+                dialect.contains("| distill"),
+                "\(provider) dialect must require | distill when admitted"
+            )
+        }
+    }
+
+    @MainActor
     func test_nestedAgentAppInheritsProjectScopeAndTokenSaverAdmission() async throws {
         // WHY: a cross-provider child must keep the host-validated project
         // scope of its active parent; otherwise the same Token Saver lanes that

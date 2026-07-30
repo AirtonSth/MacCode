@@ -2248,7 +2248,27 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             )
         }
         guard let routing else {
-            return try createAgentThread(workspace: workspace, title: title, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser, surfaceID: surfaceID, routingConfiguration: nil, inheriting: parentThread)
+            // Nested orchestrate workers inherit the controller's workspace/user
+            // scope but must NOT steal Agent App selection. The controller stays
+            // selected so the Subagents badge on the parent is the live chrome
+            // for every delegated worker (user rule: orchestrated agents always
+            // appear as subagents under the orchestrator thread).
+            return try createAgentThread(
+                workspace: workspace,
+                title: title,
+                provider: provider,
+                model: model,
+                permissionMode: permissionMode,
+                reasoningEffort: reasoningEffort,
+                serviceTier: serviceTier,
+                modelSelection: modelSelection,
+                providerInstanceId: providerInstanceId,
+                runAsUser: runAsUser,
+                surfaceID: surfaceID,
+                routingConfiguration: nil,
+                quiet: parentThread != nil,
+                inheriting: parentThread
+            )
         }
         guard let ctx = context, let manualSelection = routing.manualSelection else {
             throw JSONRPCError.invalidParams
@@ -2292,7 +2312,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             routingConfiguration: resolvedRouting
         )
         try ctx.threadRepo.upsert(thread)
-        try selectAgentThread(thread: thread.id, surfaceID: surfaceID)
+        if parentThread == nil {
+            try selectAgentThread(thread: thread.id, surfaceID: surfaceID)
+        } else {
+            // Nested orchestrate worker: keep the controller selected so the
+            // parent's Subagents surface owns live activity for this child.
+            EventBus.shared.publish(kind: "agent.thread.created", payload: agentThreadPayload(thread))
+        }
         return thread
     }
 
@@ -3069,12 +3095,23 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let prov = t.provider
         let m = t.model
         let cwd = try prepareAgentExecutionCwd(thread: &t)
+        // Provider-instance + host Token Saver injects for the Source provider.
+        // Same-host Auto never switches provider. The previous empty Auto base
+        // dropped instance config (HOME/CODEX_HOME/GROK_HOME, custom env) from the
+        // request shell; Token Saver receipt/DISTILL_HINT still arrived later via
+        // runEnvironmentProvider, but nested CLI children could miss instance
+        // homes and any early host injects. Always stamp the full base here.
+        let hostTokenSaverBase = providerEnvironment(
+            provider: prov,
+            instanceId: t.providerInstanceId,
+            threadId: thread
+        )
         // Graphify: authoritative resolve after cwd is known. Fail-open; never blocks the run.
         let graphifyEnv = await applyGraphifyOnSend(
             thread: t,
             cwd: cwd,
             attachments: resolvedAttachments,
-            baseEnvironment: autoRoutingActive ? [:] : providerEnvironment(provider: prov, instanceId: t.providerInstanceId, threadId: thread)
+            baseEnvironment: hostTokenSaverBase
         )
         let acceptancePermit = queueMessageId.map { _ in
             queueAcceptancePermit ?? AgentRunAcceptancePermit()
@@ -3164,9 +3201,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     childCapability: childCapability,
                     requestedPermissionMode: t.permissionMode
                 )
-                providerRunEnvironment[
-                    AgentDelegationCapabilityTransport.environmentKey
-                ] = childCapability
+                // Rebuild host Token Saver for the *child* thread so every
+                // orchestrated worker gets the full technique surface (receipt,
+                // DISTILL_HINT, managed PATH wrappers, Distill state, Graphify)
+                // — not a thinned parent/Auto shell.
+                providerRunEnvironment = await completeOrchestratedWorkerEnvironment(
+                    thread: t,
+                    provider: prov,
+                    cwd: cwd,
+                    attachments: resolvedAttachments,
+                    childCapability: childCapability,
+                    runtimeProfile: nestedRunContext.runtimeProfile
+                )
                 nestedReceiptRegistered = true
             } catch let error as AgentOrchestrationAdmissionError {
                 let kind: String
@@ -3579,6 +3625,54 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let path = settings.graphifyBinaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
         svc.binaryPathOverride = path.isEmpty ? nil : path
         if !active { svc.stopWatchingAll() }
+    }
+
+    /// Full host environment for an orchestrated Agent App worker (nested child).
+    ///
+    /// Product rule: every worker / orchestrated agent must receive the same Token
+    /// Saver technique surface as a user-started primary turn — execution receipt,
+    /// `RC_TOKEN_SAVER_DISTILL_HINT`, managed PATH wrappers (`| distill` / proxies),
+    /// Distill state path (Claude PostToolUse), Graphify when active, and Subagents
+    /// lifecycle keys. Rebuilds from the child thread identity after nested
+    /// admission so cross-provider children are not stuck with a parent-only or
+    /// Auto-thinned shell.
+    private func completeOrchestratedWorkerEnvironment(
+        thread: AgentThread,
+        provider: AgentProvider,
+        cwd: String,
+        attachments: [AgentAttachment],
+        childCapability: String,
+        runtimeProfile: AgentAppRuntimeProfile?
+    ) async -> [String: String] {
+        let hostBase = providerEnvironment(
+            provider: provider,
+            instanceId: thread.providerInstanceId,
+            threadId: thread.id
+        )
+        var env = await applyGraphifyOnSend(
+            thread: thread,
+            cwd: cwd,
+            attachments: attachments,
+            baseEnvironment: hostBase
+        )
+        env.removeValue(forKey: AgentAppRuntimeProfile.environmentKey)
+        if let runtimeProfile {
+            env[AgentAppRuntimeProfile.environmentKey] = runtimeProfile.rawValue
+        }
+        env[AgentDelegationCapabilityTransport.environmentKey] = childCapability
+        // providerEnvironment already stamped Token Saver when admitted. Re-assert
+        // managed wrappers first so nested PATH proxies stay in front after any
+        // Graphify merge.
+        if let managedBin = env["RC_REMOTE_CODE_MANAGED_BIN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !managedBin.isEmpty,
+           let path = env["PATH"] {
+            env["PATH"] = Self.providerPathWithManagedWrappers(
+                currentPath: path,
+                managedBin: managedBin
+            )
+        }
+        return env
     }
 
     /// Authoritative Graphify resolve on send (RPC path). Agent App UI uses the same

@@ -527,6 +527,39 @@ final class GrokACPProtocolTests: XCTestCase {
         }
     }
 
+    func test_mapperRewrapsPlainACPSubagentLifecycleForSubagentsSurface() {
+        // WHY: orchestrated Grok workers must reach ProviderNativeSubagentLifecycle
+        // even when the wire uses plain ACP sessionUpdate kinds instead of the
+        // `_x.ai/session/update` envelope (user rule: orchestrated agents always
+        // appear as subagents under the controller).
+        let childID = "019FB003-077E-7391-9013-BE1849DF3941"
+        let mapper = GrokACPEventMapper(sessionId: "grok-parent")
+        let events = mapper.consumeSessionUpdate([
+            "sessionUpdate": "subagent_spawned",
+            "subagent_id": childID.lowercased(),
+            "child_session_id": childID.lowercased(),
+            "description": "explore payments",
+        ])
+        guard case .providerRuntime(let runtime)? = events.last else {
+            return XCTFail("subagent_spawned must emit a providerRuntime event")
+        }
+        XCTAssertEqual(runtime.method, "_x.ai/session/update")
+        XCTAssertTrue(
+            ProviderNativeSubagentLifecycle.isPotentialLifecycleEvent(events.last!),
+            "re-wrapped event must be on the Subagents lifecycle hot path"
+        )
+        let updates = ProviderNativeSubagentLifecycle.updates(
+            from: events.last!,
+            parentProvider: .grok
+        )
+        XCTAssertEqual(updates.count, 1)
+        XCTAssertEqual(updates.first?.phase, .active)
+        XCTAssertEqual(
+            updates.first?.childRunId.value.uuidString.lowercased(),
+            childID.lowercased()
+        )
+    }
+
     func test_mapperStreamsThoughtTextToolsPlanAndKeepsLastTextPhaseFinal() {
         let mapper = GrokACPEventMapper(sessionId: "grok-session")
         var events: [AssistantEvent] = []

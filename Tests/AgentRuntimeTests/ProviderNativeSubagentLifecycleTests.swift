@@ -4,6 +4,30 @@ import CoreModel
 @testable import AgentRuntime
 
 final class ProviderNativeSubagentLifecycleTests: XCTestCase {
+    func testBareSubagentMethodNameStillProjectsAChild() {
+        // WHY: if a re-wrap is skipped and method is the kind name alone, the
+        // orchestrated worker must still become a Subagents row.
+        let childID = UUID()
+        let payload: [String: Any] = [
+            "child_session_id": childID.uuidString,
+            "subagent_id": childID.uuidString,
+            "status": "completed",
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        let event = AssistantEvent.providerRuntime(ProviderRuntimeEvent(
+            provider: .grok,
+            source: "grok.acp",
+            method: "subagent_finished",
+            payloadJSON: String(decoding: data, as: UTF8.self),
+            receivedAtMs: 1
+        ))
+        XCTAssertTrue(ProviderNativeSubagentLifecycle.isPotentialLifecycleEvent(event))
+        XCTAssertEqual(
+            ProviderNativeSubagentLifecycle.updates(from: event, parentProvider: .grok).first?.phase,
+            .completed
+        )
+    }
+
     func testOrdinaryProviderEventsSkipTheLifecyclePersistenceHotPath() {
         XCTAssertFalse(
             ProviderNativeSubagentLifecycle.isPotentialLifecycleEvent(

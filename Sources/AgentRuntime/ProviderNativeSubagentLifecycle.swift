@@ -32,9 +32,7 @@ enum ProviderNativeSubagentLifecycle {
     static func isPotentialLifecycleEvent(_ event: AssistantEvent) -> Bool {
         switch event {
         case .providerRuntime(let runtimeEvent):
-            return runtimeEvent.provider == .grok
-                && (runtimeEvent.method == "_x.ai/session_notification"
-                    || runtimeEvent.method == "_x.ai/session/update")
+            return runtimeEvent.provider == .grok && isGrokSubagentMethod(runtimeEvent.method)
         case .itemDelta(_, _, let outputAppend, let summary):
             guard outputAppend != nil, let summary else { return false }
             return codexCollaborationTools.contains(summary.lowercased())
@@ -63,17 +61,41 @@ enum ProviderNativeSubagentLifecycle {
         }
     }
 
+    private static func isGrokSubagentMethod(_ method: String) -> Bool {
+        method == "_x.ai/session_notification"
+            || method == "_x.ai/session/update"
+            // Mapper re-wraps plain ACP kinds; accept the kind name too so a
+            // missed re-wrap still reaches the Subagents ledger.
+            || method == "subagent_spawned"
+            || method == "subagent_progress"
+            || method == "subagent_finished"
+    }
+
     private static func grokUpdates(
         from event: ProviderRuntimeEvent
     ) -> [ProviderNativeSubagentUpdate] {
         guard event.provider == .grok,
-              event.method == "_x.ai/session_notification"
-                || event.method == "_x.ai/session/update",
+              isGrokSubagentMethod(event.method),
               let data = event.payloadJSON.data(using: .utf8),
               let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return []
         }
-        let update = (payload["update"] as? [String: Any]) ?? payload
+        // Envelope shape: { update: { sessionUpdate, child_session_id, … } }
+        // or the update object itself (including when method is the kind name).
+        let update: [String: Any]
+        if let nested = payload["update"] as? [String: Any] {
+            update = nested
+        } else if payload["sessionUpdate"] != nil {
+            update = payload
+        } else if isGrokSubagentMethod(event.method),
+                  event.method.hasPrefix("subagent_") {
+            // Bare kind as method + identity fields on the payload root.
+            var rebuilt = payload
+            rebuilt["sessionUpdate"] = event.method
+            update = rebuilt
+        } else {
+            return []
+        }
         guard let kind = update["sessionUpdate"] as? String,
               kind == "subagent_spawned"
                 || kind == "subagent_progress"
