@@ -3195,6 +3195,57 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(router.planNotesByThread[thread], "merged")
     }
 
+    /// WHY: marker-absent iOS hosts read system.capabilities as the authority
+    /// for plan_notes. It must expose the exact shared advertisement so a new
+    /// client never sends protocol_version:1 to an old host that would ignore
+    /// expected_content_digest and save without CAS.
+    @MainActor
+    func testSystemCapabilities_exposesExactPlanNotesAdvertisement() async {
+        let d = JSONRPCDispatcher(router: FakeRouter())
+        let resp = await d.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "system.capabilities",
+            params: nil
+        ))
+        XCTAssertNil(resp.error)
+        let agent = resp.result?.objectValue?["agent"]?.objectValue
+        XCTAssertEqual(
+            agent?["plan_notes"],
+            PlanNotesProjectionV1.CapabilityAdvertisement.jsonValue,
+            "system.capabilities must expose the exact shared plan_notes object"
+        )
+    }
+
+    /// WHY: attachment_upload is store-injected and optional; plan_notes is
+    /// compile-time presence of v1 get+save. Injecting or omitting attachment
+    /// must never remove or mutate the plan_notes gate.
+    @MainActor
+    func testSystemCapabilities_attachmentInjectionDoesNotMutatePlanNotes() async {
+        let expected = PlanNotesProjectionV1.CapabilityAdvertisement.jsonValue
+        let withoutAttachment = JSONRPCDispatcher(router: FakeRouter())
+        let withAttachment = JSONRPCDispatcher(
+            router: FakeRouter(),
+            agentAttachmentUploadCapability: .protectedV3
+        )
+
+        let bare = await withoutAttachment.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0", id: .number(1), method: "system.capabilities", params: nil
+        ))
+        let injected = await withAttachment.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0", id: .number(2), method: "system.capabilities", params: nil
+        ))
+
+        let bareAgent = bare.result?.objectValue?["agent"]?.objectValue
+        let injectedAgent = injected.result?.objectValue?["agent"]?.objectValue
+        XCTAssertNil(bareAgent?["attachment_upload"])
+        XCTAssertEqual(injectedAgent?["attachment_upload"], AgentAttachmentUploadCapabilityAdvertisement.protectedV3.jsonValue)
+        XCTAssertEqual(bareAgent?["plan_notes"], expected)
+        XCTAssertEqual(injectedAgent?["plan_notes"], expected)
+        XCTAssertEqual(bareAgent?["plan_notes"], injectedAgent?["plan_notes"],
+                       "attachment presence/absence must not mutate plan_notes")
+    }
+
     // Verifies that the encode<T> helper's new path (JSONDecoder -> JSONValue) produces the
     // same structure as the old path (JSONSerialization + JSONValue.from) for a representative
     // Codable. This guards against any behavioral divergence introduced by the optimization.

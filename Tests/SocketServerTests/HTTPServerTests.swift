@@ -1524,6 +1524,133 @@ final class HTTPServerTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func test_httpCapabilities_publicAndAuthenticated_exposeExactPlanNotesObject() throws {
+        // WHY: a new iOS client gates protocol_version:1 digest-CAS on this
+        // marker. Public and authenticated HTTP envelopes must both expose the
+        // exact shared object; attachment injection must not remove it.
+        let port = UInt16.random(in: 33000...44000)
+        let attachmentCapability =
+            AgentAttachmentUploadCapabilityAdvertisement.protectedV3
+        let dispatcher = JSONRPCDispatcher(
+            router: FakeRouter(),
+            agentAttachmentUploadCapability: attachmentCapability
+        )
+        let auth = StubAuth()
+        let s = DirectHTTPServer(
+            port: port,
+            loopbackOnly: true,
+            dispatcher: dispatcher,
+            auth: auth,
+            serverId: "plan-notes-caps",
+            bootEpoch: 9
+        )
+        try s.start()
+        defer { s.stop() }
+        Thread.sleep(forTimeInterval: 0.05)
+
+        let expected = PlanNotesProjectionV1.CapabilityAdvertisement.foundationObject as NSDictionary
+
+        let publicEx = expectation(description: "public plan_notes")
+        var publicAgent: [String: Any]?
+        URLSession.shared.dataTask(with: URL(string: "http://127.0.0.1:\(port)/v1/capabilities")!) { data, resp, err in
+            XCTAssertNil(err)
+            XCTAssertEqual((resp as? HTTPURLResponse)?.statusCode, 200)
+            let obj = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
+            publicAgent = obj?["agent"] as? [String: Any]
+            XCTAssertEqual(
+                publicAgent?["plan_notes"] as? NSDictionary,
+                expected,
+                "public /v1/capabilities must expose exact plan_notes advertisement"
+            )
+            XCTAssertEqual(
+                publicAgent?["attachment_upload"] as? NSDictionary,
+                attachmentCapability.foundationObject as NSDictionary,
+                "attachment capability must remain independently injected"
+            )
+            publicEx.fulfill()
+        }.resume()
+        wait(for: [publicEx], timeout: 4)
+
+        var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/capabilities/authenticated")!)
+        req.setValue("Bearer good-token", forHTTPHeaderField: "Authorization")
+        let authEx = expectation(description: "authenticated plan_notes")
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            XCTAssertNil(err)
+            XCTAssertEqual((resp as? HTTPURLResponse)?.statusCode, 200)
+            let obj = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
+            let embedded = obj?["capabilities"] as? [String: Any]
+            let agent = embedded?["agent"] as? [String: Any]
+            XCTAssertEqual(
+                agent?["plan_notes"] as? NSDictionary,
+                expected,
+                "authenticated capabilities must embed the same plan_notes object"
+            )
+            XCTAssertEqual(
+                agent?["attachment_upload"] as? NSDictionary,
+                attachmentCapability.foundationObject as NSDictionary
+            )
+            authEx.fulfill()
+        }.resume()
+        wait(for: [authEx], timeout: 4)
+
+        // Static builder parity (no socket): attachment nil/present must not
+        // drop or mutate plan_notes.
+        let barePayload = DirectHTTPServer.capabilitiesPayload(loopbackOnly: true)
+        let withAttachmentPayload = DirectHTTPServer.capabilitiesPayload(
+            loopbackOnly: true,
+            attachmentUpload: attachmentCapability
+        )
+        let barePlan = (barePayload["agent"] as? [String: Any])?["plan_notes"] as? NSDictionary
+        let withPlan = (withAttachmentPayload["agent"] as? [String: Any])?["plan_notes"] as? NSDictionary
+        XCTAssertEqual(barePlan, expected)
+        XCTAssertEqual(withPlan, expected)
+        XCTAssertNil((barePayload["agent"] as? [String: Any])?["attachment_upload"])
+        XCTAssertNotNil((withAttachmentPayload["agent"] as? [String: Any])?["attachment_upload"])
+    }
+
+    @MainActor
+    func test_planNotesCapability_httpAndSystemAuthoritiesMatchSemantically() async throws {
+        // WHY: HTTP Foundation and system.capabilities JSONValue must describe
+        // the same semantic plan_notes object so cold-connect and legacy RPC
+        // cannot disagree on the negotiation gate.
+        let httpAgent = DirectHTTPServer.capabilitiesPayload(loopbackOnly: true)["agent"] as? [String: Any]
+        let httpPlan = httpAgent?["plan_notes"] as? [String: Any]
+        let httpData = try JSONSerialization.data(
+            withJSONObject: httpPlan ?? [:],
+            options: [.sortedKeys]
+        )
+
+        let dispatcher = JSONRPCDispatcher(router: FakeRouter())
+        let resp = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "system.capabilities",
+            params: nil
+        ))
+        let systemPlan = resp.result?.objectValue?["agent"]?.objectValue?["plan_notes"]
+        XCTAssertEqual(systemPlan, PlanNotesProjectionV1.CapabilityAdvertisement.jsonValue)
+
+        guard case .object(let object)? = systemPlan else {
+            return XCTFail("system plan_notes must be an object")
+        }
+        var asFoundation: [String: Any] = [:]
+        for (key, value) in object {
+            switch value {
+            case .number(let n): asFoundation[key] = Int(n)
+            case .bool(let b): asFoundation[key] = b
+            case .string(let s): asFoundation[key] = s
+            default: XCTFail("unexpected type for \(key)")
+            }
+        }
+        let systemData = try JSONSerialization.data(
+            withJSONObject: asFoundation,
+            options: [.sortedKeys]
+        )
+        XCTAssertEqual(httpData, systemData,
+                       "HTTP and system.capabilities plan_notes must be byte-identical after canonicalization")
+    }
+
     private func connectLocalhost(port: UInt16) throws -> Int32 {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         XCTAssertGreaterThanOrEqual(fd, 0)

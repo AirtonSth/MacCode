@@ -1205,7 +1205,11 @@ public final class JSONRPCDispatcher {
                 var agentCapabilities: [String: JSONValue] = [
                     "providers": .array([.string("codex"), .string("claude"), .string("grok")]),
                     "supports_stream_events": .bool(true),
-                    "supports_resume": .bool(true)
+                    "supports_resume": .bool(true),
+                    // Always present while PlanNotesProjectionV1 is compiled in
+                    // this target. Same helper as DirectHTTPServer.capabilitiesPayload
+                    // so authorities cannot drift on the old-host negotiation gate.
+                    "plan_notes": PlanNotesProjectionV1.CapabilityAdvertisement.jsonValue,
                 ]
                 if let attachmentUpload =
                     agentAttachmentUploadCapability {

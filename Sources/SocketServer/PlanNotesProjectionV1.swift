@@ -15,11 +15,46 @@ public enum PlanNotesProjectionV1: Sendable {
     public static let protocolVersion = 1
     /// Raw UTF-8 ceiling for one page of note text (before JSON escaping).
     public static let maxBytesCeiling = 64 * 1024
+    /// Negotiated iOS weak-link/edit safety ceiling. Does not truncate or change
+    /// authoritative macOS persistence or legacy full-body clients.
+    public static let maxEditableBytes = 256 * 1024
     /// Hard proof target for a fully encoded JSON-RPC response (escape-heavy).
     public static let maxEncodedResponseBytes = 512 * 1024
     /// Compact update event preview — small enough that the event cannot blow
     /// the outbound queue even when many threads update.
     public static let eventPreviewMaxBytes = 256
+
+    /// Exact `agent.plan_notes` object for every host capability authority that
+    /// ships v1 get + digest-CAS save (this module). HTTP public/authenticated
+    /// envelopes and legacy `system.capabilities` must both use these builders
+    /// so a new iOS client never opts into `protocol_version:1` against an
+    /// older host that would ignore unknown params and save without CAS.
+    public enum CapabilityAdvertisement: Sendable {
+        public static let digestCAS = true
+        public static let transport = "http_preferred"
+
+        /// Foundation dictionary for `DirectHTTPServer.capabilitiesPayload`.
+        public static var foundationObject: [String: Any] {
+            [
+                "protocol_version": PlanNotesProjectionV1.protocolVersion,
+                "max_page_bytes": PlanNotesProjectionV1.maxBytesCeiling,
+                "max_editable_bytes": PlanNotesProjectionV1.maxEditableBytes,
+                "digest_cas": digestCAS,
+                "transport": transport,
+            ]
+        }
+
+        /// JSON-RPC value for authenticated `system.capabilities`.
+        public static var jsonValue: JSONValue {
+            .object([
+                "protocol_version": .number(Double(PlanNotesProjectionV1.protocolVersion)),
+                "max_page_bytes": .number(Double(PlanNotesProjectionV1.maxBytesCeiling)),
+                "max_editable_bytes": .number(Double(PlanNotesProjectionV1.maxEditableBytes)),
+                "digest_cas": .bool(digestCAS),
+                "transport": .string(transport),
+            ])
+        }
+    }
 
     public struct Page: Sendable, Equatable {
         public let notes: String

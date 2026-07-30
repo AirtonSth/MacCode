@@ -429,4 +429,60 @@ final class PlanNotesProjectionV1Tests: XCTestCase {
             XCTAssertEqual((error as? JSONRPCError)?.code, -32602)
         }
     }
+
+    // MARK: Capability advertisement (old-host negotiation gate)
+
+    /// WHY: iOS only opts into protocol_version:1 digest-CAS when the host
+    /// advertises this exact object. Constants must stay tied to the compiled
+    /// projection ceilings so a drift cannot open the old-host save hole.
+    func testCapabilityAdvertisement_exactObjectAndConstantParity() {
+        let foundation = PlanNotesProjectionV1.CapabilityAdvertisement.foundationObject
+        XCTAssertEqual(foundation["protocol_version"] as? Int, PlanNotesProjectionV1.protocolVersion)
+        XCTAssertEqual(foundation["max_page_bytes"] as? Int, PlanNotesProjectionV1.maxBytesCeiling)
+        XCTAssertEqual(foundation["max_page_bytes"] as? Int, 65_536)
+        XCTAssertEqual(foundation["max_editable_bytes"] as? Int, PlanNotesProjectionV1.maxEditableBytes)
+        XCTAssertEqual(foundation["max_editable_bytes"] as? Int, 262_144)
+        XCTAssertEqual(foundation["digest_cas"] as? Bool, true)
+        XCTAssertEqual(foundation["transport"] as? String, "http_preferred")
+        XCTAssertEqual(foundation.count, 5, "capability object must stay exactly the negotiated keys")
+
+        let json = PlanNotesProjectionV1.CapabilityAdvertisement.jsonValue
+        XCTAssertEqual(json, .object([
+            "protocol_version": .number(Double(PlanNotesProjectionV1.protocolVersion)),
+            "max_page_bytes": .number(Double(PlanNotesProjectionV1.maxBytesCeiling)),
+            "max_editable_bytes": .number(Double(PlanNotesProjectionV1.maxEditableBytes)),
+            "digest_cas": .bool(true),
+            "transport": .string("http_preferred"),
+        ]))
+    }
+
+    /// WHY: HTTP Foundation and system.capabilities JSONValue builders must
+    /// describe the same semantic object so authorities cannot disagree.
+    func testCapabilityAdvertisement_foundationMatchesJSONValueSemantically() throws {
+        let foundation = PlanNotesProjectionV1.CapabilityAdvertisement.foundationObject
+        let foundationData = try JSONSerialization.data(
+            withJSONObject: foundation,
+            options: [.sortedKeys]
+        )
+        let json = PlanNotesProjectionV1.CapabilityAdvertisement.jsonValue
+        guard case .object(let object) = json else {
+            return XCTFail("jsonValue must be an object")
+        }
+        // Re-encode JSONValue via Foundation so key order is canonicalized.
+        var foundationFromJSON: [String: Any] = [:]
+        for (key, value) in object {
+            switch value {
+            case .number(let n): foundationFromJSON[key] = Int(n)
+            case .bool(let b): foundationFromJSON[key] = b
+            case .string(let s): foundationFromJSON[key] = s
+            default: XCTFail("unexpected type for \(key)")
+            }
+        }
+        let jsonData = try JSONSerialization.data(
+            withJSONObject: foundationFromJSON,
+            options: [.sortedKeys]
+        )
+        XCTAssertEqual(foundationData, jsonData,
+                       "Foundation and JSONValue advertisements must be byte-identical after canonicalization")
+    }
 }

@@ -1118,6 +1118,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "rollout_enabled":
                     AgentOrchestrationRuntime.defaultRolloutEnabled(),
             ],
+            // Always present while PlanNotesProjectionV1 is compiled in this
+            // target (v1 get + digest-CAS save). Single helper with system.capabilities.
+            "plan_notes": PlanNotesProjectionV1.CapabilityAdvertisement.foundationObject,
         ]
         if let attachmentUpload {
             agent["attachment_upload"] = attachmentUpload.foundationObject
