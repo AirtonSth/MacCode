@@ -431,6 +431,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         // Silent catch-up coalesces via process-wide UserDefaults; clear so this
         // case is not starved by earlier suite tests in the same 30s bucket.
         UserDefaults.standard.removeObject(forKey: "private.silentCatchUp.lastBucket")
+        UserDefaults.standard.removeObject(forKey: "private.silentCatchUp.lastBuckets")
 
         let content = try XCTUnwrap(RemoteCodeNotificationContent.threadOutcome(
             threadId: "thread-1",

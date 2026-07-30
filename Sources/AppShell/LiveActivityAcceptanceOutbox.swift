@@ -321,20 +321,13 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
         }
     }
 
-    func acknowledge(
-        _ record: LiveActivityAcceptanceRecord,
-        acceptedEndScope: Bool
-    ) throws {
+    func acknowledge(_ record: LiveActivityAcceptanceRecord) throws {
         try lock.withLock {
             var records = try loadUnlocked()
-            if record.delivery.event == .end, acceptedEndScope {
-                records.removeAll { candidate in
-                    candidate.target.laneIdentity == record.target.laneIdentity &&
-                    Self.isSameOrOlderSession(candidate.delivery, than: record.delivery)
-                }
-            } else {
-                records.removeAll { $0.recordID == record.recordID }
-            }
+            // ACK scope is the exact delivery+target unit. A delayed accepted
+            // end for token A must never acknowledge rotated token B merely
+            // because both share one serialized lifecycle lane.
+            records.removeAll { $0.recordID == record.recordID }
             try saveUnlocked(records)
         }
     }
@@ -373,44 +366,25 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
         let recordCutoff = now.addingTimeInterval(-limits.recordRetention)
         records.removeAll { $0.enqueuedAt < recordCutoff }
 
-        // 3) Count cap: drop oldest non-end first, then oldest ends if unavoidable.
-        // Prefer keeping the newest lifecycle per lane (by enqueue time + order).
+        // 3) Count cap: sort by lifecycle identity, not enqueue time. Protect
+        // current content/start barriers and the newest terminal barrier per lane.
+        records.sort(by: recordIsOrderedBefore)
         if records.count > limits.recordCap {
-            records.sort { lhs, rhs in
-                if lhs.enqueuedAt != rhs.enqueuedAt {
-                    return lhs.enqueuedAt < rhs.enqueuedAt
-                }
-                return isOrderedBefore(lhs.delivery, rhs.delivery)
-            }
-            // Protect newest non-end per lane and all ends while possible.
-            var protected = Set<String>()
-            let byLane = Dictionary(grouping: records, by: { $0.target.laneIdentity })
-            for laneRecords in byLane.values {
-                if let newest = laneRecords
-                    .filter({ $0.delivery.event != .end })
-                    .max(by: {
-                        if $0.enqueuedAt != $1.enqueuedAt {
-                            return $0.enqueuedAt < $1.enqueuedAt
-                        }
-                        return isOrderedBefore($0.delivery, $1.delivery)
-                    }) {
-                    protected.insert(newest.recordID)
-                }
-                for end in laneRecords where end.delivery.event == .end {
-                    protected.insert(end.recordID)
-                }
-            }
             while records.count > limits.recordCap {
+                let current = currentLifecycleRecordIDs(records)
+                let terminal = neededTerminalBarrierIDs(records)
+                let protected = current.union(terminal)
                 if let idx = records.firstIndex(where: {
-                    $0.delivery.event != .end && !protected.contains($0.recordID)
+                    !protected.contains($0.recordID)
                 }) {
                     records.remove(at: idx)
                 } else if let idx = records.firstIndex(where: {
-                    $0.delivery.event == .end && !protected.contains($0.recordID)
+                    terminal.contains($0.recordID) &&
+                    !current.contains($0.recordID)
                 }) {
                     records.remove(at: idx)
                 } else if let idx = records.firstIndex(where: {
-                    $0.delivery.event != .end
+                    !current.contains($0.recordID)
                 }) {
                     records.remove(at: idx)
                 } else {
@@ -422,20 +396,25 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
         // 4) Encoded-byte budget: keep compacting oldest non-end work first.
         while encodedByteCount(records, encoder: encoder) > limits.encodedByteCap {
             guard !records.isEmpty else { break }
-            let protected = protectedRecordIDs(records)
+            let current = currentLifecycleRecordIDs(records)
+            let terminal = neededTerminalBarrierIDs(records)
+            let protected = current.union(terminal)
             if let idx = records.firstIndex(where: {
-                $0.delivery.event != .end && !protected.contains($0.recordID)
+                !protected.contains($0.recordID)
             }) {
                 records.remove(at: idx)
                 continue
             }
             if let idx = records.firstIndex(where: {
-                $0.delivery.event == .end && !protected.contains($0.recordID)
+                terminal.contains($0.recordID) &&
+                !current.contains($0.recordID)
             }) {
                 records.remove(at: idx)
                 continue
             }
-            if let idx = records.firstIndex(where: { $0.delivery.event != .end }) {
+            if let idx = records.firstIndex(where: {
+                !current.contains($0.recordID)
+            }) {
                 records.remove(at: idx)
             } else {
                 records.removeFirst()
@@ -487,11 +466,16 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
             if isOrderedBefore(current.delivery, candidate.delivery) {
                 return candidate
             }
-            if !isOrderedBefore(candidate.delivery, current.delivery),
-               candidate.enqueuedAt >= current.enqueuedAt {
-                return candidate
+            if isOrderedBefore(candidate.delivery, current.delivery) {
+                return current
             }
-            return current
+            if current.delivery.projection.sessionId != candidate.delivery.projection.sessionId {
+                return current.delivery.projection.sessionId <
+                    candidate.delivery.projection.sessionId ? candidate : current
+            }
+            // Same lifecycle identity: later enqueue/array position represents
+            // the rotated target that superseded the prior unit.
+            return candidate.enqueuedAt >= current.enqueuedAt ? candidate : current
         }
     }
 
@@ -522,26 +506,54 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
         ].map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
     }
 
-    private static func protectedRecordIDs(
+    private static func currentLifecycleRecordIDs(
         _ records: [LiveActivityAcceptanceRecord]
     ) -> Set<String> {
         var result = Set<String>()
         for lane in Dictionary(grouping: records, by: { $0.target.laneIdentity }).values {
-            if let current = lane.max(by: {
-                if $0.enqueuedAt != $1.enqueuedAt {
-                    return $0.enqueuedAt < $1.enqueuedAt
-                }
-                return isOrderedBefore($0.delivery, $1.delivery)
-            }) {
-                result.insert(current.recordID)
-            }
-            if let newestEnd = lane
-                .filter({ $0.delivery.event == .end })
-                .max(by: { isOrderedBefore($0.delivery, $1.delivery) }) {
-                result.insert(newestEnd.recordID)
+            guard let current = newestLifecycleRecord(in: lane) else { continue }
+            result.insert(current.recordID)
+            if let start = newestRecord(
+                in: lane.filter {
+                    isSameSession($0.delivery, current.delivery)
+                },
+                event: .start
+            ) {
+                // An update is not deliverable until its generation start has
+                // crossed the backend lifecycle barrier.
+                result.insert(start.recordID)
             }
         }
         return result
+    }
+
+    private static func neededTerminalBarrierIDs(
+        _ records: [LiveActivityAcceptanceRecord]
+    ) -> Set<String> {
+        var result = Set<String>()
+        for lane in Dictionary(grouping: records, by: { $0.target.laneIdentity }).values {
+            if let terminal = lane
+                .filter({ $0.delivery.event == .end })
+                .max(by: { recordIsOrderedBefore($0, $1) }) {
+                result.insert(terminal.recordID)
+            }
+        }
+        return result
+    }
+
+    private static func recordIsOrderedBefore(
+        _ lhs: LiveActivityAcceptanceRecord,
+        _ rhs: LiveActivityAcceptanceRecord
+    ) -> Bool {
+        if isOrderedBefore(lhs.delivery, rhs.delivery) { return true }
+        if isOrderedBefore(rhs.delivery, lhs.delivery) { return false }
+        if lhs.delivery.projection.sessionId != rhs.delivery.projection.sessionId {
+            return lhs.delivery.projection.sessionId < rhs.delivery.projection.sessionId
+        }
+        if lhs.enqueuedAt != rhs.enqueuedAt {
+            return lhs.enqueuedAt < rhs.enqueuedAt
+        }
+        return lhs.recordID < rhs.recordID
     }
 
     private static func encodedByteCount(
@@ -567,27 +579,14 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
         return eventRank(lhs.event) < eventRank(rhs.event)
     }
 
-    private static func isSameOrOlderSession(
-        _ candidate: LiveActivitySyncDelivery,
-        than terminal: LiveActivitySyncDelivery
-    ) -> Bool {
-        guard candidate.projection.hostId == terminal.projection.hostId else { return false }
-        let candidateBoot = UInt64(candidate.projection.epoch) ?? 0
-        let terminalBoot = UInt64(terminal.projection.epoch) ?? 0
-        if candidateBoot != terminalBoot { return candidateBoot < terminalBoot }
-        if candidate.activityGeneration != terminal.activityGeneration {
-            return candidate.activityGeneration < terminal.activityGeneration
-        }
-        return candidate.projection.revision <= terminal.projection.revision
-    }
-
     private static func isSameSession(
         _ lhs: LiveActivitySyncDelivery,
         _ rhs: LiveActivitySyncDelivery
     ) -> Bool {
         lhs.projection.hostId == rhs.projection.hostId &&
         lhs.projection.epoch == rhs.projection.epoch &&
-        lhs.activityGeneration == rhs.activityGeneration
+        lhs.activityGeneration == rhs.activityGeneration &&
+        lhs.projection.sessionId == rhs.projection.sessionId
     }
 
     private static func eventRank(_ event: PrivateLiveActivityEvent) -> Int {
@@ -738,7 +737,7 @@ public final class LiveActivityAcceptanceOutbox: @unchecked Sendable {
 
 private actor LiveActivityAcceptanceLaneScheduler {
     private enum SendOutcome: @unchecked Sendable {
-        case settled(PrivateLiveActivityV2DeliveryAck)
+        case settled
         case failed(Error)
     }
 
@@ -917,9 +916,9 @@ private actor LiveActivityAcceptanceLaneScheduler {
         scheduled.remove(record.recordID)
 
         switch outcome {
-        case .settled(let ack):
+        case .settled:
             do {
-                try store.acknowledge(record, acceptedEndScope: ack.isAccepted)
+                try store.acknowledge(record)
             } catch {
                 onError(error, record.delivery)
             }
@@ -965,7 +964,7 @@ private actor LiveActivityAcceptanceLaneScheduler {
                             ))
                             return
                         }
-                        race.resolve(.settled(ack))
+                        race.resolve(.settled)
                     } catch {
                         race.resolve(.failed(error))
                     }

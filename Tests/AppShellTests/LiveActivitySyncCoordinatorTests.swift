@@ -1067,6 +1067,60 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
         gate.release()
     }
 
+    func testDelayedAcceptedEndForTokenADoesNotAcknowledgeRotatedTokenB() async throws {
+        // WHY: delivery lanes serialize A and B, but they are not ACK scopes.
+        // If B rotates in while end A is in flight, A's delayed accepted result
+        // must not delete B before B reaches the backend.
+        let tmp = NSTemporaryDirectory() + "rc2-la-exact-end-ack-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let store = LiveActivityAcceptanceOutboxStore(settings: SettingsRepository(db: db))
+        let gate = TokenRegistrationGate()
+        let log = OrderedSyncRecorder()
+        let outbox = LiveActivityAcceptanceOutbox(
+            store: store,
+            send: { record in
+                guard case .v2(let target) = record.target else {
+                    throw OutboxTestError.responseLost
+                }
+                log.append(target.token)
+                if target.token == "token-A" {
+                    await gate.waitForRelease()
+                }
+                return PrivateLiveActivityV2DeliveryAck(
+                    id: record.recordID, status: "queued", attempts: 0, nextAttemptAt: nil
+                )
+            }
+        )
+        let end = makeDelivery(event: .end, generation: 6, revision: 3)
+        try outbox.accept(end, targets: [
+            makeTarget(for: end, token: "token-A")
+        ])
+        let aStarted = await Self.waitUntil(timeout: 1.0) {
+            log.events == ["token-A"]
+        }
+        XCTAssertTrue(aStarted)
+
+        try outbox.accept(end, targets: [
+            makeTarget(for: end, token: "token-B")
+        ])
+        let pendingBeforeAck = try store.pending()
+        XCTAssertEqual(pendingBeforeAck.count, 1)
+        guard case .v2(let queuedB) = try XCTUnwrap(pendingBeforeAck.first).target else {
+            return XCTFail("rotated token B must remain as the exact durable unit")
+        }
+        XCTAssertEqual(queuedB.token, "token-B")
+
+        gate.release()
+        let bDelivered = await Self.waitUntil(timeout: 1.0) {
+            log.events == ["token-A", "token-B"]
+        }
+        await outbox.flush()
+        XCTAssertTrue(bDelivered,
+                      "accepted end A must not acknowledge queued rotated token B")
+        XCTAssertTrue(try store.pending().isEmpty,
+                      "B retires only after its own accepted backend result")
+    }
+
     func testLiveActivityRequestsAdvertiseElevenSecondDeadline() async throws {
         // WHY: Live Activity v2 delivery, legacy delivery, and v2 token
         // registration must not hang a background lane indefinitely.
@@ -1270,6 +1324,92 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
             $0.delivery.idempotencyKey == oldStart.idempotencyKey ||
             $0.delivery.idempotencyKey == oldUpdate.idempotencyKey
         }), "superseded start/update work must never be reintroduced")
+    }
+
+    func testCountPressureDropsOldestHistoricalEndBeforeCurrentLifecycle() throws {
+        // WHY: a backlog full of historical ends must not evict the current
+        // start merely because every end was previously treated as protected.
+        let tmp = NSTemporaryDirectory() + "rc2-la-count-current-protection-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let store = LiveActivityAcceptanceOutboxStore(
+            settings: SettingsRepository(db: db),
+            limits: LiveActivityAcceptanceOutboxLimits(
+                recordRetention: 10_000,
+                recordCap: 4,
+                encodedByteCap: 128 * 1024
+            )
+        )
+        for generation in 1...4 {
+            let end = makeDelivery(
+                event: .end, generation: UInt64(generation), revision: 3
+            )
+            try store.enqueue(end, targets: [
+                makeTarget(for: end, token: "end-\(generation)")
+            ])
+        }
+        let currentStart = makeDelivery(event: .start, generation: 5, revision: 1)
+        let report = try store.enqueue(currentStart, targets: [
+            makeTarget(for: currentStart, token: "current-start")
+        ])
+
+        let pending = try store.pending()
+        XCTAssertEqual(report.droppedRecords, 1)
+        XCTAssertEqual(pending.count, 4)
+        XCTAssertTrue(pending.contains(where: {
+            $0.delivery.idempotencyKey == currentStart.idempotencyKey
+        }), "count pressure must preserve the lifecycle-current start")
+        XCTAssertTrue(pending.contains(where: {
+            $0.delivery.event == .end && $0.delivery.activityGeneration == 4
+        }), "the newest terminal barrier must remain protected")
+        XCTAssertFalse(pending.contains(where: {
+            $0.delivery.event == .end && $0.delivery.activityGeneration == 1
+        }), "the oldest historical end is the first safe pressure drop")
+    }
+
+    func testBytePressureUsesLifecycleOrderNotLateEnqueueTime() throws {
+        // WHY: a late-arriving old end has a newer enqueuedAt but an older
+        // lifecycle identity. Byte pressure must keep the higher-generation
+        // current start and discard that historical end when both cannot fit.
+        let tmp = NSTemporaryDirectory() + "rc2-la-byte-current-protection-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let clock = ManualOutboxClock(now: Date(timeIntervalSince1970: 9_000_000))
+        let currentStart = makeDelivery(event: .start, generation: 5, revision: 1)
+        let lateOldEnd = makeDelivery(event: .end, generation: 4, revision: 3)
+        let currentRecord = LiveActivityAcceptanceRecord(
+            delivery: currentStart,
+            target: makeTarget(for: currentStart, token: "current-start"),
+            enqueuedAt: clock.read()
+        )
+        clock.advance(by: 1)
+        let oldEndRecord = LiveActivityAcceptanceRecord(
+            delivery: lateOldEnd,
+            target: makeTarget(for: lateOldEnd, token: "late-old-end"),
+            enqueuedAt: clock.read()
+        )
+        let encoder = JSONEncoder()
+        let bothBytes = try encoder.encode([oldEndRecord, currentRecord]).count
+        let byteCap = bothBytes - 1
+        XCTAssertLessThanOrEqual(try encoder.encode([oldEndRecord]).count, byteCap)
+        XCTAssertLessThanOrEqual(try encoder.encode([currentRecord]).count, byteCap)
+        clock.advance(by: -1)
+        let store = LiveActivityAcceptanceOutboxStore(
+            settings: SettingsRepository(db: db),
+            now: { clock.read() },
+            limits: LiveActivityAcceptanceOutboxLimits(
+                recordRetention: 10_000,
+                recordCap: 20,
+                encodedByteCap: byteCap
+            )
+        )
+        try store.enqueue(currentStart, targets: [currentRecord.target])
+        clock.advance(by: 1)
+        let report = try store.enqueue(lateOldEnd, targets: [oldEndRecord.target])
+
+        let pending = try store.pending()
+        XCTAssertEqual(report.droppedRecords, 1)
+        XCTAssertEqual(pending.map(\.delivery.idempotencyKey), [
+            currentStart.idempotencyKey
+        ], "late enqueue time must never redefine lifecycle-current under byte pressure")
     }
 
     func testCancellationAndTimeoutRemainPendingNeverAcknowledged() async throws {
