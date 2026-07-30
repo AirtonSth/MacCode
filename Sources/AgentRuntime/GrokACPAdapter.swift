@@ -480,10 +480,20 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         let bufferedNotifications = NotificationBuffer()
         let client: GrokACPClient
         do {
+            let launchArguments = try GrokACPClient.launchArguments(for: request)
+            let isForeignUser = request.runAsUser.map { $0.uid != getuid() } == true
+            let askpass = isForeignUser
+                ? RunAsUserProcessBootstrap.materializeAskpass(
+                    targetUser: request.runAsUser!.shortName
+                )
+                : nil
             client = try GrokACPClient(
                 binary: binary,
                 cwd: request.cwd,
                 environment: request.environment,
+                launchArguments: launchArguments,
+                runAsUser: request.runAsUser,
+                askpassPath: askpass,
                 notificationHandler: { method, params in
                     bufferedNotifications.append(method: method, params: params)
                 },

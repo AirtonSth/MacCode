@@ -61,6 +61,7 @@ final class GrokParserTests: XCTestCase {
         }.first
         XCTAssertNotNil(usage, "Grok end.usage must feed Token Saver so the purple ring is not stuck on No data")
         XCTAssertEqual(usage?.totalTokens, 31137)
+        XCTAssertEqual(usage?.resolvedSemantics, .cumulative)
         XCTAssertEqual(usage?.outputTokens, 18)
         // input = uncached + cache read (25103 + 6016) when using modelUsage path
         XCTAssertEqual(usage?.inputTokens, 25103 + 6016)

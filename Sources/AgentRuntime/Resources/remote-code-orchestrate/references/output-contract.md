@@ -219,8 +219,10 @@ Controller-only `ORCHESTRATION` nodes may set `runtime` to null.
 - A required reviewer is read-only, independent, depends on every producer, and
   has dedicated passing target evidence.
 
-The validator checks the full schema, producer derivation, changed-file
-reconciliation, state transitions, blocker provenance, dependency acyclicity,
-overlapping writes, proof ownership, review triggers, runtime matrix binding,
-owner-identity hygiene, and decision consistency. Report validator `PASS` or
-its exact errors in the final response.
+The optional development validator checks the full schema, producer derivation,
+changed-file reconciliation, state transitions, blocker provenance, dependency
+acyclicity, overlapping writes, proof ownership, review triggers, runtime matrix
+binding, owner-identity hygiene, and decision consistency. When its runtime is
+already available and it is used, report `PASS` or its exact errors in the final
+response. The core orchestration must still review these invariants and complete
+without installing or requiring Python.

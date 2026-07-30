@@ -292,7 +292,8 @@ public final class GrokParser {
                 uncachedInputTokens: uncached,
                 cacheReadInputTokens: read > 0 ? read : nil,
                 reportedCostMicros: reportedCostMicros,
-                contextTokens: nil
+                contextTokens: nil,
+                semantics: .cumulative
             )
         }
 
@@ -326,7 +327,8 @@ public final class GrokParser {
             uncachedInputTokens: uncached,
             cacheReadInputTokens: read > 0 ? read : nil,
             reportedCostMicros: reportedCostMicros,
-            contextTokens: contextTokens > 0 ? contextTokens : nil
+            contextTokens: contextTokens > 0 ? contextTokens : nil,
+            semantics: .cumulative
         )
     }
 

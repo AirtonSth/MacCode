@@ -92,11 +92,26 @@ final class AgentRuntimeResourceBundleTests: XCTestCase {
 
     func test_bundle_resolvesUnderSwiftTestViaSwiftPMFallback() throws {
         // Live unit-test environment: SPM product layout under .build must resolve
-        // so reconcile keeps working in tests.
+        // so reconcile keeps working in tests. The selected bundle must be the
+        // active product, not a stale Xcode index-build resource copy.
         let bundle = try AgentRuntimeResourceBundle.bundle()
-        XCTAssertNotNil(
+        let embedded = try XCTUnwrap(
             bundle.url(forResource: "remote-code-orchestrate", withExtension: nil),
             "SPM fallback must expose the embedded orchestrate package"
+        )
+        let package = AgentSkillInstaller.remoteCodeOrchestratePinnedPackage
+        let files = try package.allowedPaths.map { relativePath in
+            let data = try Data(contentsOf: embedded.appendingPathComponent(relativePath))
+            return RemoteCodeOrchestrateFile(
+                relativePath: relativePath,
+                byteCount: data.count,
+                sha256: AgentSkillInstaller.sha256Hex(data)
+            )
+        }
+        XCTAssertEqual(
+            AgentSkillInstaller.remoteCodeOrchestrateTreeDigest(files),
+            package.sourceTreeSHA256,
+            "SwiftPM fallback must not select a stale copied resource bundle"
         )
     }
 
@@ -163,6 +178,23 @@ final class AgentRuntimeResourceBundleTests: XCTestCase {
         XCTAssertTrue(
             script.contains(".DS_Store"),
             "structural gate must reject entries the pinned source validation would refuse"
+        )
+        let package = AgentSkillInstaller.remoteCodeOrchestratePinnedPackage
+        XCTAssertTrue(
+            script.contains(
+                #"ORCHESTRATE_EXPECTED_TREE_SHA256="\#(package.sourceTreeSHA256)""#
+            ),
+            "bundle gate digest must match the v\(package.localVersion) compiled package pin"
+        )
+        for relativePath in package.allowedPaths {
+            XCTAssertTrue(
+                script.contains(#""\#(relativePath)""#),
+                "bundle gate must include pinned path \(relativePath)"
+            )
+        }
+        XCTAssertTrue(
+            script.contains("exact eight-file pinned tree"),
+            "bundle gate must reject mixed, stale, missing, and extra resource trees"
         )
         XCTAssertTrue(
             script.contains("RemoteCode_Surfaces.bundle\""),

@@ -81,6 +81,27 @@ final class SubagentActivityTests: XCTestCase {
         XCTAssertTrue(
             SubagentActivityProjection.isActiveReceipt(receipt: receipt, activeRunIds: [runId])
         )
+
+        let staleExternal = makeReceipt(
+            lifecycle: .unknown,
+            finalStatus: nil,
+            runId: runId,
+            decisionReason: "external-controlled-child"
+        )
+        XCTAssertEqual(
+            SubagentActivityProjection.mapPhase(
+                receipt: staleExternal,
+                activeRunIds: [runId]
+            ),
+            .unknown,
+            "a coordinator projection must not revive an external receipt whose lease/PID reconciliation failed"
+        )
+        XCTAssertFalse(
+            SubagentActivityProjection.isActiveReceipt(
+                receipt: staleExternal,
+                activeRunIds: [runId]
+            )
+        )
     }
 
     // MARK: - Provider normalization
@@ -395,7 +416,8 @@ final class SubagentActivityTests: XCTestCase {
         finalizedAt: Date? = nil,
         model: String = "model-x",
         nodeId: String = "worker",
-        provider: AgentProvider = .codex
+        provider: AgentProvider = .codex,
+        decisionReason: String = "test"
     ) -> AgentOrchestrationAdmissionReceipt {
         let admitted = admittedAt ?? now.addingTimeInterval(-120)
         return AgentOrchestrationAdmissionReceipt(
@@ -412,7 +434,7 @@ final class SubagentActivityTests: XCTestCase {
             providerInstanceId: provider.rawValue,
             model: model,
             capabilitySnapshotId: "cap",
-            decisionReason: "test",
+            decisionReason: decisionReason,
             admittedAt: admitted,
             lifecycleStatus: lifecycle,
             lifecycleUpdatedAt: lifecycleUpdatedAt ?? admitted,

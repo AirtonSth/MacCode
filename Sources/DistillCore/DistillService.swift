@@ -624,6 +624,10 @@ public actor DistillServiceMetricsRecorder {
 
 public final class DistillHTTPServer: @unchecked Sendable {
     public typealias SuccessHandler = @Sendable (DistillRequest, DistillResponse) async -> Void
+    /// Live paid-feature admission, re-evaluated by the HTTP boundary for every
+    /// compression request. The sidecar executable wires this to authoritative
+    /// settings; the default preserves standalone/test server compatibility.
+    public typealias DistillAdmission = @Sendable () -> Bool
     /// Optional ledger seam for forfeited (not-delivered) savings. DistillCore stays
     /// Persistence-free; the sidecar wires this to `TokenSaverSavingsRepository`.
     public typealias SavingsRecordHandler = @Sendable (DistillSavingsRecord) async -> Void
@@ -675,6 +679,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let onSuccess: SuccessHandler?
+    private let distillAdmission: DistillAdmission
     private let onSavingsRecord: SavingsRecordHandler?
     private let onAuditEvent: AuditEventHandler?
     private let reversibleStore: ReversibleStoring?
@@ -699,7 +704,8 @@ public final class DistillHTTPServer: @unchecked Sendable {
         metricsRecorder: DistillServiceMetricsRecorder? = nil,
         onSuccess: SuccessHandler? = nil,
         onSavingsRecord: SavingsRecordHandler? = nil,
-        onAuditEvent: AuditEventHandler? = nil
+        onAuditEvent: AuditEventHandler? = nil,
+        distillAdmission: @escaping DistillAdmission = { true }
     ) {
         self.configuration = configuration
         self.scheduler = scheduler
@@ -710,6 +716,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
         self.requestBodyLimitBytes = max(1, requestBodyLimitBytes)
         self._ready = startsReady
         self.metrics = metricsRecorder ?? DistillServiceMetricsRecorder()
+        self.distillAdmission = distillAdmission
         self.onSuccess = onSuccess
         self.onSavingsRecord = onSavingsRecord
         self.onAuditEvent = onAuditEvent
@@ -943,12 +950,22 @@ public final class DistillHTTPServer: @unchecked Sendable {
             send(status: 200, body: snapshot, connection: connection)
         case ("GET", "/v1/stats"):
             handleStats(connection: connection)
-        case ("POST", "/v1/distill"), ("POST", "/v1/compress"):
-            await handleDistill(request: request, connection: connection)
-        case ("POST", "/v1/rank"):
-            handleRank(request: request, connection: connection)
-        case ("POST", "/v1/embed"):
-            handleEmbed(request: request, connection: connection)
+        case ("POST", "/v1/distill"),
+             ("POST", "/v1/compress"),
+             ("POST", "/v1/rank"),
+             ("POST", "/v1/embed"):
+            guard distillAdmission() else {
+                denyDistill(connection: connection)
+                return
+            }
+            switch request.path {
+            case "/v1/rank":
+                handleRank(request: request, connection: connection)
+            case "/v1/embed":
+                handleEmbed(request: request, connection: connection)
+            default:
+                await handleDistill(request: request, connection: connection)
+            }
         case (_, "/v1/distill"), (_, "/v1/compress"):
             send(status: 405, body: ErrorBody(error: "method_not_allowed", message: "use POST"), connection: connection)
         case (_, "/v1/rank"), (_, "/v1/embed"):
@@ -1165,6 +1182,10 @@ public final class DistillHTTPServer: @unchecked Sendable {
     }
 
     private func handleDistill(request: HTTPRequest, connection: NWConnection) async {
+        guard distillAdmission() else {
+            denyDistill(connection: connection)
+            return
+        }
         await metrics.recordRequest()
         guard request.body.count <= requestBodyLimitBytes else {
             await metrics.recordFailure()
@@ -1221,7 +1242,18 @@ public final class DistillHTTPServer: @unchecked Sendable {
                     }
                 }
             }
+            guard distillAdmission() else {
+                denyDistill(connection: connection)
+                return
+            }
             let compressed = try await scheduler.submit(distillRequest)
+            // A toggle can change while an in-flight model call finishes. Do not
+            // store originals, publish reduced output, or record savings after
+            // authority is revoked.
+            guard distillAdmission() else {
+                denyDistill(connection: connection)
+                return
+            }
             var response = compressed
             if distillRequest.effectiveRunMode == .optimize,
                compressed.output != distillRequest.input {
@@ -1310,6 +1342,17 @@ public final class DistillHTTPServer: @unchecked Sendable {
             await metrics.recordFailure()
             send(status: 400, body: ErrorBody(error: "bad_request", message: "invalid distill request"), connection: connection)
         }
+    }
+
+    private func denyDistill(connection: NWConnection) {
+        send(
+            status: 409,
+            body: ErrorBody(
+                error: "token_saver_disabled",
+                message: "Token Saver is disabled; preserve the original input"
+            ),
+            connection: connection
+        )
     }
 
     private func handleRank(request: HTTPRequest, connection: NWConnection) {

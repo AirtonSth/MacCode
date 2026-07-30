@@ -301,4 +301,346 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
             "positive session % without reset metadata remains usable"
         )
     }
+
+    func test_providerBilledProvenance_roundTripPreservesUnknownAndMeasured() throws {
+        // WHY: the stored raw-token fallback must not become a provider-billed
+        // measurement merely because JSONEncoder wrote its numeric value.
+        let unknown = TokenSaverProviderUsage(
+            provider: .claude,
+            actualProviderTokens: 1_000,
+            estimatedRawTokens: 1_200
+        )
+        let measured = TokenSaverProviderUsage(
+            provider: .codex,
+            actualProviderTokens: 1_000,
+            estimatedRawTokens: 1_200,
+            actualProviderBilledTokenUnits: 250
+        )
+
+        let encoded = try JSONEncoder().encode([unknown, measured])
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [[String: Any]])
+        XCTAssertEqual(
+            object[0]["actualProviderBilledTokenUnitsProvenance"] as? String,
+            "unknown"
+        )
+        XCTAssertEqual(
+            object[1]["actualProviderBilledTokenUnitsProvenance"] as? String,
+            "measured"
+        )
+
+        let decoded = try JSONDecoder().decode(
+            [TokenSaverProviderUsage].self,
+            from: encoded
+        )
+
+        XCTAssertEqual(decoded[0].actualProviderBilledTokenUnits, 1_000, accuracy: 0.001)
+        XCTAssertNil(
+            decoded[0].knownActualProviderBilledTokenUnits,
+            "unknown fallback must stay unknown after persistence"
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(decoded[1].knownActualProviderBilledTokenUnits),
+            250,
+            accuracy: 0.001,
+            "an explicitly measured billed value must stay measured after persistence"
+        )
+    }
+
+    func test_providerBilledProvenance_legacyJSONIsConservativelyUnknown() throws {
+        // WHY: historical JSON has a numeric billed key but no origin bit, so it
+        // cannot prove whether the number was measured or synthesized from raw.
+        let legacy = """
+        {
+          "provider": "claude",
+          "actualProviderTokens": 1000,
+          "estimatedRawTokens": 1200,
+          "actualProviderBilledTokenUnits": 250,
+          "estimatedRawBilledTokenUnits": 300,
+          "eligibleRuns": 1,
+          "currentSessionTokens": 0,
+          "currentSessionLimitTokens": 0
+        }
+        """
+
+        let decoded = try JSONDecoder().decode(
+            TokenSaverProviderUsage.self,
+            from: Data(legacy.utf8)
+        )
+
+        XCTAssertEqual(decoded.actualProviderBilledTokenUnits, 250, accuracy: 0.001)
+        XCTAssertNil(
+            decoded.knownActualProviderBilledTokenUnits,
+            "legacy numeric values without provenance must not be promoted to measurements"
+        )
+    }
+
+    func test_providerBilledProvenance_mergeAndAccountUpdateStayConservative() throws {
+        // WHY: managed providers start as empty unknown rows. That zero-value
+        // placeholder must not poison a first measured delta, while any real
+        // unknown token contribution must keep the aggregate unknown.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ts-billed-provenance-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = TokenSaverUsageStore(appSupportDirectory: directory)
+        _ = try store.recordAccountUsage(provider: .grok, weeklyUsedPercent: 12)
+        let accountOnly = try XCTUnwrap(store.load().providers.first { $0.provider == .grok })
+        XCTAssertNil(
+            accountOnly.knownActualProviderBilledTokenUnits,
+            "an account quota update alone must not invent a billed measurement"
+        )
+        _ = try store.record(
+            provider: .grok,
+            actualProviderTokens: 0,
+            estimatedRawTokens: 0,
+            eligibleRuns: 0
+        )
+        let emptyMerge = try XCTUnwrap(store.load().providers.first { $0.provider == .grok })
+        XCTAssertNil(
+            emptyMerge.knownActualProviderBilledTokenUnits,
+            "merging two empty unknown rows must not manufacture a known zero"
+        )
+
+        _ = try store.record(
+            provider: .claude,
+            actualProviderTokens: 1_000,
+            estimatedRawTokens: 1_200,
+            actualProviderBilledTokenUnits: 250
+        )
+        var claude = try XCTUnwrap(store.load().providers.first { $0.provider == .claude })
+        XCTAssertEqual(
+            try XCTUnwrap(claude.knownActualProviderBilledTokenUnits),
+            250,
+            accuracy: 0.001,
+            "the empty managed-provider row is not an unknown usage contribution"
+        )
+
+        _ = try store.record(
+            provider: .claude,
+            actualProviderTokens: 200,
+            estimatedRawTokens: 240,
+            actualProviderBilledTokenUnits: 50
+        )
+        claude = try XCTUnwrap(store.load().providers.first { $0.provider == .claude })
+        XCTAssertEqual(
+            try XCTUnwrap(claude.knownActualProviderBilledTokenUnits),
+            300,
+            accuracy: 0.001,
+            "two measured deltas must merge into a measured aggregate"
+        )
+
+        _ = try store.recordAccountUsage(provider: .claude, weeklyUsedPercent: 20)
+        claude = try XCTUnwrap(store.load().providers.first { $0.provider == .claude })
+        XCTAssertEqual(
+            try XCTUnwrap(claude.knownActualProviderBilledTokenUnits),
+            300,
+            accuracy: 0.001,
+            "account quota updates must preserve, not manufacture or erase, billed provenance"
+        )
+
+        _ = try store.record(
+            provider: .claude,
+            actualProviderTokens: 100,
+            estimatedRawTokens: 100
+        )
+        _ = try store.recordAccountUsage(provider: .claude, weeklyUsedPercent: 21)
+        claude = try XCTUnwrap(store.load().providers.first { $0.provider == .claude })
+        XCTAssertNil(
+            claude.knownActualProviderBilledTokenUnits,
+            "a real unknown contribution must keep the merged total unknown across account updates"
+        )
+    }
+
+    func test_crossProcessLock_serializesEveryMutationWhileReadsRemainComplete() throws {
+        // WHY: provider proxies and the app update the same usage.json. Without
+        // one stable cross-process lock, two valid read-modify-writes can each
+        // atomically replace the file while silently dropping the other's delta.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ts-cross-process-lock-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = TokenSaverUsageStore(appSupportDirectory: directory)
+        try store.save(TokenSaverUsageSnapshot(period: .sevenDays, providers: [
+            TokenSaverProviderUsage(
+                provider: .grok,
+                actualProviderTokens: 10,
+                estimatedRawTokens: 10
+            )
+        ]))
+        let lockURL = directory
+            .appendingPathComponent("TokenSaver", isDirectory: true)
+            .appendingPathComponent("usage.lock", isDirectory: false)
+
+        let readHolder = try ExternalUsageLockHolder.acquire(path: lockURL.path)
+        let readCompleted = DispatchSemaphore(value: 0)
+        let readResult = UsageMutationResult()
+        DispatchQueue.global().async {
+            let loaded = store.load()
+            readResult.setSnapshot(loaded)
+            readCompleted.signal()
+        }
+        XCTAssertEqual(
+            readCompleted.wait(timeout: .now() + 1),
+            .success,
+            "atomic replacement lets readers return a complete old/new snapshot without waiting on writers"
+        )
+        XCTAssertEqual(readResult.snapshot?.providers.first(where: { $0.provider == .grok })?.actualProviderTokens, 10)
+        XCTAssertEqual(readHolder.releaseAndWait(), 0)
+
+        let mutations: [(String, @Sendable () throws -> Void)] = [
+            ("direct save", { try store.save(store.load()) }),
+            ("record", {
+                _ = try store.record(
+                    provider: .grok,
+                    actualProviderTokens: 7,
+                    estimatedRawTokens: 7
+                )
+            }),
+            ("account update", {
+                _ = try store.recordAccountUsage(provider: .grok, weeklyUsedPercent: 44)
+            }),
+            ("account clear", {
+                _ = try store.clearAccountUsagePercentages(provider: .grok)
+            })
+        ]
+
+        for (name, mutation) in mutations {
+            let holder = try ExternalUsageLockHolder.acquire(path: lockURL.path)
+            let completed = DispatchSemaphore(value: 0)
+            let result = UsageMutationResult()
+            DispatchQueue.global().async {
+                do {
+                    try mutation()
+                } catch {
+                    result.setError(error)
+                }
+                completed.signal()
+            }
+            XCTAssertEqual(
+                completed.wait(timeout: .now() + 0.15),
+                .timedOut,
+                "\(name) must wait while another process owns usage.lock"
+            )
+            XCTAssertEqual(holder.releaseAndWait(), 0, "native lock-holder process must exit cleanly")
+            XCTAssertEqual(
+                completed.wait(timeout: .now() + 2),
+                .success,
+                "\(name) must resume after the cross-process lock is released"
+            )
+            if let error = result.error {
+                XCTFail("\(name) failed after lock release: \(error)")
+            }
+        }
+
+        let loaded = store.load()
+        let grok = try XCTUnwrap(loaded.providers.first(where: { $0.provider == .grok }))
+        XCTAssertEqual(grok.actualProviderTokens, 17)
+        XCTAssertEqual(grok.weeklyUsedPercent, 0)
+        let usageURL = lockURL.deletingLastPathComponent().appendingPathComponent("usage.json")
+        _ = try JSONDecoder().decode(TokenSaverUsageSnapshot.self, from: Data(contentsOf: usageURL))
+
+        let permissions = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: lockURL.path)[.posixPermissions] as? NSNumber
+        )
+        XCTAssertEqual(permissions.intValue & 0o777, 0o600, "the stable sibling lock must be owner-only")
+    }
+}
+
+private final class UsageMutationResult: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedError: Error?
+    private var storedSnapshot: TokenSaverUsageSnapshot?
+
+    var error: Error? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedError
+    }
+
+    var snapshot: TokenSaverUsageSnapshot? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedSnapshot
+    }
+
+    func setError(_ error: Error) {
+        lock.lock()
+        storedError = error
+        lock.unlock()
+    }
+
+    func setSnapshot(_ snapshot: TokenSaverUsageSnapshot) {
+        lock.lock()
+        storedSnapshot = snapshot
+        lock.unlock()
+    }
+}
+
+/// `/usr/bin/lockf` is a separate native process that uses the same BSD flock
+/// contract as production. Its command writes a ready file only after acquiring
+/// the lock, then waits for the parent to write a release file.
+private final class ExternalUsageLockHolder {
+    private let process: Process
+    private let releaseURL: URL
+    private var released = false
+
+    private init(process: Process, releaseURL: URL) {
+        self.process = process
+        self.releaseURL = releaseURL
+    }
+
+    static func acquire(path: String) throws -> ExternalUsageLockHolder {
+        let markerDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ts-lock-holder-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: markerDirectory, withIntermediateDirectories: true)
+        let readyURL = markerDirectory.appendingPathComponent("ready")
+        let releaseURL = markerDirectory.appendingPathComponent("release")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/lockf")
+        process.arguments = [
+            "-k",
+            "-w",
+            path,
+            "/bin/sh",
+            "-c",
+            "/usr/bin/touch \"$1\"; while [ ! -e \"$2\" ]; do /bin/sleep 0.01; done",
+            "usage-lock-holder",
+            readyURL.path,
+            releaseURL.path
+        ]
+        try process.run()
+
+        let deadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: readyURL.path),
+              process.isRunning,
+              Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        guard FileManager.default.fileExists(atPath: readyURL.path), process.isRunning else {
+            if process.isRunning { process.terminate() }
+            process.waitUntilExit()
+            try? FileManager.default.removeItem(at: markerDirectory)
+            throw NSError(
+                domain: "TokenSaverUsageSnapshotTests.ExternalUsageLockHolder",
+                code: Int(process.terminationStatus)
+            )
+        }
+        return ExternalUsageLockHolder(process: process, releaseURL: releaseURL)
+    }
+
+    @discardableResult
+    func releaseAndWait() -> Int32 {
+        guard !released else { return process.terminationStatus }
+        released = true
+        FileManager.default.createFile(atPath: releaseURL.path, contents: Data())
+        process.waitUntilExit()
+        try? FileManager.default.removeItem(at: releaseURL.deletingLastPathComponent())
+        return process.terminationStatus
+    }
+
+    deinit {
+        _ = releaseAndWait()
+    }
 }

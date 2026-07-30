@@ -604,13 +604,24 @@ public final class ClaudeParser {
                 cacheCreationInputTokens: creation,
                 cacheReadInputTokens: read,
                 reportedCostMicros: reportedCostMicros,
-                contextTokens: nil
+                contextTokens: nil,
+                semantics: .cumulative
             )
         }
         let usage = obj["usage"] as? [String: Any] ?? obj["token_usage"] as? [String: Any] ?? obj
-        let input = intValue(usage["input_tokens"]) ?? intValue(usage["inputTokens"]) ?? 0
+        let uncached = intValue(usage["input_tokens"]) ?? intValue(usage["inputTokens"]) ?? 0
         let output = intValue(usage["output_tokens"]) ?? intValue(usage["outputTokens"]) ?? 0
-        let total = intValue(usage["total_tokens"]) ?? intValue(usage["totalTokens"]) ?? (input + output)
+        let creation = intValue(usage["cache_creation_input_tokens"])
+            ?? intValue(usage["cacheCreationInputTokens"])
+            ?? 0
+        let read = intValue(usage["cache_read_input_tokens"])
+            ?? intValue(usage["cacheReadInputTokens"])
+            ?? 0
+        let input = uncached + creation + read
+        let providerTotal = intValue(usage["total_tokens"])
+            ?? intValue(usage["totalTokens"])
+            ?? 0
+        let total = max(providerTotal, input + output)
         let window = intValue(usage["context_window"]) ?? intValue(usage["contextWindow"])
         guard input > 0 || output > 0 || total > 0 || window != nil else { return nil }
         let compactsAutomatically = usage["compacts_automatically"] as? Bool ?? usage["compactsAutomatically"] as? Bool
@@ -620,22 +631,21 @@ public final class ClaudeParser {
         )
         // Per-request occupancy: uncached + cache write + cache read + output
         // for this single request (not session-cumulative modelUsage).
-        let creation = intValue(usage["cache_creation_input_tokens"])
-            ?? intValue(usage["cacheCreationInputTokens"])
-            ?? 0
-        let read = intValue(usage["cache_read_input_tokens"])
-            ?? intValue(usage["cacheReadInputTokens"])
-            ?? 0
-        let contextTokens = input + creation + read + output
+        let contextTokens = input + output
         return AssistantTokenUsage(
             inputTokens: input,
             outputTokens: output,
             totalTokens: total,
             contextWindow: window,
             compactsAutomatically: compactsAutomatically,
-            uncachedInputTokens: input,
+            uncachedInputTokens: uncached,
+            cacheCreationInputTokens: creation,
+            cacheReadInputTokens: read,
             reportedCostMicros: reportedCostMicros,
-            contextTokens: contextTokens > 0 ? contextTokens : nil
+            contextTokens: contextTokens > 0 ? contextTokens : nil,
+            // Assistant/usage payloads are independent API requests. A result
+            // payload without modelUsage is a final snapshot for the run.
+            semantics: stringValue(obj["type"]) == "result" ? .cumulative : .incremental
         )
     }
 

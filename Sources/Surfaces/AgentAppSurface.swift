@@ -692,7 +692,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// coordinator's current active-run set. Fail open to empty on read errors.
     public func refreshSubagentActivity() {
         guard !isDisposed else { return }
-        let receipts = (try? orchestrationRuntime.recentReceipts(
+        let receipts = (try? orchestrationRuntime.activityReceipts(
             limit: SubagentActivityProjection.defaultReceiptFetchLimit
         )) ?? []
         let workspaceThreadIds = Set(threads.map(\.id))

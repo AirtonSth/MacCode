@@ -3,6 +3,84 @@ import CoreModel
 @testable import Persistence
 @testable import AgentRuntime
 
+private final class OrchestrationTestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Date
+
+    init(_ value: Date) {
+        self.value = value
+    }
+
+    func now() -> Date {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func advance(_ interval: TimeInterval) {
+        lock.lock()
+        value = value.addingTimeInterval(interval)
+        lock.unlock()
+    }
+}
+
+private func testDelegationCapability(for runID: AgentRunID) -> String {
+    AgentDelegationCapability.sha256Hex("test-capability:\(runID.value.uuidString)")
+}
+
+private extension AgentOrchestrationRuntime {
+    func recordExternalRoot(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        provider: AgentProvider,
+        providerInstanceId: String,
+        model: String,
+        permissionMode: AgentPermissionMode,
+        ownerProcessID: Int32? = nil
+    ) throws -> AgentOrchestrationAdmissionReceipt {
+        try recordExternalRoot(
+            runId: runId,
+            threadId: threadId,
+            provider: provider,
+            providerInstanceId: providerInstanceId,
+            model: model,
+            permissionMode: permissionMode,
+            delegationCapabilitySHA256: AgentDelegationCapability.sha256Hex(
+                testDelegationCapability(for: runId)
+            ),
+            ownerProcessID: ownerProcessID
+        )
+    }
+
+    func recordExternalChild(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        provider: AgentProvider,
+        providerInstanceId: String,
+        model: String,
+        nodeId: String,
+        parentRunId: AgentRunID,
+        parentThreadId: AgentThreadID? = nil,
+        requestedPermissionMode: AgentPermissionMode? = nil,
+        ownerProcessID: Int32? = nil
+    ) throws -> AgentOrchestrationAdmissionReceipt {
+        try recordAuthorizedExternalChild(
+            runId: runId,
+            threadId: threadId,
+            provider: provider,
+            providerInstanceId: providerInstanceId,
+            model: model,
+            nodeId: nodeId,
+            parentRunId: parentRunId,
+            parentThreadId: parentThreadId ?? threadId,
+            parentCapability: testDelegationCapability(for: parentRunId),
+            childCapability: testDelegationCapability(for: runId),
+            requestedPermissionMode: requestedPermissionMode,
+            ownerProcessID: ownerProcessID
+        )
+    }
+}
+
 final class AgentOrchestrationRuntimeTests: XCTestCase {
     override func setUp() {
         super.setUp()
@@ -451,13 +529,13 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         )
         let runId = AgentRunID()
         let threadId = AgentThreadID()
-        let receipt = try runtime.recordExternalChild(
+        let receipt = try runtime.recordExternalRoot(
             runId: runId,
             threadId: threadId,
             provider: .grok,
             providerInstanceId: "fixture-grok",
             model: "fixture-model",
-            nodeId: "external-worker"
+            permissionMode: .supervised
         )
 
         XCTAssertNil(receipt.parentReceiptId)
@@ -471,6 +549,1309 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         XCTAssertEqual(finalized.id, receipt.id)
         XCTAssertEqual(finalized.lifecycleStatus, .finalized)
         XCTAssertEqual(finalized.finalRunStatus, .completed)
+    }
+
+    func testDelegationCapabilityBindsEveryGenerationAndRejectsSwapReplayAndLegacyParents() throws {
+        // WHY: run/thread UUIDs are identifiers, not authority. Every nested
+        // provider hop must prove possession of its exact live parent bearer,
+        // persist only the digest, and receive an unrelated fresh bearer.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let current = Date(timeIntervalSince1970: 60_000)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            now: { current },
+            processIsAlive: { _ in true }
+        )
+        let threadID = AgentThreadID()
+        let parentRunA = AgentRunID()
+        let parentRunB = AgentRunID()
+        let parentCapabilityA = AgentDelegationCapability.issue()
+        let parentCapabilityB = AgentDelegationCapability.issue()
+        let childCapability = AgentDelegationCapability.issue()
+        XCTAssertNotEqual(parentCapabilityA, parentCapabilityB)
+        XCTAssertNotEqual(parentCapabilityA, childCapability)
+        XCTAssertTrue(AgentDelegationCapabilityTransport.isWellFormed(parentCapabilityA))
+
+        let parentA = try runtime.recordExternalRoot(
+            runId: parentRunA,
+            threadId: threadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            permissionMode: .fullAccess,
+            delegationCapabilitySHA256: AgentDelegationCapability.sha256Hex(
+                parentCapabilityA
+            )
+        )
+        _ = try runtime.recordExternalRoot(
+            runId: parentRunB,
+            threadId: threadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            permissionMode: .fullAccess,
+            delegationCapabilitySHA256: AgentDelegationCapability.sha256Hex(
+                parentCapabilityB
+            )
+        )
+
+        let encodedParent = String(
+            decoding: try JSONEncoder().encode(parentA),
+            as: UTF8.self
+        )
+        XCTAssertFalse(encodedParent.contains(parentCapabilityA))
+        XCTAssertTrue(encodedParent.contains(
+            AgentDelegationCapability.sha256Hex(parentCapabilityA)
+        ))
+
+        let childRunID = AgentRunID()
+        let child = try runtime.recordAuthorizedExternalChild(
+            runId: childRunID,
+            threadId: threadID,
+            provider: .claude,
+            providerInstanceId: "claude-cli",
+            model: "claude",
+            nodeId: "nested.claude.authorized",
+            parentRunId: parentRunA,
+            parentThreadId: threadID,
+            parentCapability: parentCapabilityA,
+            childCapability: childCapability,
+            requestedPermissionMode: .supervised
+        )
+        XCTAssertEqual(child.parentReceiptId, parentA.id)
+        XCTAssertEqual(
+            child.delegationCapabilitySHA256,
+            AgentDelegationCapability.sha256Hex(childCapability)
+        )
+        XCTAssertNotEqual(
+            child.delegationCapabilitySHA256,
+            parentA.delegationCapabilitySHA256
+        )
+        XCTAssertNotNil(try runtime.activeReceipt(
+            runId: childRunID,
+            threadId: threadID,
+            delegationCapability: childCapability
+        ))
+        XCTAssertNil(try runtime.activeReceipt(
+            runId: childRunID,
+            threadId: threadID,
+            delegationCapability: parentCapabilityA
+        ))
+
+        XCTAssertThrowsError(try runtime.recordAuthorizedExternalChild(
+            runId: AgentRunID(),
+            threadId: threadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            nodeId: "nested.grok.wrong-capability",
+            parentRunId: parentRunA,
+            parentThreadId: threadID,
+            parentCapability: parentCapabilityB,
+            childCapability: AgentDelegationCapability.issue()
+        )) {
+            XCTAssertEqual(
+                $0 as? AgentOrchestrationAdmissionError,
+                .invalidChildAdmission("parent delegation capability is invalid")
+            )
+        }
+        XCTAssertThrowsError(try runtime.recordAuthorizedExternalChild(
+            runId: AgentRunID(),
+            threadId: threadID,
+            provider: .claude,
+            providerInstanceId: "claude-cli",
+            model: "claude",
+            nodeId: "nested.claude.swapped-parent",
+            parentRunId: parentRunB,
+            parentThreadId: threadID,
+            parentCapability: parentCapabilityA,
+            childCapability: AgentDelegationCapability.issue()
+        )) {
+            XCTAssertEqual(
+                $0 as? AgentOrchestrationAdmissionError,
+                .invalidChildAdmission("parent delegation capability is invalid")
+            )
+        }
+
+        let legacyRunID = AgentRunID()
+        let legacy = AgentOrchestrationAdmissionReceipt(
+            runId: legacyRunID,
+            threadId: threadID,
+            routingRevision: 0,
+            policyDigest: "external",
+            packageRevision: "external",
+            provider: .codex,
+            providerInstanceId: "legacy",
+            model: "legacy",
+            capabilitySnapshotId: "external",
+            decisionReason: "manual-agent-app-controller",
+            admittedAt: current,
+            lifecycleStatus: .accepted,
+            deadlineAt: current.addingTimeInterval(60),
+            permissionMode: .fullAccess,
+            delegationCapabilitySHA256: nil,
+            ownerProcessID: ProcessInfo.processInfo.processIdentifier
+        )
+        try repository.save(legacy)
+        XCTAssertThrowsError(try runtime.recordAuthorizedExternalChild(
+            runId: AgentRunID(),
+            threadId: threadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            nodeId: "nested.grok.legacy-parent",
+            parentRunId: legacyRunID,
+            parentThreadId: threadID,
+            parentCapability: AgentDelegationCapability.issue(),
+            childCapability: AgentDelegationCapability.issue()
+        )) {
+            XCTAssertEqual(
+                $0 as? AgentOrchestrationAdmissionError,
+                .invalidChildAdmission("parent delegation capability is invalid")
+            )
+        }
+
+        try runtime.finalizeReceipt(runId: parentRunA, status: .completed)
+        XCTAssertThrowsError(try runtime.recordAuthorizedExternalChild(
+            runId: AgentRunID(),
+            threadId: threadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            nodeId: "nested.grok.replayed-parent",
+            parentRunId: parentRunA,
+            parentThreadId: threadID,
+            parentCapability: parentCapabilityA,
+            childCapability: AgentDelegationCapability.issue()
+        )) {
+            XCTAssertEqual(
+                $0 as? AgentOrchestrationAdmissionError,
+                .invalidChildAdmission("parent receipt is not active")
+            )
+        }
+    }
+
+    func testAuthenticatedExternalFinalizationRejectsRootSiblingWrongOwnerAndWrongContext() throws {
+        // WHY: a run UUID is not authority. The external end bridge must prove
+        // ownership of that exact telemetry child and its inherited parent
+        // scope without turning the finalization bearer into delegation power.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            processIsAlive: { [111, 222, 333].contains($0) }
+        )
+        let threadID = AgentThreadID()
+        let rootRunID = AgentRunID()
+        let childRunID = AgentRunID()
+        let siblingRunID = AgentRunID()
+        let parentCapability = AgentDelegationCapability.issue()
+        let childFinalizationCapability = AgentDelegationCapability.issue()
+        let siblingFinalizationCapability = AgentDelegationCapability.issue()
+        _ = try runtime.recordExternalRoot(
+            runId: rootRunID,
+            threadId: threadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            permissionMode: .fullAccess,
+            delegationCapabilitySHA256: AgentDelegationCapability.sha256Hex(
+                parentCapability
+            ),
+            ownerProcessID: 111
+        )
+        let child = try runtime.recordAuthenticatedTelemetryChild(
+            runId: childRunID,
+            threadId: threadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            nodeId: "nested.grok.telemetry",
+            parentRunId: rootRunID,
+            parentThreadId: threadID,
+            parentCapability: parentCapability,
+            finalizationCapability: childFinalizationCapability,
+            ownerProcessID: 222
+        )
+        _ = try runtime.recordAuthenticatedTelemetryChild(
+            runId: siblingRunID,
+            threadId: threadID,
+            provider: .claude,
+            providerInstanceId: "claude-cli",
+            model: "claude",
+            nodeId: "nested.claude.telemetry",
+            parentRunId: rootRunID,
+            parentThreadId: threadID,
+            parentCapability: parentCapability,
+            finalizationCapability: siblingFinalizationCapability,
+            ownerProcessID: 222
+        )
+
+        let handle = try XCTUnwrap(AgentExternalReceiptHandle.encode(
+            runId: childRunID,
+            finalizationCapability: childFinalizationCapability
+        ))
+        let decoded = try XCTUnwrap(AgentExternalReceiptHandle.decode(handle))
+        XCTAssertEqual(decoded.runId, childRunID)
+        XCTAssertEqual(decoded.finalizationCapability, childFinalizationCapability)
+        XCTAssertNil(child.delegationCapabilitySHA256)
+        XCTAssertEqual(
+            child.finalizationCapabilitySHA256,
+            AgentDelegationCapability.sha256Hex(childFinalizationCapability)
+        )
+        XCTAssertFalse(
+            String(decoding: try JSONEncoder().encode(child), as: UTF8.self)
+                .contains(childFinalizationCapability)
+        )
+
+        XCTAssertThrowsError(try runtime.finalizeAuthenticatedExternalReceipt(
+            runId: rootRunID,
+            status: .completed,
+            parentRunId: rootRunID,
+            parentThreadId: threadID,
+            parentCapability: parentCapability,
+            finalizationCapability: childFinalizationCapability,
+            ownerProcessID: 111
+        ))
+        XCTAssertThrowsError(try runtime.finalizeAuthenticatedExternalReceipt(
+            runId: siblingRunID,
+            status: .completed,
+            parentRunId: rootRunID,
+            parentThreadId: threadID,
+            parentCapability: parentCapability,
+            finalizationCapability: childFinalizationCapability,
+            ownerProcessID: 222
+        ))
+        XCTAssertThrowsError(try runtime.finalizeAuthenticatedExternalReceipt(
+            runId: childRunID,
+            status: .completed,
+            parentRunId: rootRunID,
+            parentThreadId: threadID,
+            parentCapability: parentCapability,
+            finalizationCapability: childFinalizationCapability,
+            ownerProcessID: 333
+        ))
+        XCTAssertThrowsError(try runtime.finalizeAuthenticatedExternalReceipt(
+            runId: childRunID,
+            status: .completed,
+            parentRunId: AgentRunID(),
+            parentThreadId: threadID,
+            parentCapability: parentCapability,
+            finalizationCapability: childFinalizationCapability,
+            ownerProcessID: 222
+        ))
+        XCTAssertThrowsError(try runtime.finalizeAuthenticatedExternalReceipt(
+            runId: childRunID,
+            status: .completed,
+            parentRunId: rootRunID,
+            parentThreadId: threadID,
+            parentCapability: AgentDelegationCapability.issue(),
+            finalizationCapability: childFinalizationCapability,
+            ownerProcessID: 222
+        ))
+        XCTAssertThrowsError(try runtime.finalizeAuthenticatedExternalReceipt(
+            runId: childRunID,
+            status: .running,
+            parentRunId: rootRunID,
+            parentThreadId: threadID,
+            parentCapability: parentCapability,
+            finalizationCapability: childFinalizationCapability,
+            ownerProcessID: 222
+        ))
+
+        // A parent can finish before its child cleanup command. The stored
+        // identity and bearer still authenticate that terminal close.
+        try runtime.finalizeReceipt(runId: rootRunID, status: .completed)
+        try runtime.finalizeAuthenticatedExternalReceipt(
+            runId: childRunID,
+            status: .completed,
+            parentRunId: rootRunID,
+            parentThreadId: threadID,
+            parentCapability: parentCapability,
+            finalizationCapability: childFinalizationCapability,
+            ownerProcessID: 222
+        )
+        XCTAssertEqual(
+            try repository.receipt(runId: childRunID)?.finalRunStatus,
+            .completed
+        )
+        XCTAssertEqual(
+            try repository.receipt(runId: siblingRunID)?.lifecycleStatus,
+            .accepted
+        )
+    }
+
+    func testFinalizedRootInvalidatesDescendantAdmissionRenewalAndActiveLookup() throws {
+        // WHY: a live child PID cannot preserve authority inherited from a
+        // finalized root. Every operation must validate the complete chain
+        // without waiting for the Subagents UI reconciliation poll.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            processIsAlive: { _ in true }
+        )
+        let threadID = AgentThreadID()
+        let rootRunID = AgentRunID()
+        let childRunID = AgentRunID()
+        let grandchildRunID = AgentRunID()
+        _ = try runtime.recordExternalRoot(
+            runId: rootRunID,
+            threadId: threadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            permissionMode: .fullAccess,
+            ownerProcessID: 111
+        )
+        _ = try runtime.recordExternalChild(
+            runId: childRunID,
+            threadId: threadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            nodeId: "nested.grok.child",
+            parentRunId: rootRunID,
+            ownerProcessID: 222
+        )
+        _ = try runtime.recordExternalChild(
+            runId: grandchildRunID,
+            threadId: threadID,
+            provider: .claude,
+            providerInstanceId: "claude-cli",
+            model: "claude",
+            nodeId: "nested.claude.grandchild",
+            parentRunId: childRunID,
+            ownerProcessID: 333
+        )
+        try runtime.finalizeReceipt(runId: rootRunID, status: .completed)
+
+        XCTAssertNil(try runtime.activeReceipt(
+            runId: grandchildRunID,
+            threadId: threadID,
+            delegationCapability: testDelegationCapability(for: grandchildRunID)
+        ))
+        XCTAssertThrowsError(try runtime.recordExternalChild(
+            runId: AgentRunID(),
+            threadId: threadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            nodeId: "nested.codex.blocked-grandchild",
+            parentRunId: childRunID,
+            ownerProcessID: 444
+        )) {
+            XCTAssertEqual(
+                $0 as? AgentOrchestrationAdmissionError,
+                .invalidChildAdmission("ancestor receipt is not active")
+            )
+        }
+        XCTAssertThrowsError(try runtime.renewExternalReceiptLease(
+            runId: grandchildRunID,
+            ownerProcessID: 333
+        )) {
+            XCTAssertEqual(
+                $0 as? AgentOrchestrationAdmissionError,
+                .invalidChildAdmission("ancestor receipt is not active")
+            )
+        }
+    }
+
+    func testCyclicReceiptAncestryFailsClosedForAdmissionRenewalAndLookup() throws {
+        // WHY: corrupted append-only ancestry must terminate deterministically
+        // instead of looping or granting a child through a repeated ancestor.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let current = Date(timeIntervalSince1970: 70_000)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            now: { current },
+            processIsAlive: { _ in true }
+        )
+        let threadID = AgentThreadID()
+        let firstID = UUID()
+        let secondID = UUID()
+        let firstRunID = AgentRunID()
+        let secondRunID = AgentRunID()
+        let firstCapability = AgentDelegationCapability.issue()
+        let deadline = current.addingTimeInterval(60)
+        try repository.save(AgentOrchestrationAdmissionReceipt(
+            id: firstID,
+            parentReceiptId: secondID,
+            runId: firstRunID,
+            threadId: threadID,
+            nodeId: "nested.first",
+            routingRevision: 0,
+            policyDigest: "external",
+            packageRevision: "external",
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            capabilitySnapshotId: "external",
+            decisionReason: "external-controlled-child",
+            admittedAt: current,
+            lifecycleStatus: .accepted,
+            deadlineAt: deadline,
+            permissionMode: .fullAccess,
+            delegationCapabilitySHA256: AgentDelegationCapability.sha256Hex(
+                firstCapability
+            ),
+            ownerProcessID: 111
+        ))
+        try repository.save(AgentOrchestrationAdmissionReceipt(
+            id: secondID,
+            parentReceiptId: firstID,
+            runId: secondRunID,
+            threadId: threadID,
+            nodeId: "nested.second",
+            routingRevision: 0,
+            policyDigest: "external",
+            packageRevision: "external",
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            capabilitySnapshotId: "external",
+            decisionReason: "external-controlled-child",
+            admittedAt: current,
+            lifecycleStatus: .accepted,
+            deadlineAt: deadline,
+            permissionMode: .fullAccess,
+            delegationCapabilitySHA256: AgentDelegationCapability.sha256Hex(
+                AgentDelegationCapability.issue()
+            ),
+            ownerProcessID: 222
+        ))
+
+        XCTAssertNil(try runtime.activeReceipt(
+            runId: firstRunID,
+            threadId: threadID,
+            delegationCapability: firstCapability
+        ))
+        XCTAssertThrowsError(try runtime.recordAuthorizedExternalChild(
+            runId: AgentRunID(),
+            threadId: threadID,
+            provider: .claude,
+            providerInstanceId: "claude-cli",
+            model: "claude",
+            nodeId: "nested.claude.cycle",
+            parentRunId: firstRunID,
+            parentThreadId: threadID,
+            parentCapability: firstCapability,
+            childCapability: AgentDelegationCapability.issue(),
+            ownerProcessID: 333
+        )) {
+            XCTAssertEqual(
+                $0 as? AgentOrchestrationAdmissionError,
+                .invalidChildAdmission("receipt ancestry is cyclic")
+            )
+        }
+        XCTAssertThrowsError(try runtime.renewExternalReceiptLease(
+            runId: firstRunID,
+            ownerProcessID: 111
+        )) {
+            XCTAssertEqual(
+                $0 as? AgentOrchestrationAdmissionError,
+                .invalidChildAdmission("receipt ancestry is cyclic")
+            )
+        }
+    }
+
+    func testManualControllerRootLinksActualCrossProviderChildRun() throws {
+        // WHY: explicit `remote-code agent-app` delegation must not invent a
+        // second synthetic run id. The parent and child receipts need the real
+        // persisted Agent App run ids so lifecycle and token usage are joinable.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false }
+        )
+        let parentRunID = AgentRunID()
+        let parentThreadID = AgentThreadID()
+        let childRunID = AgentRunID()
+
+        let parent = try runtime.recordExternalRoot(
+            runId: parentRunID,
+            threadId: parentThreadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            permissionMode: .supervised
+        )
+        let idempotentParent = try runtime.recordExternalRoot(
+            runId: parentRunID,
+            threadId: parentThreadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            permissionMode: .supervised
+        )
+        let child = try runtime.recordExternalChild(
+            runId: childRunID,
+            threadId: parentThreadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            nodeId: "nested.grok.42.abc",
+            parentRunId: parentRunID,
+            requestedPermissionMode: .supervised
+        )
+        let coordinatorEnsure = try runtime.recordExternalRoot(
+            runId: childRunID,
+            threadId: parentThreadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            permissionMode: .supervised
+        )
+
+        XCTAssertEqual(idempotentParent.id, parent.id)
+        XCTAssertEqual(coordinatorEnsure.id, child.id)
+        XCTAssertEqual(parent.nodeId, "root")
+        XCTAssertEqual(child.runId, childRunID)
+        XCTAssertEqual(child.parentReceiptId, parent.id)
+        XCTAssertEqual(child.provider, .grok)
+        XCTAssertEqual(child.permissionMode, .supervised)
+    }
+
+    func testExternalChildCannotEscalateParentPermission() throws {
+        // WHY: a cross-provider hop must never turn a supervised controller
+        // into a full-access worker merely because the child CLI requested it.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false }
+        )
+        let threadID = AgentThreadID()
+        let parentRunID = AgentRunID()
+        _ = try runtime.recordExternalRoot(
+            runId: parentRunID,
+            threadId: threadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            permissionMode: .supervised
+        )
+
+        XCTAssertThrowsError(
+            try runtime.recordExternalChild(
+                runId: AgentRunID(),
+                threadId: threadID,
+                provider: .grok,
+                providerInstanceId: "grok-cli",
+                model: "grok",
+                nodeId: "nested.grok.escalation",
+                parentRunId: parentRunID,
+                requestedPermissionMode: .fullAccess
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? AgentOrchestrationAdmissionError,
+                .invalidChildAdmission("child permission mode exceeds the parent")
+            )
+        }
+        XCTAssertEqual(try repository.receipts().count, 1)
+    }
+
+    func testExternalChildMayNarrowParentPermission() throws {
+        // WHY: a full-access controller may deliberately delegate a safer,
+        // supervised child without losing cross-provider parent linkage.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false }
+        )
+        let threadID = AgentThreadID()
+        let parentRunID = AgentRunID()
+        let parent = try runtime.recordExternalRoot(
+            runId: parentRunID,
+            threadId: threadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            permissionMode: .fullAccess
+        )
+        let child = try runtime.recordExternalChild(
+            runId: AgentRunID(),
+            threadId: threadID,
+            provider: .claude,
+            providerInstanceId: "claude-cli",
+            model: "claude",
+            nodeId: "nested.claude.supervised",
+            parentRunId: parentRunID,
+            requestedPermissionMode: .supervised
+        )
+
+        XCTAssertEqual(child.parentReceiptId, parent.id)
+        XCTAssertEqual(child.permissionMode, .supervised)
+    }
+
+    func testExternalGrandchildKeepsEachAgentAppsRealThread() throws {
+        // WHY: a nested Agent App owns a new thread. Its receipt must retain
+        // that real thread so the child can itself become the validated parent
+        // of a cross-provider grandchild.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false }
+        )
+        let rootThreadID = AgentThreadID()
+        let childThreadID = AgentThreadID()
+        let grandchildThreadID = AgentThreadID()
+        let rootRunID = AgentRunID()
+        let childRunID = AgentRunID()
+        let rootReceipt = try runtime.recordExternalRoot(
+            runId: rootRunID,
+            threadId: rootThreadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            permissionMode: .fullAccess
+        )
+        let childReceipt = try runtime.recordExternalChild(
+            runId: childRunID,
+            threadId: childThreadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            nodeId: "nested.grok.child",
+            parentRunId: rootRunID,
+            parentThreadId: rootThreadID,
+            requestedPermissionMode: .autoAcceptEdits
+        )
+        let grandchildReceipt = try runtime.recordExternalChild(
+            runId: AgentRunID(),
+            threadId: grandchildThreadID,
+            provider: .claude,
+            providerInstanceId: "claude-cli",
+            model: "claude",
+            nodeId: "nested.claude.grandchild",
+            parentRunId: childRunID,
+            parentThreadId: childThreadID,
+            requestedPermissionMode: .supervised
+        )
+
+        XCTAssertEqual(childReceipt.threadId, childThreadID)
+        XCTAssertEqual(childReceipt.parentReceiptId, rootReceipt.id)
+        XCTAssertEqual(grandchildReceipt.threadId, grandchildThreadID)
+        XCTAssertEqual(grandchildReceipt.parentReceiptId, childReceipt.id)
+        XCTAssertEqual(grandchildReceipt.permissionMode, .supervised)
+    }
+
+    func testExternalChildRejectsFinalizedParent() throws {
+        // WHY: a stale provider process must not append new work underneath a
+        // controller that has already completed.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false }
+        )
+        let threadID = AgentThreadID()
+        let parentRunID = AgentRunID()
+        _ = try runtime.recordExternalRoot(
+            runId: parentRunID,
+            threadId: threadID,
+            provider: .claude,
+            providerInstanceId: "claude-cli",
+            model: "claude",
+            permissionMode: .fullAccess
+        )
+        try runtime.finalizeReceipt(runId: parentRunID, status: .completed)
+
+        XCTAssertThrowsError(
+            try runtime.recordExternalChild(
+                runId: AgentRunID(),
+                threadId: threadID,
+                provider: .codex,
+                providerInstanceId: "codex-cli",
+                model: "gpt",
+                nodeId: "nested.codex.stale",
+                parentRunId: parentRunID,
+                requestedPermissionMode: .supervised
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? AgentOrchestrationAdmissionError,
+                .invalidChildAdmission("parent receipt is not active")
+            )
+        }
+    }
+
+    func testDirectRunLookupFindsParentOlderThanRecentReceiptWindow() throws {
+        // WHY: a long-lived controller can have more than 500 newer receipts.
+        // Parent validation must query its run directly instead of disappearing
+        // from an arbitrary recent-activity window.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let base = Date(timeIntervalSince1970: 10_000)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            now: { base },
+            externalLeaseDuration: 10_000,
+            processIsAlive: { _ in true }
+        )
+        let parentRunID = AgentRunID()
+        let parentThreadID = AgentThreadID()
+        let parent = try runtime.recordExternalRoot(
+            runId: parentRunID,
+            threadId: parentThreadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            permissionMode: .supervised,
+            ownerProcessID: 111
+        )
+
+        for offset in 1...501 {
+            try repository.save(AgentOrchestrationAdmissionReceipt(
+                runId: AgentRunID(),
+                threadId: AgentThreadID(),
+                routingRevision: 0,
+                policyDigest: "fixture",
+                packageRevision: "fixture",
+                provider: .grok,
+                providerInstanceId: "fixture",
+                model: "fixture",
+                capabilitySnapshotId: "fixture",
+                decisionReason: "fixture",
+                admittedAt: base.addingTimeInterval(TimeInterval(offset)),
+                lifecycleStatus: .accepted
+            ))
+        }
+
+        XCTAssertFalse(try repository.receipts(limit: 500).contains { $0.id == parent.id })
+        XCTAssertEqual(try repository.receipt(runId: parentRunID)?.id, parent.id)
+        XCTAssertEqual(
+            try runtime.activeReceipt(runId: parentRunID, threadId: parentThreadID)?.id,
+            parent.id
+        )
+        let child = try runtime.recordExternalChild(
+            runId: AgentRunID(),
+            threadId: parentThreadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            nodeId: "nested.grok.after-many-receipts",
+            parentRunId: parentRunID,
+            requestedPermissionMode: .supervised,
+            ownerProcessID: 222
+        )
+        XCTAssertEqual(child.parentReceiptId, parent.id)
+    }
+
+    func testConcurrentRepositoriesAdmitOneChildAndFinalizeOnce() throws {
+        // WHY: the app and provider proxy are separate writers. Two begin calls
+        // for one run must compare-and-append one child, and competing terminal
+        // statuses must append exactly one lifecycle/ledger outcome.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let secondDB = try SQLiteDB(path: db.path)
+        let firstRepository = AgentOrchestrationRepository(db: db)
+        let secondRepository = AgentOrchestrationRepository(db: secondDB)
+        let firstRuntime = AgentOrchestrationRuntime(
+            repository: firstRepository,
+            packageVerification: { true },
+            killSwitch: { false },
+            processIsAlive: { _ in true }
+        )
+        let secondRuntime = AgentOrchestrationRuntime(
+            repository: secondRepository,
+            packageVerification: { true },
+            killSwitch: { false },
+            processIsAlive: { _ in true }
+        )
+        let parentRunID = AgentRunID()
+        let threadID = AgentThreadID()
+        let parent = try firstRuntime.recordExternalRoot(
+            runId: parentRunID,
+            threadId: threadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            permissionMode: .supervised,
+            ownerProcessID: 111
+        )
+        let childRunID = AgentRunID()
+        let start = DispatchSemaphore(value: 0)
+        let done = DispatchGroup()
+        let resultsLock = NSLock()
+        var results: [Result<AgentOrchestrationAdmissionReceipt, Error>] = []
+
+        for runtime in [firstRuntime, secondRuntime] {
+            done.enter()
+            DispatchQueue.global().async {
+                start.wait()
+                let result = Result {
+                    try runtime.recordExternalChild(
+                        runId: childRunID,
+                        threadId: threadID,
+                        provider: .grok,
+                        providerInstanceId: "grok-cli",
+                        model: "grok",
+                        nodeId: "nested.grok.race",
+                        parentRunId: parentRunID,
+                        requestedPermissionMode: .supervised,
+                        ownerProcessID: 222
+                    )
+                }
+                resultsLock.lock()
+                results.append(result)
+                resultsLock.unlock()
+                done.leave()
+            }
+        }
+        start.signal()
+        start.signal()
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success)
+        let children = try results.map { try $0.get() }
+        XCTAssertEqual(Set(children.map(\.id)).count, 1)
+        XCTAssertEqual(
+            try firstRepository.receipts(limit: 20).filter { $0.runId == childRunID }.count,
+            1
+        )
+
+        let finalizeStart = DispatchSemaphore(value: 0)
+        let finalizeDone = DispatchGroup()
+        let finalizeErrorsLock = NSLock()
+        var finalizeErrors: [Error] = []
+        for (runtime, status) in [(firstRuntime, AgentRunStatus.completed), (secondRuntime, .failed)] {
+            finalizeDone.enter()
+            DispatchQueue.global().async {
+                finalizeStart.wait()
+                do {
+                    try runtime.finalizeReceipt(runId: parentRunID, status: status)
+                } catch {
+                    finalizeErrorsLock.lock()
+                    finalizeErrors.append(error)
+                    finalizeErrorsLock.unlock()
+                }
+                finalizeDone.leave()
+            }
+        }
+        finalizeStart.signal()
+        finalizeStart.signal()
+        XCTAssertEqual(finalizeDone.wait(timeout: .now() + 10), .success)
+        XCTAssertTrue(finalizeErrors.isEmpty)
+        XCTAssertEqual(try firstRepository.receipt(runId: parentRunID)?.id, parent.id)
+        XCTAssertEqual(
+            try firstRepository.ledger(limit: 20).filter { $0.runId == parentRunID }.count,
+            1
+        )
+    }
+
+    func testExternalLeaseHeartbeatAndOwnerLivenessBoundParentAdmission() throws {
+        // WHY: a crashed external controller must not remain an accepted parent
+        // forever, while a healthy long-running worker can explicitly renew.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let clock = OrchestrationTestClock(Date(timeIntervalSince1970: 20_000))
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            now: { clock.now() },
+            externalLeaseDuration: 60,
+            processIsAlive: { $0 == 111 || $0 == 222 }
+        )
+        let threadID = AgentThreadID()
+        let expiringRunID = AgentRunID()
+        _ = try runtime.recordExternalRoot(
+            runId: expiringRunID,
+            threadId: threadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            permissionMode: .supervised,
+            ownerProcessID: 111
+        )
+        clock.advance(61)
+        XCTAssertNil(try runtime.activeReceipt(runId: expiringRunID, threadId: threadID))
+        XCTAssertThrowsError(
+            try runtime.recordExternalChild(
+                runId: AgentRunID(),
+                threadId: threadID,
+                provider: .grok,
+                providerInstanceId: "grok-cli",
+                model: "grok",
+                nodeId: "nested.grok.expired",
+                parentRunId: expiringRunID,
+                ownerProcessID: 222
+            )
+        ) {
+            XCTAssertEqual(
+                $0 as? AgentOrchestrationAdmissionError,
+                .invalidChildAdmission("parent external lease expired")
+            )
+        }
+
+        let liveRunID = AgentRunID()
+        _ = try runtime.recordExternalRoot(
+            runId: liveRunID,
+            threadId: threadID,
+            provider: .claude,
+            providerInstanceId: "claude-cli",
+            model: "claude",
+            permissionMode: .supervised,
+            ownerProcessID: 111
+        )
+        clock.advance(30)
+        let renewed = try runtime.renewExternalReceiptLease(
+            runId: liveRunID,
+            ownerProcessID: 111,
+            leaseDuration: 60
+        )
+        clock.advance(40)
+        XCTAssertNotNil(try runtime.activeReceipt(runId: liveRunID, threadId: threadID))
+        let child = try runtime.recordExternalChild(
+            runId: AgentRunID(),
+            threadId: threadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            nodeId: "nested.grok.after-heartbeat",
+            parentRunId: liveRunID,
+            ownerProcessID: 222
+        )
+        XCTAssertLessThanOrEqual(try XCTUnwrap(child.deadlineAt), try XCTUnwrap(renewed.deadlineAt))
+
+        let deadOwnerRunID = AgentRunID()
+        _ = try runtime.recordExternalRoot(
+            runId: deadOwnerRunID,
+            threadId: threadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            permissionMode: .supervised,
+            ownerProcessID: 999
+        )
+        XCTAssertNil(try runtime.activeReceipt(runId: deadOwnerRunID, threadId: threadID))
+        XCTAssertThrowsError(
+            try runtime.recordExternalChild(
+                runId: AgentRunID(),
+                threadId: threadID,
+                provider: .grok,
+                providerInstanceId: "grok-cli",
+                model: "grok",
+                nodeId: "nested.grok.dead-owner",
+                parentRunId: deadOwnerRunID,
+                ownerProcessID: 222
+            )
+        ) {
+            XCTAssertEqual(
+                $0 as? AgentOrchestrationAdmissionError,
+                .invalidChildAdmission("parent owner process is not alive")
+            )
+        }
+    }
+
+    func testActivityReceiptsPersistDeadExternalOwnerAsUnknown() throws {
+        // WHY: the Subagents UI polls durable receipts independently of the
+        // provider process. A crashed worker must stop presenting as Active on
+        // the next poll, and that uncertainty must survive app relaunch.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            processIsAlive: { $0 == 111 }
+        )
+        let deadRunID = AgentRunID()
+        let deadThreadID = AgentThreadID()
+        let receipt = try runtime.recordExternalRoot(
+            runId: deadRunID,
+            threadId: deadThreadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            permissionMode: .supervised,
+            ownerProcessID: 999
+        )
+
+        _ = try runtime.activityReceipts()
+        let activity = try runtime.activityReceipts()
+
+        XCTAssertEqual(activity.first(where: { $0.id == receipt.id })?.lifecycleStatus, .unknown)
+        XCTAssertEqual(try repository.receipt(runId: deadRunID)?.lifecycleStatus, .unknown)
+        XCTAssertEqual(
+            try repository.ledger(limit: 10).filter { $0.runId == deadRunID }.count,
+            1,
+            "repeated UI polls must not append duplicate unknown lifecycle outcomes"
+        )
+    }
+
+    func testActivityReceiptsPersistExpiredExternalLeaseAsUnknown() throws {
+        // WHY: a still-existing PID is insufficient after its bounded lease
+        // expires; otherwise PID reuse or a wedged wrapper can pin Active.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let clock = OrchestrationTestClock(Date(timeIntervalSince1970: 40_000))
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            now: { clock.now() },
+            externalLeaseDuration: 60,
+            processIsAlive: { $0 == 111 }
+        )
+        let expiredRunID = AgentRunID()
+        let expiredThreadID = AgentThreadID()
+        let receipt = try runtime.recordExternalRoot(
+            runId: expiredRunID,
+            threadId: expiredThreadID,
+            provider: .claude,
+            providerInstanceId: "claude-cli",
+            model: "claude",
+            permissionMode: .supervised,
+            ownerProcessID: 111
+        )
+        clock.advance(61)
+
+        let activity = try runtime.activityReceipts()
+
+        XCTAssertEqual(activity.first(where: { $0.id == receipt.id })?.lifecycleStatus, .unknown)
+        XCTAssertEqual(try repository.receipt(runId: expiredRunID)?.lifecycleStatus, .unknown)
+    }
+
+    func testActivityReceiptsKeepLiveExternalWorkerAccepted() throws {
+        // WHY: liveness reconciliation must not demote a healthy child whose
+        // parent and own process remain live merely because another app process
+        // refreshed the activity surface.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let clock = OrchestrationTestClock(Date(timeIntervalSince1970: 45_000))
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            now: { clock.now() },
+            externalLeaseDuration: 60,
+            processIsAlive: { $0 == 111 || $0 == 222 }
+        )
+        let threadID = AgentThreadID()
+        let parentRunID = AgentRunID()
+        _ = try runtime.recordExternalRoot(
+            runId: parentRunID,
+            threadId: threadID,
+            provider: .claude,
+            providerInstanceId: "claude-cli",
+            model: "claude",
+            permissionMode: .supervised,
+            ownerProcessID: 111
+        )
+        clock.advance(1)
+        let liveRunID = AgentRunID()
+        let receipt = try runtime.recordExternalChild(
+            runId: liveRunID,
+            threadId: threadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            nodeId: "nested.codex.live",
+            parentRunId: parentRunID,
+            ownerProcessID: 222
+        )
+
+        let activity = try runtime.activityReceipts(limit: 1)
+
+        XCTAssertEqual(activity.first(where: { $0.id == receipt.id })?.lifecycleStatus, .accepted)
+        XCTAssertEqual(try repository.receipt(runId: liveRunID)?.lifecycleStatus, .accepted)
+        XCTAssertTrue(try repository.ledger(limit: 10).filter { $0.runId == liveRunID }.isEmpty)
+    }
+
+    func testActivityReceiptsCascadeFinalizedParentToChildAndGrandchildUnknown() throws {
+        // WHY: provider-native children can share the long-lived app PID. Once
+        // their parent finalizes, that PID alone must not leave descendants
+        // Working for the remainder of a 24-hour external lease.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            processIsAlive: { _ in true }
+        )
+        let threadID = AgentThreadID()
+        let rootRunID = AgentRunID()
+        let childRunID = AgentRunID()
+        let grandchildRunID = AgentRunID()
+        _ = try runtime.recordExternalRoot(
+            runId: rootRunID,
+            threadId: threadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            permissionMode: .supervised,
+            ownerProcessID: 111
+        )
+        let child = try runtime.recordExternalChild(
+            runId: childRunID,
+            threadId: threadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            nodeId: "nested.grok.child",
+            parentRunId: rootRunID,
+            ownerProcessID: 222
+        )
+        let grandchild = try runtime.recordExternalChild(
+            runId: grandchildRunID,
+            threadId: threadID,
+            provider: .claude,
+            providerInstanceId: "claude-cli",
+            model: "claude",
+            nodeId: "nested.claude.grandchild",
+            parentRunId: childRunID,
+            ownerProcessID: 333
+        )
+        try runtime.finalizeReceipt(runId: rootRunID, status: .completed)
+
+        let activity = try runtime.activityReceipts()
+
+        XCTAssertEqual(activity.first(where: { $0.id == child.id })?.lifecycleStatus, .unknown)
+        XCTAssertEqual(activity.first(where: { $0.id == grandchild.id })?.lifecycleStatus, .unknown)
+        XCTAssertEqual(try repository.receipt(runId: childRunID)?.lifecycleStatus, .unknown)
+        XCTAssertEqual(try repository.receipt(runId: grandchildRunID)?.lifecycleStatus, .unknown)
+    }
+
+    func testActivityReceiptsReconcileExternalReceiptOlderThanFiveHundredRows() throws {
+        // WHY: a global audit log can receive hundreds of newer entries while a
+        // child runs. Reconciliation must not preserve that older crashed child
+        // solely because an arbitrary activity window omitted it.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let base = Date(timeIntervalSince1970: 50_000)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            now: { base },
+            processIsAlive: { _ in false }
+        )
+        let oldRunID = AgentRunID()
+        let oldThreadID = AgentThreadID()
+        let old = try runtime.recordExternalRoot(
+            runId: oldRunID,
+            threadId: oldThreadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            permissionMode: .supervised,
+            ownerProcessID: 999
+        )
+        for offset in 1...501 {
+            try repository.save(AgentOrchestrationAdmissionReceipt(
+                runId: AgentRunID(),
+                threadId: AgentThreadID(),
+                routingRevision: 0,
+                policyDigest: "fixture",
+                packageRevision: "fixture",
+                provider: .codex,
+                providerInstanceId: "fixture",
+                model: "fixture",
+                capabilitySnapshotId: "fixture",
+                decisionReason: "fixture",
+                admittedAt: base.addingTimeInterval(TimeInterval(offset)),
+                lifecycleStatus: .finalized,
+                finalRunStatus: .completed
+            ))
+        }
+
+        XCTAssertFalse(try repository.receipts(limit: 500).contains { $0.id == old.id })
+        let activity = try runtime.activityReceipts()
+
+        XCTAssertEqual(activity.first(where: { $0.id == old.id })?.lifecycleStatus, .unknown)
+        XCTAssertEqual(try repository.receipt(runId: oldRunID)?.lifecycleStatus, .unknown)
+    }
+
+    func testLegacyExternalReceiptWithoutOwnerCannotActAsParent() throws {
+        // WHY: accepted is not enough for a process-owned external controller.
+        // A legacy row without an owner PID must fail closed after the bounded
+        // lease migration instead of becoming a permanent orphan parent.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let current = Date(timeIntervalSince1970: 30_000)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            now: { current },
+            processIsAlive: { _ in true }
+        )
+        let threadID = AgentThreadID()
+        let parentRunID = AgentRunID()
+        try repository.save(AgentOrchestrationAdmissionReceipt(
+            runId: parentRunID,
+            threadId: threadID,
+            routingRevision: 0,
+            policyDigest: "external",
+            packageRevision: "external",
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            capabilitySnapshotId: "external",
+            decisionReason: "manual-agent-app-controller",
+            admittedAt: current,
+            lifecycleStatus: .accepted,
+            deadlineAt: current.addingTimeInterval(60),
+            permissionMode: .supervised
+        ))
+
+        XCTAssertNil(try runtime.activeReceipt(runId: parentRunID, threadId: threadID))
+        XCTAssertThrowsError(
+            try runtime.recordExternalChild(
+                runId: AgentRunID(),
+                threadId: threadID,
+                provider: .grok,
+                providerInstanceId: "grok-cli",
+                model: "grok",
+                nodeId: "nested.grok.ownerless-parent",
+                parentRunId: parentRunID,
+                ownerProcessID: 222
+            )
+        ) {
+            XCTAssertEqual(
+                $0 as? AgentOrchestrationAdmissionError,
+                .invalidChildAdmission("parent owner process is unavailable")
+            )
+        }
     }
 
     func testCatalogProvenanceRequiresVerifiedLiveCatalogAndStreamingCapability() {

@@ -346,6 +346,46 @@ final class UnixSocketServerTests: XCTestCase {
         XCTAssertTrue(tasksReleased)
     }
 
+    func testAgentMessageSendGetsBoundedLongerLocalDeadline() async throws {
+        // WHY: provider preflight can legitimately exceed the generic local
+        // RPC budget. Closing the socket after the mutation was accepted leaves
+        // an orphan thread, while ordinary RPCs must keep their short deadline.
+        let socketURL = URL(
+            fileURLWithPath: "/tmp/rc2-u-agent-timeout-\(UUID().uuidString.prefix(8)).sock"
+        )
+        let server = await MainActor.run {
+            UnixSocketServer(
+                socketPath: socketURL.path,
+                dispatcher: JSONRPCDispatcher(router: FakeRouter()),
+                localRequestTimeoutForTesting: .milliseconds(40),
+                agentMessageSendRequestTimeoutForTesting: .milliseconds(300),
+                activeRequestLimitForTesting: 2,
+                localRequestHandlerForTesting: { request in
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    return JSONRPCResponse(
+                        id: request.id,
+                        result: .object(["status": .string("started")])
+                    )
+                }
+            )
+        }
+        try server.start()
+        defer {
+            server.stop()
+        }
+
+        let client = try connectUnix(path: socketURL.path)
+        defer { Darwin.close(client) }
+        let request = Data((
+            #"{"jsonrpc":"2.0","id":"agent-long-start","method":"agent.message.send","params":{"thread_id":"00000000-0000-0000-0000-000000000001","text":"hi"}}"#
+                + "\n"
+        ).utf8)
+        try writeAll(fd: client, data: request)
+
+        let response = try readLine(fd: client)
+        XCTAssertTrue(response.contains(#""status":"started""#))
+    }
+
     @MainActor
     func testEventStreamDeliversLiveEventsOverSerializedUnixSocketWriter() throws {
         let socketURL = URL(

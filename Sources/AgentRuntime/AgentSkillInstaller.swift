@@ -137,6 +137,42 @@ public enum RemoteCodeOrchestrateInstallError: Error, Sendable, Equatable {
     case lastKnownGoodUnavailable
 }
 
+/// Always-on parent identity for the provider-neutral `subagent begin` bridge.
+/// This is lifecycle scope only: resolving it must not depend on Token Saver
+/// admission or enable any paid lane.
+public struct RemoteCodeSubagentTelemetryScope: Sendable, Equatable {
+    public let threadId: AgentThreadID
+    public let parentRunId: AgentRunID?
+    public let parentThreadId: AgentThreadID?
+    public let parentCapability: String?
+
+    public init?(environment: [String: String]) {
+        guard let threadUUID = UUID(
+            uuidString: environment["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"]
+                ?? environment["RC_TOKEN_SAVER_THREAD_ID"]
+                ?? ""
+        ) else {
+            return nil
+        }
+        let threadId = AgentThreadID(threadUUID)
+        let parentRunId = UUID(
+            uuidString: environment["RC_REMOTE_CODE_ROOT_RUN_ID"]
+                ?? environment["RC_TOKEN_SAVER_ROOT_RUN_ID"]
+                ?? environment["RC_TOKEN_SAVER_ATTEMPT_ID"]
+                ?? ""
+        ).map { AgentRunID($0) }
+
+        self.threadId = threadId
+        self.parentRunId = parentRunId
+        self.parentThreadId = parentRunId == nil ? nil : threadId
+        self.parentCapability = environment[
+            AgentDelegationCapabilityTransport.environmentKey
+        ].flatMap {
+            AgentDelegationCapabilityTransport.isWellFormed($0) ? $0 : nil
+        }
+    }
+}
+
 public final class AgentSkillInstaller: @unchecked Sendable {
     public static let distillSkillID = "distill"
     public static let distillSourceURL = "https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md"
@@ -157,8 +193,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         // Upstream base revision; tree digest is recomputed from the embedded package
         // after local contract edits (skill content must stay complete / no Distill-in-skills).
         sourceRevision: "2c77fa48431bc20e5dc841652079594a3ea918c9",
-        sourceTreeSHA256: "1493839804d567da2a53cbb1314118f0c33e3f2c669f59f0691c9d85bd9bfe1b",
-        localVersion: "3",
+        sourceTreeSHA256: "b5e06a22bf885038f9c339f5c6499671aab202d54fd7a41ac75c2007e296b75b",
+        localVersion: "5",
         allowedPaths: [
             "SKILL.md",
             "agents/openai.yaml",
@@ -267,13 +303,294 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// Token economy is the paid feature: no Distill dialect, `| distill` rules,
     /// or safety ABI when the toggle is off.
     public static func tokenSaverProviderPrompt(_ base: String, environment: [String: String]) -> String {
+        let routed = nestedAgentProviderPrompt(base, environment: environment)
         let withDistill: String
         if environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
-            withDistill = managedDistillProviderPrompt(base)
+            withDistill = managedDistillProviderPrompt(routed)
         } else {
-            withDistill = base
+            withDistill = routed
         }
         return graphifyProviderPrompt(withDistill, environment: environment)
+    }
+
+    /// Always-on host routing for provider-to-provider delegation. This is
+    /// lifecycle plumbing, not a Token Saver lane, so it remains present when
+    /// the paid toggle is off. Explicit skill CLIs keep their exact ABI and are
+    /// intercepted by provider proxies instead of being silently rewritten.
+    public static func nestedAgentProviderPrompt(
+        _ base: String,
+        environment: [String: String]
+    ) -> String {
+        guard environment["RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE"] == "1",
+              let command = environment["RC_REMOTE_CODE_AGENT_APP_COMMAND"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !command.isEmpty else {
+            return base
+        }
+        let block = """
+        REMOTE_CODE_SUBAGENT_ROUTING_V1
+        When delegating a normal task to another Codex, Claude, or Grok agent, launch it through:
+        \(command) agent-app <codex|claude|grok> --prompt-file <absolute-path>
+        This keeps the child in RemoteCode's Agent App lifecycle, persistence, usage, and active Subagents UI.
+        Preserve an explicit skill's provider CLI ABI when it carries stricter sandbox, tool, memory, session, or no-subagent flags; the RemoteCode provider proxy will observe that exact launch.
+        Never bypass the launcher with an absolute provider binary for ordinary delegation.
+        """
+        if base.contains("REMOTE_CODE_SUBAGENT_ROUTING_V1") { return base }
+        return base.isEmpty ? block : base + "\n\n" + block
+    }
+
+    /// Add host runtime guidance to an exact raw provider CLI invocation without
+    /// changing its prompt transport, sandbox, tools, persistence, or output ABI.
+    public static func providerProxyArguments(
+        provider: AgentProvider,
+        arguments: [String],
+        environment: [String: String]
+    ) -> [String] {
+        let prompt = tokenSaverProviderPrompt("", environment: environment)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty,
+              isSupportedProviderTurn(provider: provider, arguments: arguments)
+        else {
+            return arguments
+        }
+
+        switch provider {
+        case .grok:
+            return mergingProviderPrompt(
+                prompt,
+                option: "--rules",
+                provider: provider,
+                arguments: arguments
+            )
+        case .claude:
+            return mergingProviderPrompt(
+                prompt,
+                option: "--append-system-prompt",
+                provider: provider,
+                arguments: arguments
+            )
+        case .codex:
+            let scan = scanProviderArguments(provider: provider, arguments: arguments)
+            guard !scan.malformed else { return arguments }
+            let configValues = (scan.optionValues["--config"] ?? [])
+                + (scan.optionValues["-c"] ?? [])
+            let hasDeveloperOverride = configValues.contains {
+                $0.hasPrefix("developer_instructions=")
+            }
+            guard !hasDeveloperOverride else { return arguments }
+            let quoted = "\""
+                + prompt
+                    .replacingOccurrences(of: "\\", with: "\\\\")
+                    .replacingOccurrences(of: "\"", with: "\\\"")
+                    .replacingOccurrences(of: "\n", with: "\\n")
+                + "\""
+            return ["--config", "developer_instructions=\(quoted)"] + arguments
+        }
+    }
+
+    /// Restrict prompt/rules injection to provider invocations whose turn ABI
+    /// RemoteCode understands. Administrative commands must remain byte-for-byte
+    /// unchanged even when an inherited runtime environment enables routing.
+    private static func isSupportedProviderTurn(
+        provider: AgentProvider,
+        arguments: [String]
+    ) -> Bool {
+        let scan = scanProviderArguments(provider: provider, arguments: arguments)
+        guard !scan.malformed else { return false }
+        if scan.flags.contains(where: {
+            $0 == "--version" || $0 == "-V" || $0 == "--help" || $0 == "-h"
+        }) {
+            return false
+        }
+        let sessionContinuationFlags: Set<String>
+        switch provider {
+        case .codex:
+            sessionContinuationFlags = []
+        case .claude:
+            sessionContinuationFlags = [
+                "--resume", "-r", "--continue", "-c", "--session-id", "--fork-session"
+            ]
+        case .grok:
+            sessionContinuationFlags = [
+                "--resume", "-r", "--continue", "--session-id", "--fork-session"
+            ]
+        }
+        if !scan.flags.isDisjoint(with: sessionContinuationFlags) {
+            return false
+        }
+
+        switch provider {
+        case .grok:
+            return scan.positionals.isEmpty
+                && ["--prompt-file", "--prompt", "-p"].contains {
+                    scan.optionValues[$0]?.contains(where: { !$0.isEmpty }) == true
+                }
+        case .claude:
+            let administrativeCommands: Set<String> = [
+                "agents", "auth", "config", "doctor", "install",
+                "mcp", "plugin", "plugins", "update"
+            ]
+            let isAdministrative = scan.positionals.first.map {
+                administrativeCommands.contains($0)
+            } ?? false
+            return !isAdministrative
+                && (scan.flags.contains("--print") || scan.flags.contains("-p"))
+        case .codex:
+            return scan.positionals.first == "exec"
+                && scan.positionals.dropFirst().first != "resume"
+        }
+    }
+
+    private struct ProviderArgumentScan {
+        var flags = Set<String>()
+        var optionValues: [String: [String]] = [:]
+        var positionals: [String] = []
+        var malformed = false
+    }
+
+    private static func scanProviderArguments(
+        provider: AgentProvider,
+        arguments: [String]
+    ) -> ProviderArgumentScan {
+        let optionBoundary = arguments.firstIndex(of: "--") ?? arguments.endIndex
+        let valueOptions = providerValueOptions(provider)
+        let flagOptions = providerFlagOptions(provider)
+        var scan = ProviderArgumentScan()
+        var index = 0
+        while index < optionBoundary {
+            let argument = arguments[index]
+            if valueOptions.contains(argument) {
+                scan.flags.insert(argument)
+                guard index + 1 < optionBoundary else {
+                    scan.malformed = true
+                    return scan
+                }
+                scan.optionValues[argument, default: []].append(arguments[index + 1])
+                index += 2
+                continue
+            }
+            if let option = valueOptions.first(where: {
+                argument.hasPrefix("\($0)=")
+            }) {
+                scan.flags.insert(option)
+                scan.optionValues[option, default: []].append(
+                    String(argument.dropFirst(option.count + 1))
+                )
+                index += 1
+                continue
+            }
+            if argument == "-" {
+                scan.positionals.append(argument)
+                index += 1
+                continue
+            }
+            if argument.hasPrefix("-") {
+                guard flagOptions.contains(argument) else {
+                    // Provider CLIs evolve. An unknown option may consume the
+                    // following argument, so treating it as a valueless flag
+                    // could make RemoteCode rewrite the wrong turn ABI.
+                    scan.malformed = true
+                    return scan
+                }
+                scan.flags.insert(argument)
+                index += 1
+                continue
+            }
+            scan.positionals.append(argument)
+            index += 1
+        }
+        return scan
+    }
+
+    private static func providerValueOptions(_ provider: AgentProvider) -> Set<String> {
+        switch provider {
+        case .grok:
+            return [
+                "--prompt-file", "--prompt", "-p", "--rules",
+                "--permission-mode", "--sandbox", "--model", "-m",
+                "--effort", "--reasoning-effort", "--output-format",
+                "--input-format", "--disallowed-tools", "--allowed-tools",
+                "--settings", "--resume", "-r", "--session-id"
+            ]
+        case .claude:
+            return [
+                "--model", "--effort", "--output-format", "--input-format",
+                "--permission-mode", "--tools", "--allowed-tools", "--allowedTools",
+                "--disallowed-tools", "--disallowedTools", "--append-system-prompt",
+                "--system-prompt", "--setting-sources", "--settings",
+                "--session-id", "--resume", "-r"
+            ]
+        case .codex:
+            return [
+                "--sandbox", "--ask-for-approval", "-a", "--config", "-c",
+                "--model", "-m", "--image", "--color", "--cd", "-C",
+                "--profile", "-p"
+            ]
+        }
+    }
+
+    private static func providerFlagOptions(_ provider: AgentProvider) -> Set<String> {
+        switch provider {
+        case .grok:
+            return [
+                "--always-approve", "--auto-update", "--continue",
+                "--help", "-h", "--list-models", "--memory", "--no-auto-update",
+                "--no-memory", "--no-plan", "--no-subagents", "--plan",
+                "--subagents", "--version", "-V"
+            ]
+        case .claude:
+            return [
+                "--continue", "-c", "--debug", "--disable-slash-commands",
+                "--fork-session", "--help", "-h", "--ide", "--include-partial-messages",
+                "--no-session-persistence", "--print", "-p", "--strict-mcp-config",
+                "--verbose", "--version", "-V"
+            ]
+        case .codex:
+            return [
+                "--dangerously-bypass-approvals-and-sandbox", "--ephemeral",
+                "--full-auto", "--help", "-h", "--ignore-user-config", "--json",
+                "--oss", "--search", "--skip-git-repo-check", "--strict-config",
+                "--version", "-V"
+            ]
+        }
+    }
+
+    private static func mergingProviderPrompt(
+        _ prompt: String,
+        option: String,
+        provider: AgentProvider,
+        arguments: [String]
+    ) -> [String] {
+        let scan = scanProviderArguments(provider: provider, arguments: arguments)
+        guard !scan.malformed,
+              (scan.optionValues[option]?.count ?? 0) <= 1 else {
+            return arguments
+        }
+        var merged = arguments
+        let optionBoundary = merged.firstIndex(of: "--") ?? merged.endIndex
+        let valueOptions = providerValueOptions(provider)
+        var index = 0
+        while index < optionBoundary {
+            let argument = merged[index]
+            if argument == option {
+                guard index + 1 < optionBoundary else { return arguments }
+                merged[index + 1] += "\n\n" + prompt
+                return merged
+            }
+            if argument.hasPrefix("\(option)=") {
+                let existing = String(argument.dropFirst(option.count + 1))
+                merged[index] = "\(option)=\(existing)\n\n\(prompt)"
+                return merged
+            }
+            if valueOptions.contains(argument) {
+                guard index + 1 < optionBoundary else { return arguments }
+                index += 2
+            } else {
+                index += 1
+            }
+        }
+        merged.insert(contentsOf: [option, prompt], at: optionBoundary)
+        return merged
     }
 
     /// Inject Graphify query-first rules when host set `RC_GRAPHIFY_ENABLED=1`.
@@ -459,6 +776,24 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             .appendingPathComponent(".remote-code/bin", isDirectory: true)
     }
 
+    public static func defaultProviderShellBridgeDirectory() -> URL {
+        defaultManagedCLIBinDirectory()
+            .deletingLastPathComponent()
+            .appendingPathComponent("shell/zsh", isDirectory: true)
+    }
+
+    /// The managed bin selected for this installer. Production uses the user's
+    /// RemoteCode home; tests and isolated provider homes use their injected root.
+    public var managedCLIBinURL: URL {
+        cliBinDirectory
+    }
+
+    public var providerShellBridgeURL: URL {
+        cliBinDirectory
+            .deletingLastPathComponent()
+            .appendingPathComponent("shell/zsh", isDirectory: true)
+    }
+
     /// A directory that is conventionally on the user's `$PATH`. RemoteCode bridges the
     /// managed `distill` CLI here so it runs from any shell without a hand-made shim.
     public static func defaultPathBinDirectory() -> URL {
@@ -545,7 +880,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         // Drop exact-output wrappers left by older catalogs (sed/rg/cat/…).
         _ = try removeManagedWrapperSymlinks(
             basenames: WrappedCommandCatalog.exactOutputCommands,
-            binaryPath: binary.path
+            binaryURL: binary
         )
         let searchDirectories = systemCommandSearchDirectories()
         var installed: [String] = []
@@ -570,11 +905,13 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// Includes legacy exact-output basenames so Token Saver off cleans old sed/rg wrappers.
     /// Does **not** remove nested provider proxies (`installProviderProxies`).
     @discardableResult
-    public func uninstallCommandWrappers() throws -> [String] {
-        let binaryPath = Self.resolveServiceBinary(fileManager: fileManager)?.path
+    public func uninstallCommandWrappers(
+        serviceBinaryURL: URL? = nil
+    ) throws -> [String] {
+        let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager)
         return try removeManagedWrapperSymlinks(
             basenames: WrappedCommandCatalog.symlinkBasenamesToRemove,
-            binaryPath: binaryPath
+            binaryURL: binary
         )
     }
 
@@ -601,13 +938,13 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         for command in ProviderProxyCatalog.providers {
             guard commandExistsOnSystem(command, searchDirectories: searchDirectories) else { continue }
             let link = cliBinDirectory.appendingPathComponent(command)
-            if let dest = try? fileManager.destinationOfSymbolicLink(atPath: link.path) {
-                if dest == binary.path
-                    || (dest as NSString).lastPathComponent == "RemoteCodeDistillService" {
+            if (try? fileManager.destinationOfSymbolicLink(atPath: link.path)) != nil {
+                if symbolicLink(at: link, pointsTo: binary) {
                     installed.append(command)
-                    continue
                 }
-                try? fileManager.removeItem(at: link) // replace a stale managed symlink
+                // A same-basename target is not ownership evidence. Preserve
+                // every symlink that does not resolve to this exact service.
+                continue
             } else if fileManager.fileExists(atPath: link.path) {
                 // A real (non-symlink) file we did not create — never clobber it.
                 continue
@@ -630,15 +967,12 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             throw AgentSkillCLIError.serviceBinaryUnavailable
         }
         let link = cliBinDirectory.appendingPathComponent(Self.agentAppMiddlewareCommand)
-        if let destination = try? fileManager.destinationOfSymbolicLink(atPath: link.path) {
-            if destination == binary.path {
+        if (try? fileManager.destinationOfSymbolicLink(atPath: link.path)) != nil {
+            if symbolicLink(at: link, pointsTo: binary) {
                 return link
             }
-            guard (destination as NSString).lastPathComponent == "RemoteCodeDistillService" else {
-                // A symlink to another executable is user-owned.
-                return nil
-            }
-            try fileManager.removeItem(at: link)
+            // A symlink to any other canonical target is user-owned.
+            return nil
         } else if fileManager.fileExists(atPath: link.path) {
             // Never overwrite a user-owned executable in the managed directory.
             return nil
@@ -647,24 +981,118 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return link
     }
 
-    /// Remove provider-proxy symlinks that still point at our service binary only.
-    @discardableResult
-    public func uninstallProviderProxies() throws -> [String] {
-        let binaryPath = Self.resolveServiceBinary(fileManager: fileManager)?.path
-        return try removeManagedWrapperSymlinks(
-            basenames: ProviderProxyCatalog.providers,
-            binaryPath: binaryPath
+    /// Return the launcher only when the managed alias resolves to the exact
+    /// RemoteCode service binary. A missing alias or user-owned file must never
+    /// be advertised to provider prompts as a working host launcher.
+    public func verifiedAgentAppMiddlewareURL(
+        serviceBinaryURL: URL? = nil
+    ) -> URL? {
+        let link = cliBinDirectory.appendingPathComponent(Self.agentAppMiddlewareCommand)
+        guard let rawDestination = try? fileManager.destinationOfSymbolicLink(atPath: link.path),
+              let expected = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager)
+        else {
+            return nil
+        }
+        let destination = resolvedSymbolicLinkDestination(
+            rawDestination,
+            relativeTo: link
         )
+        guard fileManager.isExecutableFile(atPath: destination.path),
+              symbolicLink(at: link, pointsTo: expected)
+        else {
+            return nil
+        }
+        return link
     }
 
-    private func removeManagedWrapperSymlinks(basenames: [String], binaryPath: String?) throws -> [String] {
+    /// Install zsh startup files that preserve the user's real profile and then
+    /// restore RemoteCode's managed bin to the front of PATH. Provider CLIs
+    /// commonly create login shells (`zsh -lc`) that otherwise reorder the
+    /// injected PATH and bypass nested-provider proxies.
+    @discardableResult
+    public func installProviderShellBridge() throws -> URL {
+        let directory = providerShellBridgeURL
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        for fileName in [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout"] {
+            let startupRoot = fileName == ".zshenv"
+                ? "${RC_REMOTE_CODE_ORIGINAL_ZDOTDIR:-${HOME:-}}"
+                : "${RC_REMOTE_CODE_EFFECTIVE_ZDOTDIR:-${RC_REMOTE_CODE_ORIGINAL_ZDOTDIR:-${HOME:-}}}"
+            let body = """
+            # RemoteCode managed provider shell bridge.
+            if [[ -n "${RC_REMOTE_CODE_MANAGED_ZDOTDIR:-}" ]]; then
+              export ZDOTDIR="\(startupRoot)"
+            fi
+            if [[ -n "${ZDOTDIR:-}" && "$ZDOTDIR" != "${RC_REMOTE_CODE_MANAGED_ZDOTDIR:-}" && -r "$ZDOTDIR/\(fileName)" ]]; then
+              source "$ZDOTDIR/\(fileName)"
+            fi
+            export RC_REMOTE_CODE_EFFECTIVE_ZDOTDIR="${ZDOTDIR:-${HOME:-${RC_REMOTE_CODE_ORIGINAL_ZDOTDIR:-}}}"
+            if [[ -n "${RC_REMOTE_CODE_MANAGED_ZDOTDIR:-}" ]]; then
+              export ZDOTDIR="$RC_REMOTE_CODE_MANAGED_ZDOTDIR"
+            fi
+            if [[ -n "${RC_REMOTE_CODE_MANAGED_BIN:-}" ]]; then
+              path=("$RC_REMOTE_CODE_MANAGED_BIN" "${(@)path:#${~${(b)RC_REMOTE_CODE_MANAGED_BIN}}}")
+              export PATH
+            fi
+            """
+            try Data((body + "\n").utf8).write(
+                to: directory.appendingPathComponent(fileName),
+                options: .atomic
+            )
+        }
+        return directory
+    }
+
+    /// Remove provider-proxy symlinks that still point at our service binary only.
+    @discardableResult
+    public func uninstallProviderProxies(
+        serviceBinaryURL: URL? = nil
+    ) throws -> [String] {
+        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager)
+        else {
+            return []
+        }
+        var removed: [String] = []
+        for command in ProviderProxyCatalog.providers {
+            let link = cliBinDirectory.appendingPathComponent(command)
+            guard symbolicLink(at: link, pointsTo: binary) else { continue }
+            try fileManager.removeItem(at: link)
+            removed.append(command)
+        }
+        return removed
+    }
+
+    private func symbolicLink(at link: URL, pointsTo expected: URL) -> Bool {
+        guard let rawDestination = try? fileManager.destinationOfSymbolicLink(
+            atPath: link.path
+        ) else {
+            return false
+        }
+        let destination = resolvedSymbolicLinkDestination(
+            rawDestination,
+            relativeTo: link
+        )
+        return destination.resolvingSymlinksInPath().standardizedFileURL
+            == expected.resolvingSymlinksInPath().standardizedFileURL
+    }
+
+    private func resolvedSymbolicLinkDestination(
+        _ rawDestination: String,
+        relativeTo link: URL
+    ) -> URL {
+        rawDestination.hasPrefix("/")
+            ? URL(fileURLWithPath: rawDestination)
+            : link.deletingLastPathComponent().appendingPathComponent(rawDestination)
+    }
+
+    private func removeManagedWrapperSymlinks(
+        basenames: [String],
+        binaryURL: URL?
+    ) throws -> [String] {
+        guard let binaryURL else { return [] }
         var removed: [String] = []
         for command in basenames {
             let link = cliBinDirectory.appendingPathComponent(command)
-            guard let dest = try? fileManager.destinationOfSymbolicLink(atPath: link.path) else { continue }
-            let pointsAtService = dest == binaryPath
-                || (dest as NSString).lastPathComponent == "RemoteCodeDistillService"
-            guard pointsAtService else { continue }
+            guard symbolicLink(at: link, pointsTo: binaryURL) else { continue }
             try fileManager.removeItem(at: link)
             removed.append(command)
         }

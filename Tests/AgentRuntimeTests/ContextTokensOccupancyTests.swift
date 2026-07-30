@@ -39,13 +39,19 @@ final class ContextTokensOccupancyTests: XCTestCase {
         {"type":"usage","usage":{"input_tokens":322,"cache_creation_input_tokens":98777,"cache_read_input_tokens":50000,"output_tokens":100,"context_window":200000}}
         """#
         let usage = firstTokenUsage(from: ClaudeParser().parseLine(line))
-        XCTAssertEqual(usage?.totalTokens, 422,
-                       "totalTokens without total_tokens key remains input+output (legacy)")
+        XCTAssertEqual(usage?.inputTokens, 149_099,
+                       "provider input includes uncached, cache creation, and cache read")
+        XCTAssertEqual(usage?.totalTokens, 149_199,
+                       "an interrupted run without modelUsage must retain every billed bucket")
+        XCTAssertEqual(usage?.uncachedInputTokens, 322)
+        XCTAssertEqual(usage?.cacheCreationInputTokens, 98_777)
+        XCTAssertEqual(usage?.cacheReadInputTokens, 50_000)
+        XCTAssertEqual(usage?.billedTotalTokenUnits, 322 + (98_777 * 1.25) + (50_000 * 0.1) + 100)
         XCTAssertEqual(usage?.contextWindow, 200_000)
         XCTAssertEqual(usage?.contextTokens, 322 + 98_777 + 50_000 + 100,
                        "context occupancy must sum all four single-request buckets")
-        XCTAssertNotEqual(usage?.contextTokens, usage?.totalTokens,
-                          "when cache buckets exist, occupancy exceeds bare input+output")
+        XCTAssertEqual(usage?.contextTokens, usage?.totalTokens,
+                       "per-request billing and occupancy include the same reported token buckets")
     }
 
     /// Sampled live payload shape (fact 4): assistant → message.usage is the
@@ -58,10 +64,16 @@ final class ContextTokensOccupancyTests: XCTestCase {
         XCTAssertNotNil(usage, "assistant message.usage must emit tokenUsage")
         XCTAssertEqual(usage?.contextTokens, 98_786,
                        "occupancy = uncached + cache creation + cache read + output")
-        XCTAssertEqual(usage?.inputTokens, 8)
+        XCTAssertEqual(usage?.inputTokens, 98_785)
         XCTAssertEqual(usage?.outputTokens, 1)
-        XCTAssertEqual(usage?.totalTokens, 9,
-                       "per-request totalTokens stays input+output; billing merge keeps cumulative later")
+        XCTAssertEqual(usage?.totalTokens, 98_786,
+                       "interrupted runs must not undercount cache creation/read without modelUsage")
+        XCTAssertEqual(usage?.uncachedInputTokens, 8)
+        XCTAssertEqual(usage?.cacheCreationInputTokens, 504)
+        XCTAssertEqual(usage?.cacheReadInputTokens, 98_273)
+        XCTAssertEqual(usage?.billedTotalTokenUnits, 8 + (504 * 1.25) + (98_273 * 0.1) + 1)
+        XCTAssertEqual(usage?.resolvedSemantics, .incremental,
+                       "each assistant message usage is an independent Claude API request")
     }
 
     // MARK: - Grok

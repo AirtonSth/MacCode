@@ -340,7 +340,8 @@ public final class GrokACPEventMapper: @unchecked Sendable {
             contextWindow: window,
             uncachedInputTokens: cached.map { max(0, input - $0) },
             cacheReadInputTokens: cached,
-            contextTokens: contextTokens > 0 ? contextTokens : nil
+            contextTokens: contextTokens > 0 ? contextTokens : nil,
+            semantics: .cumulative
         )
     }
 

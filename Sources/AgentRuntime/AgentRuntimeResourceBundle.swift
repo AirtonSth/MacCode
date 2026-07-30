@@ -128,12 +128,23 @@ enum AgentRuntimeResourceBundle {
         var urls: [URL] = []
         for root in roots {
             urls.append(root.appendingPathComponent(name))
+            // Prefer SwiftPM's active debug/release products before walking
+            // auxiliary trees such as `.build/index-build`. Xcode's index
+            // bundle may contain an older copied resource package and must
+            // never mask the product that `swift test` just built.
+            for config in ["debug", "release"] {
+                urls.append(
+                    root
+                        .appendingPathComponent(config, isDirectory: true)
+                        .appendingPathComponent(name)
+                )
+            }
             guard let children = try? fileManager.contentsOfDirectory(
                 at: root,
                 includingPropertiesForKeys: [.isDirectoryKey],
                 options: [.skipsHiddenFiles]
             ) else { continue }
-            for child in children {
+            for child in children.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
                 urls.append(child.appendingPathComponent(name))
                 for config in ["debug", "release"] {
                     urls.append(

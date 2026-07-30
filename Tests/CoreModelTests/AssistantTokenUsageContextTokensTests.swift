@@ -14,6 +14,8 @@ final class AssistantTokenUsageContextTokensTests: XCTestCase {
         XCTAssertEqual(usage.contextWindow, 200_000)
         XCTAssertNil(usage.contextTokens,
                      "older SQLite/JSON rows without contextTokens must decode, not fail")
+        XCTAssertEqual(usage.resolvedSemantics, .cumulative,
+                       "older rows keep the historical snapshot accounting contract")
     }
 
     func test_roundTrip_preservesContextTokens() throws {
@@ -33,5 +35,19 @@ final class AssistantTokenUsageContextTokensTests: XCTestCase {
     func test_defaultInit_contextTokensIsNil() {
         let usage = AssistantTokenUsage(inputTokens: 1, outputTokens: 1, totalTokens: 2)
         XCTAssertNil(usage.contextTokens)
+    }
+
+    func test_roundTrip_preservesIncrementalAccountingSemantics() throws {
+        let original = AssistantTokenUsage(
+            inputTokens: 3,
+            outputTokens: 2,
+            totalTokens: 5,
+            semantics: .incremental
+        )
+        let decoded = try JSONDecoder().decode(
+            AssistantTokenUsage.self,
+            from: JSONEncoder().encode(original)
+        )
+        XCTAssertEqual(decoded.resolvedSemantics, .incremental)
     }
 }

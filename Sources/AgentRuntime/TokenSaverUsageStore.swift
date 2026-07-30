@@ -1,5 +1,41 @@
 import Foundation
 import CoreModel
+import Darwin
+
+/// Cross-process wake-up for provider proxies that update `usage.json`.
+///
+/// Provider wrappers run outside the interactive app, so an in-process
+/// NotificationCenter event cannot refresh the Token Saver popover.
+public enum TokenSaverUsageCrossProcess {
+    public static let storeChangedName = Notification.Name(
+        "io.remotecode.token-saver.usage-store-changed"
+    )
+
+    public static func notifyStoreChanged() {
+        DistributedNotificationCenter.default().postNotificationName(
+            storeChangedName,
+            object: nil,
+            userInfo: nil,
+            deliverImmediately: true
+        )
+    }
+
+    @discardableResult
+    public static func observeStoreChanged(
+        queue: OperationQueue? = .main,
+        handler: @escaping () -> Void
+    ) -> NSObjectProtocol {
+        DistributedNotificationCenter.default().addObserver(
+            forName: storeChangedName,
+            object: nil,
+            queue: queue
+        ) { _ in handler() }
+    }
+
+    public static func removeObserver(_ token: NSObjectProtocol) {
+        DistributedNotificationCenter.default().removeObserver(token)
+    }
+}
 
 public enum TokenSaverPeriod: String, Codable, Sendable, CaseIterable {
     case today
@@ -21,11 +57,16 @@ public struct TokenSaverProviderUsage: Codable, Sendable, Equatable {
     public var weeklyUsedPercent: Double?
     public var weeklyWindowDurationMinutes: Int?
     public var weeklyResetsAt: Date?
-    /// True when `actualProviderBilledTokenUnits` came from an explicit init/JSON value
-    /// rather than the raw-token default. Not persisted as its own key.
+    /// True when `actualProviderBilledTokenUnits` came from an explicit provider
+    /// measurement rather than the raw-token default.
     /// WHY: estimator must refuse raw fallback when billed is unknown; the defaulted
     /// Double alone cannot distinguish "known billed" from "silently re-inflated".
     fileprivate var billedUnitsExplicitlyProvided: Bool
+
+    private enum BilledUnitsProvenance: String, Codable {
+        case measured
+        case unknown
+    }
 
     public init(
         provider: AgentProvider,
@@ -75,6 +116,7 @@ public struct TokenSaverProviderUsage: Codable, Sendable, Equatable {
         case actualProviderTokens
         case estimatedRawTokens
         case actualProviderBilledTokenUnits
+        case actualProviderBilledTokenUnitsProvenance
         case estimatedRawBilledTokenUnits
         case eligibleRuns
         case currentSessionTokens
@@ -91,9 +133,15 @@ public struct TokenSaverProviderUsage: Codable, Sendable, Equatable {
         provider = try container.decode(AgentProvider.self, forKey: .provider)
         actualProviderTokens = max(0, try container.decodeIfPresent(Int.self, forKey: .actualProviderTokens) ?? 0)
         estimatedRawTokens = max(0, try container.decodeIfPresent(Int.self, forKey: .estimatedRawTokens) ?? 0)
+        let billedProvenance = try? container.decode(
+            BilledUnitsProvenance.self,
+            forKey: .actualProviderBilledTokenUnitsProvenance
+        )
         if let billed = try container.decodeIfPresent(Double.self, forKey: .actualProviderBilledTokenUnits) {
             actualProviderBilledTokenUnits = max(0, billed)
-            billedUnitsExplicitlyProvided = true
+            // Legacy JSON has the numeric fallback but no provenance, so its
+            // billed value is unknowable. Only the new measured marker proves it.
+            billedUnitsExplicitlyProvided = billedProvenance == .measured
         } else {
             // Missing key → defaulted from raw; not a known billed measurement.
             actualProviderBilledTokenUnits = Double(actualProviderTokens)
@@ -118,8 +166,15 @@ public struct TokenSaverProviderUsage: Codable, Sendable, Equatable {
         try container.encode(provider, forKey: .provider)
         try container.encode(actualProviderTokens, forKey: .actualProviderTokens)
         try container.encode(estimatedRawTokens, forKey: .estimatedRawTokens)
-        // Persist the defaulted Double as before (does not encode the known/defaulted flag).
+        // Preserve the numeric storage contract while persisting whether that
+        // number is a provider measurement or only the raw-token fallback.
         try container.encode(actualProviderBilledTokenUnits, forKey: .actualProviderBilledTokenUnits)
+        try container.encode(
+            billedUnitsExplicitlyProvided
+                ? BilledUnitsProvenance.measured
+                : BilledUnitsProvenance.unknown,
+            forKey: .actualProviderBilledTokenUnitsProvenance
+        )
         try container.encode(estimatedRawBilledTokenUnits, forKey: .estimatedRawBilledTokenUnits)
         try container.encode(eligibleRuns, forKey: .eligibleRuns)
         try container.encode(currentSessionTokens, forKey: .currentSessionTokens)
@@ -131,7 +186,7 @@ public struct TokenSaverProviderUsage: Codable, Sendable, Equatable {
         try container.encodeIfPresent(weeklyResetsAt, forKey: .weeklyResetsAt)
     }
 
-    /// Billed units only when explicitly provided (init arg or JSON key present).
+    /// Billed units only when explicitly provided or persisted as measured.
     /// nil means defaulted-from-raw / unknown — estimator must not use this as billed.
     public var knownActualProviderBilledTokenUnits: Double? {
         billedUnitsExplicitlyProvided ? actualProviderBilledTokenUnits : nil
@@ -290,15 +345,15 @@ public struct TokenSaverUsageSnapshot: Codable, Sendable, Equatable {
 public final class TokenSaverUsageStore: @unchecked Sendable {
     // Callers construct a fresh store per write (AppContext does this from the
     // provider stream thread AND from MainActor), so a per-instance lock would
-    // not serialize anything. This process-wide lock makes every
-    // read-modify-write atomic against all other writers of usage.json.
+    // not serialize anything. This process-wide lock handles in-process writers;
+    // the stable sibling lock file below handles provider proxy processes.
     private static let ioLock = NSLock()
+    private static let lockFileName = "usage.lock"
+    private static let advisoryLock: @convention(c) (Int32, Int32) -> Int32 = flock
     private let url: URL
     private let fileManager: FileManager
     private let calendar: Calendar
     private let now: @Sendable () -> Date
-    private let encoder = JSONEncoder()
-    private let decoder = JSONDecoder()
 
     public init(
         appSupportDirectory: URL,
@@ -312,10 +367,17 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
         self.fileManager = fileManager
         self.calendar = calendar
         self.now = now
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     }
 
     public func load(period: TokenSaverPeriod = .sevenDays) -> TokenSaverUsageSnapshot {
+        // `saveUnlocked` atomically replaces usage.json, so a lock-free reader
+        // observes either the complete old file or the complete new file. Reads
+        // intentionally remain non-blocking and fail open to an empty snapshot.
+        loadUnlocked(period: period)
+    }
+
+    private func loadUnlocked(period: TokenSaverPeriod) -> TokenSaverUsageSnapshot {
+        let decoder = JSONDecoder()
         guard let data = try? Data(contentsOf: url),
               let snapshot = try? decoder.decode(TokenSaverUsageSnapshot.self, from: data),
               snapshot.period == period else {
@@ -393,38 +455,38 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
         provider: AgentProvider,
         period: TokenSaverPeriod = .sevenDays
     ) throws -> TokenSaverUsageSnapshot {
-        Self.ioLock.lock()
-        defer { Self.ioLock.unlock() }
-        let snapshot = load(period: period)
-        var providers = snapshot.providers
-        if let index = providers.firstIndex(where: { $0.provider == provider }) {
-            let current = providers[index]
-            providers[index] = TokenSaverProviderUsage(
-                provider: provider,
-                actualProviderTokens: current.actualProviderTokens,
-                estimatedRawTokens: current.estimatedRawTokens,
-                actualProviderBilledTokenUnits: current.actualProviderBilledTokenUnits,
-                estimatedRawBilledTokenUnits: current.estimatedRawBilledTokenUnits,
-                eligibleRuns: current.eligibleRuns,
-                currentSessionTokens: current.currentSessionTokens,
-                currentSessionLimitTokens: current.currentSessionLimitTokens,
-                currentSessionUsedPercent: 0,
-                currentSessionResetsAt: current.currentSessionResetsAt,
-                weeklyUsedPercent: 0,
-                weeklyWindowDurationMinutes: current.weeklyWindowDurationMinutes,
-                weeklyResetsAt: current.weeklyResetsAt,
-                billedUnitsExplicitlyProvided: current.billedUnitsExplicitlyProvided
-            )
-        } else {
-            providers.append(TokenSaverProviderUsage(
-                provider: provider,
-                currentSessionUsedPercent: 0,
-                weeklyUsedPercent: 0
-            ))
+        try withExclusiveStoreLock {
+            let snapshot = loadUnlocked(period: period)
+            var providers = snapshot.providers
+            if let index = providers.firstIndex(where: { $0.provider == provider }) {
+                let current = providers[index]
+                providers[index] = TokenSaverProviderUsage(
+                    provider: provider,
+                    actualProviderTokens: current.actualProviderTokens,
+                    estimatedRawTokens: current.estimatedRawTokens,
+                    actualProviderBilledTokenUnits: current.actualProviderBilledTokenUnits,
+                    estimatedRawBilledTokenUnits: current.estimatedRawBilledTokenUnits,
+                    eligibleRuns: current.eligibleRuns,
+                    currentSessionTokens: current.currentSessionTokens,
+                    currentSessionLimitTokens: current.currentSessionLimitTokens,
+                    currentSessionUsedPercent: 0,
+                    currentSessionResetsAt: current.currentSessionResetsAt,
+                    weeklyUsedPercent: 0,
+                    weeklyWindowDurationMinutes: current.weeklyWindowDurationMinutes,
+                    weeklyResetsAt: current.weeklyResetsAt,
+                    billedUnitsExplicitlyProvided: current.billedUnitsExplicitlyProvided
+                )
+            } else {
+                providers.append(TokenSaverProviderUsage(
+                    provider: provider,
+                    currentSessionUsedPercent: 0,
+                    weeklyUsedPercent: 0
+                ))
+            }
+            let updated = TokenSaverUsageSnapshot(period: period, providers: providers, daily: snapshot.daily)
+            try saveUnlocked(updated)
+            return updated
         }
-        let updated = TokenSaverUsageSnapshot(period: period, providers: providers, daily: snapshot.daily)
-        try save(updated)
-        return updated
     }
 
     /// Inserts zero rows for claude/codex/grok when a loaded snapshot omits them.
@@ -446,8 +508,68 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
     }
 
     public func save(_ snapshot: TokenSaverUsageSnapshot) throws {
+        try withExclusiveStoreLock {
+            try saveUnlocked(snapshot)
+        }
+    }
+
+    private func saveUnlocked(_ snapshot: TokenSaverUsageSnapshot) throws {
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(snapshot).write(to: url, options: .atomic)
+    }
+
+    /// Serializes the complete usage.json read-modify-write across RemoteCode and
+    /// provider proxy processes. The lock lives beside usage.json because locking
+    /// usage.json itself would stop protecting writers when `.atomic` replaces
+    /// that inode.
+    private func withExclusiveStoreLock<T>(_ body: () throws -> T) throws -> T {
+        Self.ioLock.lock()
+        defer { Self.ioLock.unlock() }
+
+        let directory = url.deletingLastPathComponent()
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let lockURL = directory.appendingPathComponent(Self.lockFileName, isDirectory: false)
+        let ownerReadWrite = mode_t(S_IRUSR | S_IWUSR)
+        let descriptor = Darwin.open(
+            lockURL.path,
+            O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW,
+            ownerReadWrite
+        )
+        guard descriptor >= 0 else {
+            throw Self.posixError(path: lockURL.path, operation: "open")
+        }
+        defer { Darwin.close(descriptor) }
+
+        guard Darwin.fchmod(descriptor, ownerReadWrite) == 0 else {
+            throw Self.posixError(path: lockURL.path, operation: "fchmod")
+        }
+        guard Self.setAdvisoryLock(descriptor: descriptor, operation: LOCK_EX) else {
+            throw Self.posixError(path: lockURL.path, operation: "flock")
+        }
+        defer { _ = Self.setAdvisoryLock(descriptor: descriptor, operation: LOCK_UN) }
+
+        return try body()
+    }
+
+    private static func setAdvisoryLock(descriptor: Int32, operation: Int32) -> Bool {
+        while advisoryLock(descriptor, operation) != 0 {
+            if errno != EINTR { return false }
+        }
+        return true
+    }
+
+    private static func posixError(path: String, operation: String) -> NSError {
+        let code = errno
+        return NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(code),
+            userInfo: [
+                NSFilePathErrorKey: path,
+                NSLocalizedDescriptionKey: "\(operation) failed: \(String(cString: strerror(code)))"
+            ]
+        )
     }
 
     @discardableResult
@@ -462,50 +584,70 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
         currentSessionLimitTokens: Int? = nil,
         period: TokenSaverPeriod = .sevenDays
     ) throws -> TokenSaverUsageSnapshot {
-        Self.ioLock.lock()
-        defer { Self.ioLock.unlock() }
-        let snapshot = load(period: period)
-        var providers = snapshot.providers
-        let delta = TokenSaverProviderUsage(
-            provider: provider,
-            actualProviderTokens: actualProviderTokens,
-            estimatedRawTokens: max(estimatedRawTokens, actualProviderTokens),
-            actualProviderBilledTokenUnits: actualProviderBilledTokenUnits,
-            estimatedRawBilledTokenUnits: estimatedRawBilledTokenUnits,
-            eligibleRuns: eligibleRuns,
-            currentSessionTokens: currentSessionTokens,
-            currentSessionLimitTokens: currentSessionLimitTokens ?? 0
-        )
-        if let index = providers.firstIndex(where: { $0.provider == provider }) {
-            let current = providers[index]
-            providers[index] = TokenSaverProviderUsage(
+        try withExclusiveStoreLock {
+            let snapshot = loadUnlocked(period: period)
+            var providers = snapshot.providers
+            let delta = TokenSaverProviderUsage(
                 provider: provider,
-                actualProviderTokens: current.actualProviderTokens + delta.actualProviderTokens,
-                estimatedRawTokens: current.estimatedRawTokens + delta.estimatedRawTokens,
-                // Keep stored Double sum for existing callers; known only if both sides known.
-                actualProviderBilledTokenUnits: current.actualProviderBilledTokenUnits + delta.actualProviderBilledTokenUnits,
-                estimatedRawBilledTokenUnits: current.estimatedRawBilledTokenUnits + delta.estimatedRawBilledTokenUnits,
-                eligibleRuns: current.eligibleRuns + delta.eligibleRuns,
-                currentSessionTokens: max(current.currentSessionTokens, delta.currentSessionTokens),
-                currentSessionLimitTokens: max(current.currentSessionLimitTokens, delta.currentSessionLimitTokens),
-                currentSessionUsedPercent: current.currentSessionUsedPercent,
-                currentSessionResetsAt: current.currentSessionResetsAt,
-                weeklyUsedPercent: current.weeklyUsedPercent,
-                weeklyWindowDurationMinutes: current.weeklyWindowDurationMinutes,
-                weeklyResetsAt: current.weeklyResetsAt,
-                billedUnitsExplicitlyProvided: current.billedUnitsExplicitlyProvided && delta.billedUnitsExplicitlyProvided
+                actualProviderTokens: actualProviderTokens,
+                estimatedRawTokens: max(estimatedRawTokens, actualProviderTokens),
+                actualProviderBilledTokenUnits: actualProviderBilledTokenUnits,
+                estimatedRawBilledTokenUnits: estimatedRawBilledTokenUnits,
+                eligibleRuns: eligibleRuns,
+                currentSessionTokens: currentSessionTokens,
+                currentSessionLimitTokens: currentSessionLimitTokens ?? 0
             )
-        } else {
-            providers.append(delta)
-        }
+            if let index = providers.firstIndex(where: { $0.provider == provider }) {
+                let current = providers[index]
+                let currentBilledIsMeasuredOrEmpty =
+                    current.billedUnitsExplicitlyProvided
+                    || (
+                        current.actualProviderTokens == 0
+                        && current.actualProviderBilledTokenUnits == 0
+                    )
+                let deltaBilledIsMeasuredOrEmpty =
+                    delta.billedUnitsExplicitlyProvided
+                    || (
+                        delta.actualProviderTokens == 0
+                        && delta.actualProviderBilledTokenUnits == 0
+                    )
+                let mergedBilledIsMeasured =
+                    currentBilledIsMeasuredOrEmpty
+                    && deltaBilledIsMeasuredOrEmpty
+                    && (
+                        current.billedUnitsExplicitlyProvided
+                        || delta.billedUnitsExplicitlyProvided
+                    )
+                providers[index] = TokenSaverProviderUsage(
+                    provider: provider,
+                    actualProviderTokens: current.actualProviderTokens + delta.actualProviderTokens,
+                    estimatedRawTokens: current.estimatedRawTokens + delta.estimatedRawTokens,
+                    // Keep stored Double sum for existing callers. Empty zero rows
+                    // are neutral; every real contribution must be measured.
+                    actualProviderBilledTokenUnits: current.actualProviderBilledTokenUnits + delta.actualProviderBilledTokenUnits,
+                    estimatedRawBilledTokenUnits: current.estimatedRawBilledTokenUnits + delta.estimatedRawBilledTokenUnits,
+                    eligibleRuns: current.eligibleRuns + delta.eligibleRuns,
+                    currentSessionTokens: max(current.currentSessionTokens, delta.currentSessionTokens),
+                    currentSessionLimitTokens: max(current.currentSessionLimitTokens, delta.currentSessionLimitTokens),
+                    currentSessionUsedPercent: current.currentSessionUsedPercent,
+                    currentSessionResetsAt: current.currentSessionResetsAt,
+                    weeklyUsedPercent: current.weeklyUsedPercent,
+                    weeklyWindowDurationMinutes: current.weeklyWindowDurationMinutes,
+                    weeklyResetsAt: current.weeklyResetsAt,
+                    billedUnitsExplicitlyProvided: mergedBilledIsMeasured
+                )
+            } else {
+                providers.append(delta)
+            }
 
-        let updated = TokenSaverUsageSnapshot(
-            period: period,
-            providers: providers,
-            daily: updatedDailyBuckets(from: snapshot.daily, delta: delta, period: period)
-        )
-        try save(updated)
-        return updated
+            let updated = TokenSaverUsageSnapshot(
+                period: period,
+                providers: providers,
+                daily: updatedDailyBuckets(from: snapshot.daily, delta: delta, period: period)
+            )
+            try saveUnlocked(updated)
+            return updated
+        }
     }
 
     @discardableResult
@@ -518,41 +660,41 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
         currentSessionResetsAt: Date? = nil,
         period: TokenSaverPeriod = .sevenDays
     ) throws -> TokenSaverUsageSnapshot {
-        Self.ioLock.lock()
-        defer { Self.ioLock.unlock() }
-        let snapshot = load(period: period)
-        var providers = snapshot.providers
-        if let index = providers.firstIndex(where: { $0.provider == provider }) {
-            let current = providers[index]
-            providers[index] = TokenSaverProviderUsage(
-                provider: provider,
-                actualProviderTokens: current.actualProviderTokens,
-                estimatedRawTokens: current.estimatedRawTokens,
-                actualProviderBilledTokenUnits: current.actualProviderBilledTokenUnits,
-                estimatedRawBilledTokenUnits: current.estimatedRawBilledTokenUnits,
-                eligibleRuns: current.eligibleRuns,
-                currentSessionTokens: current.currentSessionTokens,
-                currentSessionLimitTokens: current.currentSessionLimitTokens,
-                currentSessionUsedPercent: currentSessionUsedPercent ?? current.currentSessionUsedPercent,
-                currentSessionResetsAt: currentSessionResetsAt ?? current.currentSessionResetsAt,
-                weeklyUsedPercent: weeklyUsedPercent,
-                weeklyWindowDurationMinutes: weeklyWindowDurationMinutes ?? current.weeklyWindowDurationMinutes,
-                weeklyResetsAt: weeklyResetsAt ?? current.weeklyResetsAt,
-                billedUnitsExplicitlyProvided: current.billedUnitsExplicitlyProvided
-            )
-        } else {
-            providers.append(TokenSaverProviderUsage(
-                provider: provider,
-                currentSessionUsedPercent: currentSessionUsedPercent,
-                currentSessionResetsAt: currentSessionResetsAt,
-                weeklyUsedPercent: weeklyUsedPercent,
-                weeklyWindowDurationMinutes: weeklyWindowDurationMinutes,
-                weeklyResetsAt: weeklyResetsAt
-            ))
+        try withExclusiveStoreLock {
+            let snapshot = loadUnlocked(period: period)
+            var providers = snapshot.providers
+            if let index = providers.firstIndex(where: { $0.provider == provider }) {
+                let current = providers[index]
+                providers[index] = TokenSaverProviderUsage(
+                    provider: provider,
+                    actualProviderTokens: current.actualProviderTokens,
+                    estimatedRawTokens: current.estimatedRawTokens,
+                    actualProviderBilledTokenUnits: current.actualProviderBilledTokenUnits,
+                    estimatedRawBilledTokenUnits: current.estimatedRawBilledTokenUnits,
+                    eligibleRuns: current.eligibleRuns,
+                    currentSessionTokens: current.currentSessionTokens,
+                    currentSessionLimitTokens: current.currentSessionLimitTokens,
+                    currentSessionUsedPercent: currentSessionUsedPercent ?? current.currentSessionUsedPercent,
+                    currentSessionResetsAt: currentSessionResetsAt ?? current.currentSessionResetsAt,
+                    weeklyUsedPercent: weeklyUsedPercent,
+                    weeklyWindowDurationMinutes: weeklyWindowDurationMinutes ?? current.weeklyWindowDurationMinutes,
+                    weeklyResetsAt: weeklyResetsAt ?? current.weeklyResetsAt,
+                    billedUnitsExplicitlyProvided: current.billedUnitsExplicitlyProvided
+                )
+            } else {
+                providers.append(TokenSaverProviderUsage(
+                    provider: provider,
+                    currentSessionUsedPercent: currentSessionUsedPercent,
+                    currentSessionResetsAt: currentSessionResetsAt,
+                    weeklyUsedPercent: weeklyUsedPercent,
+                    weeklyWindowDurationMinutes: weeklyWindowDurationMinutes,
+                    weeklyResetsAt: weeklyResetsAt
+                ))
+            }
+            let updated = TokenSaverUsageSnapshot(period: period, providers: providers, daily: snapshot.daily)
+            try saveUnlocked(updated)
+            return updated
         }
-        let updated = TokenSaverUsageSnapshot(period: period, providers: providers, daily: snapshot.daily)
-        try save(updated)
-        return updated
     }
 
     public static func estimatePotentialSavings(usedTokens: Int, compressionRatio: Double = 0.42) -> Int {

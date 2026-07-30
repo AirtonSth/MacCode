@@ -2,6 +2,31 @@ import XCTest
 @testable import DistillCore
 
 final class ManagedDistillCLITests: XCTestCase {
+    private final class AdmissionLatch: @unchecked Sendable {
+        private let lock = NSLock()
+        private var decisions: [Bool]
+        private var checks = 0
+
+        init(_ decisions: [Bool]) {
+            self.decisions = decisions
+        }
+
+        func next() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            checks += 1
+            guard !decisions.isEmpty else { return false }
+            if decisions.count == 1 { return decisions[0] }
+            return decisions.removeFirst()
+        }
+
+        func checkCount() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return checks
+        }
+    }
+
     private actor RequestRecorder {
         private var values: [DistillRequest] = []
 
@@ -20,6 +45,10 @@ final class ManagedDistillCLITests: XCTestCase {
         func increment() -> Int {
             value += 1
             return value
+        }
+
+        func count() -> Int {
+            value
         }
     }
 
@@ -131,6 +160,57 @@ final class ManagedDistillCLITests: XCTestCase {
         let (out, code) = await cli.run()
         XCTAssertEqual(code, 0)
         XCTAssertEqual(out, raw, "no state => echo raw stdin verbatim, never lose piped data")
+    }
+
+    func test_liveAdmissionOff_returnsByteIdenticalInputWithoutTransport() async {
+        let raw = Data([0x00, 0xFF, 0x0A, 0x41, 0x00, 0x80])
+        let calls = CallCounter()
+        let cli = ManagedDistillCLI(
+            arguments: ["stale prompt"],
+            stdin: raw,
+            state: state,
+            distillAdmission: { false }
+        ) { _ in
+            _ = await calls.increment()
+            return nil
+        }
+
+        let (out, code) = await cli.run()
+
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(out, raw, "Token Saver OFF must be byte-identical passthrough")
+        let transportCalls = await calls.count()
+        XCTAssertEqual(transportCalls, 0, "OFF admission must perform zero transport calls")
+    }
+
+    func test_liveAdmissionRechecksEveryChunkAndStopsAfterTeardown() async throws {
+        let input = String(repeating: "abcdefghij", count: (ManagedDistillCLI.stdinCapBytes / 5) + 10)
+        let raw = Data(input.utf8)
+        let admission = AdmissionLatch([true, true, false])
+        let calls = CallCounter()
+        let response = try JSONEncoder().encode(DistillResponse(
+            requestID: UUID(),
+            output: "compressed chunk",
+            inputCharacters: input.count,
+            originalHandle: "chunk"
+        ))
+        let cli = ManagedDistillCLI(
+            arguments: ["summarize"],
+            stdin: raw,
+            state: state,
+            distillAdmission: { admission.next() }
+        ) { _ in
+            _ = await calls.increment()
+            return (response, 200)
+        }
+
+        let (out, code) = await cli.run()
+
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(out, raw, "teardown during a chunked run must discard partial compressed output")
+        let transportCalls = await calls.count()
+        XCTAssertEqual(transportCalls, 1, "the second chunk must not POST after live admission turns off")
+        XCTAssertGreaterThanOrEqual(admission.checkCount(), 3)
     }
 
     func test_compress_nonemptyWhitespace_returnsExactRawBytesWithoutTransport() async {

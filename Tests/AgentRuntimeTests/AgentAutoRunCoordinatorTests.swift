@@ -104,8 +104,32 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
 
         _ = try await coordinator.startRun(original)
 
-        XCTAssertEqual(runner.lastRequest, original,
-                       "Manual routing must preserve the existing coordinator request contract byte-for-byte.")
+        let dispatched = try XCTUnwrap(runner.lastRequest)
+        XCTAssertEqual(dispatched.runId, original.runId)
+        XCTAssertEqual(dispatched.threadId, original.threadId)
+        XCTAssertEqual(dispatched.provider, original.provider)
+        XCTAssertEqual(dispatched.providerInstanceId, original.providerInstanceId)
+        XCTAssertEqual(dispatched.model, original.model)
+        XCTAssertEqual(dispatched.cwd, original.cwd)
+        XCTAssertEqual(dispatched.prompt, original.prompt)
+        XCTAssertEqual(dispatched.userMessageContent, original.userMessageContent)
+        XCTAssertEqual(dispatched.permissionMode, original.permissionMode)
+        XCTAssertEqual(dispatched.reasoningEffort, original.reasoningEffort)
+        XCTAssertEqual(dispatched.serviceTier, original.serviceTier)
+        XCTAssertEqual(dispatched.interactionMode, original.interactionMode)
+        XCTAssertEqual(
+            dispatched.environment["RC_REMOTE_CODE_ROOT_RUN_ID"],
+            original.runId.value.uuidString,
+            "Every manual controller turn needs host-owned parent scope so nested provider workers attach to it."
+        )
+        XCTAssertEqual(
+            dispatched.environment["RC_REMOTE_CODE_ATTEMPT_ID"],
+            original.runId.value.uuidString
+        )
+        XCTAssertNotNil(
+            dispatched.acceptancePermit,
+            "The dispatched request must carry the coordinator's single-start acceptance permit."
+        )
         XCTAssertEqual(supplier.loadCount, 0,
                        "Manual runs must not consult Auto routing dependencies.")
     }
@@ -293,6 +317,258 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
         XCTAssertEqual(receipt.finalRunStatus, .completed)
         XCTAssertEqual(receipt.qualityOutcome, "verified:output-present")
         XCTAssertEqual(try receiptRepo.receipts().count, 1)
+    }
+
+    func testMixedTokenUsageFinalizesReconciledReceiptAndLateCumulativeEnrichesIt() async throws {
+        // WHY: Claude can emit independent request charges around a cumulative
+        // snapshot, and providers can deliver a final cumulative usage receipt
+        // after the run terminal. The durable receipt must reflect reconciled
+        // growth without reopening or otherwise changing its terminal outcome.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let receiptRepo = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: receiptRepo,
+            packageVerification: { true },
+            killSwitch: { false }
+        )
+        let thread = AgentThread(
+            title: "mixed usage auto",
+            provider: .claude,
+            model: "claude-manual",
+            routingConfiguration: autoConfiguration(runtime: runtime)
+        )
+        try threadRepo.upsert(thread)
+        let runner = RecordingProviderRunner(provider: .codex)
+        let snapshot = liveSnapshot()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            orchestrationRuntime: runtime,
+            providerSnapshotSupplier: { [snapshot] in [snapshot] },
+            providers: [.codex: runner]
+        )
+        let runId = AgentRunID()
+        _ = try await coordinator.startRun(request(threadId: thread.id, runId: runId))
+
+        runner.emit(.event(.tokenUsage(.init(
+            totalTokens: 40,
+            semantics: .incremental
+        ))))
+        runner.emit(.event(.tokenUsage(.init(
+            totalTokens: 50,
+            semantics: .cumulative
+        ))))
+        runner.emit(.event(.tokenUsage(.init(
+            totalTokens: 20,
+            semantics: .incremental
+        ))))
+        runner.emit(.finished(
+            .completed,
+            finalMessage: "done",
+            providerThreadId: nil
+        ))
+
+        let finalized = try XCTUnwrap(receiptRepo.receipt(runId: runId))
+        let finalizedAt = try XCTUnwrap(finalized.finalizedAt)
+        XCTAssertEqual(finalized.actualTokens, 60,
+                       "40 + 20 incremental must win over the 50 cumulative snapshot")
+        XCTAssertEqual(finalized.lifecycleStatus, .finalized)
+        XCTAssertEqual(finalized.finalRunStatus, .completed)
+        XCTAssertEqual(finalized.qualityOutcome, "verified:output-present")
+        XCTAssertEqual(try receiptRepo.ledger().first?.tokenUsage, 60)
+
+        runner.emit(.event(.tokenUsage(.init(
+            totalTokens: 90,
+            semantics: .cumulative
+        ))))
+
+        let enriched = try XCTUnwrap(receiptRepo.receipt(runId: runId))
+        XCTAssertEqual(enriched.actualTokens, 90)
+        XCTAssertEqual(enriched.lifecycleStatus, .finalized)
+        XCTAssertEqual(enriched.finalRunStatus, .completed)
+        XCTAssertEqual(enriched.qualityOutcome, "verified:output-present")
+        XCTAssertEqual(enriched.finalizedAt, finalizedAt,
+                       "usage correction must not rewrite the terminal timestamp")
+        XCTAssertEqual(try receiptRepo.ledger().first?.tokenUsage, 90)
+        XCTAssertEqual(try receiptRepo.ledger().count, 2,
+                       "late positive growth is an append-only ledger correction")
+
+        runner.emit(.event(.tokenUsage(.init(
+            totalTokens: 80,
+            semantics: .cumulative
+        ))))
+        XCTAssertEqual(try receiptRepo.receipt(runId: runId)?.actualTokens, 90)
+        XCTAssertEqual(try receiptRepo.ledger().count, 2,
+                       "a lower repeated snapshot must not create another correction")
+    }
+
+    func testLateCumulativeUsageRetriesAfterTransientReceiptPersistenceFailure() async throws {
+        // WHY: a provider can report its authoritative usage after terminal
+        // while the receipt ledger is briefly unwritable. The coordinator must
+        // retain that snapshot and retry it; dropping it makes the durable
+        // receipt permanently undercount the completed run.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let receiptURL = URL(fileURLWithPath: root, isDirectory: true)
+            .appendingPathComponent("orchestration/receipts.jsonl")
+        let receiptRepo = AgentOrchestrationRepository(auditLogURL: receiptURL)
+        let runtime = AgentOrchestrationRuntime(
+            repository: receiptRepo,
+            packageVerification: { true },
+            killSwitch: { false }
+        )
+        let thread = AgentThread(
+            title: "late usage retry",
+            provider: .claude,
+            model: "claude-manual",
+            routingConfiguration: autoConfiguration(runtime: runtime)
+        )
+        try threadRepo.upsert(thread)
+        let runner = RecordingProviderRunner(provider: .codex)
+        let snapshot = liveSnapshot()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            orchestrationRuntime: runtime,
+            providerSnapshotSupplier: { [snapshot] in [snapshot] },
+            providers: [.codex: runner]
+        )
+        let runId = AgentRunID()
+        _ = try await coordinator.startRun(request(threadId: thread.id, runId: runId))
+        runner.emit(.event(.tokenUsage(.init(
+            totalTokens: 60,
+            semantics: .cumulative
+        ))))
+        runner.emit(.finished(
+            .completed,
+            finalMessage: "done",
+            providerThreadId: nil
+        ))
+
+        let finalized = try XCTUnwrap(receiptRepo.receipt(runId: runId))
+        let finalizedAt = try XCTUnwrap(finalized.finalizedAt)
+        XCTAssertEqual(finalized.actualTokens, 60)
+        XCTAssertEqual(try receiptRepo.ledger().count, 1)
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o400],
+            ofItemAtPath: receiptURL.path
+        )
+        runner.emit(.event(.tokenUsage(.init(
+            totalTokens: 90,
+            semantics: .cumulative
+        ))))
+        XCTAssertEqual(try receiptRepo.receipt(runId: runId)?.actualTokens, 60,
+                       "the injected write failure must happen before enrichment persists")
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: receiptURL.path
+        )
+
+        for _ in 0..<50 {
+            if try receiptRepo.receipt(runId: runId)?.actualTokens == 90 {
+                break
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let corrected = try XCTUnwrap(receiptRepo.receipt(runId: runId))
+        XCTAssertEqual(corrected.actualTokens, 90)
+        XCTAssertEqual(corrected.lifecycleStatus, .finalized)
+        XCTAssertEqual(corrected.finalRunStatus, .completed)
+        XCTAssertEqual(corrected.finalizedAt, finalizedAt)
+        XCTAssertEqual(try receiptRepo.ledger().count, 2)
+        XCTAssertEqual(try receiptRepo.ledger().first?.tokenUsage, 90)
+
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(try receiptRepo.ledger().count, 2,
+                       "a scheduled retry that already succeeded must not duplicate the correction")
+    }
+
+    func testTerminalReceiptFinalizationRetriesWithoutLosingUsage() async throws {
+        // WHY: the run graph and orchestration receipt use separate durability
+        // stores. A transient receipt failure after the run commits terminal
+        // must not strand the receipt as accepted or discard the captured usage.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let receiptURL = URL(fileURLWithPath: root, isDirectory: true)
+            .appendingPathComponent("orchestration/finalization-retry.jsonl")
+        let receiptRepo = AgentOrchestrationRepository(auditLogURL: receiptURL)
+        let runtime = AgentOrchestrationRuntime(
+            repository: receiptRepo,
+            packageVerification: { true },
+            killSwitch: { false }
+        )
+        let thread = AgentThread(
+            title: "receipt finalization retry",
+            provider: .claude,
+            model: "claude-manual",
+            routingConfiguration: autoConfiguration(runtime: runtime)
+        )
+        try threadRepo.upsert(thread)
+        let runner = RecordingProviderRunner(provider: .codex)
+        let snapshot = liveSnapshot()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            orchestrationRuntime: runtime,
+            providerSnapshotSupplier: { [snapshot] in [snapshot] },
+            providers: [.codex: runner]
+        )
+        let runId = AgentRunID()
+        _ = try await coordinator.startRun(request(threadId: thread.id, runId: runId))
+        runner.emit(.event(.tokenUsage(.init(
+            totalTokens: 60,
+            semantics: .cumulative
+        ))))
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o400],
+            ofItemAtPath: receiptURL.path
+        )
+        runner.emit(.finished(
+            .completed,
+            finalMessage: "done",
+            providerThreadId: nil
+        ))
+        XCTAssertEqual(try runRepo.get(id: runId)?.status, .completed)
+        XCTAssertEqual(try receiptRepo.receipt(runId: runId)?.lifecycleStatus, .accepted)
+        XCTAssertNil(try receiptRepo.receipt(runId: runId)?.actualTokens)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: receiptURL.path
+        )
+
+        for _ in 0..<50 {
+            if try receiptRepo.receipt(runId: runId)?.lifecycleStatus == .finalized {
+                break
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let finalized = try XCTUnwrap(receiptRepo.receipt(runId: runId))
+        XCTAssertEqual(finalized.lifecycleStatus, .finalized)
+        XCTAssertEqual(finalized.finalRunStatus, .completed)
+        XCTAssertEqual(finalized.actualTokens, 60)
+        XCTAssertEqual(finalized.qualityOutcome, "verified:output-present")
+        XCTAssertNotNil(finalized.finalizedAt)
+        XCTAssertEqual(try receiptRepo.ledger().count, 1)
+        XCTAssertEqual(try receiptRepo.ledger().first?.tokenUsage, 60)
+
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(try receiptRepo.ledger().count, 1,
+                       "successful retry must clear pending finalization exactly once")
     }
 
     func testAutoDeadlineCancelsAnActiveProviderAndFinalizesItsReceipt() async throws {
@@ -545,6 +821,7 @@ private final class RecordingProviderRunner: AgentProviderRunner, @unchecked Sen
     let provider: AgentProvider
     private let lock = NSLock()
     private var requests: [AgentRunRequest] = []
+    private var eventSink: (@Sendable (AgentRunEvent) -> Void)?
     private let terminalStatus: AgentRunStatus?
     private let terminalMessage: String?
 
@@ -566,13 +843,20 @@ private final class RecordingProviderRunner: AgentProviderRunner, @unchecked Sen
         lock.withLock { requests.last }
     }
 
+    func emit(_ event: AgentRunEvent) {
+        lock.withLock { eventSink }?(event)
+    }
+
     func listModels() async -> [AgentModelDescriptor] { [] }
 
     func startRun(
         _ request: AgentRunRequest,
         onEvent: @escaping @Sendable (AgentRunEvent) -> Void
     ) async throws -> AgentRunHandle {
-        lock.withLock { requests.append(request) }
+        lock.withLock {
+            requests.append(request)
+            eventSink = onEvent
+        }
         if let terminalStatus {
             onEvent(.finished(terminalStatus, finalMessage: terminalMessage, providerThreadId: nil))
         }

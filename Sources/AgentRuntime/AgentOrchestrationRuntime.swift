@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import CoreModel
 import Persistence
+import Darwin
 
 public struct AgentOrchestrationRoute: Sendable, Equatable {
     public let provider: AgentProvider
@@ -59,6 +60,104 @@ public enum AgentOrchestrationReceiptLifecycleStatus: String, Codable, Sendable,
     case finalized
 }
 
+/// Cryptographic bearer used only in memory and child process environments.
+///
+/// Receipts store `sha256Hex(_:)`; the plaintext capability must never be
+/// encoded into an audit row, event, provider argument, or diagnostic.
+public enum AgentDelegationCapability {
+    private static let digestByteCount = 32
+
+    public static func issue() -> String {
+        var generator = SystemRandomNumberGenerator()
+        return (0..<32).map { _ in
+            String(format: "%02x", UInt8.random(in: .min ... .max, using: &generator))
+        }.joined()
+    }
+
+    public static func sha256Hex(_ capability: String) -> String {
+        SHA256.hash(data: Data(capability.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    public static func matches(
+        _ capability: String,
+        sha256Hex expectedHex: String?
+    ) -> Bool {
+        guard AgentDelegationCapabilityTransport.isWellFormed(capability),
+              let expectedHex,
+              let expected = decodedHex(expectedHex),
+              expected.count == digestByteCount else {
+            return false
+        }
+        let actual = Array(SHA256.hash(data: Data(capability.utf8)))
+        var difference: UInt8 = 0
+        for index in 0..<digestByteCount {
+            difference |= expected[index] ^ actual[index]
+        }
+        return difference == 0
+    }
+
+    private static func decodedHex(_ value: String) -> [UInt8]? {
+        guard value.utf8.count == digestByteCount * 2 else { return nil }
+        let bytes = Array(value.utf8)
+        var decoded = [UInt8]()
+        decoded.reserveCapacity(digestByteCount)
+        for index in stride(from: 0, to: bytes.count, by: 2) {
+            guard let high = nibble(bytes[index]),
+                  let low = nibble(bytes[index + 1]) else {
+                return nil
+            }
+            decoded.append((high << 4) | low)
+        }
+        return decoded
+    }
+
+    private static func nibble(_ value: UInt8) -> UInt8? {
+        switch value {
+        case 48...57: return value - 48
+        case 97...102: return value - 87
+        default: return nil
+        }
+    }
+}
+
+/// Opaque receipt handle returned by the provider-neutral telemetry bridge.
+///
+/// The UUID identifies the lifecycle row while the independent bearer proves
+/// that the caller owns that exact child. Only the bearer's SHA-256 digest is
+/// persisted; this capability cannot authorize descendants.
+public enum AgentExternalReceiptHandle {
+    public static func encode(
+        runId: AgentRunID,
+        finalizationCapability: String
+    ) -> String? {
+        guard AgentDelegationCapabilityTransport.isWellFormed(
+            finalizationCapability
+        ) else {
+            return nil
+        }
+        return "\(runId.value.uuidString.lowercased()).\(finalizationCapability)"
+    }
+
+    public static func decode(
+        _ value: String
+    ) -> (runId: AgentRunID, finalizationCapability: String)? {
+        let parts = value.split(
+            separator: ".",
+            maxSplits: 1,
+            omittingEmptySubsequences: false
+        )
+        guard parts.count == 2,
+              let runUUID = UUID(uuidString: String(parts[0])),
+              AgentDelegationCapabilityTransport.isWellFormed(String(parts[1]))
+        else {
+            return nil
+        }
+        return (AgentRunID(runUUID), String(parts[1]))
+    }
+}
+
 public enum AgentProviderCatalogProvenance {
     /// A missing provenance marker is promoted only when both the catalog and
     /// streaming capability were independently verified. Every uncertain or
@@ -106,6 +205,15 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
     public let reservedTokens: Int?
     public let reservedCostMicros: Int?
     public let permissionMode: AgentPermissionMode
+    /// SHA-256 of the per-generation delegation bearer. Legacy and
+    /// telemetry-only receipts have nil and cannot authorize descendants.
+    public let delegationCapabilitySHA256: String?
+    /// SHA-256 of the one-child finalization bearer returned by `subagent
+    /// begin`. It is independent from delegation authority.
+    public let finalizationCapabilitySHA256: String?
+    /// OS process that owns an external receipt. Content-free and used only as
+    /// a liveness signal alongside the bounded lease.
+    public let ownerProcessID: Int32?
     public let actualTokens: Int?
     public let actualCostMicros: Int?
     public let latencyMilliseconds: Int64?
@@ -139,6 +247,9 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
         reservedTokens: Int? = nil,
         reservedCostMicros: Int? = nil,
         permissionMode: AgentPermissionMode = .supervised,
+        delegationCapabilitySHA256: String? = nil,
+        finalizationCapabilitySHA256: String? = nil,
+        ownerProcessID: Int32? = nil,
         actualTokens: Int? = nil,
         actualCostMicros: Int? = nil,
         latencyMilliseconds: Int64? = nil,
@@ -171,6 +282,9 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
         self.reservedTokens = reservedTokens
         self.reservedCostMicros = reservedCostMicros
         self.permissionMode = permissionMode
+        self.delegationCapabilitySHA256 = delegationCapabilitySHA256
+        self.finalizationCapabilitySHA256 = finalizationCapabilitySHA256
+        self.ownerProcessID = ownerProcessID
         self.actualTokens = actualTokens
         self.actualCostMicros = actualCostMicros
         self.latencyMilliseconds = latencyMilliseconds
@@ -183,7 +297,9 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
         case capabilitySnapshotId, decisionReason, admittedAt, lifecycleStatus
         case lifecycleUpdatedAt, finalizedAt, finalRunStatus, deadlineAt
         case budgetTokens, budgetCostMicros, reservationId, reservedTokens
-        case reservedCostMicros, permissionMode, actualTokens, actualCostMicros
+        case reservedCostMicros, permissionMode, delegationCapabilitySHA256
+        case finalizationCapabilitySHA256
+        case ownerProcessID, actualTokens, actualCostMicros
         case latencyMilliseconds, qualityOutcome
     }
 
@@ -220,6 +336,15 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
         reservedTokens = try values.decodeIfPresent(Int.self, forKey: .reservedTokens)
         reservedCostMicros = try values.decodeIfPresent(Int.self, forKey: .reservedCostMicros)
         permissionMode = try values.decodeIfPresent(AgentPermissionMode.self, forKey: .permissionMode) ?? .supervised
+        delegationCapabilitySHA256 = try values.decodeIfPresent(
+            String.self,
+            forKey: .delegationCapabilitySHA256
+        )
+        finalizationCapabilitySHA256 = try values.decodeIfPresent(
+            String.self,
+            forKey: .finalizationCapabilitySHA256
+        )
+        ownerProcessID = try values.decodeIfPresent(Int32.self, forKey: .ownerProcessID)
         actualTokens = try values.decodeIfPresent(Int.self, forKey: .actualTokens)
         actualCostMicros = try values.decodeIfPresent(Int.self, forKey: .actualCostMicros)
         latencyMilliseconds = try values.decodeIfPresent(Int64.self, forKey: .latencyMilliseconds)
@@ -259,6 +384,9 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
             reservedTokens: reservedTokens,
             reservedCostMicros: reservedCostMicros,
             permissionMode: permissionMode,
+            delegationCapabilitySHA256: delegationCapabilitySHA256,
+            finalizationCapabilitySHA256: finalizationCapabilitySHA256,
+            ownerProcessID: ownerProcessID,
             actualTokens: actualTokens,
             actualCostMicros: actualCostMicros,
             latencyMilliseconds: latencyMilliseconds,
@@ -270,7 +398,50 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
         _ usage: AssistantTokenUsage?,
         latencyMilliseconds: Int64,
         actualCostMicros: Int? = nil,
-        qualityOutcome: String? = nil
+        qualityOutcome: String? = nil,
+        lifecycleUpdatedAt: Date? = nil
+    ) -> AgentOrchestrationAdmissionReceipt {
+        AgentOrchestrationAdmissionReceipt(
+            id: id,
+            parentReceiptId: parentReceiptId,
+            runId: runId,
+            threadId: threadId,
+            nodeId: nodeId,
+            attemptId: attemptId,
+            routingRevision: routingRevision,
+            policyDigest: policyDigest,
+            policyVersion: policyVersion,
+            packageRevision: packageRevision,
+            provider: provider,
+            providerInstanceId: providerInstanceId,
+            model: model,
+            capabilitySnapshotId: capabilitySnapshotId,
+            decisionReason: decisionReason,
+            admittedAt: admittedAt,
+            lifecycleStatus: lifecycleStatus,
+            lifecycleUpdatedAt: lifecycleUpdatedAt ?? self.lifecycleUpdatedAt,
+            finalizedAt: finalizedAt,
+            finalRunStatus: finalRunStatus,
+            deadlineAt: deadlineAt,
+            budgetTokens: budgetTokens,
+            budgetCostMicros: budgetCostMicros,
+            reservationId: reservationId,
+            reservedTokens: reservedTokens,
+            reservedCostMicros: reservedCostMicros,
+            permissionMode: permissionMode,
+            delegationCapabilitySHA256: delegationCapabilitySHA256,
+            finalizationCapabilitySHA256: finalizationCapabilitySHA256,
+            ownerProcessID: ownerProcessID,
+            actualTokens: usage?.totalTokens,
+            actualCostMicros: actualCostMicros ?? self.actualCostMicros,
+            latencyMilliseconds: latencyMilliseconds,
+            qualityOutcome: qualityOutcome ?? self.qualityOutcome
+        )
+    }
+
+    func renewingLease(
+        deadlineAt: Date,
+        lifecycleUpdatedAt: Date
     ) -> AgentOrchestrationAdmissionReceipt {
         AgentOrchestrationAdmissionReceipt(
             id: id,
@@ -300,10 +471,13 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
             reservedTokens: reservedTokens,
             reservedCostMicros: reservedCostMicros,
             permissionMode: permissionMode,
-            actualTokens: usage?.totalTokens,
-            actualCostMicros: actualCostMicros ?? self.actualCostMicros,
+            delegationCapabilitySHA256: delegationCapabilitySHA256,
+            finalizationCapabilitySHA256: finalizationCapabilitySHA256,
+            ownerProcessID: ownerProcessID,
+            actualTokens: actualTokens,
+            actualCostMicros: actualCostMicros,
             latencyMilliseconds: latencyMilliseconds,
-            qualityOutcome: qualityOutcome ?? self.qualityOutcome
+            qualityOutcome: qualityOutcome
         )
     }
 }
@@ -413,18 +587,22 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
     private static let admissionAction = "agent.orchestration.admitted"
     private static let lifecycleAction = "agent.orchestration.lifecycle"
     private static let ledgerAction = "agent.orchestration.ledger"
+    private static let processTransactionLock = NSLock()
     private enum Storage {
-        case database(DeviceTrustRepository)
+        case database(SQLiteDB, DeviceTrustRepository)
         case file(URL)
     }
 
     private let storage: Storage
-    private let lock = NSLock()
+    private let transactionLockURL: URL
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
     public init(db: SQLiteDB) {
-        storage = .database(DeviceTrustRepository(db: db))
+        storage = .database(db, DeviceTrustRepository(db: db))
+        let databaseURL = URL(fileURLWithPath: db.path).standardizedFileURL
+        transactionLockURL = databaseURL.deletingLastPathComponent()
+            .appendingPathComponent(".\(databaseURL.lastPathComponent).orchestration.lock")
         encoder = JSONEncoder()
         decoder = JSONDecoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -434,6 +612,8 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
 
     public init(auditLogURL: URL = AgentOrchestrationRepository.defaultAuditLogURL()) {
         storage = .file(auditLogURL)
+        transactionLockURL = auditLogURL.deletingLastPathComponent()
+            .appendingPathComponent(".admission-receipts.lock")
         encoder = JSONEncoder()
         decoder = JSONDecoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -442,59 +622,90 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
     }
 
     public func save(_ receipt: AgentOrchestrationAdmissionReceipt) throws {
-        try persist(receipt, action: Self.admissionAction)
+        try withReceiptMutation {
+            try persistUnlocked(receipt, action: Self.admissionAction)
+        }
     }
 
     public func update(_ receipt: AgentOrchestrationAdmissionReceipt) throws {
-        try persist(receipt, action: Self.lifecycleAction)
+        try withReceiptMutation {
+            try persistUnlocked(receipt, action: Self.lifecycleAction)
+        }
     }
 
     public func saveLedger(_ entry: AgentOrchestrationLedgerEntry) throws {
+        try withReceiptMutation {
+            try saveLedgerUnlocked(entry)
+        }
+    }
+
+    fileprivate func withReceiptMutation<T>(_ body: () throws -> T) throws -> T {
+        try withCrossProcessLock {
+            switch storage {
+            case .database(let db, _):
+                return try db.transaction(body)
+            case .file:
+                return try body()
+            }
+        }
+    }
+
+    fileprivate func appendAdmissionUnlocked(_ receipt: AgentOrchestrationAdmissionReceipt) throws {
+        try persistUnlocked(receipt, action: Self.admissionAction)
+    }
+
+    fileprivate func appendLifecycleUnlocked(_ receipt: AgentOrchestrationAdmissionReceipt) throws {
+        try persistUnlocked(receipt, action: Self.lifecycleAction)
+    }
+
+    fileprivate func appendLedgerUnlocked(_ entry: AgentOrchestrationLedgerEntry) throws {
+        try saveLedgerUnlocked(entry)
+    }
+
+    private func saveLedgerUnlocked(_ entry: AgentOrchestrationLedgerEntry) throws {
         let data = try encoder.encode(entry)
         guard let detail = String(data: data, encoding: .utf8) else {
             throw AgentOrchestrationAdmissionError.receiptPersistenceFailed("invalid UTF-8")
         }
         switch storage {
-        case .database(let repository):
+        case .database(_, let repository):
             try repository.audit(actor: "RemoteCode", action: Self.ledgerAction, detail: detail, at: entry.finalizedAt ?? entry.admittedAt)
         case .file(let url):
-            lock.lock()
-            defer { lock.unlock() }
-            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            if !FileManager.default.fileExists(atPath: url.path) { try Data().write(to: url, options: .atomic) }
-            let handle = try FileHandle(forWritingTo: url)
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: data + Data([0x0A]))
-            try handle.synchronize()
+            try appendFileRecordUnlocked(data, to: url)
         }
     }
 
     public func ledger(limit: Int = 50) throws -> [AgentOrchestrationLedgerEntry] {
+        try withReceiptRead {
+            try ledgerUnlocked(limit: limit)
+        }
+    }
+
+    private func ledgerUnlocked(limit: Int) throws -> [AgentOrchestrationLedgerEntry] {
         let details: [String]
         switch storage {
-        case .database(let repository):
+        case .database(_, let repository):
             details = try repository.listAuditLogDetails(
                 actions: [Self.ledgerAction],
                 limit: max(1, limit) * 4
             )
         case .file(let url):
-            lock.lock()
-            defer { lock.unlock() }
             guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8) else { return [] }
-            details = text.split(separator: "\n").map(String.init)
+            // Match the audit database contract: callers see the newest
+            // append-only correction first on either storage backend.
+            details = text.split(separator: "\n").reversed().map(String.init)
         }
         return details.compactMap { try? decoder.decode(AgentOrchestrationLedgerEntry.self, from: Data($0.utf8)) }
             .prefix(max(1, limit)).map { $0 }
     }
 
-    private func persist(_ receipt: AgentOrchestrationAdmissionReceipt, action: String) throws {
+    private func persistUnlocked(_ receipt: AgentOrchestrationAdmissionReceipt, action: String) throws {
         let data = try encoder.encode(receipt)
         guard let detail = String(data: data, encoding: .utf8) else {
             throw AgentOrchestrationAdmissionError.receiptPersistenceFailed("invalid UTF-8")
         }
         switch storage {
-        case .database(let repository):
+        case .database(_, let repository):
             try repository.audit(
                 actor: "RemoteCode",
                 action: action,
@@ -502,27 +713,20 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
                 at: receipt.lifecycleUpdatedAt
             )
         case .file(let url):
-            lock.lock()
-            defer { lock.unlock() }
-            try FileManager.default.createDirectory(
-                at: url.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            if !FileManager.default.fileExists(atPath: url.path) {
-                try Data().write(to: url, options: .atomic)
-            }
-            let handle = try FileHandle(forWritingTo: url)
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: data + Data([0x0A]))
-            try handle.synchronize()
+            try appendFileRecordUnlocked(data, to: url)
         }
     }
 
     public func receipts(limit: Int = 50) throws -> [AgentOrchestrationAdmissionReceipt] {
+        try withReceiptRead {
+            try receiptsUnlocked(limit: limit)
+        }
+    }
+
+    fileprivate func receiptsUnlocked(limit: Int) throws -> [AgentOrchestrationAdmissionReceipt] {
         let records: [AgentOrchestrationAdmissionReceipt]
         switch storage {
-        case .database(let repository):
+        case .database(_, let repository):
             records = try repository.listAuditLogDetails(
                 actions: [Self.admissionAction, Self.lifecycleAction],
                 limit: max(1, limit) * 4
@@ -531,8 +735,6 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
                 return try? decoder.decode(AgentOrchestrationAdmissionReceipt.self, from: data)
             }
         case .file(let url):
-            lock.lock()
-            defer { lock.unlock() }
             guard let data = try? Data(contentsOf: url),
                   let text = String(data: data, encoding: .utf8) else { return [] }
             records = text.split(separator: "\n")
@@ -552,8 +754,185 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
             .map { $0 }
     }
 
+    fileprivate func receiptsUnlocked(
+        ids: Set<UUID>
+    ) throws -> [UUID: AgentOrchestrationAdmissionReceipt] {
+        guard !ids.isEmpty else { return [:] }
+        var latestByID: [UUID: AgentOrchestrationAdmissionReceipt] = [:]
+        try forEachReceiptRecordUnlocked(containing: nil) { receipt in
+            guard ids.contains(receipt.id) else { return }
+            if let current = latestByID[receipt.id],
+               current.lifecycleUpdatedAt >= receipt.lifecycleUpdatedAt {
+                return
+            }
+            latestByID[receipt.id] = receipt
+        }
+        return latestByID
+    }
+
     public func receipt(runId: AgentRunID) throws -> AgentOrchestrationAdmissionReceipt? {
-        try receipts(limit: 500).first { $0.runId == runId }
+        try withReceiptRead {
+            try receiptUnlocked(runId: runId)
+        }
+    }
+
+    fileprivate func receiptUnlocked(runId: AgentRunID) throws -> AgentOrchestrationAdmissionReceipt? {
+        try latestReceiptUnlocked(containing: runId.value.uuidString) { $0.runId == runId }
+    }
+
+    fileprivate func receiptUnlocked(id: UUID) throws -> AgentOrchestrationAdmissionReceipt? {
+        try latestReceiptUnlocked(containing: id.uuidString) { $0.id == id }
+    }
+
+    private func latestReceiptUnlocked(
+        containing needle: String,
+        matching predicate: (AgentOrchestrationAdmissionReceipt) -> Bool
+    ) throws -> AgentOrchestrationAdmissionReceipt? {
+        var latest: AgentOrchestrationAdmissionReceipt?
+        try forEachReceiptRecordUnlocked(containing: needle) { receipt in
+            guard predicate(receipt) else { return }
+            if let current = latest,
+               current.lifecycleUpdatedAt > receipt.lifecycleUpdatedAt {
+                return
+            }
+            latest = receipt
+        }
+        return latest
+    }
+
+    private func forEachReceiptRecordUnlocked(
+        containing needle: String?,
+        _ body: (AgentOrchestrationAdmissionReceipt) -> Void
+    ) throws {
+        switch storage {
+        case .database(let db, _):
+            let filter = needle == nil ? "" : " AND detail LIKE ?"
+            let statement = try db.prepare("""
+                SELECT detail FROM audit_log
+                WHERE action IN (?, ?)\(filter)
+                ORDER BY id ASC;
+            """)
+            try statement.bind(1, Self.admissionAction)
+            try statement.bind(2, Self.lifecycleAction)
+            if let needle {
+                try statement.bind(3, "%\(needle)%")
+            }
+            while try statement.step() {
+                guard let detail = statement.columnText(0),
+                      let receipt = try? decoder.decode(
+                        AgentOrchestrationAdmissionReceipt.self,
+                        from: Data(detail.utf8)
+                      ) else {
+                    continue
+                }
+                body(receipt)
+            }
+        case .file(let url):
+            guard FileManager.default.fileExists(atPath: url.path) else { return }
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            var pending = Data()
+            while let chunk = try handle.read(upToCount: 64 * 1_024), !chunk.isEmpty {
+                pending.append(chunk)
+                while let newline = pending.firstIndex(of: 0x0A) {
+                    // Own the bytes before mutating `pending`; a Data slice may
+                    // otherwise share the storage whose prefix is removed next.
+                    let line = Data(pending[..<newline])
+                    pending.removeSubrange(...newline)
+                    decodeReceiptLine(line, containing: needle, body)
+                }
+            }
+            if !pending.isEmpty {
+                decodeReceiptLine(pending, containing: needle, body)
+            }
+        }
+    }
+
+    private func decodeReceiptLine(
+        _ line: Data,
+        containing needle: String?,
+        _ body: (AgentOrchestrationAdmissionReceipt) -> Void
+    ) {
+        if let needle,
+           String(decoding: line, as: UTF8.self).localizedCaseInsensitiveContains(needle) == false {
+            return
+        }
+        guard let receipt = try? decoder.decode(
+            AgentOrchestrationAdmissionReceipt.self,
+            from: line
+        ) else {
+            return
+        }
+        body(receipt)
+    }
+
+    private func appendFileRecordUnlocked(_ data: Data, to url: URL) throws {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try Data().write(to: url, options: .atomic)
+        }
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: data + Data([0x0A]))
+        try handle.synchronize()
+    }
+
+    private func withReceiptRead<T>(_ body: () throws -> T) throws -> T {
+        try withCrossProcessLock(body)
+    }
+
+    private func withCrossProcessLock<T>(_ body: () throws -> T) throws -> T {
+        Self.processTransactionLock.lock()
+        defer { Self.processTransactionLock.unlock() }
+
+        let directory = transactionLockURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let ownerReadWrite = mode_t(S_IRUSR | S_IWUSR)
+        let descriptor = Darwin.open(
+            transactionLockURL.path,
+            O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW,
+            ownerReadWrite
+        )
+        guard descriptor >= 0 else {
+            throw lockError(operation: "open")
+        }
+        defer { Darwin.close(descriptor) }
+        guard Darwin.fchmod(descriptor, ownerReadWrite) == 0 else {
+            throw lockError(operation: "fchmod")
+        }
+
+        var fileLock = Darwin.flock()
+        fileLock.l_start = 0
+        fileLock.l_len = 0
+        fileLock.l_pid = 0
+        fileLock.l_type = Int16(F_WRLCK)
+        fileLock.l_whence = Int16(SEEK_SET)
+        while Darwin.fcntl(descriptor, F_SETLKW, &fileLock) == -1 {
+            if errno != EINTR {
+                throw lockError(operation: "lock")
+            }
+        }
+        defer {
+            fileLock.l_type = Int16(F_UNLCK)
+            _ = Darwin.fcntl(descriptor, F_SETLK, &fileLock)
+        }
+        return try body()
+    }
+
+    private func lockError(operation: String) -> AgentOrchestrationAdmissionError {
+        let code = errno
+        return .receiptPersistenceFailed(
+            "\(operation) orchestration lock: \(String(cString: strerror(code)))"
+        )
     }
 
     public static func defaultAuditLogURL() -> URL {
@@ -571,7 +950,9 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     public static let requiredPackageRevision = AgentSkillInstaller.remoteCodeOrchestratePinnedPackage.sourceRevision
     public static let policyContractVersion = "1"
     public static let rolloutFlagKey = "agent.orchestration.rollout-enabled"
+    public static let defaultExternalLeaseDuration: TimeInterval = 24 * 60 * 60
     private static let maxConcurrentReservations = 32
+    private static let maximumReceiptAncestorDepth = 64
 
     public let policyDigest: String
     private let repository: AgentOrchestrationRepository
@@ -580,8 +961,9 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     private let killSwitch: @Sendable () -> Bool
     private let now: @Sendable () -> Date
     private let costEstimator: (@Sendable (AgentOrchestrationAdmissionReceipt, AssistantTokenUsage?) -> Int?)?
+    private let externalLeaseDuration: TimeInterval
+    private let processIsAlive: @Sendable (Int32) -> Bool
     private let reservationLock = NSLock()
-    private let receiptLifecycleLock = NSLock()
     private var reservations: [String: (tokens: Int?, costMicros: Int?, deadlineAt: Date?)] = [:]
 
     public init(
@@ -590,7 +972,11 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         rolloutGate: @escaping @Sendable () -> Bool = AgentOrchestrationRuntime.defaultRolloutEnabled,
         killSwitch: @escaping @Sendable () -> Bool = AgentOrchestrationRuntime.defaultKillSwitch,
         now: @escaping @Sendable () -> Date = { Date() },
-        costEstimator: (@Sendable (AgentOrchestrationAdmissionReceipt, AssistantTokenUsage?) -> Int?)? = nil
+        costEstimator: (@Sendable (AgentOrchestrationAdmissionReceipt, AssistantTokenUsage?) -> Int?)? = nil,
+        externalLeaseDuration: TimeInterval = AgentOrchestrationRuntime.defaultExternalLeaseDuration,
+        processIsAlive: @escaping @Sendable (Int32) -> Bool = {
+            AgentOrchestrationRuntime.defaultProcessIsAlive($0)
+        }
     ) {
         self.repository = repository
         self.packageVerification = packageVerification
@@ -598,6 +984,8 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         self.killSwitch = killSwitch
         self.now = now
         self.costEstimator = costEstimator
+        self.externalLeaseDuration = max(1, externalLeaseDuration)
+        self.processIsAlive = processIsAlive
         policyDigest = Self.sha256Hex(
             "\(Self.packageID)|\(Self.requiredPackageRevision)|\(Self.policyContractVersion)"
         )
@@ -656,8 +1044,14 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         budgetCostMicros: Int? = nil,
         reservationId: String? = nil,
         reservedTokens: Int? = nil,
-        reservedCostMicros: Int? = nil
+        reservedCostMicros: Int? = nil,
+        delegationCapabilitySHA256: String? = nil
     ) throws -> (route: AgentOrchestrationRoute, receipt: AgentOrchestrationAdmissionReceipt) {
+        guard delegationCapabilitySHA256.map(Self.isSHA256) ?? true else {
+            throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                "delegation capability digest is invalid"
+            )
+        }
         let resolved = try route(configuration: configuration, providerSnapshots: providerSnapshots)
         guard budgetCostMicros == nil || costEstimator != nil else {
             throw AgentOrchestrationAdmissionError.costBudgetUnavailable
@@ -691,7 +1085,8 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             reservationId: reservationId,
             reservedTokens: reservedTokens,
             reservedCostMicros: reservedCostMicros,
-            permissionMode: permissionMode
+            permissionMode: permissionMode,
+            delegationCapabilitySHA256: delegationCapabilitySHA256
         )
         let reservation = try reserveResources(
             receiptId: receipt.id,
@@ -728,7 +1123,8 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             reservationId: reservation.id,
             reservedTokens: reservation.tokens,
             reservedCostMicros: reservation.costMicros,
-            permissionMode: receipt.permissionMode
+            permissionMode: receipt.permissionMode,
+            delegationCapabilitySHA256: receipt.delegationCapabilitySHA256
         )
         do {
             try repository.save(admittedReceipt)
@@ -747,7 +1143,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     /// finalize the returned run id when that child exits. It intentionally
     /// shares the parent's route/capability decision and does not reserve a
     /// second root budget.
-    public func admitChild(
+    func admitChild(
         parentReceipt: AgentOrchestrationAdmissionReceipt,
         runId: AgentRunID,
         nodeId: String,
@@ -755,9 +1151,6 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         threadId: AgentThreadID? = nil
     ) throws -> AgentOrchestrationAdmissionReceipt {
         let trimmedNodeId = nodeId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard parentReceipt.lifecycleStatus == .accepted else {
-            throw AgentOrchestrationAdmissionError.invalidChildAdmission("parent is not active")
-        }
         guard !trimmedNodeId.isEmpty,
               trimmedNodeId.caseInsensitiveCompare("root") != .orderedSame,
               trimmedNodeId.utf8.count <= 128,
@@ -766,54 +1159,189 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
               }) else {
             throw AgentOrchestrationAdmissionError.invalidChildAdmission("node id must be a non-root safe token")
         }
-
-        let child = AgentOrchestrationAdmissionReceipt(
-            parentReceiptId: parentReceipt.id,
-            runId: runId,
-            threadId: threadId ?? parentReceipt.threadId,
-            nodeId: trimmedNodeId,
-            attemptId: attemptId ?? runId.value,
-            routingRevision: parentReceipt.routingRevision,
-            policyDigest: parentReceipt.policyDigest,
-            policyVersion: parentReceipt.policyVersion,
-            packageRevision: parentReceipt.packageRevision,
-            provider: parentReceipt.provider,
-            providerInstanceId: parentReceipt.providerInstanceId,
-            model: parentReceipt.model,
-            capabilitySnapshotId: parentReceipt.capabilitySnapshotId,
-            decisionReason: "controlled-child-of-parent",
-            admittedAt: now(),
-            lifecycleStatus: .accepted,
-            deadlineAt: parentReceipt.deadlineAt,
-            permissionMode: parentReceipt.permissionMode
-        )
         do {
-            try repository.save(child)
+            return try repository.withReceiptMutation {
+                guard let currentParent = try repository.receiptUnlocked(id: parentReceipt.id),
+                      currentParent.lifecycleStatus == .accepted else {
+                    throw AgentOrchestrationAdmissionError.invalidChildAdmission("parent is not active")
+                }
+                let admittedAt = now()
+                if Self.isExternalReceipt(currentParent) {
+                    try validateActiveReceipt(currentParent, at: admittedAt, role: "parent")
+                } else if let deadline = currentParent.deadlineAt, deadline <= admittedAt {
+                    throw AgentOrchestrationAdmissionError.invalidChildAdmission("parent deadline expired")
+                }
+                try validateActiveAncestors(of: currentParent, at: admittedAt)
+                if let existing = try repository.receiptUnlocked(runId: runId) {
+                    guard existing.parentReceiptId == currentParent.id,
+                          existing.nodeId == trimmedNodeId else {
+                        throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                            "run id already belongs to a different orchestration receipt"
+                        )
+                    }
+                    return existing
+                }
+                let child = AgentOrchestrationAdmissionReceipt(
+                    parentReceiptId: currentParent.id,
+                    runId: runId,
+                    threadId: threadId ?? currentParent.threadId,
+                    nodeId: trimmedNodeId,
+                    attemptId: attemptId ?? runId.value,
+                    routingRevision: currentParent.routingRevision,
+                    policyDigest: currentParent.policyDigest,
+                    policyVersion: currentParent.policyVersion,
+                    packageRevision: currentParent.packageRevision,
+                    provider: currentParent.provider,
+                    providerInstanceId: currentParent.providerInstanceId,
+                    model: currentParent.model,
+                    capabilitySnapshotId: currentParent.capabilitySnapshotId,
+                    decisionReason: "controlled-child-of-parent",
+                    admittedAt: admittedAt,
+                    lifecycleStatus: .accepted,
+                    deadlineAt: currentParent.deadlineAt,
+                    permissionMode: currentParent.permissionMode
+                )
+                try repository.appendAdmissionUnlocked(child)
+                return child
+            }
         } catch let error as AgentOrchestrationAdmissionError {
             throw error
         } catch {
             throw AgentOrchestrationAdmissionError.receiptPersistenceFailed(String(describing: error))
         }
-        return child
     }
 
-    /// Content-free bridge used by a worker process that cannot hold the
-    /// controller's Swift runtime instance. The caller supplies only identity
-    /// metadata; when a live parent run is present, its policy/provider scope
-    /// is inherited. This is the common begin/end protocol for Codex, Claude,
-    /// and Grok skill workers.
-    public func recordExternalChild(
+    /// Creates a delegating child only after proving possession of the active
+    /// parent's bearer. The caller supplies a fresh child bearer; only its
+    /// digest is persisted.
+    public func recordAuthorizedExternalChild(
         runId: AgentRunID,
         threadId: AgentThreadID,
         provider: AgentProvider,
         providerInstanceId: String,
         model: String,
         nodeId: String,
-        parentRunId: AgentRunID? = nil
+        parentRunId: AgentRunID,
+        parentThreadId: AgentThreadID,
+        parentCapability: String,
+        childCapability: String,
+        requestedPermissionMode: AgentPermissionMode? = nil,
+        ownerProcessID: Int32? = nil
     ) throws -> AgentOrchestrationAdmissionReceipt {
-        receiptLifecycleLock.lock()
-        defer { receiptLifecycleLock.unlock() }
-        let parent = try parentRunId.flatMap { try repository.receipt(runId: $0) }
+        guard AgentDelegationCapabilityTransport.isWellFormed(childCapability) else {
+            throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                "child delegation capability is invalid"
+            )
+        }
+        return try recordExternalChild(
+            runId: runId,
+            threadId: threadId,
+            provider: provider,
+            providerInstanceId: providerInstanceId,
+            model: model,
+            nodeId: nodeId,
+            parentRunId: parentRunId,
+            parentThreadId: parentThreadId,
+            parentCapability: parentCapability,
+            childCapabilitySHA256: AgentDelegationCapability.sha256Hex(childCapability),
+            finalizationCapabilitySHA256: nil,
+            requestedPermissionMode: requestedPermissionMode,
+            ownerProcessID: ownerProcessID,
+            trustedProviderEvent: false
+        )
+    }
+
+    /// Authenticated lifecycle-only bridge for custom non-provider workers.
+    /// Its receipt intentionally has no child capability hash and therefore
+    /// cannot authorize a grandchild.
+    public func recordAuthenticatedTelemetryChild(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        provider: AgentProvider,
+        providerInstanceId: String,
+        model: String,
+        nodeId: String,
+        parentRunId: AgentRunID,
+        parentThreadId: AgentThreadID,
+        parentCapability: String,
+        finalizationCapability: String,
+        requestedPermissionMode: AgentPermissionMode? = nil,
+        ownerProcessID: Int32? = nil
+    ) throws -> AgentOrchestrationAdmissionReceipt {
+        guard AgentDelegationCapabilityTransport.isWellFormed(
+            finalizationCapability
+        ) else {
+            throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                "finalization capability is invalid"
+            )
+        }
+        return try recordExternalChild(
+            runId: runId,
+            threadId: threadId,
+            provider: provider,
+            providerInstanceId: providerInstanceId,
+            model: model,
+            nodeId: nodeId,
+            parentRunId: parentRunId,
+            parentThreadId: parentThreadId,
+            parentCapability: parentCapability,
+            childCapabilitySHA256: nil,
+            finalizationCapabilitySHA256: AgentDelegationCapability.sha256Hex(
+                finalizationCapability
+            ),
+            requestedPermissionMode: requestedPermissionMode,
+            ownerProcessID: ownerProcessID,
+            trustedProviderEvent: false
+        )
+    }
+
+    /// Host-observed provider-native lifecycle never crosses IPC and never
+    /// receives a delegation bearer. Keep this internal so provider proxies and
+    /// local RPC cannot use it as an authorization bypass.
+    func recordProviderNativeChild(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        provider: AgentProvider,
+        providerInstanceId: String,
+        model: String,
+        nodeId: String,
+        parentRunId: AgentRunID,
+        requestedPermissionMode: AgentPermissionMode? = nil
+    ) throws -> AgentOrchestrationAdmissionReceipt {
+        try recordExternalChild(
+            runId: runId,
+            threadId: threadId,
+            provider: provider,
+            providerInstanceId: providerInstanceId,
+            model: model,
+            nodeId: nodeId,
+            parentRunId: parentRunId,
+            parentThreadId: threadId,
+            parentCapability: nil,
+            childCapabilitySHA256: nil,
+            finalizationCapabilitySHA256: nil,
+            requestedPermissionMode: requestedPermissionMode,
+            ownerProcessID: nil,
+            trustedProviderEvent: true
+        )
+    }
+
+    private func recordExternalChild(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        provider: AgentProvider,
+        providerInstanceId: String,
+        model: String,
+        nodeId: String,
+        parentRunId: AgentRunID,
+        parentThreadId: AgentThreadID,
+        parentCapability: String?,
+        childCapabilitySHA256: String?,
+        finalizationCapabilitySHA256: String?,
+        requestedPermissionMode: AgentPermissionMode?,
+        ownerProcessID: Int32?,
+        trustedProviderEvent: Bool
+    ) throws -> AgentOrchestrationAdmissionReceipt {
         let trimmedNodeId = nodeId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedNodeId.isEmpty,
               trimmedNodeId.caseInsensitiveCompare("root") != .orderedSame,
@@ -823,44 +1351,350 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
               }) else {
             throw AgentOrchestrationAdmissionError.invalidChildAdmission("node id must be a non-root safe token")
         }
-        if let existing = try repository.receipt(runId: runId) {
-            guard existing.threadId == threadId,
-                  existing.provider == provider,
-                  existing.nodeId.caseInsensitiveCompare("root") != .orderedSame else {
-                throw AgentOrchestrationAdmissionError.invalidChildAdmission(
-                    "run id already belongs to a different orchestration receipt"
-                )
-            }
-            return existing
+        let ownerPID = ownerProcessID ?? ProcessInfo.processInfo.processIdentifier
+        guard ownerPID > 0 else {
+            throw AgentOrchestrationAdmissionError.invalidChildAdmission("owner process id is invalid")
         }
-        let child = AgentOrchestrationAdmissionReceipt(
-            parentReceiptId: parent?.id,
-            runId: runId,
-            threadId: threadId,
-            nodeId: trimmedNodeId,
-            attemptId: runId.value,
-            routingRevision: parent?.routingRevision ?? 0,
-            policyDigest: parent?.policyDigest ?? "external",
-            policyVersion: parent?.policyVersion ?? "external",
-            packageRevision: parent?.packageRevision ?? "external",
-            provider: provider,
-            providerInstanceId: providerInstanceId,
-            model: model,
-            capabilitySnapshotId: parent?.capabilitySnapshotId ?? "external",
-            decisionReason: "external-controlled-child",
-            admittedAt: now(),
-            lifecycleStatus: .accepted,
-            deadlineAt: parent?.deadlineAt,
-            permissionMode: parent?.permissionMode ?? .supervised
-        )
         do {
-            try repository.save(child)
+            return try repository.withReceiptMutation {
+                let admittedAt = now()
+                guard let parent = try repository.receiptUnlocked(runId: parentRunId) else {
+                    throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                        "parent receipt is unavailable"
+                    )
+                }
+                try validateExternalParent(
+                    parent,
+                    expectedThreadId: parentThreadId,
+                    at: admittedAt
+                )
+                if !trustedProviderEvent {
+                    guard let parentCapability,
+                          AgentDelegationCapability.matches(
+                            parentCapability,
+                            sha256Hex: parent.delegationCapabilitySHA256
+                          ) else {
+                        throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                            "parent delegation capability is invalid"
+                        )
+                    }
+                }
+                if let requestedPermissionMode,
+                   !Self.isPermissionMode(
+                    requestedPermissionMode,
+                    noBroaderThan: parent.permissionMode
+                   ) {
+                    throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                        "child permission mode exceeds the parent"
+                    )
+                }
+                let permissionMode = requestedPermissionMode ?? parent.permissionMode
+                if let existing = try repository.receiptUnlocked(runId: runId) {
+                    guard existing.threadId == threadId,
+                          existing.provider == provider,
+                          existing.parentReceiptId == parent.id,
+                          existing.permissionMode == permissionMode,
+                          existing.delegationCapabilitySHA256 == childCapabilitySHA256,
+                          existing.finalizationCapabilitySHA256
+                            == finalizationCapabilitySHA256,
+                          existing.nodeId.caseInsensitiveCompare("root") != .orderedSame else {
+                        throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                            "run id already belongs to a different orchestration receipt"
+                        )
+                    }
+                    return existing
+                }
+                let child = AgentOrchestrationAdmissionReceipt(
+                    parentReceiptId: parent.id,
+                    runId: runId,
+                    threadId: threadId,
+                    nodeId: trimmedNodeId,
+                    attemptId: runId.value,
+                    routingRevision: parent.routingRevision,
+                    policyDigest: parent.policyDigest,
+                    policyVersion: parent.policyVersion,
+                    packageRevision: parent.packageRevision,
+                    provider: provider,
+                    providerInstanceId: providerInstanceId,
+                    model: model,
+                    capabilitySnapshotId: parent.capabilitySnapshotId,
+                    decisionReason: "external-controlled-child",
+                    admittedAt: admittedAt,
+                    lifecycleStatus: .accepted,
+                    deadlineAt: externalLeaseDeadline(parent: parent, at: admittedAt),
+                    permissionMode: permissionMode,
+                    delegationCapabilitySHA256: childCapabilitySHA256,
+                    finalizationCapabilitySHA256: finalizationCapabilitySHA256,
+                    ownerProcessID: ownerPID
+                )
+                try repository.appendAdmissionUnlocked(child)
+                return child
+            }
         } catch let error as AgentOrchestrationAdmissionError {
             throw error
         } catch {
             throw AgentOrchestrationAdmissionError.receiptPersistenceFailed(String(describing: error))
         }
-        return child
+    }
+
+    private static func isPermissionMode(
+        _ requested: AgentPermissionMode,
+        noBroaderThan parent: AgentPermissionMode
+    ) -> Bool {
+        func rank(_ mode: AgentPermissionMode) -> Int {
+            switch mode {
+            case .supervised: return 0
+            case .autoAcceptEdits: return 1
+            case .fullAccess: return 2
+            }
+        }
+        return rank(requested) <= rank(parent)
+    }
+
+    private func validateExternalParent(
+        _ parent: AgentOrchestrationAdmissionReceipt,
+        expectedThreadId: AgentThreadID,
+        at current: Date
+    ) throws {
+        guard parent.threadId == expectedThreadId else {
+            throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                "parent receipt belongs to a different thread"
+            )
+        }
+        try validateActiveReceipt(parent, at: current, role: "parent")
+        try validateActiveAncestors(of: parent, at: current)
+    }
+
+    private func validateActiveReceipt(
+        _ receipt: AgentOrchestrationAdmissionReceipt,
+        at current: Date,
+        role: String
+    ) throws {
+        guard receipt.lifecycleStatus == .accepted else {
+            throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                "\(role) receipt is not active"
+            )
+        }
+        if Self.isExternalReceipt(receipt) {
+            guard effectiveExternalDeadline(receipt) > current else {
+                throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                    "\(role) external lease expired"
+                )
+            }
+            guard let ownerProcessID = receipt.ownerProcessID else {
+                throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                    "\(role) owner process is unavailable"
+                )
+            }
+            guard processIsAlive(ownerProcessID) else {
+                throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                    "\(role) owner process is not alive"
+                )
+            }
+        } else if let deadlineAt = receipt.deadlineAt, deadlineAt <= current {
+            throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                "\(role) deadline expired"
+            )
+        }
+    }
+
+    private func validateActiveAncestors(
+        of receipt: AgentOrchestrationAdmissionReceipt,
+        at current: Date
+    ) throws {
+        var visited = Set([receipt.id])
+        var descendant = receipt
+        var depth = 0
+        while let parentReceiptId = descendant.parentReceiptId {
+            guard depth < Self.maximumReceiptAncestorDepth else {
+                throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                    "receipt ancestry exceeds the supported depth"
+                )
+            }
+            guard visited.insert(parentReceiptId).inserted else {
+                throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                    "receipt ancestry is cyclic"
+                )
+            }
+            guard let ancestor = try repository.receiptUnlocked(id: parentReceiptId) else {
+                throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                    "ancestor receipt is unavailable"
+                )
+            }
+            try validateActiveReceipt(ancestor, at: current, role: "ancestor")
+            descendant = ancestor
+            depth += 1
+        }
+    }
+
+    private func externalLeaseDeadline(
+        parent: AgentOrchestrationAdmissionReceipt?,
+        at admittedAt: Date
+    ) -> Date {
+        let ownDeadline = admittedAt.addingTimeInterval(externalLeaseDuration)
+        guard let parent else { return ownDeadline }
+        let parentDeadline = Self.isExternalReceipt(parent)
+            ? effectiveExternalDeadline(parent)
+            : parent.deadlineAt
+        return parentDeadline.map { min($0, ownDeadline) } ?? ownDeadline
+    }
+
+    private func effectiveExternalDeadline(_ receipt: AgentOrchestrationAdmissionReceipt) -> Date {
+        receipt.deadlineAt ?? receipt.admittedAt.addingTimeInterval(externalLeaseDuration)
+    }
+
+    public static func isExternalReceipt(_ receipt: AgentOrchestrationAdmissionReceipt) -> Bool {
+        receipt.decisionReason == "manual-agent-app-controller"
+            || receipt.decisionReason == "external-controlled-child"
+    }
+
+    public static func defaultProcessIsAlive(_ processID: Int32) -> Bool {
+        guard processID > 0 else { return false }
+        if Darwin.kill(processID, 0) == 0 { return true }
+        return errno == EPERM
+    }
+
+    /// Renews the bounded lease for a live external controller/worker.
+    ///
+    /// The owner process must call this before the current deadline; an expired
+    /// receipt cannot be revived. Child leases never extend beyond their parent.
+    @discardableResult
+    public func renewExternalReceiptLease(
+        runId: AgentRunID,
+        ownerProcessID: Int32? = nil,
+        leaseDuration: TimeInterval? = nil
+    ) throws -> AgentOrchestrationAdmissionReceipt {
+        let ownerPID = ownerProcessID ?? ProcessInfo.processInfo.processIdentifier
+        let duration = leaseDuration ?? externalLeaseDuration
+        guard ownerPID > 0, duration > 0 else {
+            throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                "external lease renewal is invalid"
+            )
+        }
+        return try repository.withReceiptMutation {
+            guard let receipt = try repository.receiptUnlocked(runId: runId),
+                  receipt.lifecycleStatus == .accepted,
+                  Self.isExternalReceipt(receipt) else {
+                throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                    "external receipt is not active"
+                )
+            }
+            guard receipt.ownerProcessID == ownerPID else {
+                throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                    "external receipt owner does not match"
+                )
+            }
+            let current = now()
+            guard effectiveExternalDeadline(receipt) > current else {
+                throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                    "external receipt lease expired"
+                )
+            }
+            guard processIsAlive(ownerPID) else {
+                throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                    "external receipt owner process is not alive"
+                )
+            }
+
+            var renewedDeadline = current.addingTimeInterval(duration)
+            if let parentReceiptId = receipt.parentReceiptId {
+                guard let parent = try repository.receiptUnlocked(id: parentReceiptId) else {
+                    throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                        "parent receipt is unavailable"
+                    )
+                }
+                try validateExternalParent(
+                    parent,
+                    expectedThreadId: parent.threadId,
+                    at: current
+                )
+                let parentDeadline = Self.isExternalReceipt(parent)
+                    ? effectiveExternalDeadline(parent)
+                    : parent.deadlineAt
+                if let parentDeadline {
+                    renewedDeadline = min(renewedDeadline, parentDeadline)
+                }
+            }
+            let updatedAt = current > receipt.lifecycleUpdatedAt
+                ? current
+                : receipt.lifecycleUpdatedAt.addingTimeInterval(0.001)
+            let renewed = receipt.renewingLease(
+                deadlineAt: renewedDeadline,
+                lifecycleUpdatedAt: updatedAt
+            )
+            try repository.appendLifecycleUnlocked(renewed)
+            return renewed
+        }
+    }
+
+    /// Ensures a manually-routed Agent App turn has a root receipt so a later
+    /// cross-provider child can link to the controller's real run identity.
+    ///
+    /// Auto routing already persists the same run id through `admit`; this
+    /// method is idempotent for that case and does not reserve a budget.
+    func recordExternalRoot(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        provider: AgentProvider,
+        providerInstanceId: String,
+        model: String,
+        permissionMode: AgentPermissionMode,
+        delegationCapabilitySHA256: String,
+        ownerProcessID: Int32? = nil
+    ) throws -> AgentOrchestrationAdmissionReceipt {
+        guard Self.isSHA256(delegationCapabilitySHA256) else {
+            throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                "delegation capability digest is invalid"
+            )
+        }
+        let ownerPID = ownerProcessID ?? ProcessInfo.processInfo.processIdentifier
+        guard ownerPID > 0 else {
+            throw AgentOrchestrationAdmissionError.invalidChildAdmission("owner process id is invalid")
+        }
+        do {
+            return try repository.withReceiptMutation {
+                if let existing = try repository.receiptUnlocked(runId: runId) {
+                    guard existing.threadId == threadId,
+                          existing.provider == provider,
+                          existing.lifecycleStatus == .accepted,
+                          existing.permissionMode == permissionMode,
+                          existing.delegationCapabilitySHA256 == delegationCapabilitySHA256 else {
+                        throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                            "run id already belongs to a different orchestration receipt"
+                        )
+                    }
+                    return existing
+                }
+                let admittedAt = now()
+                let receipt = AgentOrchestrationAdmissionReceipt(
+                    runId: runId,
+                    threadId: threadId,
+                    nodeId: "root",
+                    attemptId: runId.value,
+                    routingRevision: 0,
+                    policyDigest: "external",
+                    policyVersion: Self.policyContractVersion,
+                    packageRevision: "external",
+                    provider: provider,
+                    providerInstanceId: providerInstanceId,
+                    model: model,
+                    capabilitySnapshotId: "external",
+                    decisionReason: "manual-agent-app-controller",
+                    admittedAt: admittedAt,
+                    lifecycleStatus: .accepted,
+                    deadlineAt: admittedAt.addingTimeInterval(externalLeaseDuration),
+                    permissionMode: permissionMode,
+                    delegationCapabilitySHA256: delegationCapabilitySHA256,
+                    ownerProcessID: ownerPID
+                )
+                try repository.appendAdmissionUnlocked(receipt)
+                return receipt
+            }
+        } catch let error as AgentOrchestrationAdmissionError {
+            throw error
+        } catch {
+            throw AgentOrchestrationAdmissionError.receiptPersistenceFailed(String(describing: error))
+        }
     }
 
     public func finalizeReceipt(
@@ -869,35 +1703,202 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         usage: AssistantTokenUsage? = nil,
         qualityOutcome: String? = nil
     ) throws {
-        receiptLifecycleLock.lock()
-        defer { receiptLifecycleLock.unlock() }
-        guard let receipt = try repository.receipt(runId: runId),
-              receipt.lifecycleStatus != .finalized else { return }
+        let reservationId = try repository.withReceiptMutation { () -> String? in
+            guard let receipt = try repository.receiptUnlocked(runId: runId) else {
+                return nil
+            }
+            return try finalizeReceiptUnlocked(
+                receipt,
+                status: status,
+                usage: usage,
+                qualityOutcome: qualityOutcome
+            )
+        }
+        if let reservationId { releaseReservation(reservationId) }
+    }
+
+    /// Finalizes only the exact telemetry child represented by the opaque
+    /// `subagent begin` handle and the parent orchestration scope inherited by
+    /// the same external owner process.
+    public func finalizeAuthenticatedExternalReceipt(
+        runId: AgentRunID,
+        status: AgentRunStatus,
+        parentRunId: AgentRunID,
+        parentThreadId: AgentThreadID,
+        parentCapability: String,
+        finalizationCapability: String,
+        ownerProcessID: Int32? = nil
+    ) throws {
+        switch status {
+        case .completed, .failed, .cancelled:
+            break
+        case .pending, .running, .interrupted:
+            throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                "external finalization status is not terminal"
+            )
+        }
+        guard AgentDelegationCapabilityTransport.isWellFormed(parentCapability),
+              AgentDelegationCapabilityTransport.isWellFormed(finalizationCapability) else {
+            throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                "external finalization capability is invalid"
+            )
+        }
+        let ownerPID = ownerProcessID ?? ProcessInfo.processInfo.processIdentifier
+        guard ownerPID > 0 else {
+            throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                "external finalization owner is invalid"
+            )
+        }
+
+        let reservationId = try repository.withReceiptMutation { () -> String? in
+            guard let receipt = try repository.receiptUnlocked(runId: runId),
+                  Self.isExternalReceipt(receipt),
+                  receipt.decisionReason == "external-controlled-child",
+                  receipt.nodeId.caseInsensitiveCompare("root") != .orderedSame,
+                  let parentReceiptId = receipt.parentReceiptId,
+                  receipt.lifecycleStatus == .accepted
+                    || receipt.lifecycleStatus == .finalized,
+                  receipt.delegationCapabilitySHA256 == nil,
+                  AgentDelegationCapability.matches(
+                    finalizationCapability,
+                    sha256Hex: receipt.finalizationCapabilitySHA256
+                  ) else {
+                throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                    "external finalization receipt is invalid"
+                )
+            }
+            guard receipt.ownerProcessID == ownerPID,
+                  processIsAlive(ownerPID) else {
+                throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                    "external finalization owner does not match"
+                )
+            }
+            guard let parent = try repository.receiptUnlocked(id: parentReceiptId),
+                  parent.runId == parentRunId,
+                  parent.threadId == parentThreadId,
+                  receipt.threadId == parentThreadId,
+                  AgentDelegationCapability.matches(
+                    parentCapability,
+                    sha256Hex: parent.delegationCapabilitySHA256
+                  ) else {
+                throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                    "external finalization parent context is invalid"
+                )
+            }
+            return try finalizeReceiptUnlocked(
+                receipt,
+                status: status,
+                usage: nil,
+                qualityOutcome: nil
+            )
+        }
+        if let reservationId { releaseReservation(reservationId) }
+    }
+
+    private func finalizeReceiptUnlocked(
+        _ receipt: AgentOrchestrationAdmissionReceipt,
+        status: AgentRunStatus,
+        usage: AssistantTokenUsage?,
+        qualityOutcome: String?
+    ) throws -> String? {
+        guard receipt.lifecycleStatus != .finalized else { return nil }
         let finalizedAt = now()
         let actualCostMicros = costEstimator?(receipt, usage)
         let finalized = receipt
             .updatingLifecycle(.finalized, finalRunStatus: status, at: finalizedAt)
             .updatingUsage(
                 usage,
-                latencyMilliseconds: Int64(max(0, finalizedAt.timeIntervalSince(receipt.admittedAt) * 1_000)),
+                latencyMilliseconds: Int64(
+                    max(0, finalizedAt.timeIntervalSince(receipt.admittedAt) * 1_000)
+                ),
                 actualCostMicros: actualCostMicros,
                 qualityOutcome: qualityOutcome
             )
-        try repository.update(finalized)
+        try repository.appendLifecycleUnlocked(finalized)
         let budgetOverrun = Self.budgetOutcome(
             budgetTokens: finalized.budgetTokens,
             actualTokens: finalized.actualTokens,
             budgetCostMicros: finalized.budgetCostMicros,
             actualCostMicros: finalized.actualCostMicros
         )
-        try repository.saveLedger(
+        try repository.appendLedgerUnlocked(
             AgentOrchestrationLedgerEntry(
                 receipt: finalized,
                 outcome: [status.rawValue, budgetOverrun].compactMap { $0 }.joined(separator: ":"),
                 finalizedAt: finalizedAt
             )
         )
-        if let reservationId = receipt.reservationId { releaseReservation(reservationId) }
+        return receipt.reservationId
+    }
+
+    /// Reconciles an authoritative provider snapshot that arrived after the
+    /// terminal receipt was written. The lifecycle remains finalized; only
+    /// positive usage/cost growth is persisted as a new append-only correction.
+    ///
+    /// - Returns: `true` when the receipt is already finalized (including when
+    ///   the incoming snapshot adds no growth), or `false` when normal terminal
+    ///   finalization still owns the receipt.
+    @discardableResult
+    public func enrichFinalizedReceiptUsage(
+        runId: AgentRunID,
+        usage: AssistantTokenUsage
+    ) throws -> Bool {
+        try repository.withReceiptMutation {
+            guard let receipt = try repository.receiptUnlocked(runId: runId),
+                  receipt.lifecycleStatus == .finalized else {
+                return false
+            }
+
+            let actualTokens = max(receipt.actualTokens ?? 0, max(0, usage.totalTokens))
+            let estimatedCost = costEstimator?(receipt, usage)
+            let actualCostMicros: Int?
+            if receipt.actualCostMicros != nil || estimatedCost != nil {
+                actualCostMicros = max(receipt.actualCostMicros ?? 0, estimatedCost ?? 0)
+            } else {
+                actualCostMicros = nil
+            }
+            guard actualTokens > (receipt.actualTokens ?? 0)
+                    || actualCostMicros != receipt.actualCostMicros else {
+                return true
+            }
+
+            let observedAt = now()
+            let updatedAt = observedAt > receipt.lifecycleUpdatedAt
+                ? observedAt
+                : receipt.lifecycleUpdatedAt.addingTimeInterval(0.001)
+            let enrichedUsage = AssistantTokenUsage(
+                totalTokens: actualTokens,
+                reportedCostMicros: actualCostMicros,
+                semantics: .cumulative
+            )
+            let enriched = receipt.updatingUsage(
+                enrichedUsage,
+                latencyMilliseconds: receipt.latencyMilliseconds ?? Int64(
+                    max(0, updatedAt.timeIntervalSince(receipt.admittedAt) * 1_000)
+                ),
+                actualCostMicros: actualCostMicros,
+                qualityOutcome: receipt.qualityOutcome,
+                lifecycleUpdatedAt: updatedAt
+            )
+            try repository.appendLifecycleUnlocked(enriched)
+            let budgetOverrun = Self.budgetOutcome(
+                budgetTokens: enriched.budgetTokens,
+                actualTokens: enriched.actualTokens,
+                budgetCostMicros: enriched.budgetCostMicros,
+                actualCostMicros: enriched.actualCostMicros
+            )
+            try repository.appendLedgerUnlocked(
+                AgentOrchestrationLedgerEntry(
+                    receipt: enriched,
+                    outcome: [
+                        enriched.finalRunStatus?.rawValue,
+                        budgetOverrun
+                    ].compactMap { $0 }.joined(separator: ":"),
+                    finalizedAt: updatedAt
+                )
+            )
+            return true
+        }
     }
 
     /// First-route quality evidence is content-free: the runtime records
@@ -931,17 +1932,22 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     }
 
     public func markReceiptUnknown(runId: AgentRunID) throws {
-        receiptLifecycleLock.lock()
-        defer { receiptLifecycleLock.unlock() }
-        guard let receipt = try repository.receipt(runId: runId),
-              receipt.lifecycleStatus == .accepted else { return }
-        let updatedAt = now()
-        let unknown = receipt.updatingLifecycle(.unknown, at: updatedAt)
-        try repository.update(unknown)
-        try repository.saveLedger(
-            AgentOrchestrationLedgerEntry(receipt: unknown, outcome: "unknown", finalizedAt: updatedAt)
-        )
-        if let reservationId = receipt.reservationId { releaseReservation(reservationId) }
+        let reservationId = try repository.withReceiptMutation { () -> String? in
+            guard let receipt = try repository.receiptUnlocked(runId: runId),
+                  receipt.lifecycleStatus == .accepted else { return nil }
+            let updatedAt = now()
+            let unknown = receipt.updatingLifecycle(.unknown, at: updatedAt)
+            try repository.appendLifecycleUnlocked(unknown)
+            try repository.appendLedgerUnlocked(
+                AgentOrchestrationLedgerEntry(
+                    receipt: unknown,
+                    outcome: "unknown",
+                    finalizedAt: updatedAt
+                )
+            )
+            return receipt.reservationId
+        }
+        if let reservationId { releaseReservation(reservationId) }
     }
 
     public func reconcileReceipts(
@@ -982,6 +1988,152 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     /// Newest `lifecycleUpdatedAt` first. Does not mutate ledger or lifecycle state.
     public func recentReceipts(limit: Int = 10_000) throws -> [AgentOrchestrationAdmissionReceipt] {
         try repository.receipts(limit: max(1, limit))
+    }
+
+    /// Bounded activity read used by the Subagents surface.
+    ///
+    /// Accepted receipts are not durable proof that work remains active.
+    /// Reconcile a dead owner, missing owner, expired deadline, or inactive
+    /// ancestor to persisted `unknown` before returning the snapshot so every
+    /// app process and subsequent launch observes the same honest state.
+    /// The same UI history bound limits every two-second poll; it intentionally
+    /// exceeds the older 500-row launch-reconciliation window.
+    public func activityReceipts(limit: Int = 10_000) throws -> [AgentOrchestrationAdmissionReceipt] {
+        let result = try repository.withReceiptMutation {
+            () -> (receipts: [AgentOrchestrationAdmissionReceipt], reservationIds: [String]) in
+            var receipts = try repository.receiptsUnlocked(limit: max(1, limit))
+            let current = now()
+            var reservationIds: [String] = []
+            var receiptByID = Dictionary(uniqueKeysWithValues: receipts.map { ($0.id, $0) })
+            var fetchedParentIDs: Set<UUID> = []
+            var missingParentIDs = Set(receipts.compactMap(\.parentReceiptId))
+                .subtracting(receiptByID.keys)
+
+            // Parent chains normally sit inside the same 10k activity window.
+            // If an older ancestor fell outside it, resolve all missing IDs in
+            // one repository scan per hierarchy level rather than issuing one
+            // lookup per child.
+            while !missingParentIDs.isEmpty {
+                fetchedParentIDs.formUnion(missingParentIDs)
+                let fetched = try repository.receiptsUnlocked(ids: missingParentIDs)
+                receiptByID.merge(fetched) { current, _ in current }
+                missingParentIDs = Set(fetched.values.compactMap(\.parentReceiptId))
+                    .subtracting(receiptByID.keys)
+                    .subtracting(fetchedParentIDs)
+            }
+
+            var activeMemo: [UUID: Bool] = [:]
+            func isEffectivelyActive(
+                _ receipt: AgentOrchestrationAdmissionReceipt,
+                visiting: Set<UUID> = []
+            ) -> Bool {
+                if let cached = activeMemo[receipt.id] { return cached }
+                guard receipt.lifecycleStatus == .accepted,
+                      !visiting.contains(receipt.id) else {
+                    activeMemo[receipt.id] = false
+                    return false
+                }
+                let ownsLiveExecution: Bool
+                if Self.isExternalReceipt(receipt) {
+                    ownsLiveExecution = effectiveExternalDeadline(receipt) > current
+                        && receipt.ownerProcessID.map(processIsAlive) == true
+                } else {
+                    ownsLiveExecution = receipt.deadlineAt.map { $0 > current } ?? true
+                }
+                guard ownsLiveExecution else {
+                    activeMemo[receipt.id] = false
+                    return false
+                }
+                guard let parentReceiptId = receipt.parentReceiptId else {
+                    activeMemo[receipt.id] = true
+                    return true
+                }
+                guard let parent = receiptByID[parentReceiptId] else {
+                    activeMemo[receipt.id] = false
+                    return false
+                }
+                var nextVisiting = visiting
+                nextVisiting.insert(receipt.id)
+                let active = isEffectivelyActive(parent, visiting: nextVisiting)
+                activeMemo[receipt.id] = active
+                return active
+            }
+
+            for index in receipts.indices {
+                let receipt = receipts[index]
+                guard receipt.lifecycleStatus == .accepted,
+                      !isEffectivelyActive(receipt) else { continue }
+
+                let updatedAt = current > receipt.lifecycleUpdatedAt
+                    ? current
+                    : receipt.lifecycleUpdatedAt.addingTimeInterval(0.001)
+                let unknown = receipt.updatingLifecycle(.unknown, at: updatedAt)
+                try repository.appendLifecycleUnlocked(unknown)
+                try repository.appendLedgerUnlocked(
+                    AgentOrchestrationLedgerEntry(
+                        receipt: unknown,
+                        outcome: "unknown",
+                        finalizedAt: updatedAt
+                    )
+                )
+                receipts[index] = unknown
+                if let reservationId = receipt.reservationId {
+                    reservationIds.append(reservationId)
+                }
+            }
+
+            receipts.sort { $0.lifecycleUpdatedAt > $1.lifecycleUpdatedAt }
+            return (receipts, reservationIds)
+        }
+        for reservationId in result.reservationIds {
+            releaseReservation(reservationId)
+        }
+        return result.receipts
+    }
+
+    /// Direct, untruncated lookup for host-side nested-run validation.
+    ///
+    /// External receipts are active only while accepted, within their lease,
+    /// and owned by a live process. Auto receipts retain their explicit deadline
+    /// semantics and do not require an external process owner.
+    public func activeReceipt(
+        runId: AgentRunID,
+        threadId: AgentThreadID
+    ) throws -> AgentOrchestrationAdmissionReceipt? {
+        try repository.withReceiptMutation {
+            guard let receipt = try repository.receiptUnlocked(runId: runId),
+                  receipt.threadId == threadId else {
+                return nil
+            }
+            do {
+                let current = now()
+                try validateActiveReceipt(receipt, at: current, role: "receipt")
+                try validateActiveAncestors(of: receipt, at: current)
+                return receipt
+            } catch let error as AgentOrchestrationAdmissionError {
+                if case .invalidChildAdmission = error {
+                    return nil
+                }
+                throw error
+            }
+        }
+    }
+
+    /// Admission-only lookup that proves possession of the exact active
+    /// receipt. Legacy and telemetry-only receipts have no digest and fail.
+    public func activeReceipt(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        delegationCapability: String
+    ) throws -> AgentOrchestrationAdmissionReceipt? {
+        guard let receipt = try activeReceipt(runId: runId, threadId: threadId),
+              AgentDelegationCapability.matches(
+                delegationCapability,
+                sha256Hex: receipt.delegationCapabilitySHA256
+              ) else {
+            return nil
+        }
+        return receipt
     }
 
     public func route(

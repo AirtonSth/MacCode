@@ -9,6 +9,28 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         super.tearDown()
     }
 
+    func test_productionCodexLaunchForwardsRequestedRunAsIdentity() throws {
+        // WHY: the persisted thread user must be the OS identity of the real
+        // app-server process, including ownership tagging and foreign-UID reap.
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let adapter = try String(
+            contentsOf: root.appendingPathComponent("Sources/AgentRuntime/CodexAppServerAdapter.swift"),
+            encoding: .utf8
+        )
+        let client = try String(
+            contentsOf: root.appendingPathComponent("Sources/AgentRuntime/CodexAppServerClient.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(adapter.contains("runAsUser: request.runAsUser"))
+        XCTAssertTrue(client.contains("runAsUser: runAsUser"))
+        XCTAssertTrue(client.contains("foreignUserLaunch: foreignUserUID != nil"))
+        XCTAssertTrue(client.contains("foreignUserUID: foreignUserUID"))
+    }
+
     func test_turnStartCensus_preservesCodexWireBytesAndDoesNotInventTokens() async throws {
         let script = try makeFakeAppServerPeer()
         let store = TokenSaverCensusStore()

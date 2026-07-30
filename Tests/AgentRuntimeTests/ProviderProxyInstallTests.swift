@@ -84,14 +84,14 @@ final class ProviderProxyInstallTests: XCTestCase {
             [.posixPermissions: 0o755],
             ofItemAtPath: replacement.path
         )
-        XCTAssertEqual(
+        XCTAssertNil(
             try installer.installAgentAppMiddleware(serviceBinaryURL: replacement),
-            installed
+            "a same-basename target is not proof that RemoteCode owns the existing alias"
         )
         XCTAssertEqual(
             try FileManager.default.destinationOfSymbolicLink(atPath: installed.path),
-            replacement.path,
-            "an owned alias must follow the current app bundle after replacement"
+            binary.path,
+            "an alias whose canonical target differs from the expected service must be preserved"
         )
     }
 
@@ -158,6 +158,49 @@ final class ProviderProxyInstallTests: XCTestCase {
         XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: userFile.path))
     }
 
+    func test_providerProxyPreservesAndDoesNotAdvertiseForeignSameBasenameSymlink() throws {
+        // WHY: executable basename is attacker-controlled and is not ownership
+        // evidence for installing, advertising, or removing a provider proxy.
+        let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let binary = try fakeServiceBinary(in: home)
+        let realBins = try fakeProviderBins(in: home, names: ["grok"])
+        let foreign = home.appendingPathComponent("foreign/RemoteCodeDistillService")
+        try FileManager.default.createDirectory(
+            at: foreign.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("foreign".utf8).write(to: foreign)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: foreign.path
+        )
+
+        let link = home.appendingPathComponent(".remote-code/bin/grok")
+        try FileManager.default.createDirectory(
+            at: link.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: foreign)
+
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let installed = try installer.installProviderProxies(
+            serviceBinaryURL: binary,
+            searchDirectoriesOverride: [realBins.path]
+        )
+        XCTAssertFalse(installed.contains("grok"))
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: link.path),
+            foreign.path
+        )
+        XCTAssertFalse(
+            try installer.uninstallProviderProxies(serviceBinaryURL: binary).contains("grok")
+        )
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: link.path),
+            foreign.path
+        )
+    }
+
     func test_uninstallProviderProxies_removesOnlyOurSymlinks() throws {
         let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
         let binary = try fakeServiceBinary(in: home)
@@ -171,7 +214,7 @@ final class ProviderProxyInstallTests: XCTestCase {
         let userFile = home.appendingPathComponent(".remote-code/bin/user-tool")
         try Data("keep\n".utf8).write(to: userFile)
 
-        let removed = try installer.uninstallProviderProxies()
+        let removed = try installer.uninstallProviderProxies(serviceBinaryURL: binary)
         XCTAssertEqual(Set(removed), Set(ProviderProxyCatalog.providers))
         for name in ProviderProxyCatalog.providers {
             XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(
@@ -195,7 +238,7 @@ final class ProviderProxyInstallTests: XCTestCase {
         let lsLink = home.appendingPathComponent(".remote-code/bin/ls")
         try FileManager.default.createSymbolicLink(at: lsLink, withDestinationURL: binary)
 
-        _ = try installer.uninstallCommandWrappers()
+        _ = try installer.uninstallCommandWrappers(serviceBinaryURL: binary)
         XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: lsLink.path))
         XCTAssertEqual(
             try FileManager.default.destinationOfSymbolicLink(

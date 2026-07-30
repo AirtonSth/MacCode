@@ -39,6 +39,83 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(client.runningProcess.arguments, ["agent", "--no-leader", "stdio"])
     }
 
+    func test_productionGrokLaunchForwardsRequestedRunAsIdentity() throws {
+        // WHY: persisting runAsUser on the thread is not enough; the production
+        // adapter and client must forward it into the universal process launcher.
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let adapter = try String(
+            contentsOf: root.appendingPathComponent("Sources/AgentRuntime/GrokACPAdapter.swift"),
+            encoding: .utf8
+        )
+        let client = try String(
+            contentsOf: root.appendingPathComponent("Sources/AgentRuntime/GrokACPClient.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(adapter.contains("runAsUser: request.runAsUser"))
+        XCTAssertTrue(client.contains("runAsUser: runAsUser"))
+        XCTAssertTrue(client.contains("foreignUserLaunch: foreignUserUID != nil"))
+        XCTAssertTrue(client.contains("foreignUserUID: foreignUserUID"))
+    }
+
+    func test_samGrokWorkerProfileLaunchArgumentsPreserveEveryRawGuard() throws {
+        // WHY: promoting the raw worker into ACP must not weaken its security
+        // contract. In particular, ACP acceptEdits does not replace Grok's
+        // provider-side --always-approve behavior for non-edit tools.
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .grok,
+            model: "grok-4.5",
+            cwd: "/tmp",
+            prompt: "inspect",
+            permissionMode: .autoAcceptEdits,
+            reasoningEffort: .max,
+            environment: [
+                AgentAppRuntimeProfile.environmentKey:
+                    AgentAppRuntimeProfile.samGrokWorkerV1.rawValue
+            ]
+        )
+
+        XCTAssertEqual(
+            try GrokACPClient.launchArguments(for: request),
+            [
+                "--model", "grok-4.5",
+                "--reasoning-effort", "max",
+                "--no-memory",
+                "--no-subagents",
+                "--disallowed-tools", "Agent",
+                "--always-approve",
+                "--no-auto-update",
+                "--sandbox", "workspace",
+                "agent", "--no-leader", "stdio"
+            ]
+        )
+    }
+
+    func test_samGrokWorkerProfileFailsClosedForProviderSessionResume() {
+        // WHY: the promoted raw contract is a fresh one-shot execution. It
+        // cannot silently inherit a previous provider session's state.
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .grok,
+            model: "grok-4.5",
+            cwd: "/tmp",
+            prompt: "inspect",
+            providerThreadId: "existing-provider-session",
+            permissionMode: .autoAcceptEdits,
+            reasoningEffort: .high,
+            environment: [
+                AgentAppRuntimeProfile.environmentKey:
+                    AgentAppRuntimeProfile.samGrokWorkerV1.rawValue
+            ]
+        )
+
+        XCTAssertThrowsError(try GrokACPClient.launchArguments(for: request))
+    }
+
     func test_initializeAdvertisesOnlyImplementedClientCapabilities() {
         let params = GrokACPClient.initializeParams(clientVersion: "test")
         XCTAssertEqual(params["protocolVersion"] as? Int, 1)

@@ -391,6 +391,7 @@ public final class GrokACPClient: @unchecked Sendable {
     private var stderrBuffer = Data()
     private var stopped = false
     private let tokenSaverCensusAllowed: Bool
+    private let foreignUserUID: uid_t?
     private static let stderrLimit = 8_192
 
     public var notificationHandler: NotificationHandler?
@@ -404,10 +405,43 @@ public final class GrokACPClient: @unchecked Sendable {
     /// Unsupported shared-leader mode must fail through the existing error path.
     public static let launchArguments = ["agent", "--no-leader", "stdio"]
 
+    /// Exact process argv for the closed sam-grok-worker runtime profile.
+    /// Every raw guard is enforced by the Grok process itself before ACP starts.
+    static func launchArguments(for request: AgentRunRequest) throws -> [String] {
+        guard request.environment[AgentAppRuntimeProfile.environmentKey]
+                == AgentAppRuntimeProfile.samGrokWorkerV1.rawValue else {
+            return launchArguments
+        }
+        let model = request.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard request.provider == .grok,
+              model == "grok-4.5",
+              request.providerThreadId == nil,
+              request.permissionMode == .autoAcceptEdits,
+              let effort = request.reasoningEffort,
+              [.low, .medium, .high, .xhigh, .max].contains(effort) else {
+            throw GrokACPError.unsupported(
+                "invalid sam-grok-worker Agent App runtime profile"
+            )
+        }
+        return [
+            "--model", model,
+            "--reasoning-effort", effort.rawValue,
+            "--no-memory",
+            "--no-subagents",
+            "--disallowed-tools", "Agent",
+            "--always-approve",
+            "--no-auto-update",
+            "--sandbox", "workspace"
+        ] + launchArguments
+    }
+
     public init(
         binary: String = "grok",
         cwd: String,
         environment: [String: String] = [:],
+        launchArguments: [String] = GrokACPClient.launchArguments,
+        runAsUser: AgentRunAsUser? = nil,
+        askpassPath: String? = nil,
         tagProcess: Bool = true,
         notificationHandler: NotificationHandler? = nil,
         serverRequestHandler: ServerRequestHandler? = nil,
@@ -418,14 +452,17 @@ public final class GrokACPClient: @unchecked Sendable {
         self.notificationHandler = notificationHandler
         self.serverRequestHandler = serverRequestHandler
         self.tokenSaverCensusAllowed = tokenSaverCensusAllowed
+        self.foreignUserUID = runAsUser.flatMap { $0.uid == getuid() ? nil : $0.uid }
         parseQueue.setSpecific(key: parseQueueKey, value: 1)
         do {
             self.process = try ProviderSubprocessLauncher.makeProcess(
                 provider: .grok,
                 executablePath: path,
-                arguments: Self.launchArguments,
+                arguments: launchArguments,
                 currentDirectory: cwd,
-                environment: environment
+                environment: environment,
+                runAsUser: runAsUser,
+                askpassPath: askpassPath
             )
         } catch {
             throw GrokACPError.spawnFailed(error.localizedDescription)
@@ -465,7 +502,13 @@ public final class GrokACPClient: @unchecked Sendable {
         }
         do {
             try process.run()
-            if tagProcess { try ProcessSpawnTagger.tagProcess(process, provider: .grok) }
+            if tagProcess {
+                try ProcessSpawnTagger.tagProcess(
+                    process,
+                    provider: .grok,
+                    foreignUserLaunch: foreignUserUID != nil
+                )
+            }
         }
         catch { throw GrokACPError.spawnFailed(error.localizedDescription) }
     }
@@ -544,7 +587,12 @@ public final class GrokACPClient: @unchecked Sendable {
         guard shouldStop else { return }
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
         stderrPipe.fileHandleForReading.readabilityHandler = nil
-        if process.isRunning { ProcessTerminator.terminateTree(process) }
+        if process.isRunning {
+            ProcessTerminator.terminateTree(
+                process,
+                foreignUserUID: foreignUserUID
+            )
+        }
     }
 
     public func stopImmediatelyForAppTermination() {
@@ -555,7 +603,12 @@ public final class GrokACPClient: @unchecked Sendable {
         guard shouldStop else { return }
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
         stderrPipe.fileHandleForReading.readabilityHandler = nil
-        if process.isRunning { ProcessTerminator.terminateTreeImmediately(process) }
+        if process.isRunning {
+            ProcessTerminator.terminateTreeImmediately(
+                process,
+                foreignUserUID: foreignUserUID
+            )
+        }
     }
 
     public static func promptBlocks(for request: AgentRunRequest, capabilities: GrokACPInitializeResult) throws -> [JSONObject] {

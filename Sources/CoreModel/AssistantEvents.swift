@@ -219,6 +219,14 @@ public struct AssistantPendingCallbacksSnapshot: Codable, Sendable, Equatable {
     }
 }
 
+public enum AssistantTokenUsageSemantics: String, Codable, Sendable {
+    /// This event is an independent provider charge and must be added to earlier
+    /// incremental events from the same RemoteCode run.
+    case incremental
+    /// This event replaces an earlier snapshot for the same RemoteCode run.
+    case cumulative
+}
+
 public struct AssistantTokenUsage: Codable, Sendable, Equatable {
     public var inputTokens: Int
     public var outputTokens: Int
@@ -241,6 +249,10 @@ public struct AssistantTokenUsage: Codable, Sendable, Equatable {
     /// (e.g. Claude/Grok `modelUsage` cache re-reads summed across the session).
     /// nil when the payload is only cumulative, or when older rows omit the key.
     public var contextTokens: Int?
+    /// Provider accounting contract for this event. Optional so persisted
+    /// timelines written before the field existed remain decodable. Callers that
+    /// do not specify a value retain the historical cumulative-snapshot contract.
+    public var semantics: AssistantTokenUsageSemantics?
 
     public init(
         inputTokens: Int = 0,
@@ -252,7 +264,8 @@ public struct AssistantTokenUsage: Codable, Sendable, Equatable {
         cacheCreationInputTokens: Int? = nil,
         cacheReadInputTokens: Int? = nil,
         reportedCostMicros: Int? = nil,
-        contextTokens: Int? = nil
+        contextTokens: Int? = nil,
+        semantics: AssistantTokenUsageSemantics? = .cumulative
     ) {
         self.inputTokens = inputTokens
         self.outputTokens = outputTokens
@@ -264,6 +277,11 @@ public struct AssistantTokenUsage: Codable, Sendable, Equatable {
         self.cacheReadInputTokens = cacheReadInputTokens
         self.reportedCostMicros = reportedCostMicros
         self.contextTokens = contextTokens
+        self.semantics = semantics
+    }
+
+    public var resolvedSemantics: AssistantTokenUsageSemantics {
+        semantics ?? .cumulative
     }
 
     public var billedInputTokenUnits: Double {
@@ -301,7 +319,8 @@ public struct AssistantTokenUsage: Codable, Sendable, Equatable {
             cacheCreationInputTokens: billing.cacheCreationInputTokens ?? other.cacheCreationInputTokens,
             cacheReadInputTokens: billing.cacheReadInputTokens ?? other.cacheReadInputTokens,
             reportedCostMicros: billing.reportedCostMicros ?? other.reportedCostMicros,
-            contextTokens: incoming.contextTokens ?? existing.contextTokens
+            contextTokens: incoming.contextTokens ?? existing.contextTokens,
+            semantics: billing.semantics ?? other.semantics
         )
     }
 }

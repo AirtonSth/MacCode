@@ -97,7 +97,7 @@ final class ManagedDistillCLIInstallTests: XCTestCase {
         // Idempotent: a second install keeps the same links, no throw.
         XCTAssertEqual(Set(try installer.installCommandWrappers(serviceBinaryURL: binary)), Set(installed))
 
-        let removed = try installer.uninstallCommandWrappers()
+        let removed = try installer.uninstallCommandWrappers(serviceBinaryURL: binary)
         XCTAssertTrue(removed.contains("ls"))
         XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: lsLink.path))
     }

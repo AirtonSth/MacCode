@@ -54,7 +54,11 @@ final class CommandWrapPolicyTests: XCTestCase {
     }
 
     func test_passthroughReason_allowsReadOnlySubcommandsAndRejectsMutatingOnes() {
-        XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "git", args: ["diff"], environment: noEnv))
+        XCTAssertEqual(
+            CommandWrapPolicy.passthroughReason(command: "git", args: ["diff"], environment: noEnv),
+            "exact_patch_output"
+        )
+        XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "git", args: ["diff", "--stat"], environment: noEnv))
         XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "git", args: ["log", "--oneline"], environment: noEnv))
         XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "git", args: ["status"], environment: noEnv))
         XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "git", args: ["branch", "--show-current"], environment: noEnv))
@@ -67,14 +71,66 @@ final class CommandWrapPolicyTests: XCTestCase {
         XCTAssertEqual(CommandWrapPolicy.passthroughReason(command: "git", args: ["branch", "-D", "feature"], environment: noEnv), "mutating_subcommand")
         XCTAssertEqual(CommandWrapPolicy.passthroughReason(command: "git", args: ["remote", "add", "origin", "url"], environment: noEnv), "mutating_subcommand")
 
-        XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "gh", args: ["pr", "diff", "12"], environment: noEnv))
+        XCTAssertEqual(
+            CommandWrapPolicy.passthroughReason(command: "gh", args: ["pr", "diff", "12"], environment: noEnv),
+            "exact_patch_output"
+        )
+        XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "gh", args: ["pr", "diff", "12", "--name-only"], environment: noEnv))
         XCTAssertEqual(CommandWrapPolicy.passthroughReason(command: "gh", args: ["pr", "merge", "12"], environment: noEnv), "mutating_subcommand")
-        XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "glab", args: ["mr", "diff", "12"], environment: noEnv))
+        XCTAssertEqual(
+            CommandWrapPolicy.passthroughReason(command: "glab", args: ["mr", "diff", "12"], environment: noEnv),
+            "exact_patch_output"
+        )
+        XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "glab", args: ["mr", "diff", "12", "--name-status"], environment: noEnv))
         XCTAssertEqual(CommandWrapPolicy.passthroughReason(command: "glab", args: ["mr", "merge", "12"], environment: noEnv), "mutating_subcommand")
 
         XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "swift", args: ["test"], environment: noEnv))
         XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "xcodebuild", args: ["test"], environment: noEnv))
         XCTAssertEqual(CommandWrapPolicy.passthroughReason(command: "swift", args: ["package", "reset"], environment: noEnv), "mutating_subcommand")
+    }
+
+    func test_fullPatchInvocationsStayExactUnlessExplicitlySummaryOnly() {
+        let summaryFlags = ["--stat", "--shortstat", "--numstat", "--name-only", "--name-status"]
+        for flag in summaryFlags {
+            XCTAssertNil(
+                CommandWrapPolicy.passthroughReason(
+                    command: "git",
+                    args: ["diff", "HEAD~1", flag],
+                    environment: noEnv
+                ),
+                "git diff \(flag) is explicit summary output and may remain eligible"
+            )
+        }
+        XCTAssertNil(
+            CommandWrapPolicy.passthroughReason(
+                command: "/usr/bin/git",
+                args: ["diff", "--stat=120", "HEAD"],
+                environment: noEnv
+            )
+        )
+
+        let exactInvocations: [(String, [String])] = [
+            ("git", ["diff"]),
+            ("git", ["diff", "HEAD~1", "HEAD"]),
+            ("git", ["diff", "--cached"]),
+            ("git", ["diff", "--stat", "--patch"]),
+            ("git", ["diff", "--name-only", "-U5"]),
+            ("gh", ["pr", "diff", "42"]),
+            ("gh", ["pr", "diff", "42", "--name-only", "--patch"]),
+            ("glab", ["mr", "diff", "42"]),
+            ("glab", ["mr", "diff", "42", "--stat", "--raw"]),
+        ]
+        for (command, args) in exactInvocations {
+            XCTAssertEqual(
+                CommandWrapPolicy.passthroughReason(
+                    command: command,
+                    args: args,
+                    environment: noEnv
+                ),
+                "exact_patch_output",
+                "\(command) \(args.joined(separator: " ")) must stay byte-exact"
+            )
+        }
     }
 
     func test_shouldCompress_thresholdsAndEnvOverrides() {

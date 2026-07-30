@@ -5,6 +5,142 @@ import Darwin
 import Foundation
 import Persistence
 
+/// Authoritative, fail-closed admission for paid `/v1/distill` work.
+///
+/// Inherited hints and a previously installed CLI symlink are routing aids, not
+/// authority: both can outlive a toggle. The current app setting and the live
+/// sidecar state-file lease are re-read for every request. Removing the lease is
+/// the first step of controller teardown, so a process that already loaded stale
+/// state cannot submit another compression request while the sidecar exits.
+private final class LiveTokenSaverDistillAdmission: @unchecked Sendable {
+    private struct StateLease: Decodable, Equatable {
+        let baseURL: String
+        let authToken: String
+        let pid: Int32
+
+        enum CodingKeys: String, CodingKey {
+            case baseURL = "base_url"
+            case authToken = "auth_token"
+            case pid
+        }
+    }
+
+    private let stateURL: URL
+    private let expectedBaseURL: String?
+    private let expectedAuthToken: String
+    private let expectedPID: Int32
+    private let settingsStore: SettingsStore
+    private let settingsRepository: SettingsRepository
+
+    init?(state: ManagedDistillCLI.State?, statePath: String?) {
+        guard let state,
+              let statePath,
+              !statePath.isEmpty else {
+            return nil
+        }
+        let stateURL = URL(fileURLWithPath: statePath).standardizedFileURL
+        guard stateURL.lastPathComponent == "DistillCLIState.json",
+              stateURL.deletingLastPathComponent().lastPathComponent == "Distill",
+              Self.isOwnedRegularFile(stateURL),
+              let lease = Self.readLease(stateURL),
+              lease.baseURL == state.baseURL,
+              lease.authToken == state.authToken,
+              lease.pid > 1 else {
+            return nil
+        }
+
+        let appSupport = stateURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        guard let stores = Self.makeSettingsStores(appSupport: appSupport) else {
+            return nil
+        }
+
+        self.stateURL = stateURL
+        self.expectedBaseURL = lease.baseURL
+        self.expectedAuthToken = lease.authToken
+        self.expectedPID = lease.pid
+        self.settingsStore = stores.store
+        self.settingsRepository = stores.repository
+    }
+
+    /// Server-side gate. The ready-state file is written by the owning app only
+    /// after startup, so this initializer validates the DB now and the lease on
+    /// each later request.
+    init?(appSupportDirectory: String, authToken: String, pid: Int32) {
+        let appSupport = URL(fileURLWithPath: appSupportDirectory).standardizedFileURL
+        guard !authToken.isEmpty,
+              pid > 1,
+              let stores = Self.makeSettingsStores(appSupport: appSupport) else {
+            return nil
+        }
+        self.stateURL = appSupport
+            .appendingPathComponent("Distill", isDirectory: true)
+            .appendingPathComponent("DistillCLIState.json")
+        self.expectedBaseURL = nil
+        self.expectedAuthToken = authToken
+        self.expectedPID = pid
+        self.settingsStore = stores.store
+        self.settingsRepository = stores.repository
+    }
+
+    func isAdmitted() -> Bool {
+        guard Self.isOwnedRegularFile(stateURL),
+              let lease = Self.readLease(stateURL),
+              lease.authToken == expectedAuthToken,
+              lease.pid == expectedPID,
+              expectedBaseURL.map({ lease.baseURL == $0 }) ?? true,
+              Self.processIsAlive(expectedPID) else {
+            return false
+        }
+        // `reload` bypasses the SettingsStore instance cache. Read errors
+        // degrade to AppSettings defaults, whose Token Saver gate is OFF.
+        return settingsStore.reload().tokenSaverEnabled && hasActiveSubscription()
+    }
+
+    private static func readLease(_ url: URL) -> StateLease? {
+        guard let data = try? Data(contentsOf: url, options: [.uncached]) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(StateLease.self, from: data)
+    }
+
+    private static func makeSettingsStores(
+        appSupport: URL
+    ) -> (store: SettingsStore, repository: SettingsRepository)? {
+        let databaseURL = appSupport.appendingPathComponent("remotecode.sqlite")
+        guard isOwnedRegularFile(databaseURL),
+              let db = try? SQLiteDB(path: databaseURL.path) else {
+            return nil
+        }
+        return (SettingsStore(db: db), SettingsRepository(db: db))
+    }
+
+    private func hasActiveSubscription() -> Bool {
+        guard let json = try? settingsRepository.get("private.account.session"),
+              let data = json.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let user = object["user"] as? [String: Any],
+              user["subscribed"] as? Bool == true else {
+            return false
+        }
+        return true
+    }
+
+    private static func isOwnedRegularFile(_ url: URL) -> Bool {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let owner = attributes[.ownerAccountID] as? NSNumber else {
+            return false
+        }
+        return owner.uint32Value == getuid()
+    }
+
+    private static func processIsAlive(_ pid: Int32) -> Bool {
+        Darwin.kill(pid, 0) == 0 || errno == EPERM
+    }
+}
+
 @main
 struct RemoteCodeDistillServiceMain {
     static func main() async {
@@ -125,6 +261,11 @@ struct RemoteCodeDistillServiceMain {
             // land in token_saver_audit_events for operator visibility.
             let auditEventsRepo = TokenSaverAuditEventRepository(db: db)
             let eventWriter = DistillSidecarEventWriter()
+            let liveDistillAdmission = LiveTokenSaverDistillAdmission(
+                appSupportDirectory: configuration.appSupportDirectory,
+                authToken: configuration.authToken,
+                pid: getpid()
+            )
             // Shared fail-open persist for DistillSavingsRecord (success + forfeit).
             // Persistence errors must never block or crash the HTTP response path.
             let persistSavings: DistillHTTPServer.SavingsRecordHandler = { record in
@@ -176,7 +317,8 @@ struct RemoteCodeDistillServiceMain {
                     } catch {
                         FileHandle.standardError.write(Data("RemoteCodeDistillService audit event failed: \(error)\n".utf8))
                     }
-                }
+                },
+                distillAdmission: { liveDistillAdmission?.isAdmitted() == true }
             )
             let ready = try await server.start()
             // Pay the model cold-start NOW, while /readyz still reports 503, so the
@@ -216,14 +358,21 @@ struct RemoteCodeDistillServiceMain {
         )
         let maxChars = Int(env["REMOTE_CODE_DISTILL_MAX_OUTPUT_CHARS"] ?? "") ?? 4_000
         let session = createConfiguredURLSession()
+        let loadedState = loadCLIStateSnapshot()
+        let admission = LiveTokenSaverDistillAdmission(
+            state: loadedState?.state,
+            statePath: loadedState?.path
+        )
         let cli = ManagedDistillCLI(
             arguments: arguments,
             stdin: stdin,
-            state: loadCLIState(),
+            state: loadedState?.state,
             provider: provider,
             recoveryContext: recoveryContext,
-            maxOutputCharacters: maxChars
+            maxOutputCharacters: maxChars,
+            distillAdmission: { admission?.isAdmitted() == true }
         ) { request in
+            guard admission?.isAdmitted() == true else { return nil }
             do {
                 var scopedRequest = request
                 applyRecoveryHeaders(to: &scopedRequest, environment: env)
@@ -262,32 +411,61 @@ struct RemoteCodeDistillServiceMain {
             switch operation {
             case "begin":
                 let nodeId = try argument(named: "--node", in: arguments)
-                guard let threadUUID = UUID(
-                    uuidString: env["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"] ?? env["RC_TOKEN_SAVER_THREAD_ID"] ?? ""
-                ),
-                      let provider = AgentProvider(rawValue: env["REMOTE_CODE_AGENT_PROVIDER"] ?? "") else {
+                guard let scope = RemoteCodeSubagentTelemetryScope(environment: env),
+                      let provider = AgentProvider(rawValue: env["REMOTE_CODE_AGENT_PROVIDER"] ?? ""),
+                      let parentRunId = scope.parentRunId,
+                      let parentThreadId = scope.parentThreadId,
+                      let parentCapability = scope.parentCapability else {
                     throw TelemetryError.missingScope
                 }
-                let parentRunId: AgentRunID? = UUID(
-                    uuidString: env["RC_TOKEN_SAVER_ROOT_RUN_ID"] ?? env["RC_TOKEN_SAVER_ATTEMPT_ID"] ?? ""
-                )
-                    .map { AgentRunID($0) }
-                let child = try runtime.recordExternalChild(
+                let finalizationCapability = AgentDelegationCapability.issue()
+                let child = try runtime.recordAuthenticatedTelemetryChild(
                     runId: AgentRunID(),
-                    threadId: AgentThreadID(threadUUID),
+                    threadId: scope.threadId,
                     provider: provider,
                     providerInstanceId: env["REMOTE_CODE_PROVIDER_INSTANCE_ID"] ?? provider.rawValue,
                     model: env["REMOTE_CODE_AGENT_MODEL"] ?? "unknown",
                     nodeId: nodeId,
-                    parentRunId: parentRunId
+                    parentRunId: parentRunId,
+                    parentThreadId: parentThreadId,
+                    parentCapability: parentCapability,
+                    finalizationCapability: finalizationCapability,
+                    ownerProcessID: getppid() > 1 ? getppid() : getpid()
                 )
-                print(child.runId?.value.uuidString ?? child.id.uuidString)
+                guard let childRunId = child.runId,
+                      let handle = AgentExternalReceiptHandle.encode(
+                        runId: childRunId,
+                        finalizationCapability: finalizationCapability
+                      ) else {
+                    throw TelemetryError.invalidReceipt
+                }
+                print(handle)
             case "end":
-                guard let runUUID = UUID(uuidString: try argument(named: "--run-id", in: arguments)) else {
+                guard let handle = AgentExternalReceiptHandle.decode(
+                    try argument(named: "--run-id", in: arguments)
+                ) else {
                     throw TelemetryError.usage
                 }
-                let status = AgentRunStatus(rawValue: try argument(named: "--status", in: arguments)) ?? .failed
-                try runtime.finalizeReceipt(runId: AgentRunID(runUUID), status: status)
+                guard let scope = RemoteCodeSubagentTelemetryScope(environment: env),
+                      let parentRunId = scope.parentRunId,
+                      let parentThreadId = scope.parentThreadId,
+                      let parentCapability = scope.parentCapability else {
+                    throw TelemetryError.missingScope
+                }
+                guard let status = AgentRunStatus(
+                    rawValue: try argument(named: "--status", in: arguments)
+                ), [.completed, .failed, .cancelled].contains(status) else {
+                    throw TelemetryError.usage
+                }
+                try runtime.finalizeAuthenticatedExternalReceipt(
+                    runId: handle.runId,
+                    status: status,
+                    parentRunId: parentRunId,
+                    parentThreadId: parentThreadId,
+                    parentCapability: parentCapability,
+                    finalizationCapability: handle.finalizationCapability,
+                    ownerProcessID: getppid() > 1 ? getppid() : getpid()
+                )
             default:
                 throw TelemetryError.usage
             }
@@ -308,6 +486,7 @@ struct RemoteCodeDistillServiceMain {
     private enum TelemetryError: Error {
         case usage
         case missingScope
+        case invalidReceipt
     }
 
     /// Transparent command-wrapper mode (RTK port). Runs the real command, and when this wrapper
@@ -325,18 +504,25 @@ struct RemoteCodeDistillServiceMain {
                 recoveryProvider: recoveryContext?.provider
             )
             let maxChars = Int(env["REMOTE_CODE_DISTILL_MAX_OUTPUT_CHARS"] ?? "") ?? 4_000
+            let loadedState = loadCLIStateSnapshot()
+            let admission = LiveTokenSaverDistillAdmission(
+                state: loadedState?.state,
+                statePath: loadedState?.path
+            )
             // Per-command extraction query: nil (no question → deterministic router) for
             // search/listings; a neutral extractive query for cat/sed so the service routes to its
             // BERT lane (verbatim line selection) instead of the misfiring intent extractor.
             let cli = ManagedDistillCLI(
                 arguments: query.map { [$0] } ?? [],
                 stdin: captured,
-                state: loadCLIState(),
+                state: loadedState?.state,
                 provider: provider,
                 recoveryContext: recoveryContext,
                 maxOutputCharacters: maxChars,
-                reversibleStoreMinBytes: storeFloorBytes
+                reversibleStoreMinBytes: storeFloorBytes,
+                distillAdmission: { admission?.isAdmitted() == true }
             ) { request in
+                guard admission?.isAdmitted() == true else { return nil }
                 do {
                     var scopedRequest = request
                     applyRecoveryHeaders(to: &scopedRequest, environment: env)
@@ -359,7 +545,12 @@ struct RemoteCodeDistillServiceMain {
     /// Exposes retrieve/search/stats plus gated rc_compress through the local sidecar.
     /// Fail-soft: an unavailable service yields an MCP error result, never a crash.
     private static func runMCP() async {
-        let state = loadCLIState()
+        let loadedState = loadCLIStateSnapshot()
+        let state = loadedState?.state
+        let admission = LiveTokenSaverDistillAdmission(
+            state: state,
+            statePath: loadedState?.path
+        )
         let session = createConfiguredURLSession()
         let environment = ProcessInfo.processInfo.environment
         let server = ManagedRetrieveMCP(
@@ -388,6 +579,7 @@ struct RemoteCodeDistillServiceMain {
                 return try? JSONDecoder().decode(DistillStatsSnapshot.self, from: data)
             },
             compress: { distillRequest in
+                guard admission?.isAdmitted() == true else { return nil }
                 guard let state, let url = URL(string: state.baseURL + "/v1/distill") else { return nil }
                 var request = URLRequest(url: url)
                 request.httpMethod = "POST"
@@ -401,6 +593,7 @@ struct RemoteCodeDistillServiceMain {
                     request.setValue(distillRequest.id.uuidString.lowercased(), forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
                     request.setValue(ManagedDistillCLI.recoveryOperationID(kind: "distill", canonicalPayload: body), forHTTPHeaderField: "X-RemoteCode-Operation-ID")
                 }
+                guard admission?.isAdmitted() == true else { return nil }
                 guard let (data, response) = try? await session.data(for: request),
                       (response as? HTTPURLResponse)?.statusCode == 200 else {
                     return nil
@@ -450,7 +643,12 @@ struct RemoteCodeDistillServiceMain {
         }
     }
 
-    private static func loadCLIState() -> ManagedDistillCLI.State? {
+    private struct LoadedCLIState {
+        let state: ManagedDistillCLI.State
+        let path: String
+    }
+
+    private static func loadCLIStateSnapshot() -> LoadedCLIState? {
         let env = ProcessInfo.processInfo.environment
         var candidates: [String] = []
         if let override = env["REMOTE_CODE_DISTILL_STATE_PATH"], !override.isEmpty {
@@ -474,7 +672,10 @@ struct RemoteCodeDistillServiceMain {
                   !baseURL.isEmpty, !token.isEmpty else {
                 continue
             }
-            return ManagedDistillCLI.State(baseURL: baseURL, authToken: token)
+            return LoadedCLIState(
+                state: ManagedDistillCLI.State(baseURL: baseURL, authToken: token),
+                path: path
+            )
         }
         return nil
     }

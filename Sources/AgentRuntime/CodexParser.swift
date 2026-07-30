@@ -160,7 +160,8 @@ public final class CodexParser {
                 compactsAutomatically: compactsAutomatically,
                 uncachedInputTokens: max(0, input - cachedInput),
                 cacheCreationInputTokens: 0,
-                cacheReadInputTokens: cachedInput
+                cacheReadInputTokens: cachedInput,
+                semantics: .cumulative
             ))]
         case "context.compaction", "context_compaction":
             return [.contextCompaction(summary: obj["summary"] as? String)]

@@ -194,15 +194,19 @@ final class ProviderNativeSubagentLifecycleTests: XCTestCase {
         let threadID = AgentThreadID()
         let parentRunID = AgentRunID()
         let childRunID = AgentRunID()
-        let parent = try runtime.recordExternalChild(
+        let parentCapability = AgentDelegationCapability.issue()
+        let parent = try runtime.recordExternalRoot(
             runId: parentRunID,
             threadId: threadID,
             provider: .codex,
             providerInstanceId: "codex",
             model: "gpt-5.6-sol",
-            nodeId: "native.codex.parent"
+            permissionMode: .supervised,
+            delegationCapabilitySHA256: AgentDelegationCapability.sha256Hex(
+                parentCapability
+            )
         )
-        let child = try runtime.recordExternalChild(
+        let child = try runtime.recordProviderNativeChild(
             runId: childRunID,
             threadId: threadID,
             provider: .grok,

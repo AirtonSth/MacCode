@@ -229,11 +229,19 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             let binary = request.providerBinary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
                 ? request.providerBinary!
                 : (binaryNameOverride ?? "codex")
+            let isForeignUser = request.runAsUser.map { $0.uid != getuid() } == true
+            let askpass = isForeignUser
+                ? RunAsUserProcessBootstrap.materializeAskpass(
+                    targetUser: request.runAsUser!.shortName
+                )
+                : nil
             return try CodexAppServerClient(
                 binary: binary,
                 arguments: ["app-server"],
                 cwd: request.cwd,
                 environment: request.environment,
+                runAsUser: request.runAsUser,
+                askpassPath: askpass,
                 notificationHandler: notificationHandler,
                 serverRequestHandler: serverRequestHandler,
                 tokenSaverCensusAllowed: request.runAsUser?.uid == nil || request.runAsUser?.uid == getuid()
@@ -2989,7 +2997,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             contextWindow: contextWindow,
             compactsAutomatically: true,
             reportedCostMicros: reportedCostMicros,
-            contextTokens: contextTokens
+            contextTokens: contextTokens,
+            semantics: .cumulative
         )
     }
 

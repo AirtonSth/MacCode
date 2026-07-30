@@ -1,6 +1,7 @@
 import Foundation
 import CoreModel
 import CryptoKit
+import Darwin
 import Persistence
 import os
 
@@ -75,6 +76,73 @@ private final class PendingProviderStart: @unchecked Sendable {
         let waiter = lock.withLock { waiters.removeValue(forKey: id) }
         waiter?.resume(returning: completed)
     }
+}
+
+/// Providers use two accounting contracts: Claude can emit independent
+/// per-request charges, while final/model usage and Codex/Grok snapshots are
+/// cumulative. Keep both tracks so a final receipt reflects the larger
+/// reconciled run total without double-counting cumulative updates.
+private struct ReconciledTokenUsageAccumulator {
+    private(set) var incremental = AssistantTokenUsage(semantics: .incremental)
+    private(set) var cumulative = AssistantTokenUsage(semantics: .cumulative)
+    private(set) var hasUsage = false
+
+    mutating func record(_ usage: AssistantTokenUsage) {
+        hasUsage = true
+        switch usage.resolvedSemantics {
+        case .incremental:
+            incremental = Self.adding(incremental, usage)
+        case .cumulative:
+            cumulative = AssistantTokenUsage.merging(cumulative, with: usage)
+        }
+    }
+
+    var effective: AssistantTokenUsage? {
+        guard hasUsage else { return nil }
+        return AssistantTokenUsage.merging(incremental, with: cumulative)
+    }
+
+    private static func adding(
+        _ lhs: AssistantTokenUsage,
+        _ rhs: AssistantTokenUsage
+    ) -> AssistantTokenUsage {
+        func add(_ lhs: Int, _ rhs: Int) -> Int {
+            let (sum, overflow) = max(0, lhs).addingReportingOverflow(max(0, rhs))
+            return overflow ? Int.max : sum
+        }
+        func addOptional(_ lhs: Int?, _ rhs: Int?) -> Int? {
+            guard lhs != nil || rhs != nil else { return nil }
+            return add(lhs ?? 0, rhs ?? 0)
+        }
+        func maxOptional(_ lhs: Int?, _ rhs: Int?) -> Int? {
+            guard lhs != nil || rhs != nil else { return nil }
+            return max(lhs ?? 0, rhs ?? 0)
+        }
+        return AssistantTokenUsage(
+            inputTokens: add(lhs.inputTokens, rhs.inputTokens),
+            outputTokens: add(lhs.outputTokens, rhs.outputTokens),
+            totalTokens: add(lhs.totalTokens, rhs.totalTokens),
+            contextWindow: maxOptional(lhs.contextWindow, rhs.contextWindow),
+            compactsAutomatically: rhs.compactsAutomatically ?? lhs.compactsAutomatically,
+            uncachedInputTokens: addOptional(lhs.uncachedInputTokens, rhs.uncachedInputTokens),
+            cacheCreationInputTokens: addOptional(
+                lhs.cacheCreationInputTokens,
+                rhs.cacheCreationInputTokens
+            ),
+            cacheReadInputTokens: addOptional(lhs.cacheReadInputTokens, rhs.cacheReadInputTokens),
+            reportedCostMicros: addOptional(lhs.reportedCostMicros, rhs.reportedCostMicros),
+            contextTokens: rhs.contextTokens ?? lhs.contextTokens,
+            semantics: .incremental
+        )
+    }
+}
+
+private struct PendingOrchestrationReceiptFinalization {
+    let runId: AgentRunID
+    let threadId: AgentThreadID
+    let status: AgentRunStatus
+    let usage: AssistantTokenUsage?
+    let qualityOutcome: String
 }
 
 /// Immutable host-authoritative view of the runs currently registered in the
@@ -624,6 +692,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let threadID: String?
         let provider: String?
         let attemptID: String?
+        let delegationCapabilitySHA256: String?
 
         init(environment: [String: String]) {
             tokenSaverEnabled = environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
@@ -632,10 +701,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             threadID = environment["RC_TOKEN_SAVER_THREAD_ID"]
             provider = environment["REMOTE_CODE_AGENT_PROVIDER"]
             attemptID = environment["RC_TOKEN_SAVER_ATTEMPT_ID"]
+            delegationCapabilitySHA256 = environment[
+                AgentDelegationCapabilityTransport.environmentKey
+            ].flatMap {
+                AgentDelegationCapabilityTransport.isWellFormed($0)
+                    ? AgentDelegationCapability.sha256Hex($0)
+                    : nil
+            }
         }
 
         var carriesTokenSaverScope: Bool {
-            tokenSaverEnabled || workspaceID != nil || projectID != nil || threadID != nil || attemptID != nil
+            tokenSaverEnabled || workspaceID != nil || projectID != nil
+                || threadID != nil || attemptID != nil
+                || delegationCapabilitySHA256 != nil
         }
     }
 
@@ -657,11 +735,20 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private var providerTurnScopes: [AgentThreadID: ProviderTurnScope] = [:]
     private var activeTurnIds: [AgentRunID: String] = [:]
     private var latestTokenUsage: [AgentRunID: AssistantTokenUsage] = [:]
+    private var reconciledTokenUsage: [AgentRunID: ReconciledTokenUsageAccumulator] = [:]
+    /// Closes the narrow window between consuming the current usage snapshot and
+    /// persisting the finalized receipt. Events inside the window remain buffered
+    /// for a post-finalization enrichment pass.
+    private var receiptUsageFinalizationInFlight: Set<AgentRunID> = []
+    private var receiptUsageEnrichmentRetryScheduled: Set<AgentRunID> = []
+    private var pendingReceiptFinalizations: [AgentRunID: PendingOrchestrationReceiptFinalization] = [:]
+    private var receiptFinalizationRetryScheduled: Set<AgentRunID> = []
     /// Last provider `.error` (or stderr-derived) detail for the live run. Used when
     /// committing failed/interrupted terminals so `agent_runs.error_message` is not
     /// left nil after an abnormal end.
     private var latestRunErrorMessages: [AgentRunID: String] = [:]
     private var orchestrationDeadlineWorkItems: [AgentRunID: DispatchWorkItem] = [:]
+    private var externalReceiptLeaseWorkItems: [AgentRunID: DispatchWorkItem] = [:]
     private var activeAssistantMessageIds: [AgentRunID: AgentMessageID] = [:]
     private var activeProviderTextItemTypes: [AgentRunID: [String: AssistantItemType]] = [:]
     private var bufferedProviderTextItems: [AgentRunID: [String: BufferedProviderTextItem]] = [:]
@@ -743,6 +830,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// publication. The recursive form also tolerates persistence diagnostics
     /// emitted while a buffered snapshot is being flushed.
     private let mirrorEventLock = NSRecursiveLock()
+    private static let externalReceiptLeaseRenewalInterval: TimeInterval = 6 * 60 * 60
+    private static let externalReceiptLeaseRetryInterval: TimeInterval = 60
     private var observerRefs: [WeakAgentRunObserver] = []
     public var observer: AgentRunObserver? {
         get {
@@ -1126,7 +1215,32 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             throw error
         }
         let admittedDeadlineAt = routingSnapshot?.admissionSnapshot?.deadlineAt
-        let request = try await requestAdmittingAutoRoute(request, routingSnapshot: routingSnapshot)
+        let inheritedDelegationCapability = request.environment[
+            AgentDelegationCapabilityTransport.environmentKey
+        ].flatMap { candidate -> String? in
+            guard let orchestrationRuntime,
+                  AgentDelegationCapabilityTransport.isWellFormed(candidate),
+                  (try? orchestrationRuntime.activeReceipt(
+                    runId: request.runId,
+                    threadId: request.threadId,
+                    delegationCapability: candidate
+                  )) != nil else {
+                return nil
+            }
+            return candidate
+        }
+        let runsAsSocketOwner = (request.runAsUser?.uid ?? getuid()) == getuid()
+        let delegationCapability = orchestrationRuntime == nil || !runsAsSocketOwner
+            ? nil
+            : (inheritedDelegationCapability ?? AgentDelegationCapability.issue())
+        let delegationCapabilitySHA256 = delegationCapability.map(
+            AgentDelegationCapability.sha256Hex
+        )
+        let request = try await requestAdmittingAutoRoute(
+            request,
+            routingSnapshot: routingSnapshot,
+            delegationCapabilitySHA256: delegationCapabilitySHA256
+        )
         // A user-initiated run ends any background-await auto-continuation streak;
         // the auto-nudge path passes `isAutoContinuation: true` to preserve the bound.
         // F37: it must also invalidate any ALREADY-SCHEDULED continuation (same
@@ -1159,6 +1273,20 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             attemptId: attemptId,
             provider: request.provider
         )
+        // Parent linkage is lifecycle metadata, not a paid Token Saver lane.
+        // Keep it available when Token Saver is off so nested receipts still
+        // attach to the actual controller run.
+        effectiveEnvironment["RC_REMOTE_CODE_ROOT_RUN_ID"] = attemptId
+        effectiveEnvironment["RC_REMOTE_CODE_ATTEMPT_ID"] = attemptId
+        if let delegationCapability {
+            effectiveEnvironment[
+                AgentDelegationCapabilityTransport.environmentKey
+            ] = delegationCapability
+        } else {
+            effectiveEnvironment.removeValue(
+                forKey: AgentDelegationCapabilityTransport.environmentKey
+            )
+        }
         let effectiveRequest = AgentRunRequest(
             runId: request.runId,
             threadId: request.threadId,
@@ -1227,6 +1355,34 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lastEventKind: "run.pending",
             runtimePayloadJSON: existingRuntimePayload
         ))
+        do {
+            if let orchestrationRuntime,
+               let delegationCapabilitySHA256 {
+                _ = try orchestrationRuntime.recordExternalRoot(
+                    runId: effectiveRequest.runId,
+                    threadId: effectiveRequest.threadId,
+                    provider: effectiveRequest.provider,
+                    providerInstanceId: effectiveRequest.providerInstanceId ?? effectiveRequest.provider.rawValue,
+                    model: effectiveRequest.model,
+                    permissionMode: effectiveRequest.permissionMode,
+                    delegationCapabilitySHA256: delegationCapabilitySHA256
+                )
+                scheduleExternalReceiptLeaseRenewal(
+                    runId: effectiveRequest.runId,
+                    threadId: effectiveRequest.threadId
+                )
+            }
+        } catch {
+            // Lifecycle telemetry must not turn a successfully persisted
+            // provider run into a hidden retry. Surface the durability issue
+            // and let the provider run fail open.
+            emitPersistenceIssue(
+                "orchestration.root_receipt",
+                error: error,
+                runId: effectiveRequest.runId,
+                threadId: effectiveRequest.threadId
+            )
+        }
         await onRunPrepared?(effectiveRequest, preservedUserContent)
         lock.lock()
         let stoppedBeforeProviderWrite = pendingThreadStops.remove(effectiveRequest.threadId) != nil
@@ -1398,9 +1554,63 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
+    /// External receipts use a bounded lease so a crashed provider cannot leave
+    /// a permanently active parent. Renew that lease while this coordinator
+    /// still owns the provider run; terminal cleanup cancels the heartbeat.
+    private func scheduleExternalReceiptLeaseRenewal(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        delay: TimeInterval = AgentRunCoordinator.externalReceiptLeaseRenewalInterval
+    ) {
+        guard orchestrationRuntime != nil else { return }
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let isActive = self.lock.withLock {
+                self.active[runId] != nil || self.activeRunMetadata[runId] != nil
+            }
+            guard isActive, let runtime = self.orchestrationRuntime else {
+                _ = self.lock.withLock {
+                    self.externalReceiptLeaseWorkItems.removeValue(forKey: runId)
+                }
+                return
+            }
+            do {
+                _ = try runtime.renewExternalReceiptLease(
+                    runId: runId,
+                    ownerProcessID: ProcessInfo.processInfo.processIdentifier
+                )
+                self.scheduleExternalReceiptLeaseRenewal(
+                    runId: runId,
+                    threadId: threadId
+                )
+            } catch {
+                self.emitPersistenceIssue(
+                    "orchestration.receipt.renew_lease",
+                    error: error,
+                    runId: runId,
+                    threadId: threadId
+                )
+                self.scheduleExternalReceiptLeaseRenewal(
+                    runId: runId,
+                    threadId: threadId,
+                    delay: Self.externalReceiptLeaseRetryInterval
+                )
+            }
+        }
+        lock.withLock {
+            externalReceiptLeaseWorkItems.removeValue(forKey: runId)?.cancel()
+            externalReceiptLeaseWorkItems[runId] = workItem
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + max(1, delay),
+            execute: workItem
+        )
+    }
+
     private func requestAdmittingAutoRoute(
         _ request: AgentRunRequest,
-        routingSnapshot suppliedSnapshot: AgentOrchestrationRoutingSnapshot?
+        routingSnapshot suppliedSnapshot: AgentOrchestrationRoutingSnapshot?,
+        delegationCapabilitySHA256: String?
     ) async throws -> AgentRunRequest {
         let routingSnapshot: AgentOrchestrationRoutingSnapshot
         if let suppliedSnapshot {
@@ -1455,7 +1665,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 budgetCostMicros: routingSnapshot.admissionSnapshot?.budgetCostMicros,
                 reservationId: routingSnapshot.admissionSnapshot?.reservationId,
                 reservedTokens: routingSnapshot.admissionSnapshot?.reservedTokens,
-                reservedCostMicros: routingSnapshot.admissionSnapshot?.reservedCostMicros
+                reservedCostMicros: routingSnapshot.admissionSnapshot?.reservedCostMicros,
+                delegationCapabilitySHA256: delegationCapabilitySHA256
             )
             let launch = routingSnapshot.launchConfigurations[admission.route.providerInstanceId]
             // Display the user's words unchanged; wrap only the provider-bound prompt
@@ -2192,6 +2403,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         activeRunMetadata.removeValue(forKey: runId)
         latestTokenUsage.removeValue(forKey: runId)
+        reconciledTokenUsage.removeValue(forKey: runId)
+        receiptUsageFinalizationInFlight.remove(runId)
+        receiptUsageEnrichmentRetryScheduled.remove(runId)
         latestRunErrorMessages.removeValue(forKey: runId)
         activeTurnIds.removeValue(forKey: runId)
         activeAssistantMessageIds.removeValue(forKey: runId)
@@ -2208,6 +2422,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         providerTerminatedRuns.remove(runId)
         pendingThreadStops.remove(threadId)
         orchestrationDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
+        externalReceiptLeaseWorkItems.removeValue(forKey: runId)?.cancel()
         seq.removeValue(forKey: runId)
         lastPersistedAssistantContent.removeValue(forKey: threadId)
         autoContinuationCounts.removeValue(forKey: threadId)
@@ -3007,6 +3222,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             attemptId: recoveryAttempt,
             provider: thread.provider
         )
+        environment["RC_REMOTE_CODE_ROOT_RUN_ID"] = recoveryEventRunId.value.uuidString
+        environment["RC_REMOTE_CODE_ATTEMPT_ID"] = recoveryAttempt
         let request = AgentRunRequest(
             runId: recoveryRunID,
             threadId: threadId,
@@ -3309,6 +3526,168 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return ev
     }
 
+    private func recordReconciledTokenUsage(
+        _ usage: AssistantTokenUsage,
+        runId: AgentRunID,
+        threadId: AgentThreadID
+    ) {
+        lock.lock()
+        var accumulator = reconciledTokenUsage[runId] ?? ReconciledTokenUsageAccumulator()
+        accumulator.record(usage)
+        let effective = accumulator.effective
+        reconciledTokenUsage[runId] = accumulator
+        latestTokenUsage[runId] = effective
+        let finalizationInFlight = receiptUsageFinalizationInFlight.contains(runId)
+        lock.unlock()
+
+        // A late independent request cannot be distinguished from a replay
+        // because providers do not attach a stable usage-event ID. Legitimate
+        // incremental charges precede terminal delivery; only authoritative
+        // cumulative snapshots may enrich an already-finalized receipt.
+        guard usage.resolvedSemantics == .cumulative,
+              !finalizationInFlight,
+              effective != nil else {
+            return
+        }
+        attemptFinalizedReceiptUsageEnrichment(runId: runId, threadId: threadId)
+    }
+
+    private func attemptFinalizedReceiptUsageEnrichment(
+        runId: AgentRunID,
+        threadId: AgentThreadID
+    ) {
+        lock.lock()
+        guard !receiptUsageFinalizationInFlight.contains(runId),
+              let usage = latestTokenUsage[runId] else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+
+        do {
+            if try orchestrationRuntime?.enrichFinalizedReceiptUsage(
+                runId: runId,
+                usage: usage
+            ) == true {
+                lock.lock()
+                let current = latestTokenUsage[runId]
+                let isCovered = current.map {
+                    $0.totalTokens <= usage.totalTokens
+                        && ($0.reportedCostMicros ?? 0) <= (usage.reportedCostMicros ?? 0)
+                } ?? true
+                if isCovered {
+                    reconciledTokenUsage.removeValue(forKey: runId)
+                    latestTokenUsage.removeValue(forKey: runId)
+                    receiptUsageEnrichmentRetryScheduled.remove(runId)
+                }
+                lock.unlock()
+                if !isCovered {
+                    scheduleReceiptUsageEnrichmentRetry(runId: runId, threadId: threadId)
+                }
+            }
+        } catch {
+            emitPersistenceIssue(
+                "orchestration.receipt.enrich_usage",
+                error: error,
+                runId: runId,
+                threadId: threadId
+            )
+            scheduleReceiptUsageEnrichmentRetry(runId: runId, threadId: threadId)
+        }
+    }
+
+    private func scheduleReceiptUsageEnrichmentRetry(
+        runId: AgentRunID,
+        threadId: AgentThreadID
+    ) {
+        lock.lock()
+        guard latestTokenUsage[runId] != nil,
+              receiptUsageEnrichmentRetryScheduled.insert(runId).inserted else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+
+        Task.detached { [weak self] in
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            guard let self else { return }
+            let stillPending = self.lock.withLock {
+                self.receiptUsageEnrichmentRetryScheduled.remove(runId)
+                return self.latestTokenUsage[runId] != nil
+            }
+            if stillPending {
+                self.attemptFinalizedReceiptUsageEnrichment(
+                    runId: runId,
+                    threadId: threadId
+                )
+            }
+        }
+    }
+
+    @discardableResult
+    private func finalizeOrRetryReceipt(
+        _ pending: PendingOrchestrationReceiptFinalization
+    ) -> Bool {
+        do {
+            try orchestrationRuntime?.finalizeReceipt(
+                runId: pending.runId,
+                status: pending.status,
+                usage: pending.usage,
+                qualityOutcome: pending.qualityOutcome
+            )
+            let completionState = lock.withLock { () -> (hasLateUsage: Bool, leaseWorkItem: DispatchWorkItem?) in
+                pendingReceiptFinalizations.removeValue(forKey: pending.runId)
+                receiptFinalizationRetryScheduled.remove(pending.runId)
+                receiptUsageFinalizationInFlight.remove(pending.runId)
+                return (
+                    latestTokenUsage[pending.runId] != nil,
+                    externalReceiptLeaseWorkItems.removeValue(forKey: pending.runId)
+                )
+            }
+            completionState.leaseWorkItem?.cancel()
+            if completionState.hasLateUsage {
+                attemptFinalizedReceiptUsageEnrichment(
+                    runId: pending.runId,
+                    threadId: pending.threadId
+                )
+            }
+            return true
+        } catch {
+            lock.withLock {
+                pendingReceiptFinalizations[pending.runId] = pending
+                receiptUsageFinalizationInFlight.insert(pending.runId)
+            }
+            emitPersistenceIssue(
+                "orchestration.receipt.finalize",
+                error: error,
+                runId: pending.runId,
+                threadId: pending.threadId
+            )
+            scheduleReceiptFinalizationRetry(runId: pending.runId)
+            return false
+        }
+    }
+
+    private func scheduleReceiptFinalizationRetry(runId: AgentRunID) {
+        let shouldSchedule = lock.withLock {
+            pendingReceiptFinalizations[runId] != nil
+                && receiptFinalizationRetryScheduled.insert(runId).inserted
+        }
+        guard shouldSchedule else { return }
+
+        Task.detached { [weak self] in
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            guard let self else { return }
+            let pending = self.lock.withLock { () -> PendingOrchestrationReceiptFinalization? in
+                self.receiptFinalizationRetryScheduled.remove(runId)
+                return self.pendingReceiptFinalizations[runId]
+            }
+            if let pending {
+                self.finalizeOrRetryReceipt(pending)
+            }
+        }
+    }
+
     private func handle(
         event: AgentRunEvent,
         runId: AgentRunID,
@@ -3325,9 +3704,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 threadId: threadId
             )
             if case .tokenUsage(let usage) = ev {
-                lock.lock()
-                latestTokenUsage[runId] = usage
-                lock.unlock()
+                recordReconciledTokenUsage(usage, runId: runId, threadId: threadId)
             }
             if allowFinalResponseTranslation,
                case .turnCompleted(let turnId, let finalMessage) = ev,
@@ -3820,11 +4197,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // Codex delivers usage as an independent notification that can arrive
             // during the persist window) — and fall back to the pre-persist
             // snapshot if a concurrent stale-release already removed the entry.
+            receiptUsageFinalizationInFlight.insert(runId)
             let usage = latestTokenUsage.removeValue(forKey: runId) ?? capturedTokenUsage
+            reconciledTokenUsage.removeValue(forKey: runId)
             lock.unlock()
-            do {
-                try orchestrationRuntime?.finalizeReceipt(
+            _ = finalizeOrRetryReceipt(
+                PendingOrchestrationReceiptFinalization(
                     runId: runId,
+                    threadId: threadId,
                     status: status,
                     usage: usage,
                     qualityOutcome: AgentOrchestrationRuntime.qualityOutcome(
@@ -3832,14 +4212,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                         finalMessage: pendingTerminal.finalMessage
                     )
                 )
-            } catch {
-                emitPersistenceIssue(
-                    "orchestration.receipt.finalize",
-                    error: error,
-                    runId: runId,
-                    threadId: threadId
-                )
-            }
+            )
             let runMetadata = terminalPersistence.runMetadata
             let completedTurnId = terminalPersistence.completedTurnId
             let assistantMessageId = terminalPersistence.assistantMessageId
@@ -3859,6 +4232,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
             lock.lock()
             orchestrationDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
+            externalReceiptLeaseWorkItems.removeValue(forKey: runId)?.cancel()
             active.removeValue(forKey: runId)
             activeThreads.removeValue(forKey: threadId)
             activeRunMetadata.removeValue(forKey: runId)
@@ -4169,24 +4543,20 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 providerSession: providerSession,
                 streamEvent: pending.streamEvent
             )
-            do {
-                lock.lock()
-                let usage = latestTokenUsage.removeValue(forKey: runId)
-                lock.unlock()
-                try orchestrationRuntime?.finalizeReceipt(
+            lock.lock()
+            receiptUsageFinalizationInFlight.insert(runId)
+            let usage = latestTokenUsage.removeValue(forKey: runId)
+            reconciledTokenUsage.removeValue(forKey: runId)
+            lock.unlock()
+            _ = finalizeOrRetryReceipt(
+                PendingOrchestrationReceiptFinalization(
                     runId: runId,
+                    threadId: pending.request.threadId,
                     status: .failed,
                     usage: usage,
                     qualityOutcome: AgentOrchestrationRuntime.qualityOutcome(status: .failed, finalMessage: nil)
                 )
-            } catch {
-                emitPersistenceIssue(
-                    "orchestration.receipt.finalize",
-                    error: error,
-                    runId: runId,
-                    threadId: pending.request.threadId
-                )
-            }
+            )
         } catch {
             emitPersistenceIssue(
                 "run.start_failure.terminal_graph.commit",
@@ -4283,7 +4653,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         guard !updates.isEmpty else { return }
         for update in updates {
             do {
-                _ = try orchestrationRuntime.recordExternalChild(
+                _ = try orchestrationRuntime.recordProviderNativeChild(
                     runId: update.childRunId,
                     threadId: threadId,
                     provider: update.provider,

@@ -1,7 +1,8 @@
 import XCTest
 import CoreModel
 import Persistence
-import AgentRuntime
+@testable import AgentRuntime
+import SocketServer
 @testable import AppShell
 
 /// Regression for the Token Saver savings-attribution bug: command-output savings from the
@@ -34,6 +35,167 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             scorecardID: "test-scorecard"
         ))
         return thread
+    }
+
+    @MainActor
+    func test_nestedAgentAppInheritsProjectScopeAndTokenSaverAdmission() async throws {
+        // WHY: a cross-provider child must keep the host-validated project
+        // scope of its active parent; otherwise the same Token Saver lanes that
+        // protect the main Agent App silently turn off for the subagent.
+        let appSupport = NSTemporaryDirectory() + "RC2NestedProject-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let router = AppCommandRouter(context: context)
+        let workspace = try router.createWorkspace(name: "nested", cwd: NSTemporaryDirectory())
+        let projectID = ProjectID()
+        let parentThread = AgentThread(
+            projectId: projectID,
+            workspaceId: workspace.id,
+            title: "parent",
+            provider: .codex,
+            model: "gpt",
+            permissionMode: .fullAccess
+        )
+        try context.threadRepo.upsert(parentThread)
+        try context.tokenSaverLaneStateRepo.upsert(.init(
+            projectID: projectID.value.uuidString,
+            lane: "deterministic_wrapper",
+            state: "promoted",
+            reason: "test",
+            evidenceLevel: "provider_usage",
+            ownerRole: "Operations Owner:test",
+            permissionBoundary: "project",
+            retentionDays: 30,
+            optedOut: false,
+            killSwitchActive: false,
+            attributionJoined: true,
+            reconciliationPassed: true,
+            usageSemanticsAvailable: true,
+            scorecardID: "nested-project"
+        ))
+        let parentRunID = AgentRunID()
+        let parentCapability = AgentDelegationCapability.issue()
+        _ = try context.orchestrationRuntime.recordExternalRoot(
+            runId: parentRunID,
+            threadId: parentThread.id,
+            provider: .codex,
+            providerInstanceId: "codex",
+            model: "gpt",
+            permissionMode: .fullAccess,
+            delegationCapabilitySHA256: AgentDelegationCapability.sha256Hex(
+                parentCapability
+            )
+        )
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
+
+        let child = try await router.createAgentThreadRouting(
+            workspace: workspace.id,
+            title: "child",
+            provider: .grok,
+            model: "grok",
+            permissionMode: .supervised,
+            reasoningEffort: .high,
+            serviceTier: .auto,
+            modelSelection: nil,
+            providerInstanceId: nil,
+            runAsUser: nil,
+            surfaceID: nil,
+            routing: nil,
+            nestedRunContext: AgentNestedRunContext(
+                parentRunID: parentRunID,
+                parentThreadID: parentThread.id,
+                nodeID: "nested.grok.project",
+                parentCapability: parentCapability
+            )
+        )
+
+        XCTAssertEqual(child.projectId, projectID)
+        XCTAssertEqual(child.workspaceId, parentThread.workspaceId)
+        XCTAssertEqual(child.runAsUser, parentThread.runAsUser)
+        XCTAssertEqual(child.executionMode, parentThread.executionMode)
+        XCTAssertEqual(
+            router.providerEnvironment(
+                provider: .grok,
+                instanceId: child.providerInstanceId,
+                threadId: child.id
+            )["RC_TOKEN_SAVER_DISTILL_HINT"],
+            "1"
+        )
+    }
+
+    @MainActor
+    func test_nestedAgentAppRejectsForeignRunAsParentBeforePersistingChildThread() async throws {
+        // WHY: the Agent App middleware returns through an owner-only local IPC
+        // socket. Persisting a foreign run-as child would claim an execution
+        // identity that the host cannot actually launch or reconnect.
+        let appSupport = NSTemporaryDirectory() + "RC2NestedForeignUser-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let router = AppCommandRouter(context: context)
+        let workspace = try router.createWorkspace(name: "nested-foreign", cwd: NSTemporaryDirectory())
+        let foreignUser = AgentRunAsUser(
+            generatedUID: "foreign-user",
+            shortName: "foreign-user",
+            uid: getuid() &+ 1,
+            gid: getgid(),
+            homePath: "/Users/foreign-user"
+        )
+        let parentThread = AgentThread(
+            workspaceId: workspace.id,
+            title: "foreign parent",
+            provider: .codex,
+            model: "gpt",
+            permissionMode: .fullAccess,
+            runAsUser: foreignUser
+        )
+        try context.threadRepo.upsert(parentThread)
+        let parentRunID = AgentRunID()
+        let parentCapability = AgentDelegationCapability.issue()
+        _ = try context.orchestrationRuntime.recordExternalRoot(
+            runId: parentRunID,
+            threadId: parentThread.id,
+            provider: .codex,
+            providerInstanceId: "codex",
+            model: "gpt",
+            permissionMode: .fullAccess,
+            delegationCapabilitySHA256: AgentDelegationCapability.sha256Hex(
+                parentCapability
+            )
+        )
+
+        do {
+            _ = try await router.createAgentThreadRouting(
+                workspace: workspace.id,
+                title: "must not persist",
+                provider: .grok,
+                model: "grok-4.5",
+                permissionMode: .supervised,
+                reasoningEffort: .high,
+                serviceTier: .auto,
+                modelSelection: nil,
+                providerInstanceId: nil,
+                runAsUser: nil,
+                surfaceID: nil,
+                routing: nil,
+                nestedRunContext: AgentNestedRunContext(
+                    parentRunID: parentRunID,
+                    parentThreadID: parentThread.id,
+                    nodeID: "nested.grok.foreign",
+                    parentCapability: parentCapability
+                )
+            )
+            XCTFail("foreign-user parent must fail before child persistence")
+        } catch let error as JSONRPCError {
+            XCTAssertEqual(error.code, -32020)
+            XCTAssertEqual(
+                error.message,
+                "Nested Agent App cannot cross the host IPC user boundary."
+            )
+        }
+
+        let persisted = try context.threadRepo.list(workspaceId: workspace.id)
+        XCTAssertEqual(persisted.map(\.id), [parentThread.id])
     }
 
     @MainActor
@@ -215,11 +377,19 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
     @MainActor
     func test_providerEnvironmentPrependsManagedBin_whenTokenSaverOff() throws {
         let appSupport = NSTemporaryDirectory() + "RC2ProvProxyPathOff-" + UUID().uuidString
-        let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let skillsHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RC2ProvProxyHome-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: skillsHome) }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: appSupport,
+            agentSkillsHomeOverrideForTesting: skillsHome
+        )
         SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = false }
         ctx.reconcileManagedDistillSkills(tokenSaverEnabled: false)
         let router = AppCommandRouter(context: ctx)
-        let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+        let managedBin = skillsHome.appendingPathComponent(".remote-code/bin").path
+        let shellBridge = skillsHome.appendingPathComponent(".remote-code/shell/zsh").path
 
         for provider in AgentProvider.allCases {
             let thread = try admittedThread(in: ctx, provider: provider)
@@ -232,8 +402,132 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             XCTAssertEqual(env["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"], thread.id.value.uuidString)
             XCTAssertEqual(env["RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE"], "1")
             XCTAssertEqual(env["RC_REMOTE_CODE_AGENT_APP_SOCKET_PATH"], AppPaths.socketPath(for: .debug))
+            XCTAssertEqual(
+                env["RC_REMOTE_CODE_AGENT_APP_COMMAND"],
+                skillsHome.appendingPathComponent(".remote-code/bin")
+                    .appendingPathComponent(AgentSkillInstaller.agentAppMiddlewareCommand).path
+            )
+            XCTAssertEqual(
+                env["ZDOTDIR"],
+                shellBridge,
+                "the provider shell must use RemoteCode's profile-preserving login bridge"
+            )
             XCTAssertNil(env["RC_TOKEN_SAVER_DISTILL_HINT"])
         }
+    }
+
+    @MainActor
+    func test_providerEnvironmentUsesCustomProviderHOMEAsOriginalZDOTDIR() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RC2CustomProviderHome-\(UUID().uuidString)", isDirectory: true)
+        let skillsHome = root.appendingPathComponent("managed", isDirectory: true)
+        let providerHome = root.appendingPathComponent("claude-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: providerHome, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path,
+            agentSkillsHomeOverrideForTesting: skillsHome
+        )
+        try ctx.settingsRepo.set("agent.provider.instances", """
+        [
+          {
+            "id": "claude-isolated",
+            "provider": "claude",
+            "displayName": "Claude Isolated",
+            "binaryPath": "/usr/bin/env",
+            "homePath": "\(providerHome.path)",
+            "enabled": true,
+            "env": {}
+          }
+        ]
+        """)
+        let router = AppCommandRouter(context: ctx)
+        let thread = try admittedThread(in: ctx, provider: .claude)
+
+        let env = router.providerEnvironment(
+            provider: .claude,
+            instanceId: "claude-isolated",
+            threadId: thread.id
+        )
+
+        XCTAssertEqual(env["HOME"], providerHome.path)
+        XCTAssertEqual(env["RC_REMOTE_CODE_ORIGINAL_ZDOTDIR"], providerHome.path)
+        XCTAssertEqual(env["RC_REMOTE_CODE_EFFECTIVE_ZDOTDIR"], providerHome.path)
+        XCTAssertEqual(
+            env["ZDOTDIR"],
+            skillsHome.appendingPathComponent(".remote-code/shell/zsh").path
+        )
+
+        ctx.tokenSaverEntitlementModelValidationOverrideForTesting = .installed
+        PrivateAccountSessionStore(repo: ctx.settingsRepo).save(.init(
+            accessToken: "test-access",
+            refreshToken: "test-refresh",
+            user: .init(
+                daysRemaing: nil,
+                daysRemaining: 30,
+                email: "paid@example.com",
+                id: "paid",
+                subscribed: true
+            )
+        ))
+        XCTAssertEqual(
+            ctx.applyTokenSaverLifecycle(
+                requestedEnabled: true,
+                modelValidation: .installed,
+                persistPreference: true
+            ),
+            .enabled
+        )
+        // This environment-only test has no packaged sidecar executable. Put
+        // the controller back on the explicit XCTest injected-ready seam after
+        // lifecycle admission so the assertion exercises the emitted runtime
+        // environment rather than a synthetic process-launch failure.
+        ctx.tokenSaverDistillServiceController.stop()
+        let tokenSaverEnv = router.providerEnvironment(
+            provider: .claude,
+            instanceId: "claude-isolated",
+            threadId: thread.id
+        )
+        XCTAssertTrue(
+            tokenSaverEnv["PATH"]?.hasPrefix(
+                skillsHome.appendingPathComponent(".remote-code/bin").path + ":"
+            ) == true,
+            "Token Saver admission must retain the sandboxed managed bin"
+        )
+        XCTAssertEqual(tokenSaverEnv["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
+    }
+
+    @MainActor
+    func test_providerEnvironmentDoesNotAdvertiseUserOwnedAgentAppAlias() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RC2ForeignAgentAppAlias-\(UUID().uuidString)", isDirectory: true)
+        let skillsHome = root.appendingPathComponent("managed", isDirectory: true)
+        let managedBin = skillsHome.appendingPathComponent(".remote-code/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: managedBin, withIntermediateDirectories: true)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(
+            to: managedBin.appendingPathComponent(AgentSkillInstaller.agentAppMiddlewareCommand)
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path,
+            agentSkillsHomeOverrideForTesting: skillsHome
+        )
+        let router = AppCommandRouter(context: ctx)
+        let thread = try admittedThread(in: ctx, provider: .codex)
+
+        let env = router.providerEnvironment(
+            provider: .codex,
+            instanceId: nil,
+            threadId: thread.id
+        )
+
+        XCTAssertEqual(env["RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE"], "1")
+        XCTAssertNil(
+            env["RC_REMOTE_CODE_AGENT_APP_COMMAND"],
+            "provider prompts must not receive a missing or user-owned launcher path"
+        )
     }
 
     /// Recovered provider sessions bypass AppCommandRouter.providerEnvironment.

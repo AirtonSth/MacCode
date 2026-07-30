@@ -110,6 +110,88 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         )
     }
 
+    func testSubagentRefreshDemotesDeadExternalReceiptFromActive() throws {
+        // WHY: the Agent App refresh is the user-visible boundary. It must use
+        // the runtime's lease/PID reconciliation rather than project a stale
+        // accepted receipt as an indefinitely active subagent.
+        let root = NSTemporaryDirectory() + "rc-subagent-liveness-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: root).run()
+        let threads = AgentThreadRepository(db: db)
+        let messages = AgentMessageRepository(db: db)
+        let runs = AgentRunRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runs,
+            messageRepo: messages,
+            threadRepo: threads,
+            providers: [
+                .codex: FakeProviderRunner(provider: .codex),
+                .claude: FakeProviderRunner(provider: .claude),
+                .grok: FakeProviderRunner(provider: .grok)
+            ]
+        )
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            rolloutGate: { true },
+            killSwitch: { false },
+            processIsAlive: { _ in false }
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: WorkspaceID(),
+            cwd: root,
+            coordinator: coordinator,
+            threadRepo: threads,
+            messageRepo: messages,
+            orchestrationRuntime: runtime
+        )
+        vm.createThread(title: "dead external child")
+        let threadID = try XCTUnwrap(vm.selectedThreadId)
+        let seedRuntime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            rolloutGate: { true },
+            killSwitch: { false },
+            processIsAlive: { _ in true }
+        )
+        let parentRunID = AgentRunID()
+        let parentCapability = AgentDelegationCapability.issue()
+        _ = try seedRuntime.recordExternalRoot(
+            runId: parentRunID,
+            threadId: threadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            permissionMode: .supervised,
+            delegationCapabilitySHA256: AgentDelegationCapability.sha256Hex(
+                parentCapability
+            ),
+            ownerProcessID: 998
+        )
+        let runID = AgentRunID()
+        _ = try seedRuntime.recordAuthorizedExternalChild(
+            runId: runID,
+            threadId: threadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            nodeId: "nested.grok.dead",
+            parentRunId: parentRunID,
+            parentThreadId: threadID,
+            parentCapability: parentCapability,
+            childCapability: AgentDelegationCapability.issue(),
+            requestedPermissionMode: .supervised,
+            ownerProcessID: 999
+        )
+
+        vm.refreshSubagentActivity()
+
+        XCTAssertEqual(vm.subagentActivity.activeCount, 0)
+        XCTAssertEqual(vm.subagentActivity.unknownCount, 1)
+        XCTAssertEqual(try repository.receipt(runId: runID)?.lifecycleStatus, .unknown)
+    }
+
     func testNextThreadRestoresLastUserProviderModelAndReasoningChoice() throws {
         let suiteName = "rc-auto-last-selection-" + UUID().uuidString
         let defaults = UserDefaults(suiteName: suiteName)!

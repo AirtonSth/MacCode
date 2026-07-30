@@ -3,6 +3,28 @@ import CoreModel
 @testable import DistillCore
 
 final class DistillServiceTests: XCTestCase {
+    private final class AdmissionSwitch: @unchecked Sendable {
+        private let lock = NSLock()
+        private var enabled: Bool
+
+        init(_ enabled: Bool) {
+            self.enabled = enabled
+        }
+
+        func read() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return enabled
+        }
+
+    }
+
+    private actor CallbackCounter {
+        private var value = 0
+        func increment() { value += 1 }
+        func count() -> Int { value }
+    }
+
     private actor RecordingSuccessHandler {
         private var records: [DistillSavingsRecord] = []
 
@@ -226,6 +248,72 @@ final class DistillServiceTests: XCTestCase {
         XCTAssertEqual(response.status, 200)
         let decoded = try JSONDecoder().decode(DistillResponse.self, from: response.data)
         XCTAssertEqual(decoded.output, "PASS")
+    }
+
+    func test_httpDistillAdmissionOffDeniesAllPaidEndpointsWithoutModelMetricsOrSavings() async throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "off-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 1
+        )
+        let gate = AdmissionSwitch(false)
+        let successes = CallbackCounter()
+        let savings = CallbackCounter()
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1),
+            scopedRecoveryStore: TestScopedRecoveryStore(),
+            onSuccess: { _, _ in await successes.increment() },
+            onSavingsRecord: { _ in await savings.increment() },
+            distillAdmission: { gate.read() }
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+        let request = DistillRequest(
+            mode: .commandOutput,
+            input: "build passed\n0 failures",
+            question: "Did the build pass?"
+        )
+        let encoder = JSONEncoder()
+        let paidRequests: [(path: String, body: Data)] = [
+            ("/v1/distill", try encoder.encode(request)),
+            ("/v1/compress", try encoder.encode(request)),
+            (
+                "/v1/rank",
+                try encoder.encode(DistillRankRequest(
+                    query: "build",
+                    chunks: [.init(id: "chunk", text: "build passed")]
+                ))
+            ),
+            (
+                "/v1/embed",
+                try encoder.encode(DistillEmbedRequest(inputs: ["build passed"]))
+            ),
+        ]
+
+        for paidRequest in paidRequests {
+            let denied = try await response(
+                baseURL: ready.baseURL,
+                path: paidRequest.path,
+                method: "POST",
+                token: "off-token",
+                body: paidRequest.body
+            )
+            XCTAssertEqual(denied.status, 409)
+            XCTAssertTrue(String(decoding: denied.data, as: UTF8.self).contains("token_saver_disabled"))
+        }
+
+        let metricsResponse = try await response(
+            baseURL: ready.baseURL,
+            path: "/metrics",
+            token: "off-token"
+        )
+        let metrics = try JSONDecoder().decode(DistillServiceMetrics.self, from: metricsResponse.data)
+        let successCount = await successes.count()
+        let savingsCount = await savings.count()
+        XCTAssertEqual(metrics.totalRequests, 0, "OFF requests must not reach the distill handler or model scheduler")
+        XCTAssertEqual(successCount, 0, "OFF requests must not publish success callbacks")
+        XCTAssertEqual(savingsCount, 0, "OFF requests must not write any savings rows")
     }
 
     func test_httpStatsEndpointReturnsSavingsLedgerSnapshot() async throws {

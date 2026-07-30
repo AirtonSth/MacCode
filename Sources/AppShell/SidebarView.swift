@@ -17,6 +17,23 @@ public extension Notification.Name {
 
 @MainActor
 public final class SidebarViewModel: ObservableObject {
+    public struct TokenSaverLocalUsageUpdate: Equatable {
+        public let providerTokenDeltas: [AgentProvider: Int]
+        public let updatedAt: Date
+
+        public init(
+            providerTokenDeltas: [AgentProvider: Int],
+            updatedAt: Date
+        ) {
+            self.providerTokenDeltas = providerTokenDeltas.filter { $0.value > 0 }
+            self.updatedAt = updatedAt
+        }
+
+        public var totalTokenDelta: Int {
+            providerTokenDeltas.values.reduce(0, +)
+        }
+    }
+
     public struct TokenSaverRolloverAdmission: Equatable {
         public let allowed: Bool
         public let reason: String
@@ -345,6 +362,10 @@ public final class SidebarViewModel: ObservableObject {
     /// Timestamp of the last completed account-usage refresh, or nil when never refreshed.
     /// Drives the "last updated" line in the details popover (:188).
     @Published public private(set) var tokenSaverAccountUsageLastUpdated: Date? = nil
+    /// Latest positive change observed in the local provider-usage ledger.
+    /// This is deliberately separate from account refresh time: a provider run can
+    /// update local token usage without changing a rounded account percentage.
+    @Published public private(set) var tokenSaverLocalUsageUpdate: TokenSaverLocalUsageUpdate?
     /// Current status of the Token Saver sidecar. Updated whenever the controller
     /// posts `.rc2TokenSaverDistillStatusChanged`. Drives the status row in the
     /// details popover so a blocked/failed sidecar is never invisible (Rule 6).
@@ -368,11 +389,13 @@ public final class SidebarViewModel: ObservableObject {
     var threadListCallCount: Int = 0
     private var privateAccountObserver: NSObjectProtocol?
     private var tokenSaverUsageObserver: NSObjectProtocol?
+    private var tokenSaverDistributedUsageObserver: NSObjectProtocol?
     /// PERF-MAC-100: in-flight background reload of the heavy Token Saver
     /// usage snapshot + savings summary. A new notification cancels the prior
     /// task so a burst of per-provider `.rc2TokenSaverUsageChanged` events
     /// coalesces into a single off-main read instead of N main-thread reads.
     private var tokenSaverHeavyReloadTask: Task<Void, Never>?
+    private var tokenSaverLocalUsageBaseline: [AgentProvider: Int]?
     private var sidecarStatusObserver: NSObjectProtocol?
     private var tokenSaverToggleObserver: NSObjectProtocol?
     private let updateChecker: AppUpdateChecking?
@@ -440,8 +463,15 @@ public final class SidebarViewModel: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             guard let viewModel = self else { return }
-            Task { @MainActor in viewModel.reloadTokenSaver() }
+            Task { @MainActor in viewModel.reloadTokenSaver(trackLocalUsageChange: true) }
         }
+        self.tokenSaverDistributedUsageObserver =
+            TokenSaverUsageCrossProcess.observeStoreChanged { [weak self] in
+                guard let viewModel = self else { return }
+                Task { @MainActor in
+                    viewModel.reloadTokenSaver(trackLocalUsageChange: true)
+                }
+            }
         self.sidecarStatusObserver = NotificationCenter.default.addObserver(
             forName: .rc2TokenSaverDistillStatusChanged,
             object: nil,
@@ -481,6 +511,9 @@ public final class SidebarViewModel: ObservableObject {
         }
         if let tokenSaverUsageObserver {
             NotificationCenter.default.removeObserver(tokenSaverUsageObserver)
+        }
+        if let tokenSaverDistributedUsageObserver {
+            TokenSaverUsageCrossProcess.removeObserver(tokenSaverDistributedUsageObserver)
         }
         if let sidecarStatusObserver {
             NotificationCenter.default.removeObserver(sidecarStatusObserver)
@@ -587,7 +620,7 @@ public final class SidebarViewModel: ObservableObject {
     /// aggregate (`tokenSaverSavingsRepo.summary()`) -- runs OFF the main
     /// thread and is coalesced: a fresh notification cancels the prior task,
     /// so a per-provider burst collapses to a single background read.
-    private func reloadTokenSaver() {
+    private func reloadTokenSaver(trackLocalUsageChange: Bool = false) {
         let settings = settingsStore.load()
         tokenSaverEnabled = settings.tokenSaverEnabled
         graphifyRuntimeActive = settings.isGraphifyRuntimeActive
@@ -598,6 +631,8 @@ public final class SidebarViewModel: ObservableObject {
             tokenSaverSavingsSummary = .empty
             tokenSaverDailyEconomyToday = nil
             tokenSaverDailyEconomyWeekTotal = 0
+            tokenSaverLocalUsageBaseline = nil
+            tokenSaverLocalUsageUpdate = nil
             return
         }
         context.recomputeTokenSaverDailyEconomyToday()
@@ -618,8 +653,36 @@ public final class SidebarViewModel: ObservableObject {
                 self.tokenSaverSavingsSummary = result.summary
                 self.tokenSaverDailyEconomyToday = result.economyToday
                 self.tokenSaverDailyEconomyWeekTotal = result.economyWeekTotal
+                self.updateTokenSaverLocalUsage(
+                    from: result.snapshot,
+                    emitPositiveChange: trackLocalUsageChange
+                )
             }
         }
+    }
+
+    private func updateTokenSaverLocalUsage(
+        from snapshot: TokenSaverUsageSnapshot,
+        emitPositiveChange: Bool
+    ) {
+        let current = Dictionary(uniqueKeysWithValues: snapshot.providers.map {
+            ($0.provider, $0.actualProviderTokens)
+        })
+        defer { tokenSaverLocalUsageBaseline = current }
+        guard emitPositiveChange, let previous = tokenSaverLocalUsageBaseline else { return }
+
+        var providerDeltas: [AgentProvider: Int] = [:]
+        for (provider, tokens) in current {
+            let tokenDelta = tokens - (previous[provider] ?? 0)
+            if tokenDelta > 0 {
+                providerDeltas[provider] = tokenDelta
+            }
+        }
+        guard !providerDeltas.isEmpty else { return }
+        tokenSaverLocalUsageUpdate = TokenSaverLocalUsageUpdate(
+            providerTokenDeltas: providerDeltas,
+            updatedAt: Date()
+        )
     }
 
     public func reloadTokenSaverGovernance() {
@@ -816,6 +879,7 @@ public final class SidebarViewModel: ObservableObject {
         tokenSaverSavingsSummary = result.summary
         tokenSaverDailyEconomyToday = result.economyToday
         tokenSaverDailyEconomyWeekTotal = result.economyWeekTotal
+        updateTokenSaverLocalUsage(from: result.snapshot, emitPositiveChange: false)
     }
 
     /// Runs the heavy Token Saver reads off the main actor. `repo` is
@@ -922,7 +986,6 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     public func setTokenSaverEnabled(_ enabled: Bool) {
-        guard privateAccountUser?.subscribed == true else { return }
         if !enabled {
             let confirmed: Bool
             if let provider = tokenSaverDisableConfirmProvider {
@@ -936,12 +999,13 @@ public final class SidebarViewModel: ObservableObject {
             settingsStore.update {
                 $0.tokenSaverEnabled = false
             }
-            context?.tokenSaverDistillServiceController.stop()
-            context?.reconcileManagedDistillSkills(tokenSaverEnabled: false)
-            // Graphify is Token-Saver-gated — drop ensure/env inject immediately.
-            context?.reconcileGraphifyHost()
+            _ = context?.applyTokenSaverLifecycle(
+                requestedEnabled: false,
+                persistPreference: true
+            )
             return
         }
+        guard privateAccountUser?.subscribed == true else { return }
         let selectedValidation = validateTokenSaverModel(requireSelectedModel: true)
         if selectedValidation.state == .installed {
             tokenSaverEnabled = true
@@ -950,7 +1014,6 @@ public final class SidebarViewModel: ObservableObject {
             }
             graphifyRuntimeActive = settingsStore.load().isGraphifyRuntimeActive
             refreshTokenSaverDistillService(modelValidation: selectedValidation)
-            context?.reconcileGraphifyHost()
             return
         }
 
@@ -963,7 +1026,6 @@ public final class SidebarViewModel: ObservableObject {
             graphifyRuntimeActive = settingsStore.load().isGraphifyRuntimeActive
             refreshTokenSaverDistillService(modelValidation: installedFallbackValidation)
             beginTokenSaverModelDownload(reason: selectedValidation.reason)
-            context?.reconcileGraphifyHost()
             return
         }
 
@@ -1103,7 +1165,6 @@ public final class SidebarViewModel: ObservableObject {
             $0.tokenSaverEnabled = true
         }
         refreshTokenSaverDistillService(modelValidation: .installed)
-        context?.reconcileGraphifyHost()
     }
 
     private func validateTokenSaverModel(requireSelectedModel: Bool = false) -> TokenSaverModelValidation {
@@ -1167,7 +1228,6 @@ public final class SidebarViewModel: ObservableObject {
                     $0.tokenSaverEnabled = true
                 }
                 self.refreshTokenSaverDistillService(modelValidation: validation)
-                self.context?.reconcileGraphifyHost()
                 return manifest
             } catch is CancellationError {
                 self.tokenSaverModelDownloadState = TokenSaverModelDownloadState(
@@ -1216,12 +1276,13 @@ public final class SidebarViewModel: ObservableObject {
 
     private func refreshTokenSaverDistillService(modelValidation: TokenSaverModelValidation) {
         guard let context else { return }
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: settingsStore.load().tokenSaverEnabled)
-        context.tokenSaverDistillServiceController.startIfEligible(
-            session: PrivateAccountSessionStore(repo: context.settingsRepo).load(),
-            settings: settingsStore.load(),
-            modelValidation: modelValidation
+        let outcome = context.applyTokenSaverLifecycle(
+            requestedEnabled: settingsStore.load().tokenSaverEnabled,
+            modelValidation: modelValidation,
+            persistPreference: true
         )
+        tokenSaverEnabled = outcome.isEnabled
+        graphifyRuntimeActive = settingsStore.load().isGraphifyRuntimeActive
     }
 
     /// Returns the number of free bytes on the volume that hosts the home
@@ -3375,13 +3436,36 @@ public struct SidebarRootView: View {
                         .accessibilityLabel("Refreshing usage data")
                         .accessibilityIdentifier("sidebar.tokenSaver.usageRefreshSpinner")
                 }
-                Text(Self.lastUpdatedLabel(vm.tokenSaverAccountUsageLastUpdated, now: Date()))
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineLimit(1)
-                    .accessibilityIdentifier("sidebar.tokenSaver.lastUpdated")
+                TimelineView(.periodic(from: .now, by: 60)) { timeline in
+                    Text(Self.accountUsageLastUpdatedLabel(
+                        vm.tokenSaverAccountUsageLastUpdated,
+                        now: timeline.date
+                    ))
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .lineLimit(1)
+                }
+                .accessibilityIdentifier("sidebar.tokenSaver.lastUpdated")
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
+
+            if let localUpdate = vm.tokenSaverLocalUsageUpdate {
+                HStack(alignment: .firstTextBaseline, spacing: DS.Space.xs) {
+                    Image(systemName: "waveform.path.ecg")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(DS.Palette.success)
+                    TimelineView(.periodic(from: .now, by: 60)) { timeline in
+                        Text(Self.localUsageUpdateLabel(localUpdate, now: timeline.date))
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.success)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("sidebar.tokenSaver.localUsageUpdate")
+            }
 
             if let label = Self.sidecarStatusLabel(vm.sidecarStatus) {
                 HStack(spacing: DS.Space.xs) {
@@ -4287,6 +4371,44 @@ public struct SidebarRootView: View {
         let hours = mins / 60
         if hours < 24 { return "Updated \(hours)h ago" }
         return "Updated 24h+ ago"
+    }
+
+    /// Labels the slow provider-account probe explicitly so it cannot be mistaken
+    /// for the local per-run usage signal shown elsewhere in the popover.
+    nonisolated public static func accountUsageLastUpdatedLabel(
+        _ date: Date?,
+        now: Date
+    ) -> String {
+        let label = lastUpdatedLabel(date, now: now)
+        guard label != "Never" else { return "Account usage not refreshed" }
+        return label.replacingOccurrences(
+            of: "Updated",
+            with: "Account usage updated",
+            options: [.anchored]
+        )
+    }
+
+    /// Honest local-ledger activity copy. This reports provider tokens observed by
+    /// RemoteCode, never projected savings or a rounded provider-account percentage.
+    nonisolated public static func localUsageUpdateLabel(
+        _ update: SidebarViewModel.TokenSaverLocalUsageUpdate,
+        now: Date
+    ) -> String {
+        let order: [AgentProvider] = [.claude, .codex, .grok]
+        let providerParts = order.compactMap { provider -> String? in
+            guard let delta = update.providerTokenDeltas[provider], delta > 0 else { return nil }
+            let title: String
+            switch provider {
+            case .claude: title = "Claude"
+            case .codex: title = "Codex"
+            case .grok: title = "Grok"
+            }
+            return "\(title) +\(formatTokenCountPublic(delta))"
+        }
+        guard !providerParts.isEmpty else { return "Local usage unchanged" }
+        let relative = lastUpdatedLabel(update.updatedAt, now: now)
+            .replacingOccurrences(of: "Updated ", with: "", options: [.anchored])
+        return "Local usage · \(providerParts.joined(separator: ", ")) tokens · \(relative)"
     }
 
     /// :195 -- Accessible description of the activity rings for VoiceOver.

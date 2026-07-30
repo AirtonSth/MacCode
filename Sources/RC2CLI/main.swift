@@ -110,7 +110,7 @@ let subcommandHelp: [String: String] = [
     "notification":   "Usage: \(prog) notification <subcommand> [args...]\n\n  Subcommands: create list mark-read dismiss",
     "browser":        "Usage: \(prog) browser <subcommand> [args...]\n\n  Subcommands: navigate back forward reload url snapshot click focus hover check uncheck fill type select wait screenshot eval",
     "agent":          "Usage: \(prog) agent <subcommand> [args...]\n\n  Subcommands:\n    open --workspace WID\n    thread list [--workspace WID]\n    thread create [--workspace WID] [--title T] [--provider codex|claude] [--model M]\n    send --thread TID --text TEXT [--provider P] [--model M]\n    stop --thread TID\n    models [--provider codex|claude]",
-    "agent-app":      "Usage: \(prog) agent-app <codex|claude|grok> [PROMPT] [--prompt-file PATH] [--workspace WID] [--model M] [--permission supervised|auto_accept_edits|full_access] [--reasoning-effort LEVEL] [--turn-timeout MS] [--output-format text|json|grok-json]\n\n  Runs a persisted headless turn through the same Agent App pipeline as the UI.",
+    "agent-app":      "Usage: \(prog) agent-app <codex|claude|grok> [PROMPT] [--prompt-file PATH] [--workspace WID] [--model M] [--permission supervised|auto_accept_edits|full_access] [--reasoning-effort LEVEL] [--turn-timeout MS] [--output-format text|json|grok-json]\n\n  Runs a persisted headless turn through the same Agent App pipeline as the UI. Runtime profiles are reserved for RemoteCode's managed provider bridge.",
 ]
 
 var rest: [String] = []
@@ -148,13 +148,23 @@ struct RPC {
 
     func call(_ method: String, params: [String: Any]) -> [String: Any] {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        if fd < 0 { return ["error": ["code": -1, "message": "socket(): \(String(cString: strerror(errno)))"]] }
+        if fd < 0 {
+            return ["error": [
+                "code": -1,
+                "message": "socket(): \(String(cString: strerror(errno)))",
+                "_mutation_delivery": "definite"
+            ]]
+        }
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let maxPath = MemoryLayout.size(ofValue: addr.sun_path)
         let bytes = socketPath.utf8CString
         if bytes.count > maxPath {
-            return ["error": ["code": -1, "message": "socket path too long"]]
+            return ["error": [
+                "code": -1,
+                "message": "socket path too long",
+                "_mutation_delivery": "definite"
+            ]]
         }
         withUnsafeMutablePointer(to: &addr.sun_path) { tp in
             tp.withMemoryRebound(to: CChar.self, capacity: maxPath) { tbase in
@@ -175,7 +185,12 @@ struct RPC {
             let channelHint = envChannel != "stable"
                 ? " (tip: set RC2_CHANNEL=stable if using the App Store build)"
                 : ""
-            return ["error": ["code": -1, "message": "connect(\(socketPath)): \(msg). Is the RemoteCode app running?\(channelHint)", "_connect_failure": true]]
+            return ["error": [
+                "code": -1,
+                "message": "connect(\(socketPath)): \(msg). Is the RemoteCode app running?\(channelHint)",
+                "_connect_failure": true,
+                "_mutation_delivery": "definite"
+            ]]
         }
         // Apply receive timeout when requested via --timeout MS.
         if let ms = receiveTimeoutMS {
@@ -192,30 +207,56 @@ struct RPC {
             "params": params
         ]
         guard var data = try? JSONSerialization.data(withJSONObject: payload, options: []) else {
-            return ["error": ["code": -1, "message": "serialize failed"]]
+            return ["error": [
+                "code": -1,
+                "message": "serialize failed",
+                "_mutation_delivery": "definite"
+            ]]
         }
         data.append(0x0A)
         let writeResult = RC2CLIWriteLoop.writeAll(fd: fd, data: data)
-        if !writeResult.success { return ["error": ["code": -1, "message": "write failed"]] }
+        if !writeResult.success {
+            return ["error": [
+                "code": -1,
+                "message": "write failed",
+                "_mutation_delivery": "ambiguous"
+            ]]
+        }
         // read until newline
         var buf = Data()
         var tmp = [UInt8](repeating: 0, count: 4096)
         while true {
             let n = read(fd, &tmp, tmp.count)
             if n == 0 {
-                return ["error": ["code": -1, "message": RC2CLIDiagnostics.responseClosedBeforeReply()]]
+                return ["error": [
+                    "code": -1,
+                    "message": RC2CLIDiagnostics.responseClosedBeforeReply(),
+                    "_mutation_delivery": "ambiguous"
+                ]]
             }
             if n < 0 {
                 if (errno == EAGAIN || errno == EWOULDBLOCK), let receiveTimeoutMS {
-                    return ["error": ["code": -1, "message": RC2CLIDiagnostics.responseTimedOut(afterMilliseconds: receiveTimeoutMS)]]
+                    return ["error": [
+                        "code": -1,
+                        "message": RC2CLIDiagnostics.responseTimedOut(afterMilliseconds: receiveTimeoutMS),
+                        "_mutation_delivery": "ambiguous"
+                    ]]
                 }
-                return ["error": ["code": -1, "message": "read failed: \(String(cString: strerror(errno)))"]]
+                return ["error": [
+                    "code": -1,
+                    "message": "read failed: \(String(cString: strerror(errno)))",
+                    "_mutation_delivery": "ambiguous"
+                ]]
             }
             buf.append(tmp, count: n)
             if buf.last == 0x0A { break }
         }
         guard let any = try? JSONSerialization.jsonObject(with: buf) as? [String: Any] else {
-            return ["error": ["code": -1, "message": "decode failed: \(String(data: buf, encoding: .utf8) ?? "")"]]
+            return ["error": [
+                "code": -1,
+                "message": "decode failed: \(String(data: buf, encoding: .utf8) ?? "")",
+                "_mutation_delivery": "ambiguous"
+            ]]
         }
         return any
     }
@@ -239,14 +280,22 @@ if _timeoutResult.timeoutMS == nil, rest.first == "agent-app" {
 }
 let rpc = RPC(socketPath: socketPath, receiveTimeoutMS: receiveTimeoutMS)
 
-enum AgentAppCLIError: Error, LocalizedError {
-    case rpc(String)
+enum AgentAppCLIError: Error, LocalizedError, AgentAppMiddlewareSendFailure {
+    case rpc(String, AgentAppMiddlewareSendFailureDisposition)
     case invalidResponse
     case invalidPromptFile(String)
 
+    var agentAppMiddlewareSendFailureDisposition: AgentAppMiddlewareSendFailureDisposition {
+        switch self {
+        case .rpc(_, let disposition): return disposition
+        case .invalidResponse: return .ambiguous
+        case .invalidPromptFile: return .definite
+        }
+    }
+
     var errorDescription: String? {
         switch self {
-        case .rpc(let message): return message
+        case .rpc(let message, _): return message
         case .invalidResponse: return "RemoteCode returned an invalid RPC response."
         case .invalidPromptFile(let path): return "Could not read --prompt-file \(path)."
         }
@@ -293,7 +342,13 @@ func callAgentAppRPC(_ method: String, params: [String: AgentAppRPCValue]) throw
     }
     let response = rpc.call(method, params: params.mapValues(foundationValue))
     if let error = response["error"] as? [String: Any] {
-        throw AgentAppCLIError.rpc(error["message"] as? String ?? "RemoteCode RPC \(method) failed.")
+        let code = (error["code"] as? NSNumber)?.intValue
+        let definitelyNotAccepted = error["_mutation_delivery"] as? String == "definite"
+            || (code.map { $0 != -1 } ?? false)
+        throw AgentAppCLIError.rpc(
+            error["message"] as? String ?? "RemoteCode RPC \(method) failed.",
+            definitelyNotAccepted ? .definite : .ambiguous
+        )
     }
     guard let result = response["result"],
           let converted = agentAppRPCValue(result) else {
@@ -334,6 +389,7 @@ func emit(_ obj: Any) {
         if var dict = obj as? [String: Any],
            var errDict = dict["error"] as? [String: Any] {
             errDict.removeValue(forKey: "_connect_failure")
+            errDict.removeValue(forKey: "_mutation_delivery")
             dict["error"] = errDict
             cleaned = dict
         }
@@ -713,6 +769,32 @@ case "agent-app":
     let workspaceID = flags["workspace"]
         ?? environment["RC_TOKEN_SAVER_WORKSPACE_ID"]
         ?? environment["RC_REMOTE_CODE_WORKSPACE_ID"]
+    let parentRunID = environment["RC_REMOTE_CODE_ROOT_RUN_ID"]
+        ?? environment["RC_TOKEN_SAVER_ROOT_RUN_ID"]
+        ?? environment["RC_TOKEN_SAVER_ATTEMPT_ID"]
+    let parentThreadID = environment["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"]
+        ?? environment["RC_TOKEN_SAVER_THREAD_ID"]
+    let parentCapability =
+        environment[AgentDelegationCapabilityTransport.environmentKey]
+    guard AgentDelegationCapabilityTransport.permitsAgentAppLaunch(
+        middlewareEnabled: environment[
+            "RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE"
+        ] == "1",
+        parentRunID: parentRunID,
+        parentThreadID: parentThreadID,
+        parentCapability: parentCapability
+    ) else {
+        diagError(
+            "Managed agent-app delegation requires an active parent run, thread, and capability."
+        )
+    }
+    let subagentNodeID: String? = {
+        guard parentRunID != nil,
+              parentThreadID != nil,
+              parentCapability != nil else { return nil }
+        let suffix = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        return "nested.\(provider.rawValue).\(ProcessInfo.processInfo.processIdentifier).\(suffix.prefix(12))"
+    }()
     let permissionText = flags["permission"] ?? flags["permission-mode"] ?? "supervised"
     guard let permission = AgentPermissionMode(rawValue: permissionText.replacingOccurrences(of: "-", with: "_")) else {
         diagError("Invalid --permission \(permissionText).")
@@ -733,6 +815,10 @@ case "agent-app":
     guard ["text", "json", "grok-json"].contains(outputFormat) else {
         diagError("Invalid --output-format \(outputFormat).")
     }
+    let runtimeProfile = flags["runtime-profile"].flatMap(AgentAppRuntimeProfile.init)
+    if flags["runtime-profile"] != nil, runtimeProfile == nil {
+        diagError("Invalid managed Agent App runtime profile.")
+    }
     do {
         let output = try AgentAppMiddlewareWorkflow.execute(
             request: AgentAppMiddlewareRequest(
@@ -743,7 +829,12 @@ case "agent-app":
                 model: flags["model"],
                 permissionMode: permission,
                 reasoningEffort: effort,
-                serviceTier: tier
+                serviceTier: tier,
+                parentRunID: parentRunID,
+                parentThreadID: parentThreadID,
+                subagentNodeID: subagentNodeID,
+                parentCapability: parentCapability,
+                runtimeProfile: runtimeProfile
             ),
             maxPolls: maxPolls,
             call: callAgentAppRPC,

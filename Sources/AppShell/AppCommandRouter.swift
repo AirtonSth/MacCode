@@ -2106,26 +2106,100 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
+    private func validatedNestedParent(
+        _ nestedRunContext: AgentNestedRunContext,
+        requestedWorkspace: WorkspaceID?,
+        requestedPermissionMode: AgentPermissionMode
+    ) throws -> AgentThread {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        let parentRun = try ctx.runRepo.get(id: nestedRunContext.parentRunID)
+        let parentReceipt = try ctx.orchestrationRuntime.activeReceipt(
+            runId: nestedRunContext.parentRunID,
+            threadId: nestedRunContext.parentThreadID,
+            delegationCapability: nestedRunContext.parentCapability
+        )
+        let persistedRunIsActive = parentRun.map {
+            $0.threadId == nestedRunContext.parentThreadID
+                && ($0.status == .pending || $0.status == .running)
+        } ?? true
+        guard let parentReceipt,
+              persistedRunIsActive,
+              let parentThread = try ctx.threadRepo.get(id: nestedRunContext.parentThreadID),
+              requestedWorkspace == nil || requestedWorkspace == parentThread.workspaceId else {
+            throw JSONRPCError(
+                code: -32020,
+                message: "Nested Agent App parent is not active in this workspace.",
+                data: .object([
+                    "domain": .string("orchestration"),
+                    "kind": .string("invalid_parent")
+                ])
+            )
+        }
+        let parentEffectiveUID = parentThread.runAsUser?.uid ?? getuid()
+        guard parentEffectiveUID == getuid() else {
+            throw JSONRPCError(
+                code: -32020,
+                message: "Nested Agent App cannot cross the host IPC user boundary.",
+                data: .object([
+                    "domain": .string("orchestration"),
+                    "kind": .string("cross_user_parent")
+                ])
+            )
+        }
+        guard Self.permissionRank(requestedPermissionMode)
+                <= Self.permissionRank(parentReceipt.permissionMode) else {
+            throw JSONRPCError(
+                code: -32020,
+                message: "Child permission mode exceeds the parent.",
+                data: .object([
+                    "domain": .string("orchestration"),
+                    "kind": .string("invalid_child_admission")
+                ])
+            )
+        }
+        return parentThread
+    }
+
+    private static func permissionRank(_ mode: AgentPermissionMode) -> Int {
+        switch mode {
+        case .supervised: return 0
+        case .autoAcceptEdits: return 1
+        case .fullAccess: return 2
+        }
+    }
+
     /// Path B / scheduled: same create as Agent App, optional Auto routing config persisted
     /// so `startRun` admits through the shared orchestration path.
     ///
     /// - Parameter quiet: when true (scheduled headless fires), skip rail select and
     ///   `refreshFromState` so automatic work does not rebuild workspace UI or steal focus.
     ///   Still persists the thread and publishes `agent.thread.created`.
-    public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier = .auto, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, runAsUser: AgentRunAsUser? = nil, surfaceID: SurfaceID? = nil, routingConfiguration: AgentRoutingConfiguration?, quiet: Bool = false) throws -> AgentThread {
+    public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier = .auto, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, runAsUser: AgentRunAsUser? = nil, surfaceID: SurfaceID? = nil, routingConfiguration: AgentRoutingConfiguration?, quiet: Bool = false, inheriting parentThread: AgentThread? = nil) throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        let resolvedRunAs = resolveRunAsUser(runAsUser)
-        let t = AgentThread(workspaceId: workspace, title: title, provider: provider,
+        let resolvedWorkspace = parentThread?.workspaceId ?? workspace
+        let resolvedRunAs: AgentRunAsUser?
+        if let parentThread {
+            resolvedRunAs = parentThread.runAsUser
+        } else {
+            resolvedRunAs = resolveRunAsUser(runAsUser)
+        }
+        let t = AgentThread(projectId: parentThread?.projectId,
+                            workspaceId: resolvedWorkspace,
+                            title: title,
+                            provider: provider,
                             providerInstanceId: normalizedProviderInstanceId(provider: provider, requested: providerInstanceId),
                             model: model,
                             permissionMode: permissionMode, reasoningEffort: reasoningEffort,
+                            executionMode: parentThread?.executionMode ?? .local,
+                            baseBranch: parentThread?.baseBranch,
+                            worktreePath: parentThread?.worktreePath,
                             serviceTier: serviceTier,
                             modelSelection: modelSelection ?? AgentModelSelection(provider: provider, modelId: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier),
                             runAsUser: resolvedRunAs,
                             routingConfiguration: routingConfiguration)
         try ctx.threadRepo.upsert(t)
-        if let workspace {
-            _ = try? ctx.threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspace)
+        if let resolvedWorkspace {
+            _ = try? ctx.threadRepo.enforceWorkspaceThreadLimit(workspaceId: resolvedWorkspace)
         }
         if !quiet {
             // Only bind/select the new thread on the requesting surface (if any).
@@ -2137,13 +2211,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // subscribers (including Agent App surfaces that listen for thread.*)
         // see scheduled / RPC-created threads immediately.
         EventBus.shared.publish(kind: "agent.thread.created", payload: agentThreadPayload(t))
-        softGraphifyPreflight(workspace: workspace)
+        softGraphifyPreflight(workspace: resolvedWorkspace)
         return t
     }
 
-    public func createAgentThreadRouting(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?, routing: AgentRoutingRequest?) async throws -> AgentThread {
+    public func createAgentThreadRouting(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?, routing: AgentRoutingRequest?, nestedRunContext: AgentNestedRunContext? = nil) async throws -> AgentThread {
+        let parentThread = try nestedRunContext.map {
+            try validatedNestedParent(
+                $0,
+                requestedWorkspace: workspace,
+                requestedPermissionMode: permissionMode
+            )
+        }
         guard let routing else {
-            return try createAgentThread(workspace: workspace, title: title, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser, surfaceID: surfaceID)
+            return try createAgentThread(workspace: workspace, title: title, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser, surfaceID: surfaceID, routingConfiguration: nil, inheriting: parentThread)
         }
         guard let ctx = context, let manualSelection = routing.manualSelection else {
             throw JSONRPCError.invalidParams
@@ -2162,15 +2243,25 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             manualSelection: manualSelection,
             manualProviderInstanceId: manualInstance
         )
-        let resolvedRunAs = resolveRunAsUser(runAsUser)
+        let resolvedWorkspace = parentThread?.workspaceId ?? workspace
+        let resolvedRunAs: AgentRunAsUser?
+        if let parentThread {
+            resolvedRunAs = parentThread.runAsUser
+        } else {
+            resolvedRunAs = resolveRunAsUser(runAsUser)
+        }
         let thread = AgentThread(
-            workspaceId: workspace,
+            projectId: parentThread?.projectId,
+            workspaceId: resolvedWorkspace,
             title: title,
             provider: manualSelection.provider,
             providerInstanceId: manualInstance,
             model: manualSelection.effectiveModel,
             permissionMode: permissionMode,
             reasoningEffort: manualSelection.reasoningEffort,
+            executionMode: parentThread?.executionMode ?? .local,
+            baseBranch: parentThread?.baseBranch,
+            worktreePath: parentThread?.worktreePath,
             serviceTier: manualSelection.serviceTier,
             modelSelection: manualSelection,
             runAsUser: resolvedRunAs,
@@ -2761,7 +2852,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
-    public func sendAgentMessageRouting(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], routing: AgentRoutingRequest?) async throws -> AgentMessageSendResult {
+    public func sendAgentMessageRouting(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], routing: AgentRoutingRequest?, nestedRunContext: AgentNestedRunContext? = nil) async throws -> AgentMessageSendResult {
         guard let ctx = context, let currentThread = try ctx.threadRepo.get(id: thread) else {
             throw LayoutError.workspaceNotFound
         }
@@ -2800,7 +2891,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             providerInstanceId: providerInstanceId,
             attachments: attachments,
             queueMessageId: nil,
-            routingConfiguration: currentThread.routingConfiguration
+            routingConfiguration: currentThread.routingConfiguration,
+            nestedRunContext: nestedRunContext
         )
     }
 
@@ -2836,7 +2928,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil) async throws -> AgentMessageSendResult {
+    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard let existing = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
         let effectiveRouting = orchestrationRoutingSnapshot?.configuration
@@ -2930,25 +3022,23 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 ctx.unregisterQueueDispatchAcceptancePermit(acceptancePermit, threadId: thread)
             }
         }
-        let req = AgentRunRequest(
-            runId: queueMessageId.map { AgentRunID($0.value) } ?? AgentRunID(),
-            threadId: thread,
-            provider: prov,
-            providerInstanceId: t.providerInstanceId,
-            model: m,
-            cwd: cwd,
-            prompt: text,
-            attachments: resolvedAttachments,
-            providerThreadId: t.providerThreadId,
-            permissionMode: t.permissionMode,
-            reasoningEffort: t.reasoningEffort,
-            serviceTier: t.serviceTier,
-            interactionMode: interactionMode ?? .default,
-            providerBinary: autoRoutingActive ? nil : providerBinary(provider: prov, instanceId: t.providerInstanceId),
-            environment: graphifyEnv,
-            runAsUser: t.runAsUser,
-            acceptancePermit: acceptancePermit
+        var providerRunEnvironment = graphifyEnv
+        providerRunEnvironment.removeValue(
+            forKey: AgentAppRuntimeProfile.environmentKey
         )
+        if let runtimeProfile = nestedRunContext?.runtimeProfile {
+            guard runtimeProfile == .samGrokWorkerV1,
+                  prov == .grok,
+                  m == "grok-4.5",
+                  t.permissionMode == .autoAcceptEdits,
+                  [.low, .medium, .high, .xhigh, .max].contains(t.reasoningEffort),
+                  t.providerThreadId == nil else {
+                throw JSONRPCError.invalidParams
+            }
+            providerRunEnvironment[AgentAppRuntimeProfile.environmentKey] =
+                runtimeProfile.rawValue
+        }
+        let requestedRunID = queueMessageId.map { AgentRunID($0.value) } ?? AgentRunID()
         // Prefer a full orchestration snapshot (scheduled Path B / Auto admit)
         // so launch binary+catalog match preflight. Queued messages only carry
         // the lightweight admission fields and refill provider snapshots at start.
@@ -2972,7 +3062,106 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 throw CancellationError()
             }
         }
-        let runId = try await ctx.coordinator.startRun(req, routingSnapshot: coordinatorSnapshot)
+        var nestedReceiptRegistered = false
+        if let nestedRunContext {
+            let parentThread = try validatedNestedParent(
+                nestedRunContext,
+                requestedWorkspace: t.workspaceId,
+                requestedPermissionMode: t.permissionMode
+            )
+            guard t.workspaceId == parentThread.workspaceId,
+                  t.projectId == parentThread.projectId,
+                  t.runAsUser == parentThread.runAsUser,
+                  t.executionMode == parentThread.executionMode,
+                  t.worktreePath == parentThread.worktreePath else {
+                throw JSONRPCError(
+                    code: -32020,
+                    message: "Nested Agent App child scope does not match its parent.",
+                    data: .object([
+                        "domain": .string("orchestration"),
+                        "kind": .string("invalid_child_scope")
+                    ])
+                )
+            }
+            do {
+                let childCapability = AgentDelegationCapability.issue()
+                _ = try ctx.orchestrationRuntime.recordAuthorizedExternalChild(
+                    runId: requestedRunID,
+                    threadId: t.id,
+                    provider: prov,
+                    providerInstanceId: t.providerInstanceId ?? prov.rawValue,
+                    model: m,
+                    nodeId: nestedRunContext.nodeID,
+                    parentRunId: nestedRunContext.parentRunID,
+                    parentThreadId: nestedRunContext.parentThreadID,
+                    parentCapability: nestedRunContext.parentCapability,
+                    childCapability: childCapability,
+                    requestedPermissionMode: t.permissionMode
+                )
+                providerRunEnvironment[
+                    AgentDelegationCapabilityTransport.environmentKey
+                ] = childCapability
+                nestedReceiptRegistered = true
+            } catch let error as AgentOrchestrationAdmissionError {
+                let kind: String
+                switch error {
+                case .invalidChildAdmission:
+                    kind = "invalid_child_admission"
+                case .receiptPersistenceFailed:
+                    kind = "receipt_persistence_failed"
+                default:
+                    kind = "nested_admission_failed"
+                }
+                throw JSONRPCError(
+                    code: -32020,
+                    message: error.description,
+                    data: .object([
+                        "domain": .string("orchestration"),
+                        "kind": .string(kind)
+                    ])
+                )
+            } catch {
+                throw JSONRPCError(
+                    code: -32020,
+                    message: "Nested Agent App receipt could not be persisted.",
+                    data: .object([
+                        "domain": .string("orchestration"),
+                        "kind": .string("receipt_persistence_failed")
+                    ])
+                )
+            }
+        }
+        let req = AgentRunRequest(
+            runId: requestedRunID,
+            threadId: thread,
+            provider: prov,
+            providerInstanceId: t.providerInstanceId,
+            model: m,
+            cwd: cwd,
+            prompt: text,
+            attachments: resolvedAttachments,
+            providerThreadId: t.providerThreadId,
+            permissionMode: t.permissionMode,
+            reasoningEffort: t.reasoningEffort,
+            serviceTier: t.serviceTier,
+            interactionMode: interactionMode ?? .default,
+            providerBinary: autoRoutingActive ? nil : providerBinary(provider: prov, instanceId: t.providerInstanceId),
+            environment: providerRunEnvironment,
+            runAsUser: t.runAsUser,
+            acceptancePermit: acceptancePermit
+        )
+        let runId: AgentRunID
+        do {
+            runId = try await ctx.coordinator.startRun(req, routingSnapshot: coordinatorSnapshot)
+        } catch {
+            if nestedReceiptRegistered {
+                try? ctx.orchestrationRuntime.finalizeReceipt(
+                    runId: req.runId,
+                    status: .failed
+                )
+            }
+            throw error
+        }
         // HC-5 (R1): a message sent from the mobile mirror / RPC must become
         // visible on the Mac host. Refresh every Agent App rail so the thread
         // list + running state update, and re-load the transcript ONLY on
@@ -3294,19 +3483,29 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let ctx = context, let workspace else { return }
         let settings = SettingsStore(db: ctx.db).load()
         // Token Saver is the paid gate; Graphify is a sub-capability under it.
-        guard settings.isGraphifyRuntimeActive else { return }
+        guard ctx.isTokenSaverRuntimeActive(settings: settings),
+              settings.isGraphifyRuntimeActive else { return }
         configureGraphifyService(from: settings)
         let cwd = ctx.state.workspaces[workspace]?.cwd ?? FileManager.default.currentDirectoryPath
-        let set = GraphifyWorkspaceService.shared.softPreflight(
-            workspaceCwd: cwd,
-            pinnedRoots: settings.graphifyPinnedRoots
-        )
-        publishGraphifyWorkingSet(set, threadId: nil)
+        let pinnedRoots = settings.graphifyPinnedRoots
+        // Thread creation is an acknowledgement boundary for local RPC. Binary
+        // ensure and repository probing can take seconds and must not hold the
+        // MainActor or the Unix request open after the thread is durable.
+        Task.detached(priority: .utility) { [weak self] in
+            let set = GraphifyWorkspaceService.shared.softPreflight(
+                workspaceCwd: cwd,
+                pinnedRoots: pinnedRoots
+            )
+            await MainActor.run {
+                self?.publishGraphifyWorkingSet(set, threadId: nil)
+            }
+        }
     }
 
     private func configureGraphifyService(from settings: AppSettings) {
         let svc = GraphifyWorkspaceService.shared
-        let active = settings.isGraphifyRuntimeActive
+        let active = context?.isTokenSaverRuntimeActive(settings: settings) == true
+            && settings.isGraphifyRuntimeActive
         svc.enabled = active
         svc.autoEnsure = active && settings.graphifyAutoEnsure
         svc.writeInRepo = settings.graphifyWriteInRepo
@@ -3326,7 +3525,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     ) async -> [String: String] {
         guard let ctx = context else { return baseEnvironment }
         let settings = SettingsStore(db: ctx.db).load()
-        guard settings.isGraphifyRuntimeActive else { return baseEnvironment }
+        guard ctx.isTokenSaverRuntimeActive(settings: settings),
+              settings.isGraphifyRuntimeActive else { return baseEnvironment }
         configureGraphifyService(from: settings)
 
         let workspaceCwd = ctx.state.workspaces.first { $0.value.id == thread.workspaceId }?.value.cwd ?? cwd
@@ -4480,7 +4680,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             // Nested provider proxies (`grok`/`claude`/`codex` in managed bin) must resolve
             // for every thread-scoped provider environment — not only when Token Saver is on.
             // Token Saver command-compression wrappers remain gated by admission below.
-            let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+            let managedBin = env["RC_REMOTE_CODE_MANAGED_BIN"]
+                ?? AgentSkillInstaller.defaultManagedCLIBinDirectory().path
             let basePath = env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
             env["PATH"] = Self.providerPathWithManagedWrappers(
                 currentPath: basePath,

@@ -69,6 +69,7 @@ RUN_AS_USER_HELPER="$BIN_DIR/RemoteCodeRunAsUserHelper"
 MLX_METALLIB="$BIN_DIR/mlx.metallib"
 if [ ! -x "$BIN" ]; then echo "missing $BIN"; exit 1; fi
 if [ ! -x "$SCHEDULED_TASK_AGENT" ]; then echo "missing $SCHEDULED_TASK_AGENT"; exit 1; fi
+if [ ! -x "$CLI" ]; then echo "missing $CLI"; exit 1; fi
 if [ ! -x "$DISTILL_SERVICE" ]; then echo "missing $DISTILL_SERVICE"; exit 1; fi
 if [ ! -x "$RUN_AS_USER_HELPER" ]; then echo "missing $RUN_AS_USER_HELPER"; exit 1; fi
 scripts/build-mlx-metallib.sh "$MLX_METALLIB"
@@ -121,9 +122,7 @@ cp "$DISTILL_SERVICE" "$STAGING_APP/Contents/MacOS/RemoteCodeDistillService"
 # bundle; install to /Library/PrivilegedHelperTools with root ownership for use.
 cp "$RUN_AS_USER_HELPER" "$STAGING_APP/Contents/MacOS/RemoteCodeRunAsUserHelper"
 cp "$MLX_METALLIB" "$STAGING_APP/Contents/MacOS/mlx.metallib"
-if [ -x "$CLI" ]; then
-  cp "$CLI" "$STAGING_APP/Contents/MacOS/rc2"
-fi
+cp "$CLI" "$STAGING_APP/Contents/MacOS/rc2"
 # Canonical location only. Do NOT copy resource bundles to the .app root:
 # codesign rejects that as "unsealed contents present in the bundle root".
 # SPM's generated Bundle.module looks at the app root and fatalErrors — never

@@ -2677,6 +2677,8 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(usage.inputTokens, 120)
         XCTAssertEqual(usage.outputTokens, 6)
         XCTAssertEqual(usage.totalTokens, 126)
+        XCTAssertEqual(usage.resolvedSemantics, .cumulative,
+                       "app-server token usage updates replace the prior turn snapshot")
         XCTAssertEqual(usage.reportedCostMicros, 4_200,
                        "Codex monetary receipts must be preserved when the app-server provides one")
         XCTAssertEqual(usage.contextWindow, 258400)

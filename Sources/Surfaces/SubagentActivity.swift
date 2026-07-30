@@ -330,6 +330,9 @@ public enum SubagentActivityProjection {
         case .accepted:
             return .working
         case .unknown:
+            if AgentOrchestrationRuntime.isExternalReceipt(receipt) {
+                return .unknown
+            }
             if let runId = receipt.runId, activeRunIds.contains(runId) {
                 return .working
             }
@@ -357,6 +360,9 @@ public enum SubagentActivityProjection {
         case .accepted:
             return true
         case .unknown:
+            if AgentOrchestrationRuntime.isExternalReceipt(receipt) {
+                return false
+            }
             // Coordinator still owns the run → treat as active; otherwise stay
             // out of Done so we do not claim terminal success from uncertainty.
             if let runId = receipt.runId, activeRunIds.contains(runId) {

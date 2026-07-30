@@ -337,6 +337,11 @@ final class TokenSaverAppContextTests: XCTestCase {
             appSupportDirectory: appSupportURL.path
         )
         let (_, recoveryDB) = try Bootstrap(channel: .debug, appSupportOverride: appSupportURL.path).run()
+        SettingsStore(db: recoveryDB).update { $0.tokenSaverEnabled = true }
+        try SettingsRepository(db: recoveryDB).set(
+            "private.account.session",
+            #"{"user":{"subscribed":true}}"#
+        )
         let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
         let server = DistillHTTPServer(
             configuration: configuration,
@@ -369,14 +374,18 @@ final class TokenSaverAppContextTests: XCTestCase {
         process.standardInput = stdin
         process.standardOutput = stdout
         process.standardError = stderr
-        process.environment = CodexRunner.processEnvironment(overrides: [
+        var cliEnvironment = ProcessInfo.processInfo.environment
+        for (key, value) in [
             "REMOTE_CODE_DISTILL_STATE_PATH": stateURL.path,
             "REMOTE_CODE_AGENT_PROVIDER": "codex",
             "RC_TOKEN_SAVER_WORKSPACE_ID": "workspace",
             "RC_TOKEN_SAVER_PROJECT_ID": "project",
             "RC_TOKEN_SAVER_THREAD_ID": "thread",
             "RC_TOKEN_SAVER_ATTEMPT_ID": "attempt",
-        ], purpose: .supportProcess)
+        ] {
+            cliEnvironment[key] = value
+        }
+        process.environment = cliEnvironment
 
         try process.run()
         stdin.fileHandleForWriting.write(Data("unit tests passed\nno failures\n".utf8))
@@ -395,7 +404,7 @@ final class TokenSaverAppContextTests: XCTestCase {
                        "the provider-visible CLI path must never hit the old TypeScript checkout")
     }
 
-    func test_appContextLaunchInstallsAppPrivateDistillWhenTokenSaverEnabled() throws {
+    func test_appContextInstallsAppPrivateDistillWhenEntitledAndModelReady() throws {
         let appSupport = NSTemporaryDirectory() + "RC2ManagedSkillsLaunchOn-" + UUID().uuidString
         let home = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2ManagedSkillsLaunchHome-" + UUID().uuidString, isDirectory: true)
@@ -404,17 +413,23 @@ final class TokenSaverAppContextTests: XCTestCase {
         let appPrivateSkill = URL(fileURLWithPath: appSupport, isDirectory: true)
             .appendingPathComponent("AgentSkills/distill/SKILL.md")
 
-        let seedContext = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: seedContext.db).save(AppSettings(tokenSaverEnabled: true))
-
         let launchedContext = try AppContext(
             channel: .debug,
             appSupportOverride: appSupport,
             agentSkillsHomeOverrideForTesting: home
         )
+        savePrivateSession(in: launchedContext)
+        XCTAssertEqual(
+            launchedContext.applyTokenSaverLifecycle(
+                requestedEnabled: true,
+                modelValidation: .installed,
+                persistPreference: true
+            ),
+            .enabled
+        )
 
         XCTAssertEqual(launchedContext.managedDistillSkillInstallResults.count, 1,
-                       "Token Saver on at launch installs a single app-private Distill package")
+                       "an entitled, model-ready Token Saver installs one app-private Distill package")
         XCTAssertTrue(FileManager.default.fileExists(atPath: appPrivateSkill.path),
                       "Distill lives under RemoteCode Application Support, not provider homes")
         XCTAssertFalse(FileManager.default.fileExists(atPath: skillURLs.codex.path),
@@ -694,7 +709,7 @@ final class TokenSaverAppContextTests: XCTestCase {
         let log = logDir.appendingPathComponent("unified.jsonl")
         let body = """
         {"msg":"noise"}
-        {"msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":61.0,"billingPeriodEnd":"2026-07-22T20:46:41.975270+00:00"}}}
+        {"msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":61.0,"billingPeriodEnd":"2099-07-22T20:46:41.975270+00:00"}}}
         """
         try body.write(to: log, atomically: true, encoding: .utf8)
 
@@ -1522,7 +1537,7 @@ final class TokenSaverAppContextTests: XCTestCase {
             threadId: thread.id,
             provider: .claude,
             model: "m",
-            status: .completed,
+            status: .running,
             errorMessage: "near context limit: replayed redundant tool output"
         )
         try context.runRepo.upsert(run)
@@ -1793,11 +1808,28 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertEqual(capsules.columnInt64(0), 0)
     }
 
-    func test_offLaneSR1IsHumanizedWithoutTokenSaverWriters() async throws {
+    func test_tokenSaverOffKeepsSR1ByteIdenticalWithoutClientOrLedgerWrites() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2SR1OffLane-" + UUID().uuidString
         let context = try AppContext(
             channel: .debug,
-            appSupportOverride: NSTemporaryDirectory() + "RC2SR1OffLane-" + UUID().uuidString
+            appSupportOverride: appSupport
         )
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = false }
+
+        let runtime = CountingEchoRuntime()
+        let configuration = try DistillServiceConfiguration(
+            authToken: "off-lane-token",
+            appSupportDirectory: appSupport
+        )
+        let scheduler = DistillScheduler(runtime: runtime, maxConcurrentRequests: 1)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+        context.distillClientOverrideForTesting = DistillServiceClient(
+            ready: ready,
+            authToken: "off-lane-token"
+        )
+
         let thread = AgentThread(title: "off lane", provider: .grok, model: "test", status: .completed)
         try context.threadRepo.upsert(thread)
         let sr1 = """
@@ -1808,11 +1840,23 @@ final class TokenSaverAppContextTests: XCTestCase {
 
         let result = await context.tokenSaverHumanizeSR1Response(sr1, provider: .grok, threadId: thread.id)
 
-        XCTAssertFalse(SR1ResponseDetector.isSR1(result))
+        XCTAssertEqual(result, sr1, "Token Saver OFF must preserve provider bytes exactly")
+        let clientCallCount = await runtime.callCount
+        XCTAssertEqual(clientCallCount, 0, "an already-live sidecar client must not be called")
         XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0)
+        XCTAssertEqual(
+            TokenSaverUsageStore(
+                appSupportDirectory: URL(fileURLWithPath: appSupport, isDirectory: true)
+            ).load().usedTokens,
+            0,
+            "SR1 rewrite gating must not synthesize local provider usage"
+        )
         let attempts = try context.db.prepare("SELECT COUNT(*) FROM token_saver_attempts;")
         XCTAssertTrue(try attempts.step())
         XCTAssertEqual(attempts.columnInt64(0), 0)
+        let auditEvents = try context.db.prepare("SELECT COUNT(*) FROM token_saver_audit_events;")
+        XCTAssertTrue(try auditEvents.step())
+        XCTAssertEqual(auditEvents.columnInt64(0), 0)
     }
 
     func test_tokenSaverHumanizesSR1FinalResponseThroughDistillClientInUserLanguage() async throws {
@@ -2136,11 +2180,11 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertEqual(attempt.provider, AgentProvider.grok.rawValue)
         XCTAssertEqual(attempt.model, "grok-test")
         XCTAssertEqual(attempt.evidenceLevel, "provider_usage")
-        XCTAssertTrue(attempt.unavailableFields.contains("provider_usage_semantics"))
+        XCTAssertFalse(attempt.unavailableFields.contains("provider_usage_semantics"))
         let events = try context.tokenSaverAttemptLedger.events(attemptID: attemptID)
         XCTAssertEqual(events.map(\.kind), ["provider_usage"])
         XCTAssertTrue(events[0].payloadJSON.contains("\"total_tokens\":200"))
-        XCTAssertTrue(events[0].payloadJSON.contains("\"semantics\":\"unavailable\""))
+        XCTAssertTrue(events[0].payloadJSON.contains("\"semantics\":\"cumulative\""))
         let components = try context.db.prepare("SELECT category, tokens FROM token_saver_input_components WHERE attempt_id = ?;")
         try components.bind(1, attemptID)
         XCTAssertTrue(try components.step())
@@ -2149,6 +2193,91 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0)
         let laneStates = try context.tokenSaverLaneStateRepo.list(projectID: thread.projectId!.value.uuidString)
         XCTAssertEqual(laneStates.first(where: { $0.lane == "deterministic_wrapper" })?.state, "promoted")
+    }
+
+    func test_providerUsageEvidenceKeepsRawEventsButRecordsOnlyReconciledInputGrowth() throws {
+        // WHY: Claude can emit independent request charges followed by a
+        // cumulative result. Raw audit events remain append-only, but Pareto
+        // components must represent the effective 260-token run, not 510 tokens
+        // from naively summing every snapshot.
+        let context = try AppContext(
+            channel: .debug,
+            appSupportOverride: NSTemporaryDirectory()
+                + "RC2TokenSaverReconciledEvidence-"
+                + UUID().uuidString
+        )
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        let thread = AgentThread(
+            projectId: ProjectID(),
+            workspaceId: WorkspaceID(),
+            title: "mixed usage evidence",
+            provider: .claude,
+            model: "claude-test"
+        )
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "claude-test",
+            status: .running,
+            startedAt: Date()
+        )
+        try context.runRepo.upsert(run)
+        try admitTokenSaver(in: context, threadID: thread.id)
+        try context.tokenSaverLaneStateRepo.upsert(.init(
+            projectID: thread.projectId!.value.uuidString,
+            lane: "measurement",
+            state: "shadow_only",
+            reason: "test_measurement",
+            evidenceLevel: "provider_usage",
+            ownerRole: "Measurement Owner:test",
+            permissionBoundary: "project",
+            retentionDays: 0,
+            optedOut: false,
+            killSwitchActive: false
+        ))
+        context.coordinator.onRunStarted?(thread.id, run.id)
+
+        for usage in [
+            AssistantTokenUsage(
+                inputTokens: 100,
+                totalTokens: 100,
+                semantics: .incremental
+            ),
+            AssistantTokenUsage(
+                inputTokens: 150,
+                totalTokens: 150,
+                semantics: .incremental
+            ),
+            AssistantTokenUsage(
+                inputTokens: 260,
+                totalTokens: 260,
+                semantics: .cumulative
+            ),
+        ] {
+            context.coordinator.onAssistantEvent?(.tokenUsage(usage), thread.id, run.id)
+        }
+
+        let attemptID = run.id.value.uuidString
+        let events = try context.tokenSaverAttemptLedger.events(attemptID: attemptID)
+        XCTAssertEqual(events.map(\.kind), [
+            "provider_usage",
+            "provider_usage",
+            "provider_usage",
+        ], "raw provider observations stay append-only")
+        XCTAssertTrue(events[0].payloadJSON.contains("\"semantics\":\"incremental\""))
+        XCTAssertTrue(events[2].payloadJSON.contains("\"semantics\":\"cumulative\""))
+
+        let components = try context.db.prepare("""
+            SELECT COUNT(*), COALESCE(SUM(tokens), 0)
+            FROM token_saver_input_components
+            WHERE attempt_id = ? AND category = 'unattributed_provider_input';
+        """)
+        try components.bind(1, attemptID)
+        XCTAssertTrue(try components.step())
+        XCTAssertEqual(components.columnInt64(0), 3)
+        XCTAssertEqual(components.columnInt64(1), 260)
+        XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0)
     }
 
     func test_shadowPreparationJoinsExactScopeAndRunsPoliciesWithoutChangingProviderBytes() async throws {

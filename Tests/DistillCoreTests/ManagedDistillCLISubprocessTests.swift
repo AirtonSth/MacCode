@@ -1,4 +1,6 @@
 import XCTest
+import CoreModel
+import Persistence
 @testable import DistillCore
 
 /// End-to-end proof of the NATIVE CLI: runs the actually-built RemoteCodeDistillService
@@ -30,42 +32,109 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         let ready = try await server.start()
         defer { server.stop() }
 
-        let stateURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("cli-state-\(UUID().uuidString).json")
-        let stateJSON = "{\"base_url\":\"\(ready.baseURL)\",\"auth_token\":\"tok\"}"
-        try Data(stateJSON.utf8).write(to: stateURL)
-        defer { try? FileManager.default.removeItem(at: stateURL) }
+        let supportURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("managed-distill-live-\(UUID().uuidString)", isDirectory: true)
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: supportURL.path).run()
+        let settings = SettingsStore(db: db)
+        settings.update { $0.tokenSaverEnabled = true }
+        let settingsRepository = SettingsRepository(db: db)
+        try settingsRepository.set(
+            "private.account.session",
+            #"{"user":{"subscribed":true}}"#
+        )
+        let stateURL = supportURL
+            .appendingPathComponent("Distill", isDirectory: true)
+            .appendingPathComponent("DistillCLIState.json")
+        try FileManager.default.createDirectory(
+            at: stateURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let stateJSON: [String: Any] = [
+            "base_url": ready.baseURL,
+            "auth_token": "tok",
+            "pid": ready.pid,
+        ]
+        try JSONSerialization.data(withJSONObject: stateJSON).write(to: stateURL, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: supportURL) }
+
+        let liveEnvironment = [
+            "REMOTE_CODE_DISTILL_STATE_PATH": stateURL.path,
+            "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY": supportURL.path,
+            "REMOTE_CODE_AGENT_PROVIDER": "codex",
+            "RC_TOKEN_SAVER_WORKSPACE_ID": "workspace-subprocess",
+            "RC_TOKEN_SAVER_PROJECT_ID": "project-subprocess",
+            "RC_TOKEN_SAVER_THREAD_ID": "thread-subprocess",
+            "RC_TOKEN_SAVER_ATTEMPT_ID": "attempt-subprocess"
+        ]
 
         // Success: real binary compresses live tool output through the sidecar.
         let ok = try runProcess(
             binary,
             ["cli", "Did the build pass? Return PASS or FAIL only."],
-            env: [
-                "REMOTE_CODE_DISTILL_STATE_PATH": stateURL.path,
-                "REMOTE_CODE_AGENT_PROVIDER": "codex",
-                "RC_TOKEN_SAVER_WORKSPACE_ID": "workspace-subprocess",
-                "RC_TOKEN_SAVER_PROJECT_ID": "project-subprocess",
-                "RC_TOKEN_SAVER_THREAD_ID": "thread-subprocess",
-                "RC_TOKEN_SAVER_ATTEMPT_ID": "attempt-subprocess"
-            ],
+            env: liveEnvironment,
             stdin: "build passed\n0 failures"
         )
         XCTAssertEqual(ok.code, 0)
         XCTAssertTrue(ok.out.contains("PASS"), "real CLI binary compressed via the live sidecar; got: \(ok.out)")
 
-        // Fail-open: point at a non-existent state file (no service) => raw stdin echoed,
-        // exit 0. This is the data-loss bug the Python CLI had, now fixed.
+        // A stale env + state + installed symlink cannot override the live paid
+        // setting. No request reaches the still-running sidecar.
+        settings.update { $0.tokenSaverEnabled = false }
+        let staleSymlink = supportURL.appendingPathComponent("stale-distill-link")
+        try FileManager.default.createSymbolicLink(at: staleSymlink, withDestinationURL: binary)
+        let off = try runProcess(
+            staleSymlink,
+            ["cli", "compress this"],
+            env: liveEnvironment,
+            stdin: "OFF BYTES MUST SURVIVE"
+        )
+        XCTAssertEqual(off.code, 0)
+        XCTAssertEqual(off.out, "OFF BYTES MUST SURVIVE")
+
+        // Entitlement is part of live admission, not merely the user's toggle.
+        settings.update { $0.tokenSaverEnabled = true }
+        try settingsRepository.set(
+            "private.account.session",
+            #"{"user":{"subscribed":false}}"#
+        )
+        let unsubscribed = try runProcess(
+            binary,
+            ["cli", "compress this"],
+            env: liveEnvironment,
+            stdin: "UNSUBSCRIBED BYTES MUST SURVIVE"
+        )
+        XCTAssertEqual(unsubscribed.code, 0)
+        XCTAssertEqual(unsubscribed.out, "UNSUBSCRIBED BYTES MUST SURVIVE")
+
+        // Teardown removes the live lease before the sidecar exits. Even with
+        // enabled+subscribed DB state and stale inherited env, the CLI stays raw.
+        try settingsRepository.set(
+            "private.account.session",
+            #"{"user":{"subscribed":true}}"#
+        )
+        try FileManager.default.removeItem(at: stateURL)
+        let teardown = try runProcess(
+            binary,
+            ["cli", "compress this"],
+            env: liveEnvironment,
+            stdin: "TEARDOWN BYTES MUST SURVIVE"
+        )
+        XCTAssertEqual(teardown.code, 0)
+        XCTAssertEqual(teardown.out, "TEARDOWN BYTES MUST SURVIVE")
+
+        // Fail-open: point at a non-existent state file (no service) => exact
+        // raw stdin, exit 0. This is the data-loss bug the Python CLI had.
         let failOpen = try runProcess(
             binary,
             ["cli", "compress this"],
-            env: ["REMOTE_CODE_DISTILL_STATE_PATH": "/nonexistent/\(UUID().uuidString).json"],
+            env: [
+                "REMOTE_CODE_DISTILL_STATE_PATH": "/nonexistent/\(UUID().uuidString).json",
+                "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY": supportURL.path,
+            ],
             stdin: "RAW DATA MUST SURVIVE"
         )
         XCTAssertEqual(failOpen.code, 0, "fail-open exits 0")
-        XCTAssertEqual(
-            failOpen.out.trimmingCharacters(in: .whitespacesAndNewlines),
-            "RAW DATA MUST SURVIVE",
-            "no service => raw stdin echoed verbatim, never lost"
-        )
+        XCTAssertEqual(failOpen.out, "RAW DATA MUST SURVIVE", "no service => raw stdin echoed verbatim, never lost")
     }
 
     private func runProcess(_ url: URL, _ args: [String], env: [String: String], stdin: String) throws -> (out: String, code: Int32) {

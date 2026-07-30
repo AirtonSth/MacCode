@@ -27,6 +27,19 @@ final class ProviderProxyLifecycleTests: XCTestCase {
         defer { try? FileManager.default.removeItem(atPath: appSupport) }
         let (runtime, repo) = try makeRuntime(appSupport: appSupport)
         let threadId = AgentThreadID()
+        let parentRunId = AgentRunID()
+        let parentCapability = AgentDelegationCapability.issue()
+        _ = try runtime.recordExternalRoot(
+            runId: parentRunId,
+            threadId: threadId,
+            provider: .codex,
+            providerInstanceId: "codex",
+            model: "gpt",
+            permissionMode: .fullAccess,
+            delegationCapabilitySHA256: AgentDelegationCapability.sha256Hex(
+                parentCapability
+            )
+        )
 
         for (status, label) in [
             (AgentRunStatus.completed, "ok"),
@@ -39,14 +52,18 @@ final class ProviderProxyLifecycleTests: XCTestCase {
                 processIdentifier: 9,
                 monotonicNanos: UInt64(label.hashValue.magnitude)
             )
-            _ = try runtime.recordExternalChild(
+            _ = try runtime.recordAuthorizedExternalChild(
                 runId: runId,
                 threadId: threadId,
                 provider: .grok,
                 providerInstanceId: "grok",
                 model: "unknown",
                 nodeId: nodeId,
-                parentRunId: nil
+                parentRunId: parentRunId,
+                parentThreadId: threadId,
+                parentCapability: parentCapability,
+                childCapability: AgentDelegationCapability.issue(),
+                requestedPermissionMode: .fullAccess
             )
             try runtime.finalizeReceipt(runId: runId, status: status)
             let receipt = try XCTUnwrap(try repo.receipt(runId: runId))
@@ -71,6 +88,20 @@ final class ProviderProxyLifecycleTests: XCTestCase {
         let appSupport = NSTemporaryDirectory() + "RC2ProvProxyStatus-\(UUID().uuidString)"
         defer { try? FileManager.default.removeItem(atPath: appSupport) }
         let (runtime, repo) = try makeRuntime(appSupport: appSupport)
+        let threadId = AgentThreadID()
+        let parentRunId = AgentRunID()
+        let parentCapability = AgentDelegationCapability.issue()
+        _ = try runtime.recordExternalRoot(
+            runId: parentRunId,
+            threadId: threadId,
+            provider: .codex,
+            providerInstanceId: "codex",
+            model: "gpt",
+            permissionMode: .fullAccess,
+            delegationCapabilitySHA256: AgentDelegationCapability.sha256Hex(
+                parentCapability
+            )
+        )
         let cases: [(Bool, Int32, AgentRunStatus)] = [
             (false, 0, .completed),
             (false, 1, .failed),
@@ -84,13 +115,18 @@ final class ProviderProxyLifecycleTests: XCTestCase {
                 processIdentifier: Int32(abs(code) + 1),
                 monotonicNanos: UInt64(bitPattern: Int64(code)) &+ 1
             )
-            _ = try runtime.recordExternalChild(
+            _ = try runtime.recordAuthorizedExternalChild(
                 runId: runId,
-                threadId: AgentThreadID(),
+                threadId: threadId,
                 provider: .claude,
                 providerInstanceId: "claude",
                 model: "test",
-                nodeId: nodeId
+                nodeId: nodeId,
+                parentRunId: parentRunId,
+                parentThreadId: threadId,
+                parentCapability: parentCapability,
+                childCapability: AgentDelegationCapability.issue(),
+                requestedPermissionMode: .fullAccess
             )
             let mapped = ProviderProxyPolicy.runStatus(
                 wasUncaughtSignal: wasSignal,

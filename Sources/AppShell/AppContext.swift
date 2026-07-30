@@ -164,6 +164,20 @@ public struct TokenSaverGovernanceSnapshot: Sendable, Equatable, Codable {
     }
 }
 
+/// Authoritative result for the Token Saver host lifecycle. UI callers use this
+/// instead of treating a persisted preference as proof that paid runtime
+/// prerequisites were admitted.
+public enum TokenSaverLifecycleOutcome: Sendable, Equatable {
+    case enabled
+    case disabled
+    case blocked(String)
+    case failed(String)
+
+    public var isEnabled: Bool {
+        self == .enabled
+    }
+}
+
 struct ProjectScriptRunOutcome: Sendable, Equatable {
     let workspaceID: WorkspaceID
     let surfaceID: SurfaceID
@@ -325,20 +339,49 @@ public final class AppContext {
     private var tokenSaverAccountUsageRefreshTask: Task<Void, Never>?
     private var tokenSaverUsageNotificationTask: Task<Void, Never>?
     private var tokenSaverLastUsageNotificationAt: Date = .distantPast
-    /// Per-run accumulator: sums token counts between debounced flushes so the
-    /// expensive file I/O happens at most once per debounce window rather than
-    /// once per token-usage event.
+    /// Per-run usage state. Claude can emit independent per-request charges
+    /// followed by an authoritative cumulative result, while Codex and Grok emit
+    /// cumulative snapshots. Keep both tracks so the effective run total is the
+    /// larger of the incremental sum and cumulative snapshot.
     private struct PendingUsage {
         var provider: AgentProvider
-        var totalTokens: Int
-        var billedTokenUnits: Double
+        var incremental = AssistantTokenUsage(semantics: .incremental)
+        var cumulative = AssistantTokenUsage(semantics: .cumulative)
+        var evidencedIncremental = AssistantTokenUsage(semantics: .incremental)
+        var evidencedCumulative = AssistantTokenUsage(semantics: .cumulative)
+        var persisted = AssistantTokenUsage(semantics: .cumulative)
+        var eligibleAtEventTime = false
+        var eligibleRunRecorded = false
+        var writeInFlight = false
+        var finished = false
+    }
+    private struct UsageWriteSnapshot {
+        var runId: AgentRunID
+        var provider: AgentProvider
+        var target: AssistantTokenUsage
+        var delta: AssistantTokenUsage
+        var deltaBilledTokenUnits: Double
         var eligibleRuns: Int
         var currentSessionTokens: Int
         var currentSessionLimitTokens: Int?
     }
     private var pendingUsageByRun: [AgentRunID: PendingUsage] = [:]
+    /// Recently completed run baselines accept a late cumulative provider
+    /// receipt without double-counting. The bounded tombstone set avoids keeping
+    /// every run for the lifetime of a long-running app.
+    private var completedUsageByRun: [AgentRunID: PendingUsage] = [:]
+    private var completedUsageRunOrder: [AgentRunID] = []
+    private static let completedUsageTombstoneLimit = 256
     private var sessionLearnInputTokensByRun: [AgentRunID: Int] = [:]
     private var pendingUsageFlushTask: Task<Void, Never>?
+    /// Test seam used to deterministically fail a usage write before the real
+    /// store mutation. Production never sets this.
+    var beforeTokenSaverUsageWriteForTesting: (@Sendable () throws -> Void)?
+    var tokenSaverUsageTombstoneLimitForTesting: Int?
+    var completedUsageTombstoneCountForTesting: Int { completedUsageByRun.count }
+    func hasCompletedUsageTombstoneForTesting(runId: AgentRunID) -> Bool {
+        completedUsageByRun[runId] != nil
+    }
     private var cachedDistillClientKey: String?
     private var cachedDistillClient: DistillServiceClient?
     private var tokenSaverPromptSkipSet: [DistillResultCacheKey: Date] = [:]
@@ -363,6 +406,17 @@ public final class AppContext {
     }
     private var deferredQueuePromotions: [AgentThreadID: DeferredQueuePromotion] = [:]
     private var isTerminating = false
+    private struct TokenSaverAccountIdentity: Equatable {
+        let userID: String?
+        let subscribed: Bool
+    }
+    private var tokenSaverAccountObserver: NSObjectProtocol?
+    private var tokenSaverEntitlementReconcileTask: Task<Void, Never>?
+    private var lastTokenSaverAccountIdentity: TokenSaverAccountIdentity?
+    private var tokenSaverRuntimeAdmitted = false
+    /// Test seam for account-change readiness without installing multi-GB models.
+    /// Production leaves this nil and validates the real on-disk manifests.
+    var tokenSaverEntitlementModelValidationOverrideForTesting: TokenSaverModelValidation?
     var queueDrainWaiterCountForTesting: Int { queueDrainWaiters.count }
     var queueDrainSuppressedThreadCountForTesting: Int { queueDrainSuppressionLeases.count }
     /// Test seam: sandbox the SessionLearn target instruction files so tests never write
@@ -372,6 +426,9 @@ public final class AppContext {
     /// tests never write /distill state into the developer's real ~/.claude or
     /// ~/.codex. Production code never sets this (installs to the real provider dirs).
     var agentSkillsHomeOverrideForTesting: URL?
+    /// Test seam for proving paid cleanup does not depend on legacy-home cleanup.
+    /// Production leaves this nil and calls the ownership-safe installer scrub.
+    var legacyDistillCleanupOverrideForTesting: (() throws -> Void)?
     var tokenSaverRolloverBeforeCommitForTesting: (() throws -> Void)?
     /// Prompts shorter than this are sent verbatim: distillation overhead/latency
     /// isn't worth it and tiny instructions have nothing to compress.
@@ -688,22 +745,54 @@ public final class AppContext {
             environment: ProcessInfo.processInfo.environment
         ) {
             let bootSettings = SettingsStore(db: db).load()
-            reconcileManagedDistillSkills(tokenSaverEnabled: bootSettings.tokenSaverEnabled)
-            reconcileGraphifyHost(settings: bootSettings)
+            if !bootSettings.tokenSaverEnabled {
+                _ = applyTokenSaverLifecycle(
+                    requestedEnabled: false,
+                    persistPreference: false
+                )
+            } else {
+                let bootSession = PrivateAccountSessionStore(repo: settingsRepo).load()
+                if bootSession?.user.subscribed != true {
+                    // Entitlement is known synchronously; no reason to hash
+                    // multi-GB model files before failing closed.
+                    _ = applyTokenSaverLifecycle(
+                        requestedEnabled: true,
+                        modelValidation: .init(
+                            state: .missing,
+                            reason: "model readiness not evaluated without subscription"
+                        ),
+                        persistPreference: false
+                    )
+                } else {
+                    // Model validation may hash multi-GB weights on a cold cache.
+                    // Revoke paid runtime synchronously, then admit it only after
+                    // the full validation finishes off the main actor.
+                    _ = applyTokenSaverLifecycle(
+                        requestedEnabled: false,
+                        persistPreference: false
+                    )
+                    let appSupport = appSupportDirectory
+                    Task { @MainActor [weak self] in
+                        let validation = await Task.detached(priority: .utility) {
+                            TokenSaverModelInstaller(appSupportDirectory: appSupport)
+                                .validateInstalledTokenSaverModels()
+                        }.value
+                        guard let self,
+                              SettingsStore(db: self.db).load().tokenSaverEnabled else {
+                            return
+                        }
+                        _ = self.applyTokenSaverLifecycle(
+                            requestedEnabled: true,
+                            modelValidation: validation,
+                            persistPreference: false
+                        )
+                    }
+                }
+            }
         } else {
             // Still apply Graphify defaults outside distill reconcile gate (unit tests stay quiet).
             if !AppContext.isRunningUnitTests {
                 reconcileGraphifyHost()
-            }
-        }
-        // PERF (cold launch): never block AppContext.init on multi-GB MLX warmup.
-        // Still kick Token Saver asynchronously when already enabled so managed
-        // `distill` CLI gets DistillCLIState after relaunch (terminal pipes cannot
-        // autostart the sidecar). Demand paths also call startIfEligible(); fail-open
-        // still applies until ready.
-        if SettingsStore(db: db).load().tokenSaverEnabled {
-            Task { @MainActor [weak self] in
-                self?.startTokenSaverDistillServiceIfEligible()
             }
         }
 
@@ -914,7 +1003,8 @@ public final class AppContext {
                     "thread_id": .string(t),
                     "input_tokens": .number(Double(usage.inputTokens)),
                     "output_tokens": .number(Double(usage.outputTokens)),
-                    "total_tokens": .number(Double(usage.totalTokens))
+                    "total_tokens": .number(Double(usage.totalTokens)),
+                    "semantics": .string(usage.resolvedSemantics.rawValue)
                 ]
                 if let window = usage.contextWindow { p["context_window"] = .number(Double(window)) }
                 if let compactsAutomatically = usage.compactsAutomatically {
@@ -973,7 +1063,7 @@ public final class AppContext {
                 EventBus.shared.publish(kind: "agent.run.finished", payload: agentRunPayload(threadId: tid, runId: rid, status: status))
                 // Flush any debounced usage for this run now that the run is done so
                 // the final token batch is never stranded in the accumulator.
-                self.flushPendingTokenSaverUsage(runId: rid)
+                self.finishPendingTokenSaverUsage(runId: rid)
                 self.recordSessionLearnFromRun(runId: rid, status: status) // P5 SessionLearn (off by default)
                 // Grok has no live `.accountUsage` stream (Claude/Codex do). Re-read
                 // the local billing snapshot after each Grok run so the Token Saver
@@ -1093,9 +1183,27 @@ public final class AppContext {
             }
         }
 
+        lastTokenSaverAccountIdentity = currentTokenSaverAccountIdentity()
+        tokenSaverAccountObserver = NotificationCenter.default.addObserver(
+            forName: .rc2PrivateAccountChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.reconcileTokenSaverLifecycleAfterAccountChange()
+            }
+        }
+
         // restore last snapshot if any
         if let snap = try snapshotRepo.latest() {
             self.state = snap.layout
+        }
+    }
+
+    deinit {
+        tokenSaverEntitlementReconcileTask?.cancel()
+        if let tokenSaverAccountObserver {
+            NotificationCenter.default.removeObserver(tokenSaverAccountObserver)
         }
     }
 
@@ -1357,7 +1465,7 @@ public final class AppContext {
         }
         let settings = SettingsStore(db: db).load()
         // Paid feature gate: no token-economy env while Token Saver is off.
-        guard settings.tokenSaverEnabled else {
+        guard isTokenSaverRuntimeActive(settings: settings) else {
             return [:]
         }
         // Activate waves that have passed E2E live rollout (process-local).
@@ -1427,7 +1535,7 @@ public final class AppContext {
         env["REMOTE_CODE_PROVIDER_INSTANCE_ID"] = thread?.providerInstanceId ?? provider.rawValue
         // Managed PATH is host-local (not inside the compact receipt JSON).
         if receipt.capabilities.managedPath == true {
-            let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+            let managedBin = makeAgentSkillInstaller().managedCLIBinURL.path
             let currentPath = baseEnvironment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
             let pathParts = currentPath.split(separator: ":").map(String.init).filter { $0 != managedBin }
             env["PATH"] = ([managedBin] + pathParts).joined(separator: ":")
@@ -1462,12 +1570,51 @@ public final class AppContext {
             "REMOTE_CODE_AGENT_MODEL": thread?.model ?? "unknown",
             "REMOTE_CODE_PROVIDER_INSTANCE_ID": thread?.providerInstanceId ?? provider.rawValue,
         ]) { _, new in new }
-        let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+        let installer = makeAgentSkillInstaller()
+        let managedBin = installer.managedCLIBinURL.path
         let basePath = environment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
         environment["PATH"] = AppCommandRouter.providerPathWithManagedWrappers(
             currentPath: basePath,
             managedBin: managedBin
         )
+        environment["RC_REMOTE_CODE_MANAGED_BIN"] = managedBin
+        environment.removeValue(forKey: "RC_REMOTE_CODE_AGENT_APP_COMMAND")
+        if let agentAppCommand = installer.verifiedAgentAppMiddlewareURL() {
+            environment["RC_REMOTE_CODE_AGENT_APP_COMMAND"] = agentAppCommand.path
+        }
+
+        let shellBridge = installer.providerShellBridgeURL
+        let shellBridgeFiles = [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout"]
+        if shellBridgeFiles.allSatisfy({
+            FileManager.default.fileExists(atPath: shellBridge.appendingPathComponent($0).path)
+        }) {
+            let originalZDOTDIR = environment["ZDOTDIR"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let providerHome = environment["HOME"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let processHome = ProcessInfo.processInfo.environment["HOME"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let effectiveHome = (providerHome?.isEmpty == false)
+                ? providerHome!
+                : ((processHome?.isEmpty == false)
+                    ? processHome!
+                    : FileManager.default.homeDirectoryForCurrentUser.path)
+            let originalDirectory = (originalZDOTDIR?.isEmpty == false)
+                ? originalZDOTDIR!
+                : effectiveHome
+            environment["RC_REMOTE_CODE_ORIGINAL_ZDOTDIR"] =
+                originalDirectory == shellBridge.path
+                ? effectiveHome
+                : originalDirectory
+            environment["RC_REMOTE_CODE_EFFECTIVE_ZDOTDIR"] =
+                environment["RC_REMOTE_CODE_ORIGINAL_ZDOTDIR"]
+            environment["RC_REMOTE_CODE_MANAGED_ZDOTDIR"] = shellBridge.path
+            environment["ZDOTDIR"] = shellBridge.path
+        } else {
+            environment.removeValue(forKey: "RC_REMOTE_CODE_ORIGINAL_ZDOTDIR")
+            environment.removeValue(forKey: "RC_REMOTE_CODE_EFFECTIVE_ZDOTDIR")
+            environment.removeValue(forKey: "RC_REMOTE_CODE_MANAGED_ZDOTDIR")
+        }
         if let workspaceID = thread?.workspaceId?.value.uuidString {
             environment["RC_REMOTE_CODE_WORKSPACE_ID"] = workspaceID
         }
@@ -1515,7 +1662,7 @@ public final class AppContext {
     /// `uv tool install graphifyy` once.
     public func reconcileGraphifyHost(settings: AppSettings? = nil) {
         let s = settings ?? SettingsStore(db: db).load()
-        let active = s.isGraphifyRuntimeActive
+        let active = isTokenSaverRuntimeActive(settings: s) && s.isGraphifyRuntimeActive
         let svc = GraphifyWorkspaceService.shared
         svc.enabled = active
         svc.autoEnsure = active && s.graphifyAutoEnsure
@@ -1533,9 +1680,239 @@ public final class AppContext {
         }
     }
 
-    /// Reconcile Distill integration with the Token Saver toggle (paid feature).
-    /// App-private skill package lives under Application Support only (never
-    /// `~/.claude` / `~/.codex` skill trees). CLI, command wrappers, and retrieve
+    /// Apply the single Token Saver lifecycle used by launch, Settings, and the
+    /// sidebar. A persisted preference is only a request: paid integration is
+    /// admitted after both entitlement and local-model readiness pass.
+    ///
+    /// `persistPreference` is false at boot so a temporarily unavailable account
+    /// does not erase the user's choice. Interactive toggles pass true so a
+    /// rejected enable cannot leave the UI/store claiming Token Saver is active.
+    @discardableResult
+    public func applyTokenSaverLifecycle(
+        requestedEnabled: Bool,
+        modelValidation: TokenSaverModelValidation? = nil,
+        persistPreference: Bool
+    ) -> TokenSaverLifecycleOutcome {
+        let settingsStore = SettingsStore(db: db)
+
+        func settings(enabled: Bool) -> AppSettings {
+            var value = settingsStore.load()
+            value.tokenSaverEnabled = enabled
+            return value
+        }
+
+        func disableRuntime() -> String? {
+            tokenSaverRuntimeAdmitted = false
+            if persistPreference {
+                settingsStore.update { $0.tokenSaverEnabled = false }
+            }
+            // Revoke live capabilities before touching any legacy install. A
+            // failed legacy scrub must never leave a resident paid sidecar,
+            // Graphify watcher, CLI, wrapper, or retrieve MCP active.
+            tokenSaverDistillServiceController.stop()
+            reconcileGraphifyHost(settings: settings(enabled: false))
+            return reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        }
+
+        guard requestedEnabled else {
+            if let error = disableRuntime() {
+                return .failed(error)
+            }
+            return .disabled
+        }
+
+        let session = PrivateAccountSessionStore(repo: settingsRepo).load()
+        let validation = modelValidation
+            ?? TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
+                .validateInstalledTokenSaverModels()
+        let enabledSettings = settings(enabled: true)
+        let decision = TokenSaverDistillLaunchPlanner.decide(.init(
+            hasPrivateAccount: session != nil,
+            isSubscribed: session?.user.subscribed == true,
+            tokenSaverEnabled: true,
+            modelValidation: validation
+        ))
+
+        switch decision {
+        case .skip(let reason):
+            if let cleanupError = disableRuntime() {
+                return .failed(cleanupError)
+            }
+            return .blocked(reason)
+        case .requireModel(let reason):
+            if let cleanupError = disableRuntime() {
+                return .failed(cleanupError)
+            }
+            return .blocked(reason ?? "model download required")
+        case .start:
+            break
+        }
+
+        if let installError = reconcileManagedDistillSkills(tokenSaverEnabled: true) {
+            _ = disableRuntime()
+            return .failed(installError)
+        }
+        if persistPreference {
+            settingsStore.update { $0.tokenSaverEnabled = true }
+        }
+        tokenSaverRuntimeAdmitted = true
+        tokenSaverDistillServiceController.startIfEligible(
+            session: session,
+            settings: enabledSettings,
+            modelValidation: validation
+        )
+        activatePreferredTokenSaverModelIfDownloaded(
+            settings: enabledSettings,
+            session: session
+        )
+        reconcileGraphifyHost(settings: enabledSettings)
+        return .enabled
+    }
+
+    /// A stored ON preference is only a request. Runtime admission also requires
+    /// a currently subscribed account and one successful lifecycle admission.
+    /// Unit tests without a sandboxed integration root retain their historical
+    /// direct-settings seam; production and lifecycle tests always use the real gate.
+    func isTokenSaverRuntimeActive(settings: AppSettings? = nil) -> Bool {
+        let stored = settings ?? SettingsStore(db: db).load()
+        guard stored.tokenSaverEnabled else { return false }
+        if Self.isRunningUnitTests, agentSkillsHomeOverrideForTesting == nil {
+            return true
+        }
+        guard tokenSaverRuntimeAdmitted,
+              PrivateAccountSessionStore(repo: settingsRepo).load()?.user.subscribed == true else {
+            return false
+        }
+        return true
+    }
+
+    private func currentTokenSaverAccountIdentity() -> TokenSaverAccountIdentity {
+        let session = PrivateAccountSessionStore(repo: settingsRepo).load()
+        return TokenSaverAccountIdentity(
+            userID: session?.user.id,
+            subscribed: session?.user.subscribed == true
+        )
+    }
+
+    /// Central account/session lifecycle hook. Subscription loss revokes paid
+    /// capabilities synchronously while preserving the requested preference.
+    /// Renewal validates models off the main actor before re-admitting anything.
+    private func reconcileTokenSaverLifecycleAfterAccountChange() {
+        let identity = currentTokenSaverAccountIdentity()
+        guard identity != lastTokenSaverAccountIdentity else { return }
+        lastTokenSaverAccountIdentity = identity
+        tokenSaverEntitlementReconcileTask?.cancel()
+        tokenSaverEntitlementReconcileTask = nil
+
+        let requested = SettingsStore(db: db).load().tokenSaverEnabled
+        guard requested else {
+            _ = applyTokenSaverLifecycle(
+                requestedEnabled: false,
+                persistPreference: false
+            )
+            return
+        }
+        guard identity.subscribed else {
+            _ = applyTokenSaverLifecycle(
+                requestedEnabled: true,
+                modelValidation: .init(
+                    state: .missing,
+                    reason: "model readiness not evaluated without subscription"
+                ),
+                persistPreference: false
+            )
+            return
+        }
+
+        // Revoke the previous account's capabilities before validating a renewed
+        // or replacement subscription. The persisted request remains ON.
+        _ = applyTokenSaverLifecycle(
+            requestedEnabled: false,
+            persistPreference: false
+        )
+        if let validation = tokenSaverEntitlementModelValidationOverrideForTesting {
+            _ = applyTokenSaverLifecycle(
+                requestedEnabled: true,
+                modelValidation: validation,
+                persistPreference: false
+            )
+            return
+        }
+
+        let appSupport = appSupportDirectory
+        tokenSaverEntitlementReconcileTask = Task { @MainActor [weak self] in
+            let validation = await Task.detached(priority: .utility) {
+                TokenSaverModelInstaller(appSupportDirectory: appSupport)
+                    .validateInstalledTokenSaverModels()
+            }.value
+            guard !Task.isCancelled,
+                  let self,
+                  self.currentTokenSaverAccountIdentity() == identity,
+                  SettingsStore(db: self.db).load().tokenSaverEnabled else {
+                return
+            }
+            self.tokenSaverEntitlementReconcileTask = nil
+            _ = self.applyTokenSaverLifecycle(
+                requestedEnabled: true,
+                modelValidation: validation,
+                persistPreference: false
+            )
+        }
+    }
+
+    /// Quit-time lifecycle is cleanup-only. It never installs hooks or starts a
+    /// process from a persisted bool: eligible state is left as-is, while an
+    /// ineligible/off state is revoked before the app exits.
+    @discardableResult
+    public func prepareTokenSaverLifecycleForTermination() -> TokenSaverLifecycleOutcome {
+        tokenSaverDistillServiceController.stop()
+        let settingsStore = SettingsStore(db: db)
+        let storedSettings = settingsStore.load()
+        guard storedSettings.tokenSaverEnabled else {
+            reconcileGraphifyHost(settings: storedSettings)
+            if let error = reconcileManagedDistillSkills(tokenSaverEnabled: false) {
+                return .failed(error)
+            }
+            return .disabled
+        }
+
+        let session = PrivateAccountSessionStore(repo: settingsRepo).load()
+        let validation = TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
+            .validateInstalledTokenSaverModels()
+        let decision = TokenSaverDistillLaunchPlanner.decide(.init(
+            hasPrivateAccount: session != nil,
+            isSubscribed: session?.user.subscribed == true,
+            tokenSaverEnabled: true,
+            modelValidation: validation
+        ))
+        switch decision {
+        case .start:
+            // Preserve the already-admitted on-disk integration. Do not
+            // reconcile ON here: reconciliation can install missing paid hooks.
+            return .enabled
+        case .skip(let reason):
+            var disabledSettings = storedSettings
+            disabledSettings.tokenSaverEnabled = false
+            reconcileGraphifyHost(settings: disabledSettings)
+            if let error = reconcileManagedDistillSkills(tokenSaverEnabled: false) {
+                return .failed(error)
+            }
+            return .blocked(reason)
+        case .requireModel(let reason):
+            var disabledSettings = storedSettings
+            disabledSettings.tokenSaverEnabled = false
+            reconcileGraphifyHost(settings: disabledSettings)
+            if let error = reconcileManagedDistillSkills(tokenSaverEnabled: false) {
+                return .failed(error)
+            }
+            return .blocked(reason ?? "model download required")
+        }
+    }
+
+    /// Reconcile Distill integration after the lifecycle gate above (paid
+    /// feature). The app-private skill package lives under Application Support
+    /// only (never `~/.claude` / `~/.codex` skill trees). CLI, command wrappers,
+    /// and retrieve
     /// MCP are installed only while Token Saver is enabled; disabled removes them
     /// so free/unsubscribed runs never get token-economy hooks.
     ///
@@ -1543,45 +1920,88 @@ public final class AppContext {
     /// when reconcile runs: they are not a Token Saver lane. They only intercept
     /// shell-launched bare provider names inside a thread-scoped environment;
     /// host top-level turns keep absolute resolved binaries via ProcessLocator.
-    public func reconcileManagedDistillSkills(tokenSaverEnabled: Bool) {
+    @discardableResult
+    func reconcileManagedDistillSkills(tokenSaverEnabled: Bool) -> String? {
         let installer = makeAgentSkillInstaller()
-        do {
-            // Always scrub legacy per-provider home skill / AGENTS.md blocks.
-            try installer.uninstallLegacyProviderDistillSkills()
-            // Always-on nested provider controller (independent of Token Saver).
+        var failures: [String] = []
+
+        func capture(_ label: String, _ operation: () throws -> Void) {
             do {
-                _ = try installer.installProviderProxies()
+                try operation()
             } catch {
-                NSLog("RemoteCode provider proxy install failed: \(error)")
+                failures.append("\(label): \((error as NSError).localizedDescription)")
             }
+        }
+
+        func removePaidIntegration() {
+            // Keep these independent and first. One malformed provider config or
+            // filesystem failure must not short-circuit the remaining removals.
+            capture("command wrapper cleanup") {
+                _ = try installer.uninstallCommandWrappers()
+            }
+            capture("Distill CLI cleanup") {
+                _ = try installer.uninstallDistillCLI()
+            }
+            capture("retrieve MCP cleanup") {
+                try installer.uninstallRetrieveMCP()
+            }
+        }
+
+        if tokenSaverEnabled {
             do {
-                _ = try installer.installAgentAppMiddleware()
-            } catch {
-                NSLog("RemoteCode Agent App middleware install failed: \(error)")
-            }
-            if tokenSaverEnabled {
                 let appPrivate = try installer.installAppPrivateDistillSkill(
                     sourceRevision: "github-main-remote-code-template-v2"
                 )
                 _ = try installer.installDistillCLI(appSupportDirectory: appSupportDirectory)
-                try? installer.installCommandWrappers()
-                try? installer.installRetrieveMCP()
+                _ = try installer.installCommandWrappers()
+                try installer.installRetrieveMCP()
                 // Warm login-shell env so agent turns get profile secret/PATH parity.
                 LoginShellEnvironment.prewarm()
                 managedDistillSkillInstallResults = [appPrivate]
-                managedDistillSkillInstallError = nil
-            } else {
-                _ = try? installer.uninstallCommandWrappers()
-                _ = try? installer.uninstallDistillCLI()
-                try? installer.uninstallRetrieveMCP()
+            } catch {
+                failures.append("paid integration install: \((error as NSError).localizedDescription)")
+                removePaidIntegration()
                 managedDistillSkillInstallResults = []
-                managedDistillSkillInstallError = nil
             }
-        } catch {
-            NSLog("RemoteCode managed Distill skill reconcile failed: \(error)")
+        } else {
+            removePaidIntegration()
             managedDistillSkillInstallResults = []
-            managedDistillSkillInstallError = (error as NSError).localizedDescription
         }
+
+        // Legacy provider-home cleanup is intentionally after paid OFF cleanup.
+        // It is migration hygiene, never an authorization dependency.
+        capture("legacy Distill cleanup") {
+            if let override = legacyDistillCleanupOverrideForTesting {
+                try override()
+            } else {
+                try installer.uninstallLegacyProviderDistillSkills()
+            }
+        }
+
+        // Always-on subagent routing is independent of Token Saver. Install each
+        // component separately so a failure cannot remove or suppress siblings.
+        do {
+            _ = try installer.installProviderProxies()
+        } catch {
+            NSLog("RemoteCode provider proxy install failed: \(error)")
+        }
+        do {
+            _ = try installer.installAgentAppMiddleware()
+        } catch {
+            NSLog("RemoteCode Agent App middleware install failed: \(error)")
+        }
+        do {
+            _ = try installer.installProviderShellBridge()
+        } catch {
+            NSLog("RemoteCode provider shell bridge install failed: \(error)")
+        }
+
+        let failure = failures.isEmpty ? nil : failures.joined(separator: "; ")
+        managedDistillSkillInstallError = failure
+        if let failure {
+            NSLog("RemoteCode managed Distill reconcile incomplete: \(failure)")
+        }
+        return failure
     }
 
     private func makeAgentSkillInstaller() -> AgentSkillInstaller {
@@ -1648,10 +2068,16 @@ public final class AppContext {
                 // Writes the selected model's manifest; the already-present files are skipped via
                 // their cached checksums, so this does not re-download multiple GB.
                 _ = try await TokenSaverModelDownloader(installer: installer).downloadRequiredModels { _ in }
+                guard self.isTokenSaverRuntimeActive(),
+                      let currentSession = PrivateAccountSessionStore(repo: self.settingsRepo).load(),
+                      currentSession.user.subscribed else {
+                    return
+                }
+                let currentSettings = SettingsStore(db: self.db).load()
                 self.tokenSaverDistillServiceController.stop()
                 self.tokenSaverDistillServiceController.startIfEligible(
-                    session: session,
-                    settings: settings,
+                    session: currentSession,
+                    settings: currentSettings,
                     modelValidation: installer.validateInstalledTokenSaverModels()
                 )
                 NSLog("RemoteCode Token Saver: activated preferred model \(TokenSaverApprovedModels.selected().id)")
@@ -1944,7 +2370,7 @@ public final class AppContext {
         if tokenSaverLifecycleDegradedReason != nil {
             return .init(allowed: false, reason: "lifecycle_degraded")
         }
-        let enabled = globallyEnabled ?? SettingsStore(db: db).load().tokenSaverEnabled
+        let enabled = globallyEnabled ?? isTokenSaverRuntimeActive()
         guard let thread = try? threadRepo.get(id: threadId),
               let projectID = thread.projectId?.value.uuidString,
               thread.workspaceId != nil,
@@ -1983,7 +2409,7 @@ public final class AppContext {
         lane laneName: String
     ) -> TokenSaverAdmissionDecision {
         guard tokenSaverLifecycleDegradedReason == nil,
-              SettingsStore(db: db).load().tokenSaverEnabled,
+              isTokenSaverRuntimeActive(),
               let thread = try? threadRepo.get(id: threadId),
               let projectID = thread.projectId?.value.uuidString,
               thread.workspaceId != nil,
@@ -2658,6 +3084,12 @@ public final class AppContext {
     }
 
     func tokenSaverHumanizeSR1Response(_ response: String, provider: AgentProvider, threadId: AgentThreadID, runId: AgentRunID? = nil) async -> String {
+        // Token Saver owns every SR1 rewrite, including the deterministic fallback.
+        // Check the live paid-feature gate before detection, fallback construction,
+        // or resolving a client that may still be alive during toggle teardown.
+        guard isTokenSaverRuntimeActive() else {
+            return response
+        }
         guard SR1ResponseDetector.isSR1(response) else { return response }
 
         let targetLanguage = inferredUserLanguage(threadId: threadId)
@@ -2703,15 +3135,20 @@ public final class AppContext {
     }
 
     private func currentDistillClientWaitingForStartup() async -> DistillServiceClient? {
+        guard isTokenSaverRuntimeActive() else {
+            return nil
+        }
         if let client = currentDistillClient() {
             return client
-        }
-        guard SettingsStore(db: db).load().tokenSaverEnabled else {
-            return nil
         }
 
         startTokenSaverDistillServiceIfEligible()
         for _ in 0..<Self.tokenSaverDistillStartupPolls {
+            // The toggle can change while the sidecar is warming. Re-check before
+            // every client resolution so a late ready event cannot reactivate SR1.
+            guard isTokenSaverRuntimeActive() else {
+                return nil
+            }
             if let client = currentDistillClient() {
                 return client
             }
@@ -2722,6 +3159,9 @@ public final class AppContext {
                 break
             }
             try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        guard isTokenSaverRuntimeActive() else {
+            return nil
         }
         return currentDistillClient()
     }
@@ -2986,9 +3426,57 @@ public final class AppContext {
               let run = try? runRepo.get(id: runId) else {
             return
         }
-        if tokenSaverProjectObservation(runId: runId, lane: "session_learn").allowed {
-            sessionLearnInputTokensByRun[runId, default: 0] += max(0, usage.inputTokens)
+        var pending: PendingUsage
+        if let active = pendingUsageByRun[runId] {
+            pending = active
+        } else if let completed = completedUsageByRun.removeValue(forKey: runId) {
+            completedUsageRunOrder.removeAll { $0 == runId }
+            pending = completed
+        } else {
+            // Once a terminal baseline ages out of the bounded tombstone cache,
+            // fail closed for accounting. Reconstructing it from zero would
+            // double-count a replayed provider receipt.
+            guard run.status == .pending || run.status == .running else { return }
+            pending = PendingUsage(provider: run.provider)
         }
+        // Incremental events have no provider event ID, so a replay after the
+        // terminal callback cannot be distinguished from a new charge. Provider
+        // lifecycles deliver legitimate increments before finish; ignore a late
+        // incremental replay and continue accepting authoritative cumulative
+        // receipts.
+        if pending.finished, usage.resolvedSemantics == .incremental {
+            archiveCompletedUsage(runId: runId, pending: pending)
+            return
+        }
+
+        // Raw provider events stay append-only. Pareto input components are
+        // normalized separately: cumulative snapshots contribute only growth,
+        // while independent Claude requests contribute their full input.
+        if tokenSaverProjectObservation(runId: runId, lane: "measurement").allowed {
+            let previousEvidence = Self.effectiveEvidenceUsage(pending)
+            switch usage.resolvedSemantics {
+            case .incremental:
+                pending.evidencedIncremental = Self.addingUsage(
+                    pending.evidencedIncremental,
+                    usage
+                )
+            case .cumulative:
+                pending.evidencedCumulative = AssistantTokenUsage.merging(
+                    pending.evidencedCumulative,
+                    with: usage
+                )
+            }
+            let currentEvidence = Self.effectiveEvidenceUsage(pending)
+            appendTokenSaverProviderUsage(
+                usage,
+                inputGrowth: max(
+                    0,
+                    currentEvidence.inputTokens - previousEvidence.inputTokens
+                ),
+                runId: runId
+            )
+        }
+
         // The sidebar "used tokens" display reflects the real provider-billed count
         // and must be recorded for every Token-Saver-enabled thread — NOT gated on
         // the measurement lane (which requires a projectId + seeded lane rows).
@@ -2997,35 +3485,21 @@ public final class AppContext {
         // measurement/attribution ledger stays gated: `appendTokenSaverProviderUsage`
         // self-gates on the same measurement observation, and no other path below
         // writes measurement/savings rows.
-        appendTokenSaverProviderUsage(usage, runId: runId)
-        let settings = SettingsStore(db: db).load()
-        // Record only the real provider-billed token count. Savings are now
-        // measured at the local sidecar call sites (`| distill` command-output
-        // compression and SR1 humanization), never synthesized from provider
-        // token-usage events.
-        let eligibleRuns = settings.tokenSaverEnabled ? 1 : 0
-
-        // Accumulate into the pending buffer instead of writing to disk per event.
-        // A debounced Task will flush to disk after the quiet window; the run-end
-        // and app-quit paths force an immediate flush so no tokens are ever lost.
-        if var pending = pendingUsageByRun[runId] {
-            pending.totalTokens += usage.totalTokens
-            pending.billedTokenUnits += usage.billedTotalTokenUnits
-            pending.eligibleRuns += eligibleRuns
-            pending.currentSessionTokens = max(pending.currentSessionTokens, usage.totalTokens)
-            if let window = usage.contextWindow {
-                pending.currentSessionLimitTokens = max(pending.currentSessionLimitTokens ?? 0, window)
-            }
-            pendingUsageByRun[runId] = pending
-        } else {
-            pendingUsageByRun[runId] = PendingUsage(
-                provider: run.provider,
-                totalTokens: usage.totalTokens,
-                billedTokenUnits: usage.billedTotalTokenUnits,
-                eligibleRuns: eligibleRuns,
-                currentSessionTokens: usage.totalTokens,
-                currentSessionLimitTokens: usage.contextWindow
+        switch usage.resolvedSemantics {
+        case .incremental:
+            pending.incremental = Self.addingUsage(pending.incremental, usage)
+        case .cumulative:
+            pending.cumulative = AssistantTokenUsage.merging(
+                pending.cumulative,
+                with: usage
             )
+        }
+        let enabledAtEventTime = isTokenSaverRuntimeActive()
+        pending.eligibleAtEventTime = pending.eligibleAtEventTime || enabledAtEventTime
+        let effective = Self.effectiveUsage(pending)
+        pendingUsageByRun[runId] = pending
+        if tokenSaverProjectObservation(runId: runId, lane: "session_learn").allowed {
+            sessionLearnInputTokensByRun[runId] = max(0, effective.inputTokens)
         }
         schedulePendingUsageFlush()
     }
@@ -3056,7 +3530,6 @@ public final class AppContext {
                 "cache_state",
                 "language",
                 "hardware_class",
-                "provider_usage_semantics",
                 "provider_input_cost",
             ]
         )
@@ -3067,17 +3540,21 @@ public final class AppContext {
         }
     }
 
-    private func appendTokenSaverProviderUsage(_ usage: AssistantTokenUsage, runId: AgentRunID) {
+    private func appendTokenSaverProviderUsage(
+        _ usage: AssistantTokenUsage,
+        inputGrowth: Int,
+        runId: AgentRunID
+    ) {
         guard tokenSaverProjectObservation(runId: runId, lane: "measurement").allowed else {
             return
         }
         beginTokenSaverAttempt(runId: runId)
-        if usage.inputTokens > 0 {
+        if inputGrowth > 0 {
             do {
                 try tokenSaverAttemptLedger.appendInputComponent(
                     attemptID: runId.value.uuidString,
                     category: "unattributed_provider_input",
-                    tokens: usage.inputTokens,
+                    tokens: inputGrowth,
                     costMicros: 0
                 )
             } catch {
@@ -3085,7 +3562,7 @@ public final class AppContext {
             }
         }
         var payload: [String: Any] = [
-            "semantics": "unavailable",
+            "semantics": usage.resolvedSemantics.rawValue,
             "input_tokens": max(0, usage.inputTokens),
             "output_tokens": max(0, usage.outputTokens),
             "total_tokens": max(0, usage.totalTokens),
@@ -3143,16 +3620,45 @@ public final class AppContext {
             pendingUsageFlushTask = nil
         }
 
-        let snapshots: [(AgentRunID, PendingUsage)] = keysToFlush.compactMap { key in
-            guard let pending = pendingUsageByRun.removeValue(forKey: key) else { return nil }
-            return (key, pending)
+        let snapshots: [UsageWriteSnapshot] = keysToFlush.compactMap { key in
+            guard var pending = pendingUsageByRun[key],
+                  !pending.writeInFlight else {
+                return nil
+            }
+            let target = Self.effectiveUsage(pending)
+            let delta = Self.usageGrowth(from: pending.persisted, to: target)
+            let billedDelta = max(
+                0,
+                target.billedTotalTokenUnits - pending.persisted.billedTotalTokenUnits
+            )
+            guard delta.totalTokens > 0 || billedDelta > 0 else {
+                if pending.finished {
+                    archiveCompletedUsage(runId: key, pending: pending)
+                }
+                return nil
+            }
+            pending.writeInFlight = true
+            pendingUsageByRun[key] = pending
+            return UsageWriteSnapshot(
+                runId: key,
+                provider: pending.provider,
+                target: target,
+                delta: delta,
+                deltaBilledTokenUnits: billedDelta,
+                eligibleRuns: pending.eligibleAtEventTime && !pending.eligibleRunRecorded ? 1 : 0,
+                currentSessionTokens: target.totalTokens,
+                currentSessionLimitTokens: target.contextWindow
+            )
         }
         guard !snapshots.isEmpty else { return }
 
         let appSupportDir = appSupportDirectory
+        let beforeWrite = beforeTokenSaverUsageWriteForTesting
         backgroundWriterQueue.async { [weak self] in
-            for (_, pending) in snapshots {
+            for snapshot in snapshots {
+                let succeeded: Bool
                 do {
+                    try beforeWrite?()
                     // NO MEASURED BASELINE EXISTS FOR THIS PATH — read before "fixing".
                     //
                     // `estimatedRawTokens` deliberately receives the SAME value as
@@ -3171,24 +3677,195 @@ public final class AppContext {
                     // for the harness this feeds. Until that lands, the honest report for
                     // provider turns is "not measured", not a number.
                     _ = try TokenSaverUsageStore(appSupportDirectory: appSupportDir).record(
-                        provider: pending.provider,
-                        actualProviderTokens: pending.totalTokens,
-                        estimatedRawTokens: pending.totalTokens,
-                        actualProviderBilledTokenUnits: pending.billedTokenUnits,
-                        estimatedRawBilledTokenUnits: pending.billedTokenUnits,
-                        eligibleRuns: pending.eligibleRuns,
-                        currentSessionTokens: pending.currentSessionTokens,
-                        currentSessionLimitTokens: pending.currentSessionLimitTokens
+                        provider: snapshot.provider,
+                        actualProviderTokens: snapshot.delta.totalTokens,
+                        estimatedRawTokens: snapshot.delta.totalTokens,
+                        actualProviderBilledTokenUnits: snapshot.deltaBilledTokenUnits,
+                        estimatedRawBilledTokenUnits: snapshot.deltaBilledTokenUnits,
+                        eligibleRuns: snapshot.eligibleRuns,
+                        currentSessionTokens: snapshot.currentSessionTokens,
+                        currentSessionLimitTokens: snapshot.currentSessionLimitTokens
                     )
+                    succeeded = true
                 } catch {
                     NSLog("RemoteCode Token Saver usage record failed: \(error)")
+                    succeeded = false
+                }
+                DispatchQueue.main.async { [weak self] in
+                    self?.completeTokenSaverUsageWrite(snapshot, succeeded: succeeded)
                 }
             }
-            DispatchQueue.main.async { [weak self] in
-                self?.recomputeTokenSaverDailyEconomyToday()
-                self?.scheduleTokenSaverUsageChangedNotification()
+        }
+    }
+
+    private func finishPendingTokenSaverUsage(runId: AgentRunID) {
+        if var pending = pendingUsageByRun[runId] {
+            pending.finished = true
+            pendingUsageByRun[runId] = pending
+        } else if completedUsageByRun[runId] == nil,
+                  let run = try? runRepo.get(id: runId) {
+            var pending = PendingUsage(provider: run.provider)
+            pending.finished = true
+            archiveCompletedUsage(runId: runId, pending: pending)
+        }
+        flushPendingTokenSaverUsage(runId: runId)
+        archiveCompletedUsageIfSettled(runId: runId)
+    }
+
+    private func completeTokenSaverUsageWrite(
+        _ snapshot: UsageWriteSnapshot,
+        succeeded: Bool
+    ) {
+        guard var pending = pendingUsageByRun[snapshot.runId],
+              pending.writeInFlight else {
+            return
+        }
+        pending.writeInFlight = false
+        if succeeded {
+            pending.persisted = AssistantTokenUsage.merging(
+                pending.persisted,
+                with: snapshot.target
+            )
+            if snapshot.eligibleRuns > 0 {
+                pending.eligibleRunRecorded = true
             }
         }
+        pendingUsageByRun[snapshot.runId] = pending
+
+        if succeeded {
+            recomputeTokenSaverDailyEconomyToday()
+            scheduleTokenSaverUsageChangedNotification()
+        }
+
+        let target = Self.effectiveUsage(pending)
+        let remainingTokens = target.totalTokens - pending.persisted.totalTokens
+        let remainingBilledUnits =
+            target.billedTotalTokenUnits - pending.persisted.billedTotalTokenUnits
+        if remainingTokens > 0 || remainingBilledUnits > 0 {
+            if succeeded {
+                flushPendingTokenSaverUsage(runId: snapshot.runId)
+            } else {
+                schedulePendingUsageFlush()
+            }
+        } else if pending.finished {
+            archiveCompletedUsage(runId: snapshot.runId, pending: pending)
+        }
+    }
+
+    private func archiveCompletedUsageIfSettled(runId: AgentRunID) {
+        guard let pending = pendingUsageByRun[runId],
+              !pending.writeInFlight else {
+            return
+        }
+        let target = Self.effectiveUsage(pending)
+        guard target.totalTokens <= pending.persisted.totalTokens,
+              target.billedTotalTokenUnits <= pending.persisted.billedTotalTokenUnits else {
+            return
+        }
+        archiveCompletedUsage(runId: runId, pending: pending)
+    }
+
+    private func archiveCompletedUsage(runId: AgentRunID, pending: PendingUsage) {
+        var tombstone = pending
+        tombstone.writeInFlight = false
+        tombstone.finished = true
+        pendingUsageByRun.removeValue(forKey: runId)
+        completedUsageByRun[runId] = tombstone
+        completedUsageRunOrder.removeAll { $0 == runId }
+        completedUsageRunOrder.append(runId)
+
+        let limit = max(
+            0,
+            tokenSaverUsageTombstoneLimitForTesting
+                ?? Self.completedUsageTombstoneLimit
+        )
+        while completedUsageRunOrder.count > limit {
+            let evicted = completedUsageRunOrder.removeFirst()
+            completedUsageByRun.removeValue(forKey: evicted)
+        }
+    }
+
+    private nonisolated static func effectiveUsage(_ pending: PendingUsage) -> AssistantTokenUsage {
+        AssistantTokenUsage.merging(pending.incremental, with: pending.cumulative)
+    }
+
+    private nonisolated static func effectiveEvidenceUsage(
+        _ pending: PendingUsage
+    ) -> AssistantTokenUsage {
+        AssistantTokenUsage.merging(
+            pending.evidencedIncremental,
+            with: pending.evidencedCumulative
+        )
+    }
+
+    private nonisolated static func addingUsage(
+        _ lhs: AssistantTokenUsage,
+        _ rhs: AssistantTokenUsage
+    ) -> AssistantTokenUsage {
+        func add(_ lhs: Int, _ rhs: Int) -> Int {
+            let (sum, overflow) = max(0, lhs).addingReportingOverflow(max(0, rhs))
+            return overflow ? Int.max : sum
+        }
+        func addOptional(_ lhs: Int?, _ rhs: Int?) -> Int? {
+            guard lhs != nil || rhs != nil else { return nil }
+            return add(lhs ?? 0, rhs ?? 0)
+        }
+        return AssistantTokenUsage(
+            inputTokens: add(lhs.inputTokens, rhs.inputTokens),
+            outputTokens: add(lhs.outputTokens, rhs.outputTokens),
+            totalTokens: add(lhs.totalTokens, rhs.totalTokens),
+            contextWindow: maxOptional(lhs.contextWindow, rhs.contextWindow),
+            compactsAutomatically: rhs.compactsAutomatically ?? lhs.compactsAutomatically,
+            uncachedInputTokens: addOptional(lhs.uncachedInputTokens, rhs.uncachedInputTokens),
+            cacheCreationInputTokens: addOptional(
+                lhs.cacheCreationInputTokens,
+                rhs.cacheCreationInputTokens
+            ),
+            cacheReadInputTokens: addOptional(lhs.cacheReadInputTokens, rhs.cacheReadInputTokens),
+            reportedCostMicros: addOptional(lhs.reportedCostMicros, rhs.reportedCostMicros),
+            contextTokens: rhs.contextTokens ?? lhs.contextTokens,
+            semantics: .incremental
+        )
+    }
+
+    private nonisolated static func usageGrowth(
+        from previous: AssistantTokenUsage,
+        to latest: AssistantTokenUsage
+    ) -> AssistantTokenUsage {
+        func growth(_ old: Int?, _ new: Int?) -> Int? {
+            guard old != nil || new != nil else { return nil }
+            return max(0, (new ?? 0) - (old ?? 0))
+        }
+        return AssistantTokenUsage(
+            inputTokens: max(0, latest.inputTokens - previous.inputTokens),
+            outputTokens: max(0, latest.outputTokens - previous.outputTokens),
+            totalTokens: max(0, latest.totalTokens - previous.totalTokens),
+            contextWindow: latest.contextWindow,
+            compactsAutomatically: latest.compactsAutomatically,
+            uncachedInputTokens: growth(
+                previous.uncachedInputTokens,
+                latest.uncachedInputTokens
+            ),
+            cacheCreationInputTokens: growth(
+                previous.cacheCreationInputTokens,
+                latest.cacheCreationInputTokens
+            ),
+            cacheReadInputTokens: growth(
+                previous.cacheReadInputTokens,
+                latest.cacheReadInputTokens
+            ),
+            reportedCostMicros: growth(
+                previous.reportedCostMicros,
+                latest.reportedCostMicros
+            ),
+            contextTokens: latest.contextTokens,
+            semantics: .incremental
+        )
+    }
+
+    private nonisolated static func maxOptional(_ lhs: Int?, _ rhs: Int?) -> Int? {
+        guard lhs != nil || rhs != nil else { return nil }
+        return max(lhs ?? 0, rhs ?? 0)
     }
 
     private func scheduleTokenSaverUsageChangedNotification(now: Date = Date()) {
@@ -3227,7 +3904,7 @@ public final class AppContext {
         // have project_id NULL on all threads and 0 lane_state rows, which made every
         // savings write (including sr1-humanize) silently dead. Lossy/governed paths
         // still use tokenSaverProjectAdmission; this path only needs paid feature + same-user.
-        guard SettingsStore(db: db).load().tokenSaverEnabled else { return }
+        guard isTokenSaverRuntimeActive() else { return }
         guard tokenSaverIsSameUser(threadId: threadId) else { return }
         let laneForGovernance = mode == "sr1-humanize" ? "sr1-humanize" : "deterministic_wrapper"
         // Keep admission decision for audit snapshot (do not gate the write on it).
@@ -3341,7 +4018,8 @@ public final class AppContext {
             return
         }
         let settings = SettingsStore(db: db).load()
-        guard settings.tokenSaverEnabled, settings.isGraphifyRuntimeActive else { return }
+        guard isTokenSaverRuntimeActive(settings: settings),
+              settings.isGraphifyRuntimeActive else { return }
 
         let provider = (try? threadRepo.get(id: threadId))?.provider.rawValue ?? "unknown"
         let runKey = runId.value.uuidString
@@ -3387,7 +4065,8 @@ public final class AppContext {
         finalize: Bool = false
     ) {
         let settings = SettingsStore(db: db).load()
-        guard settings.tokenSaverEnabled, settings.isGraphifyRuntimeActive else { return }
+        guard isTokenSaverRuntimeActive(settings: settings),
+              settings.isGraphifyRuntimeActive else { return }
         guard bodyAppend != nil || outputAppend != nil || summary != nil else { return }
 
         let provider = (try? threadRepo.get(id: threadId))?.provider.rawValue ?? "unknown"

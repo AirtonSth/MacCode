@@ -82,6 +82,20 @@ else
   fi
 fi
 
+# 3b. The `remote-code agent-app` middleware dispatches to a co-located rc2
+# executable. A bundle without it can launch normally but every managed
+# cross-provider Agent App delegation fails with exit 127.
+RC2_CLI_PATH="$APP/Contents/MacOS/rc2"
+if [ ! -f "$RC2_CLI_PATH" ]; then
+  fail "missing bundled rc2 at $RC2_CLI_PATH (required by remote-code agent-app)"
+elif ! file "$RC2_CLI_PATH" | grep -q "Mach-O"; then
+  fail "bundled rc2 is not a Mach-O binary"
+elif [ ! -x "$RC2_CLI_PATH" ]; then
+  fail "bundled rc2 is not marked executable"
+else
+  note "bundled rc2 is an executable Mach-O binary"
+fi
+
 # 4. Identifier and version must be non-empty (version drives the Bonjour TXT field).
 [ -n "$(plist_get CFBundleIdentifier)" ] && note "CFBundleIdentifier present" || fail "CFBundleIdentifier is empty"
 [ -n "$(plist_get CFBundleShortVersionString)" ] && note "CFBundleShortVersionString present" || fail "CFBundleShortVersionString is empty"
@@ -218,7 +232,19 @@ fi
 # this structural check protects the distributable .app (v2.0.85–v2.0.87
 # shipped without it and aborted every launch via SPM Bundle.module).
 AGENT_RUNTIME_BUNDLE="$APP/Contents/Resources/RemoteCode_AgentRuntime.bundle"
+ORCHESTRATE_ROOT="$AGENT_RUNTIME_BUNDLE/remote-code-orchestrate"
 ORCHESTRATE_SKILL="$AGENT_RUNTIME_BUNDLE/remote-code-orchestrate/SKILL.md"
+ORCHESTRATE_EXPECTED_TREE_SHA256="b5e06a22bf885038f9c339f5c6499671aab202d54fd7a41ac75c2007e296b75b"
+ORCHESTRATE_ALLOWED_PATHS=(
+  "SKILL.md"
+  "agents/openai.yaml"
+  "references/host-runtime-matrix.md"
+  "references/output-contract.md"
+  "references/prompt-contract.md"
+  "references/routing-policy.md"
+  "scripts/test_orchestration_harness.py"
+  "scripts/validate_orchestration.py"
+)
 if [ ! -d "$AGENT_RUNTIME_BUNDLE" ]; then
   fail "missing AgentRuntime resources at $AGENT_RUNTIME_BUNDLE (launch crash class without AgentRuntimeResourceBundle)"
 elif [ ! -f "$ORCHESTRATE_SKILL" ]; then
@@ -231,6 +257,58 @@ else
     fail "AgentRuntime bundle contains .DS_Store (pinned source validation rejects unexpected entries)"
   else
     note "AgentRuntime bundle contains no .DS_Store"
+  fi
+
+  # Mirror AgentSkillInstaller's compiled package pin: exactly eight regular
+  # files, the three expected directories, no symlinks/special entries, and the
+  # same canonical path/byte-count/file-digest tree hash.
+  ORCHESTRATE_TREE_SHAPE_VALID=1
+  for relative_path in "${ORCHESTRATE_ALLOWED_PATHS[@]}"; do
+    if [ ! -f "$ORCHESTRATE_ROOT/$relative_path" ] \
+      || [ -L "$ORCHESTRATE_ROOT/$relative_path" ]; then
+      fail "orchestrate bundle missing pinned regular file: $relative_path"
+      ORCHESTRATE_TREE_SHAPE_VALID=0
+    fi
+  done
+  ORCHESTRATE_FILE_COUNT="$(find "$ORCHESTRATE_ROOT" -type f | wc -l | tr -d ' ')"
+  ORCHESTRATE_DIRECTORY_COUNT="$(find "$ORCHESTRATE_ROOT" -mindepth 1 -type d | wc -l | tr -d ' ')"
+  ORCHESTRATE_NON_REGULAR_COUNT="$(
+    find "$ORCHESTRATE_ROOT" -mindepth 1 ! -type d ! -type f | wc -l | tr -d ' '
+  )"
+  if [ "$ORCHESTRATE_FILE_COUNT" != "${#ORCHESTRATE_ALLOWED_PATHS[@]}" ] \
+    || [ "$ORCHESTRATE_DIRECTORY_COUNT" != "3" ] \
+    || [ "$ORCHESTRATE_NON_REGULAR_COUNT" != "0" ] \
+    || [ ! -d "$ORCHESTRATE_ROOT/agents" ] \
+    || [ ! -d "$ORCHESTRATE_ROOT/references" ] \
+    || [ ! -d "$ORCHESTRATE_ROOT/scripts" ]; then
+    fail "orchestrate bundle must contain only the exact eight pinned files and three directories"
+    ORCHESTRATE_TREE_SHAPE_VALID=0
+  else
+    note "orchestrate bundle contains the exact eight-file pinned tree"
+  fi
+
+  if [ "$ORCHESTRATE_TREE_SHAPE_VALID" != "1" ]; then
+    fail "cannot verify orchestrate tree digest until the pinned tree shape is restored"
+  elif ! command -v shasum >/dev/null 2>&1; then
+    fail "cannot verify orchestrate tree digest: shasum unavailable"
+  else
+    ORCHESTRATE_ACTUAL_TREE_SHA256="$(
+      for relative_path in "${ORCHESTRATE_ALLOWED_PATHS[@]}"; do
+        resource_path="$ORCHESTRATE_ROOT/$relative_path"
+        if resource_bytes="$(stat -f '%z' "$resource_path" 2>/dev/null)"; then
+          :
+        else
+          resource_bytes="$(stat -c '%s' "$resource_path")"
+        fi
+        resource_sha256="$(shasum -a 256 "$resource_path" | awk '{print $1}')"
+        printf '%s\t%s\t%s\n' "$relative_path" "$resource_bytes" "$resource_sha256"
+      done | shasum -a 256 | awk '{print $1}'
+    )"
+    if [ "$ORCHESTRATE_ACTUAL_TREE_SHA256" = "$ORCHESTRATE_EXPECTED_TREE_SHA256" ]; then
+      note "orchestrate bundle matches compiled v5 tree digest"
+    else
+      fail "orchestrate bundle tree digest mismatch (expected $ORCHESTRATE_EXPECTED_TREE_SHA256, got $ORCHESTRATE_ACTUAL_TREE_SHA256)"
+    fi
   fi
 fi
 

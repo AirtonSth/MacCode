@@ -24,6 +24,7 @@ public final class UnixSocketServer: @unchecked Sendable {
     static let maxConnectedClients = 64
     static let maxActiveRequests = 64
     private static let defaultLocalRequestTimeout: DispatchTimeInterval = .seconds(5)
+    private static let agentMessageSendLocalRequestTimeout: DispatchTimeInterval = .seconds(120)
 
     public let socketPath: String
     private let dispatcher: JSONRPCDispatcher
@@ -38,6 +39,7 @@ public final class UnixSocketServer: @unchecked Sendable {
     private var clientFDs: Set<Int32> = []
     private var activeRequestCount = 0
     private let localRequestTimeout: DispatchTimeInterval
+    private let agentMessageSendRequestTimeout: DispatchTimeInterval
     private let activeRequestLimit: Int
     private let localRequestHandlerForTesting: (@MainActor @Sendable (JSONRPCRequest) async -> JSONRPCResponse)?
     var listenerFDObserverForTesting: (@Sendable (Int32) -> Void)?
@@ -60,6 +62,7 @@ public final class UnixSocketServer: @unchecked Sendable {
         self.socketPath = socketPath
         self.dispatcher = dispatcher
         self.localRequestTimeout = Self.defaultLocalRequestTimeout
+        self.agentMessageSendRequestTimeout = Self.agentMessageSendLocalRequestTimeout
         self.activeRequestLimit = Self.maxActiveRequests
         self.localRequestHandlerForTesting = nil
     }
@@ -68,12 +71,15 @@ public final class UnixSocketServer: @unchecked Sendable {
         socketPath: String,
         dispatcher: JSONRPCDispatcher,
         localRequestTimeoutForTesting: DispatchTimeInterval,
+        agentMessageSendRequestTimeoutForTesting: DispatchTimeInterval? = nil,
         activeRequestLimitForTesting: Int,
         localRequestHandlerForTesting: @escaping @MainActor @Sendable (JSONRPCRequest) async -> JSONRPCResponse
     ) {
         self.socketPath = socketPath
         self.dispatcher = dispatcher
         self.localRequestTimeout = localRequestTimeoutForTesting
+        self.agentMessageSendRequestTimeout =
+            agentMessageSendRequestTimeoutForTesting ?? localRequestTimeoutForTesting
         self.activeRequestLimit = max(1, activeRequestLimitForTesting)
         self.localRequestHandlerForTesting = localRequestHandlerForTesting
     }
@@ -455,10 +461,14 @@ public final class UnixSocketServer: @unchecked Sendable {
                 slot.value = response
                 semaphore.signal()
             }
-            guard semaphore.wait(timeout: .now() + localRequestTimeout) == .success else {
+            let requestTimeout = req.method == "agent.message.send"
+                ? agentMessageSendRequestTimeout
+                : localRequestTimeout
+            guard semaphore.wait(timeout: .now() + requestTimeout) == .success else {
                 task.cancel()
                 EventBus.shared.publish(kind: "diagnostic.unix_request_timeout", payload: .object([
-                    "timeout_seconds": .number(5)
+                    "method": .string(req.method),
+                    "timeout_seconds": .number(Self.timeoutSeconds(requestTimeout))
                 ]))
                 return false
             }
@@ -472,6 +482,23 @@ public final class UnixSocketServer: @unchecked Sendable {
                 _ = outbound.enqueue(data)
             }
             return true
+        }
+    }
+
+    private static func timeoutSeconds(_ timeout: DispatchTimeInterval) -> Double {
+        switch timeout {
+        case .seconds(let value):
+            return Double(value)
+        case .milliseconds(let value):
+            return Double(value) / 1_000
+        case .microseconds(let value):
+            return Double(value) / 1_000_000
+        case .nanoseconds(let value):
+            return Double(value) / 1_000_000_000
+        case .never:
+            return -1
+        @unknown default:
+            return 0
         }
     }
 

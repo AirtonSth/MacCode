@@ -92,7 +92,7 @@ public protocol CommandRouting: AnyObject {
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor
     func listAgentThreads(workspace: WorkspaceID?) throws -> [AgentThread]
     func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?) throws -> AgentThread
-    func createAgentThreadRouting(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?, routing: AgentRoutingRequest?) async throws -> AgentThread
+    func createAgentThreadRouting(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?, routing: AgentRoutingRequest?, nestedRunContext: AgentNestedRunContext?) async throws -> AgentThread
     func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?) throws -> AgentThread
     func configureAgentThreadRouting(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, routing: AgentRoutingRequest?) async throws -> AgentThread
     func listAgentRunAsUsers() throws -> [AgentRunAsUser]
@@ -117,7 +117,7 @@ public protocol CommandRouting: AnyObject {
     /// mutation the mac queue drag-reorder performs.
     func reorderAgentQueuedMessage(thread: AgentThreadID, id: AgentQueuedMessageID, position: Int) throws
     func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment]) async throws -> AgentMessageSendResult
-    func sendAgentMessageRouting(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], routing: AgentRoutingRequest?) async throws -> AgentMessageSendResult
+    func sendAgentMessageRouting(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], routing: AgentRoutingRequest?, nestedRunContext: AgentNestedRunContext?) async throws -> AgentMessageSendResult
     func implementAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, newThread: Bool, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?) async throws -> (runId: AgentRunID, implementationThreadId: AgentThreadID)
     func saveAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, relativePath: String?) throws -> (path: String, relativePath: String)
     /// Per-thread plan notes (mac plan sidebar). Returns "" when none exist.
@@ -235,8 +235,8 @@ public extension CommandRouting {
         nil
     }
 
-    func createAgentThreadRouting(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?, routing: AgentRoutingRequest?) async throws -> AgentThread {
-        guard routing == nil else {
+    func createAgentThreadRouting(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?, routing: AgentRoutingRequest?, nestedRunContext: AgentNestedRunContext? = nil) async throws -> AgentThread {
+        guard routing == nil, nestedRunContext == nil else {
             throw JSONRPCError(code: -32020, message: "Model routing is not supported by this host.", data: .object(["domain": .string("routing"), "kind": .string("unsupported")]))
         }
         return try createAgentThread(workspace: workspace, title: title, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser, surfaceID: surfaceID)
@@ -249,9 +249,12 @@ public extension CommandRouting {
         return try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser)
     }
 
-    func sendAgentMessageRouting(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], routing: AgentRoutingRequest?) async throws -> AgentMessageSendResult {
+    func sendAgentMessageRouting(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], routing: AgentRoutingRequest?, nestedRunContext: AgentNestedRunContext? = nil) async throws -> AgentMessageSendResult {
         guard routing == nil else {
             throw JSONRPCError(code: -32020, message: "Model routing is not supported by this host.", data: .object(["domain": .string("routing"), "kind": .string("unsupported")]))
+        }
+        guard nestedRunContext == nil else {
+            throw JSONRPCError.notSupported("nested Agent App runs")
         }
         return try await sendAgentMessage(thread: thread, text: text, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, interactionMode: interactionMode, modelSelection: modelSelection, providerInstanceId: providerInstanceId, attachments: attachments)
     }
@@ -1773,7 +1776,8 @@ public final class JSONRPCDispatcher {
                 let runAsUser = decodeRunAsUser(from: params["run_as_user"] ?? params["runAsUser"])
                 let createSurfaceID = (params["surface_id"]?.stringValue ?? params["surfaceId"]?.stringValue).flatMap(UUID.init).map(SurfaceID.init)
                 let routing = try routingRequest(from: params, requireManualSelection: true)
-                let t = try await router.createAgentThreadRouting(workspace: wid, title: title, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser, surfaceID: createSurfaceID, routing: routing)
+                let nestedRunContext = try nestedRunContext(from: params)
+                let t = try await router.createAgentThreadRouting(workspace: wid, title: title, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser, surfaceID: createSurfaceID, routing: routing, nestedRunContext: nestedRunContext)
                 EventBus.shared.publish(kind: "agent.thread.created", payload: threadPayload(t))
                 return .init(id: id, result: encodeThread(t))
             case "agent.thread.configure":
@@ -1878,11 +1882,26 @@ public final class JSONRPCDispatcher {
                 let providerInstanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
                 let attachments = try agentAttachments(from: params["attachments"])
                 let routing = try routingRequest(from: params, requireManualSelection: false)
+                let nestedRunContext = try nestedRunContext(from: params)
                 if routing?.mode == .auto,
                    ["provider", "provider_instance_id", "providerInstanceId", "model", "reasoning_effort", "service_tier", "model_selection"].contains(where: { params[$0] != nil }) {
                     throw JSONRPCError.invalidParams
                 }
-                let sendResult = try await router.sendAgentMessageRouting(thread: tid, text: text, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, interactionMode: interactionMode, modelSelection: modelSelection, providerInstanceId: providerInstanceId, attachments: attachments, routing: routing)
+                let sendResult = try await router.sendAgentMessageRouting(
+                    thread: tid,
+                    text: text,
+                    provider: provider,
+                    model: model,
+                    permissionMode: permission,
+                    reasoningEffort: reasoning,
+                    serviceTier: serviceTier,
+                    interactionMode: interactionMode,
+                    modelSelection: modelSelection,
+                    providerInstanceId: providerInstanceId,
+                    attachments: attachments,
+                    routing: routing,
+                    nestedRunContext: nestedRunContext
+                )
                 let result = messageSendResultPayload(sendResult)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
@@ -3178,6 +3197,56 @@ public final class JSONRPCDispatcher {
             customModelId: customModelId,
             reasoningEffort: reasoning,
             serviceTier: serviceTier
+        )
+    }
+
+    private func nestedRunContext(
+        from params: [String: JSONValue]
+    ) throws -> AgentNestedRunContext? {
+        let values = (
+            parentRunID: params["parent_run_id"]?.stringValue,
+            parentThreadID: params["parent_thread_id"]?.stringValue,
+            nodeID: params["subagent_node_id"]?.stringValue,
+            parentCapability: params[
+                AgentDelegationCapabilityTransport.rpcParameterKey
+            ]?.stringValue,
+            runtimeProfile: params["runtime_profile"]?.stringValue
+        )
+        guard values.parentRunID != nil
+                || values.parentThreadID != nil
+                || values.nodeID != nil
+                || values.parentCapability != nil
+                || values.runtimeProfile != nil else {
+            return nil
+        }
+        let runtimeProfile: AgentAppRuntimeProfile?
+        if let rawProfile = values.runtimeProfile {
+            guard let parsed = AgentAppRuntimeProfile(rawValue: rawProfile) else {
+                throw JSONRPCError.invalidParams
+            }
+            runtimeProfile = parsed
+        } else {
+            runtimeProfile = nil
+        }
+        guard let parentRunUUID = values.parentRunID.flatMap(UUID.init),
+              let parentThreadUUID = values.parentThreadID.flatMap(UUID.init),
+              let nodeID = values.nodeID,
+              let parentCapability = values.parentCapability,
+              AgentDelegationCapabilityTransport.isWellFormed(parentCapability),
+              !nodeID.isEmpty,
+              nodeID.utf8.count <= 128,
+              nodeID.unicodeScalars.allSatisfy({
+                  CharacterSet.alphanumerics.contains($0)
+                      || "-_.".unicodeScalars.contains($0)
+              }) else {
+            throw JSONRPCError.invalidParams
+        }
+        return AgentNestedRunContext(
+            parentRunID: AgentRunID(parentRunUUID),
+            parentThreadID: AgentThreadID(parentThreadUUID),
+            nodeID: nodeID,
+            parentCapability: parentCapability,
+            runtimeProfile: runtimeProfile
         )
     }
 

@@ -637,11 +637,32 @@ public final class PrivateAccountSessionStore: @unchecked Sendable {
     public func save(_ session: PrivateAccountSession) {
         guard let data = try? encoder.encode(session),
               let json = String(data: data, encoding: .utf8) else { return }
-        try? repo.set(key, json)
+        do {
+            try repo.set(key, json)
+            publishAccountChanged()
+        } catch {
+            return
+        }
     }
 
     public func clear() {
-        try? repo.set(key, "")
+        do {
+            try repo.set(key, "")
+            publishAccountChanged()
+        } catch {
+            return
+        }
+    }
+
+    private func publishAccountChanged() {
+        let publish = {
+            NotificationCenter.default.post(name: .rc2PrivateAccountChanged, object: nil)
+        }
+        if Thread.isMainThread {
+            publish()
+        } else {
+            DispatchQueue.main.async(execute: publish)
+        }
     }
 }
 

@@ -46,9 +46,26 @@ final class RemoteCodeOrchestrateInstallTests: XCTestCase {
             "controlled provider workers must use the full Agent App middleware"
         )
         XCTAssertTrue(
-            skill.contains("lifecycle-only telemetry")
-                && skill.contains("not evidence of prompt compression or"),
+            skill.contains("telemetry alone is not evidence of token savings"),
             "raw compatibility paths must not be reported as measured Token Saver savings"
+        )
+        XCTAssertTrue(
+            skill.contains("The exact `sam-grok-worker` one-shot")
+                && skill.contains("automatically to `remote-code agent-app grok`"),
+            "the exact supported Grok worker ABI must document native Agent App promotion"
+        )
+        XCTAssertTrue(
+            skill.contains("Other explicit provider CLI contracts remain raw"),
+            "unsupported specialized provider ABIs must retain honest raw-path boundaries"
+        )
+        XCTAssertFalse(
+            skill.contains("python3 "),
+            "core orchestration instructions must not require an unbundled Python command"
+        )
+        XCTAssertTrue(
+            skill.contains("optional development validator")
+                && skill.contains("review the required"),
+            "formal validation may be optional, but contract review remains required"
         )
         XCTAssertTrue(
             skill.contains("Provider-native collaboration whose child prompt is hidden"),
@@ -69,8 +86,8 @@ final class RemoteCodeOrchestrateInstallTests: XCTestCase {
 
         XCTAssertEqual(package.skillID, "remote-code-orchestrate")
         XCTAssertEqual(package.sourceRevision, "2c77fa48431bc20e5dc841652079594a3ea918c9")
-        XCTAssertEqual(package.localVersion, "3")
-        XCTAssertEqual(package.sourceTreeSHA256, "1493839804d567da2a53cbb1314118f0c33e3f2c669f59f0691c9d85bd9bfe1b")
+        XCTAssertEqual(package.localVersion, "5")
+        XCTAssertEqual(package.sourceTreeSHA256, "b5e06a22bf885038f9c339f5c6499671aab202d54fd7a41ac75c2007e296b75b")
         XCTAssertEqual(package.allowedPaths, [
             "SKILL.md",
             "agents/openai.yaml",

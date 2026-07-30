@@ -4,15 +4,16 @@ import AgentRuntime
 import Persistence
 @testable import AppShell
 
-/// WHY: debouncing must coalesce many per-token record() calls into one pending
-/// total and a flush must emit the correct sum and reset the accumulator so no
-/// token counts are lost.
+/// WHY: providers do not share one accounting contract. Claude can publish
+/// independent request charges before a final cumulative result; Codex/Grok
+/// publish cumulative snapshots. Debouncing must preserve both without loss,
+/// duplication, or advancing a baseline before a write succeeds.
 @MainActor
 final class TokenSaverUsageDebounceTests: XCTestCase {
 
-    // MARK: - accumulator coalesces N events into one pending total
+    // MARK: - accumulator coalesces cumulative snapshots
 
-    func test_multipleTokenUsageEventsAccumulateIntoPendingTotal() throws {
+    func test_multipleTokenUsageSnapshotsKeepLatestCumulativeTotal() throws {
         let appSupport = NSTemporaryDirectory() + "RC2UsageDebounce-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
@@ -47,13 +48,13 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
 
-        let thread = AgentThread(title: "t", provider: .claude, model: "m")
+        let thread = AgentThread(title: "t", provider: .codex, model: "m")
         try context.threadRepo.upsert(thread)
-        let run = AgentRun(threadId: thread.id, provider: .claude, model: "m",
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "m",
                            status: .running, startedAt: Date())
         try context.runRepo.upsert(run)
 
-        // Accumulate tokens across 4 events.
+        // Provider snapshots are cumulative for the run, not independent deltas.
         for tokens in [50, 75, 100, 125] {
             context.coordinator.onAssistantEvent?(
                 .tokenUsage(AssistantTokenUsage(inputTokens: tokens, outputTokens: 0, totalTokens: tokens)),
@@ -62,28 +63,28 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
             )
         }
 
-        // Explicit flush must write the accumulated 350 tokens in a single record().
+        // Explicit flush must write the latest 125-token snapshot once.
         context.flushPendingTokenSaverUsage(runId: run.id)
 
         // Give the background writer a moment to finish.
         let deadline = Date().addingTimeInterval(2)
         var snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
-        while snapshot.providers.first(where: { $0.provider == .claude })?.actualProviderTokens == 0,
+        while snapshot.providers.first(where: { $0.provider == .codex })?.actualProviderTokens == 0,
               Date() < deadline {
             Thread.sleep(forTimeInterval: 0.02)
             snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
         }
 
-        let claude = snapshot.providers.first { $0.provider == .claude }
-        XCTAssertEqual(claude?.actualProviderTokens, 350,
-                       "flush must write the exact sum of all accumulated events; no counts dropped")
+        let codex = snapshot.providers.first { $0.provider == .codex }
+        XCTAssertEqual(codex?.actualProviderTokens, 125,
+                       "flush must not add cumulative provider snapshots together")
 
         // A second flush with the same runId must be a no-op (accumulator was reset).
         context.flushPendingTokenSaverUsage(runId: run.id)
         Thread.sleep(forTimeInterval: 0.05)
         let afterSecondFlush = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
-        let claudeAfter = afterSecondFlush.providers.first { $0.provider == .claude }
-        XCTAssertEqual(claudeAfter?.actualProviderTokens, 350,
+        let codexAfter = afterSecondFlush.providers.first { $0.provider == .codex }
+        XCTAssertEqual(codexAfter?.actualProviderTokens, 125,
                        "second flush with empty accumulator must not double-count or corrupt the total")
     }
 
@@ -146,7 +147,7 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
                            status: .running, startedAt: Date())
         try context.runRepo.upsert(run)
 
-        // Simulate a burst that would be coalesced by the debounce timer.
+        // Simulate cumulative snapshots that arrive inside the debounce window.
         for tokens in [100, 150] {
             context.coordinator.onAssistantEvent?(
                 .tokenUsage(AssistantTokenUsage(inputTokens: tokens, outputTokens: 0, totalTokens: tokens)),
@@ -167,8 +168,357 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
         }
 
         let codex = snapshot.providers.first { $0.provider == .codex }
-        XCTAssertEqual(codex?.actualProviderTokens, 250,
-                       "run-end flush must not lose tokens that were buffered inside the debounce window")
+        XCTAssertEqual(codex?.actualProviderTokens, 150,
+                       "run-end flush must persist the latest cumulative snapshot exactly once")
+    }
+
+    func test_debounceFlushThenLaterSnapshotPersistsOnlyGrowth() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2UsageGrowth-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        let thread = AgentThread(title: "t", provider: .codex, model: "m")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "m",
+                           status: .running, startedAt: Date())
+        try context.runRepo.upsert(run)
+
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(.init(inputTokens: 100, totalTokens: 100)),
+            thread.id, run.id
+        )
+        context.flushPendingTokenSaverUsage(runId: run.id)
+        await waitForProviderTokens(100, provider: .codex, appSupport: context.appSupportDirectory)
+
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(.init(inputTokens: 300, totalTokens: 300)),
+            thread.id, run.id
+        )
+        context.flushPendingTokenSaverUsage(runId: run.id)
+        await waitForProviderTokens(300, provider: .codex, appSupport: context.appSupportDirectory)
+
+        let codex = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+            .load().providers.first { $0.provider == .codex }
+        XCTAssertEqual(codex?.actualProviderTokens, 300,
+                       "a post-flush cumulative snapshot must add only 200 new tokens")
+        XCTAssertEqual(codex?.eligibleRuns, 1,
+                       "one run stays one eligible run across multiple flushes")
+    }
+
+    func test_incrementalClaudeRequestsReconcileWithFinalCumulativeReceipt() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2UsageMixedClaude-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        let thread = AgentThread(title: "claude mixed usage", provider: .claude, model: "m")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .claude, model: "m",
+                           status: .running, startedAt: Date())
+        try context.runRepo.upsert(run)
+
+        for tokens in [100, 150] {
+            context.coordinator.onAssistantEvent?(
+                .tokenUsage(.init(
+                    inputTokens: tokens,
+                    totalTokens: tokens,
+                    semantics: .incremental
+                )),
+                thread.id,
+                run.id
+            )
+        }
+        context.flushPendingTokenSaverUsage(runId: run.id)
+        await waitForProviderTokens(250, provider: .claude, appSupport: context.appSupportDirectory)
+
+        // The final modelUsage receipt covers both requests and is authoritative.
+        // Only its 10-token growth may be persisted.
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(.init(
+                inputTokens: 260,
+                totalTokens: 260,
+                semantics: .cumulative
+            )),
+            thread.id,
+            run.id
+        )
+        context.flushPendingTokenSaverUsage(runId: run.id)
+        await waitForProviderTokens(260, provider: .claude, appSupport: context.appSupportDirectory)
+
+        // An older cumulative receipt arriving late cannot subtract or duplicate.
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(.init(
+                inputTokens: 240,
+                totalTokens: 240,
+                semantics: .cumulative
+            )),
+            thread.id,
+            run.id
+        )
+        context.flushPendingTokenSaverUsage(runId: run.id)
+        try await Task.sleep(for: .milliseconds(50))
+        let claude = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+            .load().providers.first { $0.provider == .claude }
+        XCTAssertEqual(claude?.actualProviderTokens, 260)
+        XCTAssertEqual(claude?.eligibleRuns, 1)
+    }
+
+    func test_failedWriteRetriesWithoutLosingOrDoubleCountingUsage() async throws {
+        enum ForcedWriteFailure: Error { case expected }
+
+        let appSupport = NSTemporaryDirectory() + "RC2UsageRetry-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        let thread = AgentThread(title: "retry usage", provider: .grok, model: "m")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .grok, model: "m",
+                           status: .running, startedAt: Date())
+        try context.runRepo.upsert(run)
+
+        let attempted = expectation(description: "first usage write attempted")
+        context.beforeTokenSaverUsageWriteForTesting = {
+            attempted.fulfill()
+            throw ForcedWriteFailure.expected
+        }
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(.init(inputTokens: 100, totalTokens: 100, semantics: .cumulative)),
+            thread.id,
+            run.id
+        )
+        context.flushPendingTokenSaverUsage(runId: run.id)
+        await fulfillment(of: [attempted], timeout: 2)
+        context.beforeTokenSaverUsageWriteForTesting = nil
+
+        await waitForProviderTokens(100, provider: .grok, appSupport: context.appSupportDirectory)
+
+        // Retrying or replaying the same cumulative snapshot stays idempotent.
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(.init(inputTokens: 100, totalTokens: 100, semantics: .cumulative)),
+            thread.id,
+            run.id
+        )
+        context.flushPendingTokenSaverUsage(runId: run.id)
+        try await Task.sleep(for: .milliseconds(50))
+        let grok = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+            .load().providers.first { $0.provider == .grok }
+        XCTAssertEqual(grok?.actualProviderTokens, 100)
+        XCTAssertEqual(grok?.eligibleRuns, 1)
+    }
+
+    func test_eligibilityIsCapturedWhenUsageEventArrivesNotWhenFlushRuns() async throws {
+        let enabledSupport = NSTemporaryDirectory() + "RC2UsageEligibilityOn-" + UUID().uuidString
+        let enabledContext = try AppContext(channel: .debug, appSupportOverride: enabledSupport)
+        SettingsStore(db: enabledContext.db).update { $0.tokenSaverEnabled = true }
+        let enabledThread = AgentThread(title: "enabled at event", provider: .codex, model: "m")
+        try enabledContext.threadRepo.upsert(enabledThread)
+        let enabledRun = AgentRun(threadId: enabledThread.id, provider: .codex, model: "m",
+                                  status: .running, startedAt: Date())
+        try enabledContext.runRepo.upsert(enabledRun)
+        enabledContext.coordinator.onAssistantEvent?(
+            .tokenUsage(.init(totalTokens: 50, semantics: .cumulative)),
+            enabledThread.id,
+            enabledRun.id
+        )
+        SettingsStore(db: enabledContext.db).update { $0.tokenSaverEnabled = false }
+        enabledContext.flushPendingTokenSaverUsage(runId: enabledRun.id)
+        await waitForProviderTokens(
+            50,
+            provider: .codex,
+            appSupport: enabledContext.appSupportDirectory
+        )
+        XCTAssertEqual(
+            TokenSaverUsageStore(appSupportDirectory: enabledContext.appSupportDirectory)
+                .load().providers.first { $0.provider == .codex }?.eligibleRuns,
+            1,
+            "turning Token Saver off after the event must not erase that event's eligibility"
+        )
+
+        let disabledSupport = NSTemporaryDirectory() + "RC2UsageEligibilityOff-" + UUID().uuidString
+        let disabledContext = try AppContext(channel: .debug, appSupportOverride: disabledSupport)
+        let disabledThread = AgentThread(title: "disabled at event", provider: .grok, model: "m")
+        try disabledContext.threadRepo.upsert(disabledThread)
+        let disabledRun = AgentRun(threadId: disabledThread.id, provider: .grok, model: "m",
+                                   status: .running, startedAt: Date())
+        try disabledContext.runRepo.upsert(disabledRun)
+        disabledContext.coordinator.onAssistantEvent?(
+            .tokenUsage(.init(totalTokens: 70, semantics: .cumulative)),
+            disabledThread.id,
+            disabledRun.id
+        )
+        SettingsStore(db: disabledContext.db).update { $0.tokenSaverEnabled = true }
+        disabledContext.flushPendingTokenSaverUsage(runId: disabledRun.id)
+        await waitForProviderTokens(
+            70,
+            provider: .grok,
+            appSupport: disabledContext.appSupportDirectory
+        )
+        XCTAssertEqual(
+            TokenSaverUsageStore(appSupportDirectory: disabledContext.appSupportDirectory)
+                .load().providers.first { $0.provider == .grok }?.eligibleRuns,
+            0,
+            "enabling Token Saver after the event must not retroactively make it eligible"
+        )
+    }
+
+    func test_lateCumulativeEventAfterRunFinishPersistsOnlyGrowth() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2UsageLate-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        let thread = AgentThread(title: "late receipt", provider: .codex, model: "m")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "m",
+                           status: .running, startedAt: Date())
+        try context.runRepo.upsert(run)
+
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(.init(totalTokens: 100, semantics: .cumulative)),
+            thread.id,
+            run.id
+        )
+        context.flushPendingTokenSaverUsage(runId: run.id)
+        await waitForProviderTokens(100, provider: .codex, appSupport: context.appSupportDirectory)
+        context.coordinator.onRunFinished?(thread.id, run.id, .completed)
+        await Task.yield()
+
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(.init(totalTokens: 150, semantics: .cumulative)),
+            thread.id,
+            run.id
+        )
+        context.flushPendingTokenSaverUsage(runId: run.id)
+        await waitForProviderTokens(150, provider: .codex, appSupport: context.appSupportDirectory)
+        XCTAssertEqual(
+            TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+                .load().providers.first { $0.provider == .codex }?.eligibleRuns,
+            1
+        )
+    }
+
+    func test_lateIncrementalReplayAfterRunFinishIsIgnored() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2UsageLateIncrement-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        let thread = AgentThread(title: "late increment", provider: .claude, model: "m")
+        try context.threadRepo.upsert(thread)
+        var run = AgentRun(threadId: thread.id, provider: .claude, model: "m",
+                           status: .running, startedAt: Date())
+        try context.runRepo.upsert(run)
+
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(.init(totalTokens: 100, semantics: .incremental)),
+            thread.id,
+            run.id
+        )
+        context.flushPendingTokenSaverUsage(runId: run.id)
+        await waitForProviderTokens(100, provider: .claude, appSupport: context.appSupportDirectory)
+        run.status = .completed
+        run.finishedAt = Date()
+        try context.runRepo.upsert(run)
+        context.coordinator.onRunFinished?(thread.id, run.id, .completed)
+        await waitForTombstones(1, in: context)
+
+        // Incremental events have no event ID. Once terminal, a repeated payload
+        // must be treated as a replay; legitimate final growth arrives as a
+        // cumulative provider receipt.
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(.init(totalTokens: 100, semantics: .incremental)),
+            thread.id,
+            run.id
+        )
+        context.flushPendingTokenSaverUsage(runId: run.id)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(
+            TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+                .load().providers.first { $0.provider == .claude }?.actualProviderTokens,
+            100
+        )
+    }
+
+    func test_completedUsageTombstonesAreBoundedAndEvictedRunsFailClosed() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2UsageTombstones-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        context.tokenSaverUsageTombstoneLimitForTesting = 2
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        let thread = AgentThread(title: "bounded tombstones", provider: .codex, model: "m")
+        try context.threadRepo.upsert(thread)
+        var runs: [AgentRun] = []
+
+        for index in 1...3 {
+            var run = AgentRun(threadId: thread.id, provider: .codex, model: "m",
+                               status: .running, startedAt: Date())
+            try context.runRepo.upsert(run)
+            context.coordinator.onAssistantEvent?(
+                .tokenUsage(.init(totalTokens: 10, semantics: .cumulative)),
+                thread.id,
+                run.id
+            )
+            context.flushPendingTokenSaverUsage(runId: run.id)
+            await waitForProviderTokens(
+                index * 10,
+                provider: .codex,
+                appSupport: context.appSupportDirectory
+            )
+            run.status = .completed
+            run.finishedAt = Date()
+            try context.runRepo.upsert(run)
+            context.coordinator.onRunFinished?(thread.id, run.id, .completed)
+            await waitForTombstone(run.id, in: context)
+            XCTAssertEqual(context.completedUsageTombstoneCountForTesting, min(index, 2))
+            runs.append(run)
+        }
+
+        XCTAssertEqual(context.completedUsageTombstoneCountForTesting, 2)
+
+        // The first terminal baseline was evicted. Its DB terminal status makes
+        // a very late receipt fail closed instead of rebuilding from zero and
+        // charging the run a second time.
+        let evicted = try XCTUnwrap(runs.first)
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(.init(totalTokens: 20, semantics: .cumulative)),
+            thread.id,
+            evicted.id
+        )
+        context.flushPendingTokenSaverUsage(runId: evicted.id)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(
+            TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+                .load().providers.first { $0.provider == .codex }?.actualProviderTokens,
+            30
+        )
+    }
+
+    private func waitForTombstones(_ expected: Int, in context: AppContext) async {
+        let deadline = Date().addingTimeInterval(2)
+        while context.completedUsageTombstoneCountForTesting != expected,
+              Date() < deadline {
+            await Task.yield()
+        }
+        XCTAssertEqual(context.completedUsageTombstoneCountForTesting, expected)
+    }
+
+    private func waitForTombstone(_ runId: AgentRunID, in context: AppContext) async {
+        let deadline = Date().addingTimeInterval(2)
+        while !context.hasCompletedUsageTombstoneForTesting(runId: runId),
+              Date() < deadline {
+            await Task.yield()
+        }
+        XCTAssertTrue(context.hasCompletedUsageTombstoneForTesting(runId: runId))
+    }
+
+    private func waitForProviderTokens(
+        _ expected: Int,
+        provider: AgentProvider,
+        appSupport: URL,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let deadline = Date().addingTimeInterval(2)
+        var actual = 0
+        repeat {
+            actual = TokenSaverUsageStore(appSupportDirectory: appSupport)
+                .load().providers.first { $0.provider == provider }?.actualProviderTokens ?? 0
+            if actual == expected { return }
+            try? await Task.sleep(for: .milliseconds(20))
+        } while Date() < deadline
+        XCTFail("expected \(expected) provider tokens, got \(actual)", file: file, line: line)
     }
 
     func test_providerUsageFlushPersistsCacheWeightedBillingUnits() throws {

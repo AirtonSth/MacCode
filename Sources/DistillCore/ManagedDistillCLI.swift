@@ -16,6 +16,14 @@ import CoreModel
 /// wires a real URLSession transport.
 public struct ManagedDistillCLI: Sendable {
     public typealias Transport = @Sendable (URLRequest) async -> (data: Data, status: Int)?
+    /// Live paid-feature admission. The executable wires this to the authoritative
+    /// app setting plus the current sidecar lease; it is deliberately independent
+    /// of inherited environment hints, which can outlive a toggle or app teardown.
+    ///
+    /// This is re-evaluated before every lossy/local optimization and immediately
+    /// before every `/v1/distill` transport call. A denial always returns the
+    /// original stdin bytes and never calls the transport.
+    public typealias DistillAdmission = @Sendable () -> Bool
 
     /// Per-request stdin chunk size. Inputs above this are split into multiple bounded
     /// distill calls; if any chunk fails, the CLI emits the original stdin verbatim.
@@ -70,6 +78,7 @@ public struct ManagedDistillCLI: Sendable {
     /// Per-request reversible-store floor (nil = server default). The RTK command wrappers set
     /// a low value so compressed output always carries a `[[rc:<handle>]]` recovery marker.
     public let reversibleStoreMinBytes: Int?
+    public let distillAdmission: DistillAdmission
     public let transport: Transport
 
     public init(
@@ -81,6 +90,7 @@ public struct ManagedDistillCLI: Sendable {
         invocationID: String = UUID().uuidString.lowercased(),
         maxOutputCharacters: Int = 4_000,
         reversibleStoreMinBytes: Int? = nil,
+        distillAdmission: @escaping DistillAdmission = { true },
         transport: @escaping Transport
     ) {
         self.arguments = arguments
@@ -94,6 +104,7 @@ public struct ManagedDistillCLI: Sendable {
         self.invocationID = invocationID
         self.maxOutputCharacters = max(128, maxOutputCharacters)
         self.reversibleStoreMinBytes = reversibleStoreMinBytes
+        self.distillAdmission = distillAdmission
         self.transport = transport
     }
 
@@ -161,6 +172,7 @@ public struct ManagedDistillCLI: Sendable {
         func failOpen() -> (Data, Int32) { (stdin, 0) }
 
         guard !stdin.isEmpty else { return (Data(), 0) }
+        guard distillAdmission() else { return failOpen() }
         guard let input = String(data: stdin, encoding: .utf8) else { return failOpen() }
         guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return failOpen() }
 
@@ -170,6 +182,7 @@ public struct ManagedDistillCLI: Sendable {
             || ProcessInfo.processInfo.environment["RC_TOKEN_SAVER_WAVE_LIVE"] != nil
         if tokenSaverHintOn,
            let pre = TokenSaverWaveLosslessPrepass.apply(input: input, toolHint: prompt) {
+            guard distillAdmission() else { return failOpen() }
             FileHandle.standardError.write(Data(
                 "rc-wave-prepass wave=\(pre.waveID) trigger=\(pre.trigger) saved_bytes=\(pre.savedBytes) frac=\(String(format: "%.3f", pre.savedFraction))\n".utf8
             ))
@@ -202,6 +215,7 @@ public struct ManagedDistillCLI: Sendable {
         urlRequest.setValue(Self.recoveryOperationID(kind: "distill", canonicalPayload: body), forHTTPHeaderField: "X-RemoteCode-Operation-ID")
         urlRequest.httpBody = body
 
+        guard distillAdmission() else { return failOpen() }
         guard let (data, status) = await transport(urlRequest), status == 200,
               let response = try? JSONDecoder().decode(DistillResponse.self, from: data),
               !response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -245,6 +259,7 @@ public struct ManagedDistillCLI: Sendable {
             urlRequest.setValue(Self.recoveryOperationID(kind: "distill", canonicalPayload: body), forHTTPHeaderField: "X-RemoteCode-Operation-ID")
             urlRequest.httpBody = body
 
+            guard distillAdmission() else { return failOpen() }
             guard let (data, status) = await transport(urlRequest), status == 200,
                   let response = try? JSONDecoder().decode(DistillResponse.self, from: data),
                   !response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {

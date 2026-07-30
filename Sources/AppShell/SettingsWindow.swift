@@ -682,10 +682,13 @@ public final class SettingsViewModel: ObservableObject {
     }
 
     public func setTokenSaverEnabled(_ on: Bool) {
-        appSettings.tokenSaverEnabled = on
-        settingsStore.update { $0.tokenSaverEnabled = on }
-        // Graphify is a Token Saver sub-capability — re-apply host gate immediately.
-        context.reconcileGraphifyHost(settings: appSettings)
+        let outcome = context.applyTokenSaverLifecycle(
+            requestedEnabled: on,
+            persistPreference: true
+        )
+        appSettings = settingsStore.reload()
+        appSettings.tokenSaverEnabled = outcome.isEnabled
+        refreshDistillInstallStatus()
     }
 
     /// Mirrors AppContext's last managed-distill reconcile into a published status
@@ -701,7 +704,11 @@ public final class SettingsViewModel: ObservableObject {
     /// Re-run the managed-distill install (idempotent) and refresh the surfaced
     /// status — the recovery action shown next to an install failure.
     public func retryDistillInstall() {
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: appSettings.tokenSaverEnabled)
+        _ = context.applyTokenSaverLifecycle(
+            requestedEnabled: appSettings.tokenSaverEnabled,
+            persistPreference: true
+        )
+        appSettings = settingsStore.reload()
         refreshDistillInstallStatus()
     }
 
@@ -1012,7 +1019,6 @@ public final class SettingsViewModel: ObservableObject {
             privateAccountUser = verified.user
             privateAccountStatus = verified.user.subscribed ? "Subscription active" : "Signed in; subscription required for backend push"
             privateBillingPortalURL = nil
-            NotificationCenter.default.post(name: .rc2PrivateAccountChanged, object: nil)
         } catch {
             Self.accountLog.error("Private account sign-in failed: \(String(describing: error), privacy: .public)")
             privateAccountStatus = Self.signInFailureMessage(for: error)
@@ -1034,7 +1040,6 @@ public final class SettingsViewModel: ObservableObject {
             privateAccountUser = user
             privateAccountEmail = user.email
             privateAccountStatus = user.subscribed ? "Subscription active" : "Signed in; subscription required for backend push"
-            NotificationCenter.default.post(name: .rc2PrivateAccountChanged, object: nil)
         } catch {
             do {
                 let refreshed = try await privateAccountAPI.refresh(refreshToken: stored.refreshToken)
@@ -1042,14 +1047,12 @@ public final class SettingsViewModel: ObservableObject {
                 privateAccountUser = refreshed.user
                 privateAccountEmail = refreshed.user.email
                 privateAccountStatus = refreshed.user.subscribed ? "Subscription active" : "Signed in; subscription required for backend push"
-                NotificationCenter.default.post(name: .rc2PrivateAccountChanged, object: nil)
             } catch {
                 Self.accountLog.error("Private account refresh failed: \(String(describing: error), privacy: .public)")
                 privateAccountStore.clear()
                 privateAccountUser = nil
                 privateBillingPortalURL = nil
                 privateAccountStatus = "Session expired"
-                NotificationCenter.default.post(name: .rc2PrivateAccountChanged, object: nil)
             }
         }
     }
@@ -1083,7 +1086,6 @@ public final class SettingsViewModel: ObservableObject {
         privateAccountUser = nil
         privateAccountStatus = "Optional"
         privateBillingPortalURL = nil
-        NotificationCenter.default.post(name: .rc2PrivateAccountChanged, object: nil)
     }
 
     public func checkForAppUpdates() {
@@ -1677,7 +1679,7 @@ public struct SettingsView: View {
                 .labelsHidden()
                 .accessibilityIdentifier("settings.tokenSaver.enabled.toggle")
             }
-            Text("Compresses large tool output using the local MLX model so fewer tokens reach the remote provider. Activating from the sidebar is the primary path; this toggle reflects the persisted value.")
+            Text("Compresses large tool output using the local MLX model so fewer tokens reach the remote provider. Settings and the sidebar share the same subscription, model-readiness, and cleanup lifecycle.")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
             distillInstallStatusRow

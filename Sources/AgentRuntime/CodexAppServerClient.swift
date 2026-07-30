@@ -191,6 +191,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
     private var stderrBuffer = Data()
     private let requestTimeout: TimeInterval
     private let tokenSaverCensusAllowed: Bool
+    private let foreignUserUID: uid_t?
     public let forkProtocolSupport: CodexForkProtocolSupport
     // Only the stderr tail is ever surfaced (termination diagnostics), so cap
     // the buffer instead of growing it for the app-server's whole lifetime.
@@ -202,6 +203,8 @@ public final class CodexAppServerClient: @unchecked Sendable {
         arguments: [String] = ["app-server"],
         cwd: String,
         environment: [String: String] = [:],
+        runAsUser: AgentRunAsUser? = nil,
+        askpassPath: String? = nil,
         notificationHandler: NotificationHandler? = nil,
         serverRequestHandler: ServerRequestHandler? = nil,
         requestTimeout: TimeInterval = 30,
@@ -220,6 +223,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
         self.serverRequestHandler = serverRequestHandler
         self.requestTimeout = max(0.001, requestTimeout)
         self.tokenSaverCensusAllowed = tokenSaverCensusAllowed
+        self.foreignUserUID = runAsUser.flatMap { $0.uid == getuid() ? nil : $0.uid }
         if let forkProtocolSupportOverride {
             self.forkProtocolSupport = forkProtocolSupportOverride
         } else if arguments == ["app-server"] {
@@ -239,7 +243,9 @@ public final class CodexAppServerClient: @unchecked Sendable {
                 executablePath: path,
                 arguments: arguments,
                 currentDirectory: cwd,
-                environment: environment
+                environment: environment,
+                runAsUser: runAsUser,
+                askpassPath: askpassPath
             )
         } catch {
             throw CodexAppServerError.spawnFailed(error.localizedDescription)
@@ -278,7 +284,11 @@ public final class CodexAppServerClient: @unchecked Sendable {
 
         do {
             try process.run()
-            try ProcessSpawnTagger.tagProcess(process, provider: .codex)
+            try ProcessSpawnTagger.tagProcess(
+                process,
+                provider: .codex,
+                foreignUserLaunch: foreignUserUID != nil
+            )
         } catch {
             throw CodexAppServerError.spawnFailed(error.localizedDescription)
         }
@@ -475,7 +485,10 @@ public final class CodexAppServerClient: @unchecked Sendable {
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
         stderrPipe.fileHandleForReading.readabilityHandler = nil
         if process.isRunning {
-            ProcessTerminator.terminateTree(process)
+            ProcessTerminator.terminateTree(
+                process,
+                foreignUserUID: foreignUserUID
+            )
         }
         failPending(CodexAppServerError.processExited(stderrTail: ""))
     }
@@ -484,7 +497,10 @@ public final class CodexAppServerClient: @unchecked Sendable {
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
         stderrPipe.fileHandleForReading.readabilityHandler = nil
         if process.isRunning {
-            ProcessTerminator.terminateTreeImmediately(process)
+            ProcessTerminator.terminateTreeImmediately(
+                process,
+                foreignUserUID: foreignUserUID
+            )
         }
         failPending(CodexAppServerError.processExited(stderrTail: ""))
     }

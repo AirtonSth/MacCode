@@ -79,6 +79,12 @@ public enum CommandWrapPolicy {
         if name == "git", isExactGitSubcommand(args) {
             return "exact_output_subcommand"
         }
+        // Full patch output is source payload, not summary-friendly noise. Keep
+        // it byte-for-byte exact. Only an explicit non-patch summary format may
+        // opt these commands back into compression.
+        if isExactPatchInvocation(command: name, args: args) {
+            return "exact_patch_output"
+        }
         if requiresReadOnlySubcommand(name), !isAllowedReadOnlyInvocation(command: name, args: args) {
             return "mutating_subcommand"
         }
@@ -96,6 +102,61 @@ public enum CommandWrapPolicy {
 
     static func isSedInPlaceFlag(_ arg: String) -> Bool {
         arg.hasPrefix("-i") || arg == "--in-place" || arg.hasPrefix("--in-place=")
+    }
+
+    /// `git diff`, `gh pr diff`, and `glab mr diff` emit complete patches by
+    /// default. A complete patch is exact agent input and must never be sent to
+    /// Distill. Explicit summary formats remain eligible, unless a second flag
+    /// also asks the tool to emit a patch.
+    static func isExactPatchInvocation(command: String, args: [String]) -> Bool {
+        let normalized = args.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+        let patchArguments: ArraySlice<String>
+        switch command {
+        case "git":
+            guard let index = normalized.firstIndex(of: "diff") else { return false }
+            patchArguments = normalized.suffix(from: normalized.index(after: index))
+        case "gh":
+            guard nestedCommand(normalized, first: "pr", second: "diff") else { return false }
+            let index = normalized.firstIndex(of: "diff")!
+            patchArguments = normalized.suffix(from: normalized.index(after: index))
+        case "glab":
+            guard nestedCommand(normalized, first: "mr", second: "diff") else { return false }
+            let index = normalized.firstIndex(of: "diff")!
+            patchArguments = normalized.suffix(from: normalized.index(after: index))
+        default:
+            return false
+        }
+
+        let hasSummaryFormat = patchArguments.contains(where: isExplicitDiffSummaryFlag)
+        let alsoEmitsPatch = patchArguments.contains(where: isPatchEmissionFlag)
+        return !hasSummaryFormat || alsoEmitsPatch
+    }
+
+    private static func nestedCommand(_ arguments: [String], first: String, second: String) -> Bool {
+        let positional = arguments.filter { !$0.isEmpty && !$0.hasPrefix("-") }
+        return positional.count >= 2 && positional[0] == first && positional[1] == second
+    }
+
+    private static func isExplicitDiffSummaryFlag(_ argument: String) -> Bool {
+        let exact: Set<String> = [
+            "--stat", "--shortstat", "--numstat", "--name-only", "--name-status"
+        ]
+        return exact.contains(argument) || argument.hasPrefix("--stat=")
+    }
+
+    private static func isPatchEmissionFlag(_ argument: String) -> Bool {
+        if [
+            "-p", "-u", "--patch", "--patch-with-raw", "--patch-with-stat",
+            "-c", "--cc", "--combined-all-paths", "--raw"
+        ].contains(argument) {
+            return true
+        }
+        return argument.hasPrefix("-u")
+            || argument.hasPrefix("--unified")
+            || argument.hasPrefix("--word-diff")
+            || argument.hasPrefix("--color-words")
     }
 
     private static func requiresReadOnlySubcommand(_ command: String) -> Bool {

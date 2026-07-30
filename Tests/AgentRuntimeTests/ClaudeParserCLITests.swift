@@ -82,6 +82,8 @@ final class ClaudeParserCLITests: XCTestCase {
         XCTAssertEqual(usage?.inputTokens, 45_980)
         XCTAssertEqual(usage?.outputTokens, 188)
         XCTAssertEqual(usage?.totalTokens, 46_168)
+        XCTAssertEqual(usage?.resolvedSemantics, .cumulative,
+                       "final modelUsage is an authoritative run snapshot, not another request charge")
         XCTAssertEqual(usage?.contextWindow, 200_000,
                        "Claude SDK bridge result.modelUsage must feed Token Saver and context pressure; otherwise /distill responses complete but Saved stays 0")
         // G3: the three cache buckets are recorded SEPARATELY (not folded), so net

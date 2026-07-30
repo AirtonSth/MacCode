@@ -535,7 +535,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             appLifecycleLog.info("app.will_terminate distill_integration=unchanged isolated_process=true")
         } else {
             appLifecycleLog.info("app.will_terminate distill_integration=app_private_retained distill_server=stopped token_saver=\(tokenSaverEnabled ? "enabled" : "disabled")")
-            context?.reconcileManagedDistillSkills(tokenSaverEnabled: tokenSaverEnabled)
+            context?.prepareTokenSaverLifecycleForTermination()
         }
         persistRestorableStateBeforeUpdate()
         stopPetController()

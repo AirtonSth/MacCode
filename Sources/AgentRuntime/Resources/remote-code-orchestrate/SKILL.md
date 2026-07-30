@@ -32,13 +32,22 @@ user-started thread. The command is installed beside RemoteCode's own service;
 do not install a proxy server, SDK, Python, Rust, or another provider runtime.
 
 Bare `grok`, `claude`, or `codex` names still resolve through the host-managed
-PATH controller (`~/.remote-code/bin`). The supported `sam-grok-worker`
-one-shot ABI is upgraded automatically to `remote-code agent-app grok`.
-Unknown or security-specialized CLI shapes fail open to the real provider and
-record lifecycle-only telemetry; that is not evidence of prompt compression or
-token savings. Keep specialized read-only/tool-allowlisted contracts raw when
-the Agent App flags cannot express the same boundary. Skills must not invent or
-widen Token Saver admission.
+PATH controller (`~/.remote-code/bin`). The exact `sam-grok-worker` one-shot
+contract (Grok 4.5, prompt file, permitted effort, JSON output, workspace
+sandbox, always approve, and its memory/subagent/tool/update guards) is upgraded
+automatically to `remote-code agent-app grok`. Its stdout remains a JSON object
+with the worker report in `text`, while the real Agent App thread/run owns
+persistence, Token Saver processing, provider usage, and the live Subagents UI.
+Any missing, duplicated, aliased, reordered-with-unknown, or additional CLI
+member fails closed to the raw Grok ABI instead of receiving a partial rewrite.
+Other explicit provider CLI contracts remain raw: RemoteCode keeps their
+provider/output ABI, records supported lifecycle and provider-usage telemetry,
+and adds documented runtime-guidance options only for recognized provider
+turns. That raw path does not provide Agent App persistence or prompt
+compression, and telemetry alone is not evidence of token savings. Keep
+specialized read-only/tool-allowlisted contracts raw when the Agent App flags
+cannot express the same boundary. Skills must not invent or widen Token Saver
+admission.
 
 Provider-native collaboration whose child prompt is hidden inside a provider
 SDK cannot be rewritten by a Skill. RemoteCode records its live lifecycle and
@@ -121,12 +130,14 @@ Do **not** load every reference on every turn.
 | **Micro** (`T0` + certainty `absolute`/`high`) | This SKILL (this section + §1 micro) | matrix full tables, output-contract, validator until report |
 | **Single** (`T1`) | + [routing-policy.md](references/routing-policy.md) + [prompt-contract.md](references/prompt-contract.md) | full output-contract until drafting report |
 | **Multi** (`T2`) | + [host-runtime-matrix.md](references/host-runtime-matrix.md) | — |
-| **Critical** (`T3`) | + [output-contract.md](references/output-contract.md) + run validator | — |
+| **Critical** (`T3`) | + [output-contract.md](references/output-contract.md) + contract review | optional formal validator |
 
-Always run `scripts/validate_orchestration.py` before declaring completion when
-you produced a report JSON (Single/Multi/Critical). Micro path may skip the
-formal report when no delegated workers ran and proof is a single local check —
-if you write a report, validate it. Micro chat bypass: no report.
+RemoteCode orchestration must remain functional without Python or another
+unbundled runtime. When you produce report JSON (Single/Multi/Critical), review
+it against [output-contract.md](references/output-contract.md) before declaring
+completion. The packaged Python validator is an optional development check only
+when the current environment already provides a compatible runtime; its absence
+does not block the core orchestration. Micro chat bypass: no report.
 
 ## Certainty Budget
 
@@ -266,15 +277,14 @@ When skip applies or no trigger fires: `NOT_REQUIRED` + exact reason.
 ## 6. Validate Completion
 
 For Single/Multi/Critical (and any Micro that wrote a report), write JSON per
-[output-contract.md](references/output-contract.md), then:
+[output-contract.md](references/output-contract.md) and review the required
+schema, DAG, proof, manifest, and decision invariants there. This core path must
+not call or install Python, Rust, an SDK, or another provider runtime.
 
-```bash
-SAM_ORCHESTRATE_DIR="<absolute directory containing this SKILL.md>"
-python3 "$SAM_ORCHESTRATE_DIR/scripts/validate_orchestration.py" \
-  "$ORCHESTRATION_TMP/report.json"
-```
-
-Do not weaken the validator. Remove temp artifacts after validation.
+`scripts/validate_orchestration.py` remains an optional development validator
+for environments that already provide its runtime. Do not install a dependency
+to run it and do not treat its unavailability as an orchestration failure. When
+used, report `PASS` or its exact errors and remove temporary artifacts.
 
 `COMPLETE` only when DAG + review gate satisfy the contract, every completed
 producer has dedicated TARGET/`PASS` proof, manifest reconciles, and no required
