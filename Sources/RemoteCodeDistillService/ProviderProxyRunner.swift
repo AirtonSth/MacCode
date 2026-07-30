@@ -18,20 +18,38 @@ enum ProviderProxyRunner {
         let env = ProcessInfo.processInfo.environment
         let basename = ProviderProxyPolicy.commandBasename(command)
 
-        guard let realExe = resolveRealExecutable(command: basename, environment: env) else {
-            FileHandle.standardError.write(
-                Data("\(basename): command not found (RemoteCode provider proxy)\n".utf8)
-            )
-            return 127
-        }
-
         // Fail open: no telemetry scope → raw exec, no receipt.
         guard ProviderProxyPolicy.hasTelemetryScope(environment: env) else {
+            guard let realExe = resolveRealExecutable(command: basename, environment: env) else {
+                FileHandle.standardError.write(
+                    Data("\(basename): command not found (RemoteCode provider proxy)\n".utf8)
+                )
+                return 127
+            }
             return runInheritingAllStreams(executable: realExe, args: arguments)
         }
 
         let childRunId = beginReceipt(providerBasename: basename, environment: env)
-        let outcome = runInheritingAllStreamsDetailed(executable: realExe, args: arguments)
+        let outcome: ProcessOutcome
+        if let delegation = ProviderProxyPolicy.agentAppDelegation(
+            providerBasename: basename,
+            arguments: arguments,
+            environment: env
+        ) {
+            outcome = runAgentAppDelegation(delegation, environment: env)
+        } else if let realExe = resolveRealExecutable(command: basename, environment: env) {
+            outcome = runInheritingAllStreamsDetailed(executable: realExe, args: arguments)
+        } else {
+            FileHandle.standardError.write(
+                Data("\(basename): command not found (RemoteCode provider proxy)\n".utf8)
+            )
+            outcome = ProcessOutcome(
+                exitCode: 127,
+                terminationStatus: 127,
+                wasUncaughtSignal: false,
+                forwardedSignal: nil
+            )
+        }
         if let childRunId {
             endReceiptOnce(
                 runId: childRunId,
@@ -44,6 +62,102 @@ enum ProviderProxyRunner {
             )
         }
         return outcome.exitCode
+    }
+
+    /// Dispatch the explicit `remote-code agent-app …` entry point to the
+    /// bundled rc2 binary, preserving stdin/stdout/stderr and exit status.
+    static func runAgentAppCLI(
+        arguments: [String],
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Int32 {
+        runAgentAppCLIOutcome(arguments: arguments, environment: environment).exitCode
+    }
+
+    private static func runAgentAppDelegation(
+        _ delegation: ProviderAgentAppDelegation,
+        environment: [String: String]
+    ) -> ProcessOutcome {
+        var arguments = [
+            "agent-app", delegation.provider.rawValue,
+            "--prompt-file", delegation.promptFile,
+            "--permission", delegation.permissionMode.rawValue,
+            "--reasoning-effort", delegation.reasoningEffort.rawValue,
+            "--output-format", delegation.outputFormat.rawValue
+        ]
+        if let model = delegation.model, !model.isEmpty {
+            arguments.append(contentsOf: ["--model", model])
+        }
+        return runAgentAppCLIOutcome(arguments: arguments, environment: environment)
+    }
+
+    private static func runAgentAppCLIOutcome(
+        arguments: [String],
+        environment: [String: String]
+    ) -> ProcessOutcome {
+        guard let rc2 = resolveRC2Executable(environment: environment) else {
+            FileHandle.standardError.write(
+                Data("remote-code agent-app: bundled rc2 executable not found\n".utf8)
+            )
+            return ProcessOutcome(
+                exitCode: 127,
+                terminationStatus: 127,
+                wasUncaughtSignal: false,
+                forwardedSignal: nil
+            )
+        }
+        var effectiveArguments = arguments
+        if let socket = ProviderProxyPolicy.agentAppSocketPath(
+            environment: environment,
+            bundledSocketPath: bundledReleaseChannel().map { AppPaths.socketPath(for: $0) }
+        ),
+           !arguments.contains("--socket") {
+            effectiveArguments.insert(contentsOf: ["--socket", socket], at: 0)
+        }
+        return runInheritingAllStreamsDetailed(executable: rc2, args: effectiveArguments)
+    }
+
+    private static func bundledReleaseChannel() -> ReleaseChannel? {
+        guard let current = currentExecutablePath(),
+              let canonical = canonicalPath(current) else {
+            return nil
+        }
+        let contentsDirectory = URL(fileURLWithPath: canonical)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let plistURL = contentsDirectory.appendingPathComponent("Info.plist")
+        guard let data = try? Data(contentsOf: plistURL),
+              let plist = try? PropertyListSerialization.propertyList(
+                from: data,
+                options: [],
+                format: nil
+              ) as? [String: Any] else {
+            return nil
+        }
+        if let environment = plist["LSEnvironment"] as? [String: Any],
+           let channel = environment["RC2_CHANNEL"] as? String,
+           let releaseChannel = ReleaseChannel(rawValue: channel) {
+            return releaseChannel
+        }
+        guard let bundleID = plist["CFBundleIdentifier"] as? String else { return nil }
+        if bundleID == "io.remotecode.desktop" { return .stable }
+        if bundleID.hasSuffix(".canary") { return .canary }
+        if bundleID.hasSuffix(".debug") { return .debug }
+        return nil
+    }
+
+    private static func resolveRC2Executable(environment: [String: String]) -> String? {
+        if let override = environment["RC_REMOTE_CODE_RC2_PATH"],
+           FileManager.default.isExecutableFile(atPath: override) {
+            return override
+        }
+        guard let current = currentExecutablePath(),
+              let canonical = canonicalPath(current) else {
+            return nil
+        }
+        let sibling = (canonical as NSString)
+            .deletingLastPathComponent
+            .appending("/rc2")
+        return FileManager.default.isExecutableFile(atPath: sibling) ? sibling : nil
     }
 
     // MARK: - real executable

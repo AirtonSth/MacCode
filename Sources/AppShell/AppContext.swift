@@ -639,11 +639,19 @@ public final class AppContext {
             let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
             guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .initial) else {
                 return await MainActor.run {
-                    self.subagentTelemetryEnvironment(provider: provider, threadId: threadId)
+                    self.subagentTelemetryEnvironment(
+                        provider: provider,
+                        threadId: threadId,
+                        baseEnvironment: base
+                    )
                 }
             }
             var environment = await MainActor.run {
-                self.subagentTelemetryEnvironment(provider: provider, threadId: threadId)
+                self.subagentTelemetryEnvironment(
+                    provider: provider,
+                    threadId: threadId,
+                    baseEnvironment: base
+                )
             }
             environment.merge(
                 await self.tokenSaverAgentEnvironment(
@@ -1440,16 +1448,29 @@ public final class AppContext {
     /// must not make child activity disappear from the Agent App.
     func subagentTelemetryEnvironment(
         provider: AgentProvider,
-        threadId: AgentThreadID
+        threadId: AgentThreadID,
+        baseEnvironment: [String: String] = [:]
     ) -> [String: String] {
         let thread = try? threadRepo.get(id: threadId)
-        var environment = [
+        var environment = baseEnvironment
+        environment.merge([
             "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY": appSupportDirectory.path,
             "RC_REMOTE_CODE_SUBAGENT_THREAD_ID": threadId.value.uuidString,
+            "RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE": "1",
+            "RC_REMOTE_CODE_AGENT_APP_SOCKET_PATH": AppPaths.socketPath(for: channel),
             "REMOTE_CODE_AGENT_PROVIDER": provider.rawValue,
             "REMOTE_CODE_AGENT_MODEL": thread?.model ?? "unknown",
             "REMOTE_CODE_PROVIDER_INSTANCE_ID": thread?.providerInstanceId ?? provider.rawValue,
-        ]
+        ]) { _, new in new }
+        let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+        let basePath = environment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
+        environment["PATH"] = AppCommandRouter.providerPathWithManagedWrappers(
+            currentPath: basePath,
+            managedBin: managedBin
+        )
+        if let workspaceID = thread?.workspaceId?.value.uuidString {
+            environment["RC_REMOTE_CODE_WORKSPACE_ID"] = workspaceID
+        }
         if let telemetryExecutable = Self.subagentTelemetryExecutableURL()?.path {
             environment["REMOTE_CODE_SUBAGENT_TELEMETRY_COMMAND"] = telemetryExecutable
         }
@@ -1528,7 +1549,16 @@ public final class AppContext {
             // Always scrub legacy per-provider home skill / AGENTS.md blocks.
             try installer.uninstallLegacyProviderDistillSkills()
             // Always-on nested provider controller (independent of Token Saver).
-            try? installer.installProviderProxies()
+            do {
+                _ = try installer.installProviderProxies()
+            } catch {
+                NSLog("RemoteCode provider proxy install failed: \(error)")
+            }
+            do {
+                _ = try installer.installAgentAppMiddleware()
+            } catch {
+                NSLog("RemoteCode Agent App middleware install failed: \(error)")
+            }
             if tokenSaverEnabled {
                 let appPrivate = try installer.installAppPrivateDistillSkill(
                     sourceRevision: "github-main-remote-code-template-v2"

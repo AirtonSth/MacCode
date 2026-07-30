@@ -41,6 +41,19 @@ final class RemoteCodeOrchestrateInstallTests: XCTestCase {
                       || skill.contains("requested/returned skill content"),
                       "SKILL.md must cover requested and returned skill content")
         XCTAssertFalse(skill.contains("Put the Distill rule in every worker/reviewer prompt"))
+        XCTAssertTrue(
+            skill.contains("remote-code agent-app <codex|claude|grok>"),
+            "controlled provider workers must use the full Agent App middleware"
+        )
+        XCTAssertTrue(
+            skill.contains("lifecycle-only telemetry")
+                && skill.contains("not evidence of prompt compression or"),
+            "raw compatibility paths must not be reported as measured Token Saver savings"
+        )
+        XCTAssertTrue(
+            skill.contains("Provider-native collaboration whose child prompt is hidden"),
+            "the contract must disclose the provider-native prompt boundary"
+        )
     }
 
     func testPinnedManifestMatchesEmbeddedResourceTreeDigest() throws {
@@ -56,8 +69,8 @@ final class RemoteCodeOrchestrateInstallTests: XCTestCase {
 
         XCTAssertEqual(package.skillID, "remote-code-orchestrate")
         XCTAssertEqual(package.sourceRevision, "2c77fa48431bc20e5dc841652079594a3ea918c9")
-        XCTAssertEqual(package.localVersion, "2")
-        XCTAssertEqual(package.sourceTreeSHA256, "920c6cd819b285332a8381526552e08b47fd28ba55a1f4392b57f71010ce19c8")
+        XCTAssertEqual(package.localVersion, "3")
+        XCTAssertEqual(package.sourceTreeSHA256, "1493839804d567da2a53cbb1314118f0c33e3f2c669f59f0691c9d85bd9bfe1b")
         XCTAssertEqual(package.allowedPaths, [
             "SKILL.md",
             "agents/openai.yaml",

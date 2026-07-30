@@ -33,6 +33,12 @@ struct RemoteCodeDistillServiceMain {
             await runSubagentTelemetry(arguments: Array(rawArgs.dropFirst(2)))
             return
         }
+        if programName == AgentSkillInstaller.agentAppMiddlewareCommand {
+            let code = ProviderProxyRunner.runAgentAppCLI(
+                arguments: Array(rawArgs.dropFirst())
+            )
+            Darwin.exit(code)
+        }
         if programName == "rc-retrieve-mcp" || rawArgs.dropFirst().first == "mcp" {
             await runMCP()
             return

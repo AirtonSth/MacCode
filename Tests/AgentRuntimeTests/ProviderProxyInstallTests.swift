@@ -53,6 +53,72 @@ final class ProviderProxyInstallTests: XCTestCase {
         )
     }
 
+    func test_installAgentAppMiddleware_installsOwnershipSafeRemoteCodeAlias() throws {
+        // WHY: orchestrators need one provider-neutral command that always
+        // enters the host Agent App pipeline.
+        let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let binary = try fakeServiceBinary(in: home)
+        let installer = AgentSkillInstaller(homeDirectory: home)
+
+        let installed = try XCTUnwrap(installer.installAgentAppMiddleware(serviceBinaryURL: binary))
+        XCTAssertEqual(installed.lastPathComponent, "remote-code")
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: installed.path),
+            binary.path
+        )
+        XCTAssertEqual(
+            try installer.installAgentAppMiddleware(serviceBinaryURL: binary),
+            installed,
+            "reconcile must be idempotent"
+        )
+
+        let replacement = home
+            .appendingPathComponent("Replacement", isDirectory: true)
+            .appendingPathComponent("RemoteCodeDistillService")
+        try FileManager.default.createDirectory(
+            at: replacement.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        XCTAssertTrue(FileManager.default.createFile(atPath: replacement.path, contents: Data()))
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: replacement.path
+        )
+        XCTAssertEqual(
+            try installer.installAgentAppMiddleware(serviceBinaryURL: replacement),
+            installed
+        )
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: installed.path),
+            replacement.path,
+            "an owned alias must follow the current app bundle after replacement"
+        )
+    }
+
+    func test_installAgentAppMiddleware_preservesUserOwnedSymlink() throws {
+        // WHY: reconciling a new bundle must never hijack an unrelated command
+        // the user placed under the same managed directory.
+        let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let binary = try fakeServiceBinary(in: home)
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let binDirectory = home.appendingPathComponent(".remote-code/bin", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: binDirectory,
+            withIntermediateDirectories: true
+        )
+        let link = binDirectory.appendingPathComponent("remote-code")
+        try FileManager.default.createSymbolicLink(
+            atPath: link.path,
+            withDestinationPath: "/usr/local/bin/user-remote-code"
+        )
+
+        XCTAssertNil(try installer.installAgentAppMiddleware(serviceBinaryURL: binary))
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: link.path),
+            "/usr/local/bin/user-remote-code"
+        )
+    }
+
     func test_installProviderProxies_neverShadowsMissingProvider() throws {
         let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
         let binary = try fakeServiceBinary(in: home)

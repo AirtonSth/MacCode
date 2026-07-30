@@ -581,6 +581,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     private let now: @Sendable () -> Date
     private let costEstimator: (@Sendable (AgentOrchestrationAdmissionReceipt, AssistantTokenUsage?) -> Int?)?
     private let reservationLock = NSLock()
+    private let receiptLifecycleLock = NSLock()
     private var reservations: [String: (tokens: Int?, costMicros: Int?, deadlineAt: Date?)] = [:]
 
     public init(
@@ -810,6 +811,8 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         nodeId: String,
         parentRunId: AgentRunID? = nil
     ) throws -> AgentOrchestrationAdmissionReceipt {
+        receiptLifecycleLock.lock()
+        defer { receiptLifecycleLock.unlock() }
         let parent = try parentRunId.flatMap { try repository.receipt(runId: $0) }
         let trimmedNodeId = nodeId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedNodeId.isEmpty,
@@ -819,6 +822,16 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
                   CharacterSet.alphanumerics.contains($0) || "-_.".unicodeScalars.contains($0)
               }) else {
             throw AgentOrchestrationAdmissionError.invalidChildAdmission("node id must be a non-root safe token")
+        }
+        if let existing = try repository.receipt(runId: runId) {
+            guard existing.threadId == threadId,
+                  existing.provider == provider,
+                  existing.nodeId.caseInsensitiveCompare("root") != .orderedSame else {
+                throw AgentOrchestrationAdmissionError.invalidChildAdmission(
+                    "run id already belongs to a different orchestration receipt"
+                )
+            }
+            return existing
         }
         let child = AgentOrchestrationAdmissionReceipt(
             parentReceiptId: parent?.id,
@@ -856,6 +869,8 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         usage: AssistantTokenUsage? = nil,
         qualityOutcome: String? = nil
     ) throws {
+        receiptLifecycleLock.lock()
+        defer { receiptLifecycleLock.unlock() }
         guard let receipt = try repository.receipt(runId: runId),
               receipt.lifecycleStatus != .finalized else { return }
         let finalizedAt = now()
@@ -916,6 +931,8 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     }
 
     public func markReceiptUnknown(runId: AgentRunID) throws {
+        receiptLifecycleLock.lock()
+        defer { receiptLifecycleLock.unlock() }
         guard let receipt = try repository.receipt(runId: runId),
               receipt.lifecycleStatus == .accepted else { return }
         let updatedAt = now()

@@ -49,6 +49,8 @@ func usage(_ exit: Int32 = 0) -> Never {
       agent send --thread TID --text "..." [--provider ...] [--model ...]
       agent stop --thread TID
       agent models --provider codex|claude
+      agent-app codex|claude|grok [PROMPT] [--prompt-file PATH] [--workspace WID]
+                [--model M] [--permission MODE] [--reasoning-effort LEVEL]
     """
     FileHandle.standardError.write(Data(text.utf8))
     Darwin.exit(exit)
@@ -108,6 +110,7 @@ let subcommandHelp: [String: String] = [
     "notification":   "Usage: \(prog) notification <subcommand> [args...]\n\n  Subcommands: create list mark-read dismiss",
     "browser":        "Usage: \(prog) browser <subcommand> [args...]\n\n  Subcommands: navigate back forward reload url snapshot click focus hover check uncheck fill type select wait screenshot eval",
     "agent":          "Usage: \(prog) agent <subcommand> [args...]\n\n  Subcommands:\n    open --workspace WID\n    thread list [--workspace WID]\n    thread create [--workspace WID] [--title T] [--provider codex|claude] [--model M]\n    send --thread TID --text TEXT [--provider P] [--model M]\n    stop --thread TID\n    models [--provider codex|claude]",
+    "agent-app":      "Usage: \(prog) agent-app <codex|claude|grok> [PROMPT] [--prompt-file PATH] [--workspace WID] [--model M] [--permission supervised|auto_accept_edits|full_access] [--reasoning-effort LEVEL] [--turn-timeout MS] [--output-format text|json|grok-json]\n\n  Runs a persisted headless turn through the same Agent App pipeline as the UI.",
 ]
 
 var rest: [String] = []
@@ -224,7 +227,97 @@ struct RPC {
 // the caller can handle the error.
 signal(SIGPIPE, SIG_IGN)
 
+if _timeoutResult.timeoutMS == nil, rest.first == "agent-app" {
+    let (agentAppFlags, _) = parseFlags(Array(rest.dropFirst()))
+    let turnTimeoutMS = Int(agentAppFlags["turn-timeout"] ?? "3600000") ?? 3_600_000
+    if turnTimeoutMS > 0 {
+        receiveTimeoutMS = AgentAppMiddlewareTimeoutPolicy.receiveTimeoutMS(
+            explicitGlobalTimeoutMS: nil,
+            turnTimeoutMS: turnTimeoutMS
+        )
+    }
+}
 let rpc = RPC(socketPath: socketPath, receiveTimeoutMS: receiveTimeoutMS)
+
+enum AgentAppCLIError: Error, LocalizedError {
+    case rpc(String)
+    case invalidResponse
+    case invalidPromptFile(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .rpc(let message): return message
+        case .invalidResponse: return "RemoteCode returned an invalid RPC response."
+        case .invalidPromptFile(let path): return "Could not read --prompt-file \(path)."
+        }
+    }
+}
+
+func agentAppRPCValue(_ any: Any) -> AgentAppRPCValue? {
+    switch any {
+    case let value as String:
+        return .string(value)
+    case let value as NSNumber:
+        if CFGetTypeID(value) == CFBooleanGetTypeID() {
+            return .bool(value.boolValue)
+        }
+        return .number(value.doubleValue)
+    case let value as [String: Any]:
+        var object: [String: AgentAppRPCValue] = [:]
+        for (key, child) in value {
+            guard let converted = agentAppRPCValue(child) else { return nil }
+            object[key] = converted
+        }
+        return .object(object)
+    case let value as [Any]:
+        let converted = value.compactMap(agentAppRPCValue)
+        guard converted.count == value.count else { return nil }
+        return .array(converted)
+    case _ as NSNull:
+        return .null
+    default:
+        return nil
+    }
+}
+
+func callAgentAppRPC(_ method: String, params: [String: AgentAppRPCValue]) throws -> AgentAppRPCValue {
+    func foundationValue(_ value: AgentAppRPCValue) -> Any {
+        switch value {
+        case .string(let string): return string
+        case .number(let number): return number
+        case .bool(let bool): return bool
+        case .object(let object): return object.mapValues(foundationValue)
+        case .array(let array): return array.map(foundationValue)
+        case .null: return NSNull()
+        }
+    }
+    let response = rpc.call(method, params: params.mapValues(foundationValue))
+    if let error = response["error"] as? [String: Any] {
+        throw AgentAppCLIError.rpc(error["message"] as? String ?? "RemoteCode RPC \(method) failed.")
+    }
+    guard let result = response["result"],
+          let converted = agentAppRPCValue(result) else {
+        throw AgentAppCLIError.invalidResponse
+    }
+    return converted
+}
+
+func emitAgentAppOutput(_ output: AgentAppMiddlewareOutput, format: String) -> Never {
+    switch format {
+    case "json", "grok-json":
+        var object: [String: Any] = [
+            "text": output.response,
+            "thread_id": output.threadID
+        ]
+        if let runID = output.runID { object["run_id"] = runID }
+        let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        FileHandle.standardOutput.write(data ?? Data("{\"text\":\"\"}".utf8))
+        FileHandle.standardOutput.write(Data("\n".utf8))
+    default:
+        print(output.response)
+    }
+    Darwin.exit(RC2ExitCode.success)
+}
 
 func emit(_ obj: Any) {
     if jsonOutput {
@@ -593,6 +686,73 @@ case "agent":
         let prov = flags["provider"] ?? "codex"
         emit(rpc.call("agent.models.list", params: ["provider": prov]))
     default: diagError(RC2CLIDiagnostics.unknownSubcommand(sub, of: "agent"))
+    }
+case "agent-app":
+    let (flags, positional) = parseFlags(restArgs)
+    guard let providerName = positional.first,
+          let provider = AgentProvider(rawValue: providerName) else {
+        diagError("agent-app requires provider codex, claude, or grok.")
+    }
+    let trailingPrompt = positional.dropFirst().joined(separator: " ")
+    let prompt: String
+    if let path = flags["prompt-file"] {
+        guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else {
+            FileHandle.standardError.write(Data("\(AgentAppCLIError.invalidPromptFile(path).localizedDescription)\n".utf8))
+            Darwin.exit(RC2ExitCode.rpcError)
+        }
+        prompt = contents
+    } else if let text = flags["text"] ?? flags["prompt"] {
+        prompt = text
+    } else {
+        prompt = trailingPrompt
+    }
+    guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        diagError("agent-app requires a prompt, --text, or --prompt-file.")
+    }
+    let environment = ProcessInfo.processInfo.environment
+    let workspaceID = flags["workspace"]
+        ?? environment["RC_TOKEN_SAVER_WORKSPACE_ID"]
+        ?? environment["RC_REMOTE_CODE_WORKSPACE_ID"]
+    let permissionText = flags["permission"] ?? flags["permission-mode"] ?? "supervised"
+    guard let permission = AgentPermissionMode(rawValue: permissionText.replacingOccurrences(of: "-", with: "_")) else {
+        diagError("Invalid --permission \(permissionText).")
+    }
+    let effortText = flags["reasoning-effort"] ?? flags["effort"] ?? "medium"
+    guard let effort = AgentReasoningEffort(rawValue: effortText) else {
+        diagError("Invalid --reasoning-effort \(effortText).")
+    }
+    let tierText = flags["service-tier"] ?? "auto"
+    guard let tier = AgentServiceTier(rawValue: tierText) else {
+        diagError("Invalid --service-tier \(tierText).")
+    }
+    let timeoutMS = Int(flags["turn-timeout"] ?? "3600000") ?? 3_600_000
+    guard timeoutMS > 0 else { diagError("Invalid --turn-timeout \(timeoutMS).") }
+    let pollIntervalUS: useconds_t = 100_000
+    let maxPolls = max(1, timeoutMS / Int(pollIntervalUS / 1_000))
+    let outputFormat = flags["output-format"] ?? (jsonOutput ? "json" : "text")
+    guard ["text", "json", "grok-json"].contains(outputFormat) else {
+        diagError("Invalid --output-format \(outputFormat).")
+    }
+    do {
+        let output = try AgentAppMiddlewareWorkflow.execute(
+            request: AgentAppMiddlewareRequest(
+                provider: provider,
+                prompt: prompt,
+                workspaceID: workspaceID,
+                title: flags["title"],
+                model: flags["model"],
+                permissionMode: permission,
+                reasoningEffort: effort,
+                serviceTier: tier
+            ),
+            maxPolls: maxPolls,
+            call: callAgentAppRPC,
+            wait: { usleep(pollIntervalUS) }
+        )
+        emitAgentAppOutput(output, format: outputFormat)
+    } catch {
+        FileHandle.standardError.write(Data("remote-code agent-app: \(error.localizedDescription)\n".utf8))
+        Darwin.exit(RC2ExitCode.rpcError)
     }
 default:
     diagError(RC2CLIDiagnostics.unknownSubcommand(cmd, of: prog))

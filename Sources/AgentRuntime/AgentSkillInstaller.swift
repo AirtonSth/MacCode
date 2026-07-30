@@ -148,6 +148,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     public static let mcpBeginMarker = "# RemoteCode managed MCP: begin"
     public static let mcpEndMarker = "# RemoteCode managed MCP: end"
     public static let retrieveMCPName = "remotecode-distill-retrieve"
+    public static let agentAppMiddlewareCommand = "remote-code"
     public static let remoteCodeOrchestrateManifestName = ".remote-code-install.json"
     public static let remoteCodeOrchestrateRuntimeManifestName = "manifest.json"
     public static let remoteCodeOrchestratePinnedPackage = RemoteCodeOrchestratePackage(
@@ -156,8 +157,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         // Upstream base revision; tree digest is recomputed from the embedded package
         // after local contract edits (skill content must stay complete / no Distill-in-skills).
         sourceRevision: "2c77fa48431bc20e5dc841652079594a3ea918c9",
-        sourceTreeSHA256: "920c6cd819b285332a8381526552e08b47fd28ba55a1f4392b57f71010ce19c8",
-        localVersion: "2",
+        sourceTreeSHA256: "1493839804d567da2a53cbb1314118f0c33e3f2c669f59f0691c9d85bd9bfe1b",
+        localVersion: "3",
         allowedPaths: [
             "SKILL.md",
             "agents/openai.yaml",
@@ -615,6 +616,35 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             installed.append(command)
         }
         return installed
+    }
+
+    /// Install the explicit `remote-code agent-app …` entry point beside the
+    /// nested provider proxies. The service dispatches this basename to the
+    /// bundled `rc2` client; no second daemon or provider implementation exists.
+    @discardableResult
+    public func installAgentAppMiddleware(
+        serviceBinaryURL: URL? = nil
+    ) throws -> URL? {
+        try fileManager.createDirectory(at: cliBinDirectory, withIntermediateDirectories: true)
+        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
+            throw AgentSkillCLIError.serviceBinaryUnavailable
+        }
+        let link = cliBinDirectory.appendingPathComponent(Self.agentAppMiddlewareCommand)
+        if let destination = try? fileManager.destinationOfSymbolicLink(atPath: link.path) {
+            if destination == binary.path {
+                return link
+            }
+            guard (destination as NSString).lastPathComponent == "RemoteCodeDistillService" else {
+                // A symlink to another executable is user-owned.
+                return nil
+            }
+            try fileManager.removeItem(at: link)
+        } else if fileManager.fileExists(atPath: link.path) {
+            // Never overwrite a user-owned executable in the managed directory.
+            return nil
+        }
+        try fileManager.createSymbolicLink(at: link, withDestinationURL: binary)
+        return link
     }
 
     /// Remove provider-proxy symlinks that still point at our service binary only.

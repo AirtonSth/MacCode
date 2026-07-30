@@ -230,8 +230,37 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
                 "\(provider): managed bin must lead PATH when Token Saver is off for nested provider proxies"
             )
             XCTAssertEqual(env["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"], thread.id.value.uuidString)
+            XCTAssertEqual(env["RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE"], "1")
+            XCTAssertEqual(env["RC_REMOTE_CODE_AGENT_APP_SOCKET_PATH"], AppPaths.socketPath(for: .debug))
             XCTAssertNil(env["RC_TOKEN_SAVER_DISTILL_HINT"])
         }
+    }
+
+    /// Recovered provider sessions bypass AppCommandRouter.providerEnvironment.
+    /// WHY: without the managed PATH here, a resumed parent silently loses the
+    /// provider middleware for every nested child even though fresh runs keep it.
+    @MainActor
+    func test_recoveryEnvironmentAlwaysCarriesManagedMiddlewarePath_andGatesTokenSaver() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2RecoveryProxyPath-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let thread = try admittedThread(in: ctx, provider: .codex)
+        let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+        let recoveryEnvironment = try XCTUnwrap(ctx.coordinator.recoveryEnvironmentProvider)
+
+        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = false }
+        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        let disabled = await recoveryEnvironment(.codex, thread.id)
+        let disabledPath = try XCTUnwrap(disabled["PATH"])
+        XCTAssertTrue(disabledPath.hasPrefix(managedBin + ":") || disabledPath == managedBin)
+        XCTAssertEqual(disabled["RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE"], "1")
+        XCTAssertNil(disabled["RC_TOKEN_SAVER_DISTILL_HINT"])
+
+        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
+        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: true)
+        let enabled = await recoveryEnvironment(.codex, thread.id)
+        let enabledPath = try XCTUnwrap(enabled["PATH"])
+        XCTAssertTrue(enabledPath.hasPrefix(managedBin + ":") || enabledPath == managedBin)
+        XCTAssertEqual(enabled["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
     }
 
     /// Without a thread id there is no nested-provider interception scope.

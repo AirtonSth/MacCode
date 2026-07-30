@@ -149,4 +149,87 @@ final class ProviderProxyPolicyTests: XCTestCase {
             "a signal received by the proxy must not become completed when the child exits cleanly after forwarding"
         )
     }
+
+    func test_agentAppDelegation_recognizesSamGrokWorkerInvocation() throws {
+        // WHY: Codex -> Grok orchestration must enter RemoteCode's Agent App
+        // pipeline instead of spawning a token-saver-blind raw provider turn.
+        let promptPath = "/tmp/worker-prompt.txt"
+        let delegation = try XCTUnwrap(ProviderProxyPolicy.agentAppDelegation(
+            providerBasename: "grok",
+            arguments: [
+                "--prompt-file", promptPath,
+                "--model", "grok-4.5",
+                "--effort", "high",
+                "--output-format", "json",
+                "--sandbox", "workspace",
+                "--always-approve",
+                "--no-memory",
+                "--no-subagents",
+                "--disallowed-tools", "Agent",
+                "--no-auto-update"
+            ],
+            environment: [
+                "RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE": "1",
+                "RC_REMOTE_CODE_AGENT_APP_SOCKET_PATH": "/tmp/RemoteCodeDebug.sock",
+                "RC_REMOTE_CODE_SUBAGENT_THREAD_ID": UUID().uuidString,
+                "REMOTE_CODE_AGENT_PROVIDER": "codex"
+            ]
+        ))
+
+        XCTAssertEqual(delegation.provider, .grok)
+        XCTAssertEqual(delegation.promptFile, promptPath)
+        XCTAssertEqual(delegation.model, "grok-4.5")
+        XCTAssertEqual(delegation.reasoningEffort, .high)
+        XCTAssertEqual(delegation.permissionMode, .autoAcceptEdits)
+        XCTAssertEqual(delegation.outputFormat, .grokJSON)
+    }
+
+    func test_agentAppDelegation_rejectsInteractiveOrUnscopedProviderCalls() {
+        XCTAssertNil(ProviderProxyPolicy.agentAppDelegation(
+            providerBasename: "grok",
+            arguments: [],
+            environment: ["RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE": "1"]
+        ))
+        XCTAssertNil(ProviderProxyPolicy.agentAppDelegation(
+            providerBasename: "grok",
+            arguments: ["--prompt-file", "/tmp/prompt.txt", "--resume", "session"],
+            environment: [
+                "RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE": "1",
+                "RC_REMOTE_CODE_AGENT_APP_SOCKET_PATH": "/tmp/RemoteCodeDebug.sock"
+            ]
+        ))
+        XCTAssertNil(ProviderProxyPolicy.agentAppDelegation(
+            providerBasename: "grok",
+            arguments: ["--prompt-file", "/tmp/prompt.txt"],
+            environment: [
+                "RC_REMOTE_CODE_AGENT_APP_SOCKET_PATH": "/tmp/RemoteCodeDebug.sock"
+            ]
+        ))
+    }
+
+    func test_agentAppSocketPathUsesInjectedScopeThenBundledChannelFallback() {
+        // WHY: nested agents carry an exact host socket, while a human running
+        // `remote-code agent-app` in Terminal must still reach its bundled
+        // stable/debug/canary app without setting RC2_CHANNEL manually.
+        XCTAssertEqual(
+            ProviderProxyPolicy.agentAppSocketPath(
+                environment: ["RC_REMOTE_CODE_AGENT_APP_SOCKET_PATH": "/tmp/explicit.sock"],
+                bundledSocketPath: "/tmp/RemoteCode.sock"
+            ),
+            "/tmp/explicit.sock"
+        )
+        XCTAssertEqual(
+            ProviderProxyPolicy.agentAppSocketPath(
+                environment: [:],
+                bundledSocketPath: "/tmp/RemoteCode.sock"
+            ),
+            "/tmp/RemoteCode.sock"
+        )
+        XCTAssertNil(
+            ProviderProxyPolicy.agentAppSocketPath(
+                environment: [:],
+                bundledSocketPath: nil
+            )
+        )
+    }
 }

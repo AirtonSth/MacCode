@@ -2,6 +2,36 @@ import CoreModel
 import Darwin
 import Foundation
 
+public enum ProviderAgentAppOutputFormat: String, Sendable, Equatable {
+    case text
+    case grokJSON = "grok-json"
+}
+
+public struct ProviderAgentAppDelegation: Sendable, Equatable {
+    public let provider: AgentProvider
+    public let promptFile: String
+    public let model: String?
+    public let reasoningEffort: AgentReasoningEffort
+    public let permissionMode: AgentPermissionMode
+    public let outputFormat: ProviderAgentAppOutputFormat
+
+    public init(
+        provider: AgentProvider,
+        promptFile: String,
+        model: String?,
+        reasoningEffort: AgentReasoningEffort,
+        permissionMode: AgentPermissionMode,
+        outputFormat: ProviderAgentAppOutputFormat
+    ) {
+        self.provider = provider
+        self.promptFile = promptFile
+        self.model = model
+        self.reasoningEffort = reasoningEffort
+        self.permissionMode = permissionMode
+        self.outputFormat = outputFormat
+    }
+}
+
 /// Pure policy for the RemoteCode nested-provider PATH controller.
 ///
 /// The OS half (spawn, streams, receipts) lives in `RemoteCodeDistillService`;
@@ -35,6 +65,85 @@ public enum ProviderProxyPolicy {
         let provider = (environment["REMOTE_CODE_AGENT_PROVIDER"] ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return !thread.isEmpty && UUID(uuidString: thread) != nil && AgentProvider(rawValue: provider) != nil
+    }
+
+    // MARK: - Agent App middleware
+
+    /// Recognize the fixed one-shot Grok worker ABI used by RemoteCode
+    /// orchestration. Interactive, resumed, stdin-driven, and unknown provider
+    /// shapes stay on the transparent raw-CLI path.
+    public static func agentAppDelegation(
+        providerBasename: String,
+        arguments: [String],
+        environment: [String: String]
+    ) -> ProviderAgentAppDelegation? {
+        guard environment["RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE"] == "1",
+              !(environment["RC_REMOTE_CODE_AGENT_APP_SOCKET_PATH"] ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              commandBasename(providerBasename) == AgentProvider.grok.rawValue,
+              !arguments.contains("--resume"),
+              !arguments.contains("--session-id") else {
+            return nil
+        }
+
+        func value(after names: Set<String>) -> String? {
+            var index = 0
+            while index < arguments.count {
+                let argument = arguments[index]
+                if names.contains(argument), index + 1 < arguments.count {
+                    return arguments[index + 1]
+                }
+                for name in names where argument.hasPrefix("\(name)=") {
+                    return String(argument.dropFirst(name.count + 1))
+                }
+                index += 1
+            }
+            return nil
+        }
+
+        guard let promptFile = value(after: ["--prompt-file"]),
+              promptFile.hasPrefix("/") else {
+            return nil
+        }
+        let effort = value(after: ["--effort", "--reasoning-effort"])
+            .flatMap(AgentReasoningEffort.init(rawValue:)) ?? .high
+        let sandbox = value(after: ["--sandbox"])
+        let permissionMode: AgentPermissionMode
+        if sandbox == "workspace" {
+            permissionMode = .autoAcceptEdits
+        } else if arguments.contains("--always-approve") {
+            permissionMode = .fullAccess
+        } else {
+            permissionMode = .supervised
+        }
+        let output = value(after: ["--output-format"]) == "json"
+            ? ProviderAgentAppOutputFormat.grokJSON
+            : .text
+        return ProviderAgentAppDelegation(
+            provider: .grok,
+            promptFile: promptFile,
+            model: value(after: ["--model", "-m"]),
+            reasoningEffort: effort,
+            permissionMode: permissionMode,
+            outputFormat: output
+        )
+    }
+
+    public static func agentAppSocketPath(
+        environment: [String: String],
+        bundledSocketPath: String?
+    ) -> String? {
+        if let explicit = environment["RC_REMOTE_CODE_AGENT_APP_SOCKET_PATH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !explicit.isEmpty {
+            return explicit
+        }
+        guard let bundledSocketPath = bundledSocketPath?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !bundledSocketPath.isEmpty else {
+            return nil
+        }
+        return bundledSocketPath
     }
 
     // MARK: - node id (bounded, content-free)

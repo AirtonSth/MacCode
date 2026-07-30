@@ -4473,7 +4473,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if let context, let threadId {
             let telemetryEnv = context.subagentTelemetryEnvironment(
                 provider: provider,
-                threadId: threadId
+                threadId: threadId,
+                baseEnvironment: env
             )
             env.merge(telemetryEnv) { _, new in new }
             // Nested provider proxies (`grok`/`claude`/`codex` in managed bin) must resolve

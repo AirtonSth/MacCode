@@ -22,13 +22,29 @@ denied, cross-user, or mismatched receipts remain raw. Prompts, transcripts,
 tool output, and secrets never enter the receipt; Skills and exact-output
 commands remain lossless.
 
-**Nested provider CLIs are automatic.** Shell-invoking `grok`, `claude`, or
-`codex` by bare name inside a RemoteCode agent environment resolves through the
-host-managed PATH controller (`~/.remote-code/bin` → RemoteCode provider proxy).
-That controller inherits the parent environment/receipt as-is, records a
-content-free Subagents lifecycle receipt, and execs the real provider binary
-outside the managed bin. Skills must not wrap those basenames with a manual
-bridge call, and must not invent Token Saver admission.
+**Use the Agent App middleware for controlled provider workers.** When a worker
+contract can run as a normal Agent App turn, launch it with
+`remote-code agent-app <codex|claude|grok> --prompt-file <path>` (plus the
+required workspace/model/permission/reasoning flags). This creates a real Agent App thread, so the
+child uses the same admitted prompt processing, recovery, eligible command
+output lanes, provider-usage accounting, and live Token Saver refresh as a
+user-started thread. The command is installed beside RemoteCode's own service;
+do not install a proxy server, SDK, Python, Rust, or another provider runtime.
+
+Bare `grok`, `claude`, or `codex` names still resolve through the host-managed
+PATH controller (`~/.remote-code/bin`). The supported `sam-grok-worker`
+one-shot ABI is upgraded automatically to `remote-code agent-app grok`.
+Unknown or security-specialized CLI shapes fail open to the real provider and
+record lifecycle-only telemetry; that is not evidence of prompt compression or
+token savings. Keep specialized read-only/tool-allowlisted contracts raw when
+the Agent App flags cannot express the same boundary. Skills must not invent or
+widen Token Saver admission.
+
+Provider-native collaboration whose child prompt is hidden inside a provider
+SDK cannot be rewritten by a Skill. RemoteCode records its live lifecycle and
+provider-reported usage when available, while eligible shell output continues
+to inherit the parent's admitted runtime. Never label a lifecycle-only child as
+measured savings.
 
 For controlled nested workers that are **not** a bare provider CLI (custom
 scripts, non-provider tools), use the provider-neutral telemetry command around

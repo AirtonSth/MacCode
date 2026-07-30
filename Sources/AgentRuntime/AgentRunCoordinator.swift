@@ -3319,6 +3319,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         switch event {
         case .event(let rawEvent):
             let ev = sanitizeFinalAssistantEvent(rawEvent)
+            persistProviderNativeSubagentLifecycle(
+                from: ev,
+                parentRunId: runId,
+                threadId: threadId
+            )
             if case .tokenUsage(let usage) = ev {
                 lock.lock()
                 latestTokenUsage[runId] = usage
@@ -4241,6 +4246,82 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             self.lock.unlock()
             if stillPending {
                 self.retryStartFailureCommit(runId: runId)
+            }
+        }
+    }
+
+    /// Provider-native collaboration (Grok child sessions and Codex
+    /// collabAgentToolCall state) bypasses the nested-CLI PATH proxy. Persist it
+    /// into the same receipt ledger so the Subagents surface has one durable,
+    /// provider-neutral source for native and cross-provider workers.
+    private func persistProviderNativeSubagentLifecycle(
+        from event: AssistantEvent,
+        parentRunId: AgentRunID,
+        threadId: AgentThreadID
+    ) {
+        guard let orchestrationRuntime else { return }
+        guard ProviderNativeSubagentLifecycle.isPotentialLifecycleEvent(event) else { return }
+        lock.lock()
+        let metadata = activeRunMetadata[parentRunId]
+        lock.unlock()
+        let parentReceipt = try? orchestrationRuntime.recentReceipts(limit: 500)
+            .first { $0.runId == parentRunId }
+        let parentRun = try? runRepo.get(id: parentRunId)
+        guard let parentProvider = metadata?.provider
+                ?? parentReceipt?.provider
+                ?? parentRun?.provider else { return }
+        let parentProviderInstanceId = metadata?.providerInstanceId
+            ?? parentReceipt?.providerInstanceId
+            ?? parentRun?.providerInstanceId
+            ?? parentProvider.rawValue
+        let parentModel = metadata?.model ?? parentReceipt?.model ?? parentRun?.model ?? "unknown"
+
+        let updates = ProviderNativeSubagentLifecycle.updates(
+            from: event,
+            parentProvider: parentProvider
+        )
+        guard !updates.isEmpty else { return }
+        for update in updates {
+            do {
+                _ = try orchestrationRuntime.recordExternalChild(
+                    runId: update.childRunId,
+                    threadId: threadId,
+                    provider: update.provider,
+                    providerInstanceId: update.provider == parentProvider
+                        ? parentProviderInstanceId
+                        : update.provider.rawValue,
+                    model: update.provider == parentProvider ? parentModel : "unknown",
+                    nodeId: update.nodeId,
+                    parentRunId: parentRunId
+                )
+                switch update.phase {
+                case .unknown:
+                    try orchestrationRuntime.markReceiptUnknown(runId: update.childRunId)
+                case .completed:
+                    try orchestrationRuntime.finalizeReceipt(
+                        runId: update.childRunId,
+                        status: .completed
+                    )
+                case .failed:
+                    try orchestrationRuntime.finalizeReceipt(
+                        runId: update.childRunId,
+                        status: .failed
+                    )
+                case .cancelled:
+                    try orchestrationRuntime.finalizeReceipt(
+                        runId: update.childRunId,
+                        status: .cancelled
+                    )
+                case .active:
+                    break
+                }
+            } catch {
+                emitPersistenceIssue(
+                    "subagent.lifecycle",
+                    error: error,
+                    runId: parentRunId,
+                    threadId: threadId
+                )
             }
         }
     }
