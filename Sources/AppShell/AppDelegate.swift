@@ -969,7 +969,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private func startDirectHTTPServer(remoteEnabled: Bool, serverId: String, port: UInt16) throws {
         guard let context, let router, let auth = localAuth else { return }
         let loopbackOnly = !remoteEnabled
-        let dispatcher = JSONRPCDispatcher(router: router)
         let keepAliveSeconds = DirectHTTPServer.resolvedHttpKeepAliveIdleTimeoutSeconds(
             experimentEnabled: ConnectionFeatureFlags.transportKeepaliveExperimentEnabled
         )
@@ -982,6 +981,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                 .appendingPathComponent("agent-attachment-uploads-v2", isDirectory: true),
             attachmentStore: attachmentStore
         )
+        let attachmentUploadV3Store = AttachmentUploadV3Store(
+            plaintextStore: attachmentUploadV2Store
+        )
+        let dispatcher = JSONRPCDispatcher(
+            router: router,
+            agentAttachmentUploadCapability: .protectedV3
+        )
         let http = DirectHTTPServer(
             port: port,
             loopbackOnly: loopbackOnly,
@@ -990,7 +996,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             serverId: serverId,
             bootEpoch: context.liveActivityHostIdentity.bootEpoch,
             clientReceiveTimeoutSeconds: keepAliveSeconds,
-            attachmentUploadV2Store: attachmentUploadV2Store
+            attachmentUploadV2Store: attachmentUploadV2Store,
+            attachmentUploadV3Store: attachmentUploadV3Store
         )
         try http.start()
         httpServer = http

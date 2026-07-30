@@ -83,6 +83,35 @@ public struct AgentAttachmentUploadCapabilityAdvertisement: Sendable, Equatable 
         self.cipherOverheadBytes = cipherOverheadBytes
     }
 
+    public static let plaintextV2 =
+        AgentAttachmentUploadCapabilityAdvertisement(
+            protocolVersion: AttachmentUploadV2Policy.protocolVersion,
+            maxBytes: AttachmentUploadV2Policy.maximumFileBytes,
+            chunkBytes: AttachmentUploadV2Policy.rawChunkBytes,
+            maxChunkCount: AttachmentUploadV2Policy.maximumChunkCount,
+            maxFilenameBytes:
+                AttachmentUploadV2Policy.maximumFilenameBytes,
+            maxMIMETypeBytes:
+                AttachmentUploadV2Policy.maximumMIMETypeBytes,
+            contentEncodings: ["identity"],
+            cipherOverheadBytes: 0
+        )
+
+    public static let protectedV3 =
+        AgentAttachmentUploadCapabilityAdvertisement(
+            protocolVersion: AttachmentUploadV3Policy.protocolVersion,
+            maxBytes: AttachmentUploadV2Policy.maximumFileBytes,
+            chunkBytes: AttachmentUploadV3Policy.plaintextChunkBytes,
+            maxChunkCount: AttachmentUploadV2Policy.maximumChunkCount,
+            maxFilenameBytes:
+                AttachmentUploadV2Policy.maximumFilenameBytes,
+            maxMIMETypeBytes:
+                AttachmentUploadV2Policy.maximumMIMETypeBytes,
+            contentEncodings: [AttachmentUploadV3Policy.contentEncoding],
+            cipherOverheadBytes:
+                AttachmentUploadV3Policy.cipherOverheadBytes
+        )
+
     var foundationObject: [String: Any] {
         var value: [String: Any] = [
             "protocol_version": protocolVersion,
@@ -1287,9 +1316,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
         self.commandReceiptMetrics = dispatcher.commandReceiptMetrics
         self.attachmentUploadV2Store = attachmentUploadV2Store
         self.attachmentUploadV3Store = attachmentUploadV3Store
-            ?? attachmentUploadV2Store.map {
-                AttachmentUploadV3Store(plaintextStore: $0)
-            }
         self.auth = auth
         self.serverId = serverId
         self.bootEpoch = bootEpoch

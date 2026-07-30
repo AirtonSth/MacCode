@@ -1648,7 +1648,10 @@ final class HTTPServerTests: XCTestCase {
         let server = DirectHTTPServer(
             port: port,
             loopbackOnly: true,
-            dispatcher: JSONRPCDispatcher(router: FakeRouter()),
+            dispatcher: JSONRPCDispatcher(
+                router: FakeRouter(),
+                agentAttachmentUploadCapability: .plaintextV2
+            ),
             serverId: hostId,
             bootEpoch: 1,
             attachmentUploadV2Store: uploadStore

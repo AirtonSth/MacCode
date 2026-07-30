@@ -810,7 +810,10 @@ final class AttachmentUploadV3Tests: XCTestCase {
         let server = DirectHTTPServer(
             port: port,
             loopbackOnly: true,
-            dispatcher: JSONRPCDispatcher(router: FakeRouter()),
+            dispatcher: JSONRPCDispatcher(
+                router: FakeRouter(),
+                agentAttachmentUploadCapability: .protectedV3
+            ),
             auth: auth,
             serverId: serverId,
             bootEpoch: 1,
