@@ -4021,9 +4021,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         thread: AgentThreadID,
         maxEntries: Int,
         before: AgentTurnCheckpointCursor?
-    ) throws -> AgentTurnCheckpointPage {
+    ) async throws -> AgentTurnCheckpointPage {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        return try ctx.turnCheckpointRepo.listMetadataPage(
+        // SQLite query/decode must never run on MainActor (Dispatcher is @MainActor).
+        return try await ctx.checkpointListGateway.listMetadataPage(
             threadId: thread,
             maxEntries: maxEntries,
             before: before

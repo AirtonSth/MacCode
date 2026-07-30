@@ -297,6 +297,8 @@ public final class AppContext {
     public let providerPendingCallbackRepo: ProviderPendingCallbackRepository
     public let proposedPlanRepo: AgentProposedPlanRepository
     public let turnCheckpointRepo: AgentTurnCheckpointRepository
+    /// Off-MainActor owner for `agent.checkpoint.list` metadata pages.
+    public let checkpointListGateway: AgentTurnCheckpointListGateway
     public let tokenSaverSavingsRepo: TokenSaverSavingsRepository
     public let tokenSaverDailyEconomyRepo: TokenSaverDailyEconomyRepository
     public let graphifyUsageRepo: GraphifyUsageRepository
@@ -491,6 +493,7 @@ public final class AppContext {
         self.providerPendingCallbackRepo = ProviderPendingCallbackRepository(db: db)
         self.proposedPlanRepo = AgentProposedPlanRepository(db: db)
         self.turnCheckpointRepo = AgentTurnCheckpointRepository(db: db)
+        self.checkpointListGateway = AgentTurnCheckpointListGateway(db: db)
         self.tokenSaverSavingsRepo = TokenSaverSavingsRepository(db: db)
         self.tokenSaverDailyEconomyRepo = TokenSaverDailyEconomyRepository(db: db)
         self.graphifyUsageRepo = GraphifyUsageRepository(db: db)

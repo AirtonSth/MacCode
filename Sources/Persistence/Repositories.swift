@@ -3930,9 +3930,9 @@ public final class AgentTurnCheckpointRepository {
     }
 
     /// List v1 keysets may only use the fixed-width capture token persisted by
-    /// schema 58/upsert. Unlike the legacy detail decoder, this path must never
-    /// replace corrupt storage with wall-clock `Date()` because that would make
-    /// pagination change between identical reads.
+    /// the checkpoint-list schema step / upsert. Unlike the legacy detail decoder,
+    /// this path must never replace corrupt storage with wall-clock `Date()`
+    /// because that would make pagination change between identical reads.
     private func parseListCompletedAt(_ raw: String?) throws -> (token: String, date: Date) {
         guard let raw,
               raw.utf8.count == 24,
@@ -4097,7 +4097,10 @@ public final class AgentTurnCheckpointRepository {
         // Snapshot revision + page rows under one transaction so a concurrent
         // mutation cannot splice two catalog generations into one response.
         return try db.transaction {
-            let catalogRevision = try AgentTurnCheckpointCatalogRevision.current(db: db)
+            let catalogRevision = try AgentTurnCheckpointCatalogRevision.current(
+                db: db,
+                threadId: threadId
+            )
             // WHY: only capture-bounded list_* fields and explicitly capped small
             // scalars may cross the SQLite/Swift boundary. Authoritative raw metadata
             // must stay untouched even for ordering/cursors.

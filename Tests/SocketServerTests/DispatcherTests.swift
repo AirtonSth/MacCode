@@ -544,14 +544,63 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     }
     var checkpointPageOverride: AgentTurnCheckpointPage?
     var checkpointCatalogRevision: Int64 = 1
+    /// Optional delay applied on a background queue before returning the page
+    /// (MainActor heartbeat tests). Not used on the MainActor itself.
+    var checkpointPageDelayNanoseconds: UInt64 = 0
+    var checkpointPageQueryWillRun: (() -> Void)?
+    nonisolated(unsafe) private(set) var checkpointPageQueryOnMainCount = 0
+    nonisolated(unsafe) private(set) var checkpointPageQueryOffMainCount = 0
     func listAgentThreadCheckpointsPage(
         thread: AgentThreadID,
         maxEntries: Int,
         before: AgentTurnCheckpointCursor?
-    ) throws -> AgentTurnCheckpointPage {
+    ) async throws -> AgentTurnCheckpointPage {
         checkpointPageCallCount += 1
-        if let checkpointPageOverride { return checkpointPageOverride }
-        var rows = checkpointStore
+        // Capture immutable Sendable inputs on MainActor, then hop for the
+        // "repository" work so tests mirror the production gateway contract.
+        let store = checkpointStore
+        let override = checkpointPageOverride
+        let revision = checkpointCatalogRevision
+        let delay = checkpointPageDelayNanoseconds
+        let hook = checkpointPageQueryWillRun
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue(label: AgentTurnCheckpointListGateway.queueLabel).async {
+                if Thread.isMainThread {
+                    self.checkpointPageQueryOnMainCount += 1
+                } else {
+                    self.checkpointPageQueryOffMainCount += 1
+                }
+                hook?()
+                if delay > 0 {
+                    Thread.sleep(forTimeInterval: TimeInterval(delay) / 1_000_000_000)
+                }
+                do {
+                    let result = try Self.buildCheckpointPage(
+                        store: store,
+                        override: override,
+                        catalogRevision: revision,
+                        thread: thread,
+                        maxEntries: maxEntries,
+                        before: before
+                    )
+                    continuation.resume(returning: result)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private nonisolated static func buildCheckpointPage(
+        store: [AgentTurnCheckpointSummary],
+        override: AgentTurnCheckpointPage?,
+        catalogRevision: Int64,
+        thread: AgentThreadID,
+        maxEntries: Int,
+        before: AgentTurnCheckpointCursor?
+    ) throws -> AgentTurnCheckpointPage {
+        if let override { return override }
+        var rows = store
             .filter { $0.threadId == thread }
             .sorted {
                 if $0.checkpointTurnCount != $1.checkpointTurnCount {
@@ -607,7 +656,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
             completedAtTokens: tokens,
             truncated: truncated,
             nextBefore: nextBefore,
-            catalogRevision: checkpointCatalogRevision
+            catalogRevision: catalogRevision
         )
     }
     var agentCheckpointDiffCallCount = 0
@@ -3583,6 +3632,9 @@ final class DispatcherTests: XCTestCase {
     func test_agentCheckpointList_v1LinearPackingHundredHostileItemsIsOofN() async throws {
         // WHY: full-envelope re-encode per candidate is O(n²) and stalls MainActor
         // on 3G reconnects. Freeze-once + incremental counter must stay linear.
+        AgentCheckpointListContract.resetPackProbesForTesting()
+        defer { AgentCheckpointListContract.resetPackProbesForTesting() }
+
         let router = FakeRouter()
         let thread = AgentThread(workspaceId: nil, title: "pack", provider: .codex, model: "gpt-5.5")
         router.threadStore = [thread]
@@ -3638,6 +3690,82 @@ final class DispatcherTests: XCTestCase {
         }
         XCTAssertFalse(items.isEmpty)
         XCTAssertLessThanOrEqual(items.count, 100)
+        // Linear pack counters: one final envelope encode per page; freeze body
+        // encodes are O(selected items) not O(candidates²) full-envelope re-packs.
+        XCTAssertEqual(AgentCheckpointListContract.packCallCountForTesting, 1)
+        XCTAssertEqual(AgentCheckpointListContract.packFinalEnvelopeEncodeCountForTesting, 1)
+        XCTAssertGreaterThanOrEqual(
+            AgentCheckpointListContract.freezeItemBodyEncodeCountForTesting,
+            items.count
+        )
+        XCTAssertLessThanOrEqual(
+            AgentCheckpointListContract.freezeItemBodyEncodeCountForTesting,
+            items.count * 4,
+            "freeze may trim files a few times per item; must not re-encode every candidate envelope"
+        )
+        XCTAssertEqual(AgentCheckpointListContract.packOnMainActorCountForTesting, 0)
+        XCTAssertEqual(AgentCheckpointListContract.packOffMainActorCountForTesting, 1)
+    }
+
+    @MainActor
+    func test_agentCheckpointList_v1QueryAndPackNeverBlockMainActorRunLoop() async throws {
+        // WHY: eventual return timing alone is not proof. Delayed SQLite/pack
+        // hooks + MainActor heartbeat + executor counters prove the work hops.
+        AgentCheckpointListContract.resetPackProbesForTesting()
+        defer { AgentCheckpointListContract.resetPackProbesForTesting() }
+
+        let router = FakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "hb", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        router.checkpointStore = (1...8).map { n in
+            AgentTurnCheckpointSummary(
+                threadId: thread.id,
+                runId: AgentRunID(),
+                turnId: "hb-\(n)",
+                checkpointTurnCount: n,
+                checkpointRef: "r-\(n)",
+                status: .ready,
+                files: [],
+                completedAt: Date(timeIntervalSince1970: 1_700_005_000 + Double(n))
+            )
+        }
+        router.checkpointPageDelayNanoseconds = 50_000_000
+        AgentCheckpointListContract.packDelayNanosecondsForTesting = 50_000_000
+
+        var heartbeats = 0
+        let heartbeat = Task { @MainActor in
+            while !Task.isCancelled {
+                heartbeats += 1
+                try? await Task.sleep(nanoseconds: 2_000_000)
+            }
+        }
+
+        let d = JSONRPCDispatcher(router: router)
+        let response = await d.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.checkpoint.list",
+            params: [
+                "thread_id": .string(thread.id.value.uuidString),
+                "response_version": .number(1),
+                "max_entries": .number(4),
+            ]
+        ))
+        heartbeat.cancel()
+        _ = await heartbeat.result
+
+        XCTAssertNotNil(response.result)
+        XCTAssertNil(response.error)
+        XCTAssertEqual(router.checkpointPageCallCount, 1)
+        XCTAssertEqual(router.checkpointPageQueryOnMainCount, 0)
+        XCTAssertEqual(router.checkpointPageQueryOffMainCount, 1)
+        XCTAssertEqual(AgentCheckpointListContract.packOnMainActorCountForTesting, 0)
+        XCTAssertEqual(AgentCheckpointListContract.packOffMainActorCountForTesting, 1)
+        XCTAssertGreaterThan(
+            heartbeats,
+            5,
+            "MainActor run loop must keep pumping during delayed query+pack"
+        )
     }
 
     @MainActor

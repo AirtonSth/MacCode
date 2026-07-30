@@ -350,6 +350,101 @@ public enum AgentCheckpointListContract: Sendable {
         }
     }
 
+    // MARK: Pack executor probes (MainActor proof + linear encode counters)
+
+    public static let packQueueLabel = "io.remotecode.checkpoint-list-pack"
+    private static let packQueue = DispatchQueue(
+        label: packQueueLabel,
+        qos: .userInitiated
+    )
+
+    /// Invoked on the pack queue before freeze/pack (tests inject delay).
+    nonisolated(unsafe) public static var packWillRunForTesting: (() -> Void)?
+    nonisolated(unsafe) public static var packDelayNanosecondsForTesting: UInt64 = 0
+    nonisolated(unsafe) public static private(set) var packCallCountForTesting: Int = 0
+    nonisolated(unsafe) public static private(set) var packOnMainActorCountForTesting: Int = 0
+    nonisolated(unsafe) public static private(set) var packOffMainActorCountForTesting: Int = 0
+    /// Full JSONEncoder.encode of a candidate item body during freeze.
+    nonisolated(unsafe) public static private(set) var freezeItemBodyEncodeCountForTesting: Int = 0
+    /// Full JSONEncoder.encode of the final JSON-RPC success envelope during pack.
+    nonisolated(unsafe) public static private(set) var packFinalEnvelopeEncodeCountForTesting: Int = 0
+    /// Incremental cursor encode while fitting (bounded; not full-envelope re-encode).
+    nonisolated(unsafe) public static private(set) var packCursorEncodeCountForTesting: Int = 0
+
+    public static func resetPackProbesForTesting() {
+        packWillRunForTesting = nil
+        packDelayNanosecondsForTesting = 0
+        packCallCountForTesting = 0
+        packOnMainActorCountForTesting = 0
+        packOffMainActorCountForTesting = 0
+        freezeItemBodyEncodeCountForTesting = 0
+        packFinalEnvelopeEncodeCountForTesting = 0
+        packCursorEncodeCountForTesting = 0
+    }
+
+    private static func recordPackExecutorForTesting() {
+        packCallCountForTesting += 1
+        if Thread.isMainThread {
+            packOnMainActorCountForTesting += 1
+        } else {
+            packOffMainActorCountForTesting += 1
+        }
+    }
+
+    /// Freeze + pack a page off the MainActor on a dedicated serial queue.
+    /// Returns an immutable `JSONValue` payload (Sendable).
+    public static func freezeAndPackPageAsync(
+        _ page: AgentTurnCheckpointPage,
+        responseID: JSONRPCID?
+    ) async throws -> JSONValue {
+        try await withCheckedThrowingContinuation { continuation in
+            packQueue.async {
+                recordPackExecutorForTesting()
+                packWillRunForTesting?()
+                let delay = packDelayNanosecondsForTesting
+                if delay > 0 {
+                    Thread.sleep(forTimeInterval: TimeInterval(delay) / 1_000_000_000)
+                }
+                do {
+                    let payload = try freezeAndPackPage(page, responseID: responseID)
+                    continuation.resume(returning: payload)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Synchronous freeze + linear pack. Prefer `freezeAndPackPageAsync` from
+    /// `@MainActor` call sites so packing never owns the main run loop.
+    public static func freezeAndPackPage(
+        _ page: AgentTurnCheckpointPage,
+        responseID: JSONRPCID?
+    ) throws -> JSONValue {
+        let frozen = try page.items.enumerated().map { index, summary in
+            let listMetadata = page.listMetadata.indices.contains(index)
+                ? page.listMetadata[index]
+                : nil
+            let completedAtToken = page.completedAtTokens.indices.contains(index)
+                ? page.completedAtTokens[index]
+                : ""
+            return try freezeItem(
+                summary: summary,
+                sourceFilesTruncated: page.filesTruncated.indices.contains(index)
+                    ? page.filesTruncated[index]
+                    : false,
+                listMetadata: listMetadata,
+                completedAtToken: completedAtToken
+            )
+        }
+        return try packPage(
+            candidates: frozen,
+            sourceHasMore: page.truncated,
+            catalogRevision: page.catalogRevision,
+            responseID: responseID
+        )
+    }
+
     /// Freeze one bounded item once. Subsequent packing only counts/copies these
     /// bytes — never re-encodes the item or full envelope per candidate.
     public static func freezeItem(
@@ -408,6 +503,7 @@ public enum AgentCheckpointListContract: Sendable {
                 completedAt: summary.completedAt
             )
             let encoder = JSONEncoder()
+            freezeItemBodyEncodeCountForTesting += 1
             let baseData = try encoder.encode(stripped)
             guard var object = try JSONSerialization.jsonObject(with: baseData) as? [String: Any] else {
                 throw JSONRPCError.internalError
@@ -503,6 +599,7 @@ public enum AgentCheckpointListContract: Sendable {
             // Always size next_before for the prospective last item when truncated
             // could be true. Using true is conservative and matches final semantics
             // whenever sourceHasMore or not-all-candidates fit.
+            packCursorEncodeCountForTesting += 1
             let nextBefore = try encodeCursor(
                 turnCount: candidate.checkpointTurnCount,
                 completedAtToken: candidate.completedAtToken,
@@ -558,6 +655,7 @@ public enum AgentCheckpointListContract: Sendable {
         ])
         // Final encode-once verification against the real wrapper.
         let response = JSONRPCResponse(id: responseID, result: payload)
+        packFinalEnvelopeEncodeCountForTesting += 1
         guard let finalBytes = try? encoder.encode(response),
               finalBytes.count <= maxEncodedResponseBytes else {
             throw JSONRPCError.internalError

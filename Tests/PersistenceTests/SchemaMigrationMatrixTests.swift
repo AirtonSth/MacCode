@@ -190,10 +190,11 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         XCTAssertTrue(st.columnIsNull(7))
     }
 
-    func test_v58_to_head_installsCatalogRevisionTableAndTriggers() throws {
-        // WHY: revision fence must install from every supported prior version
-        // without renumbering only currentVersion (57/58 collide with Message).
-        let db = try migrateFromVersion(n: 58)
+    func test_v56_to_head_installsPerThreadCatalogRevisionAndListProjections() throws {
+        // WHY: shared integration base is 56. The single relocatable checkpoint
+        // step must install list projections + per-thread revision from that base.
+        XCTAssertEqual(Schema.sharedIntegrationBaseVersion, 56)
+        let db = try migrateFromVersion(n: Schema.sharedIntegrationBaseVersion)
         let threadID = UUID().uuidString
         let runID = UUID().uuidString
         try db.execute("""
@@ -207,37 +208,77 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             VALUES
                 ('\(runID)', '\(threadID)', 'claude', 'claude-3', 'idle',
                  '2024-06-01T00:00:00Z');
-            """)
-        try Schema.migrateSteps(db, Schema.steps)
-        XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
-
-        let rev = try db.prepare(
-            "SELECT revision FROM agent_turn_checkpoint_catalog_meta WHERE id = 1;"
-        )
-        XCTAssertTrue(try rev.step())
-        let before = rev.columnInt64(0)
-
-        try db.execute("""
             INSERT INTO agent_turn_checkpoints
                 (thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref,
                  status, files_json, completed_at, created_at)
             VALUES
-                ('\(threadID)', '\(runID)', 't1', 1, 'r1', 'ready', '[]',
-                 '2024-06-01T00:00:00.000Z', '2024-06-01T00:00:00Z');
+                ('\(threadID)', '\(runID)', 'legacy-t1', 1, 'r1', 'ready', '[]',
+                 '2024-06-01T00:00:00Z', '2024-06-01T00:00:00Z');
             """)
-        let after = try db.prepare(
-            "SELECT revision FROM agent_turn_checkpoint_catalog_meta WHERE id = 1;"
-        )
-        XCTAssertTrue(try after.step())
-        XCTAssertGreaterThan(after.columnInt64(0), before,
-                             "insert trigger must bump catalog revision")
+        try Schema.migrateSteps(db, Schema.steps)
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
+        XCTAssertEqual(try maxVersion(db), Schema.checkpointListSchemaVersion)
+
+        let legacy = try db.prepare("""
+            SELECT list_turn_id, list_metadata_unavailable, files_summary_truncated
+            FROM agent_turn_checkpoints WHERE thread_id = ?;
+            """)
+        try legacy.bind(1, threadID)
+        XCTAssertTrue(try legacy.step())
+        XCTAssertTrue(legacy.columnText(0)?.hasPrefix("rc2-legacy-row:") == true)
+        XCTAssertEqual(legacy.columnInt64(1), 1)
+        XCTAssertEqual(legacy.columnInt64(2), 1)
+
+        // Per-thread fence: insert for this thread bumps only its row.
+        try db.execute("""
+            INSERT INTO agent_turn_checkpoints
+                (thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref,
+                 status, files_json, completed_at, created_at,
+                 files_summary_json, files_summary_truncated,
+                 list_turn_id, list_completed_at, list_metadata_unavailable)
+            VALUES
+                ('\(threadID)', '\(runID)', 't2', 2, 'r2', 'ready', '[]',
+                 '2024-06-01T00:00:01.000Z', '2024-06-01T00:00:01Z',
+                 '[]', 0, 't2', '2024-06-01T00:00:01.000Z', 0);
+            """)
+        let rev = try db.prepare("""
+            SELECT revision FROM agent_turn_checkpoint_catalog_meta
+            WHERE thread_id = ?;
+            """)
+        try rev.bind(1, threadID)
+        XCTAssertTrue(try rev.step())
+        XCTAssertGreaterThanOrEqual(rev.columnInt64(0), 2)
     }
 
-    func test_v57_to_head_invalidLegacyCompletedAtUsesFixedBoundedSentinel() throws {
+    func test_precedingVersion_to_head_checkpointListStepIsSelfContained() throws {
+        // WHY: the immediately preceding version of the relocatable step must
+        // also reach head. On this branch preceding == shared base (56); final
+        // composition renumbers past Message migrations via one constant.
+        let preceding = Schema.checkpointListSchemaVersion - 1
+        XCTAssertEqual(preceding, Schema.sharedIntegrationBaseVersion)
+        let db = try migrateFromVersion(n: preceding)
+        XCTAssertEqual(try maxVersion(db), preceding)
+        try Schema.migrateSteps(db, Schema.steps)
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
+
+        // Table exists and is per-thread (no global id=1 singleton).
+        let cols = try db.prepare(
+            "PRAGMA table_info(agent_turn_checkpoint_catalog_meta);"
+        )
+        var names: [String] = []
+        while try cols.step() {
+            if let name = cols.columnText(1) { names.append(name) }
+        }
+        XCTAssertTrue(names.contains("thread_id"))
+        XCTAssertTrue(names.contains("revision"))
+        XCTAssertFalse(names.contains("id"), "must not ship the never-released global singleton schema")
+    }
+
+    func test_sharedBase_to_head_invalidLegacyCompletedAtUsesFixedBoundedSentinel() throws {
         // WHY: SQLite strftime returns NULL for malformed legacy dates. Falling
         // back to the raw completed_at value would copy attacker-sized text into
         // list_completed_at and violate the capture-time bounded source contract.
-        let db = try migrateFromVersion(n: 57)
+        let db = try migrateFromVersion(n: Schema.sharedIntegrationBaseVersion)
         let threadID = UUID().uuidString
         let runID = UUID().uuidString
         try db.execute("""
@@ -278,6 +319,24 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         XCTAssertEqual(row.columnText(0), "1970-01-01T00:00:00.000Z")
         XCTAssertEqual(row.columnInt64(1), 24)
         XCTAssertEqual(row.columnInt64(2), 1)
+    }
+
+    func test_checkpointListSchemaVersion_isSingleRelocatableStep() throws {
+        // WHY: controllers renumber one constant at composition time. Multiple
+        // provisional steps (old 57/58/59) collide with Message migrations.
+        let checkpointSteps = Schema.steps.filter {
+            $0.version > Schema.sharedIntegrationBaseVersion
+        }
+        XCTAssertEqual(checkpointSteps.count, 1)
+        XCTAssertEqual(checkpointSteps[0].version, Schema.checkpointListSchemaVersion)
+        XCTAssertEqual(Schema.currentVersion, Schema.checkpointListSchemaVersion)
+        // Residual: provisional number equals base+1 on this branch only.
+        // Final composition must advance past Message slots before merge.
+        XCTAssertEqual(
+            Schema.checkpointListSchemaVersion,
+            Schema.sharedIntegrationBaseVersion + 1,
+            "isolated-branch provisional slot; renumber for merge"
+        )
     }
 
     // MARK: - v25 → head

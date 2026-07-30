@@ -46,7 +46,7 @@ public struct JSONRPCError: Codable, Error {
     }
 }
 
-public enum JSONRPCID: Codable, Hashable {
+public enum JSONRPCID: Codable, Hashable, Sendable {
     case string(String)
     case number(Int)
 

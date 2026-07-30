@@ -9,11 +9,19 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    /// Must equal the highest SchemaStep version (step 53 economy + 54 graphify usage
-    /// + 55 savings honesty axes + 56 credible_v4 cap evidence
-    /// + 57 immutable agent-message body identity + 58 checkpoint summaries
-    /// + 59 checkpoint list wire projections + 60 checkpoint list catalog revision).
-    public static let currentVersion: Int = 60
+    /// Last shared integration-base step present on both this branch and the
+    /// final macOS composition base (Token Saver economy credible_v4).
+    public static let sharedIntegrationBaseVersion: Int = 56
+
+    /// Single relocatable checkpoint-list schema step (files_summary + list_*
+    /// wire projections + keyset index + per-thread catalog revision).
+    /// Message body identity owns step 57, so the checkpoint projection is the
+    /// next atomic migration.
+    public static let checkpointListSchemaVersion: Int =
+        sharedIntegrationBaseVersion + 2
+
+    /// Must equal the highest SchemaStep version.
+    public static let currentVersion: Int = checkpointListSchemaVersion
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -983,20 +991,11 @@ public enum Schema {
             WHERE id = NEW.id;
         END;
         """),
-        // Mobile checkpoint list projection. Keep full files_json and snapshots
-        // authoritative; list v1 reads only this capture-time bounded summary.
-        // Existing rows default to an honestly truncated empty summary until rewritten.
-        SchemaStep(58, """
+        // ONE relocatable step: mobile list projection + keyset + per-thread
+        // catalog revision after the Message body-identity migration.
+        SchemaStep(checkpointListSchemaVersion, """
         ALTER TABLE agent_turn_checkpoints ADD COLUMN files_summary_json TEXT NOT NULL DEFAULT '[]';
         ALTER TABLE agent_turn_checkpoints ADD COLUMN files_summary_truncated INTEGER NOT NULL DEFAULT 1;
-        """),
-        // Capture-time bounded wire projections for list v1 turn_id / checkpoint_ref /
-        // error_message. Do not backfill from raw columns. Existing rows receive a
-        // persisted opaque identity and an explicit metadata-unavailable sentinel,
-        // preserving pagination/actionability without materializing legacy metadata.
-        // list_completed_at is fixed-width so mixed whole/fractional legacy timestamps
-        // retain chronological keyset ordering.
-        SchemaStep(59, """
         ALTER TABLE agent_turn_checkpoints ADD COLUMN list_turn_id TEXT NOT NULL DEFAULT '';
         ALTER TABLE agent_turn_checkpoints ADD COLUMN list_turn_id_encoded_bytes INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE agent_turn_checkpoints ADD COLUMN list_turn_id_sha256 TEXT;
@@ -1018,43 +1017,60 @@ public enum Schema {
                 '1970-01-01T00:00:00.000Z'
             )
         WHERE list_metadata_unavailable = 1;
-        CREATE UNIQUE INDEX idx_agent_turn_checkpoints_list_keyset
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_turn_checkpoints_list_keyset
             ON agent_turn_checkpoints(
                 thread_id,
                 checkpoint_turn_count,
                 list_completed_at,
                 list_turn_id
             );
-        """),
-        // Catalog generation fence for agent.checkpoint.list v1. Incremented by
-        // triggers on every insert/update/delete so revision stays transactional
-        // with the checkpoint mutation (no O(N) digest per page).
-        SchemaStep(60, """
         CREATE TABLE IF NOT EXISTS agent_turn_checkpoint_catalog_meta (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
+            thread_id TEXT PRIMARY KEY NOT NULL,
             revision INTEGER NOT NULL DEFAULT 1
         );
-        INSERT OR IGNORE INTO agent_turn_checkpoint_catalog_meta(id, revision) VALUES(1, 1);
         CREATE TRIGGER IF NOT EXISTS trg_agent_turn_checkpoints_catalog_insert
         AFTER INSERT ON agent_turn_checkpoints
         BEGIN
-            UPDATE agent_turn_checkpoint_catalog_meta
-            SET revision = revision + 1
-            WHERE id = 1;
+            INSERT INTO agent_turn_checkpoint_catalog_meta(thread_id, revision)
+            VALUES (NEW.thread_id, 2)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                revision = agent_turn_checkpoint_catalog_meta.revision + 1;
         END;
         CREATE TRIGGER IF NOT EXISTS trg_agent_turn_checkpoints_catalog_update
         AFTER UPDATE ON agent_turn_checkpoints
+        WHEN OLD.checkpoint_turn_count IS NOT NEW.checkpoint_turn_count
+          OR OLD.status IS NOT NEW.status
+          OR OLD.assistant_message_id IS NOT NEW.assistant_message_id
+          OR OLD.files_summary_json IS NOT NEW.files_summary_json
+          OR OLD.files_summary_truncated IS NOT NEW.files_summary_truncated
+          OR OLD.list_turn_id IS NOT NEW.list_turn_id
+          OR OLD.list_turn_id_encoded_bytes IS NOT NEW.list_turn_id_encoded_bytes
+          OR OLD.list_turn_id_sha256 IS NOT NEW.list_turn_id_sha256
+          OR OLD.list_turn_id_truncated IS NOT NEW.list_turn_id_truncated
+          OR OLD.list_checkpoint_ref IS NOT NEW.list_checkpoint_ref
+          OR OLD.list_checkpoint_ref_encoded_bytes IS NOT NEW.list_checkpoint_ref_encoded_bytes
+          OR OLD.list_checkpoint_ref_sha256 IS NOT NEW.list_checkpoint_ref_sha256
+          OR OLD.list_checkpoint_ref_truncated IS NOT NEW.list_checkpoint_ref_truncated
+          OR OLD.list_error_message IS NOT NEW.list_error_message
+          OR OLD.list_error_message_encoded_bytes IS NOT NEW.list_error_message_encoded_bytes
+          OR OLD.list_error_message_sha256 IS NOT NEW.list_error_message_sha256
+          OR OLD.list_error_message_truncated IS NOT NEW.list_error_message_truncated
+          OR OLD.list_completed_at IS NOT NEW.list_completed_at
+          OR OLD.list_metadata_unavailable IS NOT NEW.list_metadata_unavailable
+          OR OLD.run_id IS NOT NEW.run_id
         BEGIN
-            UPDATE agent_turn_checkpoint_catalog_meta
-            SET revision = revision + 1
-            WHERE id = 1;
+            INSERT INTO agent_turn_checkpoint_catalog_meta(thread_id, revision)
+            VALUES (NEW.thread_id, 2)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                revision = agent_turn_checkpoint_catalog_meta.revision + 1;
         END;
         CREATE TRIGGER IF NOT EXISTS trg_agent_turn_checkpoints_catalog_delete
         AFTER DELETE ON agent_turn_checkpoints
         BEGIN
-            UPDATE agent_turn_checkpoint_catalog_meta
-            SET revision = revision + 1
-            WHERE id = 1;
+            INSERT INTO agent_turn_checkpoint_catalog_meta(thread_id, revision)
+            VALUES (OLD.thread_id, 2)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                revision = agent_turn_checkpoint_catalog_meta.revision + 1;
         END;
         """)
     ]

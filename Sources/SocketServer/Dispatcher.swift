@@ -183,7 +183,8 @@ public protocol CommandRouting: AnyObject {
     func rollbackAgentThread(thread: AgentThreadID, toTurnId: String) async throws
     func listAgentThreadCheckpoints(thread: AgentThreadID) throws -> [AgentTurnCheckpointSummary]
     /// Metadata page for `agent.checkpoint.list` response_version 1.
-    func listAgentThreadCheckpointsPage(thread: AgentThreadID, maxEntries: Int, before: AgentTurnCheckpointCursor?) throws -> AgentTurnCheckpointPage
+    /// Must hop off MainActor for SQLite query/decode (see AgentTurnCheckpointListGateway).
+    func listAgentThreadCheckpointsPage(thread: AgentThreadID, maxEntries: Int, before: AgentTurnCheckpointCursor?) async throws -> AgentTurnCheckpointPage
     func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, path: String?) throws -> String
     func revertAgentThreadToCheckpoint(thread: AgentThreadID, checkpointTurnCount: Int) async throws -> AgentTurnCheckpointSummary
     func stopAgentRun(thread: AgentThreadID) throws
@@ -2646,7 +2647,7 @@ public final class JSONRPCDispatcher {
                             error: error
                         )
                     }
-                    let page = try router.listAgentThreadCheckpointsPage(
+                    let page = try await router.listAgentThreadCheckpointsPage(
                         thread: v1.threadId,
                         maxEntries: v1.maxEntries,
                         before: v1.before
@@ -2660,8 +2661,11 @@ public final class JSONRPCDispatcher {
                             )
                         )
                     }
-                    // Freeze + pack off the MainActor path: pure nonisolated packing.
-                    let payload = try checkpointPagePayload(page, responseID: id)
+                    // Freeze + pack on a dedicated non-MainActor queue.
+                    let payload = try await AgentCheckpointListContract.freezeAndPackPageAsync(
+                        page,
+                        responseID: id
+                    )
                     return AgentCheckpointListContract.enforceEncodedSuccessCeiling(
                         id: id,
                         result: payload
@@ -3813,100 +3817,6 @@ public final class JSONRPCDispatcher {
             throw JSONRPCError.invalidParams
         }
         return AgentMessageCursor(createdAt: createdAt, id: id)
-    }
-
-    /// Strict keyset cursor for checkpoint list v1. Absent/null means no cursor;
-    /// any present non-object, incomplete, noncanonical, or over-budget shape is
-    /// invalid params. A cursor must be an exact round-trip of v1's bounded
-    /// `next_before`, so hostile strings never reach the SQLite keyset.
-    private func checkpointCursor(from value: JSONValue?) throws -> AgentTurnCheckpointCursor? {
-        guard let value else { return nil }
-        if case .null = value { return nil }
-        guard case .object(let object) = value else { throw JSONRPCError.invalidParams }
-        guard Set(object.keys) == [
-                "checkpoint_turn_count",
-                "completed_at",
-                "turn_id",
-              ],
-              let turnCount = object["checkpoint_turn_count"]?.intValue,
-              turnCount >= 0,
-              turnCount <= 9_007_199_254_740_991,
-              let turnId = object["turn_id"]?.stringValue,
-              !turnId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              AgentTurnCheckpointWireIdentity.encodedJSONStringByteCount(turnId)
-                <= AgentTurnCheckpointWireIdentity.maximumEncodedTurnIDBytes,
-              let completedRaw = object["completed_at"]?.stringValue,
-              completedRaw.utf8.count == 24,
-              let completedAt = Self.checkpointListISO8601Fractional.date(
-                from: completedRaw
-              ),
-              Self.checkpointListISO8601Fractional.string(from: completedAt)
-                == completedRaw
-        else {
-            throw JSONRPCError.invalidParams
-        }
-        return AgentTurnCheckpointCursor(
-            checkpointTurnCount: turnCount,
-            completedAt: completedAt,
-            turnId: turnId,
-            completedAtToken: completedRaw
-        )
-    }
-
-    private func checkpointListCompletedAtToken(
-        _ cursor: CheckpointV1ProjectedItem
-    ) -> String {
-        if !cursor.completedAtToken.isEmpty {
-            return cursor.completedAtToken
-        }
-        return Self.checkpointListISO8601Fractional.string(from: cursor.completedAt)
-    }
-
-    private struct CheckpointV1ProjectedItem {
-        let value: JSONValue
-        let checkpointTurnCount: Int
-        let completedAt: Date
-        let completedAtToken: String
-        let turnID: String
-    }
-
-    private struct CheckpointV1StringProjection {
-        let value: String?
-        let originalEncodedBytes: Int
-        let sha256: String?
-        let truncated: Bool
-    }
-
-    /// Wire envelope for response_version 1: `items`, `truncated`, `next_before`,
-    /// `catalog_revision`. Freezes each item once and packs with an incremental
-    /// byte counter (nonisolated contract helpers — no full-envelope re-encode
-    /// per candidate).
-    private func checkpointPagePayload(
-        _ page: AgentTurnCheckpointPage,
-        responseID: JSONRPCID?
-    ) throws -> JSONValue {
-        let frozen = try page.items.enumerated().map { index, summary in
-            let listMetadata = page.listMetadata.indices.contains(index)
-                ? page.listMetadata[index]
-                : nil
-            let completedAtToken = page.completedAtTokens.indices.contains(index)
-                ? page.completedAtTokens[index]
-                : ""
-            return try AgentCheckpointListContract.freezeItem(
-                summary: summary,
-                sourceFilesTruncated: page.filesTruncated.indices.contains(index)
-                    ? page.filesTruncated[index]
-                    : false,
-                listMetadata: listMetadata,
-                completedAtToken: completedAtToken
-            )
-        }
-        return try AgentCheckpointListContract.packPage(
-            candidates: frozen,
-            sourceHasMore: page.truncated,
-            catalogRevision: page.catalogRevision,
-            responseID: responseID
-        )
     }
 
     nonisolated static func checkpointListV1AcceptsResponseID(

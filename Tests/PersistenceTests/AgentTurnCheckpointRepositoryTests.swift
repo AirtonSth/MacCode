@@ -609,13 +609,14 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
     }
 
     func testMigratedRowsExposeExplicitUnavailableMetadataWithoutRawBackfill() throws {
-        // WHY: migration must not scan raw large columns. A pre-v58 row remains
-        // visible/actionable through a stable bounded surrogate while every
-        // unavailable metadata total/hash stays honestly empty.
+        // WHY: migration must not scan raw large columns. A pre-checkpoint-list
+        // row (shared base v56) remains visible/actionable through a stable
+        // bounded surrogate while every unavailable metadata total/hash stays
+        // honestly empty.
         let db = try SQLiteDB(path: ":memory:")
         try Schema.migrateSteps(
             db,
-            Schema.steps.filter { $0.version <= 57 }
+            Schema.steps.filter { $0.version <= Schema.sharedIntegrationBaseVersion }
         )
         let (tid, rid) = try seedThreadAndRun(db: db)
         let completed = Date(timeIntervalSince1970: 1_700_000_600)
@@ -785,7 +786,7 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
         let db = try SQLiteDB(path: ":memory:")
         try Schema.migrateSteps(
             db,
-            Schema.steps.filter { $0.version <= 57 }
+            Schema.steps.filter { $0.version <= Schema.sharedIntegrationBaseVersion }
         )
         let (tid, rid) = try seedThreadAndRun(db: db)
         let insert = try db.prepare("""
@@ -894,7 +895,7 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
         let db = try makeDB()
         let repo = AgentTurnCheckpointRepository(db: db)
         let (tid, rid) = try seedThreadAndRun(db: db)
-        let before = try AgentTurnCheckpointCatalogRevision.current(db: db)
+        let before = try AgentTurnCheckpointCatalogRevision.current(db: db, threadId: tid)
 
         try repo.upsert(makeHeavyCheckpoint(
             threadId: tid,
@@ -903,8 +904,8 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
             runId: rid,
             completedAt: Date(timeIntervalSince1970: 1_700_002_000)
         ))
-        let afterInsert = try AgentTurnCheckpointCatalogRevision.current(db: db)
-        XCTAssertGreaterThan(afterInsert, before)
+        let afterInsert = try AgentTurnCheckpointCatalogRevision.current(db: db, threadId: tid)
+        XCTAssertEqual(afterInsert, before + 1, "insert bumps exactly once")
 
         try repo.upsert(makeHeavyCheckpoint(
             threadId: tid,
@@ -913,8 +914,8 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
             runId: rid,
             completedAt: Date(timeIntervalSince1970: 1_700_002_001)
         ))
-        let afterUpsert = try AgentTurnCheckpointCatalogRevision.current(db: db)
-        XCTAssertGreaterThan(afterUpsert, afterInsert)
+        let afterUpsert = try AgentTurnCheckpointCatalogRevision.current(db: db, threadId: tid)
+        XCTAssertEqual(afterUpsert, afterInsert + 1, "list-emitted upsert bumps exactly once")
 
         try repo.upsert(makeHeavyCheckpoint(
             threadId: tid,
@@ -924,12 +925,15 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
             completedAt: Date(timeIntervalSince1970: 1_700_002_002)
         ))
         let page = try repo.listMetadataPage(threadId: tid, maxEntries: 10, before: nil)
-        XCTAssertEqual(page.catalogRevision, try AgentTurnCheckpointCatalogRevision.current(db: db))
+        XCTAssertEqual(
+            page.catalogRevision,
+            try AgentTurnCheckpointCatalogRevision.current(db: db, threadId: tid)
+        )
         XCTAssertEqual(page.items.count, 2)
 
         try repo.deleteAfter(threadId: tid, checkpointTurnCount: 1)
-        let afterDelete = try AgentTurnCheckpointCatalogRevision.current(db: db)
-        XCTAssertGreaterThan(afterDelete, page.catalogRevision)
+        let afterDelete = try AgentTurnCheckpointCatalogRevision.current(db: db, threadId: tid)
+        XCTAssertEqual(afterDelete, page.catalogRevision + 1, "single-row delete bumps once")
         let page2 = try repo.listMetadataPage(threadId: tid, maxEntries: 10, before: nil)
         XCTAssertEqual(page2.catalogRevision, afterDelete)
         XCTAssertEqual(page2.items.count, 1)
@@ -968,6 +972,185 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
             retry.items.map(\.turnId),
             second.items.map(\.turnId),
             "same-revision retry must be stable"
+        )
+    }
+
+    func testUnrelatedThreadMutationsDoNotInvalidateThreadAPagination() throws {
+        // WHY: a busy thread B must never bump thread A's revision fence or
+        // starve A's keyset walk mid-pagination.
+        let db = try makeDB()
+        let repo = AgentTurnCheckpointRepository(db: db)
+        let (tidA, ridA) = try seedThreadAndRun(db: db)
+        let (tidB, ridB) = try seedThreadAndRun(db: db)
+        let base = Date(timeIntervalSince1970: 1_700_003_000)
+        for n in 1...6 {
+            try repo.upsert(makeHeavyCheckpoint(
+                threadId: tidA,
+                turnCount: n,
+                turnId: "A-\(n)",
+                runId: ridA,
+                completedAt: base.addingTimeInterval(TimeInterval(n))
+            ))
+        }
+        let first = try repo.listMetadataPage(threadId: tidA, maxEntries: 2, before: nil)
+        XCTAssertTrue(first.truncated)
+        let revisionA = first.catalogRevision
+        var collected = first.items.map(\.turnId)
+        var cursor = try XCTUnwrap(first.nextBefore)
+
+        var bTurn = 0
+        while collected.count < 6 {
+            // Continuously mutate unrelated thread B between every page of A.
+            for _ in 0..<3 {
+                bTurn += 1
+                try repo.upsert(makeHeavyCheckpoint(
+                    threadId: tidB,
+                    turnCount: bTurn,
+                    turnId: "B-\(bTurn)",
+                    runId: ridB,
+                    completedAt: base.addingTimeInterval(TimeInterval(100 + bTurn))
+                ))
+            }
+            let page = try repo.listMetadataPage(
+                threadId: tidA,
+                maxEntries: 2,
+                before: cursor
+            )
+            XCTAssertEqual(
+                page.catalogRevision,
+                revisionA,
+                "thread B mutations must not invalidate thread A catalog revision"
+            )
+            collected.append(contentsOf: page.items.map(\.turnId))
+            if page.truncated {
+                cursor = try XCTUnwrap(page.nextBefore)
+            } else {
+                break
+            }
+        }
+        XCTAssertEqual(collected, ["A-6", "A-5", "A-4", "A-3", "A-2", "A-1"])
+        let revB = try AgentTurnCheckpointCatalogRevision.current(db: db, threadId: tidB)
+        XCTAssertGreaterThan(revB, 1)
+        XCTAssertEqual(
+            try AgentTurnCheckpointCatalogRevision.current(db: db, threadId: tidA),
+            revisionA
+        )
+    }
+
+    func testSameThreadMutationBetweenPagesSurfacesStaleRevisionAtRepositoryFence() throws {
+        // WHY: same-thread insert/delete between pages must advance the fence so
+        // Dispatcher can return typed restart_once before mixing generations.
+        let db = try makeDB()
+        let repo = AgentTurnCheckpointRepository(db: db)
+        let (tid, rid) = try seedThreadAndRun(db: db)
+        let base = Date(timeIntervalSince1970: 1_700_003_500)
+        for n in 1...4 {
+            try repo.upsert(makeHeavyCheckpoint(
+                threadId: tid,
+                turnCount: n,
+                turnId: "stale-\(n)",
+                runId: rid,
+                completedAt: base.addingTimeInterval(TimeInterval(n))
+            ))
+        }
+        let first = try repo.listMetadataPage(threadId: tid, maxEntries: 2, before: nil)
+        let cursor = try XCTUnwrap(first.nextBefore)
+        try repo.upsert(makeHeavyCheckpoint(
+            threadId: tid,
+            turnCount: 99,
+            turnId: "stale-new",
+            runId: rid,
+            completedAt: base.addingTimeInterval(99)
+        ))
+        let second = try repo.listMetadataPage(
+            threadId: tid,
+            maxEntries: 2,
+            before: cursor
+        )
+        XCTAssertGreaterThan(second.catalogRevision, first.catalogRevision)
+    }
+
+    func testDetailOnlyMutationDoesNotBumpCatalogRevision() throws {
+        // WHY: rewriting non-emitted payloads (diff/snapshots/raw files_json)
+        // must not spuriously invalidate an in-flight pagination session.
+        let db = try makeDB()
+        let repo = AgentTurnCheckpointRepository(db: db)
+        let (tid, rid) = try seedThreadAndRun(db: db)
+        let completed = Date(timeIntervalSince1970: 1_700_003_800)
+        try repo.upsert(makeHeavyCheckpoint(
+            threadId: tid,
+            turnCount: 1,
+            turnId: "detail-only",
+            runId: rid,
+            completedAt: completed
+        ))
+        let before = try AgentTurnCheckpointCatalogRevision.current(db: db, threadId: tid)
+
+        // Direct SQL rewrite of detail-only columns; list_* projections unchanged.
+        let st = try db.prepare("""
+            UPDATE agent_turn_checkpoints
+            SET files_json = ?,
+                file_snapshots_json = ?,
+                diff_patch = ?,
+                file_diffs_json = ?
+            WHERE thread_id = ? AND turn_id = ?;
+            """)
+        try st.bind(1, #"[ {"path":"only-detail.swift","kind":"modified","additions":9,"deletions":0} ]"#)
+        try st.bind(2, #"[{"path":"only-detail.swift","before":"a","after":"b"}]"#)
+        try st.bind(3, "@@\n+detail-only\n")
+        try st.bind(4, #"[{"path":"only-detail.swift","patch":"@@\n+x\n"}]"#)
+        try st.bind(5, tid.value.uuidString)
+        try st.bind(6, "detail-only")
+        _ = try st.step()
+
+        let after = try AgentTurnCheckpointCatalogRevision.current(db: db, threadId: tid)
+        XCTAssertEqual(after, before, "detail-only rewrite must not bump list revision")
+    }
+
+    func testGatewayListMetadataPageNeverRunsOnMainThread() async throws {
+        // WHY: Dispatcher/AppCommandRouter are @MainActor; SQLite query/decode
+        // must hop to the gateway queue. Executor counters — not timing alone —
+        // prove the off-main contract.
+        let db = try makeDB()
+        let gateway = AgentTurnCheckpointListGateway(db: db)
+        let (tid, rid) = try seedThreadAndRun(db: db)
+        let repo = AgentTurnCheckpointRepository(db: db)
+        try repo.upsert(makeHeavyCheckpoint(
+            threadId: tid,
+            turnCount: 1,
+            turnId: "gw-1",
+            runId: rid,
+            completedAt: Date(timeIntervalSince1970: 1_700_004_000)
+        ))
+
+        AgentTurnCheckpointListGateway.resetExecutionProbesForTesting()
+        AgentTurnCheckpointListGateway.queryDelayNanosecondsForTesting = 40_000_000
+        defer { AgentTurnCheckpointListGateway.resetExecutionProbesForTesting() }
+
+        var heartbeats = 0
+        let heartbeat = Task { @MainActor in
+            while !Task.isCancelled {
+                heartbeats += 1
+                try? await Task.sleep(nanoseconds: 2_000_000)
+            }
+        }
+
+        let page = try await gateway.listMetadataPage(
+            threadId: tid,
+            maxEntries: 10,
+            before: nil
+        )
+        heartbeat.cancel()
+        _ = await heartbeat.result
+
+        XCTAssertEqual(page.items.count, 1)
+        XCTAssertEqual(AgentTurnCheckpointListGateway.queryCallCountForTesting, 1)
+        XCTAssertEqual(AgentTurnCheckpointListGateway.queryOnMainActorCountForTesting, 0)
+        XCTAssertEqual(AgentTurnCheckpointListGateway.queryOffMainActorCountForTesting, 1)
+        XCTAssertGreaterThan(
+            heartbeats,
+            3,
+            "MainActor run loop must keep pumping while gateway SQLite work is delayed"
         )
     }
 }
