@@ -620,13 +620,21 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         return providerUpdateResult
     }
     var gitCwd = "/tmp"
+    /// Count of `gitDiff` invocations — used to prove invalid bounded params fail closed before the expensive router call.
+    var gitDiffCallCount = 0
+    /// When set, returned instead of shelling out to real git (keeps Dispatcher contract tests hermetic).
+    var stubGitDiff: String?
     func gitStatus(workspace: WorkspaceID) throws -> GitSummary { GitDiff.summary(in: gitCwd) }
     func gitBranches(workspace: WorkspaceID) throws -> GitBranches { GitDiff.branches(in: gitCwd) }
     func gitCheckout(workspace: WorkspaceID, branch: String) throws -> GitActionResult { GitDiff.checkout(in: gitCwd, branch: branch) }
     func gitCreateBranch(workspace: WorkspaceID, name: String) throws -> GitActionResult { GitDiff.createBranch(in: gitCwd, name: name) }
     func gitCommit(workspace: WorkspaceID, message: String) throws -> GitActionResult { GitDiff.commit(in: gitCwd, message: message) }
     func gitLog(workspace: WorkspaceID, limit: Int) throws -> [GitCommit] { GitDiff.log(in: gitCwd, limit: limit) }
-    func gitDiff(workspace: WorkspaceID, path: String?, ignoreWhitespace: Bool) throws -> String { GitDiff.diff(in: gitCwd, path: path, ignoreWhitespace: ignoreWhitespace) }
+    func gitDiff(workspace: WorkspaceID, path: String?, ignoreWhitespace: Bool) throws -> String {
+        gitDiffCallCount += 1
+        if let stubGitDiff { return stubGitDiff }
+        return GitDiff.diff(in: gitCwd, path: path, ignoreWhitespace: ignoreWhitespace)
+    }
     func gitPush(workspace: WorkspaceID) throws -> GitActionResult { GitDiff.push(in: gitCwd) }
     func gitPullRequestURL(workspace: WorkspaceID) throws -> String? { GitDiff.pullRequestURL(in: gitCwd) }
     func gitDeliveryPlan(workspace: WorkspaceID, copy: GitDeliveryCopy?) throws -> GitDeliveryPlan { GitDiff.deliveryPlan(in: gitCwd, copy: copy) }
@@ -2766,5 +2774,100 @@ final class DispatcherTests: XCTestCase {
 
         XCTAssertEqual(oldResult, newResult,
                        "encode<T> optimization must produce structurally identical JSONValue output as the original double-round-trip path")
+    }
+
+    // MARK: - git.diff bounded response v1
+
+    @MainActor
+    func test_gitDiff_withoutResponseVersion_returnsLegacyBareString() async {
+        // WHY: deployed older iOS / non-opt-in callers still expect a bare string
+        // result. Introducing response_version must not change that shape.
+        let router = FakeRouter()
+        router.stubGitDiff = "diff --git a/A b/A\n+line"
+        let d = JSONRPCDispatcher(router: router)
+        let wid = UUID().uuidString
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "git.diff", params: [
+            "workspace_id": .string(wid),
+        ]))
+
+        XCTAssertNil(resp.error)
+        XCTAssertEqual(resp.result, .string("diff --git a/A b/A\n+line"),
+                       "absent response_version must keep the exact legacy bare-string result")
+        XCTAssertEqual(router.gitDiffCallCount, 1)
+    }
+
+    @MainActor
+    func test_gitDiff_optInV1_returnsBoundedObject() async {
+        // WHY: modern iOS asks for a finite wire window; the host must report the
+        // original total separately because returned text may already be clipped.
+        let router = FakeRouter()
+        router.stubGitDiff = "a\nb\nc\nd"
+        let d = JSONRPCDispatcher(router: router)
+        let wid = UUID().uuidString
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "git.diff", params: [
+            "workspace_id": .string(wid),
+            "response_version": .number(1),
+            "max_bytes": .number(1024),
+            "max_lines": .number(2),
+        ]))
+
+        XCTAssertNil(resp.error)
+        guard case .object(let body)? = resp.result else {
+            return XCTFail("opt-in v1 must return a bounded object, not a bare string")
+        }
+        XCTAssertEqual(body["version"], .number(1))
+        XCTAssertEqual(body["text"], .string("a\nb"))
+        XCTAssertEqual(body["truncated"], .bool(true))
+        XCTAssertEqual(body["total_lines"], .number(4),
+                       "total_lines must be the original exact line count, not the returned prefix")
+        XCTAssertEqual(router.gitDiffCallCount, 1)
+    }
+
+    @MainActor
+    func test_gitDiff_invalidOptInCaps_failClosedBeforeRouter() async {
+        // WHY: a hostile/malformed cellular request must not trigger an expensive
+        // full-patch generation only to be rejected afterward.
+        let router = FakeRouter()
+        router.stubGitDiff = "should-not-be-fetched"
+        let d = JSONRPCDispatcher(router: router)
+        let wid = UUID().uuidString
+
+        let cases: [[String: JSONValue]] = [
+            // unknown version
+            ["workspace_id": .string(wid), "response_version": .number(2),
+             "max_bytes": .number(100), "max_lines": .number(10)],
+            // missing max_bytes
+            ["workspace_id": .string(wid), "response_version": .number(1),
+             "max_lines": .number(10)],
+            // missing max_lines
+            ["workspace_id": .string(wid), "response_version": .number(1),
+             "max_bytes": .number(100)],
+            // fractional max_bytes
+            ["workspace_id": .string(wid), "response_version": .number(1),
+             "max_bytes": .number(1.5), "max_lines": .number(10)],
+            // non-positive max_lines
+            ["workspace_id": .string(wid), "response_version": .number(1),
+             "max_bytes": .number(100), "max_lines": .number(0)],
+            // over-ceiling max_bytes
+            ["workspace_id": .string(wid), "response_version": .number(1),
+             "max_bytes": .number(Double(GitDiffBoundedResponse.maxBytesCeiling + 1)),
+             "max_lines": .number(10)],
+            // over-ceiling max_lines
+            ["workspace_id": .string(wid), "response_version": .number(1),
+             "max_bytes": .number(100),
+             "max_lines": .number(Double(GitDiffBoundedResponse.maxLinesCeiling + 1))],
+        ]
+
+        for (idx, params) in cases.enumerated() {
+            router.gitDiffCallCount = 0
+            let resp = await d.dispatch(JSONRPCRequest(
+                jsonrpc: "2.0", id: .number(idx + 1), method: "git.diff", params: params
+            ))
+            XCTAssertEqual(resp.error?.code, -32602, "case \(idx) must be invalid params")
+            XCTAssertEqual(router.gitDiffCallCount, 0,
+                           "case \(idx) must not invoke router.gitDiff before validation")
+        }
     }
 }

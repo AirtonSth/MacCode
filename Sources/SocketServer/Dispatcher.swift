@@ -2317,9 +2317,22 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: encode(try router.gitLog(workspace: wid, limit: limit)))
             case "git.diff":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                // Opt-in v1 caps validated before the expensive router diff so a
+                // malformed cellular request never pays for a full unbounded patch.
+                let caps = try GitDiffBoundedResponse.parseOptInCaps(params)
                 let path = params["path"]?.stringValue
                 let iw = params["ignore_whitespace"]?.boolValue ?? false
-                return .init(id: id, result: .string(try router.gitDiff(workspace: wid, path: path, ignoreWhitespace: iw)))
+                let diff = try router.gitDiff(workspace: wid, path: path, ignoreWhitespace: iw)
+                if let caps {
+                    let window = GitDiffBoundedResponse.bound(
+                        text: diff,
+                        maxBytes: caps.maxBytes,
+                        maxLines: caps.maxLines
+                    )
+                    return .init(id: id, result: window.json)
+                }
+                // Legacy: bare string for callers that omit response_version.
+                return .init(id: id, result: .string(diff))
             case "git.push":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
                 // UX-010: idempotent push — a retried request must not push
