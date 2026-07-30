@@ -219,7 +219,7 @@ final class TokenSaverSidebarSnapshotTests: XCTestCase {
                              "near-zero means elements did not expand to fill the extra width")
     }
 
-    func test_tokenSaverDetailsPopoverRendersOtherSavingsReconciliation() async throws {
+    func test_tokenSaverDetailsPopoverRendersSimplifiedUsageCard() async throws {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2TokenSaverDetailsOther-\(UUID().uuidString)", isDirectory: true)
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
@@ -256,6 +256,8 @@ final class TokenSaverSidebarSnapshotTests: XCTestCase {
         vm.reload()
         await vm.reloadTokenSaverAndWait()
 
+        // Unattributed ledger totals remain correct even though the simplified
+        // popover no longer surfaces a "Not provider-attributed" row.
         let other = try XCTUnwrap(TokenSaverSavingsDisplay.otherSavingsRow(
             from: vm.tokenSaverSavingsSummary,
             subscribed: true,
@@ -269,14 +271,14 @@ final class TokenSaverSidebarSnapshotTests: XCTestCase {
             (vm.tokenSaverSavingsSummary.savings(for: "codex")?.savedTokens ?? 0) +
             other.savedTokens,
             vm.tokenSaverSavingsSummary.totalSavedTokens,
-            "details rows must reconcile to the headline total when direct CLI rows are unattributed"
+            "ledger totals must still reconcile when direct CLI rows are unattributed"
         )
 
         let details = SidebarRootView(vm: vm)
             .tokenSaverDetailsPopoverForTesting
-            .frame(width: 350, height: 460)
+            .frame(width: 350, height: 360)
         let hosting = NSHostingView(rootView: details)
-        hosting.frame = NSRect(x: 0, y: 0, width: 350, height: 460)
+        hosting.frame = NSRect(x: 0, y: 0, width: 350, height: 360)
         hosting.wantsLayer = true
         let window = NSWindow(
             contentRect: hosting.bounds,
@@ -290,11 +292,11 @@ final class TokenSaverSidebarSnapshotTests: XCTestCase {
         RunLoop.main.run(until: Date().addingTimeInterval(0.2))
 
         guard let bitmap = hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds) else {
-            return XCTFail("Token Saver details reconciliation snapshot must create a bitmap")
+            return XCTFail("Token Saver details simplified snapshot must create a bitmap")
         }
         hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
         guard let png = bitmap.representation(using: .png, properties: [:]) else {
-            return XCTFail("Token Saver details reconciliation snapshot must encode as PNG")
+            return XCTFail("Token Saver details simplified snapshot must encode as PNG")
         }
         let artifactPath = ProcessInfo.processInfo.environment["REMOTE_CODE_TOKEN_SAVER_DETAILS_ARTIFACT"]
         let artifactURL = URL(fileURLWithPath: artifactPath ?? NSTemporaryDirectory() + "remote-code-token-saver-details-proof.png")
@@ -302,9 +304,9 @@ final class TokenSaverSidebarSnapshotTests: XCTestCase {
         try png.write(to: artifactURL)
 
         XCTAssertGreaterThan(png.count, 6_000,
-                             "details popover proof image must not be empty; a tiny file means the reconciliation UI did not render")
+                             "details popover proof image must not be empty; a tiny file means the simplified card did not render")
         XCTAssertGreaterThan(nonTransparentSampleCount(in: bitmap), 500,
-                             "details popover must render visible pixels for the reconciliation rows")
+                             "details popover must render visible pixels for rings + provider rows")
         XCTAssertTrue(FileManager.default.fileExists(atPath: artifactURL.path))
     }
 
