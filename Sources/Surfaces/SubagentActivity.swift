@@ -35,6 +35,7 @@ public struct SubagentActivityItem: Identifiable, Sendable, Equatable {
     public let displayName: String
     public let provider: SubagentProviderKind
     public let model: String?
+    public let reasoningEffort: AgentReasoningEffort?
     public let phase: SubagentActivityPhase
     public let lifecycleStatus: AgentOrchestrationReceiptLifecycleStatus
     public let finalRunStatus: AgentRunStatus?
@@ -52,6 +53,7 @@ public struct SubagentActivityItem: Identifiable, Sendable, Equatable {
         displayName: String,
         provider: SubagentProviderKind,
         model: String?,
+        reasoningEffort: AgentReasoningEffort? = nil,
         phase: SubagentActivityPhase,
         lifecycleStatus: AgentOrchestrationReceiptLifecycleStatus,
         finalRunStatus: AgentRunStatus?,
@@ -67,6 +69,7 @@ public struct SubagentActivityItem: Identifiable, Sendable, Equatable {
         self.displayName = displayName
         self.provider = provider
         self.model = model
+        self.reasoningEffort = reasoningEffort
         self.phase = phase
         self.lifecycleStatus = lifecycleStatus
         self.finalRunStatus = finalRunStatus
@@ -87,6 +90,7 @@ public struct SubagentActivityItem: Identifiable, Sendable, Equatable {
         }
     }
 
+    /// Compact meta: `Provider · model · effort` (omits missing segments).
     public var providerModelLabel: String? {
         let providerName: String
         switch provider {
@@ -95,10 +99,17 @@ public struct SubagentActivityItem: Identifiable, Sendable, Equatable {
         case .grok: providerName = "Grok"
         case .unknown: providerName = "Unknown"
         }
+        var parts = [providerName]
         if let model, !model.isEmpty {
-            return "\(providerName) · \(model)"
+            parts.append(model)
         }
-        return provider == .unknown && model == nil ? nil : providerName
+        if let reasoningEffort {
+            parts.append(reasoningEffort.displayName)
+        }
+        if provider == .unknown && model == nil && reasoningEffort == nil {
+            return nil
+        }
+        return parts.joined(separator: " · ")
     }
 }
 
@@ -310,6 +321,7 @@ public enum SubagentActivityProjection {
             displayName: displayName(nodeId: receipt.nodeId, provider: provider, model: model),
             provider: provider,
             model: model,
+            reasoningEffort: receipt.reasoningEffort,
             phase: phase,
             lifecycleStatus: receipt.lifecycleStatus,
             finalRunStatus: receipt.finalRunStatus,

@@ -1364,6 +1364,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     provider: effectiveRequest.provider,
                     providerInstanceId: effectiveRequest.providerInstanceId ?? effectiveRequest.provider.rawValue,
                     model: effectiveRequest.model,
+                    reasoningEffort: effectiveRequest.reasoningEffort,
                     permissionMode: effectiveRequest.permissionMode,
                     delegationCapabilitySHA256: delegationCapabilitySHA256
                 )
@@ -4679,6 +4680,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             ?? parentRun?.providerInstanceId
             ?? parentProvider.rawValue
         let parentModel = metadata?.model ?? parentReceipt?.model ?? parentRun?.model ?? "unknown"
+        // Native collab events do not publish child effort; inherit the parent's
+        // bound effort so Subagents still shows provider · model · reasoning.
+        let parentEffort = parentReceipt?.reasoningEffort
 
         let updates = ProviderNativeSubagentLifecycle.updates(
             from: event,
@@ -4695,6 +4699,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                         ? parentProviderInstanceId
                         : update.provider.rawValue,
                     model: update.provider == parentProvider ? parentModel : "unknown",
+                    reasoningEffort: update.provider == parentProvider ? parentEffort : nil,
                     nodeId: update.nodeId,
                     parentRunId: parentRunId
                 )

@@ -191,6 +191,9 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
     public let provider: AgentProvider
     public let providerInstanceId: String
     public let model: String
+    /// Bound reasoning effort for this run. Nil on legacy receipts that predate
+    /// the field — UI must not invent a default effort from absence.
+    public let reasoningEffort: AgentReasoningEffort?
     public let capabilitySnapshotId: String
     public let decisionReason: String
     public let admittedAt: Date
@@ -233,6 +236,7 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
         provider: AgentProvider,
         providerInstanceId: String,
         model: String,
+        reasoningEffort: AgentReasoningEffort? = nil,
         capabilitySnapshotId: String,
         decisionReason: String,
         admittedAt: Date = Date(),
@@ -268,6 +272,7 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
         self.provider = provider
         self.providerInstanceId = providerInstanceId
         self.model = model
+        self.reasoningEffort = reasoningEffort
         self.capabilitySnapshotId = capabilitySnapshotId
         self.decisionReason = decisionReason
         self.admittedAt = admittedAt
@@ -293,7 +298,7 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case id, parentReceiptId, runId, threadId, nodeId, attemptId, routingRevision, policyDigest
-        case policyVersion, packageRevision, provider, providerInstanceId, model
+        case policyVersion, packageRevision, provider, providerInstanceId, model, reasoningEffort
         case capabilitySnapshotId, decisionReason, admittedAt, lifecycleStatus
         case lifecycleUpdatedAt, finalizedAt, finalRunStatus, deadlineAt
         case budgetTokens, budgetCostMicros, reservationId, reservedTokens
@@ -319,6 +324,7 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
         provider = try values.decode(AgentProvider.self, forKey: .provider)
         providerInstanceId = try values.decode(String.self, forKey: .providerInstanceId)
         model = try values.decode(String.self, forKey: .model)
+        reasoningEffort = try values.decodeIfPresent(AgentReasoningEffort.self, forKey: .reasoningEffort)
         capabilitySnapshotId = try values.decode(String.self, forKey: .capabilitySnapshotId)
         decisionReason = try values.decode(String.self, forKey: .decisionReason)
         self.admittedAt = admittedAt
@@ -370,6 +376,7 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
             provider: provider,
             providerInstanceId: providerInstanceId,
             model: model,
+            reasoningEffort: reasoningEffort,
             capabilitySnapshotId: capabilitySnapshotId,
             decisionReason: decisionReason,
             admittedAt: admittedAt,
@@ -415,6 +422,7 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
             provider: provider,
             providerInstanceId: providerInstanceId,
             model: model,
+            reasoningEffort: reasoningEffort,
             capabilitySnapshotId: capabilitySnapshotId,
             decisionReason: decisionReason,
             admittedAt: admittedAt,
@@ -457,6 +465,7 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
             provider: provider,
             providerInstanceId: providerInstanceId,
             model: model,
+            reasoningEffort: reasoningEffort,
             capabilitySnapshotId: capabilitySnapshotId,
             decisionReason: decisionReason,
             admittedAt: admittedAt,
@@ -1165,6 +1174,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             provider: resolved.provider,
             providerInstanceId: resolved.providerInstanceId,
             model: resolved.selection.effectiveModel,
+            reasoningEffort: resolved.selection.reasoningEffort,
             capabilitySnapshotId: resolved.capabilitySnapshotId,
             decisionReason: "preferred-source-then-live-eligible-provider",
             admittedAt: now(),
@@ -1200,6 +1210,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             provider: receipt.provider,
             providerInstanceId: receipt.providerInstanceId,
             model: receipt.model,
+            reasoningEffort: receipt.reasoningEffort,
             capabilitySnapshotId: receipt.capabilitySnapshotId,
             decisionReason: receipt.decisionReason,
             admittedAt: receipt.admittedAt,
@@ -1284,6 +1295,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
                     provider: currentParent.provider,
                     providerInstanceId: currentParent.providerInstanceId,
                     model: currentParent.model,
+                    reasoningEffort: currentParent.reasoningEffort,
                     capabilitySnapshotId: currentParent.capabilitySnapshotId,
                     decisionReason: "controlled-child-of-parent",
                     admittedAt: admittedAt,
@@ -1310,6 +1322,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         provider: AgentProvider,
         providerInstanceId: String,
         model: String,
+        reasoningEffort: AgentReasoningEffort? = nil,
         nodeId: String,
         parentRunId: AgentRunID,
         parentThreadId: AgentThreadID,
@@ -1329,6 +1342,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             provider: provider,
             providerInstanceId: providerInstanceId,
             model: model,
+            reasoningEffort: reasoningEffort,
             nodeId: nodeId,
             parentRunId: parentRunId,
             parentThreadId: parentThreadId,
@@ -1350,6 +1364,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         provider: AgentProvider,
         providerInstanceId: String,
         model: String,
+        reasoningEffort: AgentReasoningEffort? = nil,
         nodeId: String,
         parentRunId: AgentRunID,
         parentThreadId: AgentThreadID,
@@ -1371,6 +1386,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             provider: provider,
             providerInstanceId: providerInstanceId,
             model: model,
+            reasoningEffort: reasoningEffort,
             nodeId: nodeId,
             parentRunId: parentRunId,
             parentThreadId: parentThreadId,
@@ -1394,6 +1410,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         provider: AgentProvider,
         providerInstanceId: String,
         model: String,
+        reasoningEffort: AgentReasoningEffort? = nil,
         nodeId: String,
         parentRunId: AgentRunID,
         requestedPermissionMode: AgentPermissionMode? = nil
@@ -1404,6 +1421,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             provider: provider,
             providerInstanceId: providerInstanceId,
             model: model,
+            reasoningEffort: reasoningEffort,
             nodeId: nodeId,
             parentRunId: parentRunId,
             parentThreadId: threadId,
@@ -1422,6 +1440,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         provider: AgentProvider,
         providerInstanceId: String,
         model: String,
+        reasoningEffort: AgentReasoningEffort?,
         nodeId: String,
         parentRunId: AgentRunID,
         parentThreadId: AgentThreadID,
@@ -1507,6 +1526,9 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
                     provider: provider,
                     providerInstanceId: providerInstanceId,
                     model: model,
+                    // Explicit child effort wins; otherwise inherit the parent's
+                    // bound effort so Subagents can show provider · model · effort.
+                    reasoningEffort: reasoningEffort ?? parent.reasoningEffort,
                     capabilitySnapshotId: parent.capabilitySnapshotId,
                     decisionReason: "external-controlled-child",
                     admittedAt: admittedAt,
@@ -1728,6 +1750,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         provider: AgentProvider,
         providerInstanceId: String,
         model: String,
+        reasoningEffort: AgentReasoningEffort? = nil,
         permissionMode: AgentPermissionMode,
         delegationCapabilitySHA256: String,
         ownerProcessID: Int32? = nil
@@ -1768,6 +1791,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
                     provider: provider,
                     providerInstanceId: providerInstanceId,
                     model: model,
+                    reasoningEffort: reasoningEffort,
                     capabilitySnapshotId: "external",
                     decisionReason: "manual-agent-app-controller",
                     admittedAt: admittedAt,

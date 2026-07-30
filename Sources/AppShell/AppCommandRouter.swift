@@ -3135,6 +3135,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     provider: prov,
                     providerInstanceId: t.providerInstanceId ?? prov.rawValue,
                     model: m,
+                    reasoningEffort: t.reasoningEffort,
                     nodeId: nestedRunContext.nodeID,
                     parentRunId: nestedRunContext.parentRunID,
                     parentThreadId: nestedRunContext.parentThreadID,

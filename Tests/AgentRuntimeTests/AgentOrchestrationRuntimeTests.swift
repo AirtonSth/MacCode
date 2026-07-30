@@ -451,6 +451,11 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         // Auto controller always binds LIGHT (Haiku), not the manual selection.
         XCTAssertEqual(admission.route.selection.modelId, "haiku")
         XCTAssertEqual(admission.route.selection.reasoningEffort, .high)
+        XCTAssertEqual(
+            admission.receipt.reasoningEffort,
+            .high,
+            "Subagents reads effort from the admission receipt, not re-routing"
+        )
         XCTAssertEqual(admission.receipt.routingRevision, 3)
         XCTAssertEqual(admission.receipt.runId, runId)
         XCTAssertEqual(admission.receipt.nodeId, "root")
@@ -504,6 +509,12 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         XCTAssertEqual(child.parentReceiptId, parent.id)
         XCTAssertEqual(child.threadId, parent.threadId)
         XCTAssertEqual(child.provider, parent.provider)
+        XCTAssertEqual(child.model, parent.model)
+        XCTAssertEqual(
+            child.reasoningEffort,
+            parent.reasoningEffort,
+            "controlled children inherit the parent's bound effort for Subagents meta"
+        )
         XCTAssertEqual(child.nodeId, "deep-worker-plan-writer")
         XCTAssertEqual(child.lifecycleStatus, .accepted)
         XCTAssertEqual(Set(try repository.receipts().map(\.id)), Set([parent.id, child.id]))

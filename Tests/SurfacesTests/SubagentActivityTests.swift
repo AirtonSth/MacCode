@@ -531,10 +531,58 @@ final class SubagentActivityTests: XCTestCase {
         let item = SubagentActivityProjection.mapItem(receipt: receipt)
         XCTAssertEqual(item.phase, .unknown)
         XCTAssertNil(item.model)
+        XCTAssertNil(item.reasoningEffort)
         XCTAssertEqual(item.displayName, "Unknown")
         XCTAssertEqual(item.statusLabel, "Unknown")
         XCTAssertFalse(item.isActive)
         XCTAssertEqual(item.provider, .grok)
+    }
+
+    func test_providerModelLabel_includesProviderModelAndReasoningEffort() {
+        // WHY: operators scan subagent rows for who is running what at which
+        // effort; omitting effort next to the model hides the binding that
+        // actually drives cost/latency for that child.
+        let withEffort = SubagentActivityProjection.mapItem(
+            receipt: makeReceipt(
+                lifecycle: .accepted,
+                model: "grok-4.5",
+                nodeId: "native.grok.019fb358-e6dd-7842-b527-abcdef12e8a6",
+                provider: .grok,
+                reasoningEffort: .high
+            )
+        )
+        XCTAssertEqual(withEffort.providerModelLabel, "Grok · grok-4.5 · High")
+        XCTAssertEqual(withEffort.reasoningEffort, .high)
+
+        let withoutEffort = SubagentActivityProjection.mapItem(
+            receipt: makeReceipt(
+                lifecycle: .accepted,
+                model: "grok-4.5",
+                nodeId: "native.grok.child",
+                provider: .grok,
+                reasoningEffort: nil
+            )
+        )
+        XCTAssertEqual(
+            withoutEffort.providerModelLabel,
+            "Grok · grok-4.5",
+            "legacy receipts without effort must not invent a default effort label"
+        )
+
+        let effortOnly = SubagentActivityProjection.mapItem(
+            receipt: makeReceipt(
+                lifecycle: .accepted,
+                model: "unknown",
+                nodeId: "nested.claude.x",
+                provider: .claude,
+                reasoningEffort: .xhigh
+            )
+        )
+        XCTAssertEqual(
+            effortOnly.providerModelLabel,
+            "Claude · Extra High",
+            "when model is missing, still show provider · effort"
+        )
     }
 
     func test_showMore_activeOverflowUsesVisibleLimit() {
@@ -576,7 +624,8 @@ final class SubagentActivityTests: XCTestCase {
         model: String = "model-x",
         nodeId: String = "worker",
         provider: AgentProvider = .codex,
-        decisionReason: String = "test"
+        decisionReason: String = "test",
+        reasoningEffort: AgentReasoningEffort? = nil
     ) -> AgentOrchestrationAdmissionReceipt {
         let admitted = admittedAt ?? now.addingTimeInterval(-120)
         return AgentOrchestrationAdmissionReceipt(
@@ -593,6 +642,7 @@ final class SubagentActivityTests: XCTestCase {
             provider: provider,
             providerInstanceId: provider.rawValue,
             model: model,
+            reasoningEffort: reasoningEffort,
             capabilitySnapshotId: "cap",
             decisionReason: decisionReason,
             admittedAt: admitted,
