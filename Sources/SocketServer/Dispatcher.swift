@@ -2480,8 +2480,65 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: .string(s))
             case "browser.screenshot":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
+                if let responseVersion = params["response_version"] {
+                    guard case .number(let rawVersion) = responseVersion,
+                          rawVersion.isFinite,
+                          rawVersion == Double(BrowserScreenshotInlineV1.version)
+                    else {
+                        throw JSONRPCError.invalidParams
+                    }
+                    guard params["path"] == nil,
+                          let maxBytes =
+                              BrowserScreenshotInlineV1.boundedPositiveInteger(
+                                  params["max_bytes"],
+                                  maximum:
+                                      BrowserScreenshotInlineV1.maximumResponseBytes
+                              ),
+                          let maxPixelDimension =
+                              BrowserScreenshotInlineV1.boundedPositiveInteger(
+                                  params["max_pixel_dimension"],
+                                  maximum:
+                                      BrowserScreenshotInlineV1.maximumPixelDimension
+                              )
+                    else {
+                        throw JSONRPCError.invalidParams
+                    }
+                    let resolved = try router.browserScreenshot(
+                        surface: sid,
+                        savePath: nil
+                    )
+                    let screenshotURL = URL(fileURLWithPath: resolved)
+                    defer { try? FileManager.default.removeItem(at: screenshotURL) }
+                    let inlineResponse: [String: JSONValue]
+                    do {
+                        inlineResponse = try BrowserScreenshotInlineV1.makeResponse(
+                            fileURL: screenshotURL,
+                            requestedMaxBytes: maxBytes,
+                            requestedMaxPixelDimension: maxPixelDimension
+                        )
+                    } catch {
+                        throw JSONRPCError(
+                            code: -32013,
+                            message: "Browser screenshot could not be encoded within mobile limits."
+                        )
+                    }
+                    EventBus.shared.publish(
+                        kind: "browser.screenshot.created",
+                        payload: .object([
+                            "surface_id": .string(sid.value.uuidString),
+                            "filename": .string("screenshot.jpg")
+                        ])
+                    )
+                    return .init(
+                        id: id,
+                        result: .object(inlineResponse)
+                    )
+                }
                 let path = params["path"]?.stringValue
-                let resolved = try router.browserScreenshot(surface: sid, savePath: path)
+                let resolved = try router.browserScreenshot(
+                    surface: sid,
+                    savePath: path
+                )
                 EventBus.shared.publish(kind: "browser.screenshot.created", payload: .object([
                     "surface_id": .string(sid.value.uuidString),
                     "filename": .string(URL(fileURLWithPath: resolved).lastPathComponent)
