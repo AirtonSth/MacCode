@@ -339,6 +339,31 @@ final class PersistenceGapTests: XCTestCase {
             "no requested actions must mean no rows — never a fallback to an unfiltered scan")
     }
 
+    /// WHY: thread-scoped Subagents polls prefilter audit detail with LIKE so the
+    /// MainActor does not decode the entire orchestration ledger every 2s.
+    func test_auditLogDetails_detailContainsPrefiltersRows() throws {
+        let repo = try freshTrustRepo()
+        try repo.audit(actor: nil, action: "agent.orchestration.admitted", detail: #"{"threadId":{"value":"AAA"},"node":"a"}"#)
+        try repo.audit(actor: nil, action: "agent.orchestration.admitted", detail: #"{"threadId":{"value":"BBB"},"node":"b"}"#)
+        try repo.audit(actor: nil, action: "agent.orchestration.admitted", detail: #"{"parentReceiptId":"X","node":"child"}"#)
+
+        let threadHits = try repo.listAuditLogDetails(
+            actions: ["agent.orchestration.admitted"],
+            detailContains: "AAA",
+            limit: 50
+        )
+        XCTAssertEqual(threadHits.count, 1)
+        XCTAssertTrue(threadHits[0].contains("AAA"))
+
+        let childHits = try repo.listAuditLogDetails(
+            actions: ["agent.orchestration.admitted"],
+            detailContains: "\"parentReceiptId\"",
+            limit: 50
+        )
+        XCTAssertEqual(childHits.count, 1)
+        XCTAssertTrue(childHits[0].contains("parentReceiptId"))
+    }
+
     // MARK: - T037: NotificationRepository round-trip + dismissed-exclusion + limit
 
     /// WHY: dismissed rows are excluded by the WHERE clause; if the exclusion

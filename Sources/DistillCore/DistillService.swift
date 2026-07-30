@@ -1204,6 +1204,19 @@ public final class DistillHTTPServer: @unchecked Sendable {
                 await metrics.recordVolatileTokenWarnings(volatileScan.warningCount)
             }
             await metrics.recordSystemPromptHash(CacheAlignerPromptContract.systemPromptHash(for: distillRequest))
+            // Precomputed-output mode (Wave A/B ledger): the client already delivered
+            // `precomputedOutput` to the caller. Record the honest original→precomputed
+            // delta via onSuccess and skip the model/scheduler entirely — mirror the
+            // terminal-recovery early-return below (build response, onSuccess, 200).
+            if let response = distillRequest.responseUsingPrecomputedOutput() {
+                if distillRequest.mode == .commandOutput, response.output != distillRequest.input {
+                    await metrics.recordToolOutputCompressed()
+                }
+                if let onSuccess { await onSuccess(distillRequest, response) }
+                await metrics.recordSuccess()
+                send(status: 200, body: response, connection: connection)
+                return
+            }
             // Recovery scope is optional for compression. Without complete scope we still
             // run the scheduler so `cmd | distill` saves tokens; we only attach a
             // reversible handle when store+scope prepare succeeds (store-before-loss).

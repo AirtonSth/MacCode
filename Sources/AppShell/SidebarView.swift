@@ -2250,9 +2250,6 @@ public struct SidebarRootView: View {
     private enum TokenSaverUsageScope: String, CaseIterable {
         case currentSession
         case week
-        // WHY: permanent attributed accumulator was unreachable with only Today/Week;
-        // All time is the only scope that surfaces the ledger's attributed all-time figure.
-        case allTime
     }
 
     @ObservedObject var vm: SidebarViewModel
@@ -3008,7 +3005,6 @@ public struct SidebarRootView: View {
         // session window.  "today" is the honest label for what is shown.
         case .currentSession: return "today"
         case .week: return "week"
-        case .allTime: return "all time"
         }
     }
 
@@ -3018,7 +3014,6 @@ public struct SidebarRootView: View {
         // not a "session" (which implies start-of-process to now).
         case .currentSession: return "Today"
         case .week: return "Week"
-        case .allTime: return "All time"
         }
     }
 
@@ -3034,10 +3029,6 @@ public struct SidebarRootView: View {
             )
         case .week:
             return TokenSaverBareUserEstimator.weekProviderTokens(daily: snapshot.daily)
-        case .allTime:
-            // WHY: usage.json only retains a short window; all-time has no matched
-            // provider-usage series.
-            return 0
         }
     }
 
@@ -3056,9 +3047,6 @@ public struct SidebarRootView: View {
             )
         case .week:
             return TokenSaverBareUserEstimator.weekProviderBilledTokenUnits(daily: snapshot.daily)
-        case .allTime:
-            // No matched usage window for all-time — not "zero billed".
-            return nil
         }
     }
 
@@ -3074,21 +3062,11 @@ public struct SidebarRootView: View {
         scope: TokenSaverUsageScope
     ) -> TokenSaverSavingsRingFraction {
         let saved = tokenSaverSavedOrPotential(in: snapshot, scope: scope)
-        switch scope {
-        case .allTime:
-            // WHY: all-time has no matched usage window; never self-normalize against 0 used.
-            return Self.tokenSaverSavingsRingFraction(
-                savedTokens: saved,
-                knownBilledUnits: nil,
-                hasComparableUsageWindow: false
-            )
-        case .currentSession, .week:
-            return Self.tokenSaverSavingsRingFraction(
-                savedTokens: saved,
-                knownBilledUnits: tokenSaverScopeKnownBilledUnits(in: snapshot, scope: scope),
-                hasComparableUsageWindow: true
-            )
-        }
+        return Self.tokenSaverSavingsRingFraction(
+            savedTokens: saved,
+            knownBilledUnits: tokenSaverScopeKnownBilledUnits(in: snapshot, scope: scope),
+            hasComparableUsageWindow: true
+        )
     }
 
     private func tokenSaverSavingsProgress(
@@ -3106,14 +3084,7 @@ public struct SidebarRootView: View {
         // teaser. Never the retired usage-fraction teaser: that inverted the card
         // so non-payers saw larger headlines than payers. History is not gated
         // on the enable toggle.
-        switch scope {
-        case .allTime:
-            return Self.tokenSaverAllTimePrimaryTokens(
-                attributedSavedTokens: vm.tokenSaverSavingsSummary.attributedSavedTokens
-            )
-        case .currentSession, .week:
-            return tokenSaverPersistedOrLiveCredible(scope: scope, snapshot: snapshot)
-        }
+        tokenSaverPersistedOrLiveCredible(scope: scope, snapshot: snapshot)
     }
 
     /// Measured tool-output ledger only (no dialect/graphify/orchestration estimates).
@@ -3124,12 +3095,6 @@ public struct SidebarRootView: View {
             return Self.tokenSaverReportWindowSavedTokens(daily: summary.daily)
         case .currentSession:
             return Self.tokenSaverTodaySavedTokens(daily: summary.daily, now: tokenSaverNow)
-        case .allTime:
-            // WHY: all-time primary is attributed; measured-only window helpers stay
-            // on retained daily rows for Today/Week estimator inputs only.
-            return Self.tokenSaverAllTimePrimaryTokens(
-                attributedSavedTokens: summary.attributedSavedTokens
-            )
         }
     }
 
@@ -3152,10 +3117,6 @@ public struct SidebarRootView: View {
                 return vm.tokenSaverDailyEconomyWeekTotal
             }
             return tokenSaverBareUserBreakdown(in: snapshot, scope: scope).totalCredible
-        case .allTime:
-            return Self.tokenSaverAllTimePrimaryTokens(
-                attributedSavedTokens: vm.tokenSaverSavingsSummary.attributedSavedTokens
-            )
         }
     }
 
@@ -3173,20 +3134,6 @@ public struct SidebarRootView: View {
                 estimatedGraphify: today.graphifyTokens,
                 estimatedOrchestration: today.orchestrationTokens,
                 appliedOutputShare: today.appliedOutputShare,
-                usedCalibratedDefaults: true
-            )
-        }
-        // WHY: all-time is the attributed ledger total, not a dialect/graphify estimate.
-        if scope == .allTime {
-            let attributed = Self.tokenSaverAllTimePrimaryTokens(
-                attributedSavedTokens: vm.tokenSaverSavingsSummary.attributedSavedTokens
-            )
-            return TokenSaverBareUserBreakdown(
-                measuredToolOutput: attributed,
-                estimatedDialect: 0,
-                estimatedGraphify: 0,
-                estimatedOrchestration: 0,
-                appliedOutputShare: 0,
                 usedCalibratedDefaults: true
             )
         }
@@ -3243,49 +3190,7 @@ public struct SidebarRootView: View {
             return Self.tokenSaverWindowSaved(forProvider: provider.rawValue, dailyByProvider: summary.dailyByProvider)
         case .currentSession:
             return Self.tokenSaverTodaySaved(forProvider: provider.rawValue, dailyByProvider: summary.dailyByProvider, now: tokenSaverNow)
-        case .allTime:
-            // BLOCKER: Persistence does not expose per-provider attributed figures.
-            // Needed: TokenSaverSavingsSummary.attributedSavedTokens(forProvider:)
-            // (or equivalent on TokenSaverSavingsRepository.summary) applying the
-            // same displayedSavingsEligibilitySQL + attributedSavingsSQL as the
-            // all-time headline. Do not reimplement that predicate in the view.
-            // Until then, use the unfiltered permanent aggregate and surface the gap.
-            return summary.savings(for: provider.rawValue)?.savedTokens ?? 0
         }
-    }
-
-    /// Window + all-time unattributed savings for the "CLI & other" row.
-    /// WHY: always return values (including zeros) so the row never silently vanishes
-    /// when this window is empty while all-time unattributed still exists.
-    private func tokenSaverScopedOtherSavings() -> (
-        windowSaved: Int,
-        windowRuns: Int,
-        allTimeSaved: Int,
-        allTimeRuns: Int
-    ) {
-        let summary = vm.tokenSaverSavingsSummary
-        let window: (savedTokens: Int, runs: Int)
-        switch tokenSaverDetailsScope {
-        case .week:
-            window = Self.tokenSaverWindowSaved(
-                forProvidersOtherThan: TokenSaverSavingsDisplay.managedProviderIDs,
-                dailyByProvider: summary.dailyByProvider
-            )
-        case .currentSession:
-            window = Self.tokenSaverTodaySaved(
-                forProvidersOtherThan: TokenSaverSavingsDisplay.managedProviderIDs,
-                dailyByProvider: summary.dailyByProvider,
-                now: tokenSaverNow
-            )
-        case .allTime:
-            window = (summary.unattributedSavedTokens, summary.unattributedRuns)
-        }
-        return (
-            windowSaved: window.savedTokens,
-            windowRuns: window.runs,
-            allTimeSaved: summary.unattributedSavedTokens,
-            allTimeRuns: summary.unattributedRuns
-        )
     }
 
     /// Self-normalizing ring mix (saved + known billed) for a11y when comparable.
@@ -3328,10 +3233,9 @@ public struct SidebarRootView: View {
                 numerator: usage.currentSessionTokens,
                 denominator: usage.currentSessionLimitTokens
             )
-        case .week, .allTime:
+        case .week:
             // Prefer effective % so an expired weekly window (or a zeroed
             // inactive-provider clear) does not keep painting a stale ring.
-            // All-time has no separate rate-limit probe; reuse weekly % when present.
             if let weeklyUsedPercent = usage.effectiveWeeklyUsedPercent() {
                 return min(max(weeklyUsedPercent / 100.0, 0), 1)
             }
@@ -3360,27 +3264,73 @@ public struct SidebarRootView: View {
     ) -> String {
         switch scope {
         case .currentSession:
-            if let currentSessionUsedPercent = usage.effectiveSessionUsedPercent() {
-                return "Session used \(Self.formatPercent(currentSessionUsedPercent / 100.0))"
-            }
-            // When session probe is missing/bare-zero, surface weekly % under a
-            // honest label instead of painting "Session used 0%".
-            if let weeklyUsedPercent = usage.effectiveWeeklyUsedPercent() {
-                return "Week used \(Self.formatPercent(weeklyUsedPercent / 100.0))"
-            }
-            guard usage.currentSessionLimitTokens > 0 else { return "Session usage not loaded" }
-            let usedProgress = tokenSaverRingProgress(
-                numerator: usage.currentSessionTokens,
-                denominator: usage.currentSessionLimitTokens
+            // Pure seam owns the session/weekly-fallback wording so tests can
+            // lock the explained fallback without rendering SwiftUI.
+            return Self.tokenSaverCurrentSessionUsageCaption(
+                effectiveSessionUsedPercent: usage.effectiveSessionUsedPercent(),
+                effectiveWeeklyUsedPercent: usage.effectiveWeeklyUsedPercent(),
+                currentSessionTokens: usage.currentSessionTokens,
+                currentSessionLimitTokens: usage.currentSessionLimitTokens
             )
-            return "Session used \(Self.formatPercent(usedProgress))"
-        case .week, .allTime:
+        case .week:
             if let weeklyUsedPercent = usage.effectiveWeeklyUsedPercent() {
                 return "Weekly used \(Self.formatPercent(weeklyUsedPercent / 100.0))"
             }
             let weeklyLimit = max(usage.estimatedRawTokens, tokenSaverDefaultWeeklyLimitTokens(for: provider), 1)
             guard usage.actualProviderTokens > 0 else { return "Weekly usage not loaded" }
             return "Weekly used \(Self.formatTokenCount(usage.actualProviderTokens)) / \(Self.formatTokenCount(weeklyLimit))"
+        }
+    }
+
+    /// Pure seam: Today-scope usage caption, including the explained weekly
+    /// fallback when session probe data is missing/bare-zero.
+    ///
+    /// WHY: Claude often has a live session % while Codex/Grok fall back to
+    /// weekly; without "(no session data)" that mix reads as a UI glitch.
+    nonisolated public static func tokenSaverCurrentSessionUsageCaption(
+        effectiveSessionUsedPercent: Double?,
+        effectiveWeeklyUsedPercent: Double?,
+        currentSessionTokens: Int = 0,
+        currentSessionLimitTokens: Int = 0
+    ) -> String {
+        if let currentSessionUsedPercent = effectiveSessionUsedPercent {
+            return "Session used \(formatPercent(currentSessionUsedPercent / 100.0))"
+        }
+        // When session probe is missing/bare-zero, surface weekly % under an
+        // explained label instead of painting "Session used 0%" or a bare
+        // "Week used X%" that looks inconsistent next to session captions.
+        if let weeklyUsedPercent = effectiveWeeklyUsedPercent {
+            return "Week used \(formatPercent(weeklyUsedPercent / 100.0)) (no session data)"
+        }
+        guard currentSessionLimitTokens > 0 else { return "Session usage not loaded" }
+        let usedProgress: Double = {
+            guard currentSessionTokens > 0, currentSessionLimitTokens > 0 else { return 0 }
+            return min(max(Double(currentSessionTokens) / Double(currentSessionLimitTokens), 0), 1)
+        }()
+        return "Session used \(formatPercent(usedProgress))"
+    }
+
+    /// Static per-provider capability copy for automatic tool-output compression.
+    ///
+    /// Snapshot of today's real support only — not derived from savings math.
+    /// TODO: replace this fixed mapping with a real capability flag (adapter /
+    /// provider matrix) when one is wired through the runtime; do not invent
+    /// integration with in-flight work.
+    nonisolated public static func tokenSaverProviderCompressionCapabilityLine(
+        for provider: AgentProvider
+    ) -> String {
+        switch provider {
+        case .claude:
+            // Claude: automatic tool-output compression when Token Saver is on
+            // (PostToolUse / built-in path; selective tools still pass through).
+            return "Compresses tool output automatically"
+        case .codex:
+            // Codex: shared wrapper compresses tool stdout when Token Saver is on
+            // (same mechanism as Grok); savings recording/measurement not available yet.
+            return "Compresses tool output automatically — savings not yet trackable for this provider"
+        case .grok:
+            // Grok: shared wrapper compresses tool stdout when Token Saver is on.
+            return "Compresses tool output automatically"
         }
     }
 
@@ -3449,24 +3399,6 @@ public struct SidebarRootView: View {
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
 
-            if let localUpdate = vm.tokenSaverLocalUsageUpdate {
-                HStack(alignment: .firstTextBaseline, spacing: DS.Space.xs) {
-                    Image(systemName: "waveform.path.ecg")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(DS.Palette.success)
-                    TimelineView(.periodic(from: .now, by: 60)) { timeline in
-                        Text(Self.localUsageUpdateLabel(localUpdate, now: timeline.date))
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.success)
-                            .lineLimit(2)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .accessibilityElement(children: .combine)
-                .accessibilityIdentifier("sidebar.tokenSaver.localUsageUpdate")
-            }
-
             if let label = Self.sidecarStatusLabel(vm.sidecarStatus) {
                 HStack(spacing: DS.Space.xs) {
                     Image(systemName: "exclamationmark.triangle.fill")
@@ -3500,18 +3432,6 @@ public struct SidebarRootView: View {
 
             tokenSaverDetailsActivityChart
 
-            // WHY: scope-independent attributed lifetime line — never competes as a
-            // second primary number (caption only); primary stays the scope picker figure.
-            Text(Self.tokenSaverSinceInstallLine(
-                attributedSavedTokens: vm.tokenSaverSavingsSummary.attributedSavedTokens,
-                attributedRuns: vm.tokenSaverSavingsSummary.attributedRuns
-            ))
-            .font(DS.Font.caption2)
-            .foregroundColor(DS.Palette.textTertiary)
-            .lineLimit(2)
-            .minimumScaleFactor(0.85)
-            .accessibilityIdentifier("sidebar.tokenSaver.sinceInstall")
-
             Divider()
 
             VStack(alignment: .leading, spacing: DS.Space.sm) {
@@ -3519,19 +3439,7 @@ public struct SidebarRootView: View {
                 ForEach(tokenSaverProvidersByUsage(in: tokenSaverDetailsSnapshot, scope: tokenSaverDetailsScope), id: \.self) { provider in
                     tokenSaverProviderRow(provider: provider)
                 }
-                // WHY: always show unattributed — zero this window must not hide all-time.
-                let other = tokenSaverScopedOtherSavings()
-                tokenSaverOtherSavingsRow(
-                    windowSaved: other.windowSaved,
-                    windowRuns: other.windowRuns,
-                    allTimeSaved: other.allTimeSaved,
-                    allTimeRuns: other.allTimeRuns
-                )
             }
-
-            Divider()
-
-            tokenSaverProjectControls
 
             Text(Self.tokenSaverBillingEvidenceDisclaimer)
                 .font(DS.Font.caption2)
@@ -3548,162 +3456,6 @@ public struct SidebarRootView: View {
 
     var tokenSaverDetailsPopoverForTesting: some View {
         tokenSaverDetailsPopover
-    }
-
-    private var tokenSaverProjectControls: some View {
-        VStack(alignment: .leading, spacing: DS.Space.sm) {
-            Text("Project controls")
-                .font(DS.Font.captionStrong)
-                .foregroundColor(DS.Palette.text)
-
-            if vm.tokenSaverProjectGovernance.isEmpty {
-                Text("No project is scoped to the selected workspace.")
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: DS.Space.sm) {
-                        ForEach(vm.tokenSaverProjectGovernance) { project in
-                            tokenSaverProjectControl(project)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxHeight: 260)
-            }
-
-            if let notice = vm.tokenSaverGovernanceNotice {
-                Text(notice)
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("sidebar.tokenSaver.project.notice")
-            }
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("sidebar.tokenSaver.projectControls")
-    }
-
-    private func tokenSaverProjectControl(
-        _ project: SidebarViewModel.TokenSaverProjectGovernance
-    ) -> some View {
-        DisclosureGroup {
-            VStack(alignment: .leading, spacing: DS.Space.xs) {
-                HStack {
-                    Toggle("Opt out", isOn: Binding(
-                        get: { project.optedOut },
-                        set: { vm.setTokenSaverProjectOptOut(projectID: project.projectID, optedOut: $0) }
-                    ))
-                    .toggleStyle(.checkbox)
-                    .accessibilityHint("Stops all Token Saver writers and restores verbatim provider delivery for this project")
-                    .accessibilityIdentifier("sidebar.tokenSaver.project.\(project.projectID).optOut")
-
-                    Spacer(minLength: DS.Space.sm)
-
-                    Picker("Retention", selection: Binding(
-                        get: { project.retentionDays },
-                        set: { vm.setTokenSaverProjectRetention(projectID: project.projectID, days: $0) }
-                    )) {
-                        Text("No retention").tag(0)
-                        Text("7 days").tag(7)
-                        Text("30 days").tag(30)
-                    }
-                    .labelsHidden()
-                    .frame(width: 100)
-                    .accessibilityLabel("Project retention")
-                    .accessibilityIdentifier("sidebar.tokenSaver.project.\(project.projectID).retention")
-                }
-
-                ForEach(project.lanes, id: \.lane) { lane in
-                    VStack(alignment: .leading, spacing: 1) {
-                        HStack(spacing: DS.Space.xs) {
-                            Text(Self.tokenSaverLaneTitle(lane.lane))
-                                .font(DS.Font.captionStrong)
-                                .foregroundColor(DS.Palette.text)
-                            Spacer(minLength: 0)
-                            Text(Self.tokenSaverLaneStateLabel(lane.state))
-                                .font(DS.Font.caption2)
-                                .foregroundColor(lane.state == "promoted" ? DS.Palette.success : DS.Palette.textTertiary)
-                        }
-                        Text("\(lane.reason) · evidence \(lane.evidenceLevel) · \(lane.permissionBoundary) · owner \(lane.ownerRole)")
-                            .font(DS.Font.caption2)
-                            .foregroundColor(DS.Palette.textTertiary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text("Retention \(lane.retentionDays)d · kill switch \(lane.killSwitchActive ? "on" : "off")")
-                            .font(DS.Font.caption2)
-                            .foregroundColor(DS.Palette.textTertiary)
-                    }
-                    .accessibilityElement(children: .combine)
-                }
-
-                HStack(spacing: DS.Space.xs) {
-                    Button("Verbatim") {
-                        vm.forceTokenSaverVerbatim(projectID: project.projectID)
-                    }
-                    .help("Stop project lanes and retry with verbatim provider input")
-                    .accessibilityIdentifier("sidebar.tokenSaver.project.\(project.projectID).verbatim")
-
-                    Button("Delete data") {
-                        confirmDeleteTokenSaverProjectData(project)
-                    }
-                    .foregroundColor(DS.Palette.danger)
-                    .accessibilityIdentifier("sidebar.tokenSaver.project.\(project.projectID).delete")
-
-                    Button("Rollover") {
-                        vm.createTokenSaverRollover(projectID: project.projectID)
-                    }
-                    .disabled(!project.rolloverAvailable)
-                    .help(project.rolloverAvailable ? "Create a self-contained child thread and preserve the original" : "Blocked: \(project.rolloverReason)")
-                    .accessibilityHint(project.rolloverAvailable ? "Preserves the original thread" : "Blocked: \(project.rolloverReason)")
-                    .accessibilityIdentifier("sidebar.tokenSaver.project.\(project.projectID).rollover")
-                }
-                .controlSize(.small)
-            }
-            .padding(.top, DS.Space.xs)
-        } label: {
-            HStack {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(project.projectName)
-                        .font(DS.Font.captionStrong)
-                        .foregroundColor(DS.Palette.text)
-                    Text("\(project.stateLabel) · \(project.laneSummaryLabel)")
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
-                }
-                Spacer(minLength: 0)
-            }
-        }
-        .padding(DS.Space.sm)
-        .background(
-            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                .fill(DS.Palette.surfaceRaised.opacity(0.72))
-        )
-        .accessibilityIdentifier("sidebar.tokenSaver.project.\(project.projectID)")
-    }
-
-    private func confirmDeleteTokenSaverProjectData(
-        _ project: SidebarViewModel.TokenSaverProjectGovernance
-    ) {
-        // Nonblocking sheet only: never runModal here (main-thread-blocking ratchet).
-        // Fail safe when no host window exists — do not delete without affirmative UI.
-        guard let window = NSApp.keyWindow else { return }
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "Delete Token Saver data for \(project.projectName)?"
-        alert.informativeText = "This immediately tombstones scoped recovery, learned records, and rollover capsules. Provider threads and project files are not deleted."
-        alert.addButton(withTitle: "Delete data")
-        alert.addButton(withTitle: "Cancel")
-        let projectID = project.projectID
-        alert.beginSheetModal(for: window) { response in
-            guard response == .alertFirstButtonReturn else { return }
-            Task { @MainActor in
-                self.vm.deleteTokenSaverProjectData(projectID: projectID)
-            }
-        }
-    }
-
-    nonisolated private static func tokenSaverLaneTitle(_ lane: String) -> String {
-        lane.replacingOccurrences(of: "_", with: " ").capitalized
     }
 
     nonisolated public static func tokenSaverLaneStateLabel(_ state: String) -> String {
@@ -3823,45 +3575,18 @@ public struct SidebarRootView: View {
                     .monospacedDigit()
                     .lineLimit(1)
             }
+            // Capability line: honest static support copy under caption/save row.
+            // Presentation only — does not change savings arithmetic.
+            Text(Self.tokenSaverProviderCompressionCapabilityLine(for: provider))
+                .font(DS.Font.caption2)
+                .foregroundColor(DS.Palette.textTertiary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityIdentifier("sidebar.tokenSaver.providerCapability.\(provider.rawValue)")
         }
         .padding(.vertical, 1)
         .accessibilityElement(children: .combine)
-    }
-
-    /// Unattributed savings (not provider-attributed — CLI / unknown provider).
-    /// Always visible, including when this window is 0.
-    private func tokenSaverOtherSavingsRow(
-        windowSaved: Int,
-        windowRuns: Int,
-        allTimeSaved: Int,
-        allTimeRuns: Int
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
-                Text("Not provider-attributed")
-                    .font(DS.Font.captionStrong)
-                    .foregroundColor(DS.Palette.text)
-                    .lineLimit(1)
-                Spacer(minLength: 0)
-            }
-            HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
-                Text(Self.tokenSaverUnattributedRunsCaption(windowRuns: windowRuns, allTimeRuns: allTimeRuns))
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.82)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                Text(Self.tokenSaverUnattributedRowValue(windowSaved: windowSaved, allTimeSaved: allTimeSaved))
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.success)
-                    .monospacedDigit()
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-            }
-        }
-        .padding(.vertical, 1)
-        .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("sidebar.tokenSaver.otherSavings")
     }
 
     private func tokenSaverRingLegendRow(color: Color, label: String, value: String) -> some View {

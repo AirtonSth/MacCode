@@ -674,7 +674,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
         }
         repairPlaceholderThreadTitles()
-        refreshSubagentActivity()
         // reloadThreads() is a PURE data reload — it must not change the
         // selection. A new/empty tab stays thread-free (fresh composer) instead
         // of auto-adopting threads.first (the new-tab-clone bug). The only
@@ -686,16 +685,34 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             publishInterestedThreadId(nil)
             onSelectedThreadChanged?(nil)
         }
+        // Refresh after selection recovery so a deleted thread cannot leave a
+        // stale Subagents snapshot until the 2s poll.
+        refreshSubagentActivity()
     }
 
     /// Rebuild Subagents snapshot from persisted admission receipts and the
     /// coordinator's current active-run set. Fail open to empty on read errors.
+    ///
+    /// Scoped to the selected thread plus parent-chain descendants (middleware
+    /// nested Agent App workers). Sibling threads without a parent link are
+    /// excluded so the badge never aggregates the whole workspace.
     public func refreshSubagentActivity() {
         guard !isDisposed else { return }
+        guard let selectedThreadId else {
+            if subagentActivity != .empty {
+                subagentActivity = .empty
+            }
+            return
+        }
+        // Thread-scoped fetch (selected rows + bounded nested-worker window) so
+        // the 2s MainActor poll does not JSON-decode the global 10k ledger.
         let receipts = (try? orchestrationRuntime.activityReceipts(
+            threadIds: [selectedThreadId],
             limit: SubagentActivityProjection.defaultReceiptFetchLimit
         )) ?? []
-        let workspaceThreadIds = Set(threads.map(\.id))
+        // Nested middleware children execute on their own thread ids; include
+        // every live coordinator run so unknown lifecycle can still refine to
+        // Working for descendants that appear via parent-chain attribution.
         let activeRunIds = Set(
             coordinator.activeThreadIdsSnapshot().compactMap { threadId in
                 coordinator.activeRunId(threadId: threadId)
@@ -703,7 +720,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         )
         subagentActivity = SubagentActivityProjection.project(
             receipts: receipts,
-            workspaceThreadIds: workspaceThreadIds,
+            threadIds: [selectedThreadId],
             activeRunIds: activeRunIds,
             now: clock()
         )
@@ -1056,6 +1073,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // UX-MAC_AGENT-001: route first-responder to the composer on every
         // open/switch so the user can type without a manual click.
         focusTick &+= 1
+        // Subagents is thread-scoped chrome: rebuild immediately so switching
+        // threads never briefly shows another thread's Active/Done counts.
+        refreshSubagentActivity()
     }
 
     /// Called by the plan sidebar whenever planNotes changes to persist the
@@ -8423,8 +8443,9 @@ public struct AgentAppView: View {
                 .foregroundColor(DS.Palette.textTertiary)
                 .lineLimit(1).truncationMode(.middle)
             Spacer(minLength: 0)
-            // Provider-neutral Subagents activity (admission receipts + coordinator).
-            // Compact badge + popover; does not touch transcript/composer.
+            // Provider-neutral Subagents activity for the selected thread only
+            // (admission receipts + coordinator). Compact badge + popover; does
+            // not touch transcript/composer or aggregate sibling threads.
             if !vm.subagentActivity.isEmpty || showSubagentActivity {
                 SubagentActivityBadge(
                     snapshot: vm.subagentActivity,

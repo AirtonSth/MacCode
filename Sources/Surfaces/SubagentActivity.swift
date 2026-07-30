@@ -170,14 +170,26 @@ public struct SubagentActivitySnapshot: Sendable, Equatable {
         expanded ? 0 : max(0, unknown.count - unknownVisibleLimit)
     }
 
-    /// Distinct providers among recent rows for the compact glyph strip (newest first, capped).
+    /// Distinct providers among recent rows (legacy / tests). Prefer
+    /// `compactAvatarItems` for chrome so each worker keeps its own face.
     public var compactGlyphProviders: [SubagentProviderKind] {
         var seen = Set<SubagentProviderKind>()
         var ordered: [SubagentProviderKind] = []
-        for item in active + done + unknown {
+        for item in compactAvatarItems {
             if seen.insert(item.provider).inserted {
                 ordered.append(item.provider)
             }
+        }
+        return ordered
+    }
+
+    /// Newest workers for the compact avatar strip (capped). Each item carries a
+    /// stable per-run identity so two Claude children never share one face.
+    public var compactAvatarItems: [SubagentActivityItem] {
+        var ordered: [SubagentActivityItem] = []
+        ordered.reserveCapacity(6)
+        for item in active + done + unknown {
+            ordered.append(item)
             if ordered.count >= 6 { break }
         }
         return ordered
@@ -195,13 +207,14 @@ public enum SubagentActivityProjection {
     public static let defaultDoneVisibleLimit = 4
     public static let defaultUnknownVisibleLimit = 4
     public static let defaultCompletedBound = 50
-    // The audit log is process-global. Scope by workspace before applying the
-    // bounded UI history limits.
+    // Primary thread window for the scoped activity fetch. Nested workers use a
+    // separate child bound on the runtime (`defaultChildActivityReceiptLimit`).
+    // Projection still scopes by selected thread + parent-chain as defense in depth.
     public static let defaultReceiptFetchLimit = 10_000
 
     public static func project(
         receipts: [AgentOrchestrationAdmissionReceipt],
-        workspaceThreadIds: Set<AgentThreadID>? = nil,
+        threadIds: Set<AgentThreadID>? = nil,
         activeRunIds: Set<AgentRunID> = [],
         now: Date = Date(),
         activeVisibleLimit: Int = defaultActiveVisibleLimit,
@@ -210,8 +223,20 @@ public enum SubagentActivityProjection {
         completedBound: Int = defaultCompletedBound
     ) -> SubagentActivitySnapshot {
         let scoped: [AgentOrchestrationAdmissionReceipt]
-        if let workspaceThreadIds {
-            scoped = receipts.filter { workspaceThreadIds.contains($0.threadId) }
+        if let threadIds {
+            // One map + shared memo for the whole filter pass so parent-chain
+            // attribution stays O(n) even with deep nested workers.
+            let receiptByID = Dictionary(uniqueKeysWithValues: receipts.map { ($0.id, $0) })
+            var memo: [UUID: Bool] = [:]
+            scoped = receipts.filter {
+                belongsToThreadScope(
+                    receipt: $0,
+                    threadIds: threadIds,
+                    receiptByID: receiptByID,
+                    memo: &memo,
+                    visiting: []
+                )
+            }
         } else {
             scoped = receipts
         }
@@ -304,6 +329,63 @@ public enum SubagentActivityProjection {
             .caseInsensitiveCompare("root") != .orderedSame
     }
 
+    /// Whether a receipt belongs on a selected thread's Subagents badge.
+    ///
+    /// Includes (1) receipts whose own `threadId` is selected and (2) nested
+    /// workers whose `parentReceiptId` chain reaches a receipt on a selected
+    /// thread. Middleware cross-provider children run on their own Agent App
+    /// thread but must still appear under the spawner; unrelated sibling-thread
+    /// receipts stay excluded.
+    public static func belongsToThreadScope(
+        receipt: AgentOrchestrationAdmissionReceipt,
+        threadIds: Set<AgentThreadID>,
+        receipts: [AgentOrchestrationAdmissionReceipt]
+    ) -> Bool {
+        if threadIds.isEmpty { return false }
+        let receiptByID = Dictionary(uniqueKeysWithValues: receipts.map { ($0.id, $0) })
+        var memo: [UUID: Bool] = [:]
+        return belongsToThreadScope(
+            receipt: receipt,
+            threadIds: threadIds,
+            receiptByID: receiptByID,
+            memo: &memo,
+            visiting: []
+        )
+    }
+
+    /// Memoized parent-chain walk used by `project`. Cycle-safe and fail-closed
+    /// when an ancestor is outside the fetched receipt window.
+    private static func belongsToThreadScope(
+        receipt: AgentOrchestrationAdmissionReceipt,
+        threadIds: Set<AgentThreadID>,
+        receiptByID: [UUID: AgentOrchestrationAdmissionReceipt],
+        memo: inout [UUID: Bool],
+        visiting: Set<UUID>
+    ) -> Bool {
+        if let cached = memo[receipt.id] { return cached }
+        if threadIds.contains(receipt.threadId) {
+            memo[receipt.id] = true
+            return true
+        }
+        guard let parentId = receipt.parentReceiptId,
+              !visiting.contains(receipt.id),
+              let parent = receiptByID[parentId] else {
+            memo[receipt.id] = false
+            return false
+        }
+        var nextVisiting = visiting
+        nextVisiting.insert(receipt.id)
+        let belongs = belongsToThreadScope(
+            receipt: parent,
+            threadIds: threadIds,
+            receiptByID: receiptByID,
+            memo: &memo,
+            visiting: nextVisiting
+        )
+        memo[receipt.id] = belongs
+        return belongs
+    }
+
     /// Normalize every provider through the neutral enum. Unknown stays unknown.
     public static func normalizeProvider(_ provider: AgentProvider) -> SubagentProviderKind {
         switch provider {
@@ -374,7 +456,10 @@ public enum SubagentActivityProjection {
         }
     }
 
-    /// Display name from `nodeId` with safe fallbacks (never empty).
+    /// List title: `Nested|Native - Provider - ab12` (never empty).
+    ///
+    /// WHY: operators scan kind + host + a short id; the old humanized nodeId
+    /// dumped pid/hex noise that hid the useful signal.
     public static func displayName(
         nodeId: String,
         provider: SubagentProviderKind = .unknown,
@@ -388,14 +473,69 @@ public enum SubagentActivityProjection {
         if trimmed.caseInsensitiveCompare("root") == .orderedSame {
             // Main-route admission: prefer model, else a stable generic label.
             if let model, !model.isEmpty { return model }
-            switch provider {
-            case .codex: return "Root · Codex"
-            case .claude: return "Root · Claude"
-            case .grok: return "Root · Grok"
-            case .unknown: return "Root"
-            }
+            return "Root - \(providerDisplayName(provider))"
         }
-        return humanizeNodeId(trimmed)
+        let kind = kindLabel(from: trimmed)
+        let host = providerDisplayName(provider, nodeId: trimmed)
+        let tail = lastFourIdentityChars(from: trimmed)
+        return "\(kind) - \(host) - \(tail)"
+    }
+
+    /// `Nested` / `Native` from the durable nodeId prefix; other workers → `Worker`.
+    public static func kindLabel(from nodeId: String) -> String {
+        let lower = nodeId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if lower.hasPrefix("native.") || lower.hasPrefix("native-") || lower.hasPrefix("native_")
+            || lower.hasPrefix("native ") {
+            return "Native"
+        }
+        if lower.hasPrefix("nested.") || lower.hasPrefix("nested-") || lower.hasPrefix("nested_")
+            || lower.hasPrefix("nested ") {
+            return "Nested"
+        }
+        return "Worker"
+    }
+
+    public static func providerDisplayName(
+        _ provider: SubagentProviderKind,
+        nodeId: String? = nil
+    ) -> String {
+        switch provider {
+        case .codex: return "Codex"
+        case .claude: return "Claude"
+        case .grok: return "Grok"
+        case .unknown:
+            // Fall back to a provider token embedded in the nodeId when known.
+            guard let nodeId else { return "Unknown" }
+            let parts = nodeId
+                .lowercased()
+                .components(separatedBy: CharacterSet(charactersIn: ".-_ "))
+                .filter { !$0.isEmpty }
+            for part in parts {
+                if part == "claude" { return "Claude" }
+                if part == "codex" { return "Codex" }
+                if part == "grok" { return "Grok" }
+            }
+            return "Unknown"
+        }
+    }
+
+    /// Last 4 alphanumeric characters of the trailing identity segment (uuid/hex).
+    public static func lastFourIdentityChars(from nodeId: String) -> String {
+        let separators = CharacterSet(charactersIn: ".-_")
+        let segments = nodeId
+            .components(separatedBy: separators)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let candidate = segments.reversed().first(where: { segment in
+            segment.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) }
+                && segment.count >= 4
+        }) ?? segments.last ?? nodeId
+        let compact = candidate.replacingOccurrences(of: "-", with: "")
+        if compact.count >= 4 {
+            return String(compact.suffix(4))
+        }
+        if compact.isEmpty { return "????" }
+        return String((compact + String(repeating: "0", count: 4)).prefix(4))
     }
 
     /// `deep-worker-plan-writer` / `deep_worker_plan_writer` → "Deep worker plan writer".
@@ -487,10 +627,56 @@ public enum SubagentActivityProjection {
     }
 }
 
-// MARK: - Visual tokens (single glyph shape; color from normalized provider)
+// MARK: - Visual tokens (per-worker avatar + provider accent)
+
+/// Deterministic “gravatar-like” face for one subagent run.
+///
+/// Seeded from receipt id so the same worker keeps the same face across polls;
+/// pattern + monogram distinguish workers even when provider color matches.
+public struct SubagentAvatarSpec: Equatable, Sendable {
+    public let seed: UInt64
+    public let monogram: String
+    public let primaryIndex: Int
+    public let secondaryIndex: Int
+    /// 15 bits of a 5×5 horizontally-mirrored grid (GitHub-style identicon).
+    public let patternBits: UInt16
+    public let provider: SubagentProviderKind
+
+    public init(
+        seed: UInt64,
+        monogram: String,
+        primaryIndex: Int,
+        secondaryIndex: Int,
+        patternBits: UInt16,
+        provider: SubagentProviderKind
+    ) {
+        self.seed = seed
+        self.monogram = monogram
+        self.primaryIndex = primaryIndex
+        self.secondaryIndex = secondaryIndex
+        self.patternBits = patternBits
+        self.provider = provider
+    }
+}
 
 public enum SubagentActivityStyle {
-    /// Stable colors per normalized provider — not layout branches.
+    /// Accessible dark-UI palette — high chroma, no pure gray faces.
+    public static let avatarPalette: [UInt32] = [
+        0x3DD6C6, // teal (codex-adjacent)
+        0xE8A838, // amber (claude-adjacent)
+        0xF472B6, // pink (grok-adjacent)
+        0x7CC7FF, // sky
+        0xA78BFA, // violet
+        0x34D399, // emerald
+        0xFB923C, // orange
+        0xF87171, // rose
+        0x38BDF8, // light blue
+        0xC084FC, // purple
+        0x4ADE80, // green
+        0xFBBF24, // gold
+    ]
+
+    /// Stable colors per normalized provider — ring accent, not the whole face.
     public static func glyphColor(for provider: SubagentProviderKind) -> Color {
         switch provider {
         case .codex: return Color(hex: 0x3DD6C6)
@@ -501,6 +687,76 @@ public enum SubagentActivityStyle {
     }
 
     public static let glyphSystemName = "hexagon.fill"
+
+    public static func avatarSpec(for item: SubagentActivityItem) -> SubagentAvatarSpec {
+        avatarSpec(id: item.id, displayName: item.displayName, provider: item.provider)
+    }
+
+    public static func avatarSpec(
+        id: UUID,
+        displayName: String,
+        provider: SubagentProviderKind
+    ) -> SubagentAvatarSpec {
+        let seed = seed(from: id)
+        let paletteCount = UInt64(avatarPalette.count)
+        let primary = Int(seed % paletteCount)
+        let secondary = Int((seed / 7) % paletteCount)
+        // Avoid identical primary/secondary when possible.
+        let secondaryResolved = secondary == primary
+            ? Int((seed / 11 + 1) % paletteCount)
+            : secondary
+        let patternBits = UInt16(truncatingIfNeeded: (seed >> 16) ^ (seed >> 32)) & 0x7FFF
+        return SubagentAvatarSpec(
+            seed: seed,
+            monogram: monogram(from: displayName),
+            primaryIndex: primary,
+            secondaryIndex: secondaryResolved,
+            patternBits: patternBits,
+            provider: provider
+        )
+    }
+
+    public static func seed(from id: UUID) -> UInt64 {
+        let bytes = withUnsafeBytes(of: id.uuid) { Array($0) }
+        var hi: UInt64 = 0
+        var lo: UInt64 = 0
+        for i in 0..<8 { hi = (hi << 8) | UInt64(bytes[i]) }
+        for i in 8..<16 { lo = (lo << 8) | UInt64(bytes[i]) }
+        // Mix so nearby UUIDs do not share faces.
+        return hi &+ (lo &* 0x9E3779B97F4A7C15)
+    }
+
+    /// 1–2 letter monogram from a humanized display name.
+    public static func monogram(from displayName: String) -> String {
+        let parts = displayName
+            .split(whereSeparator: { $0.isWhitespace || $0 == "·" || $0 == "-" || $0 == "_" })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if parts.isEmpty { return "?" }
+        if parts.count == 1 {
+            let word = parts[0]
+            if word.count >= 2 {
+                return String(word.prefix(2)).uppercased()
+            }
+            return String(word.prefix(1)).uppercased()
+        }
+        let a = parts[0].first.map(String.init) ?? ""
+        let b = parts[1].first.map(String.init) ?? ""
+        return (a + b).uppercased()
+    }
+
+    public static func paletteColor(at index: Int) -> Color {
+        let safe = ((index % avatarPalette.count) + avatarPalette.count) % avatarPalette.count
+        return Color(hex: avatarPalette[safe])
+    }
+
+    /// Whether the mirrored 5×5 cell is filled (column 0…2 maps to mirrored right).
+    public static func patternCellFilled(bits: UInt16, row: Int, col: Int) -> Bool {
+        let mirroredCol = col > 2 ? 4 - col : col
+        let index = row * 3 + mirroredCol
+        guard index >= 0, index < 15 else { return false }
+        return (bits & (1 << index)) != 0
+    }
 }
 
 // MARK: - SwiftUI: compact badge + popover panel
@@ -536,10 +792,10 @@ public struct SubagentActivityBadge: View {
                 Text("Subagents")
                     .font(DS.Font.caption.weight(.semibold))
                     .foregroundColor(DS.Palette.text)
-                if !snapshot.compactGlyphProviders.isEmpty {
+                if !snapshot.compactAvatarItems.isEmpty {
                     HStack(spacing: 2) {
-                        ForEach(snapshot.compactGlyphProviders, id: \.rawValue) { provider in
-                            SubagentActivityGlyphView(provider: provider, size: 11)
+                        ForEach(snapshot.compactAvatarItems) { item in
+                            SubagentAvatarView(item: item, size: 12, showsMonogram: false)
                         }
                     }
                     .accessibilityHidden(true)
@@ -625,7 +881,9 @@ struct SubagentActivityPopoverPanel: View {
     @Binding var unknownExpanded: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: DS.Space.md) {
+        // Title + lists only — no summary strip / avatar legend (redundant with
+        // badge counts and per-row faces; reduces noise above Active/Done).
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
             HStack(spacing: DS.Space.sm) {
                 Text("Subagents")
                     .font(DS.Font.bodyStrong)
@@ -642,21 +900,6 @@ struct SubagentActivityPopoverPanel: View {
                     }
                     .accessibilityIdentifier("agent.subagents.live")
                 }
-            }
-
-            Text(summaryText)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textSecondary)
-                .accessibilityIdentifier("agent.subagents.summary")
-
-            if !snapshot.compactGlyphProviders.isEmpty {
-                HStack(spacing: DS.Space.sm) {
-                    ForEach(snapshot.compactGlyphProviders, id: \.rawValue) { provider in
-                        SubagentActivityGlyphView(provider: provider, size: 16)
-                    }
-                    Spacer(minLength: 0)
-                }
-                .accessibilityHidden(true)
             }
 
             if snapshot.isEmpty {
@@ -720,12 +963,6 @@ struct SubagentActivityPopoverPanel: View {
         .accessibilityIdentifier("agent.subagents.popover")
     }
 
-    private var summaryText: String {
-        var parts = ["\(snapshot.activeCount) active", "\(snapshot.doneCount) done"]
-        if snapshot.unknownCount > 0 { parts.append("\(snapshot.unknownCount) unknown") }
-        return parts.joined(separator: " · ")
-    }
-
     private func sectionHeader(_ title: String, count: Int) -> some View {
         Text("\(title) · \(count)")
             .font(DS.Font.caption2.weight(.semibold))
@@ -761,7 +998,7 @@ struct SubagentActivityRowView: View {
 
     var body: some View {
         HStack(alignment: .center, spacing: DS.Space.sm) {
-            SubagentActivityGlyphView(provider: item.provider, size: 18)
+            SubagentAvatarView(item: item, size: 28, showsMonogram: true)
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.displayName)
                     .font(DS.Font.bodyDense.weight(.medium))
@@ -815,10 +1052,87 @@ struct SubagentActivityRowView: View {
     private var rowAccessibilityLabel: String {
         let time = SubagentActivityProjection.trailingTimeLabel(for: item, now: now)
         let meta = item.providerModelLabel.map { ", \($0)" } ?? ""
-        return "\(item.displayName), \(item.statusLabel)\(meta), \(time)"
+        let face = SubagentActivityStyle.avatarSpec(for: item).monogram
+        return "\(item.displayName), avatar \(face), \(item.statusLabel)\(meta), \(time)"
     }
 }
 
+/// Per-worker circular avatar: mirrored geometric pattern + monogram + provider ring.
+/// Color alone never carries identity (pattern + letters stay distinct for a11y).
+struct SubagentAvatarView: View {
+    let spec: SubagentAvatarSpec
+    var size: CGFloat = 18
+    var showsMonogram: Bool = true
+
+    init(item: SubagentActivityItem, size: CGFloat = 18, showsMonogram: Bool = true) {
+        self.spec = SubagentActivityStyle.avatarSpec(for: item)
+        self.size = size
+        self.showsMonogram = showsMonogram
+    }
+
+    init(spec: SubagentAvatarSpec, size: CGFloat = 18, showsMonogram: Bool = true) {
+        self.spec = spec
+        self.size = size
+        self.showsMonogram = showsMonogram
+    }
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            SubagentActivityStyle.paletteColor(at: spec.primaryIndex).opacity(0.92),
+                            SubagentActivityStyle.paletteColor(at: spec.secondaryIndex).opacity(0.72),
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+            // Soft vignette so monogram and pattern read on bright palette pairs.
+            Circle()
+                .fill(Color.black.opacity(0.18))
+            Canvas { context, canvasSize in
+                let cell = canvasSize.width / 5
+                let ink = Color.white.opacity(0.55)
+                for row in 0..<5 {
+                    for col in 0..<5 {
+                        guard SubagentActivityStyle.patternCellFilled(
+                            bits: spec.patternBits,
+                            row: row,
+                            col: col
+                        ) else { continue }
+                        let rect = CGRect(
+                            x: CGFloat(col) * cell + cell * 0.12,
+                            y: CGFloat(row) * cell + cell * 0.12,
+                            width: cell * 0.76,
+                            height: cell * 0.76
+                        )
+                        context.fill(Path(ellipseIn: rect), with: .color(ink))
+                    }
+                }
+            }
+            .clipShape(Circle())
+            if showsMonogram, size >= 14 {
+                Text(spec.monogram)
+                    .font(.system(size: max(8, size * 0.34), weight: .bold, design: .rounded))
+                    .foregroundColor(.white)
+                    .shadow(color: .black.opacity(0.45), radius: 0.5, y: 0.5)
+                    .minimumScaleFactor(0.7)
+                    .lineLimit(1)
+            }
+            Circle()
+                .strokeBorder(
+                    SubagentActivityStyle.glyphColor(for: spec.provider).opacity(0.85),
+                    lineWidth: max(1, size * 0.06)
+                )
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+    }
+}
+
+/// Provider-only glyph kept for any caller that still wants a host mark without a run id.
 struct SubagentActivityGlyphView: View {
     let provider: SubagentProviderKind
     var size: CGFloat = 16

@@ -131,16 +131,27 @@ final class SubagentActivityTests: XCTestCase {
 
     // MARK: - Display name from nodeId
 
-    func test_displayName_humanizesNodeId_withSafeFallbacks() {
-        // WHY: operators scan short titles; kebab nodeIds must read as words, and
-        // missing nodeIds must not produce empty rows that break VoiceOver labels.
+    func test_displayName_usesKindProviderAndLastFour() {
+        // WHY: list rows should scan as Nested/Native + host + short id — not a
+        // wall of pid/hex from the raw nodeId.
         XCTAssertEqual(
-            SubagentActivityProjection.displayName(nodeId: "deep-worker-plan-writer"),
-            "Deep worker plan writer"
+            SubagentActivityProjection.displayName(
+                nodeId: "nested.claude.74435.28b8e3e249e9c",
+                provider: .claude
+            ),
+            "Nested - Claude - 9e9c"
         )
         XCTAssertEqual(
-            SubagentActivityProjection.displayName(nodeId: "route_inventory"),
-            "Route inventory"
+            SubagentActivityProjection.displayName(
+                nodeId: "native.grok.019fb358-e6dd-7842-b527-abcdef12e8a6",
+                provider: .grok
+            ),
+            "Native - Grok - e8a6"
+        )
+        XCTAssertEqual(
+            SubagentActivityProjection.displayName(nodeId: "deep-worker-plan-writer", provider: .codex),
+            "Worker - Codex - iter",
+            "non-prefixed workers still get a bounded Worker label + tail"
         )
         XCTAssertEqual(
             SubagentActivityProjection.displayName(nodeId: "unknown"),
@@ -161,8 +172,11 @@ final class SubagentActivityTests: XCTestCase {
         )
         XCTAssertEqual(
             SubagentActivityProjection.displayName(nodeId: "root", provider: .codex, model: nil),
-            "Root · Codex"
+            "Root - Codex"
         )
+        XCTAssertEqual(SubagentActivityProjection.kindLabel(from: "nested.claude.x"), "Nested")
+        XCTAssertEqual(SubagentActivityProjection.kindLabel(from: "native.grok.x"), "Native")
+        XCTAssertEqual(SubagentActivityProjection.lastFourIdentityChars(from: "a.b.c0ffee"), "ffee")
     }
 
     // MARK: - Sorting and bounds
@@ -240,9 +254,9 @@ final class SubagentActivityTests: XCTestCase {
                        "expanded Show N more reveals the full bounded Done list")
     }
 
-    func test_project_filtersToWorkspaceThreads() {
-        // WHY: the audit log is process-global; a workspace Agent App must not
-        // show another workspace's admissions as its own subagents.
+    func test_project_filtersToSelectedThreadIds() {
+        // WHY: the audit log is process-global; the Subagents badge is per-thread
+        // chrome and must not show sibling-thread (or other workspace) admissions.
         let local = makeReceipt(
             threadId: threadA,
             lifecycle: .accepted,
@@ -258,11 +272,88 @@ final class SubagentActivityTests: XCTestCase {
         )
         let snapshot = SubagentActivityProjection.project(
             receipts: [local, foreign],
-            workspaceThreadIds: [threadA]
+            threadIds: [threadA]
         )
         XCTAssertEqual(snapshot.activeCount, 1)
         XCTAssertEqual(snapshot.doneCount, 0)
         XCTAssertEqual(snapshot.active.first?.threadId, threadA)
+    }
+
+    func test_project_includesParentChainDescendantsOnOtherThreads() {
+        // WHY: middleware nested Agent App workers run on their own thread id but
+        // must still appear on the spawning thread's badge; parent-chain is the
+        // attribution link. Unrelated siblings without that chain stay excluded.
+        let parentRootId = UUID()
+        let parentRoot = makeReceipt(
+            id: parentRootId,
+            threadId: threadA,
+            lifecycle: .accepted,
+            nodeId: "root",
+            provider: .claude
+        )
+        let nestedChild = makeReceipt(
+            id: UUID(),
+            parentReceiptId: parentRootId,
+            threadId: threadB,
+            lifecycle: .finalized,
+            finalStatus: .completed,
+            nodeId: "middleware-nested-worker",
+            provider: .codex
+        )
+        let unrelatedSibling = makeReceipt(
+            id: UUID(),
+            threadId: threadB,
+            lifecycle: .finalized,
+            finalStatus: .completed,
+            nodeId: "unrelated-sibling",
+            provider: .grok
+        )
+        let snapshot = SubagentActivityProjection.project(
+            receipts: [parentRoot, nestedChild, unrelatedSibling],
+            threadIds: [threadA]
+        )
+        XCTAssertEqual(
+            snapshot.done.map(\.nodeId),
+            ["middleware-nested-worker"],
+            "child receipt on a different thread whose parent is on the selected thread must be included"
+        )
+        XCTAssertFalse(
+            snapshot.done.contains(where: { $0.nodeId == "unrelated-sibling" }),
+            "sibling-thread receipts without a parent chain to the selection must stay out"
+        )
+        XCTAssertEqual(snapshot.activeCount, 0, "root controller is not a subagent row")
+        XCTAssertTrue(
+            SubagentActivityProjection.belongsToThreadScope(
+                receipt: nestedChild,
+                threadIds: [threadA],
+                receipts: [parentRoot, nestedChild, unrelatedSibling]
+            )
+        )
+        XCTAssertFalse(
+            SubagentActivityProjection.belongsToThreadScope(
+                receipt: unrelatedSibling,
+                threadIds: [threadA],
+                receipts: [parentRoot, nestedChild, unrelatedSibling]
+            )
+        )
+    }
+
+    func test_project_parentChainFailsClosedWhenAncestorMissing() {
+        // WHY: if the parent fell outside the fetched activity window, inventing
+        // attribution would re-open sibling leaks; fail closed instead.
+        let orphanedChild = makeReceipt(
+            id: UUID(),
+            parentReceiptId: UUID(),
+            threadId: threadB,
+            lifecycle: .accepted,
+            nodeId: "orphaned-nested",
+            provider: .codex
+        )
+        let snapshot = SubagentActivityProjection.project(
+            receipts: [orphanedChild],
+            threadIds: [threadA]
+        )
+        XCTAssertTrue(snapshot.isEmpty)
     }
 
     func test_projectExcludesRootAndKeepsUnknownOutOfDone() {
@@ -358,6 +449,73 @@ final class SubagentActivityTests: XCTestCase {
         XCTAssertEqual(snapshot.doneCount, 0)
         XCTAssertFalse(snapshot.isLive)
         XCTAssertTrue(snapshot.compactGlyphProviders.isEmpty)
+        XCTAssertTrue(snapshot.compactAvatarItems.isEmpty)
+    }
+
+    func test_avatarSpec_isStablePerId_andDistinctAcrossWorkers() {
+        // WHY: two Claude nested workers must not share one face; reopening the
+        // popover must keep the same avatar for the same receipt id.
+        let idA = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
+        let idB = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
+        let a1 = SubagentActivityStyle.avatarSpec(
+            id: idA,
+            displayName: "Nested - Claude - 9e9c",
+            provider: .claude
+        )
+        let a2 = SubagentActivityStyle.avatarSpec(
+            id: idA,
+            displayName: "Nested - Claude - 9e9c",
+            provider: .claude
+        )
+        let b = SubagentActivityStyle.avatarSpec(
+            id: idB,
+            displayName: "Nested - Claude - a1b2",
+            provider: .claude
+        )
+        XCTAssertEqual(a1, a2, "same receipt id must always paint the same avatar")
+        XCTAssertNotEqual(a1.seed, b.seed, "different workers must get different seeds")
+        let sameFace = a1.primaryIndex == b.primaryIndex && a1.patternBits == b.patternBits
+        XCTAssertFalse(sameFace, "faces must differ by pattern/color, not only provider")
+        XCTAssertEqual(a1.monogram, "NC")
+        XCTAssertEqual(SubagentActivityStyle.monogram(from: "Native - Grok - e8a6"), "NG")
+        XCTAssertEqual(SubagentActivityStyle.monogram(from: "timer"), "TI")
+        // Mirrored identicon: col 0 and col 4 share the left-column bit.
+        let bits: UInt16 = 0b001
+        XCTAssertTrue(SubagentActivityStyle.patternCellFilled(bits: bits, row: 0, col: 0))
+        XCTAssertTrue(SubagentActivityStyle.patternCellFilled(bits: bits, row: 0, col: 4))
+        XCTAssertFalse(SubagentActivityStyle.patternCellFilled(bits: bits, row: 0, col: 1))
+    }
+
+    func test_compactAvatarItems_prefersNewestWorkersOverProviderDedup() {
+        // WHY: the chrome strip used to collapse to one glyph per provider, so
+        // two Claude children looked like a single face.
+        let claudeA = makeReceipt(
+            id: UUID(),
+            lifecycle: .accepted,
+            nodeId: "nested-claude-a",
+            provider: .claude
+        )
+        let claudeB = makeReceipt(
+            id: UUID(),
+            lifecycle: .finalized,
+            finalStatus: .completed,
+            nodeId: "nested-claude-b",
+            provider: .claude
+        )
+        let grok = makeReceipt(
+            id: UUID(),
+            lifecycle: .finalized,
+            finalStatus: .completed,
+            nodeId: "native-grok",
+            provider: .grok
+        )
+        let snapshot = SubagentActivityProjection.project(receipts: [claudeA, claudeB, grok])
+        XCTAssertEqual(snapshot.compactAvatarItems.count, 3,
+                       "strip must list each worker, not one chip per provider")
+        XCTAssertEqual(
+            Set(snapshot.compactAvatarItems.map(\.provider)),
+            Set([.claude, .grok])
+        )
     }
 
     func test_mapItem_unknownProviderFieldsStayExplicit() {
@@ -407,6 +565,7 @@ final class SubagentActivityTests: XCTestCase {
 
     private func makeReceipt(
         id: UUID = UUID(),
+        parentReceiptId: UUID? = nil,
         threadId: AgentThreadID? = nil,
         lifecycle: AgentOrchestrationReceiptLifecycleStatus,
         finalStatus: AgentRunStatus? = nil,
@@ -422,6 +581,7 @@ final class SubagentActivityTests: XCTestCase {
         let admitted = admittedAt ?? now.addingTimeInterval(-120)
         return AgentOrchestrationAdmissionReceipt(
             id: id,
+            parentReceiptId: parentReceiptId,
             runId: runId,
             threadId: threadId ?? threadA,
             nodeId: nodeId,

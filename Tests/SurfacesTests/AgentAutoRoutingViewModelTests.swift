@@ -192,6 +192,204 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         XCTAssertEqual(try repository.receipt(runId: runID)?.lifecycleStatus, .unknown)
     }
 
+    func testSubagentActivityIsScopedToSelectedThreadOnly() throws {
+        // WHY: the chrome badge was aggregating every workspace thread's done
+        // workers onto empty/new threads. Subagents must be per-thread UI.
+        let root = NSTemporaryDirectory() + "rc-subagent-thread-scope-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: root).run()
+        let threads = AgentThreadRepository(db: db)
+        let messages = AgentMessageRepository(db: db)
+        let runs = AgentRunRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runs,
+            messageRepo: messages,
+            threadRepo: threads,
+            providers: [
+                .codex: FakeProviderRunner(provider: .codex),
+                .claude: FakeProviderRunner(provider: .claude),
+                .grok: FakeProviderRunner(provider: .grok)
+            ]
+        )
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            rolloutGate: { true },
+            killSwitch: { false },
+            processIsAlive: { _ in true }
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: WorkspaceID(),
+            cwd: root,
+            coordinator: coordinator,
+            threadRepo: threads,
+            messageRepo: messages,
+            orchestrationRuntime: runtime
+        )
+
+        vm.createThread(title: "thread-with-subagents")
+        let busyThreadID = try XCTUnwrap(vm.selectedThreadId)
+        let parentCapability = AgentDelegationCapability.issue()
+        let parentRunID = AgentRunID()
+        _ = try runtime.recordExternalRoot(
+            runId: parentRunID,
+            threadId: busyThreadID,
+            provider: .claude,
+            providerInstanceId: "claude-cli",
+            model: "opus",
+            permissionMode: .supervised,
+            delegationCapabilitySHA256: AgentDelegationCapability.sha256Hex(parentCapability),
+            ownerProcessID: 1001
+        )
+        let childRunID = AgentRunID()
+        _ = try runtime.recordAuthorizedExternalChild(
+            runId: childRunID,
+            threadId: busyThreadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            nodeId: "busy-worker",
+            parentRunId: parentRunID,
+            parentThreadId: busyThreadID,
+            parentCapability: parentCapability,
+            childCapability: AgentDelegationCapability.issue(),
+            requestedPermissionMode: .supervised,
+            ownerProcessID: 1002
+        )
+        try runtime.finalizeReceipt(runId: childRunID, status: .completed)
+
+        vm.refreshSubagentActivity()
+        XCTAssertEqual(vm.subagentActivity.doneCount, 1,
+                       "selected busy thread must show its own finalized subagent")
+        XCTAssertEqual(vm.subagentActivity.done.first?.nodeId, "busy-worker")
+
+        vm.createThread(title: "empty-thread")
+        let emptyThreadID = try XCTUnwrap(vm.selectedThreadId)
+        XCTAssertNotEqual(emptyThreadID, busyThreadID)
+        // createThread/selectThread must rebuild immediately — not wait for the 2s poll.
+        XCTAssertTrue(
+            vm.subagentActivity.isEmpty,
+            "a different/empty selected thread must not inherit sibling subagents"
+        )
+
+        vm.selectThread(busyThreadID)
+        XCTAssertEqual(vm.subagentActivity.doneCount, 1,
+                       "returning to the busy thread must restore its own subagents only")
+        XCTAssertEqual(vm.subagentActivity.done.first?.threadId, busyThreadID)
+
+        // Middleware nested Agent App path: child receipt lands on its own thread
+        // but parent-chain attribution must still surface it on the spawner.
+        vm.createThread(title: "middleware-child-thread")
+        let childThreadID = try XCTUnwrap(vm.selectedThreadId)
+        let nestedRunID = AgentRunID()
+        _ = try runtime.recordAuthorizedExternalChild(
+            runId: nestedRunID,
+            threadId: childThreadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            nodeId: "middleware-child",
+            parentRunId: parentRunID,
+            parentThreadId: busyThreadID,
+            parentCapability: parentCapability,
+            childCapability: AgentDelegationCapability.issue(),
+            requestedPermissionMode: .supervised,
+            ownerProcessID: 1003
+        )
+        try runtime.finalizeReceipt(runId: nestedRunID, status: .completed)
+
+        vm.selectThread(busyThreadID)
+        XCTAssertEqual(
+            Set(vm.subagentActivity.done.map(\.nodeId)),
+            Set(["busy-worker", "middleware-child"]),
+            "spawning thread badge must include parent-chain nested workers on other threads"
+        )
+        vm.selectThread(emptyThreadID)
+        XCTAssertTrue(
+            vm.subagentActivity.isEmpty,
+            "unrelated empty thread still must not inherit the spawner's nested workers"
+        )
+    }
+
+    func testSubagentRefreshClearsAfterDeletedSelectionRecovery() throws {
+        // WHY: reloadThreads used to refresh before nil-ing a deleted selection,
+        // leaving the badge stuck on the dead thread until the 2s poll.
+        let root = NSTemporaryDirectory() + "rc-subagent-deleted-sel-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: root).run()
+        let threads = AgentThreadRepository(db: db)
+        let messages = AgentMessageRepository(db: db)
+        let runs = AgentRunRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runs,
+            messageRepo: messages,
+            threadRepo: threads,
+            providers: [
+                .codex: FakeProviderRunner(provider: .codex),
+                .claude: FakeProviderRunner(provider: .claude),
+                .grok: FakeProviderRunner(provider: .grok)
+            ]
+        )
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            rolloutGate: { true },
+            killSwitch: { false },
+            processIsAlive: { _ in true }
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: WorkspaceID(),
+            cwd: root,
+            coordinator: coordinator,
+            threadRepo: threads,
+            messageRepo: messages,
+            orchestrationRuntime: runtime
+        )
+
+        vm.createThread(title: "doomed")
+        let threadID = try XCTUnwrap(vm.selectedThreadId)
+        let parentCapability = AgentDelegationCapability.issue()
+        let parentRunID = AgentRunID()
+        _ = try runtime.recordExternalRoot(
+            runId: parentRunID,
+            threadId: threadID,
+            provider: .claude,
+            providerInstanceId: "claude-cli",
+            model: "opus",
+            permissionMode: .supervised,
+            delegationCapabilitySHA256: AgentDelegationCapability.sha256Hex(parentCapability),
+            ownerProcessID: 2001
+        )
+        let childRunID = AgentRunID()
+        _ = try runtime.recordAuthorizedExternalChild(
+            runId: childRunID,
+            threadId: threadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            nodeId: "doomed-worker",
+            parentRunId: parentRunID,
+            parentThreadId: threadID,
+            parentCapability: parentCapability,
+            childCapability: AgentDelegationCapability.issue(),
+            requestedPermissionMode: .supervised,
+            ownerProcessID: 2002
+        )
+        try runtime.finalizeReceipt(runId: childRunID, status: .completed)
+        vm.refreshSubagentActivity()
+        XCTAssertEqual(vm.subagentActivity.doneCount, 1)
+
+        try threads.delete(ids: [threadID])
+        vm.reloadThreads()
+        XCTAssertNil(vm.selectedThreadId)
+        XCTAssertTrue(
+            vm.subagentActivity.isEmpty,
+            "deletion recovery must clear Subagents immediately, not leave the deleted thread's rows"
+        )
+    }
+
     func testNextThreadRestoresLastUserProviderModelAndReasoningChoice() throws {
         let suiteName = "rc-auto-last-selection-" + UUID().uuidString
         let defaults = UserDefaults(suiteName: suiteName)!

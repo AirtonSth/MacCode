@@ -1612,6 +1612,160 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         )
     }
 
+    func testActivityReceiptsThreadScopedIncludesParentChainAndExcludesSiblings() throws {
+        // WHY: the badge poll must decode only the selected thread + nested
+        // workers, still attribute middleware children on other thread ids, and
+        // never surface an unrelated sibling thread's receipts.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            processIsAlive: { _ in true }
+        )
+        let threadA = AgentThreadID()
+        let threadB = AgentThreadID()
+        let threadC = AgentThreadID()
+        let parentRunID = AgentRunID()
+        let parent = try runtime.recordExternalRoot(
+            runId: parentRunID,
+            threadId: threadA,
+            provider: .claude,
+            providerInstanceId: "claude-cli",
+            model: "opus",
+            permissionMode: .supervised,
+            ownerProcessID: 111
+        )
+        let sibling = try runtime.recordExternalRoot(
+            runId: AgentRunID(),
+            threadId: threadB,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            permissionMode: .supervised,
+            ownerProcessID: 222
+        )
+        let nested = try runtime.recordExternalChild(
+            runId: AgentRunID(),
+            threadId: threadC,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            nodeId: "middleware-nested",
+            parentRunId: parentRunID,
+            parentThreadId: threadA,
+            ownerProcessID: 333
+        )
+
+        let activity = try runtime.activityReceipts(threadIds: [threadA])
+        let ids = Set(activity.map(\.id))
+
+        XCTAssertTrue(ids.contains(parent.id), "selected-thread root must be returned for parent-chain walks")
+        XCTAssertTrue(ids.contains(nested.id), "middleware child on another thread must attribute via parent chain")
+        XCTAssertFalse(ids.contains(sibling.id), "unrelated sibling-thread receipts must stay out of the scoped fetch")
+    }
+
+    func testActivityReceiptsThreadScopedReconcilesOnlyScopedDeadWorkers() throws {
+        // WHY: scoped polls must still demote dead workers on the selected
+        // thread, but must not mutate dead accepted rows on other threads
+        // (incomplete parent view would also risk wrong demotions of live nested workers).
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            processIsAlive: { $0 == 111 }
+        )
+        let threadA = AgentThreadID()
+        let threadB = AgentThreadID()
+        let deadOnA = try runtime.recordExternalRoot(
+            runId: AgentRunID(),
+            threadId: threadA,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            permissionMode: .supervised,
+            ownerProcessID: 999
+        )
+        let deadOnB = try runtime.recordExternalRoot(
+            runId: AgentRunID(),
+            threadId: threadB,
+            provider: .claude,
+            providerInstanceId: "claude-cli",
+            model: "claude",
+            permissionMode: .supervised,
+            ownerProcessID: 888
+        )
+
+        let activity = try runtime.activityReceipts(threadIds: [threadA])
+
+        XCTAssertEqual(
+            activity.first(where: { $0.id == deadOnA.id })?.lifecycleStatus,
+            .unknown,
+            "selected-thread dead external must reconcile to unknown on the scoped poll"
+        )
+        XCTAssertEqual(try repository.receipt(runId: deadOnA.runId!)?.lifecycleStatus, .unknown)
+        XCTAssertEqual(
+            try repository.receipt(runId: deadOnB.runId!)?.lifecycleStatus,
+            .accepted,
+            "non-selected dead external must remain accepted until that thread is selected / global reconcile"
+        )
+        XCTAssertFalse(
+            activity.contains(where: { $0.id == deadOnB.id }),
+            "scoped result must not include the other thread's receipt"
+        )
+    }
+
+    func testAdmissionReceiptJSONOmitsNilParentReceiptId() throws {
+        // WHY: the scoped child prefilter uses LIKE '%"parentReceiptId"%' and
+        // assumes Codable omits the key when nil. Emitting null would match every root.
+        let root = AgentOrchestrationAdmissionReceipt(
+            runId: AgentRunID(),
+            threadId: AgentThreadID(),
+            routingRevision: 1,
+            policyDigest: String(repeating: "a", count: 64),
+            packageRevision: "test",
+            provider: .codex,
+            providerInstanceId: "codex",
+            model: "gpt",
+            capabilitySnapshotId: "cap",
+            decisionReason: "test",
+            lifecycleStatus: .accepted
+        )
+        let child = AgentOrchestrationAdmissionReceipt(
+            parentReceiptId: root.id,
+            runId: AgentRunID(),
+            threadId: AgentThreadID(),
+            nodeId: "worker",
+            routingRevision: 1,
+            policyDigest: String(repeating: "a", count: 64),
+            packageRevision: "test",
+            provider: .grok,
+            providerInstanceId: "grok",
+            model: "grok",
+            capabilitySnapshotId: "cap",
+            decisionReason: "test",
+            lifecycleStatus: .accepted
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        let rootJSON = String(data: try encoder.encode(root), encoding: .utf8) ?? ""
+        let childJSON = String(data: try encoder.encode(child), encoding: .utf8) ?? ""
+        XCTAssertFalse(
+            rootJSON.contains("parentReceiptId"),
+            "root receipts must omit parentReceiptId so the child LIKE prefilter stays selective"
+        )
+        XCTAssertTrue(
+            childJSON.contains("\"parentReceiptId\""),
+            "nested workers must encode parentReceiptId for the scoped child prefilter"
+        )
+    }
+
     func testActivityReceiptsPersistExpiredExternalLeaseAsUnknown() throws {
         // WHY: a still-existing PID is insufficient after its bounded lease
         // expires; otherwise PID reuse or a wedged wrapper can pin Active.

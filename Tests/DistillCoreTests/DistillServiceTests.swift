@@ -441,6 +441,78 @@ final class DistillServiceTests: XCTestCase {
         XCTAssertEqual(embed.embeddings.count, 0)
     }
 
+    /// Runtime that fails the test if the model/scheduler path is exercised.
+    private struct FailIfCalledRuntime: DistillRuntime {
+        func distill(_ request: DistillRequest) async throws -> String {
+            XCTFail("precomputed-output path must not call DistillRuntime.distill")
+            return "SHOULD_NOT_RUN"
+        }
+
+        func distillStaged(_ request: DistillRequest) async throws -> DistillStageResult {
+            XCTFail("precomputed-output path must not call DistillRuntime.distillStaged")
+            return DistillStageResult(output: "SHOULD_NOT_RUN", stage: .llmMLX)
+        }
+    }
+
+    func test_httpServerPrecomputedOutputRecordsDeliveredDeltaWithoutModelCall() async throws {
+        // WHY (BUG 1): Wave A clients send original + precomputedOutput; the sidecar
+        // must ledger that exact pair and skip scheduler/model recompute.
+        let configuration = try DistillServiceConfiguration(
+            authToken: "precomputed-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 2
+        )
+        let scheduler = DistillScheduler(runtime: FailIfCalledRuntime(), maxConcurrentRequests: 2)
+        let recorder = RecordingSuccessHandler()
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: scheduler,
+            scopedRecoveryStore: TestScopedRecoveryStore()
+        ) { request, response in
+            await recorder.record(request: request, response: response)
+        }
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let original = String(repeating: "same log line that repeats many times\n", count: 20) + "exit code: 0\n"
+        let delivered = "same log line that repeats many times\n… (x20)\nexit code: 0"
+        let request = DistillRequest(
+            mode: .commandOutput,
+            input: original,
+            provider: "claude",
+            recordSavings: true,
+            cacheState: "wave_prepass_A",
+            maxOutputCharacters: 4000,
+            precomputedOutput: delivered
+        )
+        let body = try JSONEncoder().encode(request)
+        let distill = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/distill",
+            method: "POST",
+            token: "precomputed-token",
+            body: body
+        )
+        XCTAssertEqual(distill.status, 200)
+        let decoded = try JSONDecoder().decode(DistillResponse.self, from: distill.data)
+        XCTAssertEqual(decoded.output, delivered, "response must echo client precomputed output")
+        XCTAssertEqual(decoded.routeStage, .deterministic)
+        XCTAssertEqual(decoded.inputTokens, TokenEstimator.estimate(original))
+        XCTAssertEqual(decoded.outputTokens, TokenEstimator.estimate(delivered))
+
+        let records = await recorder.allRecords()
+        let record = try XCTUnwrap(records.first)
+        XCTAssertEqual(records.count, 1, "exactly one ledger row (no double-count)")
+        XCTAssertEqual(record.provider, "claude")
+        XCTAssertEqual(record.cacheState, "wave_prepass_A")
+        XCTAssertEqual(
+            record.savedTokens,
+            max(TokenEstimator.estimate(original) - TokenEstimator.estimate(delivered), 0)
+        )
+        XCTAssertEqual(record.inputTokens, TokenEstimator.estimate(original))
+        XCTAssertEqual(record.outputTokens, TokenEstimator.estimate(delivered))
+    }
+
     func test_httpServerSuccessHookReceivesCommandOutputSavingsRecord() async throws {
         let configuration = try DistillServiceConfiguration(
             authToken: "record-token",

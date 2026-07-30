@@ -1,7 +1,15 @@
 import XCTest
+import CoreModel
 @testable import DistillCore
 
 final class ManagedDistillCLITests: XCTestCase {
+    override func tearDown() {
+        TokenSaverWaveLiveRollout.resetForTesting()
+        unsetenv("RC_TOKEN_SAVER_DISTILL_HINT")
+        unsetenv("RC_TOKEN_SAVER_WAVE_LIVE")
+        super.tearDown()
+    }
+
     private final class AdmissionLatch: @unchecked Sendable {
         private let lock = NSLock()
         private var decisions: [Bool]
@@ -49,6 +57,27 @@ final class ManagedDistillCLITests: XCTestCase {
 
         func count() -> Int {
             value
+        }
+    }
+
+    /// Blocks the transport until `release()` so tests can prove stdout is available
+    /// before the ledger POST begins (non-blocking deferred side effect).
+    private actor TransportGate {
+        private var released = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func waitUntilReleased() async {
+            if released { return }
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                waiters.append(cont)
+            }
+        }
+
+        func release() {
+            released = true
+            let pending = waiters
+            waiters.removeAll()
+            for cont in pending { cont.resume() }
         }
     }
 
@@ -336,6 +365,8 @@ final class ManagedDistillCLITests: XCTestCase {
     }
 
     func test_hookSubcommand_neverFallsThroughToCompress() async {
+        // Malformed Claude hook envelope (wrong field names) must fail-open to {}
+        // exit 0 — never non-zero, never treat the envelope itself as tool output.
         var transportCalled = false
         let cli = ManagedDistillCLI(
             arguments: ["hook", "post-tool-use", "--provider", "claude"],
@@ -346,11 +377,360 @@ final class ManagedDistillCLITests: XCTestCase {
             return (Data("should-not-compress".utf8), 200)
         }
         let (out, code) = await cli.run()
-        XCTAssertEqual(code, 1)
-        XCTAssertFalse(transportCalled, "hook must not invoke compress transport")
+        XCTAssertEqual(code, 0, "hook must always exit 0 (fail-open)")
+        XCTAssertFalse(transportCalled, "malformed hook envelope must not invoke compress transport")
+        XCTAssertEqual(String(decoding: out, as: UTF8.self), "{}")
+        XCTAssertFalse(String(decoding: out, as: UTF8.self).contains("should-not-compress"))
+    }
+
+    // MARK: - Wave A prepass ledger (exactly one recordSavings)
+
+    func test_waveAHit_emitsCompressedAndExactlyOneRecordSavingsWithCorrectDelta() async throws {
+        // WHY: Wave A used to return compressed stdout before any /v1/distill POST,
+        // so TokenSaverSavingsRepository never saw a row. Real byte savings were
+        // computed and then silently dropped for every provider.
+        //
+        // WHY (BUG 1): the ledger POST must carry precomputedOutput == pre.output so
+        // the sidecar records the delivered delta — NOT an independent recompute.
+        // The stub intentionally returns DIFFERENT bytes than pre.output; if the
+        // client (or server) used that response body for savings, numbers would diverge.
+        TokenSaverWaveLiveRollout.activate(.waveA)
+        setenv("RC_TOKEN_SAVER_DISTILL_HINT", "1", 1)
+
+        let line = "same log line that repeats many times for compression"
+        var input = ""
+        for _ in 0..<20 { input += line + "\n" }
+        input += "exit code: 0\n"
+
+        guard let pre = TokenSaverWaveLosslessPrepass.apply(input: input) else {
+            XCTFail("Wave A live must collapse repeated logs for this fixture")
+            return
+        }
+        XCTAssertGreaterThan(pre.savedBytes, 0)
+
+        let expectedRecord = ManagedDistillCLI.prepassSavingsRecord(
+            original: input,
+            compressed: pre.output,
+            provider: "grok",
+            waveID: pre.waveID
+        )
+        XCTAssertNotNil(expectedRecord, "DistillSavingsCalculator must accept prepass delta")
+        XCTAssertGreaterThan(expectedRecord?.savedTokens ?? 0, 0, "prepass must produce a positive token delta")
+        XCTAssertEqual(
+            expectedRecord?.savedTokens,
+            max(TokenEstimator.estimate(input) - TokenEstimator.estimate(pre.output), 0)
+        )
+
+        // DIFFERENT from pre.output — proves the client does not rely on the response body
+        // for the ledger delta (precomputed-output path ignores recompute).
+        let independentSidecarOutput = "INDEPENDENT_SIDECAR_RECOMPUTE_NOT_PRE_OUTPUT"
+        XCTAssertNotEqual(independentSidecarOutput, pre.output)
+        let sidecarResponse = DistillResponse(
+            requestID: UUID(),
+            output: independentSidecarOutput,
+            inputCharacters: input.count,
+            inputTokens: TokenEstimator.estimate(input),
+            outputTokens: TokenEstimator.estimate(independentSidecarOutput),
+            routeStage: .deterministic
+        )
+        let encoded = try JSONEncoder().encode(sidecarResponse)
+
+        let recorder = RequestRecorder()
+        let calls = CallCounter()
+        let cli = ManagedDistillCLI(
+            arguments: ["summarize logs"],
+            stdin: Data(input.utf8),
+            state: state,
+            provider: "grok"
+        ) { request in
+            _ = await calls.increment()
+            if let body = request.httpBody,
+               let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
+                await recorder.append(decoded)
+            }
+            return (encoded, 200)
+        }
+
+        let (out, code) = await cli.run()
+
+        XCTAssertEqual(code, 0)
         let text = String(decoding: out, as: UTF8.self)
-        XCTAssertTrue(text.contains("hook"), "reserved hook message expected")
-        XCTAssertFalse(text.contains("should-not-compress"))
+        XCTAssertTrue(text.hasPrefix(pre.output), "caller must receive Wave A compressed output")
+        XCTAssertFalse(text.contains(independentSidecarOutput), "caller must not see independent sidecar recompute")
+        XCTAssertNotEqual(out, Data(input.utf8), "Wave A hit must not fail-open to raw stdin")
+
+        let transportCalls = await calls.count()
+        XCTAssertEqual(transportCalls, 1, "Wave A must emit exactly one recordSavings POST (no double-count)")
+        let requests = await recorder.all()
+        XCTAssertEqual(requests.count, 1)
+        let posted = try XCTUnwrap(requests.first)
+        XCTAssertEqual(posted.recordSavings, true)
+        XCTAssertEqual(posted.input, input, "ledger POST must send original pre-prepass bytes")
+        XCTAssertEqual(
+            posted.precomputedOutput,
+            pre.output,
+            "ledger POST must carry the delivered Wave A output, not leave delta to server recompute"
+        )
+        XCTAssertEqual(posted.cacheState, "wave_prepass_\(pre.waveID)")
+        XCTAssertEqual(posted.provider, "grok")
+
+        // Honest delta is original→pre.output (precomputed path), not original→independentSidecarOutput.
+        let honest = DistillSavingsCalculator.record(
+            for: posted,
+            response: try XCTUnwrap(posted.responseUsingPrecomputedOutput())
+        )
+        XCTAssertEqual(honest?.savedTokens, expectedRecord?.savedTokens)
+        let wrongIfRecomputed = DistillSavingsCalculator.record(
+            for: DistillRequest(
+                mode: .commandOutput,
+                input: input,
+                provider: "grok",
+                recordSavings: true
+            ),
+            response: DistillResponse(
+                requestID: UUID(),
+                output: independentSidecarOutput,
+                inputCharacters: input.count,
+                inputTokens: TokenEstimator.estimate(input),
+                outputTokens: TokenEstimator.estimate(independentSidecarOutput),
+                routeStage: .deterministic
+            )
+        )
+        XCTAssertNotEqual(
+            honest?.savedTokens,
+            wrongIfRecomputed?.savedTokens,
+            "fixture must distinguish pre.output delta from independent sidecar recompute"
+        )
+    }
+
+    func test_waveAHit_runResultDeliversStdoutBeforeLedgerTransport() async {
+        // WHY (BUG 2): interactive consumers must not wait on the ledger POST RTT
+        // for bytes Wave A already produced. runResult returns stdout + deferred work.
+        TokenSaverWaveLiveRollout.activate(.waveA)
+        setenv("RC_TOKEN_SAVER_DISTILL_HINT", "1", 1)
+
+        let line = "same log line that repeats many times for compression"
+        var input = ""
+        for _ in 0..<20 { input += line + "\n" }
+        input += "exit code: 0\n"
+        guard let pre = TokenSaverWaveLosslessPrepass.apply(input: input) else {
+            XCTFail("expected Wave A hit")
+            return
+        }
+
+        let calls = CallCounter()
+        let gate = TransportGate()
+        let cli = ManagedDistillCLI(
+            arguments: [],
+            stdin: Data(input.utf8),
+            state: state,
+            provider: "claude"
+        ) { _ in
+            await gate.waitUntilReleased()
+            _ = await calls.increment()
+            return (Data("{}".utf8), 200)
+        }
+
+        let result = await cli.runResult()
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertEqual(String(decoding: result.stdout, as: UTF8.self), pre.output + "\n")
+        XCTAssertNotNil(result.deferredSideEffect, "Wave A must defer ledger POST")
+        let before = await calls.count()
+        XCTAssertEqual(before, 0, "ledger transport must not run before deferred side effect")
+
+        // Unblock transport and run deferred work.
+        await gate.release()
+        if let deferred = result.deferredSideEffect {
+            await deferred()
+        }
+        let after = await calls.count()
+        XCTAssertEqual(after, 1, "exactly one ledger POST after deferred side effect")
+    }
+
+    func test_waveAHit_sidecarUnreachable_stillReturnsCompressedFailOpen() async {
+        TokenSaverWaveLiveRollout.activate(.waveA)
+        setenv("RC_TOKEN_SAVER_DISTILL_HINT", "1", 1)
+
+        let line = "same log line that repeats many times for compression"
+        var input = ""
+        for _ in 0..<20 { input += line + "\n" }
+        input += "exit code: 0\n"
+        guard let pre = TokenSaverWaveLosslessPrepass.apply(input: input) else {
+            XCTFail("expected Wave A hit")
+            return
+        }
+
+        let calls = CallCounter()
+        let cli = ManagedDistillCLI(
+            arguments: [],
+            stdin: Data(input.utf8),
+            state: state,
+            provider: "claude"
+        ) { _ in
+            _ = await calls.increment()
+            return nil // sidecar down
+        }
+
+        let (out, code) = await cli.run()
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(String(decoding: out, as: UTF8.self), pre.output + "\n")
+        let transportCalls = await calls.count()
+        XCTAssertEqual(transportCalls, 1, "still attempts one best-effort recordSavings POST")
+    }
+
+    // MARK: - hook post-tool-use
+
+    func test_hookPostToolUse_reachableSidecar_returnsUpdatedToolOutput() async throws {
+        let rawToolOutput = String(repeating: "build line noise that should compress away\n", count: 40)
+            + "BUILD FAILED: 3 errors\n"
+        let compressed = "BUILD FAILED: 3 errors"
+        let sidecarResponse = DistillResponse(
+            requestID: UUID(),
+            output: compressed,
+            inputCharacters: rawToolOutput.count,
+            inputTokens: TokenEstimator.estimate(rawToolOutput),
+            outputTokens: TokenEstimator.estimate(compressed),
+            originalHandle: "hook1",
+            routeStage: .deterministic
+        )
+        let encoded = try JSONEncoder().encode(sidecarResponse)
+        let recorder = RequestRecorder()
+
+        // Claude PostToolUse envelope field names from ClaudeAgentSDKBridge.mjs.
+        let hookJSON: [String: Any] = [
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": ["command": "make test"],
+            "tool_response": rawToolOutput,
+        ]
+        let stdin = try JSONSerialization.data(withJSONObject: hookJSON)
+
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "post-tool-use"],
+            stdin: stdin,
+            state: state,
+            provider: "claude"
+        ) { request in
+            if let body = request.httpBody,
+               let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
+                await recorder.append(decoded)
+            }
+            return (encoded, 200)
+        }
+
+        let (out, code) = await cli.run()
+        XCTAssertEqual(code, 0)
+
+        let obj = try JSONSerialization.jsonObject(with: out) as? [String: Any]
+        let hookOut = obj?["hookSpecificOutput"] as? [String: Any]
+        XCTAssertEqual(hookOut?["hookEventName"] as? String, "PostToolUse")
+        let updated = hookOut?["updatedToolOutput"] as? String ?? ""
+        XCTAssertTrue(updated.hasPrefix(compressed), "updatedToolOutput must carry compressed tool text")
+        XCTAssertTrue(updated.contains("[[rc:hook1]]") || updated.hasPrefix(compressed))
+
+        let requests = await recorder.all()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.recordSavings, true)
+        XCTAssertEqual(requests.first?.input, rawToolOutput)
+        XCTAssertEqual(requests.first?.provider, "claude")
+    }
+
+    func test_hookPostToolUse_waveA_deliversUpdatedToolOutputBeforeLedgerTransport() async throws {
+        // WHY (BUG 2): the Claude PostToolUse hook has a tight timeout; Wave A
+        // compressed output must leave the hook without waiting on the ledger POST.
+        TokenSaverWaveLiveRollout.activate(.waveA)
+        setenv("RC_TOKEN_SAVER_DISTILL_HINT", "1", 1)
+
+        let line = "same log line that repeats many times for compression"
+        var rawToolOutput = ""
+        for _ in 0..<20 { rawToolOutput += line + "\n" }
+        rawToolOutput += "exit code: 0\n"
+        guard let pre = TokenSaverWaveLosslessPrepass.apply(input: rawToolOutput) else {
+            XCTFail("expected Wave A hit for hook fixture")
+            return
+        }
+
+        let hookJSON: [String: Any] = [
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": ["command": "make test"],
+            "tool_response": rawToolOutput,
+        ]
+        let stdin = try JSONSerialization.data(withJSONObject: hookJSON)
+
+        let calls = CallCounter()
+        let gate = TransportGate()
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "post-tool-use"],
+            stdin: stdin,
+            state: state,
+            provider: "claude"
+        ) { request in
+            await gate.waitUntilReleased()
+            _ = await calls.increment()
+            if let body = request.httpBody,
+               let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
+                // Must carry precomputed Wave A output even if transport is slow.
+                XCTAssertEqual(decoded.precomputedOutput, pre.output)
+            }
+            return (Data("{}".utf8), 200)
+        }
+
+        let result = await cli.runResult()
+        XCTAssertEqual(result.exitCode, 0)
+        let obj = try JSONSerialization.jsonObject(with: result.stdout) as? [String: Any]
+        let hookOut = obj?["hookSpecificOutput"] as? [String: Any]
+        let updated = hookOut?["updatedToolOutput"] as? String ?? ""
+        // Hook strips trailing newlines when building updatedToolOutput (same as shrink check).
+        let expected = ManagedDistillCLI.stripTrailingNewlines(pre.output)
+        XCTAssertEqual(
+            updated,
+            expected,
+            "hook must return Wave A compressed tool output before ledger POST"
+        )
+        XCTAssertNotNil(result.deferredSideEffect, "hook must propagate nested Wave A deferred ledger")
+        let before = await calls.count()
+        XCTAssertEqual(before, 0, "hook output must not wait on ledger transport")
+
+        await gate.release()
+        if let deferred = result.deferredSideEffect {
+            await deferred()
+        }
+        let after = await calls.count()
+        XCTAssertEqual(after, 1, "exactly one deferred ledger POST after hook output is ready")
+    }
+
+    func test_hookPostToolUse_sidecarUnreachable_returnsEmptyObjectExitZero() async throws {
+        let hookJSON: [String: Any] = [
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": ["command": "ls"],
+            "tool_response": "lots of tool output that would be compressed if the sidecar were up\n",
+        ]
+        let stdin = try JSONSerialization.data(withJSONObject: hookJSON)
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "post-tool-use"],
+            stdin: stdin,
+            state: state
+        ) { _ in nil }
+
+        let (out, code) = await cli.run()
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(String(decoding: out, as: UTF8.self), "{}")
+    }
+
+    func test_hookPostToolUse_malformedInput_returnsEmptyObjectExitZero() async {
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "post-tool-use"],
+            stdin: Data("not-json{{{".utf8),
+            state: state
+        ) { _ in
+            XCTFail("malformed hook input must not call transport")
+            return nil
+        }
+        let (out, code) = await cli.run()
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(String(decoding: out, as: UTF8.self), "{}")
     }
 
     func test_retrieve_success_returnsOriginal() async {

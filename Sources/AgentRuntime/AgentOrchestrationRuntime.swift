@@ -730,16 +730,106 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
             records = try repository.listAuditLogDetails(
                 actions: [Self.admissionAction, Self.lifecycleAction],
                 limit: max(1, limit) * 4
-            ).compactMap { detail in
-                guard let data = detail.data(using: .utf8) else { return nil }
-                return try? decoder.decode(AgentOrchestrationAdmissionReceipt.self, from: data)
-            }
+            ).compactMap(decodeReceiptDetail)
         case .file(let url):
             guard let data = try? Data(contentsOf: url),
                   let text = String(data: data, encoding: .utf8) else { return [] }
             records = text.split(separator: "\n")
                 .compactMap { try? decoder.decode(AgentOrchestrationAdmissionReceipt.self, from: Data($0.utf8)) }
         }
+        return latestReceipts(from: records, limit: limit)
+    }
+
+    /// Scoped activity fetch: selected-thread rows (LIKE prefilter on thread UUID)
+    /// plus a bounded window of nested-worker rows (`"parentReceiptId"` key present).
+    /// Exact thread / parent-chain membership is enforced by the caller after decode.
+    ///
+    /// WHY: the Subagents badge polls on the MainActor every ~2s. Decoding up to
+    /// 40k global JSON blobs dominated refresh cost; this cuts decode volume to
+    /// the selected thread plus nested children without a schema migration.
+    fileprivate func receiptsUnlocked(
+        matchingThreadIds threadIds: Set<AgentThreadID>,
+        limit: Int,
+        childRecordLimit: Int
+    ) throws -> [AgentOrchestrationAdmissionReceipt] {
+        guard !threadIds.isEmpty else { return [] }
+        let threadBound = max(1, limit)
+        let childBound = max(1, childRecordLimit)
+        let headroom = 4
+        var records: [AgentOrchestrationAdmissionReceipt] = []
+
+        switch storage {
+        case .database(_, let repository):
+            let actions = [Self.admissionAction, Self.lifecycleAction]
+            for threadId in threadIds {
+                // AgentThreadID encodes as {"value":"<UUID>"}; needle is the raw
+                // uuid string only. LIKE is a prefilter — exact threadId checked later.
+                let details = try repository.listAuditLogDetails(
+                    actions: actions,
+                    detailContains: threadId.value.uuidString,
+                    limit: threadBound * headroom
+                )
+                records.append(contentsOf: details.compactMap(decodeReceiptDetail))
+            }
+            // Synthesized Codable omits nil parentReceiptId, so this key appears
+            // only on nested-worker rows (a small ledger fraction).
+            let childDetails = try repository.listAuditLogDetails(
+                actions: actions,
+                detailContains: "\"parentReceiptId\"",
+                limit: childBound * headroom
+            )
+            records.append(contentsOf: childDetails.compactMap(decodeReceiptDetail))
+        case .file:
+            try forEachReceiptRecordUnlocked(containing: nil) { receipt in
+                if threadIds.contains(receipt.threadId) || receipt.parentReceiptId != nil {
+                    records.append(receipt)
+                }
+            }
+        }
+
+        // Dedupe latest-by-id, then keep newest thread-bound and child-bound
+        // windows separately so an explosion of children cannot starve thread rows.
+        var latestByID: [UUID: AgentOrchestrationAdmissionReceipt] = [:]
+        for receipt in records {
+            if let current = latestByID[receipt.id],
+               current.lifecycleUpdatedAt >= receipt.lifecycleUpdatedAt {
+                continue
+            }
+            latestByID[receipt.id] = receipt
+        }
+        let latest = latestByID.values.sorted { $0.lifecycleUpdatedAt > $1.lifecycleUpdatedAt }
+        var kept: [AgentOrchestrationAdmissionReceipt] = []
+        var keptIDs = Set<UUID>()
+        var threadCount = 0
+        var childCount = 0
+        for receipt in latest {
+            let onThread = threadIds.contains(receipt.threadId)
+            let isChild = receipt.parentReceiptId != nil
+            if onThread {
+                if threadCount >= threadBound { continue }
+                threadCount += 1
+            } else if isChild {
+                if childCount >= childBound { continue }
+                childCount += 1
+            } else {
+                continue
+            }
+            if keptIDs.insert(receipt.id).inserted {
+                kept.append(receipt)
+            }
+        }
+        return kept
+    }
+
+    private func decodeReceiptDetail(_ detail: String) -> AgentOrchestrationAdmissionReceipt? {
+        guard let data = detail.data(using: .utf8) else { return nil }
+        return try? decoder.decode(AgentOrchestrationAdmissionReceipt.self, from: data)
+    }
+
+    private func latestReceipts(
+        from records: [AgentOrchestrationAdmissionReceipt],
+        limit: Int
+    ) -> [AgentOrchestrationAdmissionReceipt] {
         var latestByID: [UUID: AgentOrchestrationAdmissionReceipt] = [:]
         for receipt in records {
             if let current = latestByID[receipt.id],
@@ -1990,7 +2080,12 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         try repository.receipts(limit: max(1, limit))
     }
 
-    /// Bounded activity read used by the Subagents surface.
+    /// Default bound for nested-worker (`parentReceiptId`) rows in a thread-scoped
+    /// activity fetch. Separate from the selected-thread window so children cannot
+    /// starve the thread's own history (and vice versa).
+    public static let defaultChildActivityReceiptLimit = 2_000
+
+    /// Bounded activity read used by the Subagents surface (global window).
     ///
     /// Accepted receipts are not durable proof that work remains active.
     /// Reconcile a dead owner, missing owner, expired deadline, or inactive
@@ -1998,10 +2093,58 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     /// app process and subsequent launch observes the same honest state.
     /// The same UI history bound limits every two-second poll; it intentionally
     /// exceeds the older 500-row launch-reconciliation window.
+    ///
+    /// Prefer `activityReceipts(threadIds:limit:)` for the live badge poll — the
+    /// global form still mutates every accepted row in the window and is kept
+    /// for tests / launch-style full-window reconciliation.
     public func activityReceipts(limit: Int = 10_000) throws -> [AgentOrchestrationAdmissionReceipt] {
+        try activityReceipts(scope: .global, limit: max(1, limit))
+    }
+
+    /// Thread-scoped activity read for the Subagents chrome badge.
+    ///
+    /// Fetches only the selected thread's rows plus a bounded nested-worker window,
+    /// then reconciles **scoped** receipts only. Unrelated sibling-thread dead
+    /// workers are intentionally not mutated here — they reconcile when that
+    /// thread is selected, via the global path, or at launch-time reconciliation.
+    public func activityReceipts(
+        threadIds: Set<AgentThreadID>,
+        limit: Int = 10_000,
+        childRecordLimit: Int = AgentOrchestrationRuntime.defaultChildActivityReceiptLimit
+    ) throws -> [AgentOrchestrationAdmissionReceipt] {
+        guard !threadIds.isEmpty else { return [] }
+        return try activityReceipts(
+            scope: .threads(threadIds, childRecordLimit: max(1, childRecordLimit)),
+            limit: max(1, limit)
+        )
+    }
+
+    private enum ActivityReceiptScope {
+        case global
+        case threads(Set<AgentThreadID>, childRecordLimit: Int)
+    }
+
+    private func activityReceipts(
+        scope: ActivityReceiptScope,
+        limit: Int
+    ) throws -> [AgentOrchestrationAdmissionReceipt] {
         let result = try repository.withReceiptMutation {
             () -> (receipts: [AgentOrchestrationAdmissionReceipt], reservationIds: [String]) in
-            var receipts = try repository.receiptsUnlocked(limit: max(1, limit))
+            var receipts: [AgentOrchestrationAdmissionReceipt]
+            let scopeThreadIds: Set<AgentThreadID>?
+            switch scope {
+            case .global:
+                receipts = try repository.receiptsUnlocked(limit: limit)
+                scopeThreadIds = nil
+            case .threads(let threadIds, let childRecordLimit):
+                receipts = try repository.receiptsUnlocked(
+                    matchingThreadIds: threadIds,
+                    limit: limit,
+                    childRecordLimit: childRecordLimit
+                )
+                scopeThreadIds = threadIds
+            }
+
             let current = now()
             var reservationIds: [String] = []
             var receiptByID = Dictionary(uniqueKeysWithValues: receipts.map { ($0.id, $0) })
@@ -2009,7 +2152,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             var missingParentIDs = Set(receipts.compactMap(\.parentReceiptId))
                 .subtracting(receiptByID.keys)
 
-            // Parent chains normally sit inside the same 10k activity window.
+            // Parent chains normally sit inside the fetched window.
             // If an older ancestor fell outside it, resolve all missing IDs in
             // one repository scan per hierarchy level rather than issuing one
             // lookup per child.
@@ -2017,9 +2160,65 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
                 fetchedParentIDs.formUnion(missingParentIDs)
                 let fetched = try repository.receiptsUnlocked(ids: missingParentIDs)
                 receiptByID.merge(fetched) { current, _ in current }
+                // Also surface ancestors that were outside the primary fetch so
+                // parent-chain membership and liveness walks stay complete.
+                for parent in fetched.values where receiptByID[parent.id] != nil {
+                    if !receipts.contains(where: { $0.id == parent.id }) {
+                        receipts.append(parent)
+                    }
+                }
                 missingParentIDs = Set(fetched.values.compactMap(\.parentReceiptId))
                     .subtracting(receiptByID.keys)
                     .subtracting(fetchedParentIDs)
+            }
+
+            // For thread-scoped reads: keep only ancestor-closed membership, and
+            // never reconcile out-of-scope children fetched by the parentReceiptId
+            // prefilter (incomplete parent view would wrongly demote live workers).
+            let reconcileIndexes: [Int]
+            if let scopeThreadIds {
+                var scopeMemo: [UUID: Bool] = [:]
+                func inScope(
+                    _ receipt: AgentOrchestrationAdmissionReceipt,
+                    visiting: Set<UUID> = []
+                ) -> Bool {
+                    if let cached = scopeMemo[receipt.id] { return cached }
+                    if scopeThreadIds.contains(receipt.threadId) {
+                        scopeMemo[receipt.id] = true
+                        return true
+                    }
+                    guard let parentId = receipt.parentReceiptId,
+                          !visiting.contains(receipt.id),
+                          let parent = receiptByID[parentId] else {
+                        scopeMemo[receipt.id] = false
+                        return false
+                    }
+                    var next = visiting
+                    next.insert(receipt.id)
+                    let belongs = inScope(parent, visiting: next)
+                    scopeMemo[receipt.id] = belongs
+                    return belongs
+                }
+
+                var scopedIDs = Set<UUID>()
+                for receipt in receipts where inScope(receipt) {
+                    var cursor: AgentOrchestrationAdmissionReceipt? = receipt
+                    var visiting = Set<UUID>()
+                    while let current = cursor, visiting.insert(current.id).inserted {
+                        scopedIDs.insert(current.id)
+                        if let parentId = current.parentReceiptId {
+                            cursor = receiptByID[parentId]
+                        } else {
+                            cursor = nil
+                        }
+                    }
+                }
+                receipts = receipts.filter { scopedIDs.contains($0.id) }
+                // Rebuild indexes after the filter so reconcile walks the scoped array.
+                receiptByID = Dictionary(uniqueKeysWithValues: receipts.map { ($0.id, $0) })
+                reconcileIndexes = Array(receipts.indices)
+            } else {
+                reconcileIndexes = Array(receipts.indices)
             }
 
             var activeMemo: [UUID: Bool] = [:]
@@ -2059,7 +2258,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
                 return active
             }
 
-            for index in receipts.indices {
+            for index in reconcileIndexes {
                 let receipt = receipts[index]
                 guard receipt.lifecycleStatus == .accepted,
                       !isEffectivelyActive(receipt) else { continue }
