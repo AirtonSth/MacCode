@@ -3010,6 +3010,204 @@ public final class AgentRunRepository: @unchecked Sendable {
         }
         return events
     }
+
+    // MARK: - agent.thread.read response_version=1 (metadata-first)
+
+    /// Metadata for one persisted stream row without transferring `payload_json`.
+    public struct StreamEventRowMeta: Sendable, Equatable {
+        public let id: Int64
+        public let seq: Int
+        public let payloadBytes: Int64
+
+        public init(id: Int64, seq: Int, payloadBytes: Int64) {
+            self.id = id
+            self.seq = seq
+            self.payloadBytes = payloadBytes
+        }
+    }
+
+    /// Newest event blocked because its stored payload alone exceeds the byte cap.
+    public struct BlockedStreamEvent: Sendable, Equatable {
+        public let id: Int64
+        public let payloadBytes: Int64
+        public let reason: String
+
+        public init(id: Int64, payloadBytes: Int64, reason: String = "byte_limit") {
+            self.id = id
+            self.payloadBytes = payloadBytes
+            self.reason = reason
+        }
+    }
+
+    /// Contiguous newest suffix selected without decoding rejected rows.
+    public struct BoundedStreamEventSelection: Sendable, Equatable {
+        public let events: [AssistantEvent]
+        /// True when older rows exist beyond this window (count probe and/or byte cut).
+        public let hasMoreOlder: Bool
+        public let blockedNewest: BlockedStreamEvent?
+        /// Row ids whose `payload_json` was transferred and decoded (testable).
+        public let decodedRowIds: [Int64]
+        /// Metadata rows inspected (at most `eventLimit + 1`).
+        public let inspectedRowCount: Int
+
+        public init(
+            events: [AssistantEvent],
+            hasMoreOlder: Bool,
+            blockedNewest: BlockedStreamEvent?,
+            decodedRowIds: [Int64],
+            inspectedRowCount: Int
+        ) {
+            self.events = events
+            self.hasMoreOlder = hasMoreOlder
+            self.blockedNewest = blockedNewest
+            self.decodedRowIds = decodedRowIds
+            self.inspectedRowCount = inspectedRowCount
+        }
+    }
+
+    /// Metadata-only newest rows: `id`, `seq`, and `LENGTH(payload_json)` — never the blob.
+    public func listLatestStreamEventMetadata(
+        threadId: AgentThreadID,
+        limit: Int
+    ) throws -> [StreamEventRowMeta] {
+        let safeLimit = max(0, limit)
+        guard safeLimit > 0 else { return [] }
+        // `payload_json` is referenced only inside LENGTH(...) and is not projected,
+        // so the Swift binding never allocates the stored blob.
+        let st = try db.prepare("""
+            SELECT id, seq, payload_bytes
+            FROM (
+                SELECT e.id AS id,
+                       e.seq AS seq,
+                       r.started_at AS started_at,
+                       LENGTH(CAST(e.payload_json AS BLOB)) AS payload_bytes
+                FROM agent_stream_events e
+                JOIN agent_runs r ON r.id = e.run_id
+                WHERE r.thread_id = ?
+                ORDER BY r.started_at DESC, e.seq DESC, e.id DESC
+                LIMIT ?
+            )
+            ORDER BY started_at ASC, seq ASC, id ASC;
+        """)
+        try st.bind(1, threadId.value.uuidString)
+        try st.bind(2, Int64(safeLimit))
+        var rows: [StreamEventRowMeta] = []
+        while try st.step() {
+            rows.append(StreamEventRowMeta(
+                id: st.columnInt64(0),
+                seq: Int(st.columnInt64(1)),
+                payloadBytes: st.columnInt64(2)
+            ))
+        }
+        return rows
+    }
+
+    /// Fetch + decode only the given row ids (chronological). Does not scan peers.
+    public func listStreamEventsByIds(
+        _ ids: [Int64],
+        strictDecoding: Bool = true
+    ) throws -> [AssistantEvent] {
+        guard !ids.isEmpty else { return [] }
+        let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
+        let st = try db.prepare("""
+            SELECT e.id, e.payload_json
+            FROM agent_stream_events e
+            JOIN agent_runs r ON r.id = e.run_id
+            WHERE e.id IN (\(placeholders))
+            ORDER BY r.started_at ASC, e.seq ASC, e.id ASC;
+        """)
+        for (offset, id) in ids.enumerated() {
+            try st.bind(Int32(offset + 1), id)
+        }
+        var events: [AssistantEvent] = []
+        let decoder = JSONDecoder()
+        while try st.step() {
+            let eventId = st.columnInt64(0)
+            guard let json = st.columnText(1),
+                  let data = json.data(using: .utf8) else {
+                if strictDecoding {
+                    throw PersistenceDataError.corruptStreamEvent("row \(eventId) has no UTF-8 payload")
+                }
+                continue
+            }
+            do {
+                events.append(try decoder.decode(AssistantEvent.self, from: data))
+            } catch {
+                if strictDecoding {
+                    throw PersistenceDataError.corruptStreamEvent("row \(eventId) has an invalid AssistantEvent payload")
+                }
+            }
+        }
+        return events
+    }
+
+    /// agent.thread.read v1 source path: inspect lengths first, decode only the
+    /// contiguous newest suffix that fits both `eventLimit` and `maxPayloadBytes`.
+    /// A newest row over the byte cap is never transferred or decoded.
+    public func listLatestStreamEventsForThreadReadV1(
+        threadId: AgentThreadID,
+        eventLimit: Int,
+        maxPayloadBytes: Int64,
+        strictDecoding: Bool = true
+    ) throws -> BoundedStreamEventSelection {
+        let safeEventLimit = max(1, eventLimit)
+        let safeMaxBytes = max(1, maxPayloadBytes)
+        // +1 probe for honest has_more without materializing full history.
+        let meta = try listLatestStreamEventMetadata(
+            threadId: threadId,
+            limit: safeEventLimit + 1
+        )
+        guard !meta.isEmpty else {
+            return BoundedStreamEventSelection(
+                events: [],
+                hasMoreOlder: false,
+                blockedNewest: nil,
+                decodedRowIds: [],
+                inspectedRowCount: 0
+            )
+        }
+
+        // meta is chronological (oldest→newest). Walk newest-first for suffix.
+        let newest = meta[meta.count - 1]
+        if newest.payloadBytes > safeMaxBytes {
+            // Do not fetch/decode the oversized newest (or any older) row.
+            return BoundedStreamEventSelection(
+                events: [],
+                hasMoreOlder: true,
+                blockedNewest: BlockedStreamEvent(
+                    id: newest.id,
+                    payloadBytes: newest.payloadBytes,
+                    reason: "byte_limit"
+                ),
+                decodedRowIds: [],
+                inspectedRowCount: meta.count
+            )
+        }
+
+        var selectedNewestFirst: [StreamEventRowMeta] = []
+        var usedBytes: Int64 = 0
+        for row in meta.reversed() {
+            if selectedNewestFirst.count >= safeEventLimit { break }
+            if usedBytes + row.payloadBytes > safeMaxBytes { break }
+            selectedNewestFirst.append(row)
+            usedBytes += row.payloadBytes
+        }
+        let selected = Array(selectedNewestFirst.reversed())
+        let selectedIds = selected.map(\.id)
+
+        // has_more: +1 probe row, or we dropped any inspected row for count/bytes.
+        let droppedFromInspected = selected.count < meta.count
+        let hasMoreOlder = droppedFromInspected
+
+        let events = try listStreamEventsByIds(selectedIds, strictDecoding: strictDecoding)
+        return BoundedStreamEventSelection(
+            events: events,
+            hasMoreOlder: hasMoreOlder,
+            blockedNewest: nil,
+            decodedRowIds: selectedIds,
+            inspectedRowCount: meta.count
+        )
+    }
 }
 
 public struct AgentProposedPlanRecord: Equatable, Sendable {

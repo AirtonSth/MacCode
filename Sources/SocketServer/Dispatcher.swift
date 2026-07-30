@@ -16,10 +16,35 @@ public struct AgentActiveRunSnapshot: Sendable, Equatable {
 public struct AgentThreadMirrorSnapshot: Sendable, Equatable {
     public let events: [AssistantEvent]
     public let eventWatermark: Int64
+    /// True when older source rows exist beyond this window (count probe and/or
+    /// byte selection). Always false for unbounded legacy reads.
+    public let sourceHadOlderEvents: Bool
+    /// Populated when the newest persisted row exceeds the byte cap and was
+    /// never decoded. Clients use this for a dedicated hydration path.
+    public let blockedEvent: BlockedMirrorEvent?
 
-    public init(events: [AssistantEvent], eventWatermark: Int64) {
+    public struct BlockedMirrorEvent: Sendable, Equatable {
+        public let id: Int64
+        public let payloadBytes: Int64
+        public let reason: String
+
+        public init(id: Int64, payloadBytes: Int64, reason: String) {
+            self.id = id
+            self.payloadBytes = payloadBytes
+            self.reason = reason
+        }
+    }
+
+    public init(
+        events: [AssistantEvent],
+        eventWatermark: Int64,
+        sourceHadOlderEvents: Bool = false,
+        blockedEvent: BlockedMirrorEvent? = nil
+    ) {
         self.events = events
         self.eventWatermark = eventWatermark
+        self.sourceHadOlderEvents = sourceHadOlderEvents
+        self.blockedEvent = blockedEvent
     }
 }
 
@@ -129,7 +154,14 @@ public protocol CommandRouting: AnyObject {
     func respondAgentUserInput(thread: AgentThreadID, requestId: String, text: String) async throws
     func listAgentPendingCallbacks(thread: AgentThreadID) throws -> AssistantPendingCallbacksSnapshot
     func readAgentThreadEvents(thread: AgentThreadID) async throws -> [AssistantEvent]
-    func readAgentThreadMirrorSnapshot(thread: AgentThreadID) async throws -> AgentThreadMirrorSnapshot
+    /// Mirror recovery snapshot.
+    /// - Legacy (`eventRowLimit`/`maxPayloadBytes` both nil): full unbounded decode.
+    /// - v1: metadata-first selection with both limits; oversized newest is never decoded.
+    func readAgentThreadMirrorSnapshot(
+        thread: AgentThreadID,
+        eventRowLimit: Int?,
+        maxPayloadBytes: Int64?
+    ) async throws -> AgentThreadMirrorSnapshot
     func rollbackAgentThread(thread: AgentThreadID, toTurnId: String) async throws
     func listAgentThreadCheckpoints(thread: AgentThreadID) throws -> [AgentTurnCheckpointSummary]
     func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, path: String?) throws -> String
@@ -2122,9 +2154,49 @@ public final class JSONRPCDispatcher {
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 return .init(id: id, result: encode(try router.listAgentPendingCallbacks(thread: tid)))
             case "agent.thread.read":
+                // response_version absent → exact legacy shapes (array or watermark object).
+                // response_version present → integral 1 only; validate before repository work.
+                if let caps = try AgentThreadReadV1.parseCaps(params) {
+                    let snapshot = try await router.readAgentThreadMirrorSnapshot(
+                        thread: caps.threadId,
+                        eventRowLimit: caps.eventLimit,
+                        maxPayloadBytes: Int64(caps.maxBytes)
+                    )
+                    let encodedEvents = snapshot.events.map { encode($0) }
+                    let blocked = snapshot.blockedEvent.map {
+                        AgentThreadReadV1.BlockedEvent(
+                            id: $0.id,
+                            payloadBytes: $0.payloadBytes,
+                            reason: $0.reason
+                        )
+                    }
+                    let window = AgentThreadReadV1.boundToEnvelope(
+                        events: snapshot.events,
+                        encodedEvents: encodedEvents,
+                        sourceHadOlderEvents: snapshot.sourceHadOlderEvents,
+                        blockedEvent: blocked,
+                        maxBytes: caps.maxBytes,
+                        eventWatermark: snapshot.eventWatermark,
+                        responseId: id,
+                        measureEnvelope: { [self] result in
+                            envelopeUTF8ByteCount(id: id, result: result)
+                        }
+                    )
+                    return .init(
+                        id: id,
+                        result: AgentThreadReadV1.payload(
+                            window: window,
+                            eventWatermark: snapshot.eventWatermark
+                        )
+                    )
+                }
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 if params["include_event_watermark"]?.boolValue == true {
-                    let snapshot = try await router.readAgentThreadMirrorSnapshot(thread: tid)
+                    let snapshot = try await router.readAgentThreadMirrorSnapshot(
+                        thread: tid,
+                        eventRowLimit: nil,
+                        maxPayloadBytes: nil
+                    )
                     let eventLimit = params["event_limit"]?.intValue
                     if let eventLimit, !(1...5_000).contains(eventLimit) {
                         throw JSONRPCError.invalidParams
@@ -3087,6 +3159,12 @@ public final class JSONRPCDispatcher {
             return .null
         }
         return result
+    }
+
+    /// Full JSON-RPC response UTF-8 size (keys, separators, escaping, id).
+    private func envelopeUTF8ByteCount(id: JSONRPCID?, result: JSONValue) -> Int {
+        let response = JSONRPCResponse(id: id, result: result)
+        return (try? _encoder.encode(response))?.count ?? Int.max
     }
 
     private func workspaceID(from params: [String: JSONValue]) throws -> WorkspaceID {

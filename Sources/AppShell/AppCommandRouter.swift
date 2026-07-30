@@ -3915,13 +3915,50 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func readAgentThreadMirrorSnapshot(
-        thread: AgentThreadID
+        thread: AgentThreadID,
+        eventRowLimit: Int?,
+        maxPayloadBytes: Int64?
     ) async throws -> AgentThreadMirrorSnapshot {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        return try ctx.coordinator.withMirrorEventSnapshot(threadId: thread) { events in
-            AgentThreadMirrorSnapshot(
+        // v1: metadata-first length inspection + decode only the selected suffix.
+        if let eventRowLimit, let maxPayloadBytes {
+            return try ctx.coordinator.withMirrorEventSnapshotForThreadReadV1(
+                threadId: thread,
+                eventLimit: eventRowLimit,
+                maxPayloadBytes: maxPayloadBytes
+            ) { selection in
+                let blocked = selection.blockedNewest.map {
+                    AgentThreadMirrorSnapshot.BlockedMirrorEvent(
+                        id: $0.id,
+                        payloadBytes: $0.payloadBytes,
+                        reason: $0.reason
+                    )
+                }
+                return AgentThreadMirrorSnapshot(
+                    events: selection.events,
+                    eventWatermark: EventBus.shared.currentSeq,
+                    sourceHadOlderEvents: selection.hasMoreOlder,
+                    blockedEvent: blocked
+                )
+            }
+        }
+        // Legacy: unbounded (or optional count-only) decode path.
+        let sqlLimit = eventRowLimit.map { max(1, $0) + 1 } ?? Int.max
+        return try ctx.coordinator.withMirrorEventSnapshot(threadId: thread, limit: sqlLimit) { loaded in
+            let hadOlder: Bool
+            let events: [AssistantEvent]
+            if let eventRowLimit, loaded.count > eventRowLimit {
+                hadOlder = true
+                events = Array(loaded.suffix(eventRowLimit))
+            } else {
+                hadOlder = false
+                events = loaded
+            }
+            return AgentThreadMirrorSnapshot(
                 events: events,
-                eventWatermark: EventBus.shared.currentSeq
+                eventWatermark: EventBus.shared.currentSeq,
+                sourceHadOlderEvents: hadOlder,
+                blockedEvent: nil
             )
         }
     }

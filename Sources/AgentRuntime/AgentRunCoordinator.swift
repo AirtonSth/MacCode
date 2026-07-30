@@ -3020,9 +3020,47 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// preventing a matching EventBus publication from crossing the caller's
     /// watermark capture. This is the recovery contract used by iOS; unlike
     /// `readThread`, it never races a fresh provider-side mutable snapshot.
+    ///
+    /// - Parameter limit: Max newest rows to load from SQLite (default unbounded).
+    ///   Callers that need a count-truncation probe should pass `eventLimit + 1`.
+    ///   Prefer `withMirrorEventSnapshotForThreadReadV1` for byte-capped recovery.
     public func withMirrorEventSnapshot<T>(
         threadId: AgentThreadID,
+        limit: Int = .max,
         _ body: ([AssistantEvent]) -> T
+    ) throws -> T {
+        try withMirrorEventLock(threadId: threadId) {
+            body(try runRepo.listLatestStreamEvents(
+                threadId: threadId,
+                limit: limit,
+                strictDecoding: true
+            ))
+        }
+    }
+
+    /// Metadata-first bounded snapshot for `agent.thread.read` response_version=1.
+    /// Never decodes a newest row whose stored `payload_json` exceeds `maxPayloadBytes`,
+    /// and never materializes full history under the mirror lock.
+    public func withMirrorEventSnapshotForThreadReadV1<T>(
+        threadId: AgentThreadID,
+        eventLimit: Int,
+        maxPayloadBytes: Int64,
+        _ body: (AgentRunRepository.BoundedStreamEventSelection) throws -> T
+    ) throws -> T {
+        try withMirrorEventLock(threadId: threadId) {
+            try body(try runRepo.listLatestStreamEventsForThreadReadV1(
+                threadId: threadId,
+                eventLimit: eventLimit,
+                maxPayloadBytes: maxPayloadBytes,
+                strictDecoding: true
+            ))
+        }
+    }
+
+    /// Shared lock + flush so watermark capture cannot race a concurrent append.
+    private func withMirrorEventLock<T>(
+        threadId: AgentThreadID,
+        _ body: () throws -> T
     ) throws -> T {
         mirrorEventLock.lock()
         defer { mirrorEventLock.unlock() }
@@ -3038,11 +3076,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 throw error
             }
         }
-        return body(try runRepo.listLatestStreamEvents(
-            threadId: threadId,
-            limit: .max,
-            strictDecoding: true
-        ))
+        return try body()
     }
 
     public func activeThreadIdsSnapshot() -> Set<AgentThreadID> {

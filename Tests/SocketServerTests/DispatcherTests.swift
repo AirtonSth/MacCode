@@ -184,6 +184,13 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     var agentUserInputResponses: [(AgentThreadID, String, String)] = []
     var respondAgentUserInputCallCount = 0
     var readAgentEvents: [AssistantEvent] = []
+    var readAgentThreadMirrorSnapshotCallCount = 0
+    /// Captures the last `eventRowLimit` argument. `nil` means unbounded legacy.
+    var lastMirrorSnapshotEventRowLimit: Int?
+    /// Captures the last `maxPayloadBytes` argument. `nil` means legacy (no byte source bound).
+    var lastMirrorSnapshotMaxPayloadBytes: Int64?
+    /// Optional blocked-event metadata returned to v1 callers (simulates source refusal).
+    var mirrorBlockedEvent: AgentThreadMirrorSnapshot.BlockedMirrorEvent?
     var pendingCallbackSnapshot = AssistantPendingCallbacksSnapshot()
     var lastRollback: (AgentThreadID, String)?
     var rollbackCallCount = 0
@@ -468,10 +475,39 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func readAgentThreadEvents(thread: AgentThreadID) async throws -> [AssistantEvent] {
         readAgentEvents
     }
-    func readAgentThreadMirrorSnapshot(thread: AgentThreadID) async throws -> AgentThreadMirrorSnapshot {
-        AgentThreadMirrorSnapshot(
-            events: readAgentEvents,
-            eventWatermark: EventBus.shared.currentSeq
+    func readAgentThreadMirrorSnapshot(
+        thread: AgentThreadID,
+        eventRowLimit: Int?,
+        maxPayloadBytes: Int64?
+    ) async throws -> AgentThreadMirrorSnapshot {
+        readAgentThreadMirrorSnapshotCallCount += 1
+        lastMirrorSnapshotEventRowLimit = eventRowLimit
+        lastMirrorSnapshotMaxPayloadBytes = maxPayloadBytes
+        // Source already blocked the newest row (empty events + metadata).
+        if let blocked = mirrorBlockedEvent {
+            return AgentThreadMirrorSnapshot(
+                events: [],
+                eventWatermark: EventBus.shared.currentSeq,
+                sourceHadOlderEvents: true,
+                blockedEvent: blocked
+            )
+        }
+        // Mirror the production +1 probe: only expose `eventRowLimit` newest
+        // events and flag when older rows would remain at the source.
+        let hadOlder: Bool
+        let events: [AssistantEvent]
+        if let limit = eventRowLimit {
+            hadOlder = readAgentEvents.count > limit
+            events = Array(readAgentEvents.suffix(limit))
+        } else {
+            hadOlder = false
+            events = readAgentEvents
+        }
+        return AgentThreadMirrorSnapshot(
+            events: events,
+            eventWatermark: EventBus.shared.currentSeq,
+            sourceHadOlderEvents: hadOlder,
+            blockedEvent: nil
         )
     }
     func rollbackAgentThread(thread: AgentThreadID, toTurnId: String) async throws {
