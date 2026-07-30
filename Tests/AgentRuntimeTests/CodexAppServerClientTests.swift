@@ -562,6 +562,134 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual((params["sandboxPolicy"] as? [String: Any])?["type"] as? String, "dangerFullAccess")
     }
 
+    func test_startTurnSubagentSupervisedAddsNetworkAccessToReadOnlySandbox() async throws {
+        // WHY: Codex's seatbelt denies all network by default under readOnly/workspaceWrite,
+        // blocking the Token Saver ledger POST. Subagent runs get networkAccess added so the
+        // ledger POST can succeed; filesystem restrictions from readOnly are unaffected.
+        let script = try makeFakeAppServerPeer()
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path
+        )
+        defer { client.stop() }
+
+        _ = try await client.initialize()
+        let response = try await client.startTurn(
+            providerThreadId: "thread-app-server-1",
+            for: AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: "/tmp/remotecode-app-server-test",
+                prompt: "subagent supervised",
+                permissionMode: .supervised,
+                environment: ["RC_REMOTE_CODE_SUBAGENT_THREAD_ID": UUID().uuidString]
+            )
+        )
+
+        let params = try XCTUnwrap(response["lastParams"] as? [String: Any])
+        let sandboxPolicy = try XCTUnwrap(params["sandboxPolicy"] as? [String: Any])
+        XCTAssertEqual(sandboxPolicy["type"] as? String, "readOnly")
+        XCTAssertEqual(sandboxPolicy["networkAccess"] as? Bool, true)
+    }
+
+    func test_startTurnSubagentAutoAcceptEditsAddsNetworkAccessToWorkspaceWriteSandbox() async throws {
+        let script = try makeFakeAppServerPeer()
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path
+        )
+        defer { client.stop() }
+
+        _ = try await client.initialize()
+        let response = try await client.startTurn(
+            providerThreadId: "thread-app-server-1",
+            for: AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: "/tmp/remotecode-app-server-test",
+                prompt: "subagent workspace write",
+                permissionMode: .autoAcceptEdits,
+                environment: ["RC_REMOTE_CODE_SUBAGENT_THREAD_ID": UUID().uuidString]
+            )
+        )
+
+        let params = try XCTUnwrap(response["lastParams"] as? [String: Any])
+        let sandboxPolicy = try XCTUnwrap(params["sandboxPolicy"] as? [String: Any])
+        XCTAssertEqual(sandboxPolicy["type"] as? String, "workspaceWrite")
+        XCTAssertEqual(sandboxPolicy["networkAccess"] as? Bool, true)
+    }
+
+    func test_startTurnSubagentFullAccessNeverGetsNetworkAccessKey() async throws {
+        // WHY: Full Access has no seatbelt at all (already unrestricted). It must stay exactly
+        // {"type": "dangerFullAccess"} — adding networkAccess there would be meaningless and
+        // could mask a future protocol change silently.
+        let script = try makeFakeAppServerPeer()
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path
+        )
+        defer { client.stop() }
+
+        _ = try await client.initialize()
+        let response = try await client.startTurn(
+            providerThreadId: "thread-app-server-1",
+            for: AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: "/tmp/remotecode-app-server-test",
+                prompt: "subagent full access",
+                permissionMode: .fullAccess,
+                environment: ["RC_REMOTE_CODE_SUBAGENT_THREAD_ID": UUID().uuidString]
+            )
+        )
+
+        let params = try XCTUnwrap(response["lastParams"] as? [String: Any])
+        let sandboxPolicy = try XCTUnwrap(params["sandboxPolicy"] as? [String: Any])
+        XCTAssertEqual(sandboxPolicy["type"] as? String, "dangerFullAccess")
+        XCTAssertNil(sandboxPolicy["networkAccess"], "dangerFullAccess must never carry a networkAccess key")
+        XCTAssertEqual(sandboxPolicy.count, 1, "dangerFullAccess sandbox policy must stay exactly {type} for subagents too")
+    }
+
+    func test_startTurnPrimaryRunNeverGetsNetworkAccessKeyRegardlessOfPermissionMode() async throws {
+        // WHY: this is the byte-identical-baseline proof. Without the subagent marker, a
+        // primary (non-subagent) Codex run must send the exact same sandboxPolicy as before
+        // this change, for every permission mode — no networkAccess key at all.
+        let script = try makeFakeAppServerPeer()
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path
+        )
+        defer { client.stop() }
+
+        _ = try await client.initialize()
+        for mode: AgentPermissionMode in [.supervised, .autoAcceptEdits, .fullAccess] {
+            let response = try await client.startTurn(
+                providerThreadId: "thread-app-server-1",
+                for: AgentRunRequest(
+                    threadId: AgentThreadID(),
+                    provider: .codex,
+                    model: "gpt-5.5",
+                    cwd: "/tmp/remotecode-app-server-test",
+                    prompt: "primary run \(mode)",
+                    permissionMode: mode
+                )
+            )
+            let params = try XCTUnwrap(response["lastParams"] as? [String: Any])
+            let sandboxPolicy = try XCTUnwrap(params["sandboxPolicy"] as? [String: Any])
+            XCTAssertNil(
+                sandboxPolicy["networkAccess"],
+                "primary run in \(mode) must never carry networkAccess — only subagents do"
+            )
+        }
+    }
+
     func test_tokenSaverHint_drivesFullDistillSpecInDeveloperInstructions() async throws {
         let script = try makeFakeAppServerPeer()
         let client = try CodexAppServerClient(

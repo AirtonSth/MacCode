@@ -739,11 +739,12 @@ public final class CodexAppServerClient: @unchecked Sendable {
         }
 
         let model = normalizedModel(request.model)
+        let isSubagent = RemoteCodeSubagentTelemetryScope(environment: request.environment) != nil
         var params: JSONObject = [
             "threadId": providerThreadId,
             "input": input,
             "approvalPolicy": approvalPolicy(for: request.permissionMode),
-            "sandboxPolicy": sandboxPolicy(for: request.permissionMode),
+            "sandboxPolicy": sandboxPolicy(for: request.permissionMode, isSubagent: isSubagent),
             "collaborationMode": collaborationMode(for: request, normalizedModel: model)
         ]
         if let model { params["model"] = model }
@@ -888,11 +889,23 @@ public final class CodexAppServerClient: @unchecked Sendable {
         }
     }
 
-    private static func sandboxPolicy(for mode: AgentPermissionMode) -> JSONObject {
+    /// Subagent Codex runs get `networkAccess: true` added to the readOnly/workspaceWrite
+    /// sandbox policy so the local Token Saver ledger POST is not blocked by the seatbelt's
+    /// default network denial. This only lifts network — filesystem restrictions from the
+    /// underlying mode are unchanged. Full Access subagents are untouched (already
+    /// unsandboxed). Primary (non-subagent) runs are never affected by this parameter.
+    private static func sandboxPolicy(for mode: AgentPermissionMode, isSubagent: Bool = false) -> JSONObject {
         switch mode {
-        case .supervised: return ["type": "readOnly"]
-        case .autoAcceptEdits: return ["type": "workspaceWrite"]
-        case .fullAccess: return ["type": "dangerFullAccess"]
+        case .supervised:
+            var policy: JSONObject = ["type": "readOnly"]
+            if isSubagent { policy["networkAccess"] = true }
+            return policy
+        case .autoAcceptEdits:
+            var policy: JSONObject = ["type": "workspaceWrite"]
+            if isSubagent { policy["networkAccess"] = true }
+            return policy
+        case .fullAccess:
+            return ["type": "dangerFullAccess"]
         }
     }
 
