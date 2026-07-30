@@ -12,21 +12,23 @@ final class DistillInstructionsTemplateTests: XCTestCase {
         // allowlist, and a never-pipe list of exact-output tools. These assertions
         // pin that decision — they previously asserted its inverse and were red,
         // because the template changed and the test did not.
-        XCTAssertTrue(t.contains("Good to pipe:"),
-                      "the template must name the noisy-output cases that default to the managed CLI")
-        // WHY: WrappedCommandCatalog forced-wraps ~40 package-manager/build/test/lint/
-        // container commands automatically now. The provider must know most of the
-        // "Good to pipe" categories no longer need a manual `| distill` — the
-        // voluntary habit is the fallback for what the host does not already cover.
+        // WHY: Token Saver must require `| distill` on eligible noisy output for every
+        // admitted primary, same-provider subagent, and cross-provider nested run — not
+        // a soft "good to pipe" suggestion the model can ignore.
+        XCTAssertTrue(t.contains("MANDATORY") || t.contains("REQUIRED to pipe"),
+                      "the template must require piping eligible noisy commands")
+        XCTAssertTrue(t.contains("policy violation") || t.contains("Omitting `| distill`"),
+                      "omitting eligible | distill must be called out as a violation")
         XCTAssertTrue(t.contains("auto-compress via the host wrapper"),
-                      "the template must clarify that most listed categories are now automatically compressed")
-        XCTAssertTrue(t.contains("pipe anything else yourself"),
-                      "the template must frame manual piping as the fallback for what is not auto-compressed")
-        // WHY: a vague "pipe voluntarily" gave the provider no actionable rule for what to
-        // actually run — it must see the concrete `| distill "<question>"` syntax so a tool
-        // outside the auto-compressed set still gets piped correctly, not skipped or guessed.
-        XCTAssertTrue(t.contains("| distill \"<question>\"`."),
-                      "the fallback instruction must show the concrete pipe-with-question syntax, not just say 'pipe it'")
+                      "the template must clarify host PATH wrappers also compress catalog commands")
+        XCTAssertTrue(
+            t.contains("| distill \"<question>\""),
+            "the instruction must show the concrete pipe-with-question syntax"
+        )
+        XCTAssertTrue(
+            t.contains("primary agents") || t.contains("cross-provider") || t.contains("subagents"),
+            "policy must apply to primary, subagent, and cross-provider shapes"
+        )
         XCTAssertTrue(t.contains("NEVER pipe `| distill` for exact-output tools"),
                       "the template must forbid compressing output the agent consumes byte-exactly")
         XCTAssertTrue(t.contains("rg, grep"),
@@ -61,13 +63,19 @@ final class DistillInstructionsTemplateTests: XCTestCase {
         XCTAssertTrue(t.contains("distill retrieve <handle>"), "retrieve command documented")
         XCTAssertTrue(t.contains("[[rc:<handle>]]"), "handle marker documented so the agent knows how to recover originals")
         // F10: keep the always-loaded config block compact; examples live in SKILL.md.
-        XCTAssertLessThan(t.count, 2_000, "provider config must stay compact (skill-complete rule may add a few lines)")
+        // Raised slightly after MANDATORY/cross-provider wording (still compact vs full skill).
+        XCTAssertLessThan(t.count, 2_600, "provider config must stay compact (skill-complete rule may add a few lines)")
         XCTAssertFalse(t.contains("bun test 2>&1 | distill"), "examples belong in the managed skill")
         XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("bun test 2>&1 | distill"))
         XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("R0 micro"),
                       "full skill carries R0 dialect details")
         XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("NEVER Distill skill content"),
                       "full skill body also protects skill content as a verbatim category")
+        XCTAssertTrue(
+            AgentSkillInstaller.distillSkillTemplate.contains("MANDATORY")
+                || AgentSkillInstaller.distillSkillTemplate.contains("REQUIRED"),
+            "full skill body must also require | distill on eligible noisy commands"
+        )
         // Bounded by the managed markers.
         XCTAssertTrue(t.hasPrefix(AgentSkillInstaller.distillInstructionsBeginMarker))
         XCTAssertTrue(t.contains("<!-- distill skill: end -->"))

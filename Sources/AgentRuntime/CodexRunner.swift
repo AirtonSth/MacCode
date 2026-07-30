@@ -415,6 +415,23 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         } else {
             env = AgentHostEnvironmentMerge.stripHostInjects(from: env)
         }
+        // Re-assert managed bin first on PATH after login-shell / expandedPath merges.
+        // Host sets RC_REMOTE_CODE_MANAGED_BIN for thread-scoped provider launches so
+        // nested provider proxies and (when Token Saver is on) command wrappers win
+        // lookup. Without this, a login PATH overlay can bury or drop the managed dir
+        // before the child process starts (shell bridge re-prepends for zsh tools, but
+        // the provider process itself must also start with a correct PATH).
+        if case .agentTurn = purpose,
+           let managedBin = env["RC_REMOTE_CODE_MANAGED_BIN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !managedBin.isEmpty {
+            let current = env["PATH"] ?? ""
+            let parts = current
+                .split(separator: ":", omittingEmptySubsequences: false)
+                .map(String.init)
+                .filter { $0 != managedBin }
+            env["PATH"] = ([managedBin] + parts).joined(separator: ":")
+        }
         // Expose the `RefreshMcpTools` tool for Claude turns so the agent can pick
         // up remote MCP servers (Linear, etc.) that finish their async connect a
         // few seconds into the session — see mcpConnectWaitDirective. A caller-set

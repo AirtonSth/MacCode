@@ -159,6 +159,34 @@ final class CommandWrapPolicyTests: XCTestCase {
         )
     }
 
+    func test_decide_compressesTerminalCatalogCommandsForAllProvidersAndKeepsExactOutputRaw() {
+        // WHY: Codex/Grok (and Claude wrap path) share this seam — compressible catalog
+        // commands must compress when terminal; exact-output basenames never auto-compress.
+        let largeLines = 80
+        let largeBytes = 4_000
+        for command in ["ls", "find", "git", "gh", "npm", "docker"] {
+            XCTAssertEqual(
+                CommandWrapPolicy.decide(
+                    command: command,
+                    isTerminalToAgent: true,
+                    outputIsValidUTF8: true,
+                    byteCount: largeBytes,
+                    lineCount: largeLines,
+                    environment: noEnv
+                ),
+                .compress,
+                "\(command) must be wrap-compressible when terminal and above threshold"
+            )
+        }
+        for exact in ["rg", "grep", "cat", "head", "sed", "jq"] {
+            XCTAssertEqual(
+                CommandWrapPolicy.passthroughReason(command: exact, args: [], environment: noEnv),
+                "exact_output_command",
+                "\(exact) must remain full-stdout (never PATH-wrapped compress)"
+            )
+        }
+    }
+
     func test_extractionQuery_neutralExtractiveForCompressibleCommands() {
         for command in ["find", "ls", "git", "gh", "/usr/bin/git"] {
             let q = CommandWrapPolicy.extractionQuery(forCommand: command)

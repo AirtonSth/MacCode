@@ -480,6 +480,81 @@ public enum TokenSaverExecutionReceiptSeam {
             .flatMap(TokenSaverExecutionReceipt.decode(json:))
     }
 
+    /// Upgrade an admitted-but-sidecar-degraded receipt when the Distill sidecar
+    /// is healthy again. Nested / cross-provider launches and host re-stamps use
+    /// this so a sticky `sidecar_unavailable` decision cannot permanently leave
+    /// distill / managed_path off after the sidecar recovers.
+    ///
+    /// - Does **not** invent admission when Token Saver was off or cross-user.
+    /// - Retargets `provider` (and Claude-only `postToolUse`) for the child provider.
+    /// - Preserves root/thread/attempt identity, lanes, and recovery scope.
+    public static func reAdmitSidecarIfAvailable(
+        receipt: TokenSaverExecutionReceipt,
+        sidecarAvailable: Bool,
+        provider: AgentProvider,
+        waveLive: String? = nil
+    ) -> TokenSaverExecutionReceipt {
+        guard receipt.admitted, receipt.sameUser else { return receipt }
+        guard sidecarAvailable else {
+            // Still degraded: only retarget provider-specific postToolUse for children.
+            if receipt.provider == provider.rawValue { return receipt }
+            return admit(
+                tokenSaverEnabled: true,
+                sameUser: true,
+                sidecarAvailable: false,
+                provider: provider,
+                threadId: receipt.threadId,
+                rootRunId: receipt.rootRunId,
+                attemptId: receipt.attemptId,
+                workspaceId: receipt.workspaceId,
+                projectId: receipt.projectId,
+                disabledLanes: Set(receipt.disabledLanes),
+                enabledLanes: Set(receipt.enabledLanes),
+                waveLive: waveLive ?? receipt.waveLive,
+                graphifyActive: receipt.capabilities.graphify == true
+            )
+        }
+        // Already fully admitted for this provider — keep identity, refresh waveLive if supplied.
+        if receipt.denialReason == .none,
+           receipt.capabilities.distill == true,
+           receipt.capabilities.managedPath == true,
+           receipt.provider == provider.rawValue {
+            guard let waveLive, !waveLive.isEmpty, waveLive != receipt.waveLive else {
+                return receipt
+            }
+            return admit(
+                tokenSaverEnabled: true,
+                sameUser: true,
+                sidecarAvailable: true,
+                provider: provider,
+                threadId: receipt.threadId,
+                rootRunId: receipt.rootRunId,
+                attemptId: receipt.attemptId,
+                workspaceId: receipt.workspaceId,
+                projectId: receipt.projectId,
+                disabledLanes: Set(receipt.disabledLanes),
+                enabledLanes: Set(receipt.enabledLanes),
+                waveLive: waveLive,
+                graphifyActive: receipt.capabilities.graphify == true
+            )
+        }
+        return admit(
+            tokenSaverEnabled: true,
+            sameUser: true,
+            sidecarAvailable: true,
+            provider: provider,
+            threadId: receipt.threadId,
+            rootRunId: receipt.rootRunId,
+            attemptId: receipt.attemptId,
+            workspaceId: receipt.workspaceId,
+            projectId: receipt.projectId,
+            disabledLanes: Set(receipt.disabledLanes),
+            enabledLanes: Set(receipt.enabledLanes),
+            waveLive: waveLive ?? receipt.waveLive,
+            graphifyActive: receipt.capabilities.graphify == true
+        )
+    }
+
     /// Rebuild the discrete environment only from the signed-off receipt shape.
     /// A malformed, denied, or provider-mismatched receipt is scrubbed to raw.
     public static func propagate(

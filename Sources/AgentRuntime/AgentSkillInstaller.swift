@@ -241,9 +241,10 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     - Do not output a rewritten/compressed version of the latest user prompt unless the user explicitly asks to compress text.
     - Emit `Dict:` early only when aliases reduce repetition (never secrets/people/paths/URLs as aliases).
 
-    Command-output policy (Token Saver — compress eligible ordinary noisy output; never distill exact-payload tools or skill content):
-    - DEFAULT: pipe high-volume / noisy, pipable ordinary commands through the RemoteCode-managed `distill` CLI with an explicit extraction prompt and `pipefail` when exit status matters.
-      Good for: build, test, lint, install, docker, kubectl, terraform, find, ls (large listings), git log/status/diff (summaries), long CI logs.
+    Command-output policy (Token Saver — REQUIRED for eligible ordinary noisy output; never distill exact-payload tools or skill content):
+    - MANDATORY: for every high-volume / noisy / pipable ordinary command, pipe through the RemoteCode-managed `distill` CLI with an explicit extraction prompt and `pipefail` when exit status matters. Do not skip because the host wrapper "might" compress — if the command is eligible, end with `| distill "<question>"` unless an exact-output rule below forbids it.
+      Required for: build, test, lint, install, docker, kubectl, terraform, find, ls (large listings), git log/status/diff (summaries), package managers, long CI/logs, and any other noisy ordinary stdout that is not exact-output.
+      Many catalog commands also auto-compress via the host PATH wrapper; still pipe `| distill` yourself when the wrapper may not apply (compound scripts, python/bun one-shots, tools outside the wrap catalog, or when you need a targeted extraction question).
     - NEVER pipe `| distill` for exact-output commands — the agent needs the full stdout for the next step:
       search/match: rg, grep, egrep, fgrep, ag, ugrep, git grep
       line/stream edit or dump: sed, awk, cat, head, tail, nl, cut, tr, paste
@@ -252,7 +253,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
       Also skip for: patches/apply, hash/token copy, interactive/TUI, non-pipable calls, or unavailable RemoteCodeDistillService.
     - NEVER Distill skill content: Skill tool output and requested/returned SKILL.md bodies are a protected verbatim category — return them complete (no summary, recovery handle, truncation, or savings accounting).
     - Never call Node, tsx, npm, bun, or a source-checkout CLI for `distill`.
-    - When you skip `| distill`, state that briefly (e.g. skip: exact sed/rg output; skip: skill content).
+    - When you skip `| distill`, state that briefly (e.g. skip: exact sed/rg output; skip: skill content). Omitting `| distill` on eligible noisy commands is a policy violation.
+    - Applies to primary agents, same-provider subagents, and cross-provider nested launches (Claude↔Codex↔Grok) whenever Token Saver is admitted.
     - Host/runtime carries the ordinary-output Distill policy; do not require every worker prompt to restate it.
     - If a summary includes `[[rc:<handle>]]`, recover exact bytes with `distill retrieve <handle>`.
     - Wait for `distill` before continuing when you did pipe it.
@@ -275,8 +277,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     Prefixes when used: S=state, C=context, D=action, R=risk, O=outcome, N=no-go, P=proof.
     Dict/`#` vars only when they reduce repetition. Never alias secrets, people, IDs, paths, URLs.
     Do not return a rewritten/compressed copy of the user's prompt unless explicitly asked to compress text.
-    Token Saver — compress eligible ordinary noisy output via managed `distill` CLI with an explicit extraction prompt; use `pipefail` when exit status matters.
-    Good to pipe: build/test/lint/install/docker/kubectl/terraform, large find/ls, git log/status/diff summaries, long logs. Most now auto-compress via the host wrapper; pipe anything else yourself: `<cmd> | distill "<question>"`.
+    Token Saver — MANDATORY for eligible ordinary noisy output on primary agents, same-provider subagents, and cross-provider nested runs (Claude/Codex/Grok). Use managed `distill` with an explicit extraction prompt; use `pipefail` when exit status matters.
+    REQUIRED to pipe: build/test/lint/install/docker/kubectl/terraform, large find/ls, git log/status/diff summaries, package managers, long logs, and any noisy ordinary stdout that is not exact-output. Many catalog commands auto-compress via the host wrapper; still pipe yourself when the wrapper may not apply or you need a targeted question: `<cmd> | distill "<question>"`. Omitting `| distill` on eligible noisy commands is a policy violation.
     NEVER pipe `| distill` for exact-output tools (agent needs full stdout): rg, grep, egrep, fgrep, sed, awk, cat, head, tail, nl, cut, tr, diff, jq, yq, git grep/show/cat-file/blame; also patches/hashes/tokens, interactive/TUI, non-pipable, or service unavailable — state the skip briefly.
     NEVER Distill skill content: Skill tool output and requested/returned SKILL bodies must stay complete/verbatim (no summary, `[[rc:]]` handle, truncation, or savings accounting).
     Never invoke Node/tsx/npm/bun or a source-checkout `distill`.

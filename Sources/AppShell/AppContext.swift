@@ -1483,9 +1483,10 @@ public final class AppContext {
             environment: baseEnvironment,
             cliState: cliState
         )
-        // Installation is not readiness. A receipt may enable Distill only
-        // after the controller has received the sidecar ready event; otherwise
-        // nested providers must stay raw and fail open.
+        // Installation is not readiness. Prefer the controller's `.running`
+        // event, but also accept a live DistillCLIState lease so a lagging
+        // `.starting` / transient status mismatch cannot sticky-deny distill
+        // for primary and nested runs after the sidecar is already serving.
         let sidecarAvailable: Bool
         if case .running = tokenSaverDistillServiceController.status {
             sidecarAvailable = true
@@ -1505,6 +1506,13 @@ public final class AppContext {
             // Pure environment-matrix tests have no sidecar process to start.
             // Treat the untouched test controller as an injected-ready seam;
             // explicit failed/blocked states remain fail-open below.
+            sidecarAvailable = true
+        } else if case .blocked = tokenSaverDistillServiceController.status {
+            // Explicit eligibility block (subscription/model) must fail open.
+            sidecarAvailable = false
+        } else if TokenSaverSidecarLeaseProbe.isHealthy(stateFileURL: tokenSaverDistillCLIStateURL) {
+            // Controller lag: ready lease on disk while status is still starting
+            // or briefly notStarted after a restart.
             sidecarAvailable = true
         } else {
             sidecarAvailable = false

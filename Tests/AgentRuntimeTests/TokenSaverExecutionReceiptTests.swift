@@ -117,6 +117,85 @@ final class TokenSaverExecutionReceiptTests: XCTestCase {
         XCTAssertNotNil(environment[TokenSaverExecutionReceipt.envKey])
     }
 
+    func test_reAdmitSidecarIfAvailable_upgradesStickyDegradedReceiptForAllProviders() {
+        // WHY: a parent that launched while the sidecar was still starting must not
+        // permanently starve primary retries or nested Codex/Claude/Grok children of
+        // distill + managed_path after the lease becomes healthy.
+        for provider in [AgentProvider.claude, .codex, .grok] {
+            let degraded = receipt(provider: provider, sidecarAvailable: false)
+            let upgraded = TokenSaverExecutionReceiptSeam.reAdmitSidecarIfAvailable(
+                receipt: degraded,
+                sidecarAvailable: true,
+                provider: provider,
+                waveLive: "wave-a"
+            )
+            XCTAssertEqual(upgraded.denialReason, .none, "\(provider)")
+            XCTAssertEqual(upgraded.capabilities.distill, true, "\(provider)")
+            XCTAssertEqual(upgraded.capabilities.managedPath, true, "\(provider)")
+            XCTAssertEqual(upgraded.threadId, threadID)
+            XCTAssertEqual(upgraded.rootRunId, rootRunID)
+            XCTAssertEqual(upgraded.attemptId, attemptID)
+            let env = TokenSaverExecutionReceiptSeam.environment(from: upgraded)
+            XCTAssertEqual(env["RC_TOKEN_SAVER_DISTILL_HINT"], "1", "\(provider)")
+            XCTAssertEqual(env["RC_TOKEN_SAVER_WAVE_LIVE"], "wave-a", "\(provider)")
+            if provider == .claude {
+                XCTAssertEqual(upgraded.capabilities.postToolUse, true)
+                XCTAssertEqual(env["RC_TOKEN_SAVER_POST_TOOL_USE"], "1")
+            } else {
+                XCTAssertNil(upgraded.capabilities.postToolUse)
+                XCTAssertNil(env["RC_TOKEN_SAVER_POST_TOOL_USE"])
+            }
+        }
+    }
+
+    func test_reAdmitSidecarIfAvailable_retargetsCrossProviderAndRestoresClaudePostToolUse() {
+        // WHY: Grok/Codex parent degraded → Claude child after sidecar recovery must
+        // get PostToolUse; Claude parent → Grok child must drop it (no false claim).
+        let degradedGrok = receipt(provider: .grok, sidecarAvailable: false)
+        let toClaude = TokenSaverExecutionReceiptSeam.reAdmitSidecarIfAvailable(
+            receipt: degradedGrok,
+            sidecarAvailable: true,
+            provider: .claude
+        )
+        XCTAssertEqual(toClaude.provider, "claude")
+        XCTAssertEqual(toClaude.capabilities.distill, true)
+        XCTAssertEqual(toClaude.capabilities.postToolUse, true)
+
+        let healthyClaude = receipt(provider: .claude, sidecarAvailable: true)
+        let toGrok = TokenSaverExecutionReceiptSeam.reAdmitSidecarIfAvailable(
+            receipt: healthyClaude,
+            sidecarAvailable: true,
+            provider: .grok
+        )
+        XCTAssertEqual(toGrok.provider, "grok")
+        XCTAssertEqual(toGrok.capabilities.distill, true)
+        XCTAssertNil(toGrok.capabilities.postToolUse)
+    }
+
+    func test_reAdmitSidecarIfAvailable_doesNotInventAdmissionWhenStillUnavailable() {
+        // WHY: fail-open while the compressor is dead — no DISTILL_HINT resurrection.
+        let degraded = receipt(provider: .codex, sidecarAvailable: false)
+        let still = TokenSaverExecutionReceiptSeam.reAdmitSidecarIfAvailable(
+            receipt: degraded,
+            sidecarAvailable: false,
+            provider: .codex
+        )
+        XCTAssertEqual(still.denialReason, .sidecarUnavailable)
+        XCTAssertEqual(still.capabilities.distill, false)
+        XCTAssertNil(TokenSaverExecutionReceiptSeam.environment(from: still)["RC_TOKEN_SAVER_DISTILL_HINT"])
+    }
+
+    func test_allProvidersEmitDistillHintWhenSidecarAvailable() {
+        // WHY: provider-neutral admit signal must not be Claude-only.
+        for provider in [AgentProvider.claude, .codex, .grok] {
+            let admitted = receipt(provider: provider, sidecarAvailable: true)
+            let env = TokenSaverExecutionReceiptSeam.environment(from: admitted)
+            XCTAssertEqual(env["RC_TOKEN_SAVER_DISTILL_HINT"], "1", "\(provider)")
+            XCTAssertEqual(admitted.capabilities.managedPath, true, "\(provider)")
+            XCTAssertEqual(admitted.capabilities.distill, true, "\(provider)")
+        }
+    }
+
     func test_providerSpecificCapabilitiesKeepUnsupportedValuesUnknown() {
         // WHY: provider-neutral propagation must not claim a Claude-only hook
         // exists on Codex, Grok, or a future provider without explicit support.
@@ -241,6 +320,64 @@ final class TokenSaverExecutionReceiptTests: XCTestCase {
         XCTAssertNil(support[TokenSaverExecutionReceipt.envKey])
         XCTAssertNil(support["RC_TOKEN_SAVER_DISTILL_HINT"])
         XCTAssertNil(support["REMOTE_CODE_DISTILL_STATE_PATH"])
+    }
+
+    func test_processEnvironment_reassertsManagedBinOnPathForAllProviders() throws {
+        // WHY: login-shell PATH merge must not bury ~/.remote-code/bin; wrappers and
+        // nested provider proxies depend on managed bin winning PATH lookup.
+        let managedBin = "/tmp/rc-managed-bin-for-test"
+        for provider in [AgentProvider.claude, .codex, .grok] {
+            var overrides = TokenSaverExecutionReceiptSeam.environment(
+                from: receipt(provider: provider, sidecarAvailable: true)
+            )
+            overrides["RC_REMOTE_CODE_MANAGED_BIN"] = managedBin
+            overrides["PATH"] = "/usr/bin:/bin"
+            let env = CodexRunner.processEnvironment(
+                overrides: overrides,
+                purpose: .agentTurn(provider),
+                base: [
+                    "HOME": "/tmp/home",
+                    "PATH": "/opt/homebrew/bin",
+                    "RC_LOGIN_SHELL_ENV_IMPORT": "0",
+                ]
+            )
+            let path = try XCTUnwrap(env["PATH"])
+            XCTAssertTrue(path.hasPrefix(managedBin + ":") || path == managedBin, "\(provider): \(path)")
+            XCTAssertEqual(env["RC_TOKEN_SAVER_DISTILL_HINT"], "1", "\(provider)")
+        }
+    }
+
+    func test_nestedCrossProviderEnvironmentKeepsDistillWhenParentAdmitted() throws {
+        // WHY: same-provider and cross-provider nested shapes share the provider-neutral
+        // admit signal — never gate on "is subagent".
+        let parent = receipt(provider: .codex, sidecarAvailable: true)
+        var parentEnv = TokenSaverExecutionReceiptSeam.environment(from: parent)
+        parentEnv["REMOTE_CODE_AGENT_PROVIDER"] = "codex"
+        parentEnv["RC_REMOTE_CODE_MANAGED_BIN"] = "/tmp/managed"
+
+        // Same-provider nested: propagate rebuilds discrete keys from receipt.
+        let same = TokenSaverExecutionReceiptSeam.propagate(into: parentEnv, provider: .codex)
+        XCTAssertEqual(same["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
+
+        // Cross-provider: re-admit to Grok keeps distill; no false PostToolUse.
+        let toGrok = TokenSaverExecutionReceiptSeam.reAdmitSidecarIfAvailable(
+            receipt: parent,
+            sidecarAvailable: true,
+            provider: .grok
+        )
+        let grokEnv = TokenSaverExecutionReceiptSeam.environment(from: toGrok)
+        XCTAssertEqual(grokEnv["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
+        XCTAssertNil(grokEnv["RC_TOKEN_SAVER_POST_TOOL_USE"])
+
+        // Cross-provider to Claude restores PostToolUse when sidecar healthy.
+        let toClaude = TokenSaverExecutionReceiptSeam.reAdmitSidecarIfAvailable(
+            receipt: parent,
+            sidecarAvailable: true,
+            provider: .claude
+        )
+        let claudeEnv = TokenSaverExecutionReceiptSeam.environment(from: toClaude)
+        XCTAssertEqual(claudeEnv["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
+        XCTAssertEqual(claudeEnv["RC_TOKEN_SAVER_POST_TOOL_USE"], "1")
     }
 
     func test_secretOrContentShapedReceiptIsRejectedAndScrubbed() throws {

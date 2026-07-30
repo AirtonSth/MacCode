@@ -385,35 +385,83 @@ enum ProviderProxyRunner {
                 return nil
             }
             let parent = admission.receipt
-            let childCapabilities = TokenSaverExecutionReceipt.Capabilities(
-                distill: parent.capabilities.distill,
-                graphify: admission.graphifyActive,
-                postToolUse: ProviderProxyPolicy.childPostToolUseCapability(
-                    targetProvider: targetProvider,
-                    distillAvailable: parent.capabilities.distill == true
-                ),
-                recoveryScope: parent.capabilities.recoveryScope,
-                managedPath: parent.capabilities.managedPath
+            // Nested launch re-probes the Distill lease so a parent that started
+            // while the sidecar was still starting does not permanently starve
+            // child Codex/Claude/Grok processes of distill + managed_path.
+            let statePath = providerDistillStatePath(environment: environment)
+            let sidecarLive = TokenSaverSidecarLeaseProbe.isHealthy(
+                stateFileURL: statePath.map { URL(fileURLWithPath: $0) }
             )
-            let retargeted = TokenSaverExecutionReceipt(
+            let seed = TokenSaverExecutionReceipt(
                 rootRunId: childId,
                 threadId: parent.threadId,
                 attemptId: childId,
-                provider: targetProvider.rawValue,
+                provider: parent.provider,
                 admitted: parent.admitted,
                 sameUser: parent.sameUser,
                 denialReason: parent.denialReason,
-                capabilities: childCapabilities,
+                capabilities: parent.capabilities,
                 disabledLanes: parent.disabledLanes,
                 enabledLanes: parent.enabledLanes,
                 workspaceId: parent.workspaceId,
                 projectId: parent.projectId,
                 waveLive: parent.waveLive
             )
-            var childRuntime = TokenSaverExecutionReceiptSeam.environment(from: retargeted)
+            let retargeted = TokenSaverExecutionReceiptSeam.reAdmitSidecarIfAvailable(
+                receipt: seed,
+                sidecarAvailable: sidecarLive || parent.capabilities.distill == true,
+                provider: targetProvider,
+                waveLive: parent.waveLive
+            )
+            // Graphify stays gated by live settings, not only the parent snapshot.
+            let graphifyActive = admission.graphifyActive
+                && retargeted.capabilities.graphify == true
+            let childCapabilities = TokenSaverExecutionReceipt.Capabilities(
+                distill: retargeted.capabilities.distill,
+                graphify: graphifyActive,
+                postToolUse: ProviderProxyPolicy.childPostToolUseCapability(
+                    targetProvider: targetProvider,
+                    distillAvailable: retargeted.capabilities.distill == true
+                ),
+                recoveryScope: retargeted.capabilities.recoveryScope,
+                managedPath: retargeted.capabilities.managedPath
+            )
+            let childReceipt = TokenSaverExecutionReceipt(
+                rootRunId: childId,
+                threadId: retargeted.threadId,
+                attemptId: childId,
+                provider: targetProvider.rawValue,
+                admitted: retargeted.admitted,
+                sameUser: retargeted.sameUser,
+                denialReason: retargeted.denialReason,
+                capabilities: childCapabilities,
+                disabledLanes: retargeted.disabledLanes,
+                enabledLanes: retargeted.enabledLanes,
+                workspaceId: retargeted.workspaceId,
+                projectId: retargeted.projectId,
+                waveLive: retargeted.waveLive
+            )
+            var childRuntime = TokenSaverExecutionReceiptSeam.environment(from: childReceipt)
             if childCapabilities.postToolUse == true,
-               let statePath = providerDistillStatePath(environment: environment) {
+               let statePath {
                 childRuntime["REMOTE_CODE_DISTILL_STATE_PATH"] = statePath
+            }
+            // Child process PATH must put managed wrappers first when distill is admitted.
+            if childCapabilities.managedPath == true {
+                let managedBin = environment["RC_REMOTE_CODE_MANAGED_BIN"]?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let bin = (managedBin?.isEmpty == false)
+                    ? managedBin!
+                    : AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+                let current = environment["PATH"]
+                    ?? ProcessInfo.processInfo.environment["PATH"]
+                    ?? ""
+                let parts = current
+                    .split(separator: ":", omittingEmptySubsequences: false)
+                    .map(String.init)
+                    .filter { $0 != bin }
+                childRuntime["PATH"] = ([bin] + parts).joined(separator: ":")
+                childRuntime["RC_REMOTE_CODE_MANAGED_BIN"] = bin
             }
             return childRuntime
         }()
