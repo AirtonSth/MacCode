@@ -456,7 +456,7 @@ public final class UnixSocketServer: @unchecked Sendable {
                 if let localRequestHandlerForTesting {
                     response = await localRequestHandlerForTesting(req)
                 } else {
-                    response = await dispatcher.dispatchLocalIPC(req)
+                    response = await dispatcher.dispatchUnixSocket(req)
                 }
                 slot.value = response
                 semaphore.signal()

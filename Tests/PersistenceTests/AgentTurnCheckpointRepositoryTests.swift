@@ -887,4 +887,87 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
             )
         }
     }
+
+    func testCatalogRevisionIncrementsTransactionallyWithInsertUpsertDelete() throws {
+        // WHY: page fences must move with every mutation that can change list
+        // fields/order; a non-transactional or O(N) digest would mix revisions.
+        let db = try makeDB()
+        let repo = AgentTurnCheckpointRepository(db: db)
+        let (tid, rid) = try seedThreadAndRun(db: db)
+        let before = try AgentTurnCheckpointCatalogRevision.current(db: db)
+
+        try repo.upsert(makeHeavyCheckpoint(
+            threadId: tid,
+            turnCount: 1,
+            turnId: "rev-insert",
+            runId: rid,
+            completedAt: Date(timeIntervalSince1970: 1_700_002_000)
+        ))
+        let afterInsert = try AgentTurnCheckpointCatalogRevision.current(db: db)
+        XCTAssertGreaterThan(afterInsert, before)
+
+        try repo.upsert(makeHeavyCheckpoint(
+            threadId: tid,
+            turnCount: 1,
+            turnId: "rev-insert",
+            runId: rid,
+            completedAt: Date(timeIntervalSince1970: 1_700_002_001)
+        ))
+        let afterUpsert = try AgentTurnCheckpointCatalogRevision.current(db: db)
+        XCTAssertGreaterThan(afterUpsert, afterInsert)
+
+        try repo.upsert(makeHeavyCheckpoint(
+            threadId: tid,
+            turnCount: 2,
+            turnId: "rev-second",
+            runId: rid,
+            completedAt: Date(timeIntervalSince1970: 1_700_002_002)
+        ))
+        let page = try repo.listMetadataPage(threadId: tid, maxEntries: 10, before: nil)
+        XCTAssertEqual(page.catalogRevision, try AgentTurnCheckpointCatalogRevision.current(db: db))
+        XCTAssertEqual(page.items.count, 2)
+
+        try repo.deleteAfter(threadId: tid, checkpointTurnCount: 1)
+        let afterDelete = try AgentTurnCheckpointCatalogRevision.current(db: db)
+        XCTAssertGreaterThan(afterDelete, page.catalogRevision)
+        let page2 = try repo.listMetadataPage(threadId: tid, maxEntries: 10, before: nil)
+        XCTAssertEqual(page2.catalogRevision, afterDelete)
+        XCTAssertEqual(page2.items.count, 1)
+    }
+
+    func testListMetadataPageRevisionStableAcrossSameRevisionRetry() throws {
+        let db = try makeDB()
+        let repo = AgentTurnCheckpointRepository(db: db)
+        let (tid, rid) = try seedThreadAndRun(db: db)
+        let base = Date(timeIntervalSince1970: 1_700_002_100.25)
+        for n in 1...5 {
+            try repo.upsert(makeHeavyCheckpoint(
+                threadId: tid,
+                turnCount: n,
+                turnId: "stable-\(n)",
+                runId: rid,
+                completedAt: base.addingTimeInterval(TimeInterval(n))
+            ))
+        }
+        let first = try repo.listMetadataPage(threadId: tid, maxEntries: 2, before: nil)
+        XCTAssertTrue(first.truncated)
+        let cursor = try XCTUnwrap(first.nextBefore)
+        let second = try repo.listMetadataPage(
+            threadId: tid,
+            maxEntries: 2,
+            before: cursor
+        )
+        XCTAssertEqual(second.catalogRevision, first.catalogRevision)
+        let retry = try repo.listMetadataPage(
+            threadId: tid,
+            maxEntries: 2,
+            before: cursor
+        )
+        XCTAssertEqual(retry.catalogRevision, first.catalogRevision)
+        XCTAssertEqual(
+            retry.items.map(\.turnId),
+            second.items.map(\.turnId),
+            "same-revision retry must be stable"
+        )
+    }
 }

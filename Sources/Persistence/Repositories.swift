@@ -4094,110 +4094,116 @@ public final class AgentTurnCheckpointRepository {
         before cursor: AgentTurnCheckpointCursor?
     ) throws -> AgentTurnCheckpointPage {
         let limit = max(1, min(maxEntries, AgentTurnCheckpointListWireProjection.maxEntries))
-        // WHY: only capture-bounded list_* fields and explicitly capped small
-        // scalars may cross the SQLite/Swift boundary. Authoritative raw metadata
-        // must stay untouched even for ordering/cursors.
-        let selectList = """
-            SELECT
-                   CASE WHEN length(CAST(thread_id AS BLOB)) <= 36 THEN thread_id END,
-                   length(CAST(thread_id AS BLOB)),
-                   CASE WHEN length(CAST(run_id AS BLOB)) <= 36 THEN run_id END,
-                   length(CAST(run_id AS BLOB)),
-                   CASE WHEN length(CAST(list_turn_id AS BLOB)) <= \(AgentTurnCheckpointWireIdentity.maximumEncodedTurnIDBytes) THEN list_turn_id END,
-                   length(CAST(list_turn_id AS BLOB)),
-                   list_turn_id_encoded_bytes,
-                   CASE WHEN length(CAST(list_turn_id_sha256 AS BLOB)) <= 64 THEN list_turn_id_sha256 END,
-                   COALESCE(length(CAST(list_turn_id_sha256 AS BLOB)), 0),
-                   list_turn_id_truncated,
-                   checkpoint_turn_count,
-                   CASE WHEN length(CAST(list_checkpoint_ref AS BLOB)) <= \(AgentTurnCheckpointListWireProjection.maxEncodedCheckpointRefBytes) THEN list_checkpoint_ref END,
-                   length(CAST(list_checkpoint_ref AS BLOB)),
-                   list_checkpoint_ref_encoded_bytes,
-                   CASE WHEN length(CAST(list_checkpoint_ref_sha256 AS BLOB)) <= 64 THEN list_checkpoint_ref_sha256 END,
-                   COALESCE(length(CAST(list_checkpoint_ref_sha256 AS BLOB)), 0),
-                   list_checkpoint_ref_truncated,
-                   CASE WHEN length(CAST(status AS BLOB)) <= 16 THEN status END,
-                   length(CAST(status AS BLOB)),
-                   CASE WHEN length(CAST(files_summary_json AS BLOB)) <= \(AgentTurnCheckpointListWireProjection.maxEncodedFilesBytes) THEN files_summary_json END,
-                   length(CAST(files_summary_json AS BLOB)),
-                   files_summary_truncated,
-                   CASE WHEN length(CAST(assistant_message_id AS BLOB)) <= 36 THEN assistant_message_id END,
-                   COALESCE(length(CAST(assistant_message_id AS BLOB)), 0),
-                   CASE WHEN length(CAST(list_error_message AS BLOB)) <= \(AgentTurnCheckpointListWireProjection.maxEncodedErrorMessageBytes) THEN list_error_message END,
-                   COALESCE(length(CAST(list_error_message AS BLOB)), 0),
-                   list_error_message_encoded_bytes,
-                   CASE WHEN length(CAST(list_error_message_sha256 AS BLOB)) <= 64 THEN list_error_message_sha256 END,
-                   COALESCE(length(CAST(list_error_message_sha256 AS BLOB)), 0),
-                   list_error_message_truncated,
-                   CASE WHEN length(CAST(list_completed_at AS BLOB)) <= 24 THEN list_completed_at END,
-                   length(CAST(list_completed_at AS BLOB)),
-                   list_metadata_unavailable
-            FROM agent_turn_checkpoints
-            """
-        let sql: String
-        if cursor == nil {
-            sql = """
-            \(selectList)
-            WHERE thread_id = ?
-            ORDER BY checkpoint_turn_count DESC, list_completed_at DESC, list_turn_id DESC
-            LIMIT ?;
-            """
-        } else {
-            sql = """
-            \(selectList)
-            WHERE thread_id = ?
-              AND (
-                checkpoint_turn_count < ?
-                OR (checkpoint_turn_count = ? AND list_completed_at < ?)
-                OR (checkpoint_turn_count = ? AND list_completed_at = ? AND list_turn_id < ?)
-              )
-            ORDER BY checkpoint_turn_count DESC, list_completed_at DESC, list_turn_id DESC
-            LIMIT ?;
-            """
-        }
-        let st = try db.prepare(sql)
-        try st.bind(1, threadId.value.uuidString)
-        if let cursor {
-            let completed = completedAtKeysetToken(for: cursor)
-            try st.bind(2, Int64(cursor.checkpointTurnCount))
-            try st.bind(3, Int64(cursor.checkpointTurnCount))
-            try st.bind(4, completed)
-            try st.bind(5, Int64(cursor.checkpointTurnCount))
-            try st.bind(6, completed)
-            try st.bind(7, cursor.turnId)
-            try st.bind(8, Int64(limit + 1))
-        } else {
-            try st.bind(2, Int64(limit + 1))
-        }
-        var rows: [(
-            summary: AgentTurnCheckpointSummary,
-            filesTruncated: Bool,
-            listMetadata: AgentTurnCheckpointListWireProjection.Capture,
-            completedAtToken: String
-        )] = []
-        while try st.step() {
-            rows.append(try decodeCheckpointMetadata(from: st, fallbackThreadId: threadId))
-        }
-        let truncated = rows.count > limit
-        let pageRows = Array(rows.prefix(limit))
-        let items = pageRows.map(\.summary)
-        let nextBefore: AgentTurnCheckpointCursor? = {
-            guard truncated, let last = pageRows.last else { return nil }
-            return AgentTurnCheckpointCursor(
-                checkpointTurnCount: last.summary.checkpointTurnCount,
-                completedAt: last.summary.completedAt,
-                turnId: last.summary.turnId,
-                completedAtToken: last.completedAtToken
+        // Snapshot revision + page rows under one transaction so a concurrent
+        // mutation cannot splice two catalog generations into one response.
+        return try db.transaction {
+            let catalogRevision = try AgentTurnCheckpointCatalogRevision.current(db: db)
+            // WHY: only capture-bounded list_* fields and explicitly capped small
+            // scalars may cross the SQLite/Swift boundary. Authoritative raw metadata
+            // must stay untouched even for ordering/cursors.
+            let selectList = """
+                SELECT
+                       CASE WHEN length(CAST(thread_id AS BLOB)) <= 36 THEN thread_id END,
+                       length(CAST(thread_id AS BLOB)),
+                       CASE WHEN length(CAST(run_id AS BLOB)) <= 36 THEN run_id END,
+                       length(CAST(run_id AS BLOB)),
+                       CASE WHEN length(CAST(list_turn_id AS BLOB)) <= \(AgentTurnCheckpointWireIdentity.maximumEncodedTurnIDBytes) THEN list_turn_id END,
+                       length(CAST(list_turn_id AS BLOB)),
+                       list_turn_id_encoded_bytes,
+                       CASE WHEN length(CAST(list_turn_id_sha256 AS BLOB)) <= 64 THEN list_turn_id_sha256 END,
+                       COALESCE(length(CAST(list_turn_id_sha256 AS BLOB)), 0),
+                       list_turn_id_truncated,
+                       checkpoint_turn_count,
+                       CASE WHEN length(CAST(list_checkpoint_ref AS BLOB)) <= \(AgentTurnCheckpointListWireProjection.maxEncodedCheckpointRefBytes) THEN list_checkpoint_ref END,
+                       length(CAST(list_checkpoint_ref AS BLOB)),
+                       list_checkpoint_ref_encoded_bytes,
+                       CASE WHEN length(CAST(list_checkpoint_ref_sha256 AS BLOB)) <= 64 THEN list_checkpoint_ref_sha256 END,
+                       COALESCE(length(CAST(list_checkpoint_ref_sha256 AS BLOB)), 0),
+                       list_checkpoint_ref_truncated,
+                       CASE WHEN length(CAST(status AS BLOB)) <= 16 THEN status END,
+                       length(CAST(status AS BLOB)),
+                       CASE WHEN length(CAST(files_summary_json AS BLOB)) <= \(AgentTurnCheckpointListWireProjection.maxEncodedFilesBytes) THEN files_summary_json END,
+                       length(CAST(files_summary_json AS BLOB)),
+                       files_summary_truncated,
+                       CASE WHEN length(CAST(assistant_message_id AS BLOB)) <= 36 THEN assistant_message_id END,
+                       COALESCE(length(CAST(assistant_message_id AS BLOB)), 0),
+                       CASE WHEN length(CAST(list_error_message AS BLOB)) <= \(AgentTurnCheckpointListWireProjection.maxEncodedErrorMessageBytes) THEN list_error_message END,
+                       COALESCE(length(CAST(list_error_message AS BLOB)), 0),
+                       list_error_message_encoded_bytes,
+                       CASE WHEN length(CAST(list_error_message_sha256 AS BLOB)) <= 64 THEN list_error_message_sha256 END,
+                       COALESCE(length(CAST(list_error_message_sha256 AS BLOB)), 0),
+                       list_error_message_truncated,
+                       CASE WHEN length(CAST(list_completed_at AS BLOB)) <= 24 THEN list_completed_at END,
+                       length(CAST(list_completed_at AS BLOB)),
+                       list_metadata_unavailable
+                FROM agent_turn_checkpoints
+                """
+            let sql: String
+            if cursor == nil {
+                sql = """
+                \(selectList)
+                WHERE thread_id = ?
+                ORDER BY checkpoint_turn_count DESC, list_completed_at DESC, list_turn_id DESC
+                LIMIT ?;
+                """
+            } else {
+                sql = """
+                \(selectList)
+                WHERE thread_id = ?
+                  AND (
+                    checkpoint_turn_count < ?
+                    OR (checkpoint_turn_count = ? AND list_completed_at < ?)
+                    OR (checkpoint_turn_count = ? AND list_completed_at = ? AND list_turn_id < ?)
+                  )
+                ORDER BY checkpoint_turn_count DESC, list_completed_at DESC, list_turn_id DESC
+                LIMIT ?;
+                """
+            }
+            let st = try db.prepare(sql)
+            try st.bind(1, threadId.value.uuidString)
+            if let cursor {
+                let completed = completedAtKeysetToken(for: cursor)
+                try st.bind(2, Int64(cursor.checkpointTurnCount))
+                try st.bind(3, Int64(cursor.checkpointTurnCount))
+                try st.bind(4, completed)
+                try st.bind(5, Int64(cursor.checkpointTurnCount))
+                try st.bind(6, completed)
+                try st.bind(7, cursor.turnId)
+                try st.bind(8, Int64(limit + 1))
+            } else {
+                try st.bind(2, Int64(limit + 1))
+            }
+            var rows: [(
+                summary: AgentTurnCheckpointSummary,
+                filesTruncated: Bool,
+                listMetadata: AgentTurnCheckpointListWireProjection.Capture,
+                completedAtToken: String
+            )] = []
+            while try st.step() {
+                rows.append(try decodeCheckpointMetadata(from: st, fallbackThreadId: threadId))
+            }
+            let truncated = rows.count > limit
+            let pageRows = Array(rows.prefix(limit))
+            let items = pageRows.map(\.summary)
+            let nextBefore: AgentTurnCheckpointCursor? = {
+                guard truncated, let last = pageRows.last else { return nil }
+                return AgentTurnCheckpointCursor(
+                    checkpointTurnCount: last.summary.checkpointTurnCount,
+                    completedAt: last.summary.completedAt,
+                    turnId: last.summary.turnId,
+                    completedAtToken: last.completedAtToken
+                )
+            }()
+            return AgentTurnCheckpointPage(
+                items: items,
+                filesTruncated: pageRows.map(\.filesTruncated),
+                listMetadata: pageRows.map(\.listMetadata),
+                completedAtTokens: pageRows.map(\.completedAtToken),
+                truncated: truncated,
+                nextBefore: nextBefore,
+                catalogRevision: catalogRevision
             )
-        }()
-        return AgentTurnCheckpointPage(
-            items: items,
-            filesTruncated: pageRows.map(\.filesTruncated),
-            listMetadata: pageRows.map(\.listMetadata),
-            completedAtTokens: pageRows.map(\.completedAtToken),
-            truncated: truncated,
-            nextBefore: nextBefore
-        )
+        }
     }
 
     /// Prefer the exact echoed/storage token; fall back to fractional format for

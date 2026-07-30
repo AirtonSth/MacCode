@@ -53,14 +53,18 @@ public protocol DirectAuthProvider: AnyObject {
 /// capabilities, authenticated HTTP capabilities, and `system.capabilities`.
 /// Single source so the three surfaces cannot drift on response budgets.
 /// `max_response_bytes` caps one complete JSON-RPC response item, including its
-/// echoed id. A top-level HTTP batch is transport aggregation of independent
-/// response items and remains subject to the server's separate HTTP body cap.
+/// echoed id. Top-level HTTP batches and nested `rpc.batch` reject this method
+/// entirely; aggregate batch ceilings live on `AgentCheckpointListContract`.
 public enum AgentCheckpointListCapabilityV1 {
-    public static let responseVersion = 1
-    public static let maxEntries = AgentTurnCheckpointListWireProjection.maxEntries
-    public static let maxItemBytes = AgentTurnCheckpointListWireProjection.maxEncodedItemBytes
-    public static let maxResponseBytes = AgentTurnCheckpointListWireProjection.maxEncodedResponseBytes
+    public static let responseVersion = AgentCheckpointListContract.responseVersion
+    public static let maxEntries = AgentCheckpointListContract.maxEntries
+    public static let maxItemBytes = AgentCheckpointListContract.maxEncodedItemBytes
+    public static let maxResponseBytes = AgentCheckpointListContract.maxEncodedResponseBytes
+    public static let maxRequestBytes = AgentCheckpointListContract.maxEncodedRequestBytes
     public static let metadataOnly = true
+    public static let transport = "http_jsonrpc_only"
+    public static let sessionRecovery = AgentCheckpointListContract.sessionRecovery
+    public static let catalogRevision = true
 
     public static var foundationObject: [String: Any] {
         [
@@ -68,7 +72,11 @@ public enum AgentCheckpointListCapabilityV1 {
             "max_entries": maxEntries,
             "max_item_bytes": maxItemBytes,
             "max_response_bytes": maxResponseBytes,
+            "max_request_bytes": maxRequestBytes,
             "metadata_only": metadataOnly,
+            "transport": transport,
+            "catalog_revision": catalogRevision,
+            "session_recovery": sessionRecovery,
         ]
     }
 
@@ -78,7 +86,11 @@ public enum AgentCheckpointListCapabilityV1 {
             "max_entries": .number(Double(maxEntries)),
             "max_item_bytes": .number(Double(maxItemBytes)),
             "max_response_bytes": .number(Double(maxResponseBytes)),
+            "max_request_bytes": .number(Double(maxRequestBytes)),
             "metadata_only": .bool(metadataOnly),
+            "transport": .string(transport),
+            "catalog_revision": .bool(catalogRevision),
+            "session_recovery": .string(sessionRecovery),
         ])
     }
 }
@@ -3196,6 +3208,30 @@ public final class DirectHTTPServer: @unchecked Sendable {
         bodyData: Data,
         ownerFingerprint: String? = nil
     ) async -> Data {
+        await dispatchRPC(
+            bodyData: bodyData,
+            ownerFingerprint: ownerFingerprint,
+            wireTransport: .http
+        )
+    }
+
+    /// WebSocket JSON-RPC entry: same framing as HTTP, but checkpoint list is forbidden.
+    public func dispatchRPCOverWebSocket(
+        bodyData: Data,
+        ownerFingerprint: String? = nil
+    ) async -> Data {
+        await dispatchRPC(
+            bodyData: bodyData,
+            ownerFingerprint: ownerFingerprint,
+            wireTransport: .webSocket
+        )
+    }
+
+    private func dispatchRPC(
+        bodyData: Data,
+        ownerFingerprint: String?,
+        wireTransport: AgentCheckpointListContract.WireTransport
+    ) async -> Data {
         let ownerFingerprint = ownerFingerprint
             ?? Self.connectionOwnerFingerprint(token: nil)
         let root: Any
@@ -3209,23 +3245,91 @@ public final class DirectHTTPServer: @unchecked Sendable {
             guard !batch.isEmpty else {
                 return rpcErrorData(.invalidRequest, id: NSNull())
             }
+            // Finite batch item count (general cap).
+            if batch.count > AgentCheckpointListContract.maxBatchItems {
+                return rpcErrorData(
+                    JSONRPCError(
+                        code: -32600,
+                        message: "JSON-RPC batch exceeds max item count.",
+                        data: .object([
+                            "reason": .string("max_batch_items"),
+                            "max_batch_items": .number(
+                                Double(AgentCheckpointListContract.maxBatchItems)
+                            ),
+                            "batch_items": .number(Double(batch.count)),
+                        ])
+                    ),
+                    id: NSNull()
+                )
+            }
+            if bodyData.count > AgentCheckpointListContract.maxBatchRequestBytes {
+                return rpcErrorData(
+                    JSONRPCError(
+                        code: -32602,
+                        message: "JSON-RPC batch exceeds max_request_bytes.",
+                        data: .object([
+                            "reason": .string("max_batch_request_bytes"),
+                            "max_request_bytes": .number(
+                                Double(AgentCheckpointListContract.maxBatchRequestBytes)
+                            ),
+                            "request_bytes": .number(Double(bodyData.count)),
+                        ])
+                    ),
+                    id: NSNull()
+                )
+            }
+            // Reject checkpoint list in any item before any sibling executes.
             var seenIDs = Set<String>()
             for item in batch {
-                guard let object = item as? [String: Any],
-                      let (_, key) = strictRPCID(object["id"], keyIsPresent: object.keys.contains("id")) else {
-                    continue
-                }
-                guard seenIDs.insert(key).inserted else {
+                guard let object = item as? [String: Any] else {
                     return rpcErrorData(.invalidRequest, id: NSNull())
+                }
+                if let method = object["method"] as? String {
+                    do {
+                        try AgentCheckpointListContract.preflightTransport(
+                            method: method,
+                            transport: wireTransport,
+                            inBatch: true
+                        )
+                    } catch let error as JSONRPCError {
+                        return rpcErrorData(error, id: NSNull())
+                    } catch {
+                        return rpcErrorData(.invalidRequest, id: NSNull())
+                    }
+                }
+                if let (_, key) = strictRPCID(object["id"], keyIsPresent: object.keys.contains("id")) {
+                    guard seenIDs.insert(key).inserted else {
+                        return rpcErrorData(.invalidRequest, id: NSNull())
+                    }
                 }
             }
             var responses: [[String: Any]] = []
             responses.reserveCapacity(batch.count)
+            var aggregateBytes = 0
             for item in batch {
-                responses.append(await dispatchStrictRPCItem(
+                let response = await dispatchStrictRPCItem(
                     item,
-                    ownerFingerprint: ownerFingerprint
-                ))
+                    ownerFingerprint: ownerFingerprint,
+                    wireTransport: wireTransport
+                )
+                let encoded = rpcJSONData(response)
+                aggregateBytes += encoded.count
+                if aggregateBytes > AgentCheckpointListContract.maxBatchAggregateResponseBytes {
+                    return rpcErrorData(
+                        JSONRPCError(
+                            code: -32603,
+                            message: "JSON-RPC batch aggregate response exceeds max_response_bytes.",
+                            data: .object([
+                                "reason": .string("max_batch_aggregate_response_bytes"),
+                                "max_response_bytes": .number(
+                                    Double(AgentCheckpointListContract.maxBatchAggregateResponseBytes)
+                                ),
+                            ])
+                        ),
+                        id: NSNull()
+                    )
+                }
+                responses.append(response)
             }
             return rpcJSONData(responses)
         }
@@ -3264,13 +3368,15 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
         return rpcJSONData(await dispatchStrictRPCItem(
             root,
-            ownerFingerprint: ownerFingerprint
+            ownerFingerprint: ownerFingerprint,
+            wireTransport: wireTransport
         ))
     }
 
     private func dispatchStrictRPCItem(
         _ value: Any,
-        ownerFingerprint: String
+        ownerFingerprint: String,
+        wireTransport: AgentCheckpointListContract.WireTransport = .http
     ) async -> [String: Any] {
         guard let object = value as? [String: Any] else {
             return rpcErrorObject(.invalidRequest, id: NSNull())
@@ -3300,15 +3406,28 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
             rawParams = objectParams
         }
-        if method == "agent.checkpoint.list",
-           rawParams?.keys.contains("response_version") == true,
-           let stringID = wireID as? String,
-           AgentTurnCheckpointWireIdentity.encodedJSONStringByteCount(stringID)
-                > JSONRPCDispatcher.checkpointListV1MaxEncodedResponseIDBytes {
-            // The HTTP seam restores the exact wire id after dispatcher encoding.
-            // Reject here as well so that restoration cannot reintroduce an
-            // oversized id into a checkpoint response (single or top-level batch).
-            return rpcErrorObject(.invalidRequest, id: NSNull())
+        if method == AgentCheckpointListContract.method {
+            // Transport gate before any repository work (single-item path).
+            // Top-level batches already reject this method before siblings run.
+            do {
+                try AgentCheckpointListContract.preflightTransport(
+                    method: method,
+                    transport: wireTransport,
+                    inBatch: false
+                )
+            } catch let error as JSONRPCError {
+                return rpcErrorObject(error, id: NSNull())
+            } catch {
+                return rpcErrorObject(.invalidRequest, id: NSNull())
+            }
+            if rawParams?.keys.contains("response_version") == true,
+               let stringID = wireID as? String,
+               AgentTurnCheckpointWireIdentity.encodedJSONStringByteCount(stringID)
+                    > JSONRPCDispatcher.checkpointListV1MaxEncodedResponseIDBytes {
+                // The HTTP seam restores the exact wire id after dispatcher encoding.
+                // Reject here so restoration cannot reintroduce a hostile id.
+                return rpcErrorObject(.invalidRequest, id: NSNull())
+            }
         }
         if method == "sync.snapshot" {
             // Handled by `dispatchRPC` single-encode path (C-24); this branch
@@ -3409,12 +3528,34 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 )
             }
         )
-        let response = await dispatcher.dispatch(request, mutationContext: mutationContext)
+        let response: JSONRPCResponse
+        switch wireTransport {
+        case .webSocket:
+            response = await dispatcher.dispatchWebSocket(
+                request,
+                mutationContext: mutationContext
+            )
+        case .http:
+            response = await dispatcher.dispatchHTTP(
+                request,
+                mutationContext: mutationContext
+            )
+        case .unix:
+            response = await dispatcher.dispatchUnixSocket(request)
+        case .localTest:
+            response = await dispatcher.dispatch(request, mutationContext: mutationContext)
+        }
         guard let encoded = try? JSONEncoder().encode(response),
               var object = try? JSONSerialization.jsonObject(with: encoded) as? [String: Any] else {
             return rpcErrorObject(.internalError, id: wireID)
         }
-        object["id"] = wireID
+        // Restore the exact wire id for finite responses. When the dispatcher
+        // deliberately nulled the id (hostile id / envelope overflow), keep null.
+        if response.id == nil {
+            object["id"] = NSNull()
+        } else {
+            object["id"] = wireID
+        }
         return object
     }
 
@@ -5325,7 +5466,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         let rpcTaskPriority = RPCDispatchSchedulerClass.taskPriority(for: body)
                         Task(priority: rpcTaskPriority) { [weak self] in
                             guard let self else { return }
-                            let response = await self.dispatchRPC(
+                            let response = await self.dispatchRPCOverWebSocket(
                                 bodyData: body,
                                 ownerFingerprint: fingerprint
                             )

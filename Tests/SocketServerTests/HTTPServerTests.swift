@@ -66,11 +66,11 @@ final class HTTPServerTests: XCTestCase {
     }
 
     @MainActor
-    func test_checkpointListV1OversizedWireIDFailsClosedForSingleAndBatchHTTP() async throws {
+    func test_checkpointListV1OversizedWireIDFailsClosedForSingleHTTP() async throws {
         // WHY: dispatchStrictRPCItem restores the exact JSON wire id after the
         // typed dispatcher returns. Admission must therefore also happen at this
-        // seam or both a direct invoke and settleReadOnlyBatch can restore a
-        // hostile id and exceed the advertised complete-response cap.
+        // seam or a direct invoke can restore a hostile id past the complete-
+        // response cap.
         let router = FakeRouter()
         let server = DirectHTTPServer(
             port: UInt16.random(in: 33_000...44_000),
@@ -109,7 +109,20 @@ final class HTTPServerTests: XCTestCase {
             AgentTurnCheckpointListWireProjection.maxEncodedResponseBytes
         )
         XCTAssertEqual(router.checkpointPageCallCount, 0)
+    }
 
+    @MainActor
+    func test_checkpointListRefusedFromTopLevelHTTPBatchBeforeAnySibling() async throws {
+        // WHY: a legal 700 KiB checkpoint page must never ride in a batch where
+        // siblings can aggregate past the weak-link contract; reject before
+        // executing any item.
+        let router = FakeRouter()
+        let server = DirectHTTPServer(
+            port: UInt16.random(in: 33_000...44_000),
+            loopbackOnly: true,
+            dispatcher: JSONRPCDispatcher(router: router),
+            bootEpoch: 1
+        )
         let batchData = await server.dispatchRPC(
             bodyData: try JSONSerialization.data(withJSONObject: [
                 [
@@ -118,28 +131,32 @@ final class HTTPServerTests: XCTestCase {
                     "method": "system.ping",
                     "params": [:],
                 ],
-                checkpointRequest,
+                [
+                    "jsonrpc": "2.0",
+                    "id": "cp",
+                    "method": "agent.checkpoint.list",
+                    "params": [
+                        "thread_id": UUID().uuidString,
+                        "response_version": 1,
+                        "max_entries": 1,
+                    ],
+                ],
             ])
         )
         let batch = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: batchData) as? [[String: Any]]
+            JSONSerialization.jsonObject(with: batchData) as? [String: Any]
         )
-        XCTAssertEqual(batch.count, 2)
-        XCTAssertEqual(batch[0]["id"] as? String, "normal")
-        XCTAssertNotNil(batch[0]["result"])
-        XCTAssertTrue(batch[1]["id"] is NSNull)
+        XCTAssertTrue(batch["id"] is NSNull)
         XCTAssertEqual(
-            (batch[1]["error"] as? [String: Any])?["code"] as? Int,
-            JSONRPCError.invalidRequest.code
+            (batch["error"] as? [String: Any])?["code"] as? Int,
+            -32600
         )
-        XCTAssertLessThanOrEqual(
-            batchData.count,
-            AgentTurnCheckpointListWireProjection.maxEncodedResponseBytes
-        )
+        let reason = ((batch["error"] as? [String: Any])?["data"] as? [String: Any])?["reason"] as? String
+        XCTAssertEqual(reason, "checkpoint_list_batch_forbidden")
         XCTAssertEqual(
             router.checkpointPageCallCount,
             0,
-            "single and top-level batch admission must both precede repository work"
+            "top-level batch must reject checkpoint list before any sibling executes"
         )
     }
 

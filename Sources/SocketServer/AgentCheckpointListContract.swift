@@ -1,0 +1,638 @@
+import Foundation
+import CoreModel
+
+/// Wire contract for `agent.checkpoint.list` (legacy + response_version 1).
+///
+/// iOS routes this method-specifically over authenticated HTTP `/v1/rpc`.
+/// Unix IPC, WebSocket multiplexed RPC, nested `rpc.batch`, and top-level
+/// JSON-RPC array batches reject the method before any repository work.
+public enum AgentCheckpointListContract: Sendable {
+    public static let method = "agent.checkpoint.list"
+    public static let responseVersion = 1
+
+    // MARK: - Ceilings (shared with capability advertisement)
+
+    public static let maxEntries = AgentTurnCheckpointListWireProjection.maxEntries
+    public static let maxEncodedItemBytes = AgentTurnCheckpointListWireProjection.maxEncodedItemBytes
+    public static let maxEncodedResponseBytes = AgentTurnCheckpointListWireProjection.maxEncodedResponseBytes
+    public static let maxEncodedResponseIDBytes = maxEncodedItemBytes
+    /// Complete encoded JSON-RPC request (id + method + params + escaping).
+    public static let maxEncodedRequestBytes = 16 * 1_024
+    public static let maxThreadIDUTF8Bytes = 36
+    public static let maxCursorTurnIDUTF8Bytes =
+        AgentTurnCheckpointWireIdentity.maximumEncodedTurnIDBytes
+    public static let maxCursorCompletedAtUTF8Bytes = 40
+    public static let maxWorkspaceIDUTF8Bytes = 36
+
+    // MARK: - General batch ceilings (HTTP array + nested rpc.batch)
+
+    public static let maxBatchItems = 32
+    /// Aggregate encoded responses across one top-level HTTP array batch or one
+    /// nested `rpc.batch` result array. Matches the weak-link single-response
+    /// ceiling so two legal 700 KiB pages cannot compound past the contract.
+    public static let maxBatchAggregateResponseBytes = maxEncodedResponseBytes
+    public static let maxBatchRequestBytes = 256 * 1_024
+
+    // MARK: - Stale-cursor recovery
+
+    public static let staleCursorCode = -32_020
+    public static let staleCursorMessage = "checkpoint list catalog revision is stale"
+    public static let sessionRecovery = "restart_once"
+
+    public static func staleCursorError(currentRevision: Int64) -> JSONRPCError {
+        JSONRPCError(
+            code: staleCursorCode,
+            message: staleCursorMessage,
+            data: .object([
+                "reason": .string("stale_cursor"),
+                "recovery": .string(sessionRecovery),
+                "restart_once": .bool(true),
+                "catalog_revision": .number(Double(currentRevision)),
+            ])
+        )
+    }
+
+    // MARK: - Transport
+
+    public enum WireTransport: String, Sendable, Equatable {
+        case http
+        case unix
+        case webSocket
+        /// Same-process unit tests / harnesses (not a production entry).
+        case localTest
+    }
+
+    public static func preflightTransport(
+        method: String,
+        transport: WireTransport,
+        inBatch: Bool
+    ) throws {
+        guard method == Self.method else { return }
+        if inBatch {
+            throw JSONRPCError(
+                code: -32600,
+                message: "agent.checkpoint.list is forbidden in batch RPC.",
+                data: .object([
+                    "reason": .string("checkpoint_list_batch_forbidden"),
+                    "method": .string(method),
+                    "transport": .string("http_jsonrpc_only"),
+                ])
+            )
+        }
+        switch transport {
+        case .http, .localTest:
+            return
+        case .unix, .webSocket:
+            throw JSONRPCError(
+                code: -32600,
+                message: "agent.checkpoint.list is HTTP JSON-RPC only.",
+                data: .object([
+                    "reason": .string("checkpoint_list_http_only"),
+                    "method": .string(method),
+                    "transport": .string(transport.rawValue),
+                ])
+            )
+        }
+    }
+
+    // MARK: - Request admission (v1)
+
+    public static let allowedV1ParamKeys: Set<String> = [
+        "thread_id",
+        "response_version",
+        "max_entries",
+        "before",
+        "catalog_revision",
+    ]
+
+    public struct V1Request: Sendable, Equatable {
+        public let threadId: AgentThreadID
+        public let maxEntries: Int
+        public let before: AgentTurnCheckpointCursor?
+        public let catalogRevision: Int64?
+    }
+
+    /// Validate exact v1 params + complete request envelope before repository work.
+    public static func parseV1Request(
+        id: JSONRPCID?,
+        params: [String: JSONValue],
+        fullRequest: JSONRPCRequest
+    ) throws -> V1Request {
+        guard Set(params.keys).isSubset(of: allowedV1ParamKeys) else {
+            throw JSONRPCError.invalidParams
+        }
+        guard Self.acceptsResponseID(id) else {
+            throw JSONRPCError.invalidRequest
+        }
+        guard case .number(let rawVersion) = params["response_version"],
+              rawVersion.isFinite,
+              let version = Int(exactly: rawVersion),
+              version == responseVersion else {
+            throw JSONRPCError.invalidParams
+        }
+        guard let threadRaw = params["thread_id"]?.stringValue,
+              threadRaw.utf8.count <= maxThreadIDUTF8Bytes,
+              let threadUUID = UUID(uuidString: threadRaw) else {
+            throw JSONRPCError.invalidParams
+        }
+
+        let pageLimit: Int
+        if let maxValue = params["max_entries"] {
+            guard case .number(let rawMax) = maxValue,
+                  rawMax.isFinite,
+                  let integral = Int(exactly: rawMax),
+                  (1...Self.maxEntries).contains(integral) else {
+                throw JSONRPCError.invalidParams
+            }
+            pageLimit = integral
+        } else {
+            pageLimit = Self.maxEntries
+        }
+
+        let before: AgentTurnCheckpointCursor?
+        if let beforeValue = params["before"] {
+            if case .null = beforeValue {
+                before = nil
+            } else {
+                before = try parseCursor(beforeValue)
+            }
+        } else {
+            before = nil
+        }
+
+        let catalogRevision: Int64?
+        if let revValue = params["catalog_revision"] {
+            guard case .number(let rawRev) = revValue,
+                  rawRev.isFinite,
+                  let integral = Int64(exactly: rawRev),
+                  integral > 0 else {
+                throw JSONRPCError.invalidParams
+            }
+            catalogRevision = integral
+        } else {
+            catalogRevision = nil
+        }
+
+        // Subsequent pages require the revision fence so two catalog generations
+        // cannot be spliced into one client sequence.
+        if before != nil, catalogRevision == nil {
+            throw JSONRPCError.invalidParams
+        }
+
+        try preflightEncodedRequest(fullRequest)
+        return V1Request(
+            threadId: AgentThreadID(threadUUID),
+            maxEntries: pageLimit,
+            before: before,
+            catalogRevision: catalogRevision
+        )
+    }
+
+    public static func parseCursor(_ value: JSONValue) throws -> AgentTurnCheckpointCursor {
+        guard case .object(let object) = value else {
+            throw JSONRPCError.invalidParams
+        }
+        // Exact keyset only — no extra/missing keys, no noncanonical timestamps.
+        guard Set(object.keys) == [
+                "checkpoint_turn_count",
+                "completed_at",
+                "turn_id",
+              ],
+              case .number(let rawTurn) = object["checkpoint_turn_count"],
+              rawTurn.isFinite,
+              let turnCount = Int(exactly: rawTurn),
+              turnCount >= 0,
+              turnCount <= 9_007_199_254_740_991,
+              let turnId = object["turn_id"]?.stringValue,
+              !turnId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              AgentTurnCheckpointWireIdentity.encodedJSONStringByteCount(turnId)
+                <= AgentTurnCheckpointWireIdentity.maximumEncodedTurnIDBytes,
+              let completedRaw = object["completed_at"]?.stringValue,
+              completedRaw.utf8.count == 24,
+              let completedAt = fractionalFormatter.date(from: completedRaw),
+              fractionalFormatter.string(from: completedAt) == completedRaw else {
+            throw JSONRPCError.invalidParams
+        }
+        return AgentTurnCheckpointCursor(
+            checkpointTurnCount: turnCount,
+            completedAt: completedAt,
+            turnId: turnId,
+            completedAtToken: completedRaw
+        )
+    }
+
+    public static func acceptsResponseID(_ responseID: JSONRPCID?) -> Bool {
+        guard let responseID,
+              let encoded = try? JSONEncoder().encode(responseID) else {
+            return responseID == nil
+        }
+        return encoded.count <= maxEncodedResponseIDBytes
+    }
+
+    public static func preflightEncodedRequest(_ request: JSONRPCRequest) throws {
+        let data = try JSONEncoder().encode(request)
+        if data.count > maxEncodedRequestBytes {
+            throw JSONRPCError(
+                code: -32602,
+                message: "Request exceeds max_request_bytes.",
+                data: .object([
+                    "reason": .string("max_request_bytes"),
+                    "max_request_bytes": .number(Double(maxEncodedRequestBytes)),
+                    "request_bytes": .number(Double(data.count)),
+                ])
+            )
+        }
+    }
+
+    public static func preflightLegacyRequest(
+        id: JSONRPCID?,
+        params: [String: JSONValue],
+        fullRequest: JSONRPCRequest
+    ) throws -> AgentThreadID {
+        // Legacy preserves prior param laxness for the business keys it already
+        // understood, but still enforces transport/request ceilings so a hostile
+        // envelope cannot exhaust the host before the repository path.
+        guard let threadRaw = params["thread_id"]?.stringValue,
+              threadRaw.utf8.count <= maxThreadIDUTF8Bytes,
+              let threadUUID = UUID(uuidString: threadRaw) else {
+            throw JSONRPCError.invalidParams
+        }
+        // Legacy responses are unbounded historically; still refuse a hostile id
+        // that cannot even fit a compact error under the weak-link ceiling.
+        if let id, !acceptsResponseID(id) {
+            throw JSONRPCError.invalidRequest
+        }
+        try preflightEncodedRequest(fullRequest)
+        return AgentThreadID(threadUUID)
+    }
+
+    // MARK: - Response ceiling
+
+    /// Encode a complete success JSON-RPC wrapper under max_response_bytes.
+    /// On overflow, emit a finite error with the real id when possible; if even
+    /// the bounded error cannot fit, emit id:null without copying the hostile id.
+    public static func enforceEncodedSuccessCeiling(
+        id: JSONRPCID?,
+        result: JSONValue
+    ) -> JSONRPCResponse {
+        let response = JSONRPCResponse(id: id, result: result)
+        if let encoded = try? JSONEncoder().encode(response),
+           encoded.count <= maxEncodedResponseBytes {
+            return response
+        }
+        return encodeBoundedErrorResponse(
+            id: id,
+            error: JSONRPCError(
+                code: -32603,
+                message: "Response exceeds max_response_bytes.",
+                data: .object([
+                    "reason": .string("max_response_bytes"),
+                    "max_response_bytes": .number(Double(maxEncodedResponseBytes)),
+                ])
+            )
+        )
+    }
+
+    public static func encodeBoundedErrorResponse(
+        id: JSONRPCID?,
+        error: JSONRPCError
+    ) -> JSONRPCResponse {
+        let withID = JSONRPCResponse(id: id, error: error)
+        if let encoded = try? JSONEncoder().encode(withID),
+           encoded.count <= maxEncodedResponseBytes {
+            return withID
+        }
+        let minimal = JSONRPCError(
+            code: error.code,
+            message: String(error.message.prefix(200)),
+            data: .object(["reason": .string("response_envelope_too_large")])
+        )
+        let retry = JSONRPCResponse(id: id, error: minimal)
+        if let encoded = try? JSONEncoder().encode(retry),
+           encoded.count <= maxEncodedResponseBytes {
+            return retry
+        }
+        return JSONRPCResponse(
+            id: nil,
+            error: JSONRPCError(
+                code: -32603,
+                message: "Response exceeds max_response_bytes.",
+                data: .object([
+                    "reason": .string("max_response_bytes"),
+                    "max_response_bytes": .number(Double(maxEncodedResponseBytes)),
+                    "id_null": .bool(true),
+                ])
+            )
+        )
+    }
+
+    // MARK: - Linear packing (nonisolated)
+
+    public struct FrozenItem: Sendable, Equatable {
+        public let value: JSONValue
+        public let encoded: Data
+        public let checkpointTurnCount: Int
+        public let completedAtToken: String
+        public let turnID: String
+
+        public init(
+            value: JSONValue,
+            encoded: Data,
+            checkpointTurnCount: Int,
+            completedAtToken: String,
+            turnID: String
+        ) {
+            self.value = value
+            self.encoded = encoded
+            self.checkpointTurnCount = checkpointTurnCount
+            self.completedAtToken = completedAtToken
+            self.turnID = turnID
+        }
+    }
+
+    /// Freeze one bounded item once. Subsequent packing only counts/copies these
+    /// bytes — never re-encodes the item or full envelope per candidate.
+    public static func freezeItem(
+        summary: AgentTurnCheckpointSummary,
+        sourceFilesTruncated: Bool,
+        listMetadata: AgentTurnCheckpointListWireProjection.Capture?,
+        completedAtToken: String
+    ) throws -> FrozenItem {
+        let turnID: AgentTurnCheckpointListWireProjection.Field
+        let checkpointRef: AgentTurnCheckpointListWireProjection.Field
+        let errorMessage: AgentTurnCheckpointListWireProjection.Field
+        if let listMetadata {
+            turnID = listMetadata.turnId
+            checkpointRef = listMetadata.checkpointRef
+            errorMessage = listMetadata.errorMessage
+        } else {
+            turnID = AgentTurnCheckpointListWireProjection.projectTurnId(summary.turnId)
+            checkpointRef = AgentTurnCheckpointListWireProjection.projectString(
+                summary.checkpointRef,
+                maximumEncodedBytes:
+                    AgentTurnCheckpointListWireProjection.maxEncodedCheckpointRefBytes
+            )
+            errorMessage = AgentTurnCheckpointListWireProjection.projectString(
+                summary.errorMessage,
+                maximumEncodedBytes:
+                    AgentTurnCheckpointListWireProjection.maxEncodedErrorMessageBytes
+            )
+        }
+        let resolvedToken = completedAtToken.isEmpty
+            ? fractionalISO8601(summary.completedAt)
+            : completedAtToken
+        var files = summary.files
+        var filesTruncated = sourceFilesTruncated
+        let fileProjection = boundFiles(files)
+        files = fileProjection.files
+        filesTruncated = filesTruncated || fileProjection.truncated
+        let metadataTruncated = turnID.truncated
+            || checkpointRef.truncated
+            || errorMessage.truncated
+            || (listMetadata?.metadataUnavailable ?? false)
+
+        func makeItem(files: [AgentTurnCheckpointFile], filesTruncated: Bool) throws -> (JSONValue, Data) {
+            let stripped = AgentTurnCheckpointSummary(
+                threadId: summary.threadId,
+                runId: summary.runId,
+                turnId: turnID.value ?? "",
+                checkpointTurnCount: summary.checkpointTurnCount,
+                checkpointRef: checkpointRef.value ?? "",
+                status: summary.status,
+                files: files,
+                fileSnapshots: [],
+                diffPatch: nil,
+                fileDiffs: [],
+                assistantMessageId: summary.assistantMessageId,
+                errorMessage: errorMessage.value,
+                completedAt: summary.completedAt
+            )
+            let encoder = JSONEncoder()
+            let baseData = try encoder.encode(stripped)
+            guard var object = try JSONSerialization.jsonObject(with: baseData) as? [String: Any] else {
+                throw JSONRPCError.internalError
+            }
+            object["fileSnapshots"] = []
+            object["diffPatch"] = NSNull()
+            object["fileDiffs"] = []
+            object["filesTruncated"] = filesTruncated
+            object["metadataTruncated"] = metadataTruncated
+            object["metadataUnavailable"] = listMetadata?.metadataUnavailable ?? false
+            object["turn_id_truncated"] = turnID.truncated
+            object["turn_id_total_encoded_bytes"] = turnID.totalEncodedBytes
+            object["turn_id_sha256"] = turnID.sha256 as Any? ?? NSNull()
+            object["checkpoint_ref_truncated"] = checkpointRef.truncated
+            object["checkpoint_ref_total_encoded_bytes"] = checkpointRef.totalEncodedBytes
+            object["checkpoint_ref_sha256"] = checkpointRef.sha256 as Any? ?? NSNull()
+            object["error_message_truncated"] = errorMessage.truncated
+            object["error_message_total_encoded_bytes"] = errorMessage.totalEncodedBytes
+            object["error_message_sha256"] = errorMessage.sha256 as Any? ?? NSNull()
+            let data = try JSONSerialization.data(withJSONObject: object, options: [])
+            return (JSONValue.from(object), data)
+        }
+
+        var item = try makeItem(files: files, filesTruncated: filesTruncated)
+        while item.1.count > maxEncodedItemBytes, !files.isEmpty {
+            files.removeLast()
+            filesTruncated = true
+            item = try makeItem(files: files, filesTruncated: true)
+        }
+        guard item.1.count <= maxEncodedItemBytes else {
+            throw JSONRPCError.internalError
+        }
+        return FrozenItem(
+            value: item.0,
+            encoded: item.1,
+            checkpointTurnCount: summary.checkpointTurnCount,
+            completedAtToken: resolvedToken,
+            turnID: turnID.value ?? ""
+        )
+    }
+
+    /// Pack frozen items with an incremental byte counter. Encodes the final
+    /// envelope once. Authoritative candidate order is preserved.
+    public static func packPage(
+        candidates: [FrozenItem],
+        sourceHasMore: Bool,
+        catalogRevision: Int64,
+        responseID: JSONRPCID?
+    ) throws -> JSONValue {
+        let encoder = JSONEncoder()
+        let idEncoded = try encodeID(responseID, encoder: encoder)
+        let revisionText = String(catalogRevision)
+        // Exact framing outside variable parts (items / truncated / next_before / id / rev):
+        // {"jsonrpc":"2.0","id":ID,"result":{"items":ITEMS,"truncated":BOOL,"next_before":NB,"catalog_revision":REV}}
+        let fixed =
+            #"{"jsonrpc":"2.0","id":"#.utf8.count
+            + #","result":{"items":"#.utf8.count
+            + #","truncated":"#.utf8.count
+            + #","next_before":"#.utf8.count
+            + #","catalog_revision":"#.utf8.count
+            + #"}}"#.utf8.count
+
+        func responseBytes(
+            itemsArrayBytes: Int,
+            truncated: Bool,
+            nextBeforeBytes: Int
+        ) -> Int {
+            fixed
+                + idEncoded.count
+                + itemsArrayBytes
+                + (truncated ? 4 : 5)
+                + nextBeforeBytes
+                + revisionText.utf8.count
+        }
+
+        var selected: [FrozenItem] = []
+        selected.reserveCapacity(candidates.count)
+        // Running sum of encoded item bodies + commas between them (no brackets).
+        var itemsInnerBytes = 0
+
+        for (index, candidate) in candidates.enumerated() {
+            let separator = selected.isEmpty ? 0 : 1
+            let newInner = itemsInnerBytes + separator + candidate.encoded.count
+            let itemsArrayBytes = newInner + 2 // brackets
+            let remainingAfter = index + 1 < candidates.count
+            let truncated = sourceHasMore || remainingAfter
+                || false // refined after selection; provisional for fit check
+            // While more candidates remain after this index OR sourceHasMore, the
+            // page is truncated if we stop here OR continue with more left.
+            // For the fit check of admitting this item when it is not the final
+            // overall row, assume truncated=true (worst-case next_before size).
+            let fitTruncated = sourceHasMore || remainingAfter || true
+            // Always size next_before for the prospective last item when truncated
+            // could be true. Using true is conservative and matches final semantics
+            // whenever sourceHasMore or not-all-candidates fit.
+            let nextBefore = try encodeCursor(
+                turnCount: candidate.checkpointTurnCount,
+                completedAtToken: candidate.completedAtToken,
+                turnID: candidate.turnID,
+                encoder: encoder
+            )
+            // Prefer null when this would be the complete final page (no more
+            // candidates and source exhausted).
+            let nextBeforeBytes: Int
+            let effectiveTruncated: Bool
+            if sourceHasMore || remainingAfter {
+                effectiveTruncated = true
+                nextBeforeBytes = nextBefore.count
+            } else {
+                // This item would complete the catalog page.
+                effectiveTruncated = false
+                nextBeforeBytes = 4 // null
+            }
+            let size = responseBytes(
+                itemsArrayBytes: itemsArrayBytes,
+                truncated: effectiveTruncated,
+                nextBeforeBytes: nextBeforeBytes
+            )
+            if size > maxEncodedResponseBytes {
+                break
+            }
+            itemsInnerBytes = newInner
+            selected.append(candidate)
+            _ = fitTruncated
+            _ = truncated
+        }
+
+        guard candidates.isEmpty || !selected.isEmpty else {
+            throw JSONRPCError.internalError
+        }
+
+        let truncated = sourceHasMore || selected.count < candidates.count
+        let nextBeforeValue: JSONValue
+        if truncated, let last = selected.last {
+            nextBeforeValue = .object([
+                "checkpoint_turn_count": .number(Double(last.checkpointTurnCount)),
+                "completed_at": .string(last.completedAtToken),
+                "turn_id": .string(last.turnID),
+            ])
+        } else {
+            nextBeforeValue = .null
+        }
+        let payload: JSONValue = .object([
+            "items": .array(selected.map(\.value)),
+            "truncated": .bool(truncated),
+            "next_before": nextBeforeValue,
+            "catalog_revision": .number(Double(catalogRevision)),
+        ])
+        // Final encode-once verification against the real wrapper.
+        let response = JSONRPCResponse(id: responseID, result: payload)
+        guard let finalBytes = try? encoder.encode(response),
+              finalBytes.count <= maxEncodedResponseBytes else {
+            throw JSONRPCError.internalError
+        }
+        return payload
+    }
+
+    // MARK: - Helpers
+
+    private static func boundFiles(
+        _ files: [AgentTurnCheckpointFile]
+    ) -> (files: [AgentTurnCheckpointFile], truncated: Bool) {
+        let encoder = JSONEncoder()
+        var kept: [AgentTurnCheckpointFile] = []
+        kept.reserveCapacity(min(files.count, AgentTurnCheckpointListWireProjection.maxFiles))
+        var encodedArrayBytes = 2
+        for file in files {
+            guard kept.count < AgentTurnCheckpointListWireProjection.maxFiles,
+                  let encoded = try? encoder.encode(file) else {
+                break
+            }
+            let separatorBytes = kept.isEmpty ? 0 : 1
+            guard encodedArrayBytes + separatorBytes + encoded.count
+                    <= AgentTurnCheckpointListWireProjection.maxEncodedFilesBytes else {
+                break
+            }
+            kept.append(file)
+            encodedArrayBytes += separatorBytes + encoded.count
+        }
+        return (kept, kept.count < files.count)
+    }
+
+    private static func encodeID(
+        _ id: JSONRPCID?,
+        encoder: JSONEncoder
+    ) throws -> Data {
+        if let id {
+            return try encoder.encode(id)
+        }
+        return Data("null".utf8)
+    }
+
+    private static func encodeCursor(
+        turnCount: Int,
+        completedAtToken: String,
+        turnID: String,
+        encoder: JSONEncoder
+    ) throws -> Data {
+        let object: [String: JSONValue] = [
+            "checkpoint_turn_count": .number(Double(turnCount)),
+            "completed_at": .string(completedAtToken),
+            "turn_id": .string(turnID),
+        ]
+        return try encoder.encode(JSONValue.object(object))
+    }
+
+    private static let fractionalFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let wholeSecondFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    private static func fractionalISO8601(_ date: Date) -> String {
+        fractionalFormatter.string(from: date)
+    }
+
+    private static func parseCompletedAt(_ raw: String) -> Date {
+        if let date = fractionalFormatter.date(from: raw) { return date }
+        if let date = wholeSecondFormatter.date(from: raw) { return date }
+        return Date(timeIntervalSinceReferenceDate: 0)
+    }
+}

@@ -12,8 +12,8 @@ public enum Schema {
     /// Must equal the highest SchemaStep version (step 53 economy + 54 graphify usage
     /// + 55 savings honesty axes + 56 credible_v4 cap evidence
     /// + 57 immutable agent-message body identity + 58 checkpoint summaries
-    /// + 59 checkpoint list wire projections).
-    public static let currentVersion: Int = 59
+    /// + 59 checkpoint list wire projections + 60 checkpoint list catalog revision).
+    public static let currentVersion: Int = 60
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -1025,6 +1025,37 @@ public enum Schema {
                 list_completed_at,
                 list_turn_id
             );
+        """),
+        // Catalog generation fence for agent.checkpoint.list v1. Incremented by
+        // triggers on every insert/update/delete so revision stays transactional
+        // with the checkpoint mutation (no O(N) digest per page).
+        SchemaStep(60, """
+        CREATE TABLE IF NOT EXISTS agent_turn_checkpoint_catalog_meta (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            revision INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT OR IGNORE INTO agent_turn_checkpoint_catalog_meta(id, revision) VALUES(1, 1);
+        CREATE TRIGGER IF NOT EXISTS trg_agent_turn_checkpoints_catalog_insert
+        AFTER INSERT ON agent_turn_checkpoints
+        BEGIN
+            UPDATE agent_turn_checkpoint_catalog_meta
+            SET revision = revision + 1
+            WHERE id = 1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_agent_turn_checkpoints_catalog_update
+        AFTER UPDATE ON agent_turn_checkpoints
+        BEGIN
+            UPDATE agent_turn_checkpoint_catalog_meta
+            SET revision = revision + 1
+            WHERE id = 1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_agent_turn_checkpoints_catalog_delete
+        AFTER DELETE ON agent_turn_checkpoints
+        BEGIN
+            UPDATE agent_turn_checkpoint_catalog_meta
+            SET revision = revision + 1
+            WHERE id = 1;
+        END;
         """)
     ]
 

@@ -1715,6 +1715,9 @@ public struct AgentTurnCheckpointCursor: Codable, Sendable, Equatable {
 
 /// Paginated metadata page for `agent.checkpoint.list` response_version 1.
 /// Items are summary-compatible but heavy payload fields are always empty/null.
+///
+/// `catalogRevision` is the generation fence for this page: first page returns
+/// it; later pages must present the same value and restart once on drift.
 public struct AgentTurnCheckpointPage: Codable, Sendable, Equatable {
     public let items: [AgentTurnCheckpointSummary]
     /// Parallel to `items`; true means the persisted mobile summary omitted one
@@ -1728,6 +1731,8 @@ public struct AgentTurnCheckpointPage: Codable, Sendable, Equatable {
     public let completedAtTokens: [String]
     public let truncated: Bool
     public let nextBefore: AgentTurnCheckpointCursor?
+    /// Catalog generation observed for this page (transactional with mutations).
+    public let catalogRevision: Int64
 
     public init(
         items: [AgentTurnCheckpointSummary],
@@ -1735,7 +1740,8 @@ public struct AgentTurnCheckpointPage: Codable, Sendable, Equatable {
         listMetadata: [AgentTurnCheckpointListWireProjection.Capture] = [],
         completedAtTokens: [String] = [],
         truncated: Bool,
-        nextBefore: AgentTurnCheckpointCursor?
+        nextBefore: AgentTurnCheckpointCursor?,
+        catalogRevision: Int64 = 1
     ) {
         self.items = items
         self.filesTruncated = filesTruncated
@@ -1743,6 +1749,7 @@ public struct AgentTurnCheckpointPage: Codable, Sendable, Equatable {
         self.completedAtTokens = completedAtTokens
         self.truncated = truncated
         self.nextBefore = nextBefore
+        self.catalogRevision = catalogRevision
     }
 }
 

@@ -530,31 +530,19 @@ public final class JSONRPCDispatcher {
     /// cannot disagree.
     public nonisolated let agentAttachmentUploadCapability:
         AgentAttachmentUploadCapabilityAdvertisement?
-    private static let checkpointListV1MaxFilesPerItem =
-        AgentTurnCheckpointListWireProjection.maxFiles
-    private static let checkpointListV1MaxEncodedFilesBytesPerItem =
-        AgentTurnCheckpointListWireProjection.maxEncodedFilesBytes
-    private static let checkpointListV1MaxEncodedItemBytes =
-        AgentTurnCheckpointListWireProjection.maxEncodedItemBytes
-    private static let checkpointListV1MaxEncodedResponseBytes =
-        AgentTurnCheckpointListWireProjection.maxEncodedResponseBytes
     /// A successful v1 response is measured with its JSON-RPC id. Bound the id
     /// before repository work so an attacker cannot consume the entire advertised
-    /// response budget with correlation metadata and trigger the release-only
-    /// first-item fallback that the old implementation guarded only by `assert`.
+    /// response budget with correlation metadata.
     nonisolated static let checkpointListV1MaxEncodedResponseIDBytes =
-        AgentTurnCheckpointListWireProjection.maxEncodedItemBytes
-    private static let checkpointListV1MaxEncodedCheckpointRefBytes =
-        AgentTurnCheckpointListWireProjection.maxEncodedCheckpointRefBytes
-    private static let checkpointListV1MaxEncodedErrorMessageBytes =
-        AgentTurnCheckpointListWireProjection.maxEncodedErrorMessageBytes
-    private static let checkpointListISO8601Fractional: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
+        AgentCheckpointListContract.maxEncodedResponseIDBytes
     private var volatileCommandReceipts = BoundedReceiptCache()
     @TaskLocal private static var centralMutationExecution = false
+    /// Transport context for methods that are HTTP-only (checkpoint list).
+    /// Default `.localTest` keeps unit tests exerciseable; production entry
+    /// points set unix / webSocket / http explicitly.
+    @TaskLocal private static var rpcWireTransport:
+        AgentCheckpointListContract.WireTransport = .localTest
+    @TaskLocal private static var rpcInBatch = false
     /// Bounded unknown-outcome fence (same cap as committed receipts). Does not
     /// store request payloads or secrets — only owner fingerprint + params hash.
     private var volatileUnknownReceipts = BoundedUnknownReceiptCache()
@@ -850,8 +838,38 @@ public final class JSONRPCDispatcher {
     /// AppCommandRouter domain handlers without fabricating remote transport
     /// identity or durable transport receipts. Network servers must call the
     /// mutation-context overload below.
+    ///
+    /// `agent.checkpoint.list` is HTTP-only; production Unix uses
+    /// `dispatchUnixSocket`. Unit tests keep the default `.localTest` transport.
     public func dispatchLocalIPC(_ req: JSONRPCRequest) async -> JSONRPCResponse {
         await dispatchCore(req)
+    }
+
+    /// Production Unix-domain socket entry: checkpoint list is forbidden.
+    public func dispatchUnixSocket(_ req: JSONRPCRequest) async -> JSONRPCResponse {
+        await Self.$rpcWireTransport.withValue(.unix) {
+            await dispatchLocalIPC(req)
+        }
+    }
+
+    /// Production WebSocket JSON-RPC entry: checkpoint list is forbidden.
+    public func dispatchWebSocket(
+        _ req: JSONRPCRequest,
+        mutationContext: MutationRequestContext?
+    ) async -> JSONRPCResponse {
+        await Self.$rpcWireTransport.withValue(.webSocket) {
+            await dispatch(req, mutationContext: mutationContext)
+        }
+    }
+
+    /// Production HTTP JSON-RPC entry: checkpoint list is allowed (subject to caps).
+    public func dispatchHTTP(
+        _ req: JSONRPCRequest,
+        mutationContext: MutationRequestContext?
+    ) async -> JSONRPCResponse {
+        await Self.$rpcWireTransport.withValue(.http) {
+            await dispatch(req, mutationContext: mutationContext)
+        }
     }
 
     /// Backward-compatible local/test entry point. Production TCP/HTTP code
@@ -1267,18 +1285,99 @@ public final class JSONRPCDispatcher {
         let id = req.id
         let params = req.params ?? [:]
         do {
+            // HTTP-only gate: both legacy and v1 checkpoint list are forbidden on
+            // Unix/WS and every batch surface before any repository work.
+            if req.method == AgentCheckpointListContract.method {
+                try AgentCheckpointListContract.preflightTransport(
+                    method: req.method,
+                    transport: Self.rpcWireTransport,
+                    inBatch: Self.rpcInBatch
+                )
+            }
             switch req.method {
             case "rpc.batch":
                 guard case .array(let calls) = params["calls"] ?? .null else { throw JSONRPCError.invalidParams }
+                // Finite item + complete-request ceilings before any sibling executes.
+                guard calls.count <= AgentCheckpointListContract.maxBatchItems else {
+                    throw JSONRPCError(
+                        code: -32600,
+                        message: "rpc.batch exceeds max item count.",
+                        data: .object([
+                            "reason": .string("max_batch_items"),
+                            "max_batch_items": .number(
+                                Double(AgentCheckpointListContract.maxBatchItems)
+                            ),
+                            "batch_items": .number(Double(calls.count)),
+                        ])
+                    )
+                }
+                let encodedBatch = try JSONEncoder().encode(req)
+                guard encodedBatch.count <= AgentCheckpointListContract.maxBatchRequestBytes else {
+                    throw JSONRPCError(
+                        code: -32602,
+                        message: "rpc.batch exceeds max_request_bytes.",
+                        data: .object([
+                            "reason": .string("max_batch_request_bytes"),
+                            "max_request_bytes": .number(
+                                Double(AgentCheckpointListContract.maxBatchRequestBytes)
+                            ),
+                            "request_bytes": .number(Double(encodedBatch.count)),
+                        ])
+                    )
+                }
+                // Preflight every item before any executes (checkpoint list forbidden).
+                for callValue in calls {
+                    guard let call = callValue.objectValue,
+                          let method = call["method"]?.stringValue else {
+                        throw JSONRPCError.invalidParams
+                    }
+                    try AgentCheckpointListContract.preflightTransport(
+                        method: method,
+                        transport: Self.rpcWireTransport,
+                        inBatch: true
+                    )
+                    guard Self.isReadOnlyBatchMethod(method) else {
+                        return .init(id: id, error: JSONRPCError(
+                            code: -32602,
+                            message: "Batch only supports read-only RPC methods.",
+                            data: .string(method)
+                        ))
+                    }
+                }
                 var results: [JSONValue] = []
+                var aggregateBytes = 0
                 for (index, callValue) in calls.enumerated() {
                     guard let call = callValue.objectValue,
-                          let method = call["method"]?.stringValue else { throw JSONRPCError.invalidParams }
-                    guard Self.isReadOnlyBatchMethod(method) else {
-                        return .init(id: id, error: JSONRPCError(code: -32602, message: "Batch only supports read-only RPC methods.", data: .string(method)))
+                          let method = call["method"]?.stringValue else {
+                        throw JSONRPCError.invalidParams
                     }
                     let callParams = call["params"]?.objectValue ?? [:]
-                    let response = await dispatchCore(JSONRPCRequest(jsonrpc: "2.0", id: .number(index), method: method, params: callParams))
+                    let response = await Self.$rpcInBatch.withValue(true) {
+                        await dispatchCore(JSONRPCRequest(
+                            jsonrpc: "2.0",
+                            id: .number(index),
+                            method: method,
+                            params: callParams
+                        ))
+                    }
+                    if let encoded = try? JSONEncoder().encode(response) {
+                        aggregateBytes += encoded.count
+                        if aggregateBytes > AgentCheckpointListContract.maxBatchAggregateResponseBytes {
+                            return AgentCheckpointListContract.encodeBoundedErrorResponse(
+                                id: id,
+                                error: JSONRPCError(
+                                    code: -32603,
+                                    message: "rpc.batch aggregate response exceeds max_response_bytes.",
+                                    data: .object([
+                                        "reason": .string("max_batch_aggregate_response_bytes"),
+                                        "max_response_bytes": .number(
+                                            Double(AgentCheckpointListContract.maxBatchAggregateResponseBytes)
+                                        ),
+                                    ])
+                                )
+                            )
+                        }
+                    }
                     if let error = response.error {
                         results.append(.object([
                             "error": .object([
@@ -2523,39 +2622,56 @@ public final class JSONRPCDispatcher {
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
             case "agent.checkpoint.list":
-                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 // Opt-in only: absent response_version keeps the legacy full-array path.
                 // Modern-only params (max_entries/before) without the opt-in are ignored.
                 if params["response_version"] != nil {
-                    guard Self.checkpointListV1AcceptsResponseID(id) else {
-                        // An unbounded id cannot be echoed inside the advertised
-                        // complete-response cap. Treat the request itself as invalid
-                        // and do not echo the hostile id.
-                        return .init(id: nil, error: .invalidRequest)
+                    if !AgentCheckpointListContract.acceptsResponseID(id) {
+                        // Hostile id cannot be echoed inside the complete-response
+                        // cap. Fail closed with id:null and skip repository work.
+                        return AgentCheckpointListContract.encodeBoundedErrorResponse(
+                            id: nil,
+                            error: .invalidRequest
+                        )
                     }
-                    guard let version = params["response_version"]?.intValue, version == 1 else {
-                        throw JSONRPCError.invalidParams
+                    let v1: AgentCheckpointListContract.V1Request
+                    do {
+                        v1 = try AgentCheckpointListContract.parseV1Request(
+                            id: id,
+                            params: params,
+                            fullRequest: req
+                        )
+                    } catch let error as JSONRPCError {
+                        return AgentCheckpointListContract.encodeBoundedErrorResponse(
+                            id: id,
+                            error: error
+                        )
                     }
-                    let maxEntries: Int
-                    if params["max_entries"] != nil {
-                        guard let limit = params["max_entries"]?.intValue, (1...100).contains(limit) else {
-                            throw JSONRPCError.invalidParams
-                        }
-                        maxEntries = limit
-                    } else {
-                        maxEntries = 100
-                    }
-                    let before = try checkpointCursor(from: params["before"])
                     let page = try router.listAgentThreadCheckpointsPage(
-                        thread: tid,
-                        maxEntries: maxEntries,
-                        before: before
+                        thread: v1.threadId,
+                        maxEntries: v1.maxEntries,
+                        before: v1.before
                     )
-                    return .init(
+                    if let clientRevision = v1.catalogRevision,
+                       clientRevision != page.catalogRevision {
+                        return AgentCheckpointListContract.encodeBoundedErrorResponse(
+                            id: id,
+                            error: AgentCheckpointListContract.staleCursorError(
+                                currentRevision: page.catalogRevision
+                            )
+                        )
+                    }
+                    // Freeze + pack off the MainActor path: pure nonisolated packing.
+                    let payload = try checkpointPagePayload(page, responseID: id)
+                    return AgentCheckpointListContract.enforceEncodedSuccessCeiling(
                         id: id,
-                        result: try checkpointPagePayload(page, responseID: id)
+                        result: payload
                     )
                 }
+                let tid = try AgentCheckpointListContract.preflightLegacyRequest(
+                    id: id,
+                    params: params,
+                    fullRequest: req
+                )
                 return .init(id: id, result: encode(try router.listAgentThreadCheckpoints(thread: tid)))
             case "agent.checkpoint.diff":
                 // QA-XPLAT :19 -- accept both `turn_count` (mac-native) and
@@ -3335,7 +3451,9 @@ public final class JSONRPCDispatcher {
         "surface.health", "surface.read_text", "surface.read_history",
         "agent.thread.list", "agent.message.queue.list", "agent.plan.notes.get",
         "agent.message.list", "agent.message.get", "agent.pending_callbacks.list",
-        "agent.thread.read", "agent.checkpoint.list", "agent.checkpoint.diff",
+        // agent.checkpoint.list is HTTP-only and rejected from every batch surface
+        // before execution (see AgentCheckpointListContract.preflightTransport).
+        "agent.thread.read", "agent.checkpoint.diff",
         "git.status", "git.branches", "git.log", "git.diff", "git.pull_request_url", "git.delivery_plan",
         "project.scripts",
         "agent.models.list", "agent.providers.list", "agent.run_as_users.list", "agent.state.current", "agent.prompt_history",
@@ -3371,6 +3489,8 @@ public final class JSONRPCDispatcher {
     ///   - "file": filesystem + file-editor surface (`fs.*`, `files.*`).
     ///   - "read": read-only methods (`isReadOnlyBatchMethod`), e.g. *.list /
     ///     *.read / *.status / *.get, system.*, events.recent, settings.get.
+    ///     Also HTTP-only read methods that are intentionally excluded from
+    ///     `readOnlyBatchMethods` (e.g. `agent.checkpoint.list`).
     ///   - "write": every other known (mutating) method.
     nonisolated static func requiredCapability(for method: String) -> String? {
         guard let namespace = method.split(separator: ".").first.map(String.init),
@@ -3379,6 +3499,11 @@ public final class JSONRPCDispatcher {
         }
         if namespace == "fs" || namespace == "files" {
             return "file"
+        }
+        if method == AgentCheckpointListContract.method {
+            // HTTP-only metadata list: still a pure read for capability scoping,
+            // but never admitted into rpc.batch / top-level array batches.
+            return "read"
         }
         if isReadOnlyBatchMethod(method) {
             return "read"
@@ -3752,23 +3877,23 @@ public final class JSONRPCDispatcher {
         let truncated: Bool
     }
 
-    /// Wire envelope for response_version 1: exactly `items`, `truncated`, `next_before`.
-    /// Each complete item is capped independently, then the final encoded JSON-RPC
-    /// response is measured while adding items. A page stops only between items and
-    /// returns a cursor for the final emitted row.
+    /// Wire envelope for response_version 1: `items`, `truncated`, `next_before`,
+    /// `catalog_revision`. Freezes each item once and packs with an incremental
+    /// byte counter (nonisolated contract helpers — no full-envelope re-encode
+    /// per candidate).
     private func checkpointPagePayload(
         _ page: AgentTurnCheckpointPage,
         responseID: JSONRPCID?
     ) throws -> JSONValue {
-        let projected = try page.items.enumerated().map { index, summary in
+        let frozen = try page.items.enumerated().map { index, summary in
             let listMetadata = page.listMetadata.indices.contains(index)
                 ? page.listMetadata[index]
                 : nil
             let completedAtToken = page.completedAtTokens.indices.contains(index)
                 ? page.completedAtTokens[index]
                 : ""
-            return try checkpointItemForV1(
-                summary,
+            return try AgentCheckpointListContract.freezeItem(
+                summary: summary,
                 sourceFilesTruncated: page.filesTruncated.indices.contains(index)
                     ? page.filesTruncated[index]
                     : false,
@@ -3776,244 +3901,18 @@ public final class JSONRPCDispatcher {
                 completedAtToken: completedAtToken
             )
         }
-        var emitted: [CheckpointV1ProjectedItem] = []
-        emitted.reserveCapacity(projected.count)
-
-        for candidate in projected {
-            let prospective = emitted + [candidate]
-            let payload = checkpointEnvelope(
-                items: prospective,
-                truncated: true
-            )
-            let response = JSONRPCResponse(id: responseID, result: payload)
-            guard let encoded = try? _encoder.encode(response),
-                  encoded.count <= Self.checkpointListV1MaxEncodedResponseBytes else {
-                break
-            }
-            emitted.append(candidate)
-        }
-
-        guard projected.isEmpty || !emitted.isEmpty else {
-            // Response-id admission plus the independent item cap make this
-            // unreachable. Fail closed in release builds if those contracts drift.
-            throw JSONRPCError.internalError
-        }
-        let finalPayload = checkpointEnvelope(
-            items: emitted,
-            truncated: page.truncated || emitted.count < projected.count
+        return try AgentCheckpointListContract.packPage(
+            candidates: frozen,
+            sourceHasMore: page.truncated,
+            catalogRevision: page.catalogRevision,
+            responseID: responseID
         )
-        guard let finalBytes = try? _encoder.encode(
-            JSONRPCResponse(id: responseID, result: finalPayload)
-        ).count,
-              finalBytes <= Self.checkpointListV1MaxEncodedResponseBytes else {
-            throw JSONRPCError.internalError
-        }
-        return finalPayload
     }
 
     nonisolated static func checkpointListV1AcceptsResponseID(
         _ responseID: JSONRPCID?
     ) -> Bool {
-        guard let responseID,
-              let encoded = try? JSONEncoder().encode(responseID) else {
-            return responseID == nil
-        }
-        return encoded.count <= checkpointListV1MaxEncodedResponseIDBytes
-    }
-
-    private func checkpointEnvelope(
-        items: [CheckpointV1ProjectedItem],
-        truncated: Bool
-    ) -> JSONValue {
-        var object: [String: JSONValue] = [
-            "items": .array(items.map(\.value)),
-            "truncated": .bool(truncated),
-        ]
-        if truncated, let cursor = items.last {
-            object["next_before"] = .object([
-                "checkpoint_turn_count": .number(Double(cursor.checkpointTurnCount)),
-                "completed_at": .string(checkpointListCompletedAtToken(cursor)),
-                "turn_id": .string(cursor.turnID),
-            ])
-        } else {
-            object["next_before"] = .null
-        }
-        return .object(object)
-    }
-
-    private func checkpointItemForV1(
-        _ summary: AgentTurnCheckpointSummary,
-        sourceFilesTruncated: Bool,
-        listMetadata: AgentTurnCheckpointListWireProjection.Capture?,
-        completedAtToken: String
-    ) throws -> CheckpointV1ProjectedItem {
-        // Prefer capture-time projections from the repository so list never
-        // re-hashes oversized raw columns at read/encode time.
-        let turnID: CheckpointV1StringProjection
-        let checkpointRef: CheckpointV1StringProjection
-        let errorMessage: CheckpointV1StringProjection
-        if let listMetadata {
-            turnID = checkpointProjection(from: listMetadata.turnId)
-            checkpointRef = checkpointProjection(from: listMetadata.checkpointRef)
-            errorMessage = checkpointProjection(from: listMetadata.errorMessage)
-        } else {
-            turnID = checkpointTurnIDForV1(summary.turnId)
-            checkpointRef = checkpointStringForV1(
-                summary.checkpointRef,
-                maximumEncodedBytes: Self.checkpointListV1MaxEncodedCheckpointRefBytes
-            )
-            errorMessage = checkpointStringForV1(
-                summary.errorMessage,
-                maximumEncodedBytes: Self.checkpointListV1MaxEncodedErrorMessageBytes
-            )
-        }
-        let resolvedCompletedAtToken = completedAtToken.isEmpty
-            ? Self.checkpointListISO8601Fractional.string(from: summary.completedAt)
-            : completedAtToken
-        var fileProjection = checkpointFilesForV1(summary.files)
-        fileProjection.truncated = fileProjection.truncated || sourceFilesTruncated
-        let metadataTruncated = turnID.truncated
-            || checkpointRef.truncated
-            || errorMessage.truncated
-            || (listMetadata?.metadataUnavailable ?? false)
-
-        func encodedItem(
-            files: [AgentTurnCheckpointFile],
-            filesTruncated: Bool
-        ) -> JSONValue {
-            let stripped = AgentTurnCheckpointSummary(
-                threadId: summary.threadId,
-                runId: summary.runId,
-                turnId: turnID.value ?? "",
-                checkpointTurnCount: summary.checkpointTurnCount,
-                checkpointRef: checkpointRef.value ?? "",
-                status: summary.status,
-                files: files,
-                fileSnapshots: [],
-                diffPatch: nil,
-                fileDiffs: [],
-                assistantMessageId: summary.assistantMessageId,
-                errorMessage: errorMessage.value,
-                completedAt: summary.completedAt
-            )
-            guard case .object(var object) = encode(stripped) else {
-                return encode(stripped)
-            }
-            object["fileSnapshots"] = .array([])
-            object["diffPatch"] = .null
-            object["fileDiffs"] = .array([])
-            object["filesTruncated"] = .bool(filesTruncated)
-            object["metadataTruncated"] = .bool(metadataTruncated)
-            object["metadataUnavailable"] = .bool(
-                listMetadata?.metadataUnavailable ?? false
-            )
-            object["turn_id_truncated"] = .bool(turnID.truncated)
-            object["turn_id_total_encoded_bytes"] = .number(
-                Double(turnID.originalEncodedBytes)
-            )
-            object["turn_id_sha256"] = turnID.sha256.map(JSONValue.string) ?? .null
-            object["checkpoint_ref_truncated"] = .bool(checkpointRef.truncated)
-            object["checkpoint_ref_total_encoded_bytes"] = .number(
-                Double(checkpointRef.originalEncodedBytes)
-            )
-            object["checkpoint_ref_sha256"] =
-                checkpointRef.sha256.map(JSONValue.string) ?? .null
-            object["error_message_truncated"] = .bool(errorMessage.truncated)
-            object["error_message_total_encoded_bytes"] = .number(
-                Double(errorMessage.originalEncodedBytes)
-            )
-            object["error_message_sha256"] =
-                errorMessage.sha256.map(JSONValue.string) ?? .null
-            return .object(object)
-        }
-
-        var item = encodedItem(
-            files: fileProjection.files,
-            filesTruncated: fileProjection.truncated
-        )
-        while encodedByteCount(item) > Self.checkpointListV1MaxEncodedItemBytes,
-              !fileProjection.files.isEmpty {
-            fileProjection.files.removeLast()
-            fileProjection.truncated = true
-            item = encodedItem(
-                files: fileProjection.files,
-                filesTruncated: true
-            )
-        }
-        guard encodedByteCount(item) <= Self.checkpointListV1MaxEncodedItemBytes else {
-            // Projection budgets are a wire contract, not a debug-only invariant.
-            // Fail closed in release builds if a future field makes even the
-            // file-free metadata item exceed the advertised item ceiling.
-            throw JSONRPCError.internalError
-        }
-        return CheckpointV1ProjectedItem(
-            value: item,
-            checkpointTurnCount: summary.checkpointTurnCount,
-            completedAt: summary.completedAt,
-            completedAtToken: resolvedCompletedAtToken,
-            turnID: turnID.value ?? ""
-        )
-    }
-
-    private func checkpointProjection(
-        from field: AgentTurnCheckpointListWireProjection.Field
-    ) -> CheckpointV1StringProjection {
-        CheckpointV1StringProjection(
-            value: field.value,
-            originalEncodedBytes: field.totalEncodedBytes,
-            sha256: field.sha256,
-            truncated: field.truncated
-        )
-    }
-
-    private func checkpointTurnIDForV1(
-        _ raw: String
-    ) -> CheckpointV1StringProjection {
-        checkpointProjection(
-            from: AgentTurnCheckpointListWireProjection.projectTurnId(raw)
-        )
-    }
-
-    private func checkpointStringForV1(
-        _ raw: String?,
-        maximumEncodedBytes: Int
-    ) -> CheckpointV1StringProjection {
-        checkpointProjection(
-            from: AgentTurnCheckpointListWireProjection.projectString(
-                raw,
-                maximumEncodedBytes: maximumEncodedBytes
-            )
-        )
-    }
-
-    private func encodedByteCount<T: Encodable>(_ value: T) -> Int {
-        (try? _encoder.encode(value).count) ?? Int.max
-    }
-
-    /// Keeps complete file entries in their stored order. The array budget uses
-    /// the exact compact JSON bytes for each encoded entry plus separators/brackets;
-    /// an entry that would cross the budget, and every later entry, is omitted.
-    private func checkpointFilesForV1(
-        _ files: [AgentTurnCheckpointFile]
-    ) -> (files: [AgentTurnCheckpointFile], truncated: Bool) {
-        var kept: [AgentTurnCheckpointFile] = []
-        kept.reserveCapacity(min(files.count, Self.checkpointListV1MaxFilesPerItem))
-        var encodedArrayBytes = 2 // `[` and `]`
-
-        for file in files {
-            guard kept.count < Self.checkpointListV1MaxFilesPerItem,
-                  let encoded = try? _encoder.encode(file) else {
-                break
-            }
-            let separatorBytes = kept.isEmpty ? 0 : 1
-            guard encodedArrayBytes + separatorBytes + encoded.count
-                    <= Self.checkpointListV1MaxEncodedFilesBytesPerItem else {
-                break
-            }
-            kept.append(file)
-            encodedArrayBytes += separatorBytes + encoded.count
-        }
-        return (kept, kept.count < files.count)
+        AgentCheckpointListContract.acceptsResponseID(responseID)
     }
 
     private func parseISO8601(_ value: String) -> Date {

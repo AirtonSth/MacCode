@@ -190,6 +190,49 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         XCTAssertTrue(st.columnIsNull(7))
     }
 
+    func test_v58_to_head_installsCatalogRevisionTableAndTriggers() throws {
+        // WHY: revision fence must install from every supported prior version
+        // without renumbering only currentVersion (57/58 collide with Message).
+        let db = try migrateFromVersion(n: 58)
+        let threadID = UUID().uuidString
+        let runID = UUID().uuidString
+        try db.execute("""
+            INSERT INTO agent_threads
+                (id, title, provider, model, status, created_at, updated_at)
+            VALUES
+                ('\(threadID)', 'rev', 'claude', 'claude-3', 'idle',
+                 '2024-06-01T00:00:00Z', '2024-06-01T00:00:00Z');
+            INSERT INTO agent_runs
+                (id, thread_id, provider, model, status, started_at)
+            VALUES
+                ('\(runID)', '\(threadID)', 'claude', 'claude-3', 'idle',
+                 '2024-06-01T00:00:00Z');
+            """)
+        try Schema.migrateSteps(db, Schema.steps)
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
+
+        let rev = try db.prepare(
+            "SELECT revision FROM agent_turn_checkpoint_catalog_meta WHERE id = 1;"
+        )
+        XCTAssertTrue(try rev.step())
+        let before = rev.columnInt64(0)
+
+        try db.execute("""
+            INSERT INTO agent_turn_checkpoints
+                (thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref,
+                 status, files_json, completed_at, created_at)
+            VALUES
+                ('\(threadID)', '\(runID)', 't1', 1, 'r1', 'ready', '[]',
+                 '2024-06-01T00:00:00.000Z', '2024-06-01T00:00:00Z');
+            """)
+        let after = try db.prepare(
+            "SELECT revision FROM agent_turn_checkpoint_catalog_meta WHERE id = 1;"
+        )
+        XCTAssertTrue(try after.step())
+        XCTAssertGreaterThan(after.columnInt64(0), before,
+                             "insert trigger must bump catalog revision")
+    }
+
     func test_v57_to_head_invalidLegacyCompletedAtUsesFixedBoundedSentinel() throws {
         // WHY: SQLite strftime returns NULL for malformed legacy dates. Falling
         // back to the raw completed_at value would copy attacker-sized text into
