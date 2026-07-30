@@ -172,4 +172,29 @@ final class CommandWrapPolicyTests: XCTestCase {
         XCTAssertTrue(CommandWrapPolicy.isFaithfulCompression(rawByteCount: 7_000, compressedContentByteCount: 200))
         XCTAssertTrue(CommandWrapPolicy.isFaithfulCompression(rawByteCount: 10, compressedContentByteCount: 10))
     }
+
+    func test_wrappedCommandCatalog_includesEndorsedForcedWrapCategories() {
+        // One representative per newly-endorsed category (package managers, build tools,
+        // test runners, linters, containers/IaC) must be forced-wrapped, never exact-output.
+        let representatives = [
+            "npm", "brew",       // package managers / install
+            "make", "cargo",     // build tools
+            "pytest", "jest",    // test runners
+            "eslint", "shellcheck", // linters
+            "docker", "terraform"  // containers / IaC
+        ]
+        for c in representatives {
+            XCTAssertTrue(WrappedCommandCatalog.commands.contains(c), "\(c) must be in the forced wrap catalog")
+            XCTAssertFalse(WrappedCommandCatalog.exactOutputCommandSet.contains(c), "\(c) must not be exact-output")
+        }
+    }
+
+    func test_wrappedCommandCatalog_neverOverlapsExactOutputFamily() {
+        // The forced wrap catalog and the exact-output (byte-exact stdout) family must remain
+        // fully disjoint sets — a command can never be both compressible and byte-exact.
+        XCTAssertTrue(
+            Set(WrappedCommandCatalog.commands).isDisjoint(with: Set(WrappedCommandCatalog.exactOutputCommands)),
+            "commands and exactOutputCommands must never overlap"
+        )
+    }
 }

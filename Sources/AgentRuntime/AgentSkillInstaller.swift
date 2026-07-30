@@ -276,7 +276,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     Dict/`#` vars only when they reduce repetition. Never alias secrets, people, IDs, paths, URLs.
     Do not return a rewritten/compressed copy of the user's prompt unless explicitly asked to compress text.
     Token Saver — compress eligible ordinary noisy output via managed `distill` CLI with an explicit extraction prompt; use `pipefail` when exit status matters.
-    Good to pipe: build/test/lint/install/docker/kubectl/terraform, large find/ls, git log/status/diff summaries, long logs.
+    Good to pipe: build/test/lint/install/docker/kubectl/terraform, large find/ls, git log/status/diff summaries, long logs. Most now auto-compress via the host wrapper; pipe anything else yourself: `<cmd> | distill "<question>"`.
     NEVER pipe `| distill` for exact-output tools (agent needs full stdout): rg, grep, egrep, fgrep, sed, awk, cat, head, tail, nl, cut, tr, diff, jq, yq, git grep/show/cat-file/blame; also patches/hashes/tokens, interactive/TUI, non-pipable, or service unavailable — state the skip briefly.
     NEVER Distill skill content: Skill tool output and requested/returned SKILL bodies must stay complete/verbatim (no summary, `[[rc:]]` handle, truncation, or savings accounting).
     Never invoke Node/tsx/npm/bun or a source-checkout `distill`.

@@ -14,6 +14,19 @@ final class DistillInstructionsTemplateTests: XCTestCase {
         // because the template changed and the test did not.
         XCTAssertTrue(t.contains("Good to pipe:"),
                       "the template must name the noisy-output cases that default to the managed CLI")
+        // WHY: WrappedCommandCatalog forced-wraps ~40 package-manager/build/test/lint/
+        // container commands automatically now. The provider must know most of the
+        // "Good to pipe" categories no longer need a manual `| distill` — the
+        // voluntary habit is the fallback for what the host does not already cover.
+        XCTAssertTrue(t.contains("auto-compress via the host wrapper"),
+                      "the template must clarify that most listed categories are now automatically compressed")
+        XCTAssertTrue(t.contains("pipe anything else yourself"),
+                      "the template must frame manual piping as the fallback for what is not auto-compressed")
+        // WHY: a vague "pipe voluntarily" gave the provider no actionable rule for what to
+        // actually run — it must see the concrete `| distill "<question>"` syntax so a tool
+        // outside the auto-compressed set still gets piped correctly, not skipped or guessed.
+        XCTAssertTrue(t.contains("| distill \"<question>\"`."),
+                      "the fallback instruction must show the concrete pipe-with-question syntax, not just say 'pipe it'")
         XCTAssertTrue(t.contains("NEVER pipe `| distill` for exact-output tools"),
                       "the template must forbid compressing output the agent consumes byte-exactly")
         XCTAssertTrue(t.contains("rg, grep"),

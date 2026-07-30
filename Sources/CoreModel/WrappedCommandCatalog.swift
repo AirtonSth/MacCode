@@ -42,7 +42,17 @@ public enum WrappedCommandCatalog {
     public static let commands: [String] = [
         "find", "ls",
         "git", "gh", "glab",
-        "swift", "xcodebuild"
+        "swift", "xcodebuild",
+        // package managers / install
+        "npm", "yarn", "pnpm", "pip", "pip3", "poetry", "bundle", "composer", "gem", "brew",
+        // build tools
+        "make", "cmake", "ninja", "gradle", "mvn", "dotnet", "cargo", "go", "rustc", "tsc", "javac",
+        // test runners
+        "pytest", "jest", "mocha", "rspec", "phpunit",
+        // linters
+        "eslint", "pylint", "flake8", "rubocop", "swiftlint", "shellcheck", "golangci-lint", "stylelint", "hadolint",
+        // containers / IaC
+        "docker", "kubectl", "helm", "terraform", "terragrunt", "pulumi"
     ]
 
     public static let commandSet: Set<String> = Set(commands)

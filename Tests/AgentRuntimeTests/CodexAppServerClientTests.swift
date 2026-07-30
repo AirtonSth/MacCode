@@ -562,10 +562,13 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual((params["sandboxPolicy"] as? [String: Any])?["type"] as? String, "dangerFullAccess")
     }
 
-    func test_startTurnSubagentSupervisedAddsNetworkAccessToReadOnlySandbox() async throws {
+    func test_startTurnTokenSaverActiveSupervisedAddsNetworkAccessToReadOnlySandbox() async throws {
         // WHY: Codex's seatbelt denies all network by default under readOnly/workspaceWrite,
-        // blocking the Token Saver ledger POST. Subagent runs get networkAccess added so the
-        // ledger POST can succeed; filesystem restrictions from readOnly are unaffected.
+        // blocking the Token Saver ledger POST. When Token Saver is admitted for this run,
+        // networkAccess is added so the ledger POST can succeed; filesystem restrictions from
+        // readOnly are unaffected. This must apply the SAME way to a primary run, a
+        // same-provider subagent, and a cross-provider nested run — the gate is "is Token
+        // Saver active", never "what kind of run is this".
         let script = try makeFakeAppServerPeer()
         let client = try CodexAppServerClient(
             binary: script,
@@ -582,9 +585,9 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                 provider: .codex,
                 model: "gpt-5.5",
                 cwd: "/tmp/remotecode-app-server-test",
-                prompt: "subagent supervised",
+                prompt: "token saver active supervised",
                 permissionMode: .supervised,
-                environment: ["RC_REMOTE_CODE_SUBAGENT_THREAD_ID": UUID().uuidString]
+                environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
             )
         )
 
@@ -594,7 +597,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual(sandboxPolicy["networkAccess"] as? Bool, true)
     }
 
-    func test_startTurnSubagentAutoAcceptEditsAddsNetworkAccessToWorkspaceWriteSandbox() async throws {
+    func test_startTurnTokenSaverActiveAutoAcceptEditsAddsNetworkAccessToWorkspaceWriteSandbox() async throws {
         let script = try makeFakeAppServerPeer()
         let client = try CodexAppServerClient(
             binary: script,
@@ -611,9 +614,9 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                 provider: .codex,
                 model: "gpt-5.5",
                 cwd: "/tmp/remotecode-app-server-test",
-                prompt: "subagent workspace write",
+                prompt: "token saver active workspace write",
                 permissionMode: .autoAcceptEdits,
-                environment: ["RC_REMOTE_CODE_SUBAGENT_THREAD_ID": UUID().uuidString]
+                environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
             )
         )
 
@@ -623,7 +626,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual(sandboxPolicy["networkAccess"] as? Bool, true)
     }
 
-    func test_startTurnSubagentFullAccessNeverGetsNetworkAccessKey() async throws {
+    func test_startTurnTokenSaverActiveFullAccessNeverGetsNetworkAccessKey() async throws {
         // WHY: Full Access has no seatbelt at all (already unrestricted). It must stay exactly
         // {"type": "dangerFullAccess"} — adding networkAccess there would be meaningless and
         // could mask a future protocol change silently.
@@ -643,9 +646,9 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                 provider: .codex,
                 model: "gpt-5.5",
                 cwd: "/tmp/remotecode-app-server-test",
-                prompt: "subagent full access",
+                prompt: "token saver active full access",
                 permissionMode: .fullAccess,
-                environment: ["RC_REMOTE_CODE_SUBAGENT_THREAD_ID": UUID().uuidString]
+                environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
             )
         )
 
@@ -653,13 +656,14 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         let sandboxPolicy = try XCTUnwrap(params["sandboxPolicy"] as? [String: Any])
         XCTAssertEqual(sandboxPolicy["type"] as? String, "dangerFullAccess")
         XCTAssertNil(sandboxPolicy["networkAccess"], "dangerFullAccess must never carry a networkAccess key")
-        XCTAssertEqual(sandboxPolicy.count, 1, "dangerFullAccess sandbox policy must stay exactly {type} for subagents too")
+        XCTAssertEqual(sandboxPolicy.count, 1, "dangerFullAccess sandbox policy must stay exactly {type} even with Token Saver active")
     }
 
-    func test_startTurnPrimaryRunNeverGetsNetworkAccessKeyRegardlessOfPermissionMode() async throws {
-        // WHY: this is the byte-identical-baseline proof. Without the subagent marker, a
-        // primary (non-subagent) Codex run must send the exact same sandboxPolicy as before
-        // this change, for every permission mode — no networkAccess key at all.
+    func test_startTurnTokenSaverInactiveNeverGetsNetworkAccessKeyRegardlessOfPermissionMode() async throws {
+        // WHY: this is the fail-open baseline required by AGENTS.md — Token Saver must not
+        // change any behavior while it is off, for ANY permission mode, regardless of whether
+        // the run is a primary agent, a subagent, or a cross-provider nested run (none of
+        // those carry RC_TOKEN_SAVER_DISTILL_HINT=1 here, matching a Token-Saver-disabled run).
         let script = try makeFakeAppServerPeer()
         let client = try CodexAppServerClient(
             binary: script,
@@ -677,15 +681,19 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                     provider: .codex,
                     model: "gpt-5.5",
                     cwd: "/tmp/remotecode-app-server-test",
-                    prompt: "primary run \(mode)",
-                    permissionMode: mode
+                    prompt: "token saver inactive \(mode)",
+                    permissionMode: mode,
+                    // Deliberately includes a subagent-parent-telemetry marker (present on
+                    // real primary AND subagent runs alike) to prove that marker alone must
+                    // never grant networkAccess — only RC_TOKEN_SAVER_DISTILL_HINT does.
+                    environment: ["RC_REMOTE_CODE_SUBAGENT_THREAD_ID": UUID().uuidString]
                 )
             )
             let params = try XCTUnwrap(response["lastParams"] as? [String: Any])
             let sandboxPolicy = try XCTUnwrap(params["sandboxPolicy"] as? [String: Any])
             XCTAssertNil(
                 sandboxPolicy["networkAccess"],
-                "primary run in \(mode) must never carry networkAccess — only subagents do"
+                "Token-Saver-inactive run in \(mode) must never carry networkAccess"
             )
         }
     }

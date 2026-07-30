@@ -739,12 +739,16 @@ public final class CodexAppServerClient: @unchecked Sendable {
         }
 
         let model = normalizedModel(request.model)
-        let isSubagent = RemoteCodeSubagentTelemetryScope(environment: request.environment) != nil
+        // Provider-neutral "Token Saver is admitted for this run" signal (same gate the
+        // Claude PostToolUse hook and the Grok/Codex distill prompt hint use) — applies
+        // uniformly whether this is a primary run, a same-provider subagent, or a
+        // cross-provider nested run, per AGENTS.md.
+        let tokenSaverActive = request.environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
         var params: JSONObject = [
             "threadId": providerThreadId,
             "input": input,
             "approvalPolicy": approvalPolicy(for: request.permissionMode),
-            "sandboxPolicy": sandboxPolicy(for: request.permissionMode, isSubagent: isSubagent),
+            "sandboxPolicy": sandboxPolicy(for: request.permissionMode, tokenSaverActive: tokenSaverActive),
             "collaborationMode": collaborationMode(for: request, normalizedModel: model)
         ]
         if let model { params["model"] = model }
@@ -889,20 +893,23 @@ public final class CodexAppServerClient: @unchecked Sendable {
         }
     }
 
-    /// Subagent Codex runs get `networkAccess: true` added to the readOnly/workspaceWrite
-    /// sandbox policy so the local Token Saver ledger POST is not blocked by the seatbelt's
-    /// default network denial. This only lifts network — filesystem restrictions from the
-    /// underlying mode are unchanged. Full Access subagents are untouched (already
-    /// unsandboxed). Primary (non-subagent) runs are never affected by this parameter.
-    private static func sandboxPolicy(for mode: AgentPermissionMode, isSubagent: Bool = false) -> JSONObject {
+    /// When Token Saver is active for this run, `networkAccess: true` is added to the
+    /// readOnly/workspaceWrite sandbox policy so the local Token Saver ledger POST is not
+    /// blocked by the seatbelt's default network denial. This only lifts network —
+    /// filesystem restrictions from the underlying mode are unchanged. Full Access is
+    /// untouched (already unsandboxed). Applies uniformly to every Codex run (primary,
+    /// subagent, or cross-provider nested) — see AGENTS.md "Token Saver / Distill rules":
+    /// this must fail open (no networkAccess) whenever Token Saver is off, and must not be
+    /// scoped to one run kind when the underlying capability is provider-wide.
+    private static func sandboxPolicy(for mode: AgentPermissionMode, tokenSaverActive: Bool = false) -> JSONObject {
         switch mode {
         case .supervised:
             var policy: JSONObject = ["type": "readOnly"]
-            if isSubagent { policy["networkAccess"] = true }
+            if tokenSaverActive { policy["networkAccess"] = true }
             return policy
         case .autoAcceptEdits:
             var policy: JSONObject = ["type": "workspaceWrite"]
-            if isSubagent { policy["networkAccess"] = true }
+            if tokenSaverActive { policy["networkAccess"] = true }
             return policy
         case .fullAccess:
             return ["type": "dangerFullAccess"]
