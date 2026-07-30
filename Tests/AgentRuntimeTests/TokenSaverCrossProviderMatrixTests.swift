@@ -53,8 +53,12 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
             )
             XCTAssertTrue(prompt.contains("| distill"), "\(provider) dialect must inject | distill")
             XCTAssertTrue(
-                prompt.contains("MANDATORY") || prompt.contains("REQUIRED to pipe"),
-                "\(provider) must require | distill on eligible noisy output"
+                prompt.contains("MANDATORY") || prompt.contains("default-pipe"),
+                "\(provider) must require default-pipe | distill"
+            )
+            XCTAssertTrue(
+                prompt.contains("non-GUI") || prompt.contains("GUI"),
+                "\(provider) must exempt GUI from | distill"
             )
             XCTAssertTrue(prompt.contains("NEVER pipe"), "\(provider) exact-output still forbidden")
 
@@ -206,7 +210,8 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
             // Args shape is provider-specific; the important proof is that the seam
             // does not drop Token Saver when building nested argv from admitted env.
             let prompt = AgentSkillInstaller.tokenSaverProviderPrompt("", environment: env)
-            XCTAssertTrue(prompt.contains("MANDATORY") || prompt.contains("REQUIRED to pipe"))
+            XCTAssertTrue(prompt.contains("MANDATORY") || prompt.contains("default-pipe"))
+            XCTAssertTrue(prompt.contains("byte-exactly") || prompt.contains("full stdout"))
             XCTAssertFalse(args.isEmpty)
         }
     }

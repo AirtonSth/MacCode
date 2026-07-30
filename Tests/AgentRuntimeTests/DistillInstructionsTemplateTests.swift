@@ -12,15 +12,20 @@ final class DistillInstructionsTemplateTests: XCTestCase {
         // allowlist, and a never-pipe list of exact-output tools. These assertions
         // pin that decision — they previously asserted its inverse and were red,
         // because the template changed and the test did not.
-        // WHY: Token Saver must require `| distill` on eligible noisy output for every
-        // admitted primary, same-provider subagent, and cross-provider nested run — not
-        // a soft "good to pipe" suggestion the model can ignore.
-        XCTAssertTrue(t.contains("MANDATORY") || t.contains("REQUIRED to pipe"),
-                      "the template must require piping eligible noisy commands")
+        // WHY: default is pipe EVERY non-GUI shell command unless the agent needs
+        // exact full stdout (rg/sed/cat/…) or the tool is GUI/interactive.
+        XCTAssertTrue(t.contains("MANDATORY") || t.contains("default-pipe"),
+                      "the template must require default-pipe | distill")
+        XCTAssertTrue(
+            t.contains("non-GUI") || t.contains("GUI"),
+            "the template must exempt GUI/interactive tools from | distill"
+        )
+        XCTAssertTrue(
+            t.contains("byte-exactly") || t.contains("full stdout"),
+            "the template must key the decision on needing exact stdout"
+        )
         XCTAssertTrue(t.contains("policy violation") || t.contains("Omitting `| distill`"),
                       "omitting eligible | distill must be called out as a violation")
-        XCTAssertTrue(t.contains("auto-compress via the host wrapper"),
-                      "the template must clarify host PATH wrappers also compress catalog commands")
         XCTAssertTrue(
             t.contains("| distill \"<question>\""),
             "the instruction must show the concrete pipe-with-question syntax"
@@ -29,10 +34,15 @@ final class DistillInstructionsTemplateTests: XCTestCase {
             t.contains("primary agents") || t.contains("cross-provider") || t.contains("subagents"),
             "policy must apply to primary, subagent, and cross-provider shapes"
         )
-        XCTAssertTrue(t.contains("NEVER pipe `| distill` for exact-output tools"),
-                      "the template must forbid compressing output the agent consumes byte-exactly")
+        XCTAssertTrue(
+            t.contains("NEVER pipe `| distill` only for exact-output")
+                || t.contains("NEVER pipe `| distill` for exact-output"),
+            "the template must forbid compressing output the agent consumes byte-exactly"
+        )
         XCTAssertTrue(t.contains("rg, grep"),
                       "the never-pipe list must name the search tools whose exact stdout the agent needs")
+        XCTAssertTrue(t.contains("sed"),
+                      "the never-pipe list must name sed as exact-output")
         XCTAssertFalse(t.contains("~10 lines or ~1KB"),
                        "the provider must not guess output size before deciding to distill")
         XCTAssertFalse(t.lowercased().contains("bias to compress"),
@@ -73,8 +83,13 @@ final class DistillInstructionsTemplateTests: XCTestCase {
                       "full skill body also protects skill content as a verbatim category")
         XCTAssertTrue(
             AgentSkillInstaller.distillSkillTemplate.contains("MANDATORY")
-                || AgentSkillInstaller.distillSkillTemplate.contains("REQUIRED"),
-            "full skill body must also require | distill on eligible noisy commands"
+                || AgentSkillInstaller.distillSkillTemplate.contains("default-pipe"),
+            "full skill body must require default-pipe | distill for non-exact shell commands"
+        )
+        XCTAssertTrue(
+            AgentSkillInstaller.distillSkillTemplate.contains("GUI")
+                || AgentSkillInstaller.distillSkillTemplate.contains("interactive"),
+            "full skill body must exempt GUI/interactive from | distill"
         )
         // Bounded by the managed markers.
         XCTAssertTrue(t.hasPrefix(AgentSkillInstaller.distillInstructionsBeginMarker))
