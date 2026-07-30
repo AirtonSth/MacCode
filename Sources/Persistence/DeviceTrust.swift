@@ -613,15 +613,33 @@ public final class DeviceTrustRepository {
     /// that made the cost scale with the entire audit log (measured ~1.3s of the
     /// ~2.0s Subagents refresh). Filter in SQL and skip date decoding entirely.
     public func listAuditLogDetails(actions: [String], limit: Int) throws -> [String] {
+        try listAuditLogDetails(actions: actions, detailContains: nil, limit: limit)
+    }
+
+    /// Like `listAuditLogDetails(actions:limit:)` with an optional SQL `detail LIKE`
+    /// prefilter. The needle is a cheap index-free prefilter only — callers must
+    /// still enforce exact membership after decoding (false positives can match).
+    public func listAuditLogDetails(
+        actions: [String],
+        detailContains needle: String?,
+        limit: Int
+    ) throws -> [String] {
         guard !actions.isEmpty else { return [] }
         let placeholders = Array(repeating: "?", count: actions.count).joined(separator: ",")
+        let filter = needle == nil ? "" : " AND detail LIKE ?"
         let st = try db.prepare(
-            "SELECT detail FROM audit_log WHERE action IN (\(placeholders)) ORDER BY id DESC LIMIT ?;"
+            "SELECT detail FROM audit_log WHERE action IN (\(placeholders))\(filter) ORDER BY id DESC LIMIT ?;"
         )
-        for (offset, action) in actions.enumerated() {
-            try st.bind(Int32(offset + 1), action)
+        var bindIndex: Int32 = 1
+        for action in actions {
+            try st.bind(bindIndex, action)
+            bindIndex += 1
         }
-        try st.bind(Int32(actions.count + 1), limit)
+        if let needle {
+            try st.bind(bindIndex, "%\(needle)%")
+            bindIndex += 1
+        }
+        try st.bind(bindIndex, limit)
         var out: [String] = []
         while try st.step() {
             if let detail = st.columnText(0) { out.append(detail) }

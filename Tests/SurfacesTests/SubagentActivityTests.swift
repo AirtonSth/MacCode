@@ -240,9 +240,9 @@ final class SubagentActivityTests: XCTestCase {
                        "expanded Show N more reveals the full bounded Done list")
     }
 
-    func test_project_filtersToWorkspaceThreads() {
-        // WHY: the audit log is process-global; a workspace Agent App must not
-        // show another workspace's admissions as its own subagents.
+    func test_project_filtersToSelectedThreadIds() {
+        // WHY: the audit log is process-global; the Subagents badge is per-thread
+        // chrome and must not show sibling-thread (or other workspace) admissions.
         let local = makeReceipt(
             threadId: threadA,
             lifecycle: .accepted,
@@ -258,11 +258,88 @@ final class SubagentActivityTests: XCTestCase {
         )
         let snapshot = SubagentActivityProjection.project(
             receipts: [local, foreign],
-            workspaceThreadIds: [threadA]
+            threadIds: [threadA]
         )
         XCTAssertEqual(snapshot.activeCount, 1)
         XCTAssertEqual(snapshot.doneCount, 0)
         XCTAssertEqual(snapshot.active.first?.threadId, threadA)
+    }
+
+    func test_project_includesParentChainDescendantsOnOtherThreads() {
+        // WHY: middleware nested Agent App workers run on their own thread id but
+        // must still appear on the spawning thread's badge; parent-chain is the
+        // attribution link. Unrelated siblings without that chain stay excluded.
+        let parentRootId = UUID()
+        let parentRoot = makeReceipt(
+            id: parentRootId,
+            threadId: threadA,
+            lifecycle: .accepted,
+            nodeId: "root",
+            provider: .claude
+        )
+        let nestedChild = makeReceipt(
+            id: UUID(),
+            parentReceiptId: parentRootId,
+            threadId: threadB,
+            lifecycle: .finalized,
+            finalStatus: .completed,
+            nodeId: "middleware-nested-worker",
+            provider: .codex
+        )
+        let unrelatedSibling = makeReceipt(
+            id: UUID(),
+            threadId: threadB,
+            lifecycle: .finalized,
+            finalStatus: .completed,
+            nodeId: "unrelated-sibling",
+            provider: .grok
+        )
+        let snapshot = SubagentActivityProjection.project(
+            receipts: [parentRoot, nestedChild, unrelatedSibling],
+            threadIds: [threadA]
+        )
+        XCTAssertEqual(
+            snapshot.done.map(\.nodeId),
+            ["middleware-nested-worker"],
+            "child receipt on a different thread whose parent is on the selected thread must be included"
+        )
+        XCTAssertFalse(
+            snapshot.done.contains(where: { $0.nodeId == "unrelated-sibling" }),
+            "sibling-thread receipts without a parent chain to the selection must stay out"
+        )
+        XCTAssertEqual(snapshot.activeCount, 0, "root controller is not a subagent row")
+        XCTAssertTrue(
+            SubagentActivityProjection.belongsToThreadScope(
+                receipt: nestedChild,
+                threadIds: [threadA],
+                receipts: [parentRoot, nestedChild, unrelatedSibling]
+            )
+        )
+        XCTAssertFalse(
+            SubagentActivityProjection.belongsToThreadScope(
+                receipt: unrelatedSibling,
+                threadIds: [threadA],
+                receipts: [parentRoot, nestedChild, unrelatedSibling]
+            )
+        )
+    }
+
+    func test_project_parentChainFailsClosedWhenAncestorMissing() {
+        // WHY: if the parent fell outside the fetched activity window, inventing
+        // attribution would re-open sibling leaks; fail closed instead.
+        let orphanedChild = makeReceipt(
+            id: UUID(),
+            parentReceiptId: UUID(),
+            threadId: threadB,
+            lifecycle: .accepted,
+            nodeId: "orphaned-nested",
+            provider: .codex
+        )
+        let snapshot = SubagentActivityProjection.project(
+            receipts: [orphanedChild],
+            threadIds: [threadA]
+        )
+        XCTAssertTrue(snapshot.isEmpty)
     }
 
     func test_projectExcludesRootAndKeepsUnknownOutOfDone() {
@@ -407,6 +484,7 @@ final class SubagentActivityTests: XCTestCase {
 
     private func makeReceipt(
         id: UUID = UUID(),
+        parentReceiptId: UUID? = nil,
         threadId: AgentThreadID? = nil,
         lifecycle: AgentOrchestrationReceiptLifecycleStatus,
         finalStatus: AgentRunStatus? = nil,
@@ -422,6 +500,7 @@ final class SubagentActivityTests: XCTestCase {
         let admitted = admittedAt ?? now.addingTimeInterval(-120)
         return AgentOrchestrationAdmissionReceipt(
             id: id,
+            parentReceiptId: parentReceiptId,
             runId: runId,
             threadId: threadId ?? threadA,
             nodeId: nodeId,

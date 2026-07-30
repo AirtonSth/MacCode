@@ -195,13 +195,14 @@ public enum SubagentActivityProjection {
     public static let defaultDoneVisibleLimit = 4
     public static let defaultUnknownVisibleLimit = 4
     public static let defaultCompletedBound = 50
-    // The audit log is process-global. Scope by workspace before applying the
-    // bounded UI history limits.
+    // Primary thread window for the scoped activity fetch. Nested workers use a
+    // separate child bound on the runtime (`defaultChildActivityReceiptLimit`).
+    // Projection still scopes by selected thread + parent-chain as defense in depth.
     public static let defaultReceiptFetchLimit = 10_000
 
     public static func project(
         receipts: [AgentOrchestrationAdmissionReceipt],
-        workspaceThreadIds: Set<AgentThreadID>? = nil,
+        threadIds: Set<AgentThreadID>? = nil,
         activeRunIds: Set<AgentRunID> = [],
         now: Date = Date(),
         activeVisibleLimit: Int = defaultActiveVisibleLimit,
@@ -210,8 +211,20 @@ public enum SubagentActivityProjection {
         completedBound: Int = defaultCompletedBound
     ) -> SubagentActivitySnapshot {
         let scoped: [AgentOrchestrationAdmissionReceipt]
-        if let workspaceThreadIds {
-            scoped = receipts.filter { workspaceThreadIds.contains($0.threadId) }
+        if let threadIds {
+            // One map + shared memo for the whole filter pass so parent-chain
+            // attribution stays O(n) even with deep nested workers.
+            let receiptByID = Dictionary(uniqueKeysWithValues: receipts.map { ($0.id, $0) })
+            var memo: [UUID: Bool] = [:]
+            scoped = receipts.filter {
+                belongsToThreadScope(
+                    receipt: $0,
+                    threadIds: threadIds,
+                    receiptByID: receiptByID,
+                    memo: &memo,
+                    visiting: []
+                )
+            }
         } else {
             scoped = receipts
         }
@@ -302,6 +315,63 @@ public enum SubagentActivityProjection {
         if receipt.parentReceiptId != nil { return true }
         return receipt.nodeId.trimmingCharacters(in: .whitespacesAndNewlines)
             .caseInsensitiveCompare("root") != .orderedSame
+    }
+
+    /// Whether a receipt belongs on a selected thread's Subagents badge.
+    ///
+    /// Includes (1) receipts whose own `threadId` is selected and (2) nested
+    /// workers whose `parentReceiptId` chain reaches a receipt on a selected
+    /// thread. Middleware cross-provider children run on their own Agent App
+    /// thread but must still appear under the spawner; unrelated sibling-thread
+    /// receipts stay excluded.
+    public static func belongsToThreadScope(
+        receipt: AgentOrchestrationAdmissionReceipt,
+        threadIds: Set<AgentThreadID>,
+        receipts: [AgentOrchestrationAdmissionReceipt]
+    ) -> Bool {
+        if threadIds.isEmpty { return false }
+        let receiptByID = Dictionary(uniqueKeysWithValues: receipts.map { ($0.id, $0) })
+        var memo: [UUID: Bool] = [:]
+        return belongsToThreadScope(
+            receipt: receipt,
+            threadIds: threadIds,
+            receiptByID: receiptByID,
+            memo: &memo,
+            visiting: []
+        )
+    }
+
+    /// Memoized parent-chain walk used by `project`. Cycle-safe and fail-closed
+    /// when an ancestor is outside the fetched receipt window.
+    private static func belongsToThreadScope(
+        receipt: AgentOrchestrationAdmissionReceipt,
+        threadIds: Set<AgentThreadID>,
+        receiptByID: [UUID: AgentOrchestrationAdmissionReceipt],
+        memo: inout [UUID: Bool],
+        visiting: Set<UUID>
+    ) -> Bool {
+        if let cached = memo[receipt.id] { return cached }
+        if threadIds.contains(receipt.threadId) {
+            memo[receipt.id] = true
+            return true
+        }
+        guard let parentId = receipt.parentReceiptId,
+              !visiting.contains(receipt.id),
+              let parent = receiptByID[parentId] else {
+            memo[receipt.id] = false
+            return false
+        }
+        var nextVisiting = visiting
+        nextVisiting.insert(receipt.id)
+        let belongs = belongsToThreadScope(
+            receipt: parent,
+            threadIds: threadIds,
+            receiptByID: receiptByID,
+            memo: &memo,
+            visiting: nextVisiting
+        )
+        memo[receipt.id] = belongs
+        return belongs
     }
 
     /// Normalize every provider through the neutral enum. Unknown stays unknown.
