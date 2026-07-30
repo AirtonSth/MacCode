@@ -2779,6 +2779,195 @@ final class DispatcherTests: XCTestCase {
                        "CAS must stop before persistence when the authoritative read failed")
     }
 
+    /// WHY: legacy mobile clients omit protocol_version and must keep receiving
+    /// the full notes string object — no silent shape change for old clients.
+    @MainActor
+    func testAgentPlanNotesGet_legacyPathUnchangedWithoutProtocolVersion() async throws {
+        let router = FakeRouter()
+        let thread = AgentThreadID()
+        let notes = String(repeating: "legacy-full-notes-", count: 100)
+        router.planNotesByThread[thread] = notes
+        let dispatcher = JSONRPCDispatcher(router: router)
+
+        let resp = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.plan.notes.get",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                // max_bytes alone must not opt into v1.
+                "max_bytes": .number(16),
+            ]
+        ))
+
+        XCTAssertNil(resp.error)
+        XCTAssertEqual(resp.result, .object(["notes": .string(notes)]))
+        XCTAssertEqual(router.planNotesByThread[thread], notes,
+                       "get must not mutate authoritative persistence")
+    }
+
+    /// WHY: v1 must page under the server ceiling, reassemble exactly, and keep
+    /// each encoded JSON-RPC response under the 512 KiB weak-link budget.
+    @MainActor
+    func testAgentPlanNotesGet_v1PagesAndReassemblesWithoutTruncatingPersistence() async throws {
+        let router = FakeRouter()
+        let thread = AgentThreadID()
+        let unit = "wire-v1-✅-"
+        var notes = ""
+        while notes.utf8.count < 180_000 {
+            notes += unit
+        }
+        let authoritative = notes
+        router.planNotesByThread[thread] = authoritative
+        let dispatcher = JSONRPCDispatcher(router: router)
+
+        var offset = 0
+        var assembled = ""
+        var digest: String?
+        var pageIndex = 0
+        while true {
+            var params: [String: JSONValue] = [
+                "thread_id": .string(thread.value.uuidString),
+                "protocol_version": .number(1),
+                "offset_bytes": .number(Double(offset)),
+                "max_bytes": .number(Double(PlanNotesProjectionV1.maxBytesCeiling)),
+            ]
+            if let digest {
+                params["content_digest"] = .string(digest)
+            }
+            let resp = await dispatcher.dispatch(JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(pageIndex + 1),
+                method: "agent.plan.notes.get",
+                params: params
+            ))
+            XCTAssertNil(resp.error, "page \(pageIndex): \(String(describing: resp.error))")
+            let body = try XCTUnwrap(resp.result?.objectValue)
+            XCTAssertEqual(body["protocol_version"], .number(1))
+            let chunk = try XCTUnwrap(body["notes"]?.stringValue)
+            assembled += chunk
+            digest = body["content_digest"]?.stringValue
+            let encoded = try JSONEncoder().encode(resp)
+            XCTAssertLessThan(
+                encoded.count,
+                PlanNotesProjectionV1.maxEncodedResponseBytes,
+                "page \(pageIndex) encoded \(encoded.count)"
+            )
+            let hasMore = try XCTUnwrap(body["has_more"]?.boolValue)
+            if !hasMore { break }
+            offset = try XCTUnwrap(body["next_offset_bytes"]?.intValue)
+            pageIndex += 1
+            XCTAssertLessThan(pageIndex, 50)
+        }
+
+        XCTAssertEqual(assembled, authoritative)
+        XCTAssertEqual(router.planNotesByThread[thread], authoritative,
+                       "paged get must leave persisted notes byte-identical")
+        XCTAssertGreaterThan(pageIndex, 0, "180 KiB must span multiple 64 KiB pages")
+    }
+
+    /// WHY: a present-but-invalid v1 request must fail closed, not fall back to
+    /// the unbounded legacy response that the client cannot afford.
+    @MainActor
+    func testAgentPlanNotesGet_v1InvalidParamsDoNotDowngradeToLegacy() async throws {
+        let router = FakeRouter()
+        let thread = AgentThreadID()
+        router.planNotesByThread[thread] = String(repeating: "x", count: 10_000)
+        let dispatcher = JSONRPCDispatcher(router: router)
+
+        let cases: [[String: JSONValue]] = [
+            [
+                "thread_id": .string(thread.value.uuidString),
+                "protocol_version": .number(2),
+            ],
+            [
+                "thread_id": .string(thread.value.uuidString),
+                "protocol_version": .number(1),
+                "offset_bytes": .number(1.5),
+            ],
+            [
+                "thread_id": .string(thread.value.uuidString),
+                "protocol_version": .number(1),
+                "max_bytes": .number(Double(PlanNotesProjectionV1.maxBytesCeiling + 1)),
+            ],
+        ]
+        for params in cases {
+            let resp = await dispatcher.dispatch(JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(1),
+                method: "agent.plan.notes.get",
+                params: params
+            ))
+            XCTAssertEqual(resp.error?.code, -32602, "\(params)")
+            XCTAssertNil(resp.result,
+                         "must not return a success/legacy body on a failed v1 request")
+        }
+    }
+
+    /// WHY: mid-pagination mutation must surface as an honest CAS error so the
+    /// client restarts reassembly instead of concatenating mixed revisions.
+    @MainActor
+    func testAgentPlanNotesGet_v1DetectsDigestMismatchMidPagination() async throws {
+        let router = FakeRouter()
+        let thread = AgentThreadID()
+        router.planNotesByThread[thread] = String(repeating: "A", count: 100_000)
+        let dispatcher = JSONRPCDispatcher(router: router)
+
+        let first = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.plan.notes.get",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "protocol_version": .number(1),
+                "offset_bytes": .number(0),
+                "max_bytes": .number(1024),
+            ]
+        ))
+        let digest = try XCTUnwrap(first.result?.objectValue?["content_digest"]?.stringValue)
+        let next = try XCTUnwrap(first.result?.objectValue?["next_offset_bytes"]?.intValue)
+
+        router.planNotesByThread[thread] = String(repeating: "B", count: 100_000)
+        let second = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(2),
+            method: "agent.plan.notes.get",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "protocol_version": .number(1),
+                "offset_bytes": .number(Double(next)),
+                "max_bytes": .number(1024),
+                "content_digest": .string(digest),
+            ]
+        ))
+        XCTAssertEqual(second.error?.code, -32009)
+        XCTAssertEqual(second.error?.message, "Plan notes changed during pagination.")
+    }
+
+    /// WHY: save must keep the full authoritative value even when notes are
+    /// multi-MiB — the wire projection is bounded, persistence is not.
+    @MainActor
+    func testAgentPlanNotesSave_persistsFullNotesUntruncated() async throws {
+        let router = FakeRouter()
+        let thread = AgentThreadID()
+        let huge = String(repeating: "💾", count: 50_000) // multi-byte, multi-100KiB
+        let dispatcher = JSONRPCDispatcher(router: router)
+
+        let resp = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.plan.notes.save",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "notes": .string(huge),
+                "client_request_id": .string(UUID().uuidString),
+            ]
+        ))
+        XCTAssertNil(resp.error)
+        XCTAssertEqual(router.planNotesByThread[thread], huge)
+        XCTAssertEqual(router.planNotesByThread[thread]?.utf8.count, huge.utf8.count)
+    }
+
     // Verifies that the encode<T> helper's new path (JSONDecoder -> JSONValue) produces the
     // same structure as the old path (JSONSerialization + JSONValue.from) for a representative
     // Codable. This guards against any behavioral divergence introduced by the optimization.

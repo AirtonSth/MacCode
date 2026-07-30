@@ -504,8 +504,15 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         }
         XCTAssertEqual(updates.count, 1,
                        "one local TextEditor save must produce exactly one realtime mirror update")
-        XCTAssertEqual(updates.first?.payload.objectValue?["thread_id"]?.stringValue, thread.id.value.uuidString)
-        XCTAssertEqual(updates.first?.payload.objectValue?["notes"]?.stringValue, "typed on Mac")
+        let payload = try XCTUnwrap(updates.first?.payload.objectValue)
+        XCTAssertEqual(payload["thread_id"]?.stringValue, thread.id.value.uuidString)
+        // WHY: full notes on the event overflow the WS budget; mirrors rehydrate
+        // via agent.plan.notes.get. Authoritative value still persisted above.
+        XCTAssertNil(payload["notes"], "update event must not embed full notes")
+        XCTAssertEqual(payload["rehydrate_required"], .bool(true))
+        XCTAssertEqual(payload["preview"]?.stringValue, "typed on Mac")
+        XCTAssertEqual(payload["content_digest"]?.stringValue,
+                       PlanNotesProjectionV1.contentDigest(of: "typed on Mac"))
     }
 
     func test_remotePlanNotesUpdate_doesNotEchoThroughLocalSaveObserver() throws {

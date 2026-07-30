@@ -137,10 +137,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private func publishAgentPlanNotesUpdated(thread: AgentThreadID, notes: String) {
-        EventBus.shared.publish(kind: "agent.plan.notes.updated", payload: .object([
-            "thread_id": .string(thread.value.uuidString),
-            "notes": .string(notes)
-        ]))
+        // Compact metadata/digest/preview only. Full notes on the event used to
+        // overflow the WS outbound budget; clients rehydrate via
+        // agent.plan.notes.get protocol_version 1. Persistence remains full.
+        EventBus.shared.publish(
+            kind: "agent.plan.notes.updated",
+            payload: PlanNotesProjectionV1.compactUpdateEvent(threadId: thread, notes: notes)
+        )
     }
 
     private func publishAgentThreadRead(_ threadID: AgentThreadID) {

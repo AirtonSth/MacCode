@@ -689,7 +689,17 @@ public final class JSONRPCDispatcher {
             payload["relative_path"] = result.objectValue?["relative_path"]
         case "agent.plan.notes.save":
             kind = "agent.plan.notes.updated"
-            payload["thread_id"] = string("thread_id")
+            // Compact metadata only — full notes on the wire drop the live stream
+            // on weak links. Authoritative text stays on disk and is paged via
+            // agent.plan.notes.get protocol_version 1.
+            if let threadString = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+               let notes = params["notes"]?.stringValue {
+                payload = PlanNotesProjectionV1.compactUpdateEvent(threadId: threadString, notes: notes).objectValue
+                    ?? ["thread_id": .string(threadString.value.uuidString)]
+            } else {
+                payload["thread_id"] = string("thread_id")
+                payload["rehydrate_required"] = .bool(true)
+            }
         case "agent.checkpoint.revert":
             kind = "agent.checkpoint.reverted"
             payload["thread_id"] = string("thread_id")
@@ -2061,7 +2071,16 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: result)
             case "agent.plan.notes.get":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
-                return .init(id: id, result: .object(["notes": .string(try router.agentPlanNotes(thread: tid))]))
+                // Opt-in protocol_version 1: bounded UTF-8 page. Absent version
+                // keeps the legacy full-string shape so old clients stay green.
+                // Present-but-invalid must not silently downgrade.
+                let caps = try PlanNotesProjectionV1.parseCaps(params)
+                let notes = try router.agentPlanNotes(thread: tid)
+                if let caps {
+                    let page = try PlanNotesProjectionV1.page(notes: notes, caps: caps)
+                    return .init(id: id, result: page.json)
+                }
+                return .init(id: id, result: .object(["notes": .string(notes)]))
             case "agent.plan.notes.save":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let notes = params["notes"]?.stringValue else { throw JSONRPCError.invalidParams }
