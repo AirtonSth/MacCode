@@ -530,12 +530,28 @@ public final class JSONRPCDispatcher {
     /// cannot disagree.
     public nonisolated let agentAttachmentUploadCapability:
         AgentAttachmentUploadCapabilityAdvertisement?
-    private static let checkpointListV1MaxFilesPerItem = 64
-    private static let checkpointListV1MaxEncodedFilesBytesPerItem = 6 * 1_024
-    private static let checkpointListV1MaxEncodedItemBytes = 8 * 1_024
-    private static let checkpointListV1MaxEncodedResponseBytes = 700 * 1_024
-    private static let checkpointListV1MaxEncodedCheckpointRefBytes = 512
-    private static let checkpointListV1MaxEncodedErrorMessageBytes = 1_024
+    private static let checkpointListV1MaxFilesPerItem =
+        AgentTurnCheckpointListWireProjection.maxFiles
+    private static let checkpointListV1MaxEncodedFilesBytesPerItem =
+        AgentTurnCheckpointListWireProjection.maxEncodedFilesBytes
+    private static let checkpointListV1MaxEncodedItemBytes =
+        AgentTurnCheckpointListWireProjection.maxEncodedItemBytes
+    private static let checkpointListV1MaxEncodedResponseBytes =
+        AgentTurnCheckpointListWireProjection.maxEncodedResponseBytes
+    private static let checkpointListV1MaxEncodedCheckpointRefBytes =
+        AgentTurnCheckpointListWireProjection.maxEncodedCheckpointRefBytes
+    private static let checkpointListV1MaxEncodedErrorMessageBytes =
+        AgentTurnCheckpointListWireProjection.maxEncodedErrorMessageBytes
+    private static let checkpointListISO8601Fractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    private static let checkpointListISO8601Plain: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
     private var volatileCommandReceipts = BoundedReceiptCache()
     @TaskLocal private static var centralMutationExecution = false
     /// Bounded unknown-outcome fence (same cap as committed receipts). Does not
@@ -1285,6 +1301,7 @@ public final class JSONRPCDispatcher {
                     // this target. Same helper as DirectHTTPServer.capabilitiesPayload
                     // so authorities cannot drift on the old-host negotiation gate.
                     "plan_notes": PlanNotesProjectionV1.CapabilityAdvertisement.jsonValue,
+                    "checkpoint_list": AgentCheckpointListCapabilityV1.jsonValue
                 ]
                 if let attachmentUpload =
                     agentAttachmentUploadCapability {
@@ -3668,30 +3685,53 @@ public final class JSONRPCDispatcher {
 
     /// Strict keyset cursor for checkpoint list v1. Absent/null means no cursor;
     /// any present non-object, incomplete, or non-ISO8601 shape is invalid params.
+    /// Accepts whole-second and fractional `completed_at` so sub-second page
+    /// boundaries round-trip for iOS equality and DB keyset continuation.
     private func checkpointCursor(from value: JSONValue?) throws -> AgentTurnCheckpointCursor? {
         guard let value else { return nil }
         if case .null = value { return nil }
         guard case .object(let object) = value else { throw JSONRPCError.invalidParams }
-        guard let turnCount = object["checkpoint_turn_count"]?.intValue,
+        guard Set(object.keys) == [
+                "checkpoint_turn_count",
+                "completed_at",
+                "turn_id",
+              ],
+              let turnCount = object["checkpoint_turn_count"]?.intValue,
               turnCount >= 0,
               let turnId = object["turn_id"]?.stringValue,
               !turnId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               let completedRaw = object["completed_at"]?.stringValue,
-              let completedAt = ISO8601DateFormatter().date(from: completedRaw)
+              let completedAt = parseCheckpointListISO8601(completedRaw)
         else {
             throw JSONRPCError.invalidParams
         }
         return AgentTurnCheckpointCursor(
             checkpointTurnCount: turnCount,
             completedAt: completedAt,
-            turnId: turnId
+            turnId: turnId,
+            completedAtToken: completedRaw
         )
+    }
+
+    private func parseCheckpointListISO8601(_ value: String) -> Date? {
+        Self.checkpointListISO8601Fractional.date(from: value)
+            ?? Self.checkpointListISO8601Plain.date(from: value)
+    }
+
+    private func checkpointListCompletedAtToken(
+        _ cursor: CheckpointV1ProjectedItem
+    ) -> String {
+        if !cursor.completedAtToken.isEmpty {
+            return cursor.completedAtToken
+        }
+        return Self.checkpointListISO8601Fractional.string(from: cursor.completedAt)
     }
 
     private struct CheckpointV1ProjectedItem {
         let value: JSONValue
         let checkpointTurnCount: Int
         let completedAt: Date
+        let completedAtToken: String
         let turnID: String
     }
 
@@ -3711,11 +3751,19 @@ public final class JSONRPCDispatcher {
         responseID: JSONRPCID?
     ) -> JSONValue {
         let projected = page.items.enumerated().map { index, summary in
-            checkpointItemForV1(
+            let listMetadata = page.listMetadata.indices.contains(index)
+                ? page.listMetadata[index]
+                : nil
+            let completedAtToken = page.completedAtTokens.indices.contains(index)
+                ? page.completedAtTokens[index]
+                : ""
+            return checkpointItemForV1(
                 summary,
                 sourceFilesTruncated: page.filesTruncated.indices.contains(index)
                     ? page.filesTruncated[index]
-                    : false
+                    : false,
+                listMetadata: listMetadata,
+                completedAtToken: completedAtToken
             )
         }
         var emitted: [CheckpointV1ProjectedItem] = []
@@ -3767,7 +3815,7 @@ public final class JSONRPCDispatcher {
         if truncated, let cursor = items.last {
             object["next_before"] = .object([
                 "checkpoint_turn_count": .number(Double(cursor.checkpointTurnCount)),
-                "completed_at": .string(iso8601(cursor.completedAt)),
+                "completed_at": .string(checkpointListCompletedAtToken(cursor)),
                 "turn_id": .string(cursor.turnID),
             ])
         } else {
@@ -3778,22 +3826,39 @@ public final class JSONRPCDispatcher {
 
     private func checkpointItemForV1(
         _ summary: AgentTurnCheckpointSummary,
-        sourceFilesTruncated: Bool
+        sourceFilesTruncated: Bool,
+        listMetadata: AgentTurnCheckpointListWireProjection.Capture?,
+        completedAtToken: String
     ) -> CheckpointV1ProjectedItem {
-        let turnID = checkpointTurnIDForV1(summary.turnId)
-        let checkpointRef = checkpointStringForV1(
-            summary.checkpointRef,
-            maximumEncodedBytes: Self.checkpointListV1MaxEncodedCheckpointRefBytes
-        )
-        let errorMessage = checkpointStringForV1(
-            summary.errorMessage,
-            maximumEncodedBytes: Self.checkpointListV1MaxEncodedErrorMessageBytes
-        )
+        // Prefer capture-time projections from the repository so list never
+        // re-hashes oversized raw columns at read/encode time.
+        let turnID: CheckpointV1StringProjection
+        let checkpointRef: CheckpointV1StringProjection
+        let errorMessage: CheckpointV1StringProjection
+        if let listMetadata {
+            turnID = checkpointProjection(from: listMetadata.turnId)
+            checkpointRef = checkpointProjection(from: listMetadata.checkpointRef)
+            errorMessage = checkpointProjection(from: listMetadata.errorMessage)
+        } else {
+            turnID = checkpointTurnIDForV1(summary.turnId)
+            checkpointRef = checkpointStringForV1(
+                summary.checkpointRef,
+                maximumEncodedBytes: Self.checkpointListV1MaxEncodedCheckpointRefBytes
+            )
+            errorMessage = checkpointStringForV1(
+                summary.errorMessage,
+                maximumEncodedBytes: Self.checkpointListV1MaxEncodedErrorMessageBytes
+            )
+        }
+        let resolvedCompletedAtToken = completedAtToken.isEmpty
+            ? Self.checkpointListISO8601Fractional.string(from: summary.completedAt)
+            : completedAtToken
         var fileProjection = checkpointFilesForV1(summary.files)
         fileProjection.truncated = fileProjection.truncated || sourceFilesTruncated
         let metadataTruncated = turnID.truncated
             || checkpointRef.truncated
             || errorMessage.truncated
+            || (listMetadata?.metadataUnavailable ?? false)
 
         func encodedItem(
             files: [AgentTurnCheckpointFile],
@@ -3822,6 +3887,9 @@ public final class JSONRPCDispatcher {
             object["fileDiffs"] = .array([])
             object["filesTruncated"] = .bool(filesTruncated)
             object["metadataTruncated"] = .bool(metadataTruncated)
+            object["metadataUnavailable"] = .bool(
+                listMetadata?.metadataUnavailable ?? false
+            )
             object["turn_id_truncated"] = .bool(turnID.truncated)
             object["turn_id_total_encoded_bytes"] = .number(
                 Double(turnID.originalEncodedBytes)
@@ -3863,24 +3931,27 @@ public final class JSONRPCDispatcher {
             value: item,
             checkpointTurnCount: summary.checkpointTurnCount,
             completedAt: summary.completedAt,
+            completedAtToken: resolvedCompletedAtToken,
             turnID: turnID.value ?? ""
+        )
+    }
+
+    private func checkpointProjection(
+        from field: AgentTurnCheckpointListWireProjection.Field
+    ) -> CheckpointV1StringProjection {
+        CheckpointV1StringProjection(
+            value: field.value,
+            originalEncodedBytes: field.totalEncodedBytes,
+            sha256: field.sha256,
+            truncated: field.truncated
         )
     }
 
     private func checkpointTurnIDForV1(
         _ raw: String
     ) -> CheckpointV1StringProjection {
-        let originalEncodedBytes =
-            AgentTurnCheckpointWireIdentity.encodedJSONStringByteCount(raw)
-        let projected = AgentTurnCheckpointWireIdentity.projectedTurnID(raw)
-        let truncated = projected != raw
-        return CheckpointV1StringProjection(
-            value: projected,
-            originalEncodedBytes: originalEncodedBytes,
-            sha256: truncated
-                ? AgentTurnCheckpointWireIdentity.sha256(raw)
-                : nil,
-            truncated: truncated
+        checkpointProjection(
+            from: AgentTurnCheckpointListWireProjection.projectTurnId(raw)
         )
     }
 
@@ -3888,35 +3959,11 @@ public final class JSONRPCDispatcher {
         _ raw: String?,
         maximumEncodedBytes: Int
     ) -> CheckpointV1StringProjection {
-        guard let raw else {
-            return CheckpointV1StringProjection(
-                value: nil,
-                originalEncodedBytes: 0,
-                sha256: nil,
-                truncated: false
+        checkpointProjection(
+            from: AgentTurnCheckpointListWireProjection.projectString(
+                raw,
+                maximumEncodedBytes: maximumEncodedBytes
             )
-        }
-        let originalEncodedBytes =
-            AgentTurnCheckpointWireIdentity.encodedJSONStringByteCount(raw)
-        guard originalEncodedBytes > maximumEncodedBytes else {
-            return CheckpointV1StringProjection(
-                value: raw,
-                originalEncodedBytes: originalEncodedBytes,
-                sha256: nil,
-                truncated: false
-            )
-        }
-        var preview = ""
-        for character in raw {
-            let candidate = preview + String(character)
-            guard encodedByteCount(candidate) <= maximumEncodedBytes else { break }
-            preview = candidate
-        }
-        return CheckpointV1StringProjection(
-            value: preview,
-            originalEncodedBytes: originalEncodedBytes,
-            sha256: AgentTurnCheckpointWireIdentity.sha256(raw),
-            truncated: true
         )
     }
 

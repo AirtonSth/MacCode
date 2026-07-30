@@ -1552,23 +1552,164 @@ public enum AgentTurnCheckpointWireIdentity {
     }
 }
 
+/// Capture-time bounded string projections for `agent.checkpoint.list` v1.
+/// Computed once on upsert and read back for list pages so the mobile path never
+/// re-materializes or re-hashes authoritative raw columns.
+public enum AgentTurnCheckpointListWireProjection {
+    public static let maxEncodedCheckpointRefBytes = 512
+    public static let maxEncodedErrorMessageBytes = 1_024
+    public static let maxFiles = 64
+    public static let maxEncodedFilesBytes = 6 * 1_024
+    public static let maxEntries = 100
+    public static let maxEncodedItemBytes = 8 * 1_024
+    public static let maxEncodedResponseBytes = 700 * 1_024
+
+    public struct Field: Codable, Sendable, Equatable {
+        public let value: String?
+        public let totalEncodedBytes: Int
+        public let sha256: String?
+        public let truncated: Bool
+
+        public init(
+            value: String?,
+            totalEncodedBytes: Int,
+            sha256: String?,
+            truncated: Bool
+        ) {
+            self.value = value
+            self.totalEncodedBytes = totalEncodedBytes
+            self.sha256 = sha256
+            self.truncated = truncated
+        }
+    }
+
+    public struct Capture: Codable, Sendable, Equatable {
+        public let turnId: Field
+        public let checkpointRef: Field
+        public let errorMessage: Field
+        /// True only for rows captured before bounded list metadata existed.
+        /// These rows carry a stable opaque identity plus explicit unavailable
+        /// sentinels; no hashes or byte totals are fabricated from raw columns.
+        public let metadataUnavailable: Bool
+
+        public init(
+            turnId: Field,
+            checkpointRef: Field,
+            errorMessage: Field,
+            metadataUnavailable: Bool = false
+        ) {
+            self.turnId = turnId
+            self.checkpointRef = checkpointRef
+            self.errorMessage = errorMessage
+            self.metadataUnavailable = metadataUnavailable
+        }
+    }
+
+    /// Project authoritative capture fields into the bounded list-wire shape.
+    public static func capture(
+        turnId: String,
+        checkpointRef: String,
+        errorMessage: String?
+    ) -> Capture {
+        Capture(
+            turnId: projectTurnId(turnId),
+            checkpointRef: projectString(
+                checkpointRef,
+                maximumEncodedBytes: maxEncodedCheckpointRefBytes
+            ),
+            errorMessage: projectString(
+                errorMessage,
+                maximumEncodedBytes: maxEncodedErrorMessageBytes
+            )
+        )
+    }
+
+    public static func projectTurnId(_ raw: String) -> Field {
+        let totalEncodedBytes =
+            AgentTurnCheckpointWireIdentity.encodedJSONStringByteCount(raw)
+        let projected = AgentTurnCheckpointWireIdentity.projectedTurnID(raw)
+        let truncated = projected != raw
+        return Field(
+            value: projected,
+            totalEncodedBytes: totalEncodedBytes,
+            sha256: truncated
+                ? AgentTurnCheckpointWireIdentity.sha256(raw)
+                : nil,
+            truncated: truncated
+        )
+    }
+
+    public static func projectString(
+        _ raw: String?,
+        maximumEncodedBytes: Int
+    ) -> Field {
+        guard let raw else {
+            return Field(
+                value: nil,
+                totalEncodedBytes: 0,
+                sha256: nil,
+                truncated: false
+            )
+        }
+        let totalEncodedBytes =
+            AgentTurnCheckpointWireIdentity.encodedJSONStringByteCount(raw)
+        guard totalEncodedBytes > maximumEncodedBytes else {
+            return Field(
+                value: raw,
+                totalEncodedBytes: totalEncodedBytes,
+                sha256: nil,
+                truncated: false
+            )
+        }
+        var preview = ""
+        for character in raw {
+            let candidate = preview + String(character)
+            guard AgentTurnCheckpointWireIdentity.encodedJSONStringByteCount(candidate)
+                    <= maximumEncodedBytes else {
+                break
+            }
+            preview = candidate
+        }
+        return Field(
+            value: preview,
+            totalEncodedBytes: totalEncodedBytes,
+            sha256: AgentTurnCheckpointWireIdentity.sha256(raw),
+            truncated: true
+        )
+    }
+}
+
 /// Keyset cursor for `agent.checkpoint.list` response_version 1.
 /// Ordered by `(checkpointTurnCount, completedAt, turnId)` descending; `turnId` is the final tie-breaker.
+///
+/// `completedAtToken` is the exact wire/DB `completed_at` string. Bind this for
+/// keyset continuation so fractional (and legacy whole-second) storage formats
+/// round-trip without reformatting drift.
 public struct AgentTurnCheckpointCursor: Codable, Sendable, Equatable {
     public let checkpointTurnCount: Int
     public let completedAt: Date
     public let turnId: String
+    /// Exact `completed_at` token from the wire or storage row. Empty only for
+    /// older test callers that construct the cursor from a Date alone.
+    public let completedAtToken: String
 
-    public init(checkpointTurnCount: Int, completedAt: Date, turnId: String) {
+    public init(
+        checkpointTurnCount: Int,
+        completedAt: Date,
+        turnId: String,
+        completedAtToken: String = ""
+    ) {
         self.checkpointTurnCount = checkpointTurnCount
         self.completedAt = completedAt
         self.turnId = turnId
+        self.completedAtToken = completedAtToken
     }
 
-    public init(from summary: AgentTurnCheckpointSummary) {
+    public init(from summary: AgentTurnCheckpointSummary, completedAtToken: String = "") {
         self.checkpointTurnCount = summary.checkpointTurnCount
         self.completedAt = summary.completedAt
         self.turnId = summary.turnId
+        self.completedAtToken = completedAtToken
     }
 }
 
@@ -1579,17 +1720,27 @@ public struct AgentTurnCheckpointPage: Codable, Sendable, Equatable {
     /// Parallel to `items`; true means the persisted mobile summary omitted one
     /// or more authoritative file entries. Empty preserves older test/router callers.
     public let filesTruncated: [Bool]
+    /// Parallel to `items`; capture-time bounded turn_id/ref/error projections.
+    /// Empty preserves older test/router callers that still project at encode time.
+    public let listMetadata: [AgentTurnCheckpointListWireProjection.Capture]
+    /// Parallel to `items`; exact `completed_at` storage/wire keyset tokens.
+    /// Empty preserves older test/router callers that reformat from `Date`.
+    public let completedAtTokens: [String]
     public let truncated: Bool
     public let nextBefore: AgentTurnCheckpointCursor?
 
     public init(
         items: [AgentTurnCheckpointSummary],
         filesTruncated: [Bool] = [],
+        listMetadata: [AgentTurnCheckpointListWireProjection.Capture] = [],
+        completedAtTokens: [String] = [],
         truncated: Bool,
         nextBefore: AgentTurnCheckpointCursor?
     ) {
         self.items = items
         self.filesTruncated = filesTruncated
+        self.listMetadata = listMetadata
+        self.completedAtTokens = completedAtTokens
         self.truncated = truncated
         self.nextBefore = nextBefore
     }

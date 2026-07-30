@@ -4,6 +4,13 @@ import Darwin
 import CryptoKit
 
 let iso = ISO8601DateFormatter()
+/// Accept fractional ISO-8601 on read so checkpoint keyset timestamps that
+/// store sub-second precision still decode correctly on legacy list/detail paths.
+private let isoFractional: ISO8601DateFormatter = {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter
+}()
 
 public enum PersistenceDataError: Error, CustomStringConvertible {
     case corruptProviderEventLog(String)
@@ -30,8 +37,10 @@ public enum AgentRoutingPersistenceError: Error, Equatable {
 }
 
 private func parseDate(_ s: String?) -> Date {
-    guard let s, let d = iso.date(from: s) else { return Date() }
-    return d
+    guard let s else { return Date() }
+    if let d = isoFractional.date(from: s) { return d }
+    if let d = iso.date(from: s) { return d }
+    return Date()
 }
 
 private func encodeModelSelection(_ selection: AgentModelSelection) -> String? {
@@ -3788,10 +3797,15 @@ public final class AgentProposedPlanRepository {
 
 public final class AgentTurnCheckpointRepository {
     let db: SQLiteDB
-    private static let checkpointListV1MaxFiles = 64
-    private static let checkpointListV1MaxEncodedFilesBytes = 6 * 1_024
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    /// Checkpoint list keyset timestamps must round-trip sub-second values so
+    /// iOS item equality and DB continuation use the same bound string.
+    private static let completedAtFractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
 
     public init(db: SQLiteDB) { self.db = db }
 
@@ -3799,14 +3813,28 @@ public final class AgentTurnCheckpointRepository {
         let filesData = try encoder.encode(checkpoint.files)
         let filesJSON = String(data: filesData, encoding: .utf8) ?? "[]"
         let fileSummary = try boundedFileSummary(checkpoint.files)
+        let listProjection = AgentTurnCheckpointListWireProjection.capture(
+            turnId: checkpoint.turnId,
+            checkpointRef: checkpoint.checkpointRef,
+            errorMessage: checkpoint.errorMessage
+        )
         let snapshotsData = try encoder.encode(checkpoint.fileSnapshots)
         let snapshotsJSON = String(data: snapshotsData, encoding: .utf8) ?? "[]"
         let fileDiffsData = try encoder.encode(checkpoint.fileDiffs)
         let fileDiffsJSON = String(data: fileDiffsData, encoding: .utf8) ?? "[]"
         let now = iso.string(from: Date())
         let st = try db.prepare("""
-            INSERT INTO agent_turn_checkpoints(thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status, files_json, assistant_message_id, error_message, completed_at, created_at, file_snapshots_json, diff_patch, file_diffs_json, files_summary_json, files_summary_truncated)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO agent_turn_checkpoints(
+                thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status,
+                files_json, assistant_message_id, error_message, completed_at, created_at,
+                file_snapshots_json, diff_patch, file_diffs_json,
+                files_summary_json, files_summary_truncated,
+                list_turn_id, list_turn_id_encoded_bytes, list_turn_id_sha256, list_turn_id_truncated,
+                list_checkpoint_ref, list_checkpoint_ref_encoded_bytes, list_checkpoint_ref_sha256, list_checkpoint_ref_truncated,
+                list_error_message, list_error_message_encoded_bytes, list_error_message_sha256, list_error_message_truncated,
+                list_completed_at, list_metadata_unavailable
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(thread_id, turn_id) DO UPDATE SET
                 run_id=excluded.run_id,
                 checkpoint_turn_count=excluded.checkpoint_turn_count,
@@ -3818,6 +3846,20 @@ public final class AgentTurnCheckpointRepository {
                 file_diffs_json=excluded.file_diffs_json,
                 files_summary_json=excluded.files_summary_json,
                 files_summary_truncated=excluded.files_summary_truncated,
+                list_turn_id=excluded.list_turn_id,
+                list_turn_id_encoded_bytes=excluded.list_turn_id_encoded_bytes,
+                list_turn_id_sha256=excluded.list_turn_id_sha256,
+                list_turn_id_truncated=excluded.list_turn_id_truncated,
+                list_checkpoint_ref=excluded.list_checkpoint_ref,
+                list_checkpoint_ref_encoded_bytes=excluded.list_checkpoint_ref_encoded_bytes,
+                list_checkpoint_ref_sha256=excluded.list_checkpoint_ref_sha256,
+                list_checkpoint_ref_truncated=excluded.list_checkpoint_ref_truncated,
+                list_error_message=excluded.list_error_message,
+                list_error_message_encoded_bytes=excluded.list_error_message_encoded_bytes,
+                list_error_message_sha256=excluded.list_error_message_sha256,
+                list_error_message_truncated=excluded.list_error_message_truncated,
+                list_completed_at=excluded.list_completed_at,
+                list_metadata_unavailable=excluded.list_metadata_unavailable,
                 assistant_message_id=excluded.assistant_message_id,
                 error_message=excluded.error_message,
                 completed_at=excluded.completed_at;
@@ -3831,27 +3873,43 @@ public final class AgentTurnCheckpointRepository {
         try st.bind(7, filesJSON)
         try st.bind(8, checkpoint.assistantMessageId?.value.uuidString)
         try st.bind(9, checkpoint.errorMessage)
-        try st.bind(10, iso.string(from: checkpoint.completedAt))
+        try st.bind(10, formatCompletedAt(checkpoint.completedAt))
         try st.bind(11, now)
         try st.bind(12, snapshotsJSON)
         try st.bind(13, checkpoint.diffPatch)
         try st.bind(14, fileDiffsJSON)
         try st.bind(15, fileSummary.json)
         try st.bind(16, fileSummary.truncated ? Int64(1) : Int64(0))
+        try st.bind(17, listProjection.turnId.value ?? "")
+        try st.bind(18, Int64(listProjection.turnId.totalEncodedBytes))
+        try st.bind(19, listProjection.turnId.sha256)
+        try st.bind(20, listProjection.turnId.truncated ? Int64(1) : Int64(0))
+        try st.bind(21, listProjection.checkpointRef.value ?? "")
+        try st.bind(22, Int64(listProjection.checkpointRef.totalEncodedBytes))
+        try st.bind(23, listProjection.checkpointRef.sha256)
+        try st.bind(24, listProjection.checkpointRef.truncated ? Int64(1) : Int64(0))
+        try st.bind(25, listProjection.errorMessage.value)
+        try st.bind(26, Int64(listProjection.errorMessage.totalEncodedBytes))
+        try st.bind(27, listProjection.errorMessage.sha256)
+        try st.bind(28, listProjection.errorMessage.truncated ? Int64(1) : Int64(0))
+        try st.bind(29, formatCompletedAt(checkpoint.completedAt))
+        try st.bind(30, Int64(0))
         _ = try st.step()
     }
 
     private func boundedFileSummary(
         _ files: [AgentTurnCheckpointFile]
     ) throws -> (json: String, truncated: Bool) {
+        let maxFiles = AgentTurnCheckpointListWireProjection.maxFiles
+        let maxBytes = AgentTurnCheckpointListWireProjection.maxEncodedFilesBytes
         var kept: [AgentTurnCheckpointFile] = []
-        kept.reserveCapacity(min(files.count, Self.checkpointListV1MaxFiles))
+        kept.reserveCapacity(min(files.count, maxFiles))
         var encoded = try encoder.encode(kept)
         for file in files {
-            guard kept.count < Self.checkpointListV1MaxFiles else { break }
+            guard kept.count < maxFiles else { break }
             let candidate = kept + [file]
             let candidateData = try encoder.encode(candidate)
-            guard candidateData.count <= Self.checkpointListV1MaxEncodedFilesBytes else {
+            guard candidateData.count <= maxBytes else {
                 break
             }
             kept = candidate
@@ -3861,6 +3919,14 @@ public final class AgentTurnCheckpointRepository {
             String(data: encoded, encoding: .utf8) ?? "[]",
             kept.count < files.count
         )
+    }
+
+    private func formatCompletedAt(_ date: Date) -> String {
+        Self.completedAtFractional.string(from: date)
+    }
+
+    private func parseCompletedAt(_ raw: String?) -> Date {
+        parseDate(raw)
     }
 
     public func nextTurnCount(threadId: AgentThreadID) throws -> Int {
@@ -4001,141 +4067,164 @@ public final class AgentTurnCheckpointRepository {
 
     /// Metadata-only page for mobile/3G clients (`agent.checkpoint.list` response_version 1).
     ///
-    /// Projects summary columns only, including the capture-time bounded
-    /// `files_summary_json`. Never selects authoritative `files_json`,
-    /// `file_snapshots_json`, `diff_patch`, or `file_diffs_json`. Uses descending
-    /// keyset pagination on `(checkpoint_turn_count, completed_at, turn_id)` with
-    /// `LIMIT maxEntries + 1`.
+    /// Selects only capture-time bounded list projections, files_summary, and
+    /// scalar metadata. Never selects authoritative raw `turn_id`,
+    /// `checkpoint_ref`, `error_message`, `files_json`, `file_snapshots_json`,
+    /// `diff_patch`, or `file_diffs_json` for page rows. Uses descending keyset
+    /// pagination on bounded `(checkpoint_turn_count, list_completed_at,
+    /// list_turn_id)` with `LIMIT maxEntries + 1`.
     public func listMetadataPage(
         threadId: AgentThreadID,
         maxEntries: Int,
         before cursor: AgentTurnCheckpointCursor?
     ) throws -> AgentTurnCheckpointPage {
-        let limit = max(1, min(maxEntries, 100))
+        let limit = max(1, min(maxEntries, AgentTurnCheckpointListWireProjection.maxEntries))
+        // WHY: list_* columns are the only values the page source may materialize
+        // or compare. Raw metadata must stay untouched even for ordering/cursors.
+        let selectList = """
+            SELECT thread_id, run_id,
+                   list_turn_id, list_turn_id_encoded_bytes, list_turn_id_sha256, list_turn_id_truncated,
+                   checkpoint_turn_count,
+                   list_checkpoint_ref, list_checkpoint_ref_encoded_bytes, list_checkpoint_ref_sha256, list_checkpoint_ref_truncated,
+                   status, files_summary_json, files_summary_truncated, assistant_message_id,
+                   list_error_message, list_error_message_encoded_bytes, list_error_message_sha256, list_error_message_truncated,
+                   list_completed_at, list_metadata_unavailable
+            FROM agent_turn_checkpoints
+            """
         let sql: String
         if cursor == nil {
             sql = """
-            SELECT thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status, files_summary_json, files_summary_truncated, assistant_message_id, error_message, completed_at
-            FROM agent_turn_checkpoints
+            \(selectList)
             WHERE thread_id = ?
-            ORDER BY checkpoint_turn_count DESC, completed_at DESC, turn_id DESC
+            ORDER BY checkpoint_turn_count DESC, list_completed_at DESC, list_turn_id DESC
             LIMIT ?;
             """
         } else {
             sql = """
-            SELECT thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status, files_summary_json, files_summary_truncated, assistant_message_id, error_message, completed_at
-            FROM agent_turn_checkpoints
+            \(selectList)
             WHERE thread_id = ?
               AND (
                 checkpoint_turn_count < ?
-                OR (checkpoint_turn_count = ? AND completed_at < ?)
-                OR (checkpoint_turn_count = ? AND completed_at = ? AND turn_id < ?)
+                OR (checkpoint_turn_count = ? AND list_completed_at < ?)
+                OR (checkpoint_turn_count = ? AND list_completed_at = ? AND list_turn_id < ?)
               )
-            ORDER BY checkpoint_turn_count DESC, completed_at DESC, turn_id DESC
+            ORDER BY checkpoint_turn_count DESC, list_completed_at DESC, list_turn_id DESC
             LIMIT ?;
             """
         }
         let st = try db.prepare(sql)
         try st.bind(1, threadId.value.uuidString)
         if let cursor {
-            let storageTurnID = try storageTurnID(
-                for: cursor,
-                threadId: threadId
-            )
-            let completed = iso.string(from: cursor.completedAt)
+            let completed = completedAtKeysetToken(for: cursor)
             try st.bind(2, Int64(cursor.checkpointTurnCount))
             try st.bind(3, Int64(cursor.checkpointTurnCount))
             try st.bind(4, completed)
             try st.bind(5, Int64(cursor.checkpointTurnCount))
             try st.bind(6, completed)
-            try st.bind(7, storageTurnID)
+            try st.bind(7, cursor.turnId)
             try st.bind(8, Int64(limit + 1))
         } else {
             try st.bind(2, Int64(limit + 1))
         }
-        var rows: [(summary: AgentTurnCheckpointSummary, filesTruncated: Bool)] = []
+        var rows: [(
+            summary: AgentTurnCheckpointSummary,
+            filesTruncated: Bool,
+            listMetadata: AgentTurnCheckpointListWireProjection.Capture,
+            completedAtToken: String
+        )] = []
         while try st.step() {
             rows.append(try decodeCheckpointMetadata(from: st, fallbackThreadId: threadId))
         }
         let truncated = rows.count > limit
         let pageRows = Array(rows.prefix(limit))
         let items = pageRows.map(\.summary)
-        let nextBefore = truncated ? items.last.map(AgentTurnCheckpointCursor.init(from:)) : nil
+        let nextBefore: AgentTurnCheckpointCursor? = {
+            guard truncated, let last = pageRows.last else { return nil }
+            return AgentTurnCheckpointCursor(
+                checkpointTurnCount: last.summary.checkpointTurnCount,
+                completedAt: last.summary.completedAt,
+                turnId: last.summary.turnId,
+                completedAtToken: last.completedAtToken
+            )
+        }()
         return AgentTurnCheckpointPage(
             items: items,
             filesTruncated: pageRows.map(\.filesTruncated),
+            listMetadata: pageRows.map(\.listMetadata),
+            completedAtTokens: pageRows.map(\.completedAtToken),
             truncated: truncated,
             nextBefore: nextBefore
         )
     }
 
-    /// Resolves an oversized v1 wire identity only inside its exact keyset tie.
-    /// This avoids a global scan and never guesses on a collision or ambiguous row.
-    private func storageTurnID(
-        for cursor: AgentTurnCheckpointCursor,
-        threadId: AgentThreadID
-    ) throws -> String {
-        guard AgentTurnCheckpointWireIdentity.isDigestIdentity(cursor.turnId) else {
-            return cursor.turnId
+    /// Prefer the exact echoed/storage token; fall back to fractional format for
+    /// older in-process callers that only supply a Date.
+    private func completedAtKeysetToken(for cursor: AgentTurnCheckpointCursor) -> String {
+        if !cursor.completedAtToken.isEmpty {
+            return cursor.completedAtToken
         }
-        let st = try db.prepare("""
-            SELECT turn_id
-            FROM agent_turn_checkpoints
-            WHERE thread_id = ?
-              AND checkpoint_turn_count = ?
-              AND completed_at = ?
-            ORDER BY turn_id DESC;
-            """)
-        try st.bind(1, threadId.value.uuidString)
-        try st.bind(2, Int64(cursor.checkpointTurnCount))
-        try st.bind(3, iso.string(from: cursor.completedAt))
-        var matches: [String] = []
-        while try st.step() {
-            guard let raw = st.columnText(0),
-                  AgentTurnCheckpointWireIdentity.projectedTurnID(raw) == cursor.turnId else {
-                continue
-            }
-            matches.append(raw)
-            if matches.count > 1 { break }
-        }
-        guard matches.count == 1, let match = matches.first else {
-            throw PersistenceDataError.corruptCheckpoint(
-                "checkpoint v1 cursor identity is missing or ambiguous"
-            )
-        }
-        return match
+        return formatCompletedAt(cursor.completedAt)
     }
 
-    /// Decode a metadata projection row. Heavy payload columns are never present;
-    /// always emit empty snapshots/diffs so callers cannot accidentally ship them.
+    /// Decode a metadata projection row. Heavy payload columns and raw
+    /// turn_id/checkpoint_ref/error_message are never present; always emit empty
+    /// snapshots/diffs so callers cannot accidentally ship them.
     private func decodeCheckpointMetadata(
         from st: SQLiteStatement,
         fallbackThreadId: AgentThreadID
-    ) throws -> (summary: AgentTurnCheckpointSummary, filesTruncated: Bool) {
-        let filesJSON = st.columnText(6) ?? "[]"
+    ) throws -> (
+        summary: AgentTurnCheckpointSummary,
+        filesTruncated: Bool,
+        listMetadata: AgentTurnCheckpointListWireProjection.Capture,
+        completedAtToken: String
+    ) {
+        let filesJSON = st.columnText(12) ?? "[]"
         let files: [AgentTurnCheckpointFile]
         do {
             files = try decoder.decode([AgentTurnCheckpointFile].self, from: Data(filesJSON.utf8))
         } catch {
             throw PersistenceDataError.corruptCheckpoint(
-                "invalid files_json for turn \(st.columnText(2) ?? "<unknown>"): \(error)"
+                "invalid files_summary_json for turn \(st.columnText(2) ?? "<unknown>"): \(error)"
             )
         }
-        return (AgentTurnCheckpointSummary(
+        let listMetadata = AgentTurnCheckpointListWireProjection.Capture(
+            turnId: .init(
+                value: st.columnText(2) ?? "",
+                totalEncodedBytes: Int(st.columnInt64(3)),
+                sha256: st.columnText(4),
+                truncated: st.columnInt64(5) != 0
+            ),
+            checkpointRef: .init(
+                value: st.columnText(7) ?? "",
+                totalEncodedBytes: Int(st.columnInt64(8)),
+                sha256: st.columnText(9),
+                truncated: st.columnInt64(10) != 0
+            ),
+            errorMessage: .init(
+                value: st.columnText(15),
+                totalEncodedBytes: Int(st.columnInt64(16)),
+                sha256: st.columnText(17),
+                truncated: st.columnInt64(18) != 0
+            ),
+            metadataUnavailable: st.columnInt64(20) != 0
+        )
+        let completedAtToken = st.columnText(19) ?? ""
+        let summary = AgentTurnCheckpointSummary(
             threadId: AgentThreadID(UUID(uuidString: st.columnText(0) ?? "") ?? fallbackThreadId.value),
             runId: AgentRunID(UUID(uuidString: st.columnText(1) ?? "") ?? UUID()),
-            turnId: st.columnText(2) ?? "",
-            checkpointTurnCount: Int(st.columnInt64(3)),
-            checkpointRef: st.columnText(4) ?? "",
-            status: AgentTurnCheckpointStatus(rawValue: st.columnText(5) ?? "") ?? .error,
+            turnId: listMetadata.turnId.value ?? "",
+            checkpointTurnCount: Int(st.columnInt64(6)),
+            checkpointRef: listMetadata.checkpointRef.value ?? "",
+            status: AgentTurnCheckpointStatus(rawValue: st.columnText(11) ?? "") ?? .error,
             files: files,
             fileSnapshots: [],
             diffPatch: nil,
             fileDiffs: [],
-            assistantMessageId: st.columnText(8).flatMap(UUID.init(uuidString:)).map(AgentMessageID.init),
-            errorMessage: st.columnText(9),
-            completedAt: parseDate(st.columnText(10))
-        ), st.columnInt64(7) != 0)
+            assistantMessageId: st.columnText(14).flatMap(UUID.init(uuidString:)).map(AgentMessageID.init),
+            errorMessage: listMetadata.errorMessage.value,
+            completedAt: parseCompletedAt(completedAtToken)
+        )
+        return (summary, st.columnInt64(13) != 0, listMetadata, completedAtToken)
     }
 
     private func decodeCheckpoint(from st: SQLiteStatement, fallbackThreadId: AgentThreadID) throws -> AgentTurnCheckpointSummary {

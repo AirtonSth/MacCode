@@ -541,11 +541,13 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func listAgentThreadCheckpoints(thread: AgentThreadID) throws -> [AgentTurnCheckpointSummary] {
         checkpointStore.filter { $0.threadId == thread }
     }
+    var checkpointPageOverride: AgentTurnCheckpointPage?
     func listAgentThreadCheckpointsPage(
         thread: AgentThreadID,
         maxEntries: Int,
         before: AgentTurnCheckpointCursor?
     ) throws -> AgentTurnCheckpointPage {
+        if let checkpointPageOverride { return checkpointPageOverride }
         var rows = checkpointStore
             .filter { $0.threadId == thread }
             .sorted {
@@ -570,7 +572,8 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         }
         let limit = max(1, min(maxEntries, 100))
         let truncated = rows.count > limit
-        let items = rows.prefix(limit).map {
+        let pageRows = Array(rows.prefix(limit))
+        let items = pageRows.map {
             AgentTurnCheckpointSummary(
                 threadId: $0.threadId,
                 runId: $0.runId,
@@ -584,10 +587,23 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
                 completedAt: $0.completedAt
             )
         }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let tokens = pageRows.map { fractional.string(from: $0.completedAt) }
+        let nextBefore: AgentTurnCheckpointCursor? = {
+            guard truncated, let last = pageRows.last, let token = tokens.last else { return nil }
+            return AgentTurnCheckpointCursor(
+                checkpointTurnCount: last.checkpointTurnCount,
+                completedAt: last.completedAt,
+                turnId: last.turnId,
+                completedAtToken: token
+            )
+        }()
         return AgentTurnCheckpointPage(
-            items: Array(items),
+            items: items,
+            completedAtTokens: tokens,
             truncated: truncated,
-            nextBefore: truncated ? items.last.map(AgentTurnCheckpointCursor.init(from:)) : nil
+            nextBefore: nextBefore
         )
     }
     var agentCheckpointDiffCallCount = 0
@@ -2805,6 +2821,191 @@ final class DispatcherTests: XCTestCase {
     }
 
     @MainActor
+    func test_agentCheckpointList_v1FractionalCompletedAtCursorContinuesWithoutDuplicate() async throws {
+        // WHY: next_before.completed_at must preserve sub-second instants so iOS
+        // item equality and the host keyset do not collapse page boundaries.
+        let router = FakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "frac", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        let base = Date(timeIntervalSince1970: 1_700_000_700.0)
+        router.checkpointStore = (0..<4).map { n in
+            AgentTurnCheckpointSummary(
+                threadId: thread.id,
+                runId: AgentRunID(),
+                turnId: "frac-\(n)",
+                checkpointTurnCount: n + 1,
+                checkpointRef: "ref-\(n)",
+                status: .ready,
+                files: [],
+                completedAt: base.addingTimeInterval(Double(n) * 0.250)
+            )
+        }
+        let d = JSONRPCDispatcher(router: router)
+
+        let first = await d.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.checkpoint.list",
+            params: [
+                "thread_id": .string(thread.id.value.uuidString),
+                "response_version": .number(1),
+                "max_entries": .number(2)
+            ]
+        ))
+        guard case .object(let page)? = first.result,
+              case .array(let items) = page["items"],
+              case .object(let cursor) = page["next_before"],
+              let completedAt = cursor["completed_at"]?.stringValue else {
+            return XCTFail("v1 fractional page must return items + next_before")
+        }
+        XCTAssertEqual(items.count, 2)
+        XCTAssertTrue(
+            completedAt.contains("."),
+            "next_before.completed_at must include fractional seconds, got \(completedAt)"
+        )
+        XCTAssertEqual(cursor["turn_id"], .string("frac-2"))
+
+        let second = await d.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(2),
+            method: "agent.checkpoint.list",
+            params: [
+                "thread_id": .string(thread.id.value.uuidString),
+                "response_version": .number(1),
+                "max_entries": .number(2),
+                "before": .object(cursor)
+            ]
+        ))
+        guard case .object(let older)? = second.result,
+              case .array(let olderItems) = older["items"] else {
+            return XCTFail("continuation must return envelope")
+        }
+        XCTAssertEqual(olderItems.count, 2)
+        let turnIds: [String] = (items + olderItems).compactMap {
+            guard case .object(let obj) = $0 else { return nil }
+            return obj["turnId"]?.stringValue
+        }
+        XCTAssertEqual(turnIds, ["frac-3", "frac-2", "frac-1", "frac-0"])
+        XCTAssertEqual(Set(turnIds).count, 4, "fractional cursor must not skip or duplicate")
+        XCTAssertEqual(older["truncated"], .bool(false))
+        XCTAssertEqual(older["next_before"], .null)
+    }
+
+    @MainActor
+    func test_agentCheckpointList_v1EncodesLegacyMetadataUnavailableSentinel() async throws {
+        // WHY: upgraded rows must remain visible and actionable without claiming
+        // hashes/totals that v58 never captured from their raw metadata.
+        let router = FakeRouter()
+        let thread = AgentThread(
+            workspaceId: nil,
+            title: "legacy",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        let surrogate = "rc2-legacy-row:" + String(repeating: "a", count: 32)
+        let item = AgentTurnCheckpointSummary(
+            threadId: thread.id,
+            runId: AgentRunID(),
+            turnId: surrogate,
+            checkpointTurnCount: 7,
+            checkpointRef: "",
+            status: .ready,
+            files: [],
+            completedAt: Date(timeIntervalSince1970: 1_700_000_800)
+        )
+        let unavailableField = AgentTurnCheckpointListWireProjection.Field(
+            value: nil,
+            totalEncodedBytes: 0,
+            sha256: nil,
+            truncated: true
+        )
+        router.checkpointPageOverride = AgentTurnCheckpointPage(
+            items: [item],
+            filesTruncated: [true],
+            listMetadata: [
+                .init(
+                    turnId: .init(
+                        value: surrogate,
+                        totalEncodedBytes: 0,
+                        sha256: nil,
+                        truncated: true
+                    ),
+                    checkpointRef: .init(
+                        value: "",
+                        totalEncodedBytes: 0,
+                        sha256: nil,
+                        truncated: true
+                    ),
+                    errorMessage: unavailableField,
+                    metadataUnavailable: true
+                )
+            ],
+            completedAtTokens: ["2023-11-14T22:26:40.000Z"],
+            truncated: false,
+            nextBefore: nil
+        )
+        let response = await JSONRPCDispatcher(router: router).dispatch(
+            JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(1),
+                method: "agent.checkpoint.list",
+                params: [
+                    "thread_id": .string(thread.id.value.uuidString),
+                    "response_version": .number(1),
+                    "max_entries": .number(1),
+                ]
+            )
+        )
+        guard case .object(let page)? = response.result,
+              case .array(let items)? = page["items"],
+              case .object(let wire)? = items.first else {
+            return XCTFail("legacy row must remain in the v1 page")
+        }
+        XCTAssertEqual(wire["turnId"], .string(surrogate))
+        XCTAssertEqual(wire["checkpointTurnCount"], .number(7))
+        XCTAssertEqual(wire["metadataUnavailable"], .bool(true))
+        XCTAssertEqual(wire["metadataTruncated"], .bool(true))
+        XCTAssertEqual(wire["turn_id_total_encoded_bytes"], .number(0))
+        XCTAssertEqual(wire["turn_id_sha256"], .null)
+        XCTAssertEqual(wire["checkpoint_ref_total_encoded_bytes"], .number(0))
+        XCTAssertEqual(wire["checkpoint_ref_sha256"], .null)
+        XCTAssertEqual(wire["error_message_total_encoded_bytes"], .number(0))
+        XCTAssertEqual(wire["error_message_sha256"], .null)
+    }
+
+    @MainActor
+    func test_systemCapabilities_advertisesCheckpointListV1Marker() async throws {
+        // WHY: iOS discovers response_version 1 budgets from capabilities; a missing
+        // or drifted marker would leave the client on the unbounded legacy path.
+        let d = JSONRPCDispatcher(router: FakeRouter())
+        let resp = await d.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "system.capabilities",
+            params: nil
+        ))
+        guard case .object(let result)? = resp.result,
+              case .object(let agent) = result["agent"],
+              case .object(let marker) = agent["checkpoint_list"] else {
+            return XCTFail("system.capabilities must advertise agent.checkpoint_list")
+        }
+        XCTAssertEqual(marker["response_version"], .number(1))
+        XCTAssertEqual(marker["max_entries"], .number(100))
+        XCTAssertEqual(marker["max_item_bytes"], .number(8_192))
+        XCTAssertEqual(marker["max_response_bytes"], .number(716_800))
+        XCTAssertEqual(marker["metadata_only"], .bool(true))
+        XCTAssertEqual(Set(marker.keys), [
+            "response_version", "max_entries", "max_item_bytes",
+            "max_response_bytes", "metadata_only"
+        ])
+        XCTAssertEqual(
+            .object(marker),
+            AgentCheckpointListCapabilityV1.jsonValue,
+            "dispatcher must use the shared capability representation"
+        )
+    }
+
+    @MainActor
     func test_agentCheckpointList_v1RejectsInvalidVersionLimitAndCursorShapes() async throws {
         // WHY: invalid opt-in shapes must fail closed with JSON-RPC invalid params
         // so clients cannot half-enable the modern path with ambiguous values.
@@ -2894,6 +3095,17 @@ final class DispatcherTests: XCTestCase {
                 "turn_id": .string("turn-1")
             ])
         ], "non-ISO8601 completed_at must be invalid params")
+
+        await assertInvalidParams([
+            "thread_id": .string(tid),
+            "response_version": .number(1),
+            "before": .object([
+                "checkpoint_turn_count": .number(1),
+                "completed_at": .string("2023-11-14T22:13:20.000Z"),
+                "turn_id": .string("turn-1"),
+                "unexpected": .bool(true),
+            ])
+        ], "cursor keys must match the negotiated v1 shape exactly")
 
         await assertInvalidParams([
             "thread_id": .string(tid),

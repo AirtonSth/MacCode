@@ -277,13 +277,45 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
                        "production v1 path must not select diff_patch")
         XCTAssertFalse(sql.contains("file_diffs_json"),
                        "production v1 path must not select file_diffs_json")
+        // WHY: SELECT must never materialize raw turn_id/checkpoint_ref/error_message
+        // for up-to-101 page rows; only capture-time list_* projections are legal.
+        let selectClause = sql.components(separatedBy: "FROM").first ?? sql
+        let cleanedSelect = selectClause
+            .replacingOccurrences(of: "list_turn_id_encoded_bytes", with: "")
+            .replacingOccurrences(of: "list_turn_id_sha256", with: "")
+            .replacingOccurrences(of: "list_turn_id_truncated", with: "")
+            .replacingOccurrences(of: "list_turn_id", with: "")
+            .replacingOccurrences(of: "list_checkpoint_ref_encoded_bytes", with: "")
+            .replacingOccurrences(of: "list_checkpoint_ref_sha256", with: "")
+            .replacingOccurrences(of: "list_checkpoint_ref_truncated", with: "")
+            .replacingOccurrences(of: "list_checkpoint_ref", with: "")
+            .replacingOccurrences(of: "list_error_message_encoded_bytes", with: "")
+            .replacingOccurrences(of: "list_error_message_sha256", with: "")
+            .replacingOccurrences(of: "list_error_message_truncated", with: "")
+            .replacingOccurrences(of: "list_error_message", with: "")
+        XCTAssertFalse(cleanedSelect.contains("turn_id"),
+                       "page SELECT must exclude raw turn_id (ORDER BY may still reference it)")
+        XCTAssertFalse(cleanedSelect.contains("checkpoint_ref"),
+                       "page SELECT must exclude raw checkpoint_ref")
+        XCTAssertFalse(cleanedSelect.contains("error_message"),
+                       "page SELECT must exclude raw error_message")
+        XCTAssertTrue(sql.contains("list_turn_id"),
+                      "page SELECT must read capture-time projected turn id")
+        XCTAssertTrue(sql.contains("list_checkpoint_ref"),
+                      "page SELECT must read capture-time checkpoint_ref preview")
+        XCTAssertTrue(sql.contains("list_error_message"),
+                      "page SELECT must read capture-time error_message preview")
         XCTAssertTrue(sql.contains("LIMIT ?") || sql.contains("LIMIT"),
                       "must use LIMIT max_entries+1 paging")
         XCTAssertTrue(
             sql.contains("checkpoint_turn_count DESC")
-                && sql.contains("completed_at DESC")
-                && sql.contains("turn_id DESC"),
-            "ORDER BY must be DESC on the full keyset"
+                && sql.contains("list_completed_at DESC")
+                && sql.contains("list_turn_id DESC"),
+            "ORDER BY must use only the bounded DESC keyset"
+        )
+        XCTAssertFalse(
+            sql.contains(" completed_at DESC") || sql.contains(" turn_id DESC"),
+            "page source ordering must never read or compare raw metadata columns"
         )
     }
 
@@ -382,10 +414,10 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
         XCTAssertEqual(Set(allIds).count, 4, "pages must be duplicate-free across the keyset")
     }
 
-    func testListMetadataPage_resolvesOversizedWireCursorInsideExactTieAcrossMutation() throws {
+    func testListMetadataPage_usesBoundedOversizedCursorAcrossMutation() throws {
         // WHY: an oversized provider turn id must not brick history or be echoed
-        // unbounded. The wire digest still has to resume the original SQL keyset
-        // after a between-page insert without a duplicate or global cursor scan.
+        // unbounded. Its persisted bounded identity must resume the same source-
+        // bounded SQL keyset after a between-page insert.
         let db = try makeDB()
         let repo = AgentTurnCheckpointRepository(db: db)
         let (tid, rid) = try seedThreadAndRun(db: db)
@@ -407,22 +439,29 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
             maxEntries: 2,
             before: nil
         )
-        XCTAssertEqual(first.items.map(\.turnId), [raw("d"), raw("c")])
+        let expectedWire = ["a", "b", "c", "d"].map {
+            AgentTurnCheckpointWireIdentity.projectedTurnID(raw($0))
+        }.sorted(by: >)
+        XCTAssertEqual(first.items.map(\.turnId), Array(expectedWire.prefix(2)),
+                       "list page must emit capture-time projected identities, not raw oversized turn ids")
         guard let rawCursor = first.nextBefore else {
             return XCTFail("oversized first page must expose a cursor")
         }
-        let wireTurnID = AgentTurnCheckpointWireIdentity.projectedTurnID(
-            rawCursor.turnId
-        )
-        XCTAssertTrue(AgentTurnCheckpointWireIdentity.isDigestIdentity(wireTurnID))
-        XCTAssertNotEqual(wireTurnID, rawCursor.turnId)
+        XCTAssertTrue(AgentTurnCheckpointWireIdentity.isDigestIdentity(rawCursor.turnId))
+        XCTAssertEqual(rawCursor.turnId, expectedWire[1])
 
-        // A new row before the already-emitted boundary must not leak into the
-        // continuation or cause an existing row to repeat.
+        // Choose a bounded identity that sorts before the already-emitted boundary.
+        // A between-page insert there must not leak into the continuation.
+        let inserted = (0..<10_000).lazy.map { raw("insert-\($0)") }.first {
+            AgentTurnCheckpointWireIdentity.projectedTurnID($0) > rawCursor.turnId
+        }
+        guard let inserted else {
+            return XCTFail("fixture must find an identity before the cursor")
+        }
         try repo.upsert(makeHeavyCheckpoint(
             threadId: tid,
             turnCount: 9,
-            turnId: raw("z"),
+            turnId: inserted,
             runId: rid,
             completedAt: sameCompleted
         ))
@@ -437,30 +476,265 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
         let second = try repo.listMetadataPage(
             threadId: tid,
             maxEntries: 2,
-            before: AgentTurnCheckpointCursor(
-                checkpointTurnCount: rawCursor.checkpointTurnCount,
-                completedAt: rawCursor.completedAt,
-                turnId: wireTurnID
-            )
+            before: rawCursor
         )
-        XCTAssertEqual(second.items.map(\.turnId), [raw("b"), raw("a")])
+        XCTAssertEqual(second.items.map(\.turnId), Array(expectedWire.suffix(2)))
         XCTAssertFalse(second.truncated)
         let combined = first.items.map(\.turnId) + second.items.map(\.turnId)
         XCTAssertEqual(Set(combined).count, 4)
-        XCTAssertFalse(combined.contains(raw("z")))
+        XCTAssertFalse(combined.contains(inserted))
+        XCTAssertFalse(
+            combined.contains(
+                AgentTurnCheckpointWireIdentity.projectedTurnID(inserted)
+            )
+        )
         XCTAssertTrue(
             observedSQL.contains {
                 $0.contains("checkpoint_turn_count = ?")
-                    && $0.contains("completed_at = ?")
-                    && $0.contains("SELECT turn_id")
+                    && $0.contains("list_completed_at = ?")
+                    && $0.contains("list_turn_id < ?")
+                    && !$0.contains("SELECT turn_id")
             },
-            "digest resolution must scan only the exact count/timestamp tie"
+            "continuation must compare only the bounded keyset"
         )
     }
 
-    func testListMetadataPage_ambiguousDigestIdentityFailsInsteadOfChoosingARow() throws {
-        // WHY: even a deliberately constructed digest alias must fail loud; choosing
-        // either matching storage row would make pagination authorization ambiguous.
+    func testListMetadataPage_usesStoredBoundedProjections_notRawAtReadTime() throws {
+        // WHY: list must ship capture-time projections. If a later mutation rewrites
+        // raw turn_id/ref/error without recapturing list_*, list still returns the
+        // stored bounded values and never re-hashes the adversarial raw columns.
+        let db = try makeDB()
+        let repo = AgentTurnCheckpointRepository(db: db)
+        let (tid, rid) = try seedThreadAndRun(db: db)
+        let hugeTurn = String(repeating: "turn-\"-\\-🙂-", count: 40)
+        let hugeRef = String(repeating: "ref-\"-\\-🙂-", count: 80)
+        let hugeError = String(repeating: "err-\"-\\-🙂-", count: 100)
+        let captured = AgentTurnCheckpointListWireProjection.capture(
+            turnId: hugeTurn,
+            checkpointRef: hugeRef,
+            errorMessage: hugeError
+        )
+        try repo.upsert(AgentTurnCheckpointSummary(
+            threadId: tid,
+            runId: rid,
+            turnId: hugeTurn,
+            checkpointTurnCount: 1,
+            checkpointRef: hugeRef,
+            status: .ready,
+            files: [AgentTurnCheckpointFile(path: "a.swift", kind: "modified", additions: 1, deletions: 0)],
+            errorMessage: hugeError,
+            completedAt: Date(timeIntervalSince1970: 1_700_000_400)
+        ))
+
+        let poisonTurn = String(repeating: "POISON-TURN-", count: 80)
+        let poisonRef = String(repeating: "POISON-REF-", count: 80)
+        let poisonError = String(repeating: "POISON-ERR-", count: 80)
+        let poison = try db.prepare("""
+            UPDATE agent_turn_checkpoints
+            SET turn_id = ?, checkpoint_ref = ?, error_message = ?
+            WHERE thread_id = ?;
+            """)
+        try poison.bind(1, poisonTurn)
+        try poison.bind(2, poisonRef)
+        try poison.bind(3, poisonError)
+        try poison.bind(4, tid.value.uuidString)
+        _ = try poison.step()
+
+        let page = try repo.listMetadataPage(threadId: tid, maxEntries: 1, before: nil)
+        XCTAssertEqual(page.items.count, 1)
+        XCTAssertEqual(page.items[0].turnId, captured.turnId.value)
+        XCTAssertEqual(page.items[0].checkpointRef, captured.checkpointRef.value)
+        XCTAssertEqual(page.items[0].errorMessage, captured.errorMessage.value)
+        XCTAssertEqual(page.listMetadata.count, 1)
+        XCTAssertEqual(page.listMetadata[0], captured)
+        XCTAssertNotEqual(page.items[0].turnId, poisonTurn)
+        XCTAssertNotEqual(page.items[0].checkpointRef, poisonRef)
+        XCTAssertNotEqual(page.items[0].errorMessage, poisonError)
+        XCTAssertTrue(page.listMetadata[0].turnId.truncated)
+        XCTAssertTrue(page.listMetadata[0].checkpointRef.truncated)
+        XCTAssertTrue(page.listMetadata[0].errorMessage.truncated)
+        XCTAssertEqual(page.listMetadata[0].turnId.sha256, captured.turnId.sha256)
+        XCTAssertEqual(
+            page.listMetadata[0].turnId.totalEncodedBytes,
+            captured.turnId.totalEncodedBytes
+        )
+
+        // Legacy/detail path still sees the mutated authoritative raw columns.
+        let legacy = try repo.list(threadId: tid)
+        XCTAssertEqual(legacy.first?.turnId, poisonTurn)
+        XCTAssertEqual(legacy.first?.checkpointRef, poisonRef)
+        XCTAssertEqual(legacy.first?.errorMessage, poisonError)
+    }
+
+    func testListMetadataPage_fractionalCompletedAtPageBoundaryDoesNotSkipOrDuplicate() throws {
+        // WHY: sub-second completed_at is part of the keyset. Truncating to whole
+        // seconds collapses page boundaries and either duplicates or skips items.
+        let db = try makeDB()
+        let repo = AgentTurnCheckpointRepository(db: db)
+        let (tid, rid) = try seedThreadAndRun(db: db)
+        let base = Date(timeIntervalSince1970: 1_700_000_500.0)
+        for i in 0..<4 {
+            try repo.upsert(makeHeavyCheckpoint(
+                threadId: tid,
+                turnCount: i + 1,
+                turnId: "frac-\(i)",
+                runId: rid,
+                completedAt: base.addingTimeInterval(Double(i) * 0.250)
+            ))
+        }
+
+        let first = try repo.listMetadataPage(threadId: tid, maxEntries: 2, before: nil)
+        XCTAssertEqual(first.items.map(\.turnId), ["frac-3", "frac-2"])
+        XCTAssertTrue(first.truncated)
+        guard let cursor = first.nextBefore else {
+            return XCTFail("fractional first page must expose next_before")
+        }
+        // Cursor Date must retain the exact fractional instant of the boundary item.
+        XCTAssertEqual(
+            cursor.completedAt.timeIntervalSince1970,
+            base.addingTimeInterval(0.500).timeIntervalSince1970,
+            accuracy: 0.000_5
+        )
+
+        let second = try repo.listMetadataPage(
+            threadId: tid,
+            maxEntries: 2,
+            before: cursor
+        )
+        XCTAssertEqual(second.items.map(\.turnId), ["frac-1", "frac-0"])
+        XCTAssertFalse(second.truncated)
+        let all = first.items.map(\.turnId) + second.items.map(\.turnId)
+        XCTAssertEqual(all, ["frac-3", "frac-2", "frac-1", "frac-0"])
+        XCTAssertEqual(Set(all).count, 4, "fractional keyset must not skip or duplicate")
+    }
+
+    func testMigratedRowsExposeExplicitUnavailableMetadataWithoutRawBackfill() throws {
+        // WHY: migration must not scan raw large columns. A pre-v58 row remains
+        // visible/actionable through a stable bounded surrogate while every
+        // unavailable metadata total/hash stays honestly empty.
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrateSteps(
+            db,
+            Schema.steps.filter { $0.version <= 57 }
+        )
+        let (tid, rid) = try seedThreadAndRun(db: db)
+        let completed = Date(timeIntervalSince1970: 1_700_000_600)
+        let insert = try db.prepare("""
+            INSERT INTO agent_turn_checkpoints(
+                thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status,
+                files_json, assistant_message_id, error_message, completed_at, created_at,
+                file_snapshots_json, diff_patch, file_diffs_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, '[]', NULL, '[]');
+            """)
+        try insert.bind(1, tid.value.uuidString)
+        try insert.bind(2, rid.value.uuidString)
+        try insert.bind(3, "legacy-turn")
+        try insert.bind(4, Int64(1))
+        try insert.bind(5, "legacy-ref")
+        try insert.bind(6, "ready")
+        try insert.bind(7, "[]")
+        try insert.bind(8, "legacy-error")
+        try insert.bind(9, ISO8601DateFormatter().string(from: completed))
+        try insert.bind(10, ISO8601DateFormatter().string(from: completed))
+        _ = try insert.step()
+        try Schema.migrateSteps(db, Schema.steps)
+
+        let repo = AgentTurnCheckpointRepository(db: db)
+        let page = try repo
+            .listMetadataPage(threadId: tid, maxEntries: 1, before: nil)
+        XCTAssertEqual(page.items.count, 1)
+        XCTAssertTrue(page.items[0].turnId.hasPrefix("rc2-legacy-row:"))
+        XCTAssertEqual(page.items[0].turnId.utf8.count, 47)
+        XCTAssertEqual(page.items[0].checkpointRef, "")
+        XCTAssertNil(page.items[0].errorMessage)
+        XCTAssertEqual(page.items[0].checkpointTurnCount, 1)
+        XCTAssertEqual(page.listMetadata.count, 1)
+        XCTAssertTrue(page.listMetadata[0].metadataUnavailable)
+        XCTAssertTrue(page.listMetadata[0].turnId.truncated)
+        XCTAssertTrue(page.listMetadata[0].checkpointRef.truncated)
+        XCTAssertTrue(page.listMetadata[0].errorMessage.truncated)
+        XCTAssertEqual(page.listMetadata[0].turnId.totalEncodedBytes, 0)
+        XCTAssertNil(page.listMetadata[0].turnId.sha256)
+        XCTAssertEqual(page.listMetadata[0].checkpointRef.totalEncodedBytes, 0)
+        XCTAssertNil(page.listMetadata[0].checkpointRef.sha256)
+        XCTAssertEqual(page.listMetadata[0].errorMessage.totalEncodedBytes, 0)
+        XCTAssertNil(page.listMetadata[0].errorMessage.sha256)
+        XCTAssertEqual(page.filesTruncated, [true])
+        XCTAssertEqual(page.completedAtTokens, ["2023-11-14T22:23:20.000Z"])
+        XCTAssertEqual(
+            try repo.get(threadId: tid, checkpointTurnCount: 1)?.turnId,
+            "legacy-turn",
+            "turn-count actions must still resolve the authoritative legacy row"
+        )
+    }
+
+    func testListMetadataPage_mixedLegacyAndCapturedRowsPaginatesWithoutLoss() throws {
+        // WHY: an upgraded DB is mixed until old checkpoints age out. v1 must
+        // return every old and new row exactly once while making unavailable
+        // metadata distinguishable from ordinary truncation.
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrateSteps(
+            db,
+            Schema.steps.filter { $0.version <= 57 }
+        )
+        let (tid, rid) = try seedThreadAndRun(db: db)
+        let insert = try db.prepare("""
+            INSERT INTO agent_turn_checkpoints(
+                thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status,
+                files_json, completed_at, created_at, file_snapshots_json, file_diffs_json
+            ) VALUES (?, ?, ?, ?, ?, 'ready', '[]', ?, ?, '[]', '[]');
+            """)
+        for count in [1, 3, 5] {
+            insert.reset()
+            try insert.bind(1, tid.value.uuidString)
+            try insert.bind(2, rid.value.uuidString)
+            try insert.bind(3, "legacy-\(count)")
+            try insert.bind(4, Int64(count))
+            try insert.bind(5, "legacy-ref-\(count)")
+            let token = ISO8601DateFormatter().string(
+                from: Date(timeIntervalSince1970: Double(1_700_001_000 + count))
+            )
+            try insert.bind(6, token)
+            try insert.bind(7, token)
+            _ = try insert.step()
+        }
+        try Schema.migrateSteps(db, Schema.steps)
+        let repo = AgentTurnCheckpointRepository(db: db)
+        for count in [2, 4, 6] {
+            try repo.upsert(makeHeavyCheckpoint(
+                threadId: tid,
+                turnCount: count,
+                turnId: "captured-\(count)",
+                runId: rid,
+                completedAt: Date(timeIntervalSince1970: Double(1_700_001_000 + count))
+            ))
+        }
+
+        var cursor: AgentTurnCheckpointCursor?
+        var counts: [Int] = []
+        var unavailable: [Bool] = []
+        repeat {
+            let page = try repo.listMetadataPage(
+                threadId: tid,
+                maxEntries: 2,
+                before: cursor
+            )
+            counts.append(contentsOf: page.items.map(\.checkpointTurnCount))
+            unavailable.append(
+                contentsOf: page.listMetadata.map(\.metadataUnavailable)
+            )
+            cursor = page.nextBefore
+            if !page.truncated { break }
+        } while cursor != nil
+
+        XCTAssertEqual(counts, [6, 5, 4, 3, 2, 1])
+        XCTAssertEqual(Set(counts).count, 6, "mixed keyset must not skip or duplicate")
+        XCTAssertEqual(unavailable, [false, true, false, true, false, true])
+    }
+
+    func testUpsertFailsLoudOnProjectedKeysetIdentityCollision() throws {
+        // WHY: even a deliberately constructed digest alias must fail loud at
+        // capture; a non-unique bounded keyset could skip a row on continuation.
         let db = try makeDB()
         let repo = AgentTurnCheckpointRepository(db: db)
         let (tid, rid) = try seedThreadAndRun(db: db)
@@ -468,30 +742,20 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
         let oversized = String(repeating: "collision-source-🙂", count: 40)
         let digestIdentity = AgentTurnCheckpointWireIdentity.projectedTurnID(oversized)
         XCTAssertTrue(AgentTurnCheckpointWireIdentity.isDigestIdentity(digestIdentity))
-        for turnID in [oversized, digestIdentity] {
-            try repo.upsert(makeHeavyCheckpoint(
-                threadId: tid,
-                turnCount: 11,
-                turnId: turnID,
-                runId: rid,
-                completedAt: completed
-            ))
-        }
-
-        XCTAssertThrowsError(try repo.listMetadataPage(
+        try repo.upsert(makeHeavyCheckpoint(
             threadId: tid,
-            maxEntries: 1,
-            before: AgentTurnCheckpointCursor(
-                checkpointTurnCount: 11,
-                completedAt: completed,
-                turnId: digestIdentity
-            )
-        )) { error in
-            guard case PersistenceDataError.corruptCheckpoint(let message) = error else {
-                return XCTFail("expected explicit corrupt cursor identity, got \(error)")
-            }
-            XCTAssertTrue(message.contains("missing or ambiguous"))
-        }
+            turnCount: 11,
+            turnId: oversized,
+            runId: rid,
+            completedAt: completed
+        ))
+        XCTAssertThrowsError(try repo.upsert(makeHeavyCheckpoint(
+            threadId: tid,
+            turnCount: 11,
+            turnId: digestIdentity,
+            runId: rid,
+            completedAt: completed
+        )))
     }
 
     func testWireIdentityEncodedByteCountMatchesJSONEncoderForEscapedAndUnicodeStrings() throws {

@@ -1,6 +1,7 @@
 import Foundation
 import Darwin
 import CryptoKit
+import CoreModel
 import Persistence
 import AgentRuntime
 
@@ -46,6 +47,37 @@ public protocol DirectAuthProvider: AnyObject {
     func cancelPairingRequest(requestId: String) -> Bool
     func listDevices() -> [[String: Any]]
     func revokeDevice(_ id: String)
+}
+
+/// Exact `agent.checkpoint_list` capability marker shared by public HTTP
+/// capabilities, authenticated HTTP capabilities, and `system.capabilities`.
+/// Single source so the three surfaces cannot drift on response budgets.
+public enum AgentCheckpointListCapabilityV1 {
+    public static let responseVersion = 1
+    public static let maxEntries = AgentTurnCheckpointListWireProjection.maxEntries
+    public static let maxItemBytes = AgentTurnCheckpointListWireProjection.maxEncodedItemBytes
+    public static let maxResponseBytes = AgentTurnCheckpointListWireProjection.maxEncodedResponseBytes
+    public static let metadataOnly = true
+
+    public static var foundationObject: [String: Any] {
+        [
+            "response_version": responseVersion,
+            "max_entries": maxEntries,
+            "max_item_bytes": maxItemBytes,
+            "max_response_bytes": maxResponseBytes,
+            "metadata_only": metadataOnly,
+        ]
+    }
+
+    public static var jsonValue: JSONValue {
+        .object([
+            "response_version": .number(Double(responseVersion)),
+            "max_entries": .number(Double(maxEntries)),
+            "max_item_bytes": .number(Double(maxItemBytes)),
+            "max_response_bytes": .number(Double(maxResponseBytes)),
+            "metadata_only": .bool(metadataOnly),
+        ])
+    }
 }
 
 /// Store-independent advertisement injected into both HTTP capabilities
@@ -1112,6 +1144,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             "providers": ["codex", "claude", "grok"],
             "supports_stream_events": true,
             "supports_resume": true,
+            "checkpoint_list": AgentCheckpointListCapabilityV1.foundationObject,
             "model_routing": [
                 "auto": true,
                 "admission_receipts": true,

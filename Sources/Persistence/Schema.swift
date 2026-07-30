@@ -11,8 +11,9 @@ public struct SchemaStep {
 public enum Schema {
     /// Must equal the highest SchemaStep version (step 53 economy + 54 graphify usage
     /// + 55 savings honesty axes + 56 credible_v4 cap evidence
-    /// + 57 immutable agent-message body identity + 58 checkpoint summaries).
-    public static let currentVersion: Int = 58
+    /// + 57 immutable agent-message body identity + 58 checkpoint summaries
+    /// + 59 checkpoint list wire projections).
+    public static let currentVersion: Int = 59
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -988,6 +989,42 @@ public enum Schema {
         SchemaStep(58, """
         ALTER TABLE agent_turn_checkpoints ADD COLUMN files_summary_json TEXT NOT NULL DEFAULT '[]';
         ALTER TABLE agent_turn_checkpoints ADD COLUMN files_summary_truncated INTEGER NOT NULL DEFAULT 1;
+        """),
+        // Capture-time bounded wire projections for list v1 turn_id / checkpoint_ref /
+        // error_message. Do not backfill from raw columns. Existing rows receive a
+        // persisted opaque identity and an explicit metadata-unavailable sentinel,
+        // preserving pagination/actionability without materializing legacy metadata.
+        // list_completed_at is fixed-width so mixed whole/fractional legacy timestamps
+        // retain chronological keyset ordering.
+        SchemaStep(59, """
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN list_turn_id TEXT NOT NULL DEFAULT '';
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN list_turn_id_encoded_bytes INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN list_turn_id_sha256 TEXT;
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN list_turn_id_truncated INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN list_checkpoint_ref TEXT NOT NULL DEFAULT '';
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN list_checkpoint_ref_encoded_bytes INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN list_checkpoint_ref_sha256 TEXT;
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN list_checkpoint_ref_truncated INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN list_error_message TEXT;
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN list_error_message_encoded_bytes INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN list_error_message_sha256 TEXT;
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN list_error_message_truncated INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN list_completed_at TEXT NOT NULL DEFAULT '';
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN list_metadata_unavailable INTEGER NOT NULL DEFAULT 1;
+        UPDATE agent_turn_checkpoints
+        SET list_turn_id = 'rc2-legacy-row:' || lower(hex(randomblob(16))),
+            list_completed_at = COALESCE(
+                strftime('%Y-%m-%dT%H:%M:%fZ', completed_at),
+                completed_at
+            )
+        WHERE list_metadata_unavailable = 1;
+        CREATE UNIQUE INDEX idx_agent_turn_checkpoints_list_keyset
+            ON agent_turn_checkpoints(
+                thread_id,
+                checkpoint_turn_count,
+                list_completed_at,
+                list_turn_id
+            );
         """)
     ]
 

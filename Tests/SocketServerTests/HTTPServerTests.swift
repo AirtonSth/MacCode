@@ -1344,6 +1344,26 @@ final class HTTPServerTests: XCTestCase {
         wait(for: [ex], timeout: 4)
     }
 
+    func test_capabilitiesPayload_advertisesExactCheckpointListV1Marker() {
+        // WHY: public and authenticated HTTP builders share capabilitiesPayload; the
+        // marker must match system.capabilities so clients do not branch on drift.
+        let payload = DirectHTTPServer.capabilitiesPayload(loopbackOnly: true)
+        guard let agent = payload["agent"] as? [String: Any],
+              let marker = agent["checkpoint_list"] as? [String: Any] else {
+            return XCTFail("HTTP capabilities must advertise agent.checkpoint_list")
+        }
+        XCTAssertEqual(marker["response_version"] as? Int, 1)
+        XCTAssertEqual(marker["max_entries"] as? Int, 100)
+        XCTAssertEqual(marker["max_item_bytes"] as? Int, 8_192)
+        XCTAssertEqual(marker["max_response_bytes"] as? Int, 716_800)
+        XCTAssertEqual(marker["metadata_only"] as? Bool, true)
+        XCTAssertEqual(
+            NSDictionary(dictionary: marker),
+            NSDictionary(dictionary: AgentCheckpointListCapabilityV1.foundationObject),
+            "HTTP capabilities must use the shared foundation representation"
+        )
+    }
+
     @MainActor
     func test_authenticatedCapabilities_rejectsMissingAndInvalidBearer_onLoopback() throws {
         // WHY: even loopback-only must not leak host identity via this route

@@ -170,12 +170,24 @@ final class SchemaMigrationMatrixTests: XCTestCase {
                        "a v13 checkpoint row must survive migration to head — " +
                        "destroying checkpoints removes the user's ability to undo agent actions")
 
-        // Steps 14 and 15 ADD columns to agent_turn_checkpoints; verify those columns exist.
-        let st = try db.prepare("SELECT file_snapshots_json, diff_patch, file_diffs_json FROM agent_turn_checkpoints LIMIT 1;")
+        // Later steps add detail and bounded-list columns. Verify the v13 row
+        // remains visible without fabricating metadata from its raw fields.
+        let st = try db.prepare("""
+            SELECT file_snapshots_json, diff_patch, file_diffs_json,
+                   list_turn_id, list_completed_at, list_metadata_unavailable,
+                   list_turn_id_encoded_bytes, list_turn_id_sha256
+            FROM agent_turn_checkpoints
+            LIMIT 1;
+            """)
         defer { st.reset() }
         XCTAssertTrue(try st.step(),
-                      "columns added in v14/v15 (file_snapshots_json, diff_patch, file_diffs_json) " +
+                      "columns added after v13 " +
                       "must exist after migrating from v13 to head")
+        XCTAssertTrue(st.columnText(3)?.hasPrefix("rc2-legacy-row:") == true)
+        XCTAssertEqual(st.columnText(4), "2024-06-01T00:00:00.000Z")
+        XCTAssertEqual(st.columnInt64(5), 1)
+        XCTAssertEqual(st.columnInt64(6), 0)
+        XCTAssertTrue(st.columnIsNull(7))
     }
 
     // MARK: - v25 → head
