@@ -1486,6 +1486,44 @@ public struct AgentTurnCheckpointSummary: Codable, Sendable, Equatable, Identifi
     }
 }
 
+/// Keyset cursor for `agent.checkpoint.list` response_version 1.
+/// Ordered by `(checkpointTurnCount, completedAt, turnId)` descending; `turnId` is the final tie-breaker.
+public struct AgentTurnCheckpointCursor: Codable, Sendable, Equatable {
+    public let checkpointTurnCount: Int
+    public let completedAt: Date
+    public let turnId: String
+
+    public init(checkpointTurnCount: Int, completedAt: Date, turnId: String) {
+        self.checkpointTurnCount = checkpointTurnCount
+        self.completedAt = completedAt
+        self.turnId = turnId
+    }
+
+    public init(from summary: AgentTurnCheckpointSummary) {
+        self.checkpointTurnCount = summary.checkpointTurnCount
+        self.completedAt = summary.completedAt
+        self.turnId = summary.turnId
+    }
+}
+
+/// Paginated metadata page for `agent.checkpoint.list` response_version 1.
+/// Items are summary-compatible but heavy payload fields are always empty/null.
+public struct AgentTurnCheckpointPage: Codable, Sendable, Equatable {
+    public let items: [AgentTurnCheckpointSummary]
+    public let truncated: Bool
+    public let nextBefore: AgentTurnCheckpointCursor?
+
+    public init(
+        items: [AgentTurnCheckpointSummary],
+        truncated: Bool,
+        nextBefore: AgentTurnCheckpointCursor?
+    ) {
+        self.items = items
+        self.truncated = truncated
+        self.nextBefore = nextBefore
+    }
+}
+
 public enum AgentMessageRole: String, Codable, Sendable {
     case user
     case assistant

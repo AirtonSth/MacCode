@@ -541,6 +541,55 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func listAgentThreadCheckpoints(thread: AgentThreadID) throws -> [AgentTurnCheckpointSummary] {
         checkpointStore.filter { $0.threadId == thread }
     }
+    func listAgentThreadCheckpointsPage(
+        thread: AgentThreadID,
+        maxEntries: Int,
+        before: AgentTurnCheckpointCursor?
+    ) throws -> AgentTurnCheckpointPage {
+        var rows = checkpointStore
+            .filter { $0.threadId == thread }
+            .sorted {
+                if $0.checkpointTurnCount != $1.checkpointTurnCount {
+                    return $0.checkpointTurnCount > $1.checkpointTurnCount
+                }
+                if $0.completedAt != $1.completedAt {
+                    return $0.completedAt > $1.completedAt
+                }
+                return $0.turnId > $1.turnId
+            }
+        if let before {
+            rows = rows.filter {
+                if $0.checkpointTurnCount != before.checkpointTurnCount {
+                    return $0.checkpointTurnCount < before.checkpointTurnCount
+                }
+                if $0.completedAt != before.completedAt {
+                    return $0.completedAt < before.completedAt
+                }
+                return $0.turnId < before.turnId
+            }
+        }
+        let limit = max(1, min(maxEntries, 100))
+        let truncated = rows.count > limit
+        let items = rows.prefix(limit).map {
+            AgentTurnCheckpointSummary(
+                threadId: $0.threadId,
+                runId: $0.runId,
+                turnId: $0.turnId,
+                checkpointTurnCount: $0.checkpointTurnCount,
+                checkpointRef: $0.checkpointRef,
+                status: $0.status,
+                files: $0.files,
+                assistantMessageId: $0.assistantMessageId,
+                errorMessage: $0.errorMessage,
+                completedAt: $0.completedAt
+            )
+        }
+        return AgentTurnCheckpointPage(
+            items: Array(items),
+            truncated: truncated,
+            nextBefore: truncated ? items.last.map(AgentTurnCheckpointCursor.init(from:)) : nil
+        )
+    }
     var agentCheckpointDiffCallCount = 0
     var stubAgentCheckpointDiff: String?
     func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, path: String?) throws -> String {
@@ -2394,6 +2443,312 @@ final class DispatcherTests: XCTestCase {
         XCTAssertNotNil(list.result)
         XCTAssertEqual(diff.result, .string("@@ README\n+changed\n"),
                        "per-turn file diffs must be reachable over RPC so clients can inspect a specific agent turn without relying on current git state")
+    }
+
+    @MainActor
+    func test_agentCheckpointList_legacyResponseKeepsFullArrayWithHeavyFields() async throws {
+        // WHY: absent response_version must keep the existing complete-array contract
+        // so older clients still receive full snapshots/diffs and exact ordering.
+        let router = FakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "legacy", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        let older = Date(timeIntervalSince1970: 100)
+        let newer = Date(timeIntervalSince1970: 200)
+        router.checkpointStore = [
+            AgentTurnCheckpointSummary(
+                threadId: thread.id,
+                runId: AgentRunID(),
+                turnId: "turn-1",
+                checkpointTurnCount: 1,
+                checkpointRef: "ref-1",
+                status: .ready,
+                files: [AgentTurnCheckpointFile(path: "a.swift", kind: "modified", additions: 1, deletions: 0)],
+                fileSnapshots: [AgentTurnCheckpointFileSnapshot(path: "a.swift", kind: "modified", contentsBase64: "YQ==")],
+                diffPatch: "diff-1",
+                fileDiffs: [AgentTurnCheckpointFileDiff(path: "a.swift", patch: "@@1")],
+                completedAt: older
+            ),
+            AgentTurnCheckpointSummary(
+                threadId: thread.id,
+                runId: AgentRunID(),
+                turnId: "turn-2",
+                checkpointTurnCount: 2,
+                checkpointRef: "ref-2",
+                status: .ready,
+                files: [],
+                fileSnapshots: [AgentTurnCheckpointFileSnapshot(path: "b.swift", kind: "added", contentsBase64: "Yg==")],
+                diffPatch: "diff-2",
+                fileDiffs: [AgentTurnCheckpointFileDiff(path: "b.swift", patch: "@@2")],
+                completedAt: newer
+            )
+        ]
+        let d = JSONRPCDispatcher(router: router)
+
+        let plain = await d.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.checkpoint.list",
+            params: ["thread_id": .string(thread.id.value.uuidString)]
+        ))
+        // Modern-only params without response_version must not change legacy behavior.
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.checkpoint.list", params: [
+            "thread_id": .string(thread.id.value.uuidString),
+            "max_entries": .number(1),
+            "before": .object(["checkpoint_turn_count": .number(2)])
+        ]))
+
+        XCTAssertEqual(resp.result, plain.result,
+                       "without the explicit version opt-in, modern-only keys must be byte-semantic no-ops")
+        guard case .array(let items)? = resp.result else {
+            return XCTFail("legacy path must return a JSON array of checkpoints, got \(String(describing: resp.result))")
+        }
+        XCTAssertEqual(items.count, 2, "legacy path ignores max_entries and returns the full store")
+        guard case .object(let first)? = items.first,
+              case .object(let second)? = items.dropFirst().first else {
+            return XCTFail("legacy items must be objects")
+        }
+        XCTAssertEqual(first["turnId"], .string("turn-1"))
+        XCTAssertEqual(first["diffPatch"], .string("diff-1"))
+        XCTAssertEqual(first["fileSnapshots"]?.arrayValue?.count, 1)
+        XCTAssertEqual(first["fileDiffs"]?.arrayValue?.count, 1)
+        XCTAssertEqual(second["turnId"], .string("turn-2"))
+        XCTAssertEqual(second["diffPatch"], .string("diff-2"))
+    }
+
+    @MainActor
+    func test_agentCheckpointList_v1EnvelopeStripsHeavyFieldsAndPaginates() async throws {
+        // WHY: opt-in response_version 1 is the cheap mobile envelope; heavy payload
+        // fields must be empty/null and the result shape is exactly items/truncated/next_before.
+        let router = FakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "v1", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        router.checkpointStore = (1...3).map { n in
+            AgentTurnCheckpointSummary(
+                threadId: thread.id,
+                runId: AgentRunID(),
+                turnId: "turn-\(n)",
+                checkpointTurnCount: n,
+                checkpointRef: "ref-\(n)",
+                status: .ready,
+                files: [AgentTurnCheckpointFile(path: "f.swift", kind: "modified", additions: n, deletions: 0)],
+                fileSnapshots: [AgentTurnCheckpointFileSnapshot(path: "f.swift", kind: "modified", contentsBase64: "SEVBVlk=")],
+                diffPatch: "HEAVY-DIFF-\(n)",
+                fileDiffs: [AgentTurnCheckpointFileDiff(path: "f.swift", patch: "@@HEAVY-\(n)")],
+                completedAt: base.addingTimeInterval(TimeInterval(n))
+            )
+        }
+        let d = JSONRPCDispatcher(router: router)
+
+        let first = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.checkpoint.list", params: [
+            "thread_id": .string(thread.id.value.uuidString),
+            "response_version": .number(1),
+            "max_entries": .number(2)
+        ]))
+
+        guard case .object(let page)? = first.result else {
+            return XCTFail("v1 must return an object envelope, got \(String(describing: first.result))")
+        }
+        XCTAssertEqual(Set(page.keys), ["items", "truncated", "next_before"],
+                       "v1 envelope must have exactly items, truncated, next_before")
+        guard case .array(let items) = page["items"] else {
+            return XCTFail("items must be an array")
+        }
+        XCTAssertEqual(items.count, 2)
+        XCTAssertEqual(page["truncated"], .bool(true))
+        guard case .object(let firstItem)? = items.first,
+              case .object(let secondItem)? = items.dropFirst().first else {
+            return XCTFail("items must be checkpoint summary objects")
+        }
+        XCTAssertEqual(firstItem["turnId"], .string("turn-3"))
+        XCTAssertEqual(secondItem["turnId"], .string("turn-2"))
+        for item in [firstItem, secondItem] {
+            XCTAssertEqual(item["fileSnapshots"], .array([]),
+                           "every v1 item must explicitly serialize fileSnapshots: []")
+            XCTAssertEqual(item["diffPatch"], .null,
+                           "every v1 item must explicitly serialize diffPatch: null")
+            XCTAssertEqual(item["fileDiffs"], .array([]),
+                           "every v1 item must explicitly serialize fileDiffs: []")
+            XCTAssertNotEqual(item["files"], .array([]), "files summary metadata remains allowed")
+        }
+        guard case .object(let cursor) = page["next_before"] else {
+            return XCTFail("truncated page must return next_before cursor of final emitted item")
+        }
+        XCTAssertEqual(cursor["checkpoint_turn_count"], .number(2))
+        XCTAssertEqual(cursor["turn_id"], .string("turn-2"))
+        XCTAssertNotNil(cursor["completed_at"]?.stringValue)
+        XCTAssertEqual(Set(cursor.keys), ["checkpoint_turn_count", "completed_at", "turn_id"],
+                       "the v1 cursor must expose only its stable keyset")
+
+        let second = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.checkpoint.list", params: [
+            "thread_id": .string(thread.id.value.uuidString),
+            "response_version": .number(1),
+            "max_entries": .number(2),
+            "before": .object(cursor)
+        ]))
+        guard case .object(let older)? = second.result,
+              case .array(let olderItems) = older["items"] else {
+            return XCTFail("second v1 page must return envelope")
+        }
+        XCTAssertEqual(olderItems.count, 1)
+        XCTAssertEqual(older["truncated"], .bool(false))
+        XCTAssertEqual(older["next_before"], .null)
+        guard case .object(let last)? = olderItems.first else {
+            return XCTFail("expected remaining item")
+        }
+        XCTAssertEqual(last["turnId"], .string("turn-1"))
+    }
+
+    @MainActor
+    func test_agentCheckpointList_v1DefaultsToFiniteHundredItemPage() async throws {
+        // WHY: opting into v1 without an explicit max_entries must remain bounded;
+        // otherwise a reconnect can put an unbounded checkpoint history back on 3G.
+        let router = FakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "v1-default", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        router.checkpointStore = (1...101).map { n in
+            AgentTurnCheckpointSummary(
+                threadId: thread.id,
+                runId: AgentRunID(),
+                turnId: "turn-\(n)",
+                checkpointTurnCount: n,
+                checkpointRef: "ref-\(n)",
+                status: .ready,
+                files: [],
+                completedAt: Date(timeIntervalSince1970: TimeInterval(n))
+            )
+        }
+        let d = JSONRPCDispatcher(router: router)
+
+        let response = await d.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.checkpoint.list",
+            params: [
+                "thread_id": .string(thread.id.value.uuidString),
+                "response_version": .number(1)
+            ]
+        ))
+
+        guard case .object(let page)? = response.result,
+              case .array(let items) = page["items"] else {
+            return XCTFail("v1 default must return a bounded page envelope")
+        }
+        XCTAssertEqual(items.count, 100)
+        XCTAssertEqual(page["truncated"], .bool(true))
+        XCTAssertNotEqual(page["next_before"], .null)
+    }
+
+    @MainActor
+    func test_agentCheckpointList_v1RejectsInvalidVersionLimitAndCursorShapes() async throws {
+        // WHY: invalid opt-in shapes must fail closed with JSON-RPC invalid params
+        // so clients cannot half-enable the modern path with ambiguous values.
+        let router = FakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "invalid", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        router.checkpointStore = [
+            AgentTurnCheckpointSummary(
+                threadId: thread.id,
+                runId: AgentRunID(),
+                turnId: "turn-1",
+                checkpointTurnCount: 1,
+                checkpointRef: "ref-1",
+                status: .ready,
+                files: [],
+                completedAt: Date(timeIntervalSince1970: 50)
+            )
+        ]
+        let d = JSONRPCDispatcher(router: router)
+        let tid = thread.id.value.uuidString
+
+        func assertInvalidParams(_ params: [String: JSONValue], _ reason: String) async {
+            let resp = await d.dispatch(JSONRPCRequest(
+                jsonrpc: "2.0", id: .number(1), method: "agent.checkpoint.list", params: params
+            ))
+            XCTAssertEqual(resp.error?.code, -32602, reason)
+            XCTAssertNil(resp.result, reason)
+        }
+
+        await assertInvalidParams([
+            "thread_id": .string(tid),
+            "response_version": .number(2)
+        ], "unsupported response_version must be invalid params")
+
+        await assertInvalidParams([
+            "thread_id": .string(tid),
+            "response_version": .number(1.5)
+        ], "fractional response_version must be invalid params")
+
+        await assertInvalidParams([
+            "thread_id": .string(tid),
+            "response_version": .string("1")
+        ], "string response_version must be invalid params")
+
+        await assertInvalidParams([
+            "thread_id": .string(tid),
+            "response_version": .number(1),
+            "max_entries": .number(0)
+        ], "max_entries below 1 must be invalid params")
+
+        await assertInvalidParams([
+            "thread_id": .string(tid),
+            "response_version": .number(1),
+            "max_entries": .number(101)
+        ], "max_entries above 100 must be invalid params")
+
+        await assertInvalidParams([
+            "thread_id": .string(tid),
+            "response_version": .number(1),
+            "max_entries": .number(10.5)
+        ], "fractional max_entries must be invalid params")
+
+        await assertInvalidParams([
+            "thread_id": .string(tid),
+            "response_version": .number(1),
+            "max_entries": .number(Double.infinity)
+        ], "non-finite max_entries must be invalid params without trapping")
+
+        await assertInvalidParams([
+            "thread_id": .string(tid),
+            "response_version": .number(1),
+            "before": .string("not-a-cursor")
+        ], "non-object before cursor must be invalid params")
+
+        await assertInvalidParams([
+            "thread_id": .string(tid),
+            "response_version": .number(1),
+            "before": .object(["checkpoint_turn_count": .number(1)])
+        ], "incomplete before cursor must be invalid params")
+
+        await assertInvalidParams([
+            "thread_id": .string(tid),
+            "response_version": .number(1),
+            "before": .object([
+                "checkpoint_turn_count": .number(1),
+                "completed_at": .string("not-iso"),
+                "turn_id": .string("turn-1")
+            ])
+        ], "non-ISO8601 completed_at must be invalid params")
+
+        await assertInvalidParams([
+            "thread_id": .string(tid),
+            "response_version": .number(1),
+            "before": .object([
+                "checkpoint_turn_count": .number(-1),
+                "completed_at": .string("2026-07-30T12:00:00Z"),
+                "turn_id": .string("turn-1")
+            ])
+        ], "negative checkpoint_turn_count must be invalid params")
+
+        await assertInvalidParams([
+            "thread_id": .string(tid),
+            "response_version": .number(1),
+            "before": .object([
+                "checkpointTurnCount": .number(1),
+                "completedAt": .string("2026-07-30T12:00:00Z"),
+                "turnId": .string("turn-1")
+            ])
+        ], "v1 cursor aliases must not silently weaken the frozen snake_case contract")
     }
 
     @MainActor

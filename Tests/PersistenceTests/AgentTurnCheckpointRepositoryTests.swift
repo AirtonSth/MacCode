@@ -173,4 +173,147 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
 
         XCTAssertEqual(result.count, 2)
     }
+
+    // MARK: - listMetadataPage (response_version 1 projection)
+
+    private func makeHeavyCheckpoint(
+        threadId: AgentThreadID,
+        turnCount: Int,
+        turnId: String,
+        runId: AgentRunID,
+        completedAt: Date
+    ) -> AgentTurnCheckpointSummary {
+        AgentTurnCheckpointSummary(
+            threadId: threadId,
+            runId: runId,
+            turnId: turnId,
+            checkpointTurnCount: turnCount,
+            checkpointRef: "ref-\(turnId)",
+            status: .ready,
+            files: [AgentTurnCheckpointFile(path: "a.swift", kind: "modified", additions: 1, deletions: 0)],
+            fileSnapshots: [
+                AgentTurnCheckpointFileSnapshot(
+                    path: "a.swift",
+                    kind: "modified",
+                    contentsBase64: Data("HEAVY-SNAPSHOT-\(turnId)".utf8).base64EncodedString()
+                )
+            ],
+            diffPatch: "diff --git a/a.swift b/a.swift\n+HEAVY-\(turnId)\n",
+            fileDiffs: [AgentTurnCheckpointFileDiff(path: "a.swift", patch: "@@\n+HEAVY-\(turnId)\n")],
+            assistantMessageId: nil,
+            errorMessage: nil,
+            completedAt: completedAt
+        )
+    }
+
+    func testListMetadataPage_sqlProjectsLightColumnsWithLimit_andIgnoresCorruptHeavyBlobs() throws {
+        // WHY: mobile/3G clients must not pay to read or decode file_snapshots_json,
+        // diff_patch, or file_diffs_json. The observed SQL must prove explicit projection
+        // + LIMIT, and corrupt heavy blobs must not poison the metadata result.
+        let db = try makeDB()
+        let repo = AgentTurnCheckpointRepository(db: db)
+        let (tid, rid) = try seedThreadAndRun(db: db)
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        for i in 1...3 {
+            try repo.upsert(makeHeavyCheckpoint(
+                threadId: tid,
+                turnCount: i,
+                turnId: "turn-\(i)",
+                runId: rid,
+                completedAt: base.addingTimeInterval(TimeInterval(i))
+            ))
+        }
+
+        // Corrupt the heavy columns after a normal upsert so list() would struggle
+        // if those columns were selected; metadata page must still succeed.
+        let corrupt = try db.prepare("""
+            UPDATE agent_turn_checkpoints
+            SET file_snapshots_json = 'NOT-JSON{{{',
+                diff_patch = 'x',
+                file_diffs_json = '{bad'
+            WHERE thread_id = ?;
+        """)
+        try corrupt.bind(1, tid.value.uuidString)
+        _ = try corrupt.step()
+
+        var observedSQL: [String] = []
+        db.beforeStatementStepForTesting = { sql in
+            if sql.contains("FROM agent_turn_checkpoints") {
+                observedSQL.append(sql)
+            }
+        }
+        defer { db.beforeStatementStepForTesting = nil }
+
+        let page = try repo.listMetadataPage(threadId: tid, maxEntries: 2, before: nil)
+
+        XCTAssertEqual(page.items.count, 2, "LIMIT max_entries must cap emitted items")
+        XCTAssertTrue(page.truncated, "LIMIT max_entries+1 must detect another page")
+        XCTAssertNotNil(page.nextBefore, "cursor of final emitted item only when another page exists")
+        XCTAssertEqual(page.items.map(\.turnId), ["turn-3", "turn-2"],
+                       "DESC keyset must emit newest checkpoint_turn_count first")
+        for item in page.items {
+            XCTAssertEqual(item.fileSnapshots, [], "metadata page must never surface snapshots")
+            XCTAssertNil(item.diffPatch, "metadata page must never surface diff_patch")
+            XCTAssertEqual(item.fileDiffs, [], "metadata page must never surface file diffs")
+            XCTAssertEqual(item.files.count, 1, "files_json summary metadata remains allowed")
+        }
+
+        let metadataSQL = observedSQL.first { $0.contains("LIMIT") && $0.contains("ORDER BY") }
+        XCTAssertNotNil(metadataSQL, "metadata page must issue an ordered LIMIT query")
+        let sql = metadataSQL ?? ""
+        XCTAssertTrue(sql.contains("files_json"), "projection may include summary files_json")
+        XCTAssertFalse(sql.contains("file_snapshots_json"),
+                       "production v1 path must not select file_snapshots_json")
+        XCTAssertFalse(sql.contains("diff_patch"),
+                       "production v1 path must not select diff_patch")
+        XCTAssertFalse(sql.contains("file_diffs_json"),
+                       "production v1 path must not select file_diffs_json")
+        XCTAssertTrue(sql.contains("LIMIT ?") || sql.contains("LIMIT"),
+                      "must use LIMIT max_entries+1 paging")
+        XCTAssertTrue(
+            sql.contains("checkpoint_turn_count DESC")
+                && sql.contains("completed_at DESC")
+                && sql.contains("turn_id DESC"),
+            "ORDER BY must be DESC on the full keyset"
+        )
+    }
+
+    func testListMetadataPage_tieBreaksOnTurnId_withoutDuplicatesAcrossPages() throws {
+        // WHY: when checkpoint_turn_count and completed_at tie, turn_id is the only
+        // deterministic final tie-breaker. Page boundaries must not skip or duplicate rows.
+        let db = try makeDB()
+        let repo = AgentTurnCheckpointRepository(db: db)
+        let (tid, rid) = try seedThreadAndRun(db: db)
+        let sameCompleted = Date(timeIntervalSince1970: 1_700_000_100)
+        // Same turn count + completed_at; lexicographic turn_id order: a < b < c < d
+        for turnId in ["tie-a", "tie-b", "tie-c", "tie-d"] {
+            try repo.upsert(makeHeavyCheckpoint(
+                threadId: tid,
+                turnCount: 7,
+                turnId: turnId,
+                runId: rid,
+                completedAt: sameCompleted
+            ))
+        }
+
+        let first = try repo.listMetadataPage(threadId: tid, maxEntries: 2, before: nil)
+        XCTAssertEqual(first.items.map(\.turnId), ["tie-d", "tie-c"],
+                       "DESC turn_id tie-break must prefer larger turn_id first")
+        XCTAssertTrue(first.truncated)
+        guard let cursor = first.nextBefore else {
+            return XCTFail("first page must expose next_before when truncated")
+        }
+        XCTAssertEqual(cursor.turnId, "tie-c")
+        XCTAssertEqual(cursor.checkpointTurnCount, 7)
+
+        let second = try repo.listMetadataPage(threadId: tid, maxEntries: 2, before: cursor)
+        XCTAssertEqual(second.items.map(\.turnId), ["tie-b", "tie-a"],
+                       "second page must continue after the cursor without duplicates")
+        XCTAssertFalse(second.truncated)
+        XCTAssertNil(second.nextBefore, "final page must not emit next_before")
+
+        let allIds = first.items.map(\.turnId) + second.items.map(\.turnId)
+        XCTAssertEqual(allIds, ["tie-d", "tie-c", "tie-b", "tie-a"])
+        XCTAssertEqual(Set(allIds).count, 4, "pages must be duplicate-free across the keyset")
+    }
 }

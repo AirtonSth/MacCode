@@ -182,6 +182,8 @@ public protocol CommandRouting: AnyObject {
     ) async throws -> AgentThreadMirrorSnapshot
     func rollbackAgentThread(thread: AgentThreadID, toTurnId: String) async throws
     func listAgentThreadCheckpoints(thread: AgentThreadID) throws -> [AgentTurnCheckpointSummary]
+    /// Metadata page for `agent.checkpoint.list` response_version 1.
+    func listAgentThreadCheckpointsPage(thread: AgentThreadID, maxEntries: Int, before: AgentTurnCheckpointCursor?) throws -> AgentTurnCheckpointPage
     func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, path: String?) throws -> String
     func revertAgentThreadToCheckpoint(thread: AgentThreadID, checkpointTurnCount: Int) async throws -> AgentTurnCheckpointSummary
     func stopAgentRun(thread: AgentThreadID) throws
@@ -2498,6 +2500,29 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: result)
             case "agent.checkpoint.list":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                // Opt-in only: absent response_version keeps the legacy full-array path.
+                // Modern-only params (max_entries/before) without the opt-in are ignored.
+                if params["response_version"] != nil {
+                    guard let version = params["response_version"]?.intValue, version == 1 else {
+                        throw JSONRPCError.invalidParams
+                    }
+                    let maxEntries: Int
+                    if params["max_entries"] != nil {
+                        guard let limit = params["max_entries"]?.intValue, (1...100).contains(limit) else {
+                            throw JSONRPCError.invalidParams
+                        }
+                        maxEntries = limit
+                    } else {
+                        maxEntries = 100
+                    }
+                    let before = try checkpointCursor(from: params["before"])
+                    let page = try router.listAgentThreadCheckpointsPage(
+                        thread: tid,
+                        maxEntries: maxEntries,
+                        before: before
+                    )
+                    return .init(id: id, result: checkpointPagePayload(page))
+                }
                 return .init(id: id, result: encode(try router.listAgentThreadCheckpoints(thread: tid)))
             case "agent.checkpoint.diff":
                 // QA-XPLAT :19 -- accept both `turn_count` (mac-native) and
@@ -3630,6 +3655,72 @@ public final class JSONRPCDispatcher {
             throw JSONRPCError.invalidParams
         }
         return AgentMessageCursor(createdAt: createdAt, id: id)
+    }
+
+    /// Strict keyset cursor for checkpoint list v1. Absent/null means no cursor;
+    /// any present non-object, incomplete, or non-ISO8601 shape is invalid params.
+    private func checkpointCursor(from value: JSONValue?) throws -> AgentTurnCheckpointCursor? {
+        guard let value else { return nil }
+        if case .null = value { return nil }
+        guard case .object(let object) = value else { throw JSONRPCError.invalidParams }
+        guard let turnCount = object["checkpoint_turn_count"]?.intValue,
+              turnCount >= 0,
+              let turnId = object["turn_id"]?.stringValue,
+              !turnId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let completedRaw = object["completed_at"]?.stringValue,
+              let completedAt = ISO8601DateFormatter().date(from: completedRaw)
+        else {
+            throw JSONRPCError.invalidParams
+        }
+        return AgentTurnCheckpointCursor(
+            checkpointTurnCount: turnCount,
+            completedAt: completedAt,
+            turnId: turnId
+        )
+    }
+
+    /// Wire envelope for response_version 1: exactly `items`, `truncated`, `next_before`.
+    /// Each item is summary-compatible with heavy payload fields forced empty/null.
+    /// (`JSONEncoder` omits nil optionals, so `diffPatch` is forced to `.null` explicitly.)
+    private func checkpointPagePayload(_ page: AgentTurnCheckpointPage) -> JSONValue {
+        let items: [JSONValue] = page.items.map { summary in
+            let stripped = AgentTurnCheckpointSummary(
+                threadId: summary.threadId,
+                runId: summary.runId,
+                turnId: summary.turnId,
+                checkpointTurnCount: summary.checkpointTurnCount,
+                checkpointRef: summary.checkpointRef,
+                status: summary.status,
+                files: summary.files,
+                fileSnapshots: [],
+                diffPatch: nil,
+                fileDiffs: [],
+                assistantMessageId: summary.assistantMessageId,
+                errorMessage: summary.errorMessage,
+                completedAt: summary.completedAt
+            )
+            guard case .object(var obj) = encode(stripped) else {
+                return encode(stripped)
+            }
+            obj["fileSnapshots"] = .array([])
+            obj["diffPatch"] = .null
+            obj["fileDiffs"] = .array([])
+            return .object(obj)
+        }
+        var object: [String: JSONValue] = [
+            "items": .array(items),
+            "truncated": .bool(page.truncated)
+        ]
+        if let cursor = page.nextBefore {
+            object["next_before"] = .object([
+                "checkpoint_turn_count": .number(Double(cursor.checkpointTurnCount)),
+                "completed_at": .string(iso8601(cursor.completedAt)),
+                "turn_id": .string(cursor.turnId)
+            ])
+        } else {
+            object["next_before"] = .null
+        }
+        return .object(object)
     }
 
     private func parseISO8601(_ value: String) -> Date {

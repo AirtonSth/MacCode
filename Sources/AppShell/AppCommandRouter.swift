@@ -4017,6 +4017,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return try ctx.turnCheckpointRepo.list(threadId: thread)
     }
 
+    public func listAgentThreadCheckpointsPage(
+        thread: AgentThreadID,
+        maxEntries: Int,
+        before: AgentTurnCheckpointCursor?
+    ) throws -> AgentTurnCheckpointPage {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        return try ctx.turnCheckpointRepo.listMetadataPage(
+            threadId: thread,
+            maxEntries: maxEntries,
+            before: before
+        )
+    }
+
     public func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, path: String?) throws -> String {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard let checkpoint = try ctx.turnCheckpointRepo.get(threadId: thread, checkpointTurnCount: checkpointTurnCount) else {
