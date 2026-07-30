@@ -54,19 +54,8 @@ public final class AgentAttachmentStore: @unchecked Sendable {
     public func stage(path: String) throws -> AgentAttachment {
         let source = try AgentAttachmentResolver.resolve(paths: [path], fileManager: fileManager)[0]
         let sourceURL = URL(fileURLWithPath: source.path)
-        let attributes = try? fileManager.attributesOfItem(atPath: sourceURL.path)
-        if let size = (attributes?[.size] as? NSNumber)?.int64Value,
-           size > Int64(Self.maximumSizeBytes) {
-            throw AgentAttachmentResolverError.exceedsMaximumSize(
-                source.displayName,
-                Self.maximumSizeBytes
-            )
-        }
-        guard let data = try? Data(contentsOf: sourceURL, options: .mappedIfSafe) else {
-            throw AgentAttachmentResolverError.notReadableFile(path)
-        }
-        return try stage(
-            data: data,
+        return try stageFile(
+            at: sourceURL,
             displayName: source.displayName,
             kind: source.kind,
             mimeType: source.mimeType
@@ -124,6 +113,200 @@ public final class AgentAttachmentStore: @unchecked Sendable {
                 sha256: digest,
                 sizeBytes: data.count
             )
+        }
+    }
+
+    /// Stages a file by streaming bounded reads so large payloads (up to 25 MiB)
+    /// never need a contiguous in-memory buffer. Optional expected digest/size
+    /// fail closed when the on-disk bytes disagree.
+    public func stageFile(
+        at sourceURL: URL,
+        displayName: String,
+        kind: AgentAttachmentKind,
+        mimeType: String?,
+        expectedSHA256: String? = nil,
+        expectedSizeBytes: Int? = nil,
+        referenceID: String? = nil,
+        consumeSource: Bool = false
+    ) throws -> AgentAttachment {
+        let attributes = try? fileManager.attributesOfItem(atPath: sourceURL.path)
+        guard let sizeNumber = attributes?[.size] as? NSNumber else {
+            throw AgentAttachmentResolverError.notReadableFile(sourceURL.path)
+        }
+        let size = sizeNumber.int64Value
+        guard size > 0 else {
+            throw AgentAttachmentResolverError.malformedReference("empty attachment data")
+        }
+        guard size <= Int64(Self.maximumSizeBytes) else {
+            throw AgentAttachmentResolverError.exceedsMaximumSize(
+                displayName,
+                Self.maximumSizeBytes
+            )
+        }
+        if let expectedSizeBytes, Int64(expectedSizeBytes) != size {
+            throw AgentAttachmentResolverError.malformedReference("size does not match staged file")
+        }
+        let safeName = try Self.validatedDisplayName(displayName)
+        let normalizedMIME = try Self.validatedMIMEType(mimeType)
+            ?? (kind == .file ? "application/octet-stream" : nil)
+        let sizeBytes = Int(size)
+        let stableReferenceID: String
+        if let referenceID {
+            let normalized = referenceID
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard Self.isReferenceID(normalized) else {
+                throw AgentAttachmentResolverError.malformedReference("invalid attachment reference id")
+            }
+            stableReferenceID = normalized
+        } else {
+            stableReferenceID = UUID().uuidString.lowercased()
+        }
+
+        return try AgentAttachmentStorageSynchronization.withLock(root: root) {
+            try prepareDirectories()
+            let stagedURL: URL
+            let temporaryURL: URL?
+            let digest: String
+            if consumeSource {
+                stagedURL = sourceURL
+                temporaryURL = nil
+                digest = try Self.streamDigest(at: sourceURL)
+            } else {
+                let tempURL = root.appendingPathComponent(
+                    ".stage-\(UUID().uuidString.lowercased()).tmp",
+                    isDirectory: false
+                )
+                stagedURL = tempURL
+                temporaryURL = tempURL
+                digest = try Self.streamCopyAndDigest(
+                    from: sourceURL,
+                    to: tempURL,
+                    fileManager: fileManager
+                )
+            }
+            defer {
+                if let temporaryURL {
+                    try? fileManager.removeItem(at: temporaryURL)
+                }
+            }
+            let stagedAttributes = try? fileManager.attributesOfItem(
+                atPath: stagedURL.path
+            )
+            guard let stagedSize = (stagedAttributes?[.size] as? NSNumber)?.int64Value,
+                  stagedSize == size else {
+                throw AgentAttachmentResolverError.malformedReference(
+                    "size changed while staging file"
+                )
+            }
+            if let expectedSHA256 {
+                let expected = expectedSHA256
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                guard Self.isDigest(expected), expected == digest else {
+                    throw AgentAttachmentResolverError.malformedReference(
+                        "hash does not match staged file"
+                    )
+                }
+            }
+
+            let storedURL = blobURL(digest: digest)
+            let stagedPath = stagedURL.standardizedFileURL.resolvingSymlinksInPath().path
+            let storedPath = storedURL.standardizedFileURL.resolvingSymlinksInPath().path
+            if fileManager.fileExists(atPath: storedURL.path),
+               (try? Self.streamDigest(at: storedURL)) == digest {
+                if stagedPath != storedPath {
+                    try? fileManager.removeItem(at: stagedURL)
+                }
+            } else {
+                if fileManager.fileExists(atPath: storedURL.path) {
+                    try fileManager.removeItem(at: storedURL)
+                }
+                if stagedPath != storedPath {
+                    try fileManager.moveItem(at: stagedURL, to: storedURL)
+                }
+            }
+            try fileManager.setAttributes(
+                [.posixPermissions: 0o600, .modificationDate: Date()],
+                ofItemAtPath: storedURL.path
+            )
+
+            let metadata = Metadata(
+                digest: digest,
+                displayName: safeName,
+                kind: kind,
+                mimeType: normalizedMIME
+            )
+            if let existingMetadata = try loadMetadata(referenceID: stableReferenceID) {
+                guard existingMetadata == metadata else {
+                    throw AgentAttachmentResolverError.malformedReference(
+                        "attachment reference metadata conflict"
+                    )
+                }
+            } else {
+                try persistMetadata(metadata, referenceID: stableReferenceID)
+            }
+            return AgentAttachment(
+                id: stableReferenceID,
+                path: storedURL.path,
+                displayName: metadata.displayName,
+                kind: metadata.kind,
+                mimeType: metadata.mimeType,
+                sha256: digest,
+                sizeBytes: sizeBytes
+            )
+        }
+    }
+
+    /// Creates the same human-readable hardlink used by macOS drag/drop so a
+    /// paired client can insert a recognizable host path without copying bytes.
+    public func composerInsertionPath(
+        for attachment: AgentAttachment
+    ) throws -> String {
+        let name = try Self.validatedDisplayName(attachment.displayName)
+        guard let rawID = attachment.id?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased(),
+              Self.isReferenceID(rawID) || Self.isDigest(rawID),
+              let digest = attachment.sha256?.lowercased(),
+              Self.isDigest(digest) else {
+            throw AgentAttachmentResolverError.malformedReference(
+                "incomplete attachment metadata"
+            )
+        }
+        let source = URL(fileURLWithPath: attachment.path)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        let managedRoot = root.standardizedFileURL.resolvingSymlinksInPath()
+        guard source.deletingLastPathComponent().path == managedRoot.path,
+              source.lastPathComponent == digest,
+              fileManager.isReadableFile(atPath: source.path) else {
+            throw AgentAttachmentResolverError.notReadableFile(name)
+        }
+
+        return try AgentAttachmentStorageSynchronization.withLock(root: root) {
+            try prepareDirectories()
+            let linkRoot = root
+                .appendingPathComponent("composer-paths", isDirectory: true)
+                .appendingPathComponent(rawID, isDirectory: true)
+            try fileManager.createDirectory(
+                at: linkRoot,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try fileManager.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: linkRoot.path
+            )
+            let link = linkRoot.appendingPathComponent(name, isDirectory: false)
+            if !fileManager.fileExists(atPath: link.path) {
+                try fileManager.linkItem(at: source, to: link)
+                try fileManager.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: link.path
+                )
+            }
+            return link.path
         }
     }
 
@@ -296,6 +479,72 @@ public final class AgentAttachmentStore: @unchecked Sendable {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
+    /// Streams `source` into `destination` in 1 MiB windows while hashing.
+    private static func streamCopyAndDigest(
+        from source: URL,
+        to destination: URL,
+        fileManager: FileManager
+    ) throws -> String {
+        guard fileManager.createFile(atPath: destination.path, contents: nil) else {
+            throw AgentAttachmentResolverError.notReadableFile(source.path)
+        }
+        let reader: FileHandle
+        do {
+            reader = try FileHandle(forReadingFrom: source)
+        } catch {
+            throw AgentAttachmentResolverError.notReadableFile(source.path)
+        }
+        defer { try? reader.close() }
+        let writer: FileHandle
+        do {
+            writer = try FileHandle(forWritingTo: destination)
+        } catch {
+            throw AgentAttachmentResolverError.notReadableFile(destination.path)
+        }
+        defer { try? writer.close() }
+        var hasher = SHA256()
+        let window = 1_024 * 1_024
+        while true {
+            let chunk: Data
+            do {
+                chunk = try reader.read(upToCount: window) ?? Data()
+            } catch {
+                throw AgentAttachmentResolverError.notReadableFile(source.path)
+            }
+            if chunk.isEmpty { break }
+            hasher.update(data: chunk)
+            do {
+                try writer.write(contentsOf: chunk)
+            } catch {
+                throw AgentAttachmentResolverError.notReadableFile(destination.path)
+            }
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func streamDigest(at source: URL) throws -> String {
+        let reader: FileHandle
+        do {
+            reader = try FileHandle(forReadingFrom: source)
+        } catch {
+            throw AgentAttachmentResolverError.notReadableFile(source.path)
+        }
+        defer { try? reader.close() }
+        var hasher = SHA256()
+        let window = 1_024 * 1_024
+        while true {
+            let chunk: Data
+            do {
+                chunk = try reader.read(upToCount: window) ?? Data()
+            } catch {
+                throw AgentAttachmentResolverError.notReadableFile(source.path)
+            }
+            if chunk.isEmpty { break }
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
     private static func isDigest(_ value: String) -> Bool {
         value.count == 64 && value.allSatisfy { $0.isHexDigit }
     }
@@ -307,9 +556,11 @@ public final class AgentAttachmentStore: @unchecked Sendable {
     private static func validatedDisplayName(_ raw: String) throws -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
+              trimmed != ".",
+              trimmed != "..",
               trimmed == URL(fileURLWithPath: trimmed).lastPathComponent,
               !trimmed.contains("\0"),
-              trimmed.count <= 255 else {
+              trimmed.utf8.count <= 255 else {
             throw AgentAttachmentResolverError.malformedReference("invalid display name")
         }
         return trimmed

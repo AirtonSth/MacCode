@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Persistence
 import SocketServer
@@ -93,6 +94,40 @@ public final class LocalAuthAdapter: DirectAuthProvider {
 
     public func verify(token: String) -> Bool {
         ((try? repo.verify(token: token)) ?? nil) != nil
+    }
+
+    /// Stable durable owner for Attachment Upload v2 (and similar bindings).
+    ///
+    /// The trusted device row is the security principal. `clientDeviceID` is
+    /// client-supplied display/pairing metadata and must never merge two trust
+    /// rows into one upload owner. Only an opaque SHA-256 fingerprint is
+    /// returned — never the bearer or raw row id.
+    public func authorizedOwnerFingerprint(token: String) -> String? {
+        guard let trust = (try? repo.verify(token: token)) ?? nil else { return nil }
+        return Self.opaqueAuthorizedOwnerFingerprint(
+            stableIdentity: "device:\(trust.id)"
+        )
+    }
+
+    public func isAuthorizedOwnerFingerprintActive(
+        _ fingerprint: String
+    ) -> Bool {
+        guard fingerprint.utf8.count == 64 else { return false }
+        return ((try? repo.list()) ?? []).contains { trust in
+            trust.revokedAt == nil
+                && Self.opaqueAuthorizedOwnerFingerprint(
+                    stableIdentity: "device:\(trust.id)"
+                ) == fingerprint
+        }
+    }
+
+    /// Hash a stable authorized identity into an opaque 64-char hex fingerprint.
+    /// Pure helper so tests can assert the mapping without logging raw ids.
+    nonisolated static func opaqueAuthorizedOwnerFingerprint(stableIdentity: String) -> String {
+        let material = Data("rc2.authorized-owner.v1:\(stableIdentity)".utf8)
+        return SHA256.hash(data: material)
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     public func createPairingRequest(deviceName: String) -> (requestId: String, code: String)? {

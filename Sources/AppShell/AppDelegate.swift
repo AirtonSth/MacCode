@@ -973,6 +973,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let keepAliveSeconds = DirectHTTPServer.resolvedHttpKeepAliveIdleTimeoutSeconds(
             experimentEnabled: ConnectionFeatureFlags.transportKeepaliveExperimentEnabled
         )
+        let attachmentStore = AgentAttachmentStore(
+            root: context.appSupportDirectory
+                .appendingPathComponent("agent-attachments", isDirectory: true)
+        )
+        let attachmentUploadV2Store = AttachmentUploadV2Store(
+            root: context.appSupportDirectory
+                .appendingPathComponent("agent-attachment-uploads-v2", isDirectory: true),
+            attachmentStore: attachmentStore
+        )
         let http = DirectHTTPServer(
             port: port,
             loopbackOnly: loopbackOnly,
@@ -980,7 +989,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             auth: auth,
             serverId: serverId,
             bootEpoch: context.liveActivityHostIdentity.bootEpoch,
-            clientReceiveTimeoutSeconds: keepAliveSeconds
+            clientReceiveTimeoutSeconds: keepAliveSeconds,
+            attachmentUploadV2Store: attachmentUploadV2Store
         )
         try http.start()
         httpServer = http

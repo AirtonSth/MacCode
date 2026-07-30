@@ -20,6 +20,33 @@ import CoreModel
 
 @MainActor
 final class RPCContractParityTests: XCTestCase {
+    /// Executable non-RPC HTTP routes consumed by the paired client. Keep this
+    /// catalog explicit so call-inventory review cannot mistake HEAD support
+    /// for a comment-only contract.
+    private let executableRouteCatalog: Set<String> = [
+        "GET /__rc2_static/*",
+        "HEAD /__rc2_static/*",
+    ]
+
+    func test_staticGrantExecutableRouteCatalogContainsGETAndHEAD() {
+        let staticRoutes = Set(
+            executableRouteCatalog.filter {
+                $0.hasSuffix(" /__rc2_static/*")
+            }
+        )
+        XCTAssertEqual(
+            staticRoutes,
+            [
+                "GET /__rc2_static/*",
+                "HEAD /__rc2_static/*",
+            ]
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.staticFileHTTPMethods,
+            ["GET", "HEAD"],
+            "the executable method gate must match the route catalog"
+        )
+    }
 
     // MARK: - Manifest: required param keys per method
 

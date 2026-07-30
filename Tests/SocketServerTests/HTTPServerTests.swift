@@ -1,5 +1,6 @@
 import XCTest
 import Darwin
+import CryptoKit
 import CoreModel
 import Persistence
 @testable import SocketServer
@@ -292,6 +293,151 @@ final class HTTPServerTests: XCTestCase {
         }.resume()
 
         wait(for: [served, blocked], timeout: 4)
+    }
+
+    @MainActor
+    func test_staticFileRouteHonorsBoundedByteRangeForMobilePreview() throws {
+        let temp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-static-range-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let file = temp.appendingPathComponent("preview.bin")
+        try Data("0123456789".utf8).write(to: file)
+        let grant = try XCTUnwrap(DirectStaticFileRegistry.shared.register(fileURL: file))
+
+        let port = UInt16.random(in: 33000...44000)
+        let dispatcher = JSONRPCDispatcher(router: FakeRouter())
+        let server = DirectHTTPServer(
+            port: port,
+            loopbackOnly: true,
+            dispatcher: dispatcher,
+            bootEpoch: 1
+        )
+        try server.start()
+        defer { server.stop() }
+        Thread.sleep(forTimeInterval: 0.05)
+
+        var request = URLRequest(
+            url: URL(string: "http://127.0.0.1:\(port)\(grant.routePath)")!
+        )
+        request.setValue("bytes=2-5", forHTTPHeaderField: "Range")
+        let response = expectation(description: "bounded static range")
+        URLSession.shared.dataTask(with: request) { data, rawResponse, error in
+            let http = rawResponse as? HTTPURLResponse
+            XCTAssertNil(error)
+            XCTAssertEqual(http?.statusCode, 206)
+            XCTAssertEqual(http?.value(forHTTPHeaderField: "Accept-Ranges"), "bytes")
+            XCTAssertEqual(http?.value(forHTTPHeaderField: "Content-Range"), "bytes 2-5/10")
+            XCTAssertEqual(http?.value(forHTTPHeaderField: "Content-Length"), "4")
+            XCTAssertEqual(String(data: data ?? Data(), encoding: .utf8), "2345")
+            response.fulfill()
+        }.resume()
+
+        wait(for: [response], timeout: 4)
+    }
+
+    @MainActor
+    func test_staticFileHEADMatchesGETAndRangeHeadersWithoutBody()
+        async throws
+    {
+        // WHY: mobile previews probe metadata before downloading. HEAD must
+        // reuse GET's exact status/range geometry while sending no file bytes.
+        let temp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(
+                "rc2-static-head-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: temp,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let file = temp.appendingPathComponent("preview.bin")
+        try Data("0123456789".utf8).write(to: file)
+        let grant = try XCTUnwrap(
+            DirectStaticFileRegistry.shared.register(fileURL: file)
+        )
+
+        let port = UInt16.random(in: 33_000...44_000)
+        let server = DirectHTTPServer(
+            port: port,
+            loopbackOnly: true,
+            dispatcher: JSONRPCDispatcher(router: FakeRouter()),
+            bootEpoch: 1
+        )
+        try server.start()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let url = try XCTUnwrap(
+            URL(string: "http://127.0.0.1:\(port)\(grant.routePath)")
+        )
+
+        var head = URLRequest(url: url)
+        head.httpMethod = "HEAD"
+        let (headBody, rawHeadResponse) =
+            try await URLSession.shared.data(for: head)
+        let headResponse = try XCTUnwrap(
+            rawHeadResponse as? HTTPURLResponse
+        )
+        XCTAssertEqual(headResponse.statusCode, 200)
+        XCTAssertEqual(
+            headResponse.value(forHTTPHeaderField: "Content-Type"),
+            "application/octet-stream"
+        )
+        XCTAssertEqual(
+            headResponse.value(forHTTPHeaderField: "Accept-Ranges"),
+            "bytes"
+        )
+        XCTAssertEqual(
+            headResponse.value(forHTTPHeaderField: "Content-Length"),
+            "10"
+        )
+        XCTAssertTrue(headBody.isEmpty)
+
+        var rangedHead = URLRequest(url: url)
+        rangedHead.httpMethod = "HEAD"
+        rangedHead.setValue("bytes=2-5", forHTTPHeaderField: "Range")
+        let (rangedBody, rawRangedResponse) =
+            try await URLSession.shared.data(for: rangedHead)
+        let rangedResponse = try XCTUnwrap(
+            rawRangedResponse as? HTTPURLResponse
+        )
+        XCTAssertEqual(rangedResponse.statusCode, 206)
+        XCTAssertEqual(
+            rangedResponse.value(forHTTPHeaderField: "Content-Type"),
+            "application/octet-stream"
+        )
+        XCTAssertEqual(
+            rangedResponse.value(forHTTPHeaderField: "Accept-Ranges"),
+            "bytes"
+        )
+        XCTAssertEqual(
+            rangedResponse.value(forHTTPHeaderField: "Content-Range"),
+            "bytes 2-5/10"
+        )
+        XCTAssertEqual(
+            rangedResponse.value(forHTTPHeaderField: "Content-Length"),
+            "4"
+        )
+        XCTAssertTrue(rangedBody.isEmpty)
+    }
+
+    func test_staticFileRangeParserRejectsInvalidOrOutOfBoundsRanges() {
+        XCTAssertEqual(
+            DirectHTTPServer.staticFileByteRange(header: nil, fileSize: 10),
+            .full
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.staticFileByteRange(header: "bytes=0-1499999", fileSize: 10),
+            .partial(start: 0, end: 9)
+        )
+        for header in ["items=0-1", "bytes=10-20", "bytes=5-2", "bytes=0-1,4-5", "bytes=-0"] {
+            XCTAssertEqual(
+                DirectHTTPServer.staticFileByteRange(header: header, fileSize: 10),
+                .unsatisfiable,
+                "\(header) must not fall back to a full-file response"
+            )
+        }
     }
 
     @MainActor
@@ -1437,6 +1583,556 @@ final class HTTPServerTests: XCTestCase {
         let buf = Data("GET / HTTP/1.1\r\nHost: x\r\n".utf8)
         XCTAssertNil(DirectHTTPServer.nextHeaderTerminatorRange(in: buf, from: 0),
                      "absent terminator must return nil")
+    }
+
+    func test_attachmentUploadV2RouteAndFilenameParsingAreStrict() {
+        // WHY: client-controlled path/header values must never become ambiguous
+        // staging paths, especially when a background retry reconstructs them.
+        let id = "241f35d6-2ecf-4e3a-8588-22077937b64d"
+        XCTAssertEqual(
+            DirectHTTPServer.attachmentUploadV2Route(
+                path: "/v1/agent/attachment-uploads/v2/\(id)"
+            ),
+            .upload(uploadId: id)
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.attachmentUploadV2Route(
+                path: "/v1/agent/attachment-uploads/v2/\(id)/chunks/49"
+            ),
+            .chunk(uploadId: id, index: 49)
+        )
+        XCTAssertTrue(DirectHTTPServer.httpAuthGateRequiresToken(
+            loopbackOnly: false,
+            path: "/v1/agent/attachment-uploads/v2/\(id)/chunks/0",
+            hasAuthProvider: true
+        ))
+        XCTAssertNil(DirectHTTPServer.attachmentUploadV2Route(
+            path: "/v1//agent/attachment-uploads/v2/\(id)"
+        ))
+        XCTAssertNil(DirectHTTPServer.attachmentUploadV2Route(
+            path: "/v1/agent/attachment-uploads/v2/\(id)/"
+        ))
+        XCTAssertNil(DirectHTTPServer.attachmentUploadV2Route(
+            path: "/v1/agent/attachment-uploads/v2/not-a-uuid/chunks/0"
+        ))
+
+        let filename = "captura 3G.png"
+        let encoded = Data(filename.utf8).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "="))
+        XCTAssertEqual(
+            DirectHTTPServer.attachmentUploadV2Filename(base64URLValue: encoded),
+            filename
+        )
+        XCTAssertNil(
+            DirectHTTPServer.attachmentUploadV2Filename(base64URLValue: "../not-base64url")
+        )
+    }
+
+    @MainActor
+    func test_attachmentUploadV2HTTPCommitResumeCapabilityAndCancel() async throws {
+        // WHY: background cellular retries need one durable contract across
+        // capability discovery, out-of-order PUT, duplicate PUT, GET, and DELETE.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-http-upload-v2-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uploadStore = AttachmentUploadV2Store(
+            root: root.appendingPathComponent("uploads", isDirectory: true),
+            attachmentStore: AgentAttachmentStore(
+                root: root.appendingPathComponent("attachments", isDirectory: true)
+            )
+        )
+        let port = UInt16.random(in: 33000...44000)
+        let hostId = "host-upload-v2-test"
+        let server = DirectHTTPServer(
+            port: port,
+            loopbackOnly: true,
+            dispatcher: JSONRPCDispatcher(router: FakeRouter()),
+            serverId: hostId,
+            bootEpoch: 1,
+            attachmentUploadV2Store: uploadStore
+        )
+        try server.start()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        let baseURL = URL(string: "http://127.0.0.1:\(port)")!
+        let workspaceId = "04bc0dac-0c27-46e0-9807-7f920f52db1c"
+        func digest(_ data: Data) -> String {
+            SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        }
+        func encodedFilename(_ value: String) -> String {
+            Data(value.utf8).base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+                .trimmingCharacters(in: CharacterSet(charactersIn: "="))
+        }
+        func putRequest(
+            uploadId: String,
+            index: Int,
+            filename: String,
+            file: Data,
+            chunk: Data
+        ) -> URLRequest {
+            var request = URLRequest(
+                url: baseURL.appendingPathComponent(
+                    "/v1/agent/attachment-uploads/v2/\(uploadId)/chunks/\(index)"
+                )
+            )
+            request.httpMethod = "PUT"
+            request.httpBody = chunk
+            request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+            request.setValue("identity", forHTTPHeaderField: "Content-Encoding")
+            request.setValue(uploadId, forHTTPHeaderField: "Idempotency-Key")
+            request.setValue(hostId, forHTTPHeaderField: "X-RC2-Expected-Host-ID")
+            request.setValue(workspaceId, forHTTPHeaderField: "X-RC2-Workspace-ID")
+            request.setValue(
+                encodedFilename(filename),
+                forHTTPHeaderField: "X-RC2-Filename-UTF8-Base64URL"
+            )
+            request.setValue("application/octet-stream", forHTTPHeaderField: "X-RC2-Mime-Type")
+            request.setValue(String(file.count), forHTTPHeaderField: "X-RC2-Total-Bytes")
+            request.setValue(
+                digest(file),
+                forHTTPHeaderField: "X-RC2-File-SHA256"
+            )
+            request.setValue(
+                String(AttachmentUploadV2Policy.rawChunkBytes),
+                forHTTPHeaderField: "X-RC2-Chunk-Bytes"
+            )
+            request.setValue(
+                String(AttachmentUploadV2Policy.chunkCount(sizeBytes: file.count)),
+                forHTTPHeaderField: "X-RC2-Chunk-Count"
+            )
+            request.setValue(
+                String(chunk.count),
+                forHTTPHeaderField: "X-RC2-Raw-Chunk-Bytes"
+            )
+            request.setValue(digest(chunk), forHTTPHeaderField: "X-RC2-Chunk-SHA256")
+            return request
+        }
+
+        let capabilityURL = baseURL.appendingPathComponent("/v1/capabilities")
+        let (capabilityData, capabilityResponse) = try await URLSession.shared.data(
+            from: capabilityURL
+        )
+        XCTAssertEqual((capabilityResponse as? HTTPURLResponse)?.statusCode, 200)
+        let capabilityBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: capabilityData) as? [String: Any]
+        )
+        let agent = try XCTUnwrap(capabilityBody["agent"] as? [String: Any])
+        let capability = try XCTUnwrap(
+            agent["attachment_upload"] as? [String: Any]
+        )
+        XCTAssertEqual(capability["protocol_version"] as? Int, 2)
+        XCTAssertEqual(
+            capability["chunk_bytes"] as? Int,
+            AttachmentUploadV2Policy.rawChunkBytes
+        )
+        XCTAssertEqual(capability["max_filename_bytes"] as? Int, 255)
+        XCTAssertEqual(capability["max_mime_type_bytes"] as? Int, 128)
+
+        let committedUploadId = UUID().uuidString.lowercased()
+        let committedPayload = Data("resume-safe raw attachment".utf8)
+        let committedRequest = putRequest(
+            uploadId: committedUploadId,
+            index: 0,
+            filename: "note.txt",
+            file: committedPayload,
+            chunk: committedPayload
+        )
+        let (commitData, commitResponse) = try await URLSession.shared.data(
+            for: committedRequest
+        )
+        XCTAssertEqual((commitResponse as? HTTPURLResponse)?.statusCode, 201)
+        XCTAssertEqual(
+            (commitResponse as? HTTPURLResponse)?
+                .value(forHTTPHeaderField: "Cache-Control"),
+            "no-store"
+        )
+        let commitBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: commitData) as? [String: Any]
+        )
+        XCTAssertEqual(commitBody["state"] as? String, "committed")
+        XCTAssertEqual(commitBody["server_id"] as? String, hostId)
+        XCTAssertEqual(commitBody["workspace_id"] as? String, workspaceId)
+        let committedResult = try XCTUnwrap(commitBody["result"] as? [String: Any])
+        let stagedPath = try XCTUnwrap(
+            committedResult["composer_insertion_text"] as? String
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: URL(fileURLWithPath: stagedPath)),
+            committedPayload
+        )
+
+        let (duplicateData, duplicateResponse) = try await URLSession.shared.data(
+            for: committedRequest
+        )
+        XCTAssertEqual((duplicateResponse as? HTTPURLResponse)?.statusCode, 200)
+        let duplicateBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: duplicateData) as? [String: Any]
+        )
+        XCTAssertEqual(
+            (duplicateBody["result"] as? [String: Any])?["id"] as? String,
+            committedResult["id"] as? String,
+            "an uncertain PUT retry must resolve to the same durable reference"
+        )
+
+        var statusRequest = URLRequest(
+            url: baseURL.appendingPathComponent(
+                "/v1/agent/attachment-uploads/v2/\(committedUploadId)"
+            )
+        )
+        statusRequest.setValue(hostId, forHTTPHeaderField: "X-RC2-Expected-Host-ID")
+        statusRequest.setValue(
+            committedUploadId,
+            forHTTPHeaderField: "Idempotency-Key"
+        )
+        statusRequest.setValue(workspaceId, forHTTPHeaderField: "X-RC2-Workspace-ID")
+        let (statusData, statusResponse) = try await URLSession.shared.data(
+            for: statusRequest
+        )
+        XCTAssertEqual((statusResponse as? HTTPURLResponse)?.statusCode, 200)
+        let statusBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: statusData) as? [String: Any]
+        )
+        XCTAssertEqual(statusBody["state"] as? String, "committed")
+        XCTAssertEqual(statusBody["received_bytes"] as? Int, committedPayload.count)
+
+        let partialUploadId = UUID().uuidString.lowercased()
+        let fullChunkSize = AttachmentUploadV2Policy.rawChunkBytes
+        let partialFile = Data(repeating: 0x7a, count: fullChunkSize + 1)
+        let lastChunk = partialFile.subdata(in: fullChunkSize..<partialFile.count)
+        let partialRequest = putRequest(
+            uploadId: partialUploadId,
+            index: 1,
+            filename: "partial.bin",
+            file: partialFile,
+            chunk: lastChunk
+        )
+        let (partialData, partialResponse) = try await URLSession.shared.data(
+            for: partialRequest
+        )
+        XCTAssertEqual((partialResponse as? HTTPURLResponse)?.statusCode, 202)
+        let partialBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: partialData) as? [String: Any]
+        )
+        XCTAssertEqual(partialBody["state"] as? String, "receiving")
+        XCTAssertEqual(partialBody["received_chunks"] as? [Int], [1])
+
+        var cancelRequest = URLRequest(
+            url: baseURL.appendingPathComponent(
+                "/v1/agent/attachment-uploads/v2/\(partialUploadId)"
+            )
+        )
+        cancelRequest.httpMethod = "DELETE"
+        cancelRequest.setValue(hostId, forHTTPHeaderField: "X-RC2-Expected-Host-ID")
+        cancelRequest.setValue(partialUploadId, forHTTPHeaderField: "Idempotency-Key")
+        cancelRequest.setValue(workspaceId, forHTTPHeaderField: "X-RC2-Workspace-ID")
+        let (cancelData, cancelResponse) = try await URLSession.shared.data(
+            for: cancelRequest
+        )
+        XCTAssertEqual((cancelResponse as? HTTPURLResponse)?.statusCode, 200)
+        let cancelBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: cancelData) as? [String: Any]
+        )
+        XCTAssertEqual(cancelBody["state"] as? String, "cancelled")
+
+        let (goneData, goneResponse) = try await URLSession.shared.data(
+            for: partialRequest
+        )
+        XCTAssertEqual((goneResponse as? HTTPURLResponse)?.statusCode, 410)
+        let goneBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: goneData) as? [String: Any]
+        )
+        let goneError = try XCTUnwrap(goneBody["error"] as? [String: Any])
+        XCTAssertEqual(goneError["code"] as? String, "upload_cancelled")
+
+        let cancelledBeforePUTId = UUID().uuidString.lowercased()
+        var earlyCancel = URLRequest(
+            url: baseURL.appendingPathComponent(
+                "/v1/agent/attachment-uploads/v2/\(cancelledBeforePUTId)"
+            )
+        )
+        earlyCancel.httpMethod = "DELETE"
+        earlyCancel.setValue(hostId, forHTTPHeaderField: "X-RC2-Expected-Host-ID")
+        earlyCancel.setValue(cancelledBeforePUTId, forHTTPHeaderField: "Idempotency-Key")
+        earlyCancel.setValue(workspaceId, forHTTPHeaderField: "X-RC2-Workspace-ID")
+        let (earlyCancelData, earlyCancelResponse) = try await URLSession.shared.data(
+            for: earlyCancel
+        )
+        XCTAssertEqual((earlyCancelResponse as? HTTPURLResponse)?.statusCode, 200)
+        let earlyCancelBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: earlyCancelData) as? [String: Any]
+        )
+        XCTAssertEqual(earlyCancelBody["state"] as? String, "cancelled")
+        XCTAssertEqual(earlyCancelBody["total_bytes"] as? Int, 0)
+
+        let lateByte = Data([0x01])
+        let latePUT = putRequest(
+            uploadId: cancelledBeforePUTId,
+            index: 0,
+            filename: "late.bin",
+            file: lateByte,
+            chunk: lateByte
+        )
+        let (_, lateResponse) = try await URLSession.shared.data(for: latePUT)
+        XCTAssertEqual((lateResponse as? HTTPURLResponse)?.statusCode, 410)
+    }
+
+    /// Auth double that maps distinct bearer strings onto a stable owner key.
+    /// Models an authenticated in-place token rotation on one trusted device
+    /// row without pulling AppShell into SocketServerTests.
+    private final class StableOwnerAuth: DirectAuthProvider {
+        /// bearer → opaque stable owner material (not a fingerprint; hashed by
+        /// authorizedOwnerFingerprint to mirror production providers).
+        private let tokenToStableOwner: [String: String]
+
+        init(tokenToStableOwner: [String: String]) {
+            self.tokenToStableOwner = tokenToStableOwner
+        }
+
+        func verify(token: String) -> Bool { tokenToStableOwner[token] != nil }
+
+        func authorizedOwnerFingerprint(token: String) -> String? {
+            guard let stable = tokenToStableOwner[token] else { return nil }
+            let material = Data("rc2.authorized-owner.v1:\(stable)".utf8)
+            return SHA256.hash(data: material)
+                .map { String(format: "%02x", $0) }
+                .joined()
+        }
+
+        func createPairingCode() -> String? { nil }
+        func redeemPairingCode(
+            _ code: String,
+            deviceName: String
+        ) -> (deviceId: String, token: String)? { nil }
+        func listDevices() -> [[String: Any]] { [] }
+        func revokeDevice(_ id: String) {}
+    }
+
+    @MainActor
+    func test_attachmentUploadV2_stableOwnerFingerprint_resumesAcrossBearerRefresh() async throws {
+        // WHY: rotating a valid bearer for the same authorized device must
+        // resume the exact durable upload id/result. Binding to the raw bearer
+        // made a committed upload look 404 after refresh (false ownerMismatch).
+        let tokenA1 = "owner-a-bearer-v1"
+        let tokenA2 = "owner-a-bearer-v2-after-refresh"
+        let tokenB = "owner-b-distinct-bearer"
+        let auth = StableOwnerAuth(tokenToStableOwner: [
+            tokenA1: "device-row:phone-a",
+            tokenA2: "device-row:phone-a",
+            tokenB: "device-row:phone-b",
+        ])
+        XCTAssertEqual(
+            auth.authorizedOwnerFingerprint(token: tokenA1),
+            auth.authorizedOwnerFingerprint(token: tokenA2),
+            "same stable owner material must hash to one fingerprint across bearers"
+        )
+        XCTAssertNotEqual(
+            auth.authorizedOwnerFingerprint(token: tokenA1),
+            auth.authorizedOwnerFingerprint(token: tokenB),
+            "distinct authorized owners must remain isolated"
+        )
+        XCTAssertNil(
+            auth.authorizedOwnerFingerprint(token: "not-a-token"),
+            "invalid tokens must not mint an owner fingerprint"
+        )
+        // Default DirectAuthProvider path still token-derives after verify.
+        let defaultAuth = StubAuth()
+        XCTAssertEqual(
+            defaultAuth.authorizedOwnerFingerprint(token: "good-token"),
+            DirectHTTPServer.connectionOwnerFingerprint(token: "good-token")
+        )
+        XCTAssertNil(defaultAuth.authorizedOwnerFingerprint(token: "wrong-token"))
+        XCTAssertEqual(
+            DirectHTTPServer.attachmentUploadV2OwnerFingerprint(
+                token: tokenA1,
+                auth: auth,
+                requiresToken: true
+            ),
+            auth.authorizedOwnerFingerprint(token: tokenA1)
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.attachmentUploadV2OwnerFingerprint(
+                token: nil,
+                auth: nil,
+                requiresToken: false
+            ),
+            DirectHTTPServer.connectionOwnerFingerprint(token: nil),
+            "loopback/no-auth harness must keep the trusted-local fallback"
+        )
+        XCTAssertNil(
+            DirectHTTPServer.attachmentUploadV2OwnerFingerprint(
+                token: "not-a-token",
+                auth: auth,
+                requiresToken: true
+            ),
+            "required auth must fail closed instead of falling back to a token-scoped owner"
+        )
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "rc-http-upload-v2-stable-owner-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uploadStore = AttachmentUploadV2Store(
+            root: root.appendingPathComponent("uploads", isDirectory: true),
+            attachmentStore: AgentAttachmentStore(
+                root: root.appendingPathComponent("attachments", isDirectory: true)
+            )
+        )
+        let port = UInt16.random(in: 33000...44000)
+        let hostId = "host-upload-v2-stable-owner"
+        let server = DirectHTTPServer(
+            port: port,
+            loopbackOnly: false,
+            dispatcher: JSONRPCDispatcher(router: FakeRouter()),
+            auth: auth,
+            serverId: hostId,
+            bootEpoch: 1,
+            attachmentUploadV2Store: uploadStore
+        )
+        try server.start()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        let baseURL = URL(string: "http://127.0.0.1:\(port)")!
+        let workspaceId = "a1b2c3d4-e5f6-4789-a012-3456789abcde"
+        let uploadId = UUID().uuidString.lowercased()
+        let payload = Data("stable-owner resume payload".utf8)
+        func digest(_ data: Data) -> String {
+            SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        }
+        func encodedFilename(_ value: String) -> String {
+            Data(value.utf8).base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+                .trimmingCharacters(in: CharacterSet(charactersIn: "="))
+        }
+        func putRequest(bearer: String) -> URLRequest {
+            var request = URLRequest(
+                url: baseURL.appendingPathComponent(
+                    "/v1/agent/attachment-uploads/v2/\(uploadId)/chunks/0"
+                )
+            )
+            request.httpMethod = "PUT"
+            request.httpBody = payload
+            request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+            request.setValue("identity", forHTTPHeaderField: "Content-Encoding")
+            request.setValue(uploadId, forHTTPHeaderField: "Idempotency-Key")
+            request.setValue(hostId, forHTTPHeaderField: "X-RC2-Expected-Host-ID")
+            request.setValue(workspaceId, forHTTPHeaderField: "X-RC2-Workspace-ID")
+            request.setValue(
+                encodedFilename("stable.txt"),
+                forHTTPHeaderField: "X-RC2-Filename-UTF8-Base64URL"
+            )
+            request.setValue("text/plain", forHTTPHeaderField: "X-RC2-Mime-Type")
+            request.setValue(String(payload.count), forHTTPHeaderField: "X-RC2-Total-Bytes")
+            request.setValue(digest(payload), forHTTPHeaderField: "X-RC2-File-SHA256")
+            request.setValue(
+                String(AttachmentUploadV2Policy.rawChunkBytes),
+                forHTTPHeaderField: "X-RC2-Chunk-Bytes"
+            )
+            request.setValue("1", forHTTPHeaderField: "X-RC2-Chunk-Count")
+            request.setValue(
+                String(payload.count),
+                forHTTPHeaderField: "X-RC2-Raw-Chunk-Bytes"
+            )
+            request.setValue(digest(payload), forHTTPHeaderField: "X-RC2-Chunk-SHA256")
+            return request
+        }
+        func statusRequest(bearer: String) -> URLRequest {
+            var request = URLRequest(
+                url: baseURL.appendingPathComponent(
+                    "/v1/agent/attachment-uploads/v2/\(uploadId)"
+                )
+            )
+            request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
+            request.setValue(hostId, forHTTPHeaderField: "X-RC2-Expected-Host-ID")
+            request.setValue(uploadId, forHTTPHeaderField: "Idempotency-Key")
+            request.setValue(workspaceId, forHTTPHeaderField: "X-RC2-Workspace-ID")
+            return request
+        }
+
+        let (commitData, commitResponse) = try await URLSession.shared.data(
+            for: putRequest(bearer: tokenA1)
+        )
+        XCTAssertEqual((commitResponse as? HTTPURLResponse)?.statusCode, 201)
+        let commitBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: commitData) as? [String: Any]
+        )
+        XCTAssertEqual(commitBody["state"] as? String, "committed")
+        let committedResult = try XCTUnwrap(commitBody["result"] as? [String: Any])
+        let committedAttachmentId = try XCTUnwrap(committedResult["id"] as? String)
+
+        // Bearer refresh for the same authorized owner: exact resume.
+        let (resumeData, resumeResponse) = try await URLSession.shared.data(
+            for: putRequest(bearer: tokenA2)
+        )
+        XCTAssertEqual((resumeResponse as? HTTPURLResponse)?.statusCode, 200)
+        let resumeBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: resumeData) as? [String: Any]
+        )
+        XCTAssertEqual(resumeBody["state"] as? String, "committed")
+        XCTAssertEqual(
+            (resumeBody["result"] as? [String: Any])?["id"] as? String,
+            committedAttachmentId,
+            "refreshed bearer for the same stable owner must resume the same committed result"
+        )
+
+        let (statusData, statusResponse) = try await URLSession.shared.data(
+            for: statusRequest(bearer: tokenA2)
+        )
+        XCTAssertEqual((statusResponse as? HTTPURLResponse)?.statusCode, 200)
+        let statusBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: statusData) as? [String: Any]
+        )
+        XCTAssertEqual(statusBody["state"] as? String, "committed")
+        XCTAssertEqual(
+            (statusBody["result"] as? [String: Any])?["id"] as? String,
+            committedAttachmentId
+        )
+
+        // Different valid owner: privacy-preserving 404 (not a leak of existence).
+        let (crossData, crossResponse) = try await URLSession.shared.data(
+            for: statusRequest(bearer: tokenB)
+        )
+        XCTAssertEqual((crossResponse as? HTTPURLResponse)?.statusCode, 404)
+        let crossBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: crossData) as? [String: Any]
+        )
+        let crossError = try XCTUnwrap(crossBody["error"] as? [String: Any])
+        XCTAssertEqual(crossError["code"] as? String, "upload_not_found")
+
+        let (crossPutData, crossPutResponse) = try await URLSession.shared.data(
+            for: putRequest(bearer: tokenB)
+        )
+        XCTAssertEqual((crossPutResponse as? HTTPURLResponse)?.statusCode, 404)
+        let crossPutBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: crossPutData) as? [String: Any]
+        )
+        let crossPutError = try XCTUnwrap(crossPutBody["error"] as? [String: Any])
+        XCTAssertEqual(crossPutError["code"] as? String, "upload_not_found")
+
+        // Invalid bearer still 401; host/workspace/idempotency gates stay intact.
+        let (unauthData, unauthResponse) = try await URLSession.shared.data(
+            for: statusRequest(bearer: "forged-token")
+        )
+        XCTAssertEqual((unauthResponse as? HTTPURLResponse)?.statusCode, 401)
+        let unauthBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: unauthData) as? [String: Any]
+        )
+        let unauthError = try XCTUnwrap(unauthBody["error"] as? [String: Any])
+        XCTAssertEqual(unauthError["code"] as? String, "unauthorized")
+
+        var badHost = statusRequest(bearer: tokenA2)
+        badHost.setValue("other-host", forHTTPHeaderField: "X-RC2-Expected-Host-ID")
+        let (_, badHostResponse) = try await URLSession.shared.data(for: badHost)
+        XCTAssertEqual((badHostResponse as? HTTPURLResponse)?.statusCode, 409)
     }
 
     private func writeAll(fd: Int32, data: Data) throws {

@@ -263,4 +263,39 @@ final class AgentAttachmentStoreTests: XCTestCase {
         XCTAssertThrowsError(try store.resolveClientReference(malformed))
         XCTAssertThrowsError(try store.resolveClientReference(unknown))
     }
+
+    func test_stageFileStreamsExactBytesAndRejectsDigestMismatch() throws {
+        // WHY: chunked upload finalize must stage from a file without requiring a
+        // contiguous 25 MiB buffer, while still failing closed on digest lies.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-agent-attachment-stage-file-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let source = root.appendingPathComponent("source.bin")
+        let bytes = Data((0..<12_345).map { UInt8($0 % 251) })
+        try bytes.write(to: source)
+        let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let store = AgentAttachmentStore(root: root.appendingPathComponent("managed", isDirectory: true))
+
+        let staged = try store.stageFile(
+            at: source,
+            displayName: "streamed.bin",
+            kind: .file,
+            mimeType: "application/octet-stream",
+            expectedSHA256: digest,
+            expectedSizeBytes: bytes.count
+        )
+        XCTAssertEqual(staged.sha256, digest)
+        XCTAssertEqual(staged.sizeBytes, bytes.count)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: staged.path)), bytes)
+
+        XCTAssertThrowsError(try store.stageFile(
+            at: source,
+            displayName: "bad-hash.bin",
+            kind: .file,
+            mimeType: "application/octet-stream",
+            expectedSHA256: String(repeating: "0", count: 64),
+            expectedSizeBytes: bytes.count
+        ))
+    }
 }

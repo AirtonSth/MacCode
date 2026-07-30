@@ -14,9 +14,21 @@ import AgentRuntime
 /// - GET  /v1/capabilities
 /// - GET  /v1/capabilities/authenticated  (bearer required, including loopback)
 /// - GET  /healthz
-/// - GET  /__rc2_static/<grant>/<relative-path>
+/// - GET|HEAD /__rc2_static/<grant>/<relative-path>
 public protocol DirectAuthProvider: AnyObject {
     func verify(token: String) -> Bool
+    /// Opaque durable owner fingerprint for a verified bearer.
+    ///
+    /// Used by Attachment Upload v2 so a bearer refresh for the same
+    /// authorized paired/account device resumes the same upload binding.
+    /// Returns `nil` when the token is invalid. Implementations must never
+    /// return raw bearer material or raw client identifiers — only an
+    /// opaque fingerprint suitable for durable owner isolation.
+    func authorizedOwnerFingerprint(token: String) -> String?
+    /// True only while the durable trusted-device row represented by this
+    /// fingerprint remains non-revoked. Capability-only background PUT uses
+    /// this gate before reading any request body.
+    func isAuthorizedOwnerFingerprintActive(_ fingerprint: String) -> Bool
     func createPairingCode() -> String?
     func redeemPairingCode(_ code: String, deviceName: String) -> (deviceId: String, token: String)?
     /// Device-initiated: create a request and surface a Mac-side
@@ -111,6 +123,16 @@ public struct AgentAttachmentUploadCapabilityAdvertisement: Sendable, Equatable 
 /// Defaulted so existing conformers (e.g. test doubles) need no change
 /// until they opt into the request/approve flow.
 public extension DirectAuthProvider {
+    /// Safe default: still validates the token and preserves owner isolation
+    /// via the existing token-derived fingerprint. Providers that can expose
+    /// a stable authorized identity (e.g. LocalAuthAdapter) should override.
+    func authorizedOwnerFingerprint(token: String) -> String? {
+        guard verify(token: token) else { return nil }
+        return DirectHTTPServer.connectionOwnerFingerprint(token: token)
+    }
+    func isAuthorizedOwnerFingerprintActive(_ fingerprint: String) -> Bool {
+        false
+    }
     func createPairingRequest(deviceName: String) -> (requestId: String, code: String)? { nil }
     func createPairingRequest(deviceName: String, privateAccountAccessToken: String?) -> (requestId: String, code: String)? {
         createPairingRequest(deviceName: deviceName)
@@ -791,6 +813,38 @@ final class WebSocketLivenessState: @unchecked Sendable {
 }
 
 public final class DirectHTTPServer: @unchecked Sendable {
+    nonisolated static let staticFileHTTPMethods: Set<String> = [
+        "GET",
+        "HEAD",
+    ]
+
+    enum AttachmentUploadV2HTTPRoute: Equatable {
+        case upload(uploadId: String)
+        case chunk(uploadId: String, index: Int)
+
+        var uploadId: String {
+            switch self {
+            case .upload(let uploadId), .chunk(let uploadId, _):
+                return uploadId
+            }
+        }
+    }
+
+    enum AttachmentUploadV3HTTPRoute: Equatable {
+        case upload(uploadId: String)
+        case prepare(uploadId: String)
+        case chunk(uploadId: String, index: Int)
+
+        var uploadId: String {
+            switch self {
+            case .upload(let uploadId),
+                 .prepare(let uploadId),
+                 .chunk(let uploadId, _):
+                return uploadId
+            }
+        }
+    }
+
     enum ConnectionReadWaitStageForTesting: Hashable, Sendable {
         case header(bufferedBytes: Int)
         case body(bufferedBytes: Int, expectedBytes: Int)
@@ -1042,18 +1096,21 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return [
             "surface_types": ["terminal", "ssh", "browser", "agentApp", "files", "markdown", "filePreview", "rightSidebarTool"],
             "ssh": [
-                "methods": ["ssh.host.list", "ssh.host.upsert", "ssh.host.delete", "ssh.connect", "ssh.disconnect", "ssh.transfer.upload", "ssh.transfer.download", "ssh.files.local.list", "ssh.files.remote.list"]
+                "methods": ["ssh.host.list", "ssh.host.upsert", "ssh.host.delete", "ssh.connect", "ssh.disconnect", "ssh.transfer.upload", "ssh.transfer.download", "ssh.files.local.list", "ssh.files.remote.list", "ssh.files.remote.mkdir", "ssh.files.remote.rename", "ssh.files.remote.delete"]
             ],
             "agent": agent,
             "browser_automation": [
-                "p0": ["navigate", "back", "forward", "reload", "url.get", "mirror_url.get"],
+                "p0": ["navigate", "back", "forward", "reload", "stop", "url.get", "mirror_url.get"],
                 "p1": ["click", "fill", "type", "focus", "hover", "check", "uncheck", "select", "eval", "snapshot", "screenshot", "wait"],
                 "p1_unsupported": false
             ],
             "files": [
-                "methods": ["fs.workspace.list", "fs.workspace.read", "fs.workspace.preview_url", "fs.workspace.create_file", "fs.workspace.rename", "fs.workspace.delete", "files.tab.open", "files.tab.split", "files.state.get", "files.state.update", "files.edit.open", "files.edit.apply_patch", "files.edit.save", "files.edit.discard", "files.edit.close"]
+                "methods": ["fs.mkdir", "fs.workspace.list", "fs.workspace.read", "fs.workspace.preview_url", "fs.workspace.create_file", "fs.workspace.rename", "fs.workspace.delete", "files.tab.open", "files.tab.split", "files.state.get", "files.state.update", "files.edit.open", "files.edit.apply_patch", "files.edit.save", "files.edit.discard", "files.edit.close"]
             ],
-            "git": ["read_only": false],
+            "git": [
+                "read_only": false,
+                "methods": ["git.status", "git.branches", "git.checkout", "git.create_branch", "git.commit", "git.log", "git.diff", "git.fetch", "git.pull", "git.push", "git.pull_request_url", "git.delivery_plan", "git.deliver"],
+            ],
             "feature_flags": ["remote_access_enabled": !loopbackOnly]
         ]
     }
@@ -1063,6 +1120,75 @@ public final class DirectHTTPServer: @unchecked Sendable {
             return false
         }
         return object["method"] as? String == "agent.attachment.upload"
+    }
+
+    /// Strict parser for the authenticated raw-upload v2 route family.
+    /// UUID-only path components make traversal/ambiguous normalization fail
+    /// before any staging filesystem path is built.
+    nonisolated static func attachmentUploadV2Route(
+        path: String
+    ) -> AttachmentUploadV2HTTPRoute? {
+        guard path.hasPrefix("/"),
+              !path.hasSuffix("/"),
+              !path.contains("//") else {
+            return nil
+        }
+        let components = path.split(separator: "/", omittingEmptySubsequences: true)
+        guard components.count == 5 || components.count == 7,
+              components[0] == "v1",
+              components[1] == "agent",
+              components[2] == "attachment-uploads",
+              components[3] == "v2" else {
+            return nil
+        }
+        let rawUploadId = String(components[4]).lowercased()
+        guard UUID(uuidString: rawUploadId) != nil else { return nil }
+        if components.count == 5 {
+            return .upload(uploadId: rawUploadId)
+        }
+        guard components[5] == "chunks",
+              let index = Int(components[6]),
+              index >= 0 else {
+            return nil
+        }
+        return .chunk(uploadId: rawUploadId, index: index)
+    }
+
+    nonisolated static func attachmentUploadV3Route(
+        path: String
+    ) -> AttachmentUploadV3HTTPRoute? {
+        guard path.hasPrefix("/"),
+              !path.hasSuffix("/"),
+              !path.contains("//") else {
+            return nil
+        }
+        let components = path.split(
+            separator: "/",
+            omittingEmptySubsequences: true
+        )
+        guard (5...7).contains(components.count),
+              components[0] == "v1",
+              components[1] == "agent",
+              components[2] == "attachment-uploads",
+              components[3] == "v3" else {
+            return nil
+        }
+        let rawUploadId = String(components[4]).lowercased()
+        guard UUID(uuidString: rawUploadId) != nil else { return nil }
+        if components.count == 5 {
+            return .upload(uploadId: rawUploadId)
+        }
+        if components.count == 6, components[5] == "prepare" {
+            return .prepare(uploadId: rawUploadId)
+        }
+        guard components.count == 7,
+              components[5] == "chunks",
+              let index = Int(components[6]),
+              index >= 0,
+              index < AttachmentUploadV2Policy.maximumChunkCount else {
+            return nil
+        }
+        return .chunk(uploadId: rawUploadId, index: index)
     }
 
     /// Pure helper: search `buf` for the CRLFCRLF header terminator starting
@@ -1086,6 +1212,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
     public let bindLoopbackOnly: Bool
     public let dispatcher: JSONRPCDispatcher
     public let commandReceiptMetrics: CommandReceiptMetrics
+    public let attachmentUploadV2Store: AttachmentUploadV2Store?
+    public let attachmentUploadV3Store: AttachmentUploadV3Store?
     public weak var auth: DirectAuthProvider?
     /// Stable, persisted **logical** host identity. iOS pins this (RCA-022); it must
     /// survive process restarts or every relaunch looks like a different
@@ -1141,11 +1269,27 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// True when the IPv6 listener is bound (dual-stack path active).
     public var isIPv6ListenerBound: Bool { listenFD6 >= 0 }
 
-    public init(port: UInt16 = 18217, loopbackOnly: Bool = true, dispatcher: JSONRPCDispatcher, auth: DirectAuthProvider? = nil, serverId: String = ProcessInfo.processInfo.globallyUniqueString, bootEpoch: UInt64, clientReceiveTimeoutSeconds: Int = DirectHTTPServer.httpKeepAliveIdleTimeoutSeconds, webSocketOutboundMaxQueuedBytes: Int = DirectHTTPServer.maxWebSocketOutboundQueuedBytes) {
+    public init(
+        port: UInt16 = 18217,
+        loopbackOnly: Bool = true,
+        dispatcher: JSONRPCDispatcher,
+        auth: DirectAuthProvider? = nil,
+        serverId: String = ProcessInfo.processInfo.globallyUniqueString,
+        bootEpoch: UInt64,
+        clientReceiveTimeoutSeconds: Int = DirectHTTPServer.httpKeepAliveIdleTimeoutSeconds,
+        webSocketOutboundMaxQueuedBytes: Int = DirectHTTPServer.maxWebSocketOutboundQueuedBytes,
+        attachmentUploadV2Store: AttachmentUploadV2Store? = nil,
+        attachmentUploadV3Store: AttachmentUploadV3Store? = nil
+    ) {
         self.port = port
         self.bindLoopbackOnly = loopbackOnly
         self.dispatcher = dispatcher
         self.commandReceiptMetrics = dispatcher.commandReceiptMetrics
+        self.attachmentUploadV2Store = attachmentUploadV2Store
+        self.attachmentUploadV3Store = attachmentUploadV3Store
+            ?? attachmentUploadV2Store.map {
+                AttachmentUploadV3Store(plaintextStore: $0)
+            }
         self.auth = auth
         self.serverId = serverId
         self.bootEpoch = bootEpoch
@@ -1663,6 +1807,283 @@ public final class DirectHTTPServer: @unchecked Sendable {
         }
         let presentedBearerToken = Self.bearerToken(from: headers)
         let clientRequestsClose = Self.httpClientRequestsClose(headers)
+        let parsedAttachmentUploadV2Route = Self.attachmentUploadV2Route(path: path)
+        let attachmentUploadV2Route: AttachmentUploadV2HTTPRoute? = {
+            switch (method, parsedAttachmentUploadV2Route) {
+            case ("PUT", .chunk), ("GET", .upload), ("DELETE", .upload):
+                return parsedAttachmentUploadV2Route
+            default:
+                return nil
+            }
+        }()
+        let parsedAttachmentUploadV3Route = Self.attachmentUploadV3Route(
+            path: path
+        )
+        let attachmentUploadV3Route: AttachmentUploadV3HTTPRoute? = {
+            switch (method, parsedAttachmentUploadV3Route) {
+            case ("POST", .prepare),
+                 ("PUT", .chunk),
+                 ("GET", .upload),
+                 ("DELETE", .upload):
+                return parsedAttachmentUploadV3Route
+            default:
+                return nil
+            }
+        }()
+        var attachmentUploadOwnerFingerprint: String?
+        var attachmentUploadV3OwnerFingerprint: String?
+        var authorizedProtectedChunk: AttachmentUploadV3AuthorizedChunk?
+
+        if let attachmentUploadV3Route {
+            let uploadId = attachmentUploadV3Route.uploadId
+            guard let v3Store = attachmentUploadV3Store else {
+                sendAttachmentUploadV3Error(
+                    fd: fd,
+                    status: 404,
+                    code: "attachment_upload_v3_unavailable",
+                    message: "Protected attachment upload is unavailable.",
+                    retryable: false,
+                    uploadId: uploadId
+                )
+                return
+            }
+            switch attachmentUploadV3Route {
+            case .chunk(_, let index):
+                // These fields carry raw identity/key material in v2. Their
+                // presence on a redirect-following background request is a
+                // protocol violation even if a proxy would otherwise ignore
+                // them.
+                let forbidden = [
+                    "authorization",
+                    "x-rc2-expected-host-id",
+                    "x-rc2-workspace-id",
+                    "x-rc2-filename-utf8-base64url",
+                    "x-rc2-total-bytes",
+                    "x-rc2-file-sha256",
+                    "x-rc2-chunk-sha256",
+                    "x-rc2-encryption-key",
+                ]
+                guard forbidden.allSatisfy({ headers[$0] == nil }),
+                      headers["content-encoding"] == nil
+                        || headers["content-encoding"]?
+                            .lowercased() == "identity",
+                      headers["content-type"]?
+                        .split(separator: ";", maxSplits: 1)
+                        .first?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .lowercased() == "application/octet-stream",
+                      let capability =
+                        headers["x-rc2-chunk-capability"],
+                      let sealedSHA256 = headers["x-rc2-sealed-sha256"],
+                      let sealedBytes =
+                        Self.attachmentUploadV2PositiveInt(
+                            headers["x-rc2-sealed-bytes"]
+                        ),
+                      let declaredContentLength =
+                        Self.attachmentUploadV2PositiveInt(
+                            headers["content-length"]
+                        ),
+                      sealedBytes == declaredContentLength,
+                      sealedBytes
+                        <= AttachmentUploadV3Policy
+                            .maximumSealedChunkBytes,
+                      let idempotencyKey = headers["idempotency-key"] else {
+                    sendAttachmentUploadV3Error(
+                        fd: fd,
+                        status: 400,
+                        code: "invalid_protected_chunk_headers",
+                        message: "Protected chunk headers are invalid.",
+                        retryable: false,
+                        uploadId: uploadId
+                    )
+                    return
+                }
+                do {
+                    authorizedProtectedChunk = try v3Store.authorizeChunk(
+                        uploadId: uploadId,
+                        chunkIndex: index,
+                        capabilityBase64URL: capability,
+                        sealedSHA256: sealedSHA256,
+                        sealedBytes: sealedBytes,
+                        idempotencyKey: idempotencyKey,
+                        ownerIsActive: { [weak auth] owner in
+                            auth?.isAuthorizedOwnerFingerprintActive(owner)
+                                ?? false
+                        }
+                    )
+                } catch {
+                    let mapped = Self.attachmentUploadV3HTTPError(error)
+                    sendAttachmentUploadV3Error(
+                        fd: fd,
+                        status: mapped.status,
+                        code: mapped.code,
+                        message: mapped.message,
+                        retryable: mapped.retryable,
+                        uploadId: uploadId
+                    )
+                    return
+                }
+
+            case .prepare, .upload:
+                attachmentUploadV3OwnerFingerprint =
+                    Self.attachmentUploadV3OwnerFingerprint(
+                        token: presentedBearerToken,
+                        auth: auth
+                    )
+                guard attachmentUploadV3OwnerFingerprint != nil else {
+                    sendAttachmentUploadV3Error(
+                        fd: fd,
+                        status: 401,
+                        code: "unauthorized",
+                        message: "A valid bearer token is required.",
+                        retryable: false,
+                        uploadId: uploadId,
+                        additionalHeaders: [
+                            "WWW-Authenticate": wwwAuthenticateHeaderValue(
+                                scheme: "Bearer",
+                                realm: "RC2"
+                            )
+                        ]
+                    )
+                    return
+                }
+                guard headers["x-rc2-expected-host-id"] == serverId,
+                      let idempotencyKey = headers["idempotency-key"],
+                      UUID(uuidString: idempotencyKey)
+                        == UUID(uuidString: uploadId) else {
+                    sendAttachmentUploadV3Error(
+                        fd: fd,
+                        status: 409,
+                        code: "protected_control_identity_mismatch",
+                        message: "Protected upload control identity is invalid.",
+                        retryable: false,
+                        uploadId: uploadId
+                    )
+                    return
+                }
+            }
+        }
+
+        // Raw upload v2 is authenticated and host-pinned before reading the
+        // request body. This prevents an unauthenticated LAN peer or stale host
+        // endpoint from making the server buffer even one 512 KiB chunk.
+        if let attachmentUploadV2Route,
+           attachmentUploadV3Route == nil {
+            let uploadId = attachmentUploadV2Route.uploadId
+            guard attachmentUploadV2Store != nil else {
+                sendAttachmentUploadV2Error(
+                    fd: fd,
+                    status: 404,
+                    code: "attachment_upload_v2_unavailable",
+                    message: "Attachment upload v2 is unavailable.",
+                    retryable: false,
+                    uploadId: uploadId,
+                    acceptEncoding: headers["accept-encoding"]
+                )
+                return
+            }
+            let requiresToken = Self.httpAuthGateRequiresToken(
+                loopbackOnly: bindLoopbackOnly,
+                path: path,
+                hasAuthProvider: auth != nil
+            )
+            attachmentUploadOwnerFingerprint =
+                Self.attachmentUploadV2OwnerFingerprint(
+                    token: presentedBearerToken,
+                    auth: auth,
+                    requiresToken: requiresToken
+                )
+            guard attachmentUploadOwnerFingerprint != nil else {
+                sendAttachmentUploadV2Error(
+                    fd: fd,
+                    status: 401,
+                    code: "unauthorized",
+                    message: "A valid bearer token is required.",
+                    retryable: false,
+                    uploadId: uploadId,
+                    acceptEncoding: headers["accept-encoding"],
+                    additionalHeaders: [
+                        "WWW-Authenticate": wwwAuthenticateHeaderValue(
+                            scheme: "Bearer",
+                            realm: "RC2"
+                        )
+                    ]
+                )
+                return
+            }
+            guard headers["x-rc2-expected-host-id"] == serverId else {
+                sendAttachmentUploadV2Error(
+                    fd: fd,
+                    status: 409,
+                    code: "host_identity_mismatch",
+                    message: "The expected host identity does not match this server.",
+                    retryable: false,
+                    uploadId: uploadId,
+                    acceptEncoding: headers["accept-encoding"]
+                )
+                return
+            }
+            guard let idempotencyKey = headers["idempotency-key"],
+                  UUID(uuidString: idempotencyKey) == UUID(uuidString: uploadId) else {
+                sendAttachmentUploadV2Error(
+                    fd: fd,
+                    status: 409,
+                    code: "idempotency_key_mismatch",
+                    message: "Idempotency-Key must match the upload id.",
+                    retryable: false,
+                    uploadId: uploadId,
+                    acceptEncoding: headers["accept-encoding"]
+                )
+                return
+            }
+            guard let workspaceId = headers["x-rc2-workspace-id"],
+                  UUID(uuidString: workspaceId) != nil else {
+                sendAttachmentUploadV2Error(
+                    fd: fd,
+                    status: 400,
+                    code: "invalid_workspace_id",
+                    message: "X-RC2-Workspace-ID must be a UUID.",
+                    retryable: false,
+                    uploadId: uploadId,
+                    acceptEncoding: headers["accept-encoding"]
+                )
+                return
+            }
+            let contentEncoding = headers["content-encoding"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard contentEncoding == nil || contentEncoding == "identity" else {
+                sendAttachmentUploadV2Error(
+                    fd: fd,
+                    status: 400,
+                    code: "unsupported_content_encoding",
+                    message: "Attachment upload v2 accepts identity encoding only.",
+                    retryable: false,
+                    uploadId: uploadId,
+                    acceptEncoding: headers["accept-encoding"]
+                )
+                return
+            }
+            if method == "PUT" {
+                let contentType = headers["content-type"]?
+                    .split(separator: ";", maxSplits: 1)
+                    .first?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                guard contentType == "application/octet-stream" else {
+                    sendAttachmentUploadV2Error(
+                        fd: fd,
+                        status: 400,
+                        code: "unsupported_content_type",
+                        message: "Attachment chunks must use application/octet-stream.",
+                        retryable: false,
+                        uploadId: uploadId,
+                        acceptEncoding: headers["accept-encoding"]
+                    )
+                    return
+                }
+            }
+        }
 
         // Read remaining body bytes if Content-Length declares more
         // than we already have.
@@ -1696,11 +2117,52 @@ public final class DirectHTTPServer: @unchecked Sendable {
         } else {
             largeBodyAuthorized = true
         }
-        let requestBodyLimit = requestedAttachmentUpload && largeBodyAuthorized
-            ? Self.maxAttachmentUploadRequestBodyBytes
-            : Self.maxRequestBodyBytes
+        let requestBodyLimit: Int
+        if let route = attachmentUploadV3Route {
+            switch route {
+            case .chunk:
+                requestBodyLimit =
+                    AttachmentUploadV3Policy.maximumSealedChunkBytes
+            case .prepare:
+                requestBodyLimit = AttachmentUploadV3Policy.maximumPrepareBytes
+            case .upload:
+                requestBodyLimit = 0
+            }
+        } else if attachmentUploadV2Route != nil {
+            requestBodyLimit = AttachmentUploadV2Policy.rawChunkBytes
+        } else if requestedAttachmentUpload && largeBodyAuthorized {
+            requestBodyLimit = Self.maxAttachmentUploadRequestBodyBytes
+        } else {
+            requestBodyLimit = Self.maxRequestBodyBytes
+        }
         guard contentLength <= requestBodyLimit else {
-            send(fd: fd, status: 413, contentType: "text/plain", body: Data("request body too large\n".utf8))
+            if let route = attachmentUploadV3Route {
+                sendAttachmentUploadV3Error(
+                    fd: fd,
+                    status: 413,
+                    code: "protected_request_too_large",
+                    message: "Protected upload request exceeds its fixed limit.",
+                    retryable: false,
+                    uploadId: route.uploadId
+                )
+            } else if let route = attachmentUploadV2Route {
+                sendAttachmentUploadV2Error(
+                    fd: fd,
+                    status: 413,
+                    code: "chunk_too_large",
+                    message: "The raw chunk exceeds the fixed 512 KiB limit.",
+                    retryable: false,
+                    uploadId: route.uploadId,
+                    acceptEncoding: headers["accept-encoding"]
+                )
+            } else {
+                send(
+                    fd: fd,
+                    status: 413,
+                    contentType: "text/plain",
+                    body: Data("request body too large\n".utf8)
+                )
+            }
             return
         }
         let bodyStartAbsolute = headerEnd.upperBound
@@ -2189,12 +2651,19 @@ public final class DirectHTTPServer: @unchecked Sendable {
             return
         }
 
-        if method == "GET", path.hasPrefix(DirectStaticFileRegistry.routePrefix) {
+        if Self.staticFileHTTPMethods.contains(method),
+           path.hasPrefix(DirectStaticFileRegistry.routePrefix) {
             guard let file = DirectStaticFileRegistry.shared.resolve(routePath: path) else {
                 send(fd: fd, status: 404, contentType: "text/plain", body: Data("not found\n".utf8))
                 return
             }
-            sendFile(fd: fd, status: 200, contentType: file.contentType, url: file.url)
+            sendFile(
+                fd: fd,
+                contentType: file.contentType,
+                url: file.url,
+                rangeHeader: headers["range"],
+                sendBody: method == "GET"
+            )
             if clientRequestsClose { return }
             buffer = leftoverBuffer
             continue
@@ -2206,7 +2675,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
         // client before a token exists (mirrors /v1/discovery); gating
         // it makes every LAN connect fail with 401 → permanent
         // "Not authorized". It must be exempt like discovery.
-        if Self.httpAuthGateRequiresToken(loopbackOnly: bindLoopbackOnly, path: path, hasAuthProvider: auth != nil),
+        if attachmentUploadV2Route == nil,
+           attachmentUploadV3Route == nil,
+           Self.httpAuthGateRequiresToken(loopbackOnly: bindLoopbackOnly, path: path, hasAuthProvider: auth != nil),
            let auth = auth {
             if requestBearerVerified {
                 // ok
@@ -2228,13 +2699,19 @@ public final class DirectHTTPServer: @unchecked Sendable {
                      additionalHeaders: challengeHeaders); return
             }
         }
+        // Attachment Upload v2 binds durable jobs to a stable authorized
+        // identity (when the auth provider can supply one) so a bearer
+        // refresh for the same paired device resumes the same upload.
+        // Other HTTP/WS owner paths keep the token-derived fingerprint.
         let requestOwnerFingerprint = Self.connectionOwnerFingerprint(
             token: presentedBearerToken
         )
-
         // POST body for pair endpoints; honor Content-Length read above.
         var bodyData = buffer.subdata(in: bodyStartAbsolute..<min(bodyStartAbsolute + contentLength, buffer.endIndex))
-        if let contentEncoding = headers["content-encoding"], !contentEncoding.isEmpty {
+        if attachmentUploadV2Route == nil,
+           attachmentUploadV3Route == nil,
+           let contentEncoding = headers["content-encoding"],
+           !contentEncoding.isEmpty {
             do {
                 bodyData = try PayloadCodec.codec(for: contentEncoding).decode(
                     bodyData,
@@ -2257,6 +2734,45 @@ public final class DirectHTTPServer: @unchecked Sendable {
            (!requestedAttachmentUpload || !Self.isAttachmentUploadRPCEnvelope(bodyData)) {
             send(fd: fd, status: 413, contentType: "text/plain", body: Data("request body too large\n".utf8))
             return
+        }
+        if let attachmentUploadV3Route {
+            handleAttachmentUploadV3(
+                fd: fd,
+                method: method,
+                route: attachmentUploadV3Route,
+                headers: headers,
+                bodyData: bodyData,
+                ownerFingerprint: attachmentUploadV3OwnerFingerprint,
+                authorizedChunk: authorizedProtectedChunk
+            )
+            if clientRequestsClose { return }
+            buffer = leftoverBuffer
+            continue
+        }
+        if let attachmentUploadV2Route {
+            guard let attachmentUploadOwnerFingerprint else {
+                sendAttachmentUploadV2Error(
+                    fd: fd,
+                    status: 401,
+                    code: "unauthorized",
+                    message: "A valid bearer token is required.",
+                    retryable: false,
+                    uploadId: attachmentUploadV2Route.uploadId,
+                    acceptEncoding: headers["accept-encoding"]
+                )
+                return
+            }
+            handleAttachmentUploadV2(
+                fd: fd,
+                method: method,
+                route: attachmentUploadV2Route,
+                headers: headers,
+                bodyData: bodyData,
+                ownerFingerprint: attachmentUploadOwnerFingerprint
+            )
+            if clientRequestsClose { return }
+            buffer = leftoverBuffer
+            continue
         }
 
         switch (method, path) {
@@ -3531,6 +4047,38 @@ public final class DirectHTTPServer: @unchecked Sendable {
             .joined()
     }
 
+    /// Owner binding for Attachment Upload v2.
+    ///
+    /// When auth is required, `authorizedOwnerFingerprint` is both the
+    /// validation and owner-resolution gate: a provider failure returns nil
+    /// rather than silently creating a second token-scoped owner. Trusted
+    /// loopback/no-auth requests retain the existing local fallback.
+    static func attachmentUploadV2OwnerFingerprint(
+        token: String?,
+        auth: DirectAuthProvider?,
+        requiresToken: Bool
+    ) -> String? {
+        if requiresToken {
+            guard let auth, let token else { return nil }
+            return auth.authorizedOwnerFingerprint(token: token)
+        }
+        return connectionOwnerFingerprint(token: token)
+    }
+
+    /// Protected-v3 control calls always derive their owner from a verified
+    /// bearer when an auth provider exists, including loopback tests. The
+    /// prepare body's owner field is only a consistency claim, never authority.
+    static func attachmentUploadV3OwnerFingerprint(
+        token: String?,
+        auth: DirectAuthProvider?
+    ) -> String? {
+        if let auth {
+            guard let token else { return nil }
+            return auth.authorizedOwnerFingerprint(token: token)
+        }
+        return connectionOwnerFingerprint(token: token)
+    }
+
     private func strictRPCID(_ value: Any?, keyIsPresent: Bool) -> (Any, String)? {
         guard keyIsPresent else { return nil }
         if value is NSNull { return (NSNull(), "null") }
@@ -3568,6 +4116,779 @@ public final class DirectHTTPServer: @unchecked Sendable {
             ?? Data("{}".utf8)
     }
 
+    private func handleAttachmentUploadV2(
+        fd: Int32,
+        method: String,
+        route: AttachmentUploadV2HTTPRoute,
+        headers: [String: String],
+        bodyData: Data,
+        ownerFingerprint: String
+    ) {
+        guard let store = attachmentUploadV2Store else {
+            sendAttachmentUploadV2Error(
+                fd: fd,
+                status: 404,
+                code: "attachment_upload_v2_unavailable",
+                message: "Attachment upload v2 is unavailable.",
+                retryable: false,
+                uploadId: route.uploadId,
+                acceptEncoding: headers["accept-encoding"]
+            )
+            return
+        }
+
+        do {
+            guard let idempotencyKey = headers["idempotency-key"],
+                  UUID(uuidString: idempotencyKey) == UUID(uuidString: route.uploadId) else {
+                throw AttachmentUploadV2HTTPError(
+                    status: 409,
+                    code: "idempotency_key_mismatch",
+                    message: "Idempotency-Key must match the upload id."
+                )
+            }
+            guard let workspaceId = headers["x-rc2-workspace-id"],
+                  UUID(uuidString: workspaceId) != nil else {
+                throw AttachmentUploadV2HTTPError(
+                    status: 400,
+                    code: "invalid_workspace_id",
+                    message: "X-RC2-Workspace-ID must be a UUID."
+                )
+            }
+            let status: AttachmentUploadV2Status
+            let responseStatus: Int
+            switch (method, route) {
+            case ("GET", .upload(let uploadId)):
+                guard bodyData.isEmpty else {
+                    throw AttachmentUploadV2HTTPError(
+                        status: 400,
+                        code: "unexpected_request_body",
+                        message: "Upload status requests must not include a body."
+                    )
+                }
+                status = try store.status(
+                    ownerFingerprint: ownerFingerprint,
+                    uploadId: uploadId,
+                    workspaceId: workspaceId
+                )
+                responseStatus = 200
+
+            case ("DELETE", .upload(let uploadId)):
+                guard bodyData.isEmpty else {
+                    throw AttachmentUploadV2HTTPError(
+                        status: 400,
+                        code: "unexpected_request_body",
+                        message: "Upload cancellation requests must not include a body."
+                    )
+                }
+                status = try store.cancel(
+                    ownerFingerprint: ownerFingerprint,
+                    uploadId: uploadId,
+                    workspaceId: workspaceId
+                )
+                responseStatus = 200
+
+            case ("PUT", .chunk(let uploadId, let index)):
+                guard let encodedFilename = headers["x-rc2-filename-utf8-base64url"],
+                      let filename = Self.attachmentUploadV2Filename(
+                        base64URLValue: encodedFilename
+                      ) else {
+                    throw AttachmentUploadV2HTTPError(
+                        status: 400,
+                        code: "invalid_filename",
+                        message: "The filename header is not valid UTF-8 base64url."
+                    )
+                }
+                guard let totalBytes = Self.attachmentUploadV2PositiveInt(
+                    headers["x-rc2-total-bytes"]
+                ) else {
+                    throw AttachmentUploadV2HTTPError(
+                        status: 400,
+                        code: "invalid_total_bytes",
+                        message: "X-RC2-Total-Bytes must be a positive integer."
+                    )
+                }
+                guard totalBytes <= AttachmentUploadV2Policy.maximumFileBytes else {
+                    throw AttachmentUploadV2HTTPError(
+                        status: 413,
+                        code: "attachment_too_large",
+                        message: "The attachment exceeds the 25 MiB limit."
+                    )
+                }
+                guard let chunkBytes = Self.attachmentUploadV2PositiveInt(
+                    headers["x-rc2-chunk-bytes"]
+                ), chunkBytes == AttachmentUploadV2Policy.rawChunkBytes else {
+                    throw AttachmentUploadV2HTTPError(
+                        status: 400,
+                        code: "invalid_chunk_size",
+                        message: "X-RC2-Chunk-Bytes does not match the fixed protocol size."
+                    )
+                }
+                let expectedChunkCount = AttachmentUploadV2Policy.chunkCount(
+                    sizeBytes: totalBytes
+                )
+                guard let chunkCount = Self.attachmentUploadV2PositiveInt(
+                    headers["x-rc2-chunk-count"]
+                ), chunkCount == expectedChunkCount,
+                   chunkCount <= AttachmentUploadV2Policy.maximumChunkCount else {
+                    throw AttachmentUploadV2HTTPError(
+                        status: 400,
+                        code: "invalid_chunk_count",
+                        message: "X-RC2-Chunk-Count does not match the declared file size."
+                    )
+                }
+                guard let rawChunkBytes = Self.attachmentUploadV2PositiveInt(
+                    headers["x-rc2-raw-chunk-bytes"]
+                ), rawChunkBytes == bodyData.count else {
+                    throw AttachmentUploadV2HTTPError(
+                        status: 400,
+                        code: "invalid_raw_chunk_size",
+                        message: "X-RC2-Raw-Chunk-Bytes does not match the request body."
+                    )
+                }
+                guard let fileSHA256 = headers["x-rc2-file-sha256"],
+                      let chunkSHA256 = headers["x-rc2-chunk-sha256"] else {
+                    throw AttachmentUploadV2HTTPError(
+                        status: 400,
+                        code: "missing_digest",
+                        message: "Whole-file and chunk SHA-256 headers are required."
+                    )
+                }
+
+                _ = try store.begin(
+                    ownerFingerprint: ownerFingerprint,
+                    uploadId: uploadId,
+                    workspaceId: workspaceId,
+                    filename: filename,
+                    mimeType: headers["x-rc2-mime-type"],
+                    sizeBytes: totalBytes,
+                    sha256: fileSHA256
+                )
+                status = try store.putChunk(
+                    ownerFingerprint: ownerFingerprint,
+                    uploadId: uploadId,
+                    chunkIndex: index,
+                    data: bodyData,
+                    sha256: chunkSHA256
+                )
+                if status.newlyCommitted {
+                    responseStatus = 201
+                } else if status.newlyAcceptedChunk {
+                    responseStatus = 202
+                } else {
+                    responseStatus = 200
+                }
+
+            default:
+                throw AttachmentUploadV2HTTPError(
+                    status: 404,
+                    code: "route_not_found",
+                    message: "Attachment upload v2 route not found."
+                )
+            }
+
+            if status.newlyCommitted, let result = status.result {
+                EventBus.shared.publish(kind: "agent.attachment.uploaded", payload: .object([
+                    "workspace_id": .string(status.workspaceId),
+                    "id": .string(result.id),
+                    "display_name": .string(result.displayName),
+                    "sha256": .string(result.sha256),
+                    "size_bytes": .number(Double(result.sizeBytes)),
+                ]))
+            }
+            sendAttachmentUploadV2Status(
+                fd: fd,
+                httpStatus: responseStatus,
+                status: status,
+                acceptEncoding: headers["accept-encoding"]
+            )
+        } catch let error as AttachmentUploadV2HTTPError {
+            sendAttachmentUploadV2Error(
+                fd: fd,
+                status: error.status,
+                code: error.code,
+                message: error.message,
+                retryable: error.retryable,
+                uploadId: route.uploadId,
+                acceptEncoding: headers["accept-encoding"]
+            )
+        } catch let error as AttachmentUploadV2Error {
+            let mapped = Self.attachmentUploadV2HTTPError(error)
+            sendAttachmentUploadV2Error(
+                fd: fd,
+                status: mapped.status,
+                code: mapped.code,
+                message: mapped.message,
+                retryable: mapped.retryable,
+                uploadId: route.uploadId,
+                acceptEncoding: headers["accept-encoding"]
+            )
+        } catch {
+            sendAttachmentUploadV2Error(
+                fd: fd,
+                status: 500,
+                code: "attachment_upload_storage_failure",
+                message: "Attachment upload v2 failed.",
+                retryable: true,
+                uploadId: route.uploadId,
+                acceptEncoding: headers["accept-encoding"]
+            )
+        }
+    }
+
+    private func handleAttachmentUploadV3(
+        fd: Int32,
+        method: String,
+        route: AttachmentUploadV3HTTPRoute,
+        headers: [String: String],
+        bodyData: Data,
+        ownerFingerprint: String?,
+        authorizedChunk: AttachmentUploadV3AuthorizedChunk?
+    ) {
+        guard let store = attachmentUploadV3Store else {
+            sendAttachmentUploadV3Error(
+                fd: fd,
+                status: 404,
+                code: "attachment_upload_v3_unavailable",
+                message: "Protected attachment upload is unavailable.",
+                retryable: false,
+                uploadId: route.uploadId
+            )
+            return
+        }
+        do {
+            switch (method, route) {
+            case ("POST", .prepare(let uploadId)):
+                guard let ownerFingerprint else {
+                    throw AttachmentUploadV3HTTPError(
+                        status: 401,
+                        code: "unauthorized",
+                        message: "A valid bearer token is required."
+                    )
+                }
+                let contentType = headers["content-type"]?
+                    .split(separator: ";", maxSplits: 1)
+                    .first?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                guard contentType == "application/json" else {
+                    throw AttachmentUploadV3HTTPError(
+                        status: 400,
+                        code: "unsupported_content_type",
+                        message: "Prepare requires application/json."
+                    )
+                }
+                let prepare = try AttachmentUploadV3Store
+                    .decodePrepareRequest(bodyData)
+                guard prepare.serverId == serverId else {
+                    throw AttachmentUploadV3HTTPError(
+                        status: 409,
+                        code: "host_identity_mismatch",
+                        message: "Prepare targets a different host."
+                    )
+                }
+                _ = try store.prepare(
+                    uploadId: uploadId,
+                    authorizedOwnerFingerprint: ownerFingerprint,
+                    request: prepare
+                )
+                sendAttachmentUploadV3Prepare(
+                    fd: fd,
+                    uploadId: uploadId
+                )
+
+            case ("GET", .upload(let uploadId)),
+                 ("DELETE", .upload(let uploadId)):
+                guard bodyData.isEmpty,
+                      let ownerFingerprint,
+                      let workspaceId = headers["x-rc2-workspace-id"],
+                      UUID(uuidString: workspaceId) != nil else {
+                    throw AttachmentUploadV3HTTPError(
+                        status: 400,
+                        code: "invalid_control_request",
+                        message: "Protected upload control request is invalid."
+                    )
+                }
+                let status: AttachmentUploadV2Status
+                if method == "GET" {
+                    status = try store.status(
+                        ownerFingerprint: ownerFingerprint,
+                        uploadId: uploadId,
+                        workspaceId: workspaceId
+                    )
+                } else {
+                    status = try store.cancel(
+                        ownerFingerprint: ownerFingerprint,
+                        uploadId: uploadId,
+                        workspaceId: workspaceId
+                    )
+                }
+                sendAttachmentUploadV3Status(
+                    fd: fd,
+                    httpStatus: 200,
+                    status: status
+                )
+
+            case ("PUT", .chunk):
+                guard let authorizedChunk else {
+                    throw AttachmentUploadV3HTTPError(
+                        status: 403,
+                        code: "chunk_capability_rejected",
+                        message: "Protected chunk capability was rejected."
+                    )
+                }
+                let status = try store.putProtectedChunk(
+                    authorization: authorizedChunk,
+                    sealedData: bodyData,
+                    ownerIsActive: { [weak auth] owner in
+                        auth?.isAuthorizedOwnerFingerprintActive(owner)
+                            ?? false
+                    }
+                )
+                if status.newlyCommitted, let result = status.result {
+                    EventBus.shared.publish(
+                        kind: "agent.attachment.uploaded",
+                        payload: .object([
+                            "workspace_id": .string(status.workspaceId),
+                            "id": .string(result.id),
+                            "display_name": .string(result.displayName),
+                            "sha256": .string(result.sha256),
+                            "size_bytes": .number(Double(result.sizeBytes)),
+                        ])
+                    )
+                }
+                // The iOS background callback is deliberately untrusted and
+                // always confirms via authenticated GET. Avoid spending weak
+                // cellular downlink on 50 redundant status envelopes.
+                send(
+                    fd: fd,
+                    status: 204,
+                    contentType: "application/json",
+                    body: Data(),
+                    additionalHeaders: [
+                        "Cache-Control": "no-store",
+                        "Content-Length": "0",
+                    ]
+                )
+
+            default:
+                throw AttachmentUploadV3HTTPError(
+                    status: 404,
+                    code: "route_not_found",
+                    message: "Protected attachment upload route not found."
+                )
+            }
+        } catch let error as AttachmentUploadV3HTTPError {
+            sendAttachmentUploadV3Error(
+                fd: fd,
+                status: error.status,
+                code: error.code,
+                message: error.message,
+                retryable: error.retryable,
+                uploadId: route.uploadId
+            )
+        } catch let error as AttachmentUploadV3Error {
+            let mapped = Self.attachmentUploadV3HTTPError(error)
+            sendAttachmentUploadV3Error(
+                fd: fd,
+                status: mapped.status,
+                code: mapped.code,
+                message: mapped.message,
+                retryable: mapped.retryable,
+                uploadId: route.uploadId
+            )
+        } catch let error as AttachmentUploadV2Error {
+            let mapped = Self.attachmentUploadV2HTTPError(error)
+            sendAttachmentUploadV3Error(
+                fd: fd,
+                status: mapped.status,
+                code: mapped.code,
+                message: mapped.message,
+                retryable: mapped.retryable,
+                uploadId: route.uploadId
+            )
+        } catch {
+            sendAttachmentUploadV3Error(
+                fd: fd,
+                status: 500,
+                code: "attachment_upload_storage_failure",
+                message: "Protected attachment upload failed.",
+                retryable: true,
+                uploadId: route.uploadId
+            )
+        }
+    }
+
+    private struct AttachmentUploadV3HTTPError: Error {
+        let status: Int
+        let code: String
+        let message: String
+        let retryable: Bool
+
+        init(
+            status: Int,
+            code: String,
+            message: String,
+            retryable: Bool = false
+        ) {
+            self.status = status
+            self.code = code
+            self.message = message
+            self.retryable = retryable
+        }
+    }
+
+    nonisolated private static func attachmentUploadV3HTTPError(
+        _ error: Error
+    ) -> AttachmentUploadV3HTTPError {
+        guard let error = error as? AttachmentUploadV3Error else {
+            return .init(
+                status: 500,
+                code: "attachment_upload_storage_failure",
+                message: "Protected attachment upload storage failed.",
+                retryable: true
+            )
+        }
+        switch error {
+        case .invalidParams(let detail):
+            return .init(
+                status: 400,
+                code: "invalid_protected_request",
+                message: detail
+            )
+        case .uploadUnknown:
+            return .init(
+                status: 404,
+                code: "upload_not_found",
+                message: "Upload not found."
+            )
+        case .ownerInactive:
+            return .init(
+                status: 403,
+                code: "upload_owner_revoked",
+                message: "The paired device is no longer authorized."
+            )
+        case .capabilityRejected:
+            return .init(
+                status: 403,
+                code: "chunk_capability_rejected",
+                message: "Protected chunk capability was rejected."
+            )
+        case .metadataConflict:
+            return .init(
+                status: 409,
+                code: "upload_metadata_conflict",
+                message: "Protected upload metadata conflicts."
+            )
+        case .sealedChunkRejected(let detail):
+            return .init(
+                status: 422,
+                code: "invalid_protected_chunk",
+                message: detail
+            )
+        case .storageFailure:
+            return .init(
+                status: 500,
+                code: "attachment_upload_storage_failure",
+                message: "Protected attachment upload storage failed.",
+                retryable: true
+            )
+        }
+    }
+
+    private func sendAttachmentUploadV3Prepare(
+        fd: Int32,
+        uploadId: String
+    ) {
+        let body: [String: Any] = [
+            "protocol_version": AttachmentUploadV3Policy.protocolVersion,
+            "content_encoding": AttachmentUploadV3Policy.contentEncoding,
+            "server_id": serverId,
+            "upload_id": uploadId,
+            "prepared": true,
+        ]
+        let data = (try? JSONSerialization.data(
+            withJSONObject: body,
+            options: [.sortedKeys]
+        )) ?? Data()
+        send(
+            fd: fd,
+            status: 200,
+            contentType: "application/json",
+            body: data,
+            additionalHeaders: ["Cache-Control": "no-store"]
+        )
+    }
+
+    private func sendAttachmentUploadV3Status(
+        fd: Int32,
+        httpStatus: Int,
+        status: AttachmentUploadV2Status
+    ) {
+        let result: Any
+        if let value = status.result {
+            result = [
+                "id": value.id,
+                "display_name": value.displayName,
+                "kind": value.kind.rawValue,
+                "mime_type": value.mimeType.map { $0 as Any } ?? NSNull(),
+                "sha256": value.sha256,
+                "size_bytes": value.sizeBytes,
+                "composer_insertion_text": value.composerInsertionText,
+            ] as [String: Any]
+        } else {
+            result = NSNull()
+        }
+        let body: [String: Any] = [
+            "protocol_version": AttachmentUploadV3Policy.protocolVersion,
+            "server_id": serverId,
+            "upload_id": status.uploadId,
+            "workspace_id": status.workspaceId,
+            "state": status.phase.rawValue,
+            "received_chunks": status.receivedChunkIndices,
+            "received_bytes": status.receivedBytes,
+            "total_bytes": status.sizeBytes,
+            "result": result,
+        ]
+        let data = (try? JSONSerialization.data(
+            withJSONObject: body,
+            options: [.sortedKeys]
+        )) ?? Data()
+        send(
+            fd: fd,
+            status: httpStatus,
+            contentType: "application/json",
+            body: data,
+            additionalHeaders: ["Cache-Control": "no-store"]
+        )
+    }
+
+    private func sendAttachmentUploadV3Error(
+        fd: Int32,
+        status: Int,
+        code: String,
+        message: String,
+        retryable: Bool,
+        uploadId: String?,
+        additionalHeaders: [String: String] = [:]
+    ) {
+        var body: [String: Any] = [
+            "protocol_version": AttachmentUploadV3Policy.protocolVersion,
+            "server_id": serverId,
+            "error": [
+                "code": code,
+                "message": message,
+                "retryable": retryable,
+            ] as [String: Any],
+        ]
+        if let uploadId {
+            body["upload_id"] = uploadId
+        }
+        let data = (try? JSONSerialization.data(
+            withJSONObject: body,
+            options: [.sortedKeys]
+        )) ?? Data()
+        send(
+            fd: fd,
+            status: status,
+            contentType: "application/json",
+            body: data,
+            additionalHeaders: additionalHeaders.merging(
+                ["Cache-Control": "no-store"],
+                uniquingKeysWith: { current, _ in current }
+            )
+        )
+    }
+
+    private struct AttachmentUploadV2HTTPError: Error {
+        let status: Int
+        let code: String
+        let message: String
+        let retryable: Bool
+
+        init(
+            status: Int,
+            code: String,
+            message: String,
+            retryable: Bool = false
+        ) {
+            self.status = status
+            self.code = code
+            self.message = message
+            self.retryable = retryable
+        }
+    }
+
+    nonisolated private static func attachmentUploadV2HTTPError(
+        _ error: AttachmentUploadV2Error
+    ) -> AttachmentUploadV2HTTPError {
+        switch error {
+        case .invalidParams(let detail):
+            return .init(status: 400, code: "invalid_request", message: detail)
+        case .uploadUnknown, .ownerMismatch:
+            return .init(status: 404, code: "upload_not_found", message: "Upload not found.")
+        case .uploadCancelled:
+            return .init(status: 410, code: "upload_cancelled", message: "Upload was cancelled.")
+        case .metadataConflict:
+            return .init(
+                status: 409,
+                code: "upload_metadata_conflict",
+                message: "Upload metadata conflicts with the durable upload."
+            )
+        case .chunkDigestConflict:
+            return .init(
+                status: 409,
+                code: "chunk_conflict",
+                message: "The chunk conflicts with a previously accepted chunk."
+            )
+        case .chunkValidationFailed(let detail):
+            return .init(status: 422, code: "invalid_chunk", message: detail)
+        case .fileDigestMismatch:
+            return .init(
+                status: 422,
+                code: "file_digest_mismatch",
+                message: "The assembled file SHA-256 does not match."
+            )
+        case .activeJobLimitExceeded, .reservedBytesExceeded:
+            return .init(
+                status: 409,
+                code: "upload_capacity_exceeded",
+                message: "The durable upload capacity is temporarily full.",
+                retryable: true
+            )
+        case .storageFailure:
+            return .init(
+                status: 500,
+                code: "attachment_upload_storage_failure",
+                message: "Attachment upload storage failed.",
+                retryable: true
+            )
+        }
+    }
+
+    nonisolated static func attachmentUploadV2Filename(
+        base64URLValue: String
+    ) -> String? {
+        guard !base64URLValue.isEmpty,
+              base64URLValue.utf8.allSatisfy({
+                  (65...90).contains($0)
+                      || (97...122).contains($0)
+                      || (48...57).contains($0)
+                      || $0 == 45
+                      || $0 == 95
+              }) else {
+            return nil
+        }
+        var base64 = base64URLValue
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let remainder = base64.utf8.count % 4
+        guard remainder != 1 else { return nil }
+        if remainder > 0 {
+            base64 += String(repeating: "=", count: 4 - remainder)
+        }
+        guard let data = Data(base64Encoded: base64),
+              let filename = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return filename
+    }
+
+    nonisolated private static func attachmentUploadV2PositiveInt(
+        _ raw: String?
+    ) -> Int? {
+        guard let raw,
+              !raw.isEmpty,
+              raw.allSatisfy(\.isNumber),
+              let value = Int(raw),
+              value > 0 else {
+            return nil
+        }
+        return value
+    }
+
+    private func sendAttachmentUploadV2Status(
+        fd: Int32,
+        httpStatus: Int,
+        status: AttachmentUploadV2Status,
+        acceptEncoding: String?
+    ) {
+        let result: Any
+        if let value = status.result {
+            result = [
+                "id": value.id,
+                "display_name": value.displayName,
+                "kind": value.kind.rawValue,
+                "mime_type": value.mimeType.map { $0 as Any } ?? NSNull(),
+                "sha256": value.sha256,
+                "size_bytes": value.sizeBytes,
+                "composer_insertion_text": value.composerInsertionText,
+            ] as [String: Any]
+        } else {
+            result = NSNull()
+        }
+        let body: [String: Any] = [
+            "protocol_version": status.protocolVersion,
+            "server_id": serverId,
+            "upload_id": status.uploadId,
+            "workspace_id": status.workspaceId,
+            "state": status.phase.rawValue,
+            "received_chunks": status.receivedChunkIndices,
+            "received_bytes": status.receivedBytes,
+            "total_bytes": status.sizeBytes,
+            "result": result,
+        ]
+        let data = (try? JSONSerialization.data(
+            withJSONObject: body,
+            options: [.sortedKeys]
+        )) ?? Data()
+        send(
+            fd: fd,
+            status: httpStatus,
+            contentType: "application/json",
+            body: data,
+            acceptEncoding: acceptEncoding,
+            additionalHeaders: ["Cache-Control": "no-store"]
+        )
+    }
+
+    private func sendAttachmentUploadV2Error(
+        fd: Int32,
+        status: Int,
+        code: String,
+        message: String,
+        retryable: Bool,
+        uploadId: String?,
+        acceptEncoding: String?,
+        additionalHeaders: [String: String] = [:]
+    ) {
+        var body: [String: Any] = [
+            "protocol_version": AttachmentUploadV2Policy.protocolVersion,
+            "server_id": serverId,
+            "error": [
+                "code": code,
+                "message": message,
+                "retryable": retryable,
+            ] as [String: Any],
+        ]
+        if let uploadId {
+            body["upload_id"] = uploadId
+        }
+        let data = (try? JSONSerialization.data(
+            withJSONObject: body,
+            options: [.sortedKeys]
+        )) ?? Data()
+        var responseHeaders = additionalHeaders
+        responseHeaders["Cache-Control"] = "no-store"
+        send(
+            fd: fd,
+            status: status,
+            contentType: "application/json",
+            body: data,
+            acceptEncoding: acceptEncoding,
+            additionalHeaders: responseHeaders
+        )
+    }
+
     private func send(fd: Int32, status: Int, contentType: String, body: Data, acceptEncoding: String? = nil, additionalHeaders: [String: String] = [:]) {
         var responseBody = body
         var extraHeaders = ""
@@ -3595,19 +4916,119 @@ public final class DirectHTTPServer: @unchecked Sendable {
         }
     }
 
-    private func sendFile(fd: Int32, status: Int, contentType: String, url: URL) {
+    enum StaticFileByteRange: Equatable {
+        case full
+        case partial(start: UInt64, end: UInt64)
+        case unsatisfiable
+    }
+
+    nonisolated static func staticFileByteRange(
+        header: String?,
+        fileSize: UInt64
+    ) -> StaticFileByteRange {
+        guard let header else { return .full }
+        let trimmed = header.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("bytes="),
+              !trimmed.contains(","),
+              fileSize > 0
+        else { return .unsatisfiable }
+
+        let value = trimmed.dropFirst("bytes=".count)
+        let components = value.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard components.count == 2 else { return .unsatisfiable }
+
+        if components[0].isEmpty {
+            guard let suffixLength = UInt64(components[1]), suffixLength > 0 else {
+                return .unsatisfiable
+            }
+            let length = min(suffixLength, fileSize)
+            return .partial(start: fileSize - length, end: fileSize - 1)
+        }
+
+        guard let start = UInt64(components[0]), start < fileSize else {
+            return .unsatisfiable
+        }
+        let end: UInt64
+        if components[1].isEmpty {
+            end = fileSize - 1
+        } else {
+            guard let requestedEnd = UInt64(components[1]), requestedEnd >= start else {
+                return .unsatisfiable
+            }
+            end = min(requestedEnd, fileSize - 1)
+        }
+        return .partial(start: start, end: end)
+    }
+
+    private func sendFile(
+        fd: Int32,
+        contentType: String,
+        url: URL,
+        rangeHeader: String?,
+        sendBody: Bool
+    ) {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let size = (attrs[.size] as? NSNumber)?.uint64Value,
-              let handle = try? FileHandle(forReadingFrom: url) else {
+              let size = (attrs[.size] as? NSNumber)?.uint64Value else {
             send(fd: fd, status: 404, contentType: "text/plain", body: Data("not found\n".utf8))
             return
         }
-        defer { try? handle.close() }
-        let head = "HTTP/1.1 \(status) \(reasonPhrase(status))\r\nContent-Type: \(contentType)\r\nContent-Length: \(size)\r\nConnection: keep-alive\r\nKeep-Alive: timeout=\(receiveTimeoutSeconds)\r\n\r\n"
+        let status: Int
+        let offset: UInt64
+        let responseSize: UInt64
+        var rangeHeaders = "Accept-Ranges: bytes\r\n"
+        switch Self.staticFileByteRange(header: rangeHeader, fileSize: size) {
+        case .full:
+            status = 200
+            offset = 0
+            responseSize = size
+        case .partial(let start, let end):
+            status = 206
+            offset = start
+            responseSize = end - start + 1
+            rangeHeaders += "Content-Range: bytes \(start)-\(end)/\(size)\r\n"
+        case .unsatisfiable:
+            send(
+                fd: fd,
+                status: 416,
+                contentType: "text/plain",
+                body: Data(),
+                additionalHeaders: [
+                    "Accept-Ranges": "bytes",
+                    "Content-Range": "bytes */\(size)"
+                ]
+            )
+            return
+        }
+        let handle: FileHandle?
+        if sendBody {
+            guard let opened = try? FileHandle(forReadingFrom: url) else {
+                send(fd: fd, status: 404, contentType: "text/plain", body: Data("not found\n".utf8))
+                return
+            }
+            if offset > 0 {
+                do {
+                    try opened.seek(toOffset: offset)
+                } catch {
+                    try? opened.close()
+                    send(fd: fd, status: 404, contentType: "text/plain", body: Data("not found\n".utf8))
+                    return
+                }
+            }
+            handle = opened
+        } else {
+            // HEAD intentionally does not open, seek, or read the granted file.
+            handle = nil
+        }
+        defer { try? handle?.close() }
+        let head = "HTTP/1.1 \(status) \(reasonPhrase(status))\r\nContent-Type: \(contentType)\r\n\(rangeHeaders)Content-Length: \(responseSize)\r\nConnection: keep-alive\r\nKeep-Alive: timeout=\(receiveTimeoutSeconds)\r\n\r\n"
         guard writeAll(fd: fd, data: Data(head.utf8)) else { return }
-        while true {
-            guard let chunk = try? handle.read(upToCount: 64 * 1024), !chunk.isEmpty else { return }
+        guard let handle else { return }
+        var remaining = responseSize
+        while remaining > 0 {
+            let readCount = Int(min(remaining, UInt64(64 * 1024)))
+            guard let chunk = try? handle.read(upToCount: readCount), !chunk.isEmpty else { return }
             guard writeAll(fd: fd, data: chunk) else { return }
+            remaining -= UInt64(chunk.count)
         }
     }
 
@@ -3632,13 +5053,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
     private func reasonPhrase(_ s: Int) -> String {
         switch s {
         case 200: return "OK"
+        case 201: return "Created"
+        case 202: return "Accepted"
+        case 206: return "Partial Content"
         case 400: return "Bad Request"
         case 401: return "Unauthorized"
         case 404: return "Not Found"
+        case 409: return "Conflict"
         case 410: return "Gone"
         case 413: return "Payload Too Large"
+        case 416: return "Range Not Satisfiable"
+        case 422: return "Unprocessable Content"
         case 429: return "Too Many Requests"
         case 431: return "Request Header Fields Too Large"
+        case 500: return "Internal Server Error"
         case 503: return "Service Unavailable"
         case 101: return "Switching Protocols"
         default: return "OK"
