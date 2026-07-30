@@ -536,7 +536,8 @@ public final class URLSessionPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
                 pushTokenType: pushTokenType,
                 timestampSeconds: timestampSeconds
             ),
-            idempotencyKey: idempotencyKey
+            idempotencyKey: idempotencyKey,
+            timeout: LiveActivityDeliveryPolicy.requestTimeoutSeconds
         )
     }
 
@@ -550,7 +551,8 @@ public final class URLSessionPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
             method: "POST",
             accessToken: accessToken,
             body: deliveryRequest,
-            idempotencyKey: idempotencyKey
+            idempotencyKey: idempotencyKey,
+            timeout: LiveActivityDeliveryPolicy.requestTimeoutSeconds
         )
     }
 
@@ -562,7 +564,8 @@ public final class URLSessionPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
             path: Self.liveActivityV2TokensPath,
             method: "POST",
             accessToken: accessToken,
-            body: registration
+            body: registration,
+            timeout: LiveActivityDeliveryPolicy.requestTimeoutSeconds
         )
     }
 
@@ -571,7 +574,8 @@ public final class URLSessionPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
         method: String,
         accessToken: String? = nil,
         body: (any Encodable)? = nil,
-        idempotencyKey: String? = nil
+        idempotencyKey: String? = nil,
+        timeout: TimeInterval? = nil
     ) async throws -> Response {
         let normalizedPath = path.hasPrefix("/") ? String(path.dropFirst()) : path
         var request = URLRequest(url: baseURL.appendingPathComponent(normalizedPath))
@@ -586,6 +590,11 @@ public final class URLSessionPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try encoder.encode(AnyEncodable(body))
+        }
+        if let timeout {
+            // Explicit 10–12s band so a hung Live Activity HTTPS call cannot
+            // pin a device lane indefinitely.
+            request.timeoutInterval = timeout
         }
 
         let (data, response) = try await session.data(for: request)
@@ -875,7 +884,10 @@ public final class PrivatePushTargetStore: @unchecked Sendable {
         purpose: PrivatePushTokenPurpose,
         environment: PrivatePushEnvironment,
         activityGeneration: UInt64? = nil,
-        activityId: String? = nil
+        activityId: String? = nil,
+        bootEpoch: UInt64? = nil,
+        activitySessionId: String? = nil,
+        token: String? = nil
     ) throws {
         try lock.withLock {
             var values = try loadRecordsUnlocked()
@@ -885,10 +897,135 @@ public final class PrivatePushTargetStore: @unchecked Sendable {
                 $0.purpose == purpose &&
                 $0.environment == environment &&
                 $0.activityGeneration == activityGeneration &&
-                $0.activityId == activityId
+                $0.activityId == activityId &&
+                (bootEpoch == nil || $0.bootEpoch == bootEpoch) &&
+                (activitySessionId == nil || $0.activitySessionId == activitySessionId) &&
+                (token == nil || $0.token == token)
             }
             try saveRecordsUnlocked(values)
         }
+    }
+
+    /// Remove exactly one dead `.activityUpdate` courier. Scope is owner/server,
+    /// device, APNs environment, Activity ID, boot epoch, generation, session,
+    /// and rejected token identity. A delayed rejection for historical token A
+    /// never removes rotated current token B, other devices, or other
+    /// environments.
+    public func invalidateActivityUpdateTarget(_ target: PrivatePushTargetRecord) throws {
+        guard target.purpose == .activityUpdate else { return }
+        try lock.withLock {
+            var values = try loadRecordsUnlocked()
+            // Only the still-authoritative row for this exact ownership may
+            // retire. If the stored token already rotated, leave B alone.
+            values.removeAll {
+                $0.purpose == .activityUpdate &&
+                $0.deviceId == target.deviceId &&
+                $0.serverId == target.serverId &&
+                $0.environment == target.environment &&
+                $0.activityId == target.activityId &&
+                $0.bootEpoch == target.bootEpoch &&
+                $0.activityGeneration == target.activityGeneration &&
+                $0.activitySessionId == target.activitySessionId &&
+                $0.token == target.token
+            }
+            try saveRecordsUnlocked(values)
+        }
+    }
+
+    /// Age/count prune for stale `.activityUpdate` rows while protecting the
+    /// current authoritative token per device + server + APNs environment
+    /// (newest `updatedAt`). Alert and push-to-start rows are never candidates.
+    @discardableResult
+    public func pruneStaleActivityUpdateTargets(
+        now: Date = Date(),
+        maxAge: TimeInterval = PrivatePushTargetStore.activityUpdateRetention,
+        maxCount: Int = PrivatePushTargetStore.activityUpdateCap
+    ) throws -> Int {
+        try lock.withLock {
+            var values = try loadRecordsUnlocked()
+            let before = values.count
+            let updates = values.filter { $0.purpose == .activityUpdate }
+            guard !updates.isEmpty else { return 0 }
+
+            // Newest courier per device/server/environment is the current authority.
+            var newestByDeviceEnv: [String: PrivatePushTargetRecord] = [:]
+            for record in updates {
+                let slot = Self.activityUpdateDeviceEnvironmentIdentity(record)
+                if let existing = newestByDeviceEnv[slot] {
+                    if record.updatedAt >= existing.updatedAt {
+                        newestByDeviceEnv[slot] = record
+                    }
+                } else {
+                    newestByDeviceEnv[slot] = record
+                }
+            }
+            let protectedKeys = Set(newestByDeviceEnv.values.map(Self.activityUpdateExactKey))
+            let cutoff = now.addingTimeInterval(-max(0, maxAge))
+            let effectiveMaxCount = max(0, maxCount)
+
+            // Age-prune only non-authoritative rows.
+            values.removeAll { record in
+                guard record.purpose == .activityUpdate else { return false }
+                if protectedKeys.contains(Self.activityUpdateExactKey(record)) {
+                    return false
+                }
+                return record.updatedAt < cutoff
+            }
+
+            var remainingUpdates = values.filter { $0.purpose == .activityUpdate }
+            if remainingUpdates.count > effectiveMaxCount {
+                remainingUpdates.sort { $0.updatedAt < $1.updatedAt }
+                var dropKeys = Set<String>()
+                var liveCount = remainingUpdates.count
+                // Prefer dropping non-authoritative first.
+                for record in remainingUpdates {
+                    guard liveCount > effectiveMaxCount else { break }
+                    let key = Self.activityUpdateExactKey(record)
+                    if protectedKeys.contains(key) { continue }
+                    dropKeys.insert(key)
+                    liveCount -= 1
+                }
+                values.removeAll {
+                    $0.purpose == .activityUpdate &&
+                    dropKeys.contains(Self.activityUpdateExactKey($0))
+                }
+            }
+
+            let removed = before - values.count
+            if removed > 0 {
+                try saveRecordsUnlocked(values)
+            }
+            return removed
+        }
+    }
+
+    /// One rollover window plus a small margin for delayed terminal delivery.
+    public static let activityUpdateRetention: TimeInterval = 8 * 60 * 60
+    /// Historical-row cap after age prune. Current per-device authorities stay
+    /// protected even if their device count alone exceeds this soft cap.
+    public static let activityUpdateCap = 64
+
+    private static func activityUpdateDeviceEnvironmentIdentity(
+        _ record: PrivatePushTargetRecord
+    ) -> String {
+        [
+            record.serverId,
+            record.deviceId,
+            record.environment.rawValue,
+        ].map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+    }
+
+    private static func activityUpdateExactKey(_ record: PrivatePushTargetRecord) -> String {
+        [
+            record.serverId,
+            record.deviceId,
+            record.environment.rawValue,
+            record.activityId ?? "",
+            record.bootEpoch.map(String.init) ?? "",
+            record.activityGeneration.map(String.init) ?? "",
+            record.activitySessionId ?? "",
+            record.token,
+        ].map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
     }
 
     private func loadRecordsUnlocked() throws -> [PrivatePushTargetRecord] {
@@ -1296,7 +1433,11 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             }
             if !exact.isEmpty { return exact.map(LiveActivityAcceptanceTarget.v2) }
             // Stale ownership after Mac relaunch: still try the newest update token.
-            if let newest = preferred.max(by: { $0.updatedAt < $1.updatedAt }) {
+            // Persistence may round adjacent registrations to the same timestamp.
+            // In that tie, `upsert` order is the only remaining recency signal.
+            let newestTimestamp = preferred.map(\.updatedAt).max()
+            if let newestTimestamp,
+               let newest = preferred.last(where: { $0.updatedAt == newestTimestamp }) {
                 return [.v2(newest)]
             }
             // No update token yet (iOS app never opened after remote start): use
@@ -1357,19 +1498,19 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                 nextAttemptAt: nil
             )
         case .v2(let target):
+            let ack: PrivateLiveActivityV2DeliveryAck
             do {
                 let request = PrivateLiveActivityV2DeliveryRequest(delivery: delivery, target: target)
-                let ack = try await sessionRefresher.perform(session: session) { accessToken in
+                ack = try await sessionRefresher.perform(session: session) { accessToken in
                     try await self.api.deliverLiveActivityV2(
                         accessToken: accessToken,
                         request: request,
                         idempotencyKey: delivery.idempotencyKey
                     )
                 }
-                guard ack.isAccepted else {
+                guard ack.isSettled else {
                     throw LiveActivityAcceptanceOutboxError.backendDidNotAccept(ack.status)
                 }
-                return ack
             } catch {
                 // User dismissed the Lock Screen card or ActivityKit ended it: the
                 // activity_update token is dead. Fail over to push-to-start `.start`
@@ -1403,6 +1544,24 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                 }
                 throw error
             }
+            // Prune while the current courier is still protected. Doing this
+            // before terminal invalidation prevents a stale historical row from
+            // becoming the newly "current" protected fallback.
+            do {
+                _ = try pushTargetStore.pruneStaleActivityUpdateTargets()
+            } catch {
+                Self.log.error(
+                    "Live Activity token prune failed: \(String(describing: error), privacy: .public)"
+                )
+            }
+            // Terminal/end retires only this exact owner/device/env/activity/
+            // generation/token. A delayed result for A cannot remove rotated B.
+            // Persistence failure stays retryable through the durable outbox.
+            if target.purpose == .activityUpdate,
+               delivery.event == .end || ack.isTerminal {
+                try pushTargetStore.invalidateActivityUpdateTarget(target)
+            }
+            return ack
         }
     }
 

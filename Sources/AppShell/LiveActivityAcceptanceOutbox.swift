@@ -1,5 +1,6 @@
 import Foundation
 import Persistence
+import os
 
 public struct PrivateLiveActivityV2DeliveryAck: Codable, Equatable, Sendable {
     public let id: String
@@ -18,6 +19,16 @@ public struct PrivateLiveActivityV2DeliveryAck: Codable, Equatable, Sendable {
 
     public var isAccepted: Bool {
         ["pending", "queued", "processing", "delivered"].contains(status)
+    }
+
+    /// Backend-settled outcomes that must not be retried. They do not prove
+    /// delivery, but they do prove this exact token/unit cannot make progress.
+    public var isTerminal: Bool {
+        ["permanent", "superseded"].contains(status)
+    }
+
+    public var isSettled: Bool {
+        isAccepted || isTerminal
     }
 
     private enum CodingKeys: String, CodingKey { case id, status, attempts, nextAttemptAt, accepted }
@@ -45,19 +56,56 @@ public enum LiveActivityAcceptanceTarget: Codable, Equatable, Sendable {
     var unitIdentity: String {
         switch self {
         case .v2(let target):
-            return "v2|\(target.serverId)|\(target.deviceId)|\(target.environment.rawValue)|\(target.purpose.rawValue)"
+            return Self.identity([
+                "v2",
+                target.serverId,
+                target.deviceId,
+                target.environment.rawValue,
+                target.purpose.rawValue,
+                target.activityId ?? "",
+                target.bootEpoch.map(String.init) ?? "",
+                target.activityGeneration.map(String.init) ?? "",
+                target.activitySessionId ?? "",
+                target.token,
+            ])
         case .legacy(let target):
-            return "legacy|\(target.deviceId ?? "unknown")|\(target.pushTokenType)"
+            return Self.identity([
+                "legacy",
+                target.deviceId ?? "unknown",
+                target.pushTokenType,
+                target.liveActivityToken ?? "",
+            ])
         }
     }
 
-    var deviceIdentity: String {
+    /// Concurrent-progress key. This app owns one `active-threads` activity
+    /// stream per paired device/server/environment. Every token and lifecycle
+    /// generation in that stream stays serialized, while another device or
+    /// environment can progress independently. Purpose, ActivityKit instance
+    /// ID, generation, session, and token are intentionally excluded: all may
+    /// rotate between a start and its terminal barrier.
+    var laneIdentity: String {
         switch self {
         case .v2(let target):
-            return "v2|\(target.serverId)|\(target.deviceId)|\(target.environment.rawValue)"
+            return Self.identity([
+                "v2-lane",
+                "active-threads",
+                target.serverId,
+                target.deviceId,
+                target.environment.rawValue,
+            ])
         case .legacy(let target):
-            return "legacy|\(target.deviceId ?? "unknown")|\(target.pushTokenType)"
+            return Self.identity([
+                "legacy-lane",
+                "active-threads",
+                target.deviceId ?? "unknown",
+                target.pushTokenType,
+            ])
         }
+    }
+
+    private static func identity(_ parts: [String]) -> String {
+        parts.map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
     }
 }
 
@@ -66,53 +114,141 @@ public struct LiveActivityAcceptanceRecord: Codable, Equatable, Sendable {
     public let target: LiveActivityAcceptanceTarget
     public let attempts: Int
     public let nextAttemptAt: Date?
+    /// Wall-clock enqueue time for offline backlog age bounds.
+    public let enqueuedAt: Date
 
     public init(
         delivery: LiveActivitySyncDelivery,
         target: LiveActivityAcceptanceTarget,
         attempts: Int = 0,
-        nextAttemptAt: Date? = nil
+        nextAttemptAt: Date? = nil,
+        enqueuedAt: Date = Date()
     ) {
         self.delivery = delivery
         self.target = target
         self.attempts = attempts
         self.nextAttemptAt = nextAttemptAt
+        self.enqueuedAt = enqueuedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case delivery, target, attempts, nextAttemptAt, enqueuedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        delivery = try values.decode(LiveActivitySyncDelivery.self, forKey: .delivery)
+        target = try values.decode(LiveActivityAcceptanceTarget.self, forKey: .target)
+        attempts = try values.decode(Int.self, forKey: .attempts)
+        nextAttemptAt = try values.decodeIfPresent(Date.self, forKey: .nextAttemptAt)
+        enqueuedAt = try values.decodeIfPresent(Date.self, forKey: .enqueuedAt)
+            ?? Date(timeIntervalSince1970: delivery.projection.updatedAt)
     }
 
     var recordID: String { delivery.idempotencyKey + "|" + target.unitIdentity }
 }
 
+/// Shared Live Activity HTTPS / outbox policy (deadlines, lanes, backlog).
+public enum LiveActivityDeliveryPolicy: Sendable {
+    /// Live Activity v2 delivery, legacy delivery, and v2 token registration
+    /// share the same 10–12s request deadline band.
+    public static let requestTimeoutSeconds: TimeInterval = 11
+    /// Independent device/environment lanes may progress together; each lane
+    /// still serializes its own lifecycle.
+    public static let maximumConcurrentLanes: Int = 4
+    /// Pending acceptance records older than this are no longer actionable.
+    public static let pendingRecordRetention: TimeInterval = 7 * 24 * 60 * 60
+    /// Hard count cap after superseded/age compaction.
+    public static let pendingRecordCap: Int = 256
+    /// Encoded snapshot budget; superseded work is compacted before current/end.
+    public static let encodedByteCap: Int = 256 * 1024
+    /// The outbox deadline is slightly above the per-request URL deadline so
+    /// refresh/adapter overhead cannot pin a lane indefinitely.
+    public static let sendTimeoutSeconds: TimeInterval = 12
+}
+
+public struct LiveActivityAcceptanceOutboxLimits: Equatable, Sendable {
+    public let recordRetention: TimeInterval
+    public let recordCap: Int
+    public let encodedByteCap: Int
+
+    public init(
+        recordRetention: TimeInterval = LiveActivityDeliveryPolicy.pendingRecordRetention,
+        recordCap: Int = LiveActivityDeliveryPolicy.pendingRecordCap,
+        encodedByteCap: Int = LiveActivityDeliveryPolicy.encodedByteCap
+    ) {
+        self.recordRetention = max(0, recordRetention)
+        self.recordCap = max(1, recordCap)
+        self.encodedByteCap = max(1, encodedByteCap)
+    }
+}
+
 public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
     private static let key = "live_activity.acceptance_outbox.v1"
+
+    public static var pendingRecordRetention: TimeInterval {
+        LiveActivityDeliveryPolicy.pendingRecordRetention
+    }
+    public static var pendingRecordCap: Int { LiveActivityDeliveryPolicy.pendingRecordCap }
+    public static var encodedByteCap: Int { LiveActivityDeliveryPolicy.encodedByteCap }
+
+    /// Result of a bounds compaction pass. Dropped rows are never treated as
+    /// backend success (no invented acknowledgements).
+    public struct CompactionReport: Equatable, Sendable {
+        public let droppedRecords: Int
+
+        public var didDrop: Bool { droppedRecords > 0 }
+    }
 
     private let settings: SettingsRepository
     private let lock = NSLock()
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private let now: () -> Date
+    private let limits: LiveActivityAcceptanceOutboxLimits
 
-    public init(settings: SettingsRepository) {
+    public init(
+        settings: SettingsRepository,
+        now: @escaping () -> Date = { Date() },
+        limits: LiveActivityAcceptanceOutboxLimits = LiveActivityAcceptanceOutboxLimits()
+    ) {
         self.settings = settings
+        self.now = now
+        self.limits = limits
     }
 
+    @discardableResult
     public func enqueue(
         _ delivery: LiveActivitySyncDelivery,
         targets: [LiveActivityAcceptanceTarget]
-    ) throws {
+    ) throws -> CompactionReport {
         try lock.withLock {
             var records = try loadUnlocked()
+            let stamp = now()
             for target in targets {
-                let incoming = LiveActivityAcceptanceRecord(delivery: delivery, target: target)
+                let incoming = LiveActivityAcceptanceRecord(
+                    delivery: delivery,
+                    target: target,
+                    enqueuedAt: stamp
+                )
                 guard !records.contains(where: { $0.recordID == incoming.recordID }) else { continue }
                 if delivery.event == .update {
                     records.removeAll {
-                        $0.target.unitIdentity == target.unitIdentity &&
+                        $0.target.laneIdentity == target.laneIdentity &&
                         $0.delivery.event == .update &&
                         Self.isSameSession($0.delivery, delivery)
                     }
                 }
                 records.append(incoming)
             }
+            let report = Self.compactBacklog(
+                &records,
+                now: stamp,
+                encoder: encoder,
+                limits: limits
+            )
             try saveUnlocked(records)
+            return report
         }
     }
 
@@ -120,15 +256,31 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
         try lock.withLock { try loadUnlocked() }
     }
 
+    /// Apply age/count/byte bounds without enqueueing new work (used on resume).
+    @discardableResult
+    public func compactBacklog() throws -> CompactionReport {
+        try lock.withLock {
+            var records = try loadUnlocked()
+            let report = Self.compactBacklog(
+                &records,
+                now: now(),
+                encoder: encoder,
+                limits: limits
+            )
+            try saveUnlocked(records)
+            return report
+        }
+    }
+
     func candidates() throws -> [LiveActivityAcceptanceRecord] {
         try lock.withLock {
             let records = try loadUnlocked()
-            let groups = Dictionary(grouping: records, by: { $0.target.unitIdentity })
-            let perUnit: [LiveActivityAcceptanceRecord] = groups.values.compactMap { unit -> LiveActivityAcceptanceRecord? in
-                guard let oldestSession = unit.min(by: {
+            let groups = Dictionary(grouping: records, by: { $0.target.laneIdentity })
+            return groups.values.compactMap { lane -> LiveActivityAcceptanceRecord? in
+                guard let oldestSession = lane.min(by: {
                     Self.isOrderedBefore($0.delivery, $1.delivery)
                 }) else { return nil }
-                let session = unit.filter {
+                let session = lane.filter {
                     Self.isSameSession($0.delivery, oldestSession.delivery)
                 }
                 if let terminal = session
@@ -144,14 +296,6 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
                 return session.max(by: {
                     $0.delivery.projection.revision < $1.delivery.projection.revision
                 })
-            }
-            let oldestByDevice = Dictionary(grouping: records, by: { $0.target.deviceIdentity })
-                .compactMapValues { values in
-                    values.min(by: { Self.isOrderedBefore($0.delivery, $1.delivery) })
-                }
-            return perUnit.filter { candidate in
-                guard let oldest = oldestByDevice[candidate.target.deviceIdentity] else { return false }
-                return Self.isSameSession(candidate.delivery, oldest.delivery)
             }
         }
     }
@@ -169,19 +313,23 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
                 delivery: records[index].delivery,
                 target: records[index].target,
                 attempts: records[index].attempts + 1,
-                nextAttemptAt: nextAttemptAt
+                nextAttemptAt: nextAttemptAt,
+                enqueuedAt: records[index].enqueuedAt
             )
             try saveUnlocked(records)
             return records[index]
         }
     }
 
-    func acknowledge(_ record: LiveActivityAcceptanceRecord) throws {
+    func acknowledge(
+        _ record: LiveActivityAcceptanceRecord,
+        acceptedEndScope: Bool
+    ) throws {
         try lock.withLock {
             var records = try loadUnlocked()
-            if record.delivery.event == .end {
+            if record.delivery.event == .end, acceptedEndScope {
                 records.removeAll { candidate in
-                    candidate.target.deviceIdentity == record.target.deviceIdentity &&
+                    candidate.target.laneIdentity == record.target.laneIdentity &&
                     Self.isSameOrOlderSession(candidate.delivery, than: record.delivery)
                 }
             } else {
@@ -202,6 +350,205 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
         let data = try encoder.encode(records)
         guard let json = String(data: data, encoding: .utf8) else { return }
         try settings.set(Self.key, json)
+    }
+
+    /// Compact superseded lifecycle work first, then age/count/byte bounds.
+    /// Newest/current lifecycle and terminal/end records are preserved wherever
+    /// possible. Dropped rows leave no acknowledgement — success is never invented.
+    private static func compactBacklog(
+        _ records: inout [LiveActivityAcceptanceRecord],
+        now: Date,
+        encoder: JSONEncoder,
+        limits: LiveActivityAcceptanceOutboxLimits
+    ) -> CompactionReport {
+        // 1) Superseded lifecycle work: keep terminal barriers, the current
+        // start/update, and no stale non-terminal generations.
+        compactSupersededLifecycle(&records)
+        // Semantic supersession is routine last-write-wins work, not pressure.
+        // Only age/count/byte losses are disclosed through the error seam.
+        let beforeBoundedDrops = records.count
+
+        // 2) Hard age bound for every event, including start/end. ActivityKit
+        // and backend retention are both much shorter than an unbounded queue.
+        let recordCutoff = now.addingTimeInterval(-limits.recordRetention)
+        records.removeAll { $0.enqueuedAt < recordCutoff }
+
+        // 3) Count cap: drop oldest non-end first, then oldest ends if unavoidable.
+        // Prefer keeping the newest lifecycle per lane (by enqueue time + order).
+        if records.count > limits.recordCap {
+            records.sort { lhs, rhs in
+                if lhs.enqueuedAt != rhs.enqueuedAt {
+                    return lhs.enqueuedAt < rhs.enqueuedAt
+                }
+                return isOrderedBefore(lhs.delivery, rhs.delivery)
+            }
+            // Protect newest non-end per lane and all ends while possible.
+            var protected = Set<String>()
+            let byLane = Dictionary(grouping: records, by: { $0.target.laneIdentity })
+            for laneRecords in byLane.values {
+                if let newest = laneRecords
+                    .filter({ $0.delivery.event != .end })
+                    .max(by: {
+                        if $0.enqueuedAt != $1.enqueuedAt {
+                            return $0.enqueuedAt < $1.enqueuedAt
+                        }
+                        return isOrderedBefore($0.delivery, $1.delivery)
+                    }) {
+                    protected.insert(newest.recordID)
+                }
+                for end in laneRecords where end.delivery.event == .end {
+                    protected.insert(end.recordID)
+                }
+            }
+            while records.count > limits.recordCap {
+                if let idx = records.firstIndex(where: {
+                    $0.delivery.event != .end && !protected.contains($0.recordID)
+                }) {
+                    records.remove(at: idx)
+                } else if let idx = records.firstIndex(where: {
+                    $0.delivery.event == .end && !protected.contains($0.recordID)
+                }) {
+                    records.remove(at: idx)
+                } else if let idx = records.firstIndex(where: {
+                    $0.delivery.event != .end
+                }) {
+                    records.remove(at: idx)
+                } else {
+                    records.removeFirst()
+                }
+            }
+        }
+
+        // 4) Encoded-byte budget: keep compacting oldest non-end work first.
+        while encodedByteCount(records, encoder: encoder) > limits.encodedByteCap {
+            guard !records.isEmpty else { break }
+            let protected = protectedRecordIDs(records)
+            if let idx = records.firstIndex(where: {
+                $0.delivery.event != .end && !protected.contains($0.recordID)
+            }) {
+                records.remove(at: idx)
+                continue
+            }
+            if let idx = records.firstIndex(where: {
+                $0.delivery.event == .end && !protected.contains($0.recordID)
+            }) {
+                records.remove(at: idx)
+                continue
+            }
+            if let idx = records.firstIndex(where: { $0.delivery.event != .end }) {
+                records.remove(at: idx)
+            } else {
+                records.removeFirst()
+            }
+        }
+
+        return CompactionReport(
+            droppedRecords: max(0, beforeBoundedDrops - records.count)
+        )
+    }
+
+    private static func compactSupersededLifecycle(
+        _ records: inout [LiveActivityAcceptanceRecord]
+    ) {
+        var keepIDs = Set<String>()
+        for lane in Dictionary(grouping: records, by: { $0.target.laneIdentity }).values {
+            guard let newestLifecycle = newestLifecycleRecord(in: lane) else { continue }
+            let currentSession = sessionIdentity(newestLifecycle.delivery)
+            let sessions = Dictionary(grouping: lane, by: {
+                sessionIdentity($0.delivery)
+            })
+
+            for (sessionKey, session) in sessions {
+                // Every historical terminal remains a lifecycle barrier. Within
+                // one session the newest end supersedes its start/update.
+                if let newestEnd = newestRecord(in: session, event: .end) {
+                    keepIDs.insert(newestEnd.recordID)
+                    continue
+                }
+                // Once a newer lifecycle exists, historical non-terminal work
+                // must not resurrect an obsolete Live Activity.
+                guard sessionKey == currentSession else { continue }
+                if let newestStart = newestRecord(in: session, event: .start) {
+                    keepIDs.insert(newestStart.recordID)
+                }
+                if let newestUpdate = newestRecord(in: session, event: .update) {
+                    keepIDs.insert(newestUpdate.recordID)
+                }
+            }
+        }
+        records.removeAll { !keepIDs.contains($0.recordID) }
+    }
+
+    private static func newestLifecycleRecord(
+        in records: [LiveActivityAcceptanceRecord]
+    ) -> LiveActivityAcceptanceRecord? {
+        records.reduce(nil) { current, candidate in
+            guard let current else { return candidate }
+            if isOrderedBefore(current.delivery, candidate.delivery) {
+                return candidate
+            }
+            if !isOrderedBefore(candidate.delivery, current.delivery),
+               candidate.enqueuedAt >= current.enqueuedAt {
+                return candidate
+            }
+            return current
+        }
+    }
+
+    private static func newestRecord(
+        in records: [LiveActivityAcceptanceRecord],
+        event: PrivateLiveActivityEvent
+    ) -> LiveActivityAcceptanceRecord? {
+        records.reduce(nil) { current, candidate in
+            guard candidate.delivery.event == event else { return current }
+            guard let current else { return candidate }
+            if candidate.delivery.projection.revision > current.delivery.projection.revision {
+                return candidate
+            }
+            if candidate.delivery.projection.revision == current.delivery.projection.revision,
+               candidate.enqueuedAt >= current.enqueuedAt {
+                return candidate
+            }
+            return current
+        }
+    }
+
+    private static func sessionIdentity(_ delivery: LiveActivitySyncDelivery) -> String {
+        [
+            delivery.projection.hostId,
+            delivery.projection.epoch,
+            String(delivery.activityGeneration),
+            delivery.projection.sessionId,
+        ].map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+    }
+
+    private static func protectedRecordIDs(
+        _ records: [LiveActivityAcceptanceRecord]
+    ) -> Set<String> {
+        var result = Set<String>()
+        for lane in Dictionary(grouping: records, by: { $0.target.laneIdentity }).values {
+            if let current = lane.max(by: {
+                if $0.enqueuedAt != $1.enqueuedAt {
+                    return $0.enqueuedAt < $1.enqueuedAt
+                }
+                return isOrderedBefore($0.delivery, $1.delivery)
+            }) {
+                result.insert(current.recordID)
+            }
+            if let newestEnd = lane
+                .filter({ $0.delivery.event == .end })
+                .max(by: { isOrderedBefore($0.delivery, $1.delivery) }) {
+                result.insert(newestEnd.recordID)
+            }
+        }
+        return result
+    }
+
+    private static func encodedByteCount(
+        _ records: [LiveActivityAcceptanceRecord],
+        encoder: JSONEncoder
+    ) -> Int {
+        (try? encoder.encode(records).count) ?? Int.max
     }
 
     private static func isOrderedBefore(
@@ -254,6 +601,9 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
 
 public enum LiveActivityAcceptanceOutboxError: Error, Equatable {
     case backendDidNotAccept(String)
+    /// Offline backlog exceeded age/count/byte bounds. Dropped work is never
+    /// treated as backend success — records are removed without inventing acks.
+    case backlogCompacted(droppedRecords: Int)
 }
 
 public final class LiveActivityAcceptanceOutbox: @unchecked Sendable {
@@ -265,11 +615,15 @@ public final class LiveActivityAcceptanceOutbox: @unchecked Sendable {
 
     private enum Command: @unchecked Sendable {
         case wake
-        case retryReady(String)
         case flush(CheckedContinuation<Void, Never>)
     }
 
+    private static let log = Logger(
+        subsystem: "io.remotecode.app",
+        category: "live-activity-acceptance"
+    )
     private let store: LiveActivityAcceptanceOutboxStore
+    private let onError: ErrorHandler
     private let continuation: AsyncStream<Command>.Continuation
     private var worker: Task<Void, Never>?
 
@@ -285,45 +639,38 @@ public final class LiveActivityAcceptanceOutbox: @unchecked Sendable {
                 execute: callback
             )
         },
+        maximumConcurrentLanes: Int = LiveActivityDeliveryPolicy.maximumConcurrentLanes,
+        sendTimeout: TimeInterval = LiveActivityDeliveryPolicy.sendTimeoutSeconds,
         onError: @escaping ErrorHandler = { _, _ in },
         send: @escaping Send
     ) {
         self.store = store
+        self.onError = onError
         var capturedContinuation: AsyncStream<Command>.Continuation?
         let stream = AsyncStream<Command> { capturedContinuation = $0 }
         let commandContinuation = capturedContinuation!
         self.continuation = commandContinuation
+        let scheduler = LiveActivityAcceptanceLaneScheduler(
+            store: store,
+            now: now,
+            retryDelay: retryDelay,
+            schedule: schedule,
+            maximumConcurrentLanes: maximumConcurrentLanes,
+            sendTimeout: sendTimeout,
+            send: send,
+            onError: onError
+        )
         self.worker = Task {
-            var scheduled = Set<String>()
             for await command in stream {
                 switch command {
                 case .wake:
-                    await Self.drain(
-                        store: store,
-                        now: now,
-                        retryDelay: retryDelay,
-                        schedule: schedule,
-                        send: send,
-                        onError: onError,
-                        continuation: commandContinuation,
-                        scheduled: &scheduled
-                    )
-                case .retryReady(let key):
-                    scheduled.remove(key)
-                    await Self.drain(
-                        store: store,
-                        now: now,
-                        retryDelay: retryDelay,
-                        schedule: schedule,
-                        send: send,
-                        onError: onError,
-                        continuation: commandContinuation,
-                        scheduled: &scheduled
-                    )
+                    await scheduler.wake()
                 case .flush(let barrier):
+                    await scheduler.flush()
                     barrier.resume()
                 }
             }
+            await scheduler.stop()
         }
     }
 
@@ -336,11 +683,17 @@ public final class LiveActivityAcceptanceOutbox: @unchecked Sendable {
         _ delivery: LiveActivitySyncDelivery,
         targets: [LiveActivityAcceptanceTarget]
     ) throws {
-        try store.enqueue(delivery, targets: targets)
+        let report = try store.enqueue(delivery, targets: targets)
+        surfaceCompaction(report, delivery: delivery)
         continuation.yield(.wake)
     }
 
     public func resumePending() {
+        do {
+            surfaceCompaction(try store.compactBacklog(), delivery: nil)
+        } catch {
+            onError(error, nil)
+        }
         continuation.yield(.wake)
     }
 
@@ -350,71 +703,25 @@ public final class LiveActivityAcceptanceOutbox: @unchecked Sendable {
         }
     }
 
-    private static func drain(
-        store: LiveActivityAcceptanceOutboxStore,
-        now: Now,
-        retryDelay: RetryDelay,
-        schedule: Schedule,
-        send: Send,
-        onError: ErrorHandler,
-        continuation: AsyncStream<Command>.Continuation,
-        scheduled: inout Set<String>
-    ) async {
-        while true {
-            let record: LiveActivityAcceptanceRecord
-            do {
-                let candidates = try store.candidates()
-                guard !candidates.isEmpty else { return }
-                let ready = candidates.filter { ($0.nextAttemptAt ?? .distantPast) <= now() }
-                guard let next = ready.sorted(by: Self.isPreferred).first else {
-                    for candidate in candidates {
-                        guard let retryAt = candidate.nextAttemptAt else { continue }
-                        let candidateKey = candidate.recordID
-                        if scheduled.insert(candidateKey).inserted {
-                            schedule(max(0, retryAt.timeIntervalSince(now()))) {
-                                continuation.yield(.retryReady(candidateKey))
-                            }
-                        }
-                    }
-                    return
-                }
-                record = next
-            } catch {
-                onError(error, nil)
-                return
-            }
-            let key = record.recordID
-            do {
-                let ack = try await send(record)
-                guard ack.isAccepted else {
-                    throw LiveActivityAcceptanceOutboxError.backendDidNotAccept(ack.status)
-                }
-                try store.acknowledge(record)
-                scheduled.remove(key)
-            } catch {
-                onError(error, record.delivery)
-                let delay = retryDelay(record.attempts + 1)
-                let failed: LiveActivityAcceptanceRecord?
-                do {
-                    failed = try store.recordFailure(
-                        recordID: key,
-                        nextAttemptAt: now().addingTimeInterval(delay)
-                    )
-                } catch {
-                    onError(error, record.delivery)
-                    return
-                }
-                if failed != nil, scheduled.insert(key).inserted {
-                    schedule(delay) {
-                        continuation.yield(.retryReady(key))
-                    }
-                }
-                continue
-            }
-        }
+    private func surfaceCompaction(
+        _ report: LiveActivityAcceptanceOutboxStore.CompactionReport,
+        delivery: LiveActivitySyncDelivery?
+    ) {
+        guard report.didDrop else { return }
+        // Surface dropped offline backlog via the existing diagnostic seam
+        // without inventing a settled backend success.
+        Self.log.info(
+            "live-activity backlog compacted droppedRecords=\(report.droppedRecords, privacy: .public)"
+        )
+        onError(
+            LiveActivityAcceptanceOutboxError.backlogCompacted(
+                droppedRecords: report.droppedRecords
+            ),
+            delivery
+        )
     }
 
-    private static func isPreferred(
+    fileprivate static func isPreferred(
         _ lhs: LiveActivityAcceptanceRecord,
         _ rhs: LiveActivityAcceptanceRecord
     ) -> Bool {
@@ -426,5 +733,271 @@ public final class LiveActivityAcceptanceOutbox: @unchecked Sendable {
             return lhs.delivery.activityGeneration < rhs.delivery.activityGeneration
         }
         return lhs.delivery.projection.revision < rhs.delivery.projection.revision
+    }
+}
+
+private actor LiveActivityAcceptanceLaneScheduler {
+    private enum SendOutcome: @unchecked Sendable {
+        case settled(PrivateLiveActivityV2DeliveryAck)
+        case failed(Error)
+    }
+
+    /// One-shot race that lets the lane deadline win even if a test adapter or
+    /// future transport ignores cooperative task cancellation. Production
+    /// URLSession work is still cancelled, but the scheduler never waits for an
+    /// uncooperative child before freeing the bounded lane.
+    private final class SendRace: @unchecked Sendable {
+        private let lock = NSLock()
+        private var result: SendOutcome?
+        private var continuation: CheckedContinuation<SendOutcome, Never>?
+        private var tasks: [Task<Void, Never>] = []
+
+        func install(_ continuation: CheckedContinuation<SendOutcome, Never>) {
+            lock.lock()
+            if let result {
+                lock.unlock()
+                continuation.resume(returning: result)
+            } else {
+                self.continuation = continuation
+                lock.unlock()
+            }
+        }
+
+        func add(_ task: Task<Void, Never>) {
+            lock.lock()
+            if result == nil {
+                tasks.append(task)
+                lock.unlock()
+            } else {
+                lock.unlock()
+                task.cancel()
+            }
+        }
+
+        func resolve(_ result: SendOutcome) {
+            lock.lock()
+            guard self.result == nil else {
+                lock.unlock()
+                return
+            }
+            self.result = result
+            let continuation = self.continuation
+            self.continuation = nil
+            let tasks = self.tasks
+            self.tasks.removeAll()
+            lock.unlock()
+
+            tasks.forEach { $0.cancel() }
+            continuation?.resume(returning: result)
+        }
+    }
+
+    private enum DeadlineError: Error {
+        case exceeded
+    }
+
+    private let store: LiveActivityAcceptanceOutboxStore
+    private let now: LiveActivityAcceptanceOutbox.Now
+    private let retryDelay: LiveActivityAcceptanceOutbox.RetryDelay
+    private let schedule: LiveActivityAcceptanceOutbox.Schedule
+    private let maximumConcurrentLanes: Int
+    private let sendTimeout: TimeInterval
+    private let send: LiveActivityAcceptanceOutbox.Send
+    private let onError: LiveActivityAcceptanceOutbox.ErrorHandler
+
+    private var inFlight: [String: (recordID: String, task: Task<Void, Never>)] = [:]
+    private var scheduled = Set<String>()
+    private var flushWaiters: [CheckedContinuation<Void, Never>] = []
+    private var stopped = false
+
+    init(
+        store: LiveActivityAcceptanceOutboxStore,
+        now: @escaping LiveActivityAcceptanceOutbox.Now,
+        retryDelay: @escaping LiveActivityAcceptanceOutbox.RetryDelay,
+        schedule: @escaping LiveActivityAcceptanceOutbox.Schedule,
+        maximumConcurrentLanes: Int,
+        sendTimeout: TimeInterval,
+        send: @escaping LiveActivityAcceptanceOutbox.Send,
+        onError: @escaping LiveActivityAcceptanceOutbox.ErrorHandler
+    ) {
+        self.store = store
+        self.now = now
+        self.retryDelay = retryDelay
+        self.schedule = schedule
+        self.maximumConcurrentLanes = max(1, maximumConcurrentLanes)
+        self.sendTimeout = max(0.001, sendTimeout)
+        self.send = send
+        self.onError = onError
+    }
+
+    func wake() {
+        pump()
+    }
+
+    func retryReady(_ key: String) {
+        scheduled.remove(key)
+        pump()
+    }
+
+    func flush() async {
+        pump()
+        guard !inFlight.isEmpty else { return }
+        await withCheckedContinuation { continuation in
+            flushWaiters.append(continuation)
+        }
+    }
+
+    func stop() {
+        guard !stopped else { return }
+        stopped = true
+        for value in inFlight.values {
+            value.task.cancel()
+        }
+        inFlight.removeAll()
+        resumeFlushWaiters()
+    }
+
+    private func pump() {
+        guard !stopped else {
+            resumeFlushWaiters()
+            return
+        }
+        let candidates: [LiveActivityAcceptanceRecord]
+        do {
+            candidates = try store.candidates()
+        } catch {
+            onError(error, nil)
+            resumeFlushWaitersIfIdle()
+            return
+        }
+
+        let stamp = now()
+        for candidate in candidates {
+            guard let retryAt = candidate.nextAttemptAt, retryAt > stamp else { continue }
+            let key = candidate.recordID
+            if scheduled.insert(key).inserted {
+                schedule(max(0, retryAt.timeIntervalSince(stamp))) { [weak self] in
+                    Task { await self?.retryReady(key) }
+                }
+            }
+        }
+
+        let ready = candidates
+            .filter { ($0.nextAttemptAt ?? .distantPast) <= stamp }
+            .sorted(by: LiveActivityAcceptanceOutbox.isPreferred)
+        for record in ready {
+            guard inFlight.count < maximumConcurrentLanes else { break }
+            let lane = record.target.laneIdentity
+            guard inFlight[lane] == nil else { continue }
+            start(record, lane: lane)
+        }
+        resumeFlushWaitersIfIdle()
+    }
+
+    private func start(_ record: LiveActivityAcceptanceRecord, lane: String) {
+        let send = self.send
+        let timeout = sendTimeout
+        let task = Task { [weak self] in
+            let outcome = await Self.performSend(record, timeout: timeout, send: send)
+            await self?.finish(record, lane: lane, outcome: outcome)
+        }
+        inFlight[lane] = (record.recordID, task)
+    }
+
+    private func finish(
+        _ record: LiveActivityAcceptanceRecord,
+        lane: String,
+        outcome: SendOutcome
+    ) {
+        guard !stopped,
+              inFlight[lane]?.recordID == record.recordID else {
+            return
+        }
+        inFlight.removeValue(forKey: lane)
+        scheduled.remove(record.recordID)
+
+        switch outcome {
+        case .settled(let ack):
+            do {
+                try store.acknowledge(record, acceptedEndScope: ack.isAccepted)
+            } catch {
+                onError(error, record.delivery)
+            }
+        case .failed(let error):
+            onError(error, record.delivery)
+            let delay = retryDelay(record.attempts + 1)
+            do {
+                let failed = try store.recordFailure(
+                    recordID: record.recordID,
+                    nextAttemptAt: now().addingTimeInterval(delay)
+                )
+                if failed != nil, scheduled.insert(record.recordID).inserted {
+                    let key = record.recordID
+                    schedule(delay) { [weak self] in
+                        Task { await self?.retryReady(key) }
+                    }
+                }
+            } catch {
+                onError(error, record.delivery)
+            }
+        }
+        pump()
+    }
+
+    private static func performSend(
+        _ record: LiveActivityAcceptanceRecord,
+        timeout: TimeInterval,
+        send: @escaping LiveActivityAcceptanceOutbox.Send
+    ) async -> SendOutcome {
+        let race = SendRace()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                race.install(continuation)
+
+                let sendTask = Task {
+                    do {
+                        let ack = try await send(record)
+                        guard ack.isSettled else {
+                            race.resolve(.failed(
+                                LiveActivityAcceptanceOutboxError.backendDidNotAccept(
+                                    ack.status
+                                )
+                            ))
+                            return
+                        }
+                        race.resolve(.settled(ack))
+                    } catch {
+                        race.resolve(.failed(error))
+                    }
+                }
+                race.add(sendTask)
+
+                let timeoutTask = Task {
+                    let nanoseconds = UInt64(
+                        min(Double(UInt64.max), timeout * 1_000_000_000)
+                    )
+                    do {
+                        try await Task.sleep(nanoseconds: nanoseconds)
+                    } catch {
+                        return
+                    }
+                    race.resolve(.failed(DeadlineError.exceeded))
+                }
+                race.add(timeoutTask)
+            }
+        } onCancel: {
+            race.resolve(.failed(CancellationError()))
+        }
+    }
+
+    private func resumeFlushWaitersIfIdle() {
+        guard inFlight.isEmpty else { return }
+        resumeFlushWaiters()
+    }
+
+    private func resumeFlushWaiters() {
+        let waiters = flushWaiters
+        flushWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 }

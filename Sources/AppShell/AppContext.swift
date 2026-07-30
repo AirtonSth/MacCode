@@ -554,6 +554,11 @@ public final class AppContext {
         let reboundPushToStart = (try? privatePushTargetStore.rebindDurableTokens(
             toHostServerId: liveActivityIdentity.serverId
         )) ?? []
+        do {
+            _ = try privatePushTargetStore.pruneStaleActivityUpdateTargets()
+        } catch {
+            NSLog("Live Activity token prune failed during launch: \(error)")
+        }
         self.liveActivitySyncCoordinator = LiveActivitySyncCoordinator(
             serverId: liveActivityIdentity.serverId,
             bootEpoch: liveActivityIdentity.bootEpoch,
