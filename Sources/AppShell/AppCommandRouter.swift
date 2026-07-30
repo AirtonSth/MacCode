@@ -2565,6 +2565,30 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return try ctx.messageRepo.listPage(threadId: thread, limit: max(0, min(limit, 500)), before: before, after: after)
     }
 
+    public func listAgentMessagesWithinBodyBudget(
+        thread: AgentThreadID,
+        limit: Int,
+        before: AgentMessageCursor?,
+        after: AgentMessageCursor?,
+        budget: Int,
+        contentLimit: Int
+    ) throws -> AgentMessageBodyBudgetResult {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        return try ctx.messageRepo.listPageWithinBodyBudget(
+            threadId: thread,
+            limit: max(1, min(limit, 500)),
+            before: before,
+            after: after,
+            budget: budget,
+            contentLimit: contentLimit,
+            appendEllipsisOnCap: false,
+            attachmentsByteLimit:
+                AgentMessageTransport.attachmentJSONMaxBytes,
+            attachmentsCountLimit:
+                AgentMessageTransport.attachmentCountLimit
+        )
+    }
+
     public func getAgentMessage(id: AgentMessageID) throws -> AgentMessage? {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         return try ctx.messageRepo.get(id: id)

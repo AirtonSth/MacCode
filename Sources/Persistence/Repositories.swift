@@ -764,18 +764,46 @@ public struct AgentMessageBodyBudgetResult: Sendable, Equatable {
     public var rows: [AgentMessage]
     public var blanked: Int
     public var hasMoreOlder: Bool
+    public var hasMoreNewer: Bool
     public var nextBefore: AgentMessageCursor?
+    public var nextAfter: AgentMessageCursor?
+    /// Original persisted UTF-8 body sizes keyed by message id (honest pre-truncation counts).
+    public var originalByteCounts: [AgentMessageID: Int]
+    /// Message ids whose returned `content` is shorter than the persisted body.
+    public var truncatedIDs: Set<AgentMessageID>
+    /// Exact number of persisted attachment objects, even when their JSON was
+    /// too large to cross the SQLite decode boundary.
+    public var attachmentCounts: [AgentMessageID: Int]
+    /// Rows whose attachment array was omitted or count-capped.
+    public var attachmentTruncatedIDs: Set<AgentMessageID>
+    /// Default/before pages prioritize newest bodies; after pages prioritize
+    /// the oldest rows immediately following their cursor.
+    public var prefersNewestBodies: Bool
 
     public init(
         rows: [AgentMessage],
         blanked: Int,
         hasMoreOlder: Bool = false,
-        nextBefore: AgentMessageCursor? = nil
+        nextBefore: AgentMessageCursor? = nil,
+        hasMoreNewer: Bool = false,
+        nextAfter: AgentMessageCursor? = nil,
+        originalByteCounts: [AgentMessageID: Int] = [:],
+        truncatedIDs: Set<AgentMessageID> = [],
+        attachmentCounts: [AgentMessageID: Int] = [:],
+        attachmentTruncatedIDs: Set<AgentMessageID> = [],
+        prefersNewestBodies: Bool = true
     ) {
         self.rows = rows
         self.blanked = blanked
         self.hasMoreOlder = hasMoreOlder
+        self.hasMoreNewer = hasMoreNewer
         self.nextBefore = nextBefore
+        self.nextAfter = nextAfter
+        self.originalByteCounts = originalByteCounts
+        self.truncatedIDs = truncatedIDs
+        self.attachmentCounts = attachmentCounts
+        self.attachmentTruncatedIDs = attachmentTruncatedIDs
+        self.prefersNewestBodies = prefersNewestBodies
     }
 }
 
@@ -918,57 +946,94 @@ public final class AgentMessageRepository: @unchecked Sendable {
 
     /// Keyset-bounded transcript page. Unlike `listWithinBodyBudget`, this never
     /// scans shells for the full thread and never asks SQLite to return more than
-    /// `limit + 1` capped bodies. Repeated `before` cursors use the same
+    /// `limit + 1` capped bodies. Repeated `before`/`after` cursors use the same
     /// (created_at,rowid) order as rendering, preventing page gaps/duplicates.
+    ///
+    /// - Parameters:
+    ///   - appendEllipsisOnCap: When true (UI path), character-capped bodies may
+    ///     gain a trailing ellipsis. Wire transport sets this false so truncation
+    ///     is represented only by flags/byte counts.
     public func listPageWithinBodyBudget(
         threadId: AgentThreadID,
         limit requestedLimit: Int,
-        before cursor: AgentMessageCursor? = nil,
+        before beforeCursor: AgentMessageCursor? = nil,
+        after afterCursor: AgentMessageCursor? = nil,
         budget: Int,
-        contentLimit: Int = AssistantTimelineState.liveTextLimit
+        contentLimit: Int = AssistantTimelineState.liveTextLimit,
+        appendEllipsisOnCap: Bool = true,
+        attachmentsByteLimit: Int = 64 * 1_024,
+        attachmentsCountLimit: Int = 32
     ) throws -> AgentMessageBodyBudgetResult {
         try db.performSync { database in
         let limit = max(1, min(requestedLimit, 500))
-        let cappedContentLimit = max(1, contentLimit)
-        let cappedByteLimit = cappedContentLimit >= (Int.max - 128) / 4
-            ? Int.max
-            : (cappedContentLimit * 4) + 128
+        let cappedByteLimit = max(1, contentLimit)
+        let cappedAttachmentsByteLimit = max(2, attachmentsByteLimit)
+        let cappedAttachmentsCountLimit = max(0, attachmentsCountLimit)
+        let afterDirection = afterCursor != nil
         let predicate: String
-        if cursor == nil {
+        let orderDesc: String
+        let orderAsc: String
+        let windowOrder: String
+        if let _ = afterCursor {
+            predicate = "thread_id = ? AND (created_at > ? OR (created_at = ? AND rowid > (SELECT rowid FROM agent_messages WHERE id = ?)))"
+            orderDesc = "created_at ASC, rowid ASC"
+            orderAsc = "created_at ASC, rowid ASC"
+            windowOrder = "created_at ASC, rowid ASC"
+        } else if beforeCursor == nil {
             predicate = "thread_id = ?"
+            orderDesc = "created_at DESC, rowid DESC"
+            orderAsc = "created_at ASC, rowid ASC"
+            windowOrder = "created_at DESC, rowid DESC"
         } else {
             predicate = "thread_id = ? AND (created_at < ? OR (created_at = ? AND rowid < (SELECT rowid FROM agent_messages WHERE id = ?)))"
+            orderDesc = "created_at DESC, rowid DESC"
+            orderAsc = "created_at ASC, rowid ASC"
+            windowOrder = "created_at DESC, rowid DESC"
         }
         let statement = try database.prepare("""
             WITH candidates AS (
                 SELECT rowid, id, thread_id, role,
-                       substr(content, 1, ?) AS capped_content,
+                       substr(CAST(content AS BLOB), 1, ?) AS capped_content,
                        length(CAST(content AS BLOB)) AS body_bytes,
-                       created_at, attachments_json
+                       created_at,
+                       CASE
+                         WHEN length(CAST(attachments_json AS BLOB)) <= ?
+                         THEN attachments_json
+                         ELSE '[]'
+                       END AS capped_attachments_json,
+                       CASE
+                         WHEN json_valid(attachments_json)
+                              AND json_type(attachments_json) = 'array'
+                         THEN json_array_length(attachments_json)
+                         ELSE 0
+                       END AS attachment_count,
+                       length(CAST(attachments_json AS BLOB)) AS attachment_bytes
                 FROM agent_messages
                 WHERE \(predicate)
-                ORDER BY created_at DESC, rowid DESC
+                ORDER BY \(orderDesc)
                 LIMIT ?
             ), ranked AS (
                 SELECT *,
-                       ROW_NUMBER() OVER (ORDER BY created_at DESC, rowid DESC) AS row_number,
+                       ROW_NUMBER() OVER (ORDER BY \(windowOrder)) AS row_number,
                        SUM(MIN(body_bytes, ?)) OVER (
-                           ORDER BY created_at DESC, rowid DESC
+                           ORDER BY \(windowOrder)
                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                        ) AS running_bytes,
                        COUNT(*) OVER () AS candidate_count
                 FROM candidates
             )
             SELECT id, thread_id, role, capped_content, created_at,
-                   attachments_json, body_bytes, candidate_count
+                   capped_attachments_json, body_bytes, candidate_count,
+                   attachment_count, attachment_bytes
             FROM ranked
-            WHERE row_number <= ? AND (row_number = 1 OR running_bytes <= ?)
-            ORDER BY created_at ASC, rowid ASC;
+            WHERE row_number <= ? AND running_bytes <= ?
+            ORDER BY \(orderAsc);
         """)
         var index: Int32 = 1
-        try statement.bind(index, cappedContentLimit); index += 1
+        try statement.bind(index, cappedByteLimit); index += 1
+        try statement.bind(index, cappedAttachmentsByteLimit); index += 1
         try statement.bind(index, threadId.value.uuidString); index += 1
-        if let cursor {
+        if let cursor = afterCursor ?? beforeCursor {
             let created = iso.string(from: cursor.createdAt)
             try statement.bind(index, created); index += 1
             try statement.bind(index, created); index += 1
@@ -980,6 +1045,10 @@ public final class AgentMessageRepository: @unchecked Sendable {
         try statement.bind(index, max(1, budget))
 
         var rows: [AgentMessage] = []
+        var originalByteCounts: [AgentMessageID: Int] = [:]
+        var truncatedIDs: Set<AgentMessageID> = []
+        var attachmentCounts: [AgentMessageID: Int] = [:]
+        var attachmentTruncatedIDs: Set<AgentMessageID> = []
         var candidateCount = 0
         while try statement.step() {
             guard let idText = statement.columnText(0), let id = UUID(uuidString: idText),
@@ -987,29 +1056,80 @@ public final class AgentMessageRepository: @unchecked Sendable {
                   let roleText = statement.columnText(2), let role = AgentMessageRole(rawValue: roleText),
                   let createdText = statement.columnText(4), let createdAt = iso.date(from: createdText)
             else { continue }
-            let rawContent = statement.columnText(3) ?? ""
+            let rawContent = utf8Prefix(from: statement.columnBlob(3))
             let originalBytes = Int(statement.columnInt64(6))
-            let content = originalBytes > rawContent.utf8.count
-                ? AssistantTimelineState.cappedText(rawContent + "…", limit: cappedContentLimit)
-                : rawContent
+            let messageID = AgentMessageID(id)
+            originalByteCounts[messageID] = originalBytes
+            let content: String
+            if originalBytes > rawContent.utf8.count {
+                truncatedIDs.insert(messageID)
+                content = appendEllipsisOnCap
+                    ? AssistantTimelineState.cappedText(rawContent + "…")
+                    : rawContent
+            } else {
+                content = rawContent
+            }
             candidateCount = max(candidateCount, Int(statement.columnInt64(7)))
+            let attachmentCount = max(0, Int(statement.columnInt64(8)))
+            let attachmentBytes = max(0, Int(statement.columnInt64(9)))
+            attachmentCounts[messageID] = attachmentCount
+            let decodedAttachments = decodeAttachments(statement.columnText(5))
+            let attachments = Array(
+                decodedAttachments.prefix(cappedAttachmentsCountLimit)
+            )
+            if attachmentBytes > cappedAttachmentsByteLimit
+                || attachmentCount > attachments.count {
+                attachmentTruncatedIDs.insert(messageID)
+            }
             rows.append(AgentMessage(
-                id: AgentMessageID(id),
+                id: messageID,
                 threadId: AgentThreadID(threadUUID),
                 role: role,
                 content: content,
                 createdAt: createdAt,
-                attachments: decodeAttachments(statement.columnText(5))
+                attachments: attachments
             ))
         }
-        let hasMoreOlder = candidateCount > rows.count || candidateCount > limit
+        let budgetDropped = max(0, min(candidateCount, limit) - rows.count)
+        let hasMoreFromLimit = candidateCount > limit
+        let hasMoreOlder: Bool
+        let hasMoreNewer: Bool
+        if afterDirection {
+            hasMoreOlder = true
+            hasMoreNewer = hasMoreFromLimit || budgetDropped > 0 || candidateCount > rows.count
+        } else {
+            hasMoreOlder = hasMoreFromLimit || budgetDropped > 0 || candidateCount > rows.count
+            hasMoreNewer = beforeCursor != nil
+        }
         return AgentMessageBodyBudgetResult(
             rows: rows,
             blanked: max(0, candidateCount - rows.count),
             hasMoreOlder: hasMoreOlder,
-            nextBefore: rows.first.map { AgentMessageCursor(createdAt: $0.createdAt, id: $0.id) }
+            nextBefore: rows.first.map { AgentMessageCursor(createdAt: $0.createdAt, id: $0.id) },
+            hasMoreNewer: hasMoreNewer,
+            nextAfter: rows.last.map { AgentMessageCursor(createdAt: $0.createdAt, id: $0.id) },
+            originalByteCounts: originalByteCounts,
+            truncatedIDs: truncatedIDs,
+            attachmentCounts: attachmentCounts,
+            attachmentTruncatedIDs: attachmentTruncatedIDs,
+            prefersNewestBodies: !afterDirection
         )
         }
+    }
+
+    /// SQLite returns a byte-capped BLOB so the full body never crosses the
+    /// decode boundary. A cap can land inside the final scalar; remove at most
+    /// three continuation bytes until the prefix is valid UTF-8.
+    private func utf8Prefix(from blob: Data?) -> String {
+        guard var bytes = blob else { return "" }
+        for _ in 0..<4 {
+            if let text = String(data: bytes, encoding: .utf8) {
+                return text
+            }
+            guard !bytes.isEmpty else { break }
+            bytes.removeLast()
+        }
+        return ""
     }
 
     public func count(threadId: AgentThreadID) throws -> Int {

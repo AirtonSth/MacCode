@@ -822,19 +822,6 @@ public final class AppContext {
             if let request = event.providerRequestId { payload["provider_request_id"] = .string(request) }
             return .object(payload)
         }
-        func messageJSON(_ message: AgentMessage) -> JSONValue {
-            guard let data = try? JSONEncoder().encode(message),
-                  let decoded = try? JSONDecoder().decode(JSONValue.self, from: data),
-                  case .object(var object) = decoded else {
-                return .null
-            }
-            let references = message.attachments.compactMap(AgentAttachmentReference.init)
-            object["attachments"] = (try? JSONDecoder().decode(
-                JSONValue.self,
-                from: JSONEncoder().encode(references)
-            )) ?? .array([])
-            return .object(object)
-        }
         func agentRunPayload(threadId: AgentThreadID, runId: AgentRunID? = nil, status: AgentRunStatus? = nil) -> JSONValue {
             var payload: [String: JSONValue] = ["thread_id": .string(threadId.value.uuidString)]
             if let runId {
@@ -864,7 +851,11 @@ public final class AppContext {
             self?.beginTokenSaverAttempt(runId: runId)
         }
         coordinator.onMessageAppended = { message in
-            EventBus.shared.publish(kind: "agent.message.appended", payload: messageJSON(message))
+            // Bounded wire policy: never put a multi-MiB body into EventBus.
+            EventBus.shared.publish(
+                kind: "agent.message.appended",
+                payload: AgentMessageTransport.appendedEventPayload(from: message)
+            )
         }
         coordinator.onAssistantEvent = { ev, tid, runId in
             let t = tid.value.uuidString

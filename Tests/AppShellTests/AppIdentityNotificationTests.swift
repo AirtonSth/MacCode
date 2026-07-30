@@ -925,6 +925,94 @@ final class AppIdentityNotificationTests: XCTestCase {
         }, "the iOS mirror must receive the persisted assistant answer before a follow-up clears live stream state")
     }
 
+    func testAgentMessageAppendEventBoundsBodiesOverOneMiBWithHonestHash() async throws {
+        let dir = NSTemporaryDirectory() + "RC2MessageEventsBudget-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let oversized = String(repeating: "B", count: 1_200_000) // > 1 MiB
+        let expectedHash = AgentMessageTransport.bodySHA256Hex(oversized)
+        let attachments = (0..<100).map { index in
+            let digest = String(format: "%064x", index + 1)
+            return AgentAttachment(
+                id: digest,
+                path: "/private/never-on-wire-\(index)",
+                displayName: "event-\(index).txt",
+                kind: .file,
+                mimeType: "text/plain",
+                sha256: digest,
+                sizeBytes: index + 1
+            )
+        }
+        let message = AgentMessage(
+            threadId: AgentThreadID(),
+            role: .assistant,
+            content: oversized,
+            attachments: attachments
+        )
+
+        // Exercise the same policy AppContext publishes for agent.message.appended.
+        let payloadValue = AgentMessageTransport.appendedEventPayload(from: message)
+        guard case .object(let payload) = payloadValue else {
+            return XCTFail("appended event payload must be an object")
+        }
+        let content = try XCTUnwrap(payload["content"]?.stringValue)
+        XCTAssertLessThanOrEqual(content.utf8.count, AgentMessageTransport.eventContentMaxBytes,
+                                 "event content must be a UTF-8 prefix of at most 2048 bytes")
+        XCTAssertLessThanOrEqual(
+            try JSONEncoder().encode(payloadValue).count,
+            AgentMessageTransport.eventPayloadMaxBytes,
+            "the fully escaped event payload must remain under its transport cap"
+        )
+        XCTAssertEqual(content, String(oversized.prefix(AgentMessageTransport.eventContentMaxBytes)))
+        XCTAssertEqual(payload["body_available"], .bool(true))
+        XCTAssertEqual(payload["body_truncated"], .bool(true))
+        XCTAssertEqual(payload["body_byte_count"], .number(Double(oversized.utf8.count)),
+                       "body_byte_count must report the original persisted body size")
+        XCTAssertEqual(payload["body_sha256"], .string(expectedHash),
+                       "body_sha256 must be the lowercase SHA-256 of the complete UTF-8 body")
+        XCTAssertEqual(payload["role"], .string("assistant"))
+        XCTAssertEqual(payload["attachment_count"], .number(100))
+        XCTAssertEqual(payload["attachments_truncated"], .bool(true))
+        XCTAssertLessThanOrEqual(
+            payload["attachments"]?.arrayValue?.count ?? Int.max,
+            AgentMessageTransport.attachmentCountLimit
+        )
+        XCTAssertFalse(
+            String(
+                decoding: try JSONEncoder().encode(payloadValue),
+                as: UTF8.self
+            ).contains("/private/never-on-wire-")
+        )
+
+        // Small messages remain complete.
+        let small = AgentMessage(threadId: message.threadId, role: .user, content: "tiny")
+        guard case .object(let smallPayload) = AgentMessageTransport.appendedEventPayload(from: small) else {
+            return XCTFail("small event payload must be an object")
+        }
+        XCTAssertEqual(smallPayload["content"], .string("tiny"))
+        XCTAssertEqual(smallPayload["body_truncated"], .bool(false))
+        XCTAssertEqual(smallPayload["body_byte_count"], .number(4))
+        XCTAssertEqual(smallPayload["body_sha256"], .string(AgentMessageTransport.bodySHA256Hex("tiny")))
+        XCTAssertEqual(smallPayload["attachment_count"], .number(0))
+        XCTAssertEqual(smallPayload["attachments_truncated"], .bool(false))
+
+        // Publish through EventBus the way AppContext does for coordinator appends.
+        let startSeq = EventBus.shared.snapshot().lastSeq
+        var events: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: startSeq) { event in
+            if event.kind == "agent.message.appended" { events.append(event) }
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+        EventBus.shared.publish(kind: "agent.message.appended", payload: payloadValue)
+        await waitAsync("bounded append event is visible on the bus") { !events.isEmpty }
+        guard case .object(let busPayload) = events.first?.payload else {
+            return XCTFail("EventBus must retain the bounded payload object")
+        }
+        XCTAssertLessThanOrEqual(busPayload["content"]?.stringValue?.utf8.count ?? Int.max,
+                                 AgentMessageTransport.eventContentMaxBytes)
+        XCTAssertEqual(busPayload["body_sha256"], .string(expectedHash))
+    }
+
     func testHostSendTitlesPlaceholderThreadFromFullFirstUserMessage() async throws {
         let dir = NSTemporaryDirectory() + "RC2ThreadTitle-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)

@@ -2469,6 +2469,388 @@ final class DispatcherTests: XCTestCase {
     }
 
     @MainActor
+    func test_agentMessageListV1BoundsOversizedBodiesAndKeepsLegacyArray() async throws {
+        let router = FakeRouter()
+        let t = AgentThread(workspaceId: nil, title: "budget", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [t]
+        let oversized = String(
+            repeating: "A\n\"\\\u{0001}",
+            count: 300_000
+        )
+        XCTAssertGreaterThan(oversized.utf8.count, 1_048_576)
+        let attachments = (0..<100).map { index in
+            let digest = String(format: "%064x", index + 1)
+            return AgentAttachment(
+                id: digest,
+                path: "/secret/attachment-\(index)",
+                displayName: "attachment-\(index).txt",
+                kind: .file,
+                mimeType: "text/plain",
+                sha256: digest,
+                sizeBytes: index + 1
+            )
+        }
+        let base = Date(timeIntervalSinceReferenceDate: 2_000)
+        let largeID = AgentMessageID(UUID(uuidString: "00000000-0000-0000-0000-000000000101")!)
+        router.messageStore = [
+            AgentMessage(
+                id: largeID,
+                threadId: t.id,
+                role: .assistant,
+                content: oversized,
+                createdAt: base,
+                attachments: attachments
+            )
+        ]
+        let d = JSONRPCDispatcher(router: router)
+
+        // Legacy list remains a full-content array (no response_version).
+        let legacy = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.message.list", params: [
+            "thread_id": .string(t.id.value.uuidString),
+            "limit": .number(20)
+        ]))
+        guard case .array(let legacyMessages)? = legacy.result,
+              case .object(let legacyLarge)? = legacyMessages.first else {
+            return XCTFail("legacy agent.message.list must return an array of full messages")
+        }
+        XCTAssertEqual(legacyLarge["content"]?.stringValue?.utf8.count, oversized.utf8.count,
+                       "without response_version=1, list must keep the full persisted body for compatibility")
+
+        let v1 = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.message.list", params: [
+            "thread_id": .string(t.id.value.uuidString),
+            "limit": .number(20),
+            "response_version": .number(1),
+            "max_body_bytes": .number(64_000)
+        ]))
+        guard case .object(let envelope)? = v1.result,
+              case .array(let messages)? = envelope["messages"],
+              case .object(let object)? = messages.first else {
+            return XCTFail("v1 list must return a versioned envelope with messages")
+        }
+        XCTAssertEqual(envelope["version"], .number(1))
+        XCTAssertEqual(messages.count, 1, "single-message page must still include the oversized row")
+        let encodedResponse = try JSONEncoder().encode(v1)
+        XCTAssertLessThanOrEqual(
+            encodedResponse.count,
+            64_000,
+            "max_body_bytes owns the fully escaped JSON-RPC response, not raw character counts"
+        )
+        XCTAssertFalse(
+            String(decoding: encodedResponse, as: UTF8.self)
+                .contains("/secret/"),
+            "v1 attachment metadata must never expose provider-visible host paths"
+        )
+        let content = try XCTUnwrap(object["content"]?.stringValue)
+        var aggregate = 0
+        for message in messages {
+            guard case .object(let row) = message else { return XCTFail("message must be object") }
+            aggregate += (row["content"]?.stringValue ?? "").utf8.count
+            XCTAssertNotNil(row["content"]?.stringValue?.data(using: .utf8), "v1 content must be valid UTF-8")
+            XCTAssertFalse((row["content"]?.stringValue ?? "").contains("…"),
+                           "v1 wire content must not invent ellipsis; flags represent truncation")
+        }
+        XCTAssertEqual(object["body_available"], .bool(true))
+        XCTAssertEqual(object["body_truncated"], .bool(true),
+                       "oversized body must report honest truncation")
+        XCTAssertEqual(object["body_byte_count"], .number(Double(oversized.utf8.count)),
+                       "body_byte_count must describe the original persisted body")
+        XCTAssertLessThan(content.utf8.count, oversized.utf8.count)
+        XCTAssertLessThanOrEqual(content.utf8.count, 64_000)
+        XCTAssertLessThanOrEqual(aggregate, 64_000,
+                                 "aggregate returned content UTF-8 bytes must not exceed max_body_bytes")
+        XCTAssertEqual(object["attachment_count"], .number(100))
+        XCTAssertEqual(object["attachments_truncated"], .bool(true))
+        XCTAssertLessThanOrEqual(
+            object["attachments"]?.arrayValue?.count ?? Int.max,
+            AgentMessageTransport.attachmentCountLimit
+        )
+    }
+
+    @MainActor
+    func test_agentMessageListV1ColdTenLargeMessagesFitsFirstUseWebSocketBudget() async throws {
+        let router = FakeRouter()
+        let thread = AgentThread(
+            workspaceId: nil,
+            title: "cold first use",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        router.threadStore = [thread]
+        let base = Date(timeIntervalSinceReferenceDate: 2_500)
+        router.messageStore = (0..<10).map { index in
+            AgentMessage(
+                id: AgentMessageID(
+                    UUID(
+                        uuidString: String(
+                            format: "00000000-0000-0000-0001-%012d",
+                            index
+                        )
+                    )!
+                ),
+                threadId: thread.id,
+                role: .assistant,
+                content: String(repeating: "cold-🙂-\"\\\n", count: 20_000),
+                createdAt: base.addingTimeInterval(TimeInterval(index))
+            )
+        }
+        XCTAssertGreaterThan(
+            router.messageStore.reduce(0) { $0 + $1.content.utf8.count },
+            2 * 1_048_576
+        )
+
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let response = await dispatcher.dispatch(
+            JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(11),
+                method: "agent.message.list",
+                params: [
+                    "thread_id": .string(thread.id.value.uuidString),
+                    "limit": .number(10),
+                    "response_version": .number(1),
+                    "max_body_bytes": .number(64 * 1_024),
+                ]
+            )
+        )
+
+        let encoded = try JSONEncoder().encode(response)
+        XCTAssertLessThanOrEqual(
+            encoded.count,
+            64 * 1_024,
+            "cold first-use history must fit one bounded WebSocket response"
+        )
+        guard case .object(let envelope)? = response.result,
+              case .array(let messages)? = envelope["messages"] else {
+            return XCTFail("cold first-use history must use the v1 envelope")
+        }
+        XCTAssertFalse(messages.isEmpty)
+        XCTAssertLessThan(messages.count, 10)
+        XCTAssertEqual(
+            envelope["has_more_older"],
+            .bool(true),
+            "rows omitted by the first-use byte budget must remain pageable"
+        )
+        XCTAssertTrue(messages.allSatisfy { value in
+            guard case .object(let message) = value else { return false }
+            return message["body_available"] == .bool(true)
+                && message["body_truncated"] == .bool(true)
+        })
+    }
+
+    @MainActor
+    func test_agentMessageGetV1ChunksOverOneMiBWithHashAndExactEnvelopeCap() async throws {
+        let router = FakeRouter()
+        let t = AgentThread(workspaceId: nil, title: "get-budget", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [t]
+        let body = String(
+            repeating: "🙂\n\"\\\u{0001}z",
+            count: 140_000
+        )
+        XCTAssertGreaterThan(body.utf8.count, 1_048_576)
+        let mid = AgentMessageID()
+        router.messageStore = [
+            AgentMessage(id: mid, threadId: t.id, role: .assistant, content: body)
+        ]
+        let d = JSONRPCDispatcher(router: router)
+
+        let legacy = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.message.get", params: [
+            "message_id": .string(mid.value.uuidString)
+        ]))
+        guard case .object(let legacyObject)? = legacy.result else {
+            return XCTFail("legacy get must return the full message object")
+        }
+        XCTAssertEqual(legacyObject["content"]?.stringValue?.utf8.count, body.utf8.count)
+
+        let expectedHash = AgentMessageTransport.bodySHA256Hex(body)
+        var offset = 0
+        var reconstructed = ""
+        var chunks = 0
+        while true {
+            let response = await d.dispatch(JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(2 + chunks),
+                method: "agent.message.get",
+                params: [
+                    "message_id": .string(mid.value.uuidString),
+                    "response_version": .number(1),
+                    "max_bytes": .number(64_000),
+                    "offset_bytes": .number(Double(offset)),
+                ]
+            ))
+            XCTAssertLessThanOrEqual(
+                try JSONEncoder().encode(response).count,
+                64_000,
+                "every escaped chunk response must fit its requested HTTP budget"
+            )
+            guard case .object(let envelope)? = response.result,
+                  Set(envelope.keys) == [
+                    "version", "message", "body_offset",
+                    "body_next_offset",
+                  ],
+                  case .object(let message)? = envelope["message"],
+                  let content = message["content"]?.stringValue else {
+                return XCTFail("v1 get must return the frozen chunk envelope")
+            }
+            XCTAssertEqual(envelope["version"], .number(1))
+            XCTAssertEqual(
+                envelope["body_offset"],
+                .number(Double(offset))
+            )
+            XCTAssertEqual(message["body_offset"], .number(Double(offset)))
+            XCTAssertEqual(message["body_sha256"], .string(expectedHash))
+            XCTAssertEqual(
+                message["body_byte_count"],
+                .number(Double(body.utf8.count))
+            )
+            XCTAssertNotNil(content.data(using: .utf8))
+            reconstructed += content
+            chunks += 1
+            if let next = envelope["body_next_offset"]?.intValue {
+                XCTAssertGreaterThan(next, offset)
+                XCTAssertEqual(
+                    message["body_next_offset"],
+                    .number(Double(next))
+                )
+                XCTAssertEqual(message["body_truncated"], .bool(true))
+                offset = next
+            } else {
+                XCTAssertEqual(
+                    envelope["body_next_offset"],
+                    .null
+                )
+                XCTAssertEqual(message["body_truncated"], .bool(false))
+                break
+            }
+        }
+        XCTAssertGreaterThan(chunks, 4)
+        XCTAssertEqual(reconstructed, body)
+        XCTAssertEqual(
+            AgentMessageTransport.bodySHA256Hex(reconstructed),
+            expectedHash
+        )
+
+        let missingOffset = await d.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(9_998),
+            method: "agent.message.get",
+            params: [
+                "message_id": .string(mid.value.uuidString),
+                "response_version": .number(1),
+                "max_bytes": .number(64_000),
+            ]
+        ))
+        XCTAssertEqual(
+            missingOffset.error?.code,
+            JSONRPCError.invalidParams.code,
+            "advertising v1 without its required chunk offset must fail closed"
+        )
+
+        let midScalar = await d.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(9_999),
+            method: "agent.message.get",
+            params: [
+                "message_id": .string(mid.value.uuidString),
+                "response_version": .number(1),
+                "max_bytes": .number(64_000),
+                "offset_bytes": .number(1),
+            ]
+        ))
+        XCTAssertEqual(midScalar.error?.code, JSONRPCError.invalidParams.code)
+
+        let capped = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(10_000), method: "agent.message.get", params: [
+            "message_id": .string(mid.value.uuidString),
+            "response_version": .number(1),
+            "max_bytes": .number(Double(10 * 1_048_576)),
+            "offset_bytes": .number(0)
+        ]))
+        guard case .object(let cappedEnv)? = capped.result,
+              case .object(let cappedMessage)? = cappedEnv["message"] else {
+            return XCTFail("v1 get must accept oversized max_bytes and clamp")
+        }
+        XCTAssertLessThanOrEqual(
+            try JSONEncoder().encode(capped).count,
+            AgentMessageTransport.getMaxBytesCap
+        )
+        XCTAssertEqual(cappedMessage["body_sha256"], .string(expectedHash))
+    }
+
+    @MainActor
+    func test_agentMessageListV1PaginationDoesNotSkipBudgetDroppedRows() async throws {
+        let router = FakeRouter()
+        let t = AgentThread(workspaceId: nil, title: "page-budget", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [t]
+        let base = Date(timeIntervalSinceReferenceDate: 3_000)
+        // Three medium bodies: a tight budget should keep only the newest and flag older via has_more_older.
+        router.messageStore = (0..<3).map { index in
+            AgentMessage(
+                id: AgentMessageID(UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", index))!),
+                threadId: t.id,
+                role: .assistant,
+                content: String(repeating: "x", count: 1_000),
+                createdAt: base.addingTimeInterval(TimeInterval(index))
+            )
+        }
+        let d = JSONRPCDispatcher(router: router)
+        let first = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.message.list", params: [
+            "thread_id": .string(t.id.value.uuidString),
+            "limit": .number(10),
+            "response_version": .number(1),
+            "max_body_bytes": .number(1_200)
+        ]))
+        guard case .object(let page)? = first.result,
+              case .array(let messages)? = page["messages"],
+              case .object(let nextBefore)? = page["next_before"] else {
+            return XCTFail("v1 list must expose next_before when older rows remain")
+        }
+        XCTAssertEqual(page["has_more_older"], .bool(true),
+                       "budget-omitted older rows must surface as has_more_older, not silent skips")
+        XCTAssertFalse(messages.isEmpty)
+        XCTAssertEqual(
+            Set(nextBefore.keys),
+            ["created_at", "id"],
+            "v1 cursors use one exact snake_case shape"
+        )
+
+        let older = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.message.list", params: [
+            "thread_id": .string(t.id.value.uuidString),
+            "limit": .number(10),
+            "response_version": .number(1),
+            "max_body_bytes": .number(50_000),
+            "before": .object(nextBefore)
+        ]))
+        guard case .object(let olderPage)? = older.result,
+              case .array(let olderMessages)? = olderPage["messages"] else {
+            return XCTFail("older v1 page must return messages")
+        }
+        XCTAssertFalse(olderMessages.isEmpty,
+                       "pagination must eventually reach budget-omitted older rows")
+
+        let malformedCursor = await d.dispatch(
+            JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(3),
+                method: "agent.message.list",
+                params: [
+                    "thread_id": .string(t.id.value.uuidString),
+                    "limit": .number(10),
+                    "response_version": .number(1),
+                    "max_body_bytes": .number(50_000),
+                    "before": .object([
+                        "createdAt": .string("not-the-v1-cursor-shape"),
+                        "id": .string(UUID().uuidString),
+                    ]),
+                ]
+            )
+        )
+        XCTAssertEqual(
+            malformedCursor.error?.code,
+            JSONRPCError.invalidParams.code,
+            "a modern malformed cursor must fail closed instead of restarting at the newest page"
+        )
+    }
+
+    @MainActor
     func test_agentThreadListKeepsFullTitleAndAddsDisplayTitleForMirrors() async throws {
         let router = FakeRouter()
         let fullTitle = "git add commit and push all repos here with this long exact wording"

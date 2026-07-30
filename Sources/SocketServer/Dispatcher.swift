@@ -128,6 +128,17 @@ public protocol CommandRouting: AnyObject {
     func selectAgentThread(thread: AgentThreadID, surfaceID: SurfaceID?) throws
     func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage]
     func listAgentMessagesPage(thread: AgentThreadID, limit: Int, before: AgentMessageCursor?, after: AgentMessageCursor?) throws -> AgentMessagePage
+    /// Body-budgeted keyset page used by `agent.message.list` response_version=1.
+    /// Hosts with SQLite should override to call `listPageWithinBodyBudget`; the
+    /// protocol extension provides an in-memory default for test conformers.
+    func listAgentMessagesWithinBodyBudget(
+        thread: AgentThreadID,
+        limit: Int,
+        before: AgentMessageCursor?,
+        after: AgentMessageCursor?,
+        budget: Int,
+        contentLimit: Int
+    ) throws -> AgentMessageBodyBudgetResult
     /// PERF-007: returns the set of thread IDs that have at least one message, via a
     /// single SQL query. Used by agent.thread.list to derive provider_locked for every
     /// thread without issuing one query per thread.
@@ -265,6 +276,29 @@ public extension CommandRouting {
 
     func activeAgentRun(thread: AgentThreadID) throws -> AgentActiveRunSnapshot? {
         nil
+    }
+
+    /// Safe in-memory default so FakeRouter/test hosts need no SQL body-budget path.
+    func listAgentMessagesWithinBodyBudget(
+        thread: AgentThreadID,
+        limit: Int,
+        before: AgentMessageCursor?,
+        after: AgentMessageCursor?,
+        budget: Int,
+        contentLimit: Int
+    ) throws -> AgentMessageBodyBudgetResult {
+        let page = try listAgentMessagesPage(
+            thread: thread,
+            limit: limit,
+            before: before,
+            after: after
+        )
+        return AgentMessageTransport.pageWithinBodyBudget(
+            page: page,
+            budget: budget,
+            contentLimit: contentLimit,
+            afterDirection: after != nil
+        )
     }
 
     func createAgentThreadRouting(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?, routing: AgentRoutingRequest?, nestedRunContext: AgentNestedRunContext? = nil) async throws -> AgentThread {
@@ -2123,6 +2157,48 @@ public final class JSONRPCDispatcher {
             case "agent.message.list":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 let limit = params["limit"]?.intValue ?? 200
+                if let responseVersion = params["response_version"] {
+                    guard responseVersion.intValue == 1,
+                          let rawBudget = params["max_body_bytes"]?.intValue else {
+                        throw JSONRPCError.invalidParams
+                    }
+                    let maxBodyBytes = AgentMessageTransport.clampListMaxBodyBytes(rawBudget)
+                    guard AgentMessageTransport.supportsResponseBudget(
+                        maxBodyBytes
+                    ) else {
+                        throw JSONRPCError.invalidParams
+                    }
+                    let before = try v1MessageCursor(
+                        from: params["before"]
+                    )
+                    let after = try v1MessageCursor(
+                        from: params["after"]
+                    )
+                    guard before == nil || after == nil else {
+                        throw JSONRPCError.invalidParams
+                    }
+                    let budgeted = try router.listAgentMessagesWithinBodyBudget(
+                        thread: tid,
+                        limit: limit,
+                        before: before,
+                        after: after,
+                        budget: maxBodyBytes,
+                        contentLimit:
+                            AgentMessageTransport.sqlContentLimit(
+                                for: maxBodyBytes
+                            )
+                    )
+                    guard let result = AgentMessageTransport.v1ListResult(
+                        from: budgeted,
+                        maxResponseBytes: maxBodyBytes,
+                        responseID: id,
+                        basePayload: messagePayload,
+                        encodeCursor: v1MessageCursorPayload
+                    ) else {
+                        throw JSONRPCError.invalidParams
+                    }
+                    return .init(id: id, result: result)
+                }
                 if params["pagination"]?.boolValue == true || params["page"]?.boolValue == true {
                     let page = try router.listAgentMessagesPage(
                         thread: tid,
@@ -2136,6 +2212,30 @@ public final class JSONRPCDispatcher {
             case "agent.message.get":
                 guard let mid = params["message_id"]?.stringValue.flatMap(UUID.init).map(AgentMessageID.init) else { throw JSONRPCError.invalidParams }
                 guard let message = try router.getAgentMessage(id: mid) else { throw JSONRPCError.invalidParams }
+                if let responseVersion = params["response_version"] {
+                    guard responseVersion.intValue == 1,
+                          let rawMaxBytes = params["max_bytes"]?.intValue,
+                          let offsetBytes = params["offset_bytes"]?.intValue
+                    else {
+                        throw JSONRPCError.invalidParams
+                    }
+                    let maxBytes = AgentMessageTransport.clampGetMaxBytes(
+                        rawMaxBytes
+                    )
+                    guard AgentMessageTransport.supportsResponseBudget(
+                        maxBytes
+                    ),
+                          let result = AgentMessageTransport.v1GetResult(
+                        message: message,
+                        offsetBytes: offsetBytes,
+                        maxResponseBytes: maxBytes,
+                        responseID: id,
+                        basePayload: messagePayload
+                          ) else {
+                        throw JSONRPCError.invalidParams
+                    }
+                    return .init(id: id, result: result)
+                }
                 return .init(id: id, result: messagePayload(message))
             case "agent.run.stop":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
@@ -3364,6 +3464,42 @@ public final class JSONRPCDispatcher {
         return nil
     }
 
+    private func messageCursorPayload(_ cursor: AgentMessageCursor) -> JSONValue {
+        .object([
+            "created_at": .string(iso8601(cursor.createdAt)),
+            "createdAt": .string(iso8601(cursor.createdAt)),
+            "id": .string(cursor.id.value.uuidString)
+        ])
+    }
+
+    private func v1MessageCursorPayload(
+        _ cursor: AgentMessageCursor
+    ) -> JSONValue {
+        .object([
+            "created_at": .string(iso8601(cursor.createdAt)),
+            "id": .string(cursor.id.value.uuidString),
+        ])
+    }
+
+    private func v1MessageCursor(
+        from value: JSONValue?
+    ) throws -> AgentMessageCursor? {
+        guard let value else { return nil }
+        if value == .null { return nil }
+        guard case .object(let object) = value,
+              Set(object.keys) == ["created_at", "id"],
+              let id = object["id"]?.stringValue
+                .flatMap(UUID.init)
+                .map(AgentMessageID.init),
+              let createdText = object["created_at"]?.stringValue,
+              let createdAt = ISO8601DateFormatter().date(
+                from: createdText
+              ) else {
+            throw JSONRPCError.invalidParams
+        }
+        return AgentMessageCursor(createdAt: createdAt, id: id)
+    }
+
     private func parseISO8601(_ value: String) -> Date {
         ISO8601DateFormatter().date(from: value) ?? Date(timeIntervalSinceReferenceDate: 0)
     }
@@ -3377,11 +3513,7 @@ public final class JSONRPCDispatcher {
             "hasMoreNewer": .bool(page.hasMoreNewer)
         ]
         if let cursor = page.nextBefore {
-            let encoded: JSONValue = .object([
-                "created_at": .string(iso8601(cursor.createdAt)),
-                "createdAt": .string(iso8601(cursor.createdAt)),
-                "id": .string(cursor.id.value.uuidString)
-            ])
+            let encoded = messageCursorPayload(cursor)
             object["next_before"] = encoded
             object["nextBefore"] = encoded
         } else {
@@ -3389,11 +3521,7 @@ public final class JSONRPCDispatcher {
             object["nextBefore"] = .null
         }
         if let cursor = page.nextAfter {
-            let encoded: JSONValue = .object([
-                "created_at": .string(iso8601(cursor.createdAt)),
-                "createdAt": .string(iso8601(cursor.createdAt)),
-                "id": .string(cursor.id.value.uuidString)
-            ])
+            let encoded = messageCursorPayload(cursor)
             object["next_after"] = encoded
             object["nextAfter"] = encoded
         } else {
