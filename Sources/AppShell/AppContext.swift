@@ -3927,7 +3927,8 @@ public final class AppContext {
                 cacheState: cacheState,
                 attributability: "not_prompt_bound",
                 delivered: true,
-                governance: governance.jsonString()
+                governance: governance.jsonString(),
+                threadID: threadId.value.uuidString
             )
             recomputeTokenSaverDailyEconomyToday()
             NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)

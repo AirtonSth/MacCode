@@ -30,7 +30,7 @@ final class CLIProviderAttributionTests: XCTestCase {
             configuration: config,
             scheduler: scheduler,
             scopedRecoveryStore: TestScopedRecoveryStore()
-        ) { request, response in
+        ) { request, response, _ in
             await capture.add(request, response)
         }
         let ready = try await server.start()

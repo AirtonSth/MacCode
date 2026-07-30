@@ -1003,6 +1003,8 @@ public final class SidebarViewModel: ObservableObject {
                 requestedEnabled: false,
                 persistPreference: true
             )
+            // Footer + other surfaces re-check eligibility immediately.
+            NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
             return
         }
         guard privateAccountUser?.subscribed == true else { return }
@@ -1014,6 +1016,7 @@ public final class SidebarViewModel: ObservableObject {
             }
             graphifyRuntimeActive = settingsStore.load().isGraphifyRuntimeActive
             refreshTokenSaverDistillService(modelValidation: selectedValidation)
+            NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
             return
         }
 
@@ -1026,6 +1029,7 @@ public final class SidebarViewModel: ObservableObject {
             graphifyRuntimeActive = settingsStore.load().isGraphifyRuntimeActive
             refreshTokenSaverDistillService(modelValidation: installedFallbackValidation)
             beginTokenSaverModelDownload(reason: selectedValidation.reason)
+            NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
             return
         }
 
@@ -2990,7 +2994,7 @@ public struct SidebarRootView: View {
             scope: tokenSaverLimitScopeTitle(for: scope),
             savedTokens: tokenSaverSavedOrPotential(in: snapshot, scope: scope),
             savedProgress: ringVals.tokenSaverProgress,
-            savedGoalTokens: fraction.mixTokens ?? 0,
+            savedGoalTokens: fraction.mixTokens ?? tokenSaverSavingsGoalTokens(for: scope),
             savingsRingComparable: fraction.isComparable,
             savingsRingUnavailableReason: fraction.unavailableReason,
             claudeUsedProgress: ringVals.claudeUsedProgress,
@@ -3019,7 +3023,7 @@ public struct SidebarRootView: View {
 
     /// Window-aligned provider usage for bare-user estimator inputs only.
     /// Prefer `snapshot.daily` buckets (same retention window as the savings ledger).
-    /// Never use this as a green-ring denominator — ring fill requires known billed units.
+    /// Not a green-ring denominator — the green ring uses fixed 5M/35M goals.
     private func tokenSaverScopeUsedTokens(in snapshot: TokenSaverUsageSnapshot, scope: TokenSaverUsageScope) -> Int {
         switch scope {
         case .currentSession:
@@ -3029,24 +3033,6 @@ public struct SidebarRootView: View {
             )
         case .week:
             return TokenSaverBareUserEstimator.weekProviderTokens(daily: snapshot.daily)
-        }
-    }
-
-    /// Known billed units for the selected scope window, or nil when unknown.
-    /// WHY: green-ring denominator must never fall back to raw tokens (cache reads
-    /// count at full weight and overstate the window ~8×).
-    private func tokenSaverScopeKnownBilledUnits(
-        in snapshot: TokenSaverUsageSnapshot,
-        scope: TokenSaverUsageScope
-    ) -> Double? {
-        switch scope {
-        case .currentSession:
-            return TokenSaverBareUserEstimator.todayProviderBilledTokenUnits(
-                daily: snapshot.daily,
-                now: tokenSaverNow
-            )
-        case .week:
-            return TokenSaverBareUserEstimator.weekProviderBilledTokenUnits(daily: snapshot.daily)
         }
     }
 
@@ -3062,9 +3048,10 @@ public struct SidebarRootView: View {
         scope: TokenSaverUsageScope
     ) -> TokenSaverSavingsRingFraction {
         let saved = tokenSaverSavedOrPotential(in: snapshot, scope: scope)
+        let isDaily = scope == .currentSession
         return Self.tokenSaverSavingsRingFraction(
             savedTokens: saved,
-            knownBilledUnits: tokenSaverScopeKnownBilledUnits(in: snapshot, scope: scope),
+            goalTokens: Self.tokenSaverSavingsGoalTokens(isDailyScope: isDaily),
             hasComparableUsageWindow: true
         )
     }
@@ -3193,10 +3180,9 @@ public struct SidebarRootView: View {
         }
     }
 
-    /// Self-normalizing ring mix (saved + known billed) for a11y when comparable.
-    /// Returns 0 when the ring is in an explicit unavailable state (no raw fallback).
+    /// Fixed green-ring goal for the selected scope (5M today / 35M week).
     private func tokenSaverSavingsGoalTokens(for scope: TokenSaverUsageScope) -> Int {
-        tokenSaverSavingsRingFraction(for: tokenSaverDetailsSnapshot, scope: scope).mixTokens ?? 0
+        Self.tokenSaverSavingsGoalTokens(isDailyScope: scope == .currentSession)
     }
 
     private func tokenSaverSavingsSummary(
@@ -3791,13 +3777,12 @@ public struct SidebarRootView: View {
         ).totalCredible
     }
 
-    /// Legacy absolute goals (2M day / 10M week). Retained as a pure constant seam
-    /// for older tests; the green ring no longer uses these fixed denominators.
+    /// Absolute goals for the green Token Saver ring: 5M today / 35M week.
     nonisolated public static func tokenSaverSavingsGoalTokens(isDailyScope: Bool) -> Int {
-        isDailyScope ? 2_000_000 : 10_000_000
+        isDailyScope ? 5_000_000 : 35_000_000
     }
 
-    /// Absolute goal progress for the green Token Saver ring (2M today / 10M week).
+    /// Absolute goal progress for the green Token Saver ring (5M today / 35M week).
     nonisolated public static func savingsToGoalProgress(
         savedTokens: Int,
         goalTokens: Int
@@ -3809,8 +3794,7 @@ public struct SidebarRootView: View {
     }
 
     /// Share of the measured (saved + used) mix that was locally reduced.
-    /// Self-normalizing: a healthy day with small absolute savings still reads as a
-    /// meaningful percent instead of 1% of a 2M aspirational goal.
+    /// Retained as a pure diagnostic seam; the green ring uses fixed goals instead.
     ///
     /// `usedTokens` must be **known billed** units (caller responsibility). Never
     /// pass raw provider tokens here for a displayed ring fraction.
@@ -3827,12 +3811,10 @@ public struct SidebarRootView: View {
 
     /// Green savings ring fraction for a scope window.
     ///
-    /// - Comparable + known billed → `saved / (saved + billed)`.
-    /// - Unknown billed → explicit unavailable (never raw fallback).
+    /// - Comparable window (Today/Week) → `saved / goal` clamped to 1 (5M today / 35M week).
     /// - No comparable usage window (all-time) → explicit unavailable (never 100% from used=0).
     public enum TokenSaverSavingsRingFraction: Equatable, Sendable {
-        case comparable(progress: Double, mixTokens: Int)
-        case billedUnavailable
+        case comparable(progress: Double, goalTokens: Int)
         case noComparableUsageWindow
 
         public var isComparable: Bool {
@@ -3845,8 +3827,9 @@ public struct SidebarRootView: View {
             return 0
         }
 
+        /// Fixed goal denominator when comparable (5M today / 35M week).
         public var mixTokens: Int? {
-            if case .comparable(_, let mix) = self { return mix }
+            if case .comparable(_, let goal) = self { return goal }
             return nil
         }
 
@@ -3854,30 +3837,24 @@ public struct SidebarRootView: View {
             switch self {
             case .comparable:
                 return nil
-            case .billedUnavailable:
-                return "billed usage unknown"
             case .noComparableUsageWindow:
                 return "no comparable usage window"
             }
         }
     }
 
-    /// Pure seam: map saved + optional known billed into a ring fraction state.
+    /// Pure seam: map saved + fixed goal into a ring fraction state.
     nonisolated public static func tokenSaverSavingsRingFraction(
         savedTokens: Int,
-        knownBilledUnits: Double?,
+        goalTokens: Int,
         hasComparableUsageWindow: Bool
     ) -> TokenSaverSavingsRingFraction {
         guard hasComparableUsageWindow else {
             return .noComparableUsageWindow
         }
-        guard let billed = knownBilledUnits, billed.isFinite, billed >= 0 else {
-            return .billedUnavailable
-        }
-        let saved = max(0, savedTokens)
-        let used = Int(billed.rounded())
-        let progress = savingsAvoidanceRatio(savedTokens: saved, usedTokens: used)
-        return .comparable(progress: progress, mixTokens: max(saved + used, 1))
+        let goal = max(goalTokens, 1)
+        let progress = savingsToGoalProgress(savedTokens: savedTokens, goalTokens: goal)
+        return .comparable(progress: progress, goalTokens: goal)
     }
 
     /// All-time reconciliation: managed attributed rows + unattributed must equal
@@ -4143,13 +4120,13 @@ public struct SidebarRootView: View {
     /// values so screen readers can convey the same information as the visual rings.
     ///
     /// When `savingsRingComparable` is false, the green ring is in an explicit
-    /// unavailable state (unknown billed units or no comparable usage window) —
-    /// never claim a window-mix percent derived from raw tokens or used=0.
+    /// unavailable state (no comparable usage window / all-time) — never claim a
+    /// goal percent from used=0.
     nonisolated public static func ringsAccessibilityLabel(
         scope: String,
         savedTokens: Int,
         savedProgress: Double,
-        savedGoalTokens: Int = 10_000_000,
+        savedGoalTokens: Int = 35_000_000,
         savingsRingComparable: Bool = true,
         savingsRingUnavailableReason: String? = nil,
         claudeUsedProgress: Double,
@@ -4167,19 +4144,20 @@ public struct SidebarRootView: View {
                 : "\(savedTokens)"
         let savingsPart: String
         if savingsRingComparable {
-            // WHY: ring is self-normalizing (saved/(saved+known billed)); a11y names
-            // the mix denominator instead of a fixed 2M/10M goal.
-            let mixStr = savedGoalTokens >= 1_000_000
+            // WHY: ring is fixed-goal (5M today / 35M week); a11y names that goal.
+            let goalStr = savedGoalTokens >= 1_000_000
                 ? String(format: "%.0fM", Double(savedGoalTokens) / 1_000_000)
                 : savedGoalTokens >= 1_000
                     ? String(format: "%.0fK", Double(savedGoalTokens) / 1_000)
                     : "\(savedGoalTokens)"
-            savingsPart = "measured save \(savedStr) local tokens, ~\(savedPct)% of window mix (\(mixStr))"
+            // WHY: the figure is scope credible (measured + dialect + graphify), same
+            // as the visible "Estimated save" headline — never claim "measured" alone.
+            savingsPart = "estimated save \(savedStr) local tokens, ~\(savedPct)% of \(goalStr) goal"
         } else {
             let reason = (savingsRingUnavailableReason?.isEmpty == false)
                 ? savingsRingUnavailableReason!
                 : "usage window unavailable"
-            savingsPart = "measured save \(savedStr) local tokens, savings share unavailable (\(reason))"
+            savingsPart = "estimated save \(savedStr) local tokens, savings share unavailable (\(reason))"
         }
         return "Token Saver rings, \(scope): \(savingsPart), Claude used \(claudePct)%, Codex used \(codexPct)%, Grok used \(grokPct)%"
     }

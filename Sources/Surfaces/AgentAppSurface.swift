@@ -216,6 +216,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// switch; read through `backgroundShellCount`, which also gates on a live
     /// run so a finished run cannot leave a stale count on screen.
     @Published public private(set) var liveBackgroundShellCount: Int = 0
+    /// Thread footer display figure (credible total: measured + dialect + …).
+    /// 0 when Token Saver is off, not subscribed, or no savings yet.
+    @Published public private(set) var tokenSaverThreadSavedTokens: Int = 0
+    /// Ledger-only delivered total for the thread (floor for honesty / copy).
+    @Published public private(set) var tokenSaverThreadMeasuredTokens: Int = 0
+    /// True when Token Saver is enabled **and** the account is subscribed.
+    @Published public private(set) var tokenSaverFooterEnabled: Bool = false
+    private weak var tokenSaverSavingsRepo: TokenSaverSavingsRepository?
+    private var tokenSaverFooterEligibleCheck: (@Sendable () -> Bool)?
+    private var tokenSaverGraphifyActiveCheck: (@Sendable () -> Bool)?
+    private var tokenSaverFooterObserver: NSObjectProtocol?
+    private var tokenSaverFooterAccountObserver: NSObjectProtocol?
+    private var tokenSaverFooterStatusObserver: NSObjectProtocol?
+    /// PERF: cancel-and-coalesce off-main ledger reads (same pattern as sidebar
+    /// PERF-MAC-100). A burst of `rc2TokenSaverUsageChanged` collapses to one read.
+    private var tokenSaverFooterReloadTask: Task<Void, Never>?
     @Published public var currentRunId: AgentRunID?
     @Published public var hasUnreadActivity: Bool = false
     @Published public var showPlanSidebar: Bool = false
@@ -632,6 +648,23 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         checkpointRevertUndoExpiryTask = nil
         messageHistoryLoadTask?.cancel()
         messageHistoryLoadTask = nil
+        if let tokenSaverFooterObserver {
+            NotificationCenter.default.removeObserver(tokenSaverFooterObserver)
+            self.tokenSaverFooterObserver = nil
+        }
+        if let tokenSaverFooterAccountObserver {
+            NotificationCenter.default.removeObserver(tokenSaverFooterAccountObserver)
+            self.tokenSaverFooterAccountObserver = nil
+        }
+        if let tokenSaverFooterStatusObserver {
+            NotificationCenter.default.removeObserver(tokenSaverFooterStatusObserver)
+            self.tokenSaverFooterStatusObserver = nil
+        }
+        tokenSaverFooterReloadTask?.cancel()
+        tokenSaverFooterReloadTask = nil
+        tokenSaverSavingsRepo = nil
+        tokenSaverFooterEligibleCheck = nil
+        tokenSaverGraphifyActiveCheck = nil
         _ = streamEventBatch.drain()
         streamUIBackpressured = false
         publishInterestedThreadId(nil)
@@ -887,6 +920,92 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         timelineItemIndex.location(of: id)
     }
 
+    /// Wire Token Saver thread-savings footer. Host calls after init with the
+    /// shared ledger + eligibility (enabled && subscribed) + graphify gate.
+    /// Safe to call once per surface.
+    ///
+    /// `isEligible` / `isGraphifyActive` are invoked **off the main actor** inside
+    /// the coalesced reload task — implementors must be thread-safe (fresh
+    /// SettingsStore per call is fine; avoid MainActor-only UI state).
+    public func bindTokenSaverThreadFooter(
+        savingsRepo: TokenSaverSavingsRepository,
+        isEligible: @escaping @Sendable () -> Bool,
+        isGraphifyActive: @escaping @Sendable () -> Bool = { false }
+    ) {
+        tokenSaverSavingsRepo = savingsRepo
+        tokenSaverFooterEligibleCheck = isEligible
+        tokenSaverGraphifyActiveCheck = isGraphifyActive
+        if tokenSaverFooterObserver == nil {
+            let handler: (Notification) -> Void = { [weak self] _ in
+                self?.reloadTokenSaverThreadSavings()
+            }
+            // Savings ledger changes.
+            tokenSaverFooterObserver = NotificationCenter.default.addObserver(
+                forName: Notification.Name("rc2TokenSaverUsageChanged"),
+                object: nil,
+                queue: .main,
+                using: handler
+            )
+            // B-6 residual: toggle / account change must hide the chip immediately,
+            // not wait for the next turn or thread switch.
+            tokenSaverFooterAccountObserver = NotificationCenter.default.addObserver(
+                forName: Notification.Name("rc2PrivateAccountChanged"),
+                object: nil,
+                queue: .main,
+                using: handler
+            )
+            tokenSaverFooterStatusObserver = NotificationCenter.default.addObserver(
+                forName: Notification.Name("rc2TokenSaverDistillStatusChanged"),
+                object: nil,
+                queue: .main,
+                using: handler
+            )
+        }
+        reloadTokenSaverThreadSavings()
+    }
+
+    /// Schedule a coalesced reload: eligibility + ledger + estimate all off-main.
+    public func reloadTokenSaverThreadSavings() {
+        guard !isDisposed else { return }
+        tokenSaverFooterReloadTask?.cancel()
+        let eligibleCheck = tokenSaverFooterEligibleCheck
+        let graphifyCheck = tokenSaverGraphifyActiveCheck
+        let threadId = selectedThreadId
+        let repo = tokenSaverSavingsRepo
+        // Capture assistant size on MainActor (messages are UI state).
+        let assistantChars = messages
+            .filter { $0.role == .assistant }
+            .reduce(0) { $0 + $1.content.utf8.count }
+        tokenSaverFooterReloadTask = Task { [weak self] in
+            // Eligibility/settings reads off-main so a savings burst does not
+            // stack cold SettingsStore performSync on the MainActor.
+            let eligible = eligibleCheck?() == true
+            let graphifyActive = graphifyCheck?() == true
+            let measured: Int
+            if eligible, let threadId, let repo {
+                let id = threadId.value.uuidString
+                measured = await Task.detached(priority: .utility) {
+                    (try? repo.savedTokens(forThreadID: id)) ?? 0
+                }.value
+            } else {
+                measured = 0
+            }
+            guard !Task.isCancelled else { return }
+            let display = AgentAppView.tokenSaverThreadFooterDisplayTokens(
+                measuredDelivered: measured,
+                assistantChars: assistantChars,
+                tokenSaverEnabled: eligible,
+                graphifyActive: graphifyActive
+            )
+            await MainActor.run { [weak self] in
+                guard let self, !self.isDisposed, !Task.isCancelled else { return }
+                self.tokenSaverFooterEnabled = eligible
+                self.tokenSaverThreadMeasuredTokens = measured
+                self.tokenSaverThreadSavedTokens = display
+            }
+        }
+    }
+
     public func selectThread(_ id: AgentThreadID, markRead: Bool = true) {
         guard !isDisposed else { return }
         historyReplayNotice = nil
@@ -1076,6 +1195,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // Subagents is thread-scoped chrome: rebuild immediately so switching
         // threads never briefly shows another thread's Active/Done counts.
         refreshSubagentActivity()
+        // Token Saver footer is per-thread; re-read the permanent total on open.
+        reloadTokenSaverThreadSavings()
     }
 
     /// Called by the plan sidebar whenever planNotes changes to persist the
@@ -5679,6 +5800,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 }
             }
             self.onRunStateChange?()
+            // Final replies show cumulative thread savings; refresh after each turn
+            // so the footer tracks ledger growth during the conversation.
+            if finishedTid == self.selectedThreadId {
+                self.reloadTokenSaverThreadSavings()
+            }
         }
     }
 
@@ -8760,6 +8886,11 @@ public struct AgentAppView: View {
                                     turnView(turn)
                                 }
                             }
+                            // B-1: one chip for the whole thread, after the newest
+                            // finished answer — never N copies under every final.
+                            if !vm.selectedThreadRunIsStartingOrRunning {
+                                tokenSaverThreadFooter()
+                            }
                             if Self.shouldRenderActivePlan(
                                 plan: vm.activePlan,
                                 status: vm.status,
@@ -9597,6 +9728,137 @@ public struct AgentAppView: View {
             .help("Copy message")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Pure seam: thread footer figure — same bare-user credible stack as the
+    /// sidebar card (measured + dialect + graphify), thread-scoped.
+    ///
+    /// - `measuredDelivered`: permanent ledger total for the thread.
+    /// - Thread-local billed floor: `max(measured, assistantTokens)`. The host has
+    ///   no per-thread provider-usage ledger yet; this floor is evidence the user
+    ///   already saw in the thread (assistant text + measured pipes), never a
+    ///   global day aggregate or raw cache-inflated count. Caps still apply.
+    /// - Graphify only when active **and** signal count > 0.
+    ///
+    /// Invariant: result ≥ measuredDelivered when enabled (estimates never lower
+    /// the thread figure).
+    nonisolated static func tokenSaverThreadFooterDisplayTokens(
+        measuredDelivered: Int,
+        assistantChars: Int,
+        tokenSaverEnabled: Bool,
+        graphifyActive: Bool,
+        graphifySignalCount: Int = 0
+    ) -> Int {
+        let measured = max(0, measuredDelivered)
+        guard tokenSaverEnabled else { return measured }
+        let assistantTokens = max(0, assistantChars) / Int(TokenSaverBareUserEstimator.charsPerToken)
+        // Thread-local usage floor so usage-anchored dialect/graphify can run
+        // without inventing global billed windows.
+        let threadBilledFloor = Double(max(measured, assistantTokens, 1))
+        let breakdown = TokenSaverBareUserEstimator.estimate(
+            measuredToolOutputSaved: measured,
+            tokenSaverEnabled: true,
+            graphifyActive: graphifyActive,
+            orchestrationActive: false,
+            observation: TokenSaverBareUserObservation(
+                windowProviderTokens: Int(threadBilledFloor),
+                windowProviderBilledTokenUnits: threadBilledFloor,
+                assistantChars: max(0, assistantChars),
+                graphifySignalCount: graphifyActive ? max(0, graphifySignalCount) : 0
+            )
+        )
+        return max(measured, breakdown.totalCredible)
+    }
+
+    /// Pure seam: footer copy.
+    ///
+    /// - Requires `measuredTokens > 0` so estimates only **raise** a proven ledger
+    ///   figure — never invent a chip from assistant text alone.
+    /// - Product copy (locked): "You saved N tokens in this thread"
+    ///   + optional " + Auto used cheaper models at the same quality".
+    nonisolated static func tokenSaverThreadFooterText(
+        displayTokens: Int,
+        measuredTokens: Int,
+        enabled: Bool,
+        autoRoutingActive: Bool = false
+    ) -> String? {
+        guard enabled, measuredTokens > 0, displayTokens > 0 else { return nil }
+        let amount = formatTokenCountForFooter(displayTokens)
+        let base = "Token Saver: You saved \(amount) tokens in this thread"
+        if autoRoutingActive {
+            return base + " + Auto used cheaper models at the same quality"
+        }
+        return base
+    }
+
+    /// Backward-compatible alias used by older tests — measured-only copy path.
+    nonisolated static func tokenSaverThreadFooterText(
+        savedTokens: Int,
+        enabled: Bool
+    ) -> String? {
+        tokenSaverThreadFooterText(
+            displayTokens: savedTokens,
+            measuredTokens: savedTokens,
+            enabled: enabled,
+            autoRoutingActive: false
+        )
+    }
+
+    nonisolated static func formatTokenCountForFooter(_ value: Int) -> String {
+        let n = max(0, value)
+        if n >= 1_000_000 {
+            let whole = Double(n) / 1_000_000.0
+            if n % 1_000_000 == 0 { return String(format: "%.0fM", whole) }
+            return String(format: whole >= 10 ? "%.0fM" : "%.1fM", whole)
+        }
+        if n >= 1_000 {
+            let whole = Double(n) / 1_000.0
+            // Exact thousands → "100K"; otherwise keep one decimal ("12.5K").
+            if n % 1_000 == 0 {
+                return String(format: "%.0fK", whole)
+            }
+            return String(format: "%.1fK", whole)
+        }
+        return "\(n)"
+    }
+
+    /// Soft success chip once under the newest finished answer (not every turn).
+    @ViewBuilder
+    private func tokenSaverThreadFooter() -> some View {
+        // Auto routing is the product name for model-auto orchestration on a thread.
+        let autoRouting = vm.routingMode == .auto
+        if let text = Self.tokenSaverThreadFooterText(
+            displayTokens: vm.tokenSaverThreadSavedTokens,
+            measuredTokens: vm.tokenSaverThreadMeasuredTokens,
+            enabled: vm.tokenSaverFooterEnabled,
+            autoRoutingActive: autoRouting
+        ) {
+            HStack(spacing: DS.Space.xs) {
+                Image(systemName: "leaf.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(DS.Palette.success)
+                    .accessibilityHidden(true)
+                Text(text)
+                    .font(DS.Font.caption2.weight(.medium))
+                    .foregroundColor(DS.Palette.success)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, DS.Space.sm)
+            .padding(.vertical, 5)
+            .background(DS.Palette.success.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(text)
+            .accessibilityIdentifier("agent.tokenSaver.threadFooter")
+            .help(
+                autoRouting
+                    ? "Tokens saved in this thread, plus Auto routing to cheaper models without dropping quality"
+                    : "Token Saver estimated savings for this thread (local ledger + credible legs)"
+            )
+            .transition(.opacity.combined(with: .move(edge: .top)))
+        }
     }
 
     private func runningHiddenTranscriptRow(

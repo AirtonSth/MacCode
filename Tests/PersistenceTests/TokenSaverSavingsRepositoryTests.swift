@@ -426,4 +426,66 @@ final class TokenSaverSavingsRepositoryTests: XCTestCase {
         XCTAssertEqual(summary.totalSavedTokens, 1100)
         XCTAssertEqual(summary.totalRuns, 3)
     }
+
+    func test_threadTotals_accumulateDeliveredOnly_andSurviveEventPrune() throws {
+        // WHY: Agent final-reply footer needs a permanent per-thread total that
+        // does not vanish when event rows age out of the retention window.
+        let db = try makeDB()
+        let repo = TokenSaverSavingsRepository(db: db, retentionDays: 1)
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let threadA = "11111111-1111-1111-1111-111111111111"
+        let threadB = "22222222-2222-2222-2222-222222222222"
+
+        _ = try repo.record(
+            provider: "claude",
+            mode: "command-output",
+            inputTokens: 1_000,
+            outputTokens: 100,
+            savedTokens: 900,
+            delivered: true,
+            threadID: threadA,
+            at: now.addingTimeInterval(-10 * 86_400)
+        )
+        _ = try repo.record(
+            provider: "claude",
+            mode: "command-output",
+            inputTokens: 500,
+            outputTokens: 50,
+            savedTokens: 450,
+            delivered: true,
+            threadID: threadA,
+            at: now
+        )
+        // Undelivered forfeit must not inflate the user-facing thread total.
+        _ = try repo.record(
+            provider: "claude",
+            mode: "command-output (discarded)",
+            inputTokens: 800,
+            outputTokens: 80,
+            savedTokens: 720,
+            delivered: false,
+            threadID: threadA,
+            at: now
+        )
+        _ = try repo.record(
+            provider: "codex",
+            mode: "command-output",
+            inputTokens: 200,
+            outputTokens: 20,
+            savedTokens: 180,
+            delivered: true,
+            threadID: threadB,
+            at: now
+        )
+
+        XCTAssertEqual(try repo.savedTokens(forThreadID: threadA), 1_350)
+        XCTAssertEqual(try repo.savedTokens(forThreadID: threadB), 180)
+        XCTAssertEqual(try repo.savedTokens(forThreadID: ""), 0)
+        XCTAssertEqual(try repo.savedTokens(forThreadID: "missing"), 0)
+
+        // Prune deletes old event rows but must keep the permanent thread total.
+        try repo.prune(now: now)
+        XCTAssertEqual(try repo.savedTokens(forThreadID: threadA), 1_350,
+                       "thread total must survive event prune")
+    }
 }

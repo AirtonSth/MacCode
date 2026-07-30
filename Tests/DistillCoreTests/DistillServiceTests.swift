@@ -28,8 +28,12 @@ final class DistillServiceTests: XCTestCase {
     private actor RecordingSuccessHandler {
         private var records: [DistillSavingsRecord] = []
 
-        func record(request: DistillRequest, response: DistillResponse) {
-            if let record = DistillSavingsCalculator.record(for: request, response: response) {
+        func record(request: DistillRequest, response: DistillResponse, threadID: String = "") {
+            if let record = DistillSavingsCalculator.record(
+                for: request,
+                response: response,
+                threadID: threadID
+            ) {
                 records.append(record)
             }
         }
@@ -263,7 +267,7 @@ final class DistillServiceTests: XCTestCase {
             configuration: configuration,
             scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1),
             scopedRecoveryStore: TestScopedRecoveryStore(),
-            onSuccess: { _, _ in await successes.increment() },
+            onSuccess: { _, _, _ in await successes.increment() },
             onSavingsRecord: { _ in await savings.increment() },
             distillAdmission: { gate.read() }
         )
@@ -468,8 +472,8 @@ final class DistillServiceTests: XCTestCase {
             configuration: configuration,
             scheduler: scheduler,
             scopedRecoveryStore: TestScopedRecoveryStore()
-        ) { request, response in
-            await recorder.record(request: request, response: response)
+        ) { request, response, threadID in
+            await recorder.record(request: request, response: response, threadID: threadID)
         }
         let ready = try await server.start()
         defer { server.stop() }
@@ -525,8 +529,8 @@ final class DistillServiceTests: XCTestCase {
             configuration: configuration,
             scheduler: scheduler,
             scopedRecoveryStore: TestScopedRecoveryStore()
-        ) { request, response in
-            await recorder.record(request: request, response: response)
+        ) { request, response, threadID in
+            await recorder.record(request: request, response: response, threadID: threadID)
         }
         let ready = try await server.start()
         defer { server.stop() }

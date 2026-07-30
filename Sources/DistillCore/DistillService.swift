@@ -623,7 +623,9 @@ public actor DistillServiceMetricsRecorder {
 }
 
 public final class DistillHTTPServer: @unchecked Sendable {
-    public typealias SuccessHandler = @Sendable (DistillRequest, DistillResponse) async -> Void
+    /// `(request, response, threadID)` — `threadID` comes from recovery headers
+    /// (`X-RemoteCode-Thread-ID`) so the savings ledger can attribute the row.
+    public typealias SuccessHandler = @Sendable (DistillRequest, DistillResponse, String) async -> Void
     /// Live paid-feature admission, re-evaluated by the HTTP boundary for every
     /// compression request. The sidecar executable wires this to authoritative
     /// settings; the default preserves standalone/test server compatibility.
@@ -1148,7 +1150,8 @@ public final class DistillHTTPServer: @unchecked Sendable {
     /// Emit delivered=0 forfeit row + denial audit when lossy compression is discarded.
     private func emitForfeitedCompression(
         request: DistillRequest,
-        compressed: DistillResponse
+        compressed: DistillResponse,
+        threadID: String = ""
     ) async {
         let base = Self.savingsModeBase(for: request.mode)
         let trimmedProvider = request.provider?
@@ -1165,7 +1168,8 @@ public final class DistillHTTPServer: @unchecked Sendable {
             cacheState: Self.savingsCacheState(for: request),
             routeStage: compressed.routeStage,
             attributability: Self.savingsAttributability(for: request.mode),
-            delivered: false
+            delivered: false,
+            threadID: threadID
         )
         if let onSavingsRecord {
             await onSavingsRecord(record)
@@ -1194,6 +1198,9 @@ public final class DistillHTTPServer: @unchecked Sendable {
         }
         do {
             let distillRequest = try decoder.decode(DistillRequest.self, from: request.body)
+            // Prefer scoped recovery header; empty for bare CLI pipes.
+            let savingsThreadID = (request.headers["x-remotecode-thread-id"] ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             if distillRequest.mode == .commandOutput {
                 await metrics.recordToolOutputEligible()
             }
@@ -1212,7 +1219,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
                 if distillRequest.mode == .commandOutput, response.output != distillRequest.input {
                     await metrics.recordToolOutputCompressed()
                 }
-                if let onSuccess { await onSuccess(distillRequest, response) }
+                if let onSuccess { await onSuccess(distillRequest, response, savingsThreadID) }
                 await metrics.recordSuccess()
                 send(status: 200, body: response, connection: connection)
                 return
@@ -1243,7 +1250,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
                                     runMode: .optimize,
                                     routeStage: .verbatim
                                 )
-                                if let onSuccess { await onSuccess(distillRequest, response) }
+                                if let onSuccess { await onSuccess(distillRequest, response, savingsThreadID) }
                                 await metrics.recordSuccess()
                                 send(status: 200, body: response, connection: connection)
                                 return
@@ -1326,7 +1333,8 @@ public final class DistillHTTPServer: @unchecked Sendable {
                         // a delivered=0 forfeit row + denial audit so operators see it.
                         await emitForfeitedCompression(
                             request: distillRequest,
-                            compressed: compressed
+                            compressed: compressed,
+                            threadID: savingsThreadID
                         )
                     }
                 }
@@ -1335,7 +1343,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
                 await metrics.recordToolOutputCompressed()
             }
             if let onSuccess {
-                await onSuccess(distillRequest, response)
+                await onSuccess(distillRequest, response, savingsThreadID)
             }
             await metrics.recordSuccess()
             send(status: 200, body: response, connection: connection)

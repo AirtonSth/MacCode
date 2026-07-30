@@ -220,6 +220,7 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
         attributability: String = "unknown",
         delivered: Bool = false,
         governance: String = "{}",
+        threadID: String = "",
         at date: Date = Date()
     ) throws -> Int {
         let saved = max(inputTokens - outputTokens, 0)
@@ -235,6 +236,7 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
             attributability: attributability,
             delivered: delivered,
             governance: governance,
+            threadID: threadID,
             at: date
         )
     }
@@ -255,6 +257,7 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
         attributability: String = "unknown",
         delivered: Bool = false,
         governance: String = "{}",
+        threadID: String = "",
         at date: Date = Date()
     ) throws -> Int {
         let saved = max(savedTokens, 0)
@@ -268,12 +271,13 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
         let content = trimmedContent.isEmpty ? "unknown" : trimmedContent
         let trimmedEngine = engine.trimmingCharacters(in: .whitespacesAndNewlines)
         let eng = trimmedEngine.isEmpty ? "unknown" : trimmedEngine
+        let thread = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
         try db.performSync { database in
             let insert = try database.prepare("""
                 INSERT INTO token_saver_savings
                     (provider, mode, input_tokens, output_tokens, saved_tokens, created_at, created_at_ms,
-                     cache_state, content_type, engine, attributability, delivered, governance_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                     cache_state, content_type, engine, attributability, delivered, governance_json, thread_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """)
             defer { insert.reset() }
             try insert.bind(1, provider)
@@ -289,6 +293,7 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
             try insert.bind(11, attr)
             try insert.bind(12, deliveredFlag)
             try insert.bind(13, gov)
+            try insert.bind(14, thread)
             _ = try insert.step()
 
             let total = try database.prepare("""
@@ -324,12 +329,50 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
             try total.bind(9, gov)
             _ = try total.step()
 
+            // Permanent per-thread accumulator (only delivered rows count toward
+            // the user-facing "saved in this thread" claim).
+            if !thread.isEmpty, delivered {
+                let threadTotal = try database.prepare("""
+                    INSERT INTO token_saver_thread_totals
+                        (thread_id, saved_tokens, runs, updated_at)
+                    VALUES (?, ?, 1, ?)
+                    ON CONFLICT(thread_id) DO UPDATE SET
+                        saved_tokens = token_saver_thread_totals.saved_tokens + excluded.saved_tokens,
+                        runs = token_saver_thread_totals.runs + excluded.runs,
+                        updated_at = excluded.updated_at;
+                """)
+                defer { threadTotal.reset() }
+                try threadTotal.bind(1, thread)
+                try threadTotal.bind(2, saved)
+                try threadTotal.bind(3, iso)
+                _ = try threadTotal.step()
+            }
+
             let prune = try database.prepare("DELETE FROM token_saver_savings WHERE created_at_ms < ?;")
             defer { prune.reset() }
             try prune.bind(1, cutoff)
             _ = try prune.step()
         }
         return saved
+    }
+
+    /// Cumulative delivered tokens saved for one agent thread (permanent total).
+    /// Empty / unknown thread ids return 0.
+    public func savedTokens(forThreadID threadID: String) throws -> Int {
+        let thread = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !thread.isEmpty else { return 0 }
+        return try db.performSync { database in
+            let stmt = try database.prepare("""
+                SELECT COALESCE(saved_tokens, 0)
+                FROM token_saver_thread_totals
+                WHERE thread_id = ?
+                LIMIT 1;
+            """)
+            defer { stmt.reset() }
+            try stmt.bind(1, thread)
+            guard try stmt.step() else { return 0 }
+            return Int(stmt.columnInt64(0))
+        }
     }
 
     private static func normalizedAttributability(_ raw: String) -> String {

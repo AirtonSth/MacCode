@@ -217,10 +217,10 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             """)
         try Schema.migrateSteps(db, Schema.steps)
         XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
-        XCTAssertEqual(try maxVersion(db), Schema.checkpointListSchemaVersion)
+        XCTAssertGreaterThanOrEqual(try maxVersion(db), Schema.checkpointListSchemaVersion)
 
         let legacy = try db.prepare("""
-            SELECT list_turn_id, list_metadata_unavailable, files_summary_truncated
+            SELECT list_turn_id, list_metadata_unavailable, files_summary_timestamp
             FROM agent_turn_checkpoints WHERE thread_id = ?;
             """)
         try legacy.bind(1, threadID)
@@ -260,7 +260,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         XCTAssertEqual(try maxVersion(db), preceding)
         try Schema.migrateSteps(db, Schema.steps)
         XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
-        XCTAssertEqual(try maxVersion(db), Schema.checkpointListSchemaVersion)
+        XCTAssertGreaterThanOrEqual(try maxVersion(db), Schema.checkpointListSchemaVersion)
 
         // Table exists and is per-thread (no global id=1 singleton).
         let cols = try db.prepare(
@@ -331,20 +331,21 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         }
         XCTAssertEqual(namedSteps.count, 1, "exactly one step uses the named version")
         XCTAssertEqual(namedSteps[0].sql, Schema.checkpointListMigrationSQL)
-        XCTAssertEqual(Schema.currentVersion, Schema.checkpointListSchemaVersion)
+        XCTAssertGreaterThanOrEqual(Schema.currentVersion, Schema.checkpointListSchemaVersion)
         XCTAssertGreaterThan(
             Schema.checkpointListSchemaVersion,
             Schema.sharedIntegrationBaseVersion,
             "named step must sit after the shared integration base"
         )
-        // The composed head has exactly the Message identity step followed by
-        // the named checkpoint step. This catches duplicate or reordered slots.
+        // The composed head has Message identity, named checkpoint list, then
+        // Token Saver per-thread totals (59). This catches duplicate/reordered slots.
         let postBase = Schema.steps.filter {
             $0.version > Schema.sharedIntegrationBaseVersion
         }
         XCTAssertEqual(postBase.map(\.version), [
             Schema.sharedIntegrationBaseVersion + 1,
             Schema.checkpointListSchemaVersion,
+            Schema.currentVersion,
         ])
     }
 

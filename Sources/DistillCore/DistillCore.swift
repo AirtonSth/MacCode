@@ -489,6 +489,9 @@ public struct DistillSavingsRecord: Sendable, Equatable {
     /// response path. Verbatim / fail-open (output == input, or routeStage
     /// `.verbatim`) is false so the ledger does not credit discarded compression.
     public let delivered: Bool
+    /// Agent thread that produced this saving (from `X-RemoteCode-Thread-ID` /
+    /// `RC_TOKEN_SAVER_THREAD_ID`). Empty when unscoped (bare CLI).
+    public let threadID: String
 
     public init(
         provider: String,
@@ -499,7 +502,8 @@ public struct DistillSavingsRecord: Sendable, Equatable {
         cacheState: String = "unknown",
         routeStage: TokenSaverRouteStage? = nil,
         attributability: String = "unknown",
-        delivered: Bool = true
+        delivered: Bool = true,
+        threadID: String = ""
     ) {
         self.provider = provider
         self.mode = mode
@@ -510,11 +514,17 @@ public struct DistillSavingsRecord: Sendable, Equatable {
         self.routeStage = routeStage
         self.attributability = attributability
         self.delivered = delivered
+        self.threadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
 public enum DistillSavingsCalculator {
-    public static func record(for request: DistillRequest, response: DistillResponse, defaultProvider: String = "unknown") -> DistillSavingsRecord? {
+    public static func record(
+        for request: DistillRequest,
+        response: DistillResponse,
+        defaultProvider: String = "unknown",
+        threadID: String = ""
+    ) -> DistillSavingsRecord? {
         guard request.recordSavings == true else { return nil }
         guard request.effectiveRunMode == .optimize else { return nil }
         let provider = request.provider?
@@ -523,6 +533,7 @@ public enum DistillSavingsCalculator {
         // Verbatim fail-open: compressed bytes never replaced the original.
         let delivered = response.routeStage != .verbatim
             && response.output != request.input
+        let thread = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
 
         switch request.mode {
         case .commandOutput:
@@ -539,7 +550,8 @@ public enum DistillSavingsCalculator {
                 cacheState: request.cacheState ?? "tool_output_oneshot",
                 routeStage: response.routeStage,
                 attributability: "not_prompt_bound",
-                delivered: delivered
+                delivered: delivered,
+                threadID: thread
             )
         case .sr1Humanize:
             // The agent emitted the compressed SR1 response instead of the full
@@ -555,7 +567,8 @@ public enum DistillSavingsCalculator {
                 savedTokens: estimate.savedTokens,
                 cacheState: "sr1_humanize",
                 attributability: "not_prompt_bound",
-                delivered: delivered
+                delivered: delivered,
+                threadID: thread
             )
         case .longText, .watchSummary:
             let cacheState = request.cacheState ?? (request.mode == .longText ? "prompt" : "watch")
@@ -569,7 +582,8 @@ public enum DistillSavingsCalculator {
                 cacheState: cacheState,
                 routeStage: response.routeStage,
                 attributability: attributability,
-                delivered: delivered
+                delivered: delivered,
+                threadID: thread
             )
         }
     }

@@ -259,26 +259,30 @@ final class TokenSaverCardSeamTests: XCTestCase {
                       "Rings label must include Grok used percent: \(label)")
     }
 
-    func test_ringsAccessibilityLabel_namesSelfNormalizingWindowMix() {
-        // WHY: green ring uses saved/(saved+used), not fixed 2M/10M — a11y must
-        // name the window mix so VoiceOver matches the visible fill.
+    func test_ringsAccessibilityLabel_namesFixedGoalDenominator() {
+        // WHY: green ring fills against fixed goals (5M today / 35M week) — a11y must
+        // name that goal so VoiceOver matches the visible fill.
         let label = SidebarRootView.ringsAccessibilityLabel(
             scope: "week",
-            savedTokens: 10_000_000,
+            savedTokens: 35_000_000,
             savedProgress: 1,
-            savedGoalTokens: 10_000_000,
+            savedGoalTokens: 35_000_000,
             claudeUsedProgress: 0.4,
             codexUsedProgress: 0.2,
             grokUsedProgress: 0.1
         )
-        XCTAssertTrue(label.lowercased().contains("measured save") || label.lowercased().contains("est."),
-                      "Rings label must describe estimated/measured save: \(label)")
+        XCTAssertTrue(label.lowercased().contains("estimated save") || label.lowercased().contains("est."),
+                      "Rings label must describe estimated save (credible total): \(label)")
+        XCTAssertFalse(label.lowercased().contains("measured save"),
+                       "A11y must not claim measured when the figure is credible total: \(label)")
         XCTAssertTrue(label.contains("100%") || label.contains("~100%"),
                       "Rings label must include progress percent: \(label)")
-        XCTAssertTrue(label.lowercased().contains("window mix") || label.contains("10M"),
-                      "Rings label must name the self-normalizing mix denominator: \(label)")
+        XCTAssertTrue(label.lowercased().contains("goal") || label.contains("35M"),
+                      "Rings label must name the fixed goal denominator: \(label)")
         XCTAssertFalse(label.contains("provider spend"),
                        "Rings label must not describe the old denominator: \(label)")
+        XCTAssertFalse(label.lowercased().contains("window mix"),
+                       "Rings label must not claim self-normalizing window mix: \(label)")
     }
 
     func test_ringsAccessibilityLabel_zeroValues_stillNonEmpty() {
@@ -351,24 +355,24 @@ final class TokenSaverCardSeamTests: XCTestCase {
 
     // MARK: - Token Saver saved-token targets
 
-    func test_tokenSaverSavingsGoalTokens_dailyIs2M_weekIs10M() {
-        // WHY: Product rule: Daily fills at 2M; Week fills at 10M.
-        XCTAssertEqual(SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: true), 2_000_000)
-        XCTAssertEqual(SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: false), 10_000_000)
+    func test_tokenSaverSavingsGoalTokens_dailyIs5M_weekIs35M() {
+        // WHY: Product rule: Today fills at 5M; Week fills at 35M.
+        XCTAssertEqual(SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: true), 5_000_000)
+        XCTAssertEqual(SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: false), 35_000_000)
     }
 
-    func test_savingsToGoalProgress_dailyTwoMillionSaved_returnsFull() {
-        // WHY: Daily target is 2M saved tokens.
+    func test_savingsToGoalProgress_dailyFiveMillionSaved_returnsFull() {
+        // WHY: Today target is 5M saved tokens.
         XCTAssertEqual(
-            SidebarRootView.savingsToGoalProgress(savedTokens: 2_000_000, goalTokens: 2_000_000),
+            SidebarRootView.savingsToGoalProgress(savedTokens: 5_000_000, goalTokens: 5_000_000),
             1
         )
     }
 
-    func test_savingsToGoalProgress_weekFiveMillionSaved_returnsHalf() {
-        // WHY: Week target is 10M, so 5M saved should show a half ring.
+    func test_savingsToGoalProgress_weekSeventeenPointFiveMillionSaved_returnsHalf() {
+        // WHY: Week target is 35M, so 17.5M saved should show a half ring.
         XCTAssertEqual(
-            SidebarRootView.savingsToGoalProgress(savedTokens: 5_000_000, goalTokens: 10_000_000),
+            SidebarRootView.savingsToGoalProgress(savedTokens: 17_500_000, goalTokens: 35_000_000),
             0.5,
             accuracy: 0.000_001
         )
@@ -377,7 +381,7 @@ final class TokenSaverCardSeamTests: XCTestCase {
     func test_savingsToGoalProgress_moreThanGoal_clampsToFull() {
         // WHY: the ring cannot render beyond 100%; savings above the tab target stay full.
         XCTAssertEqual(
-            SidebarRootView.savingsToGoalProgress(savedTokens: 12_000_000, goalTokens: 10_000_000),
+            SidebarRootView.savingsToGoalProgress(savedTokens: 40_000_000, goalTokens: 35_000_000),
             1
         )
     }
@@ -385,7 +389,7 @@ final class TokenSaverCardSeamTests: XCTestCase {
     func test_savingsToGoalProgress_zeroSaved_returnsEmpty() {
         // WHY: no measured savings must not show a filled impact ring.
         XCTAssertEqual(
-            SidebarRootView.savingsToGoalProgress(savedTokens: 0, goalTokens: 2_000_000),
+            SidebarRootView.savingsToGoalProgress(savedTokens: 0, goalTokens: 5_000_000),
             0
         )
     }
@@ -400,7 +404,8 @@ final class TokenSaverCardSeamTests: XCTestCase {
     }
 
     func test_savingsAvoidanceRatio_halfSavedHalfUsed_returnsHalf() {
-        // WHY: ring fill must self-normalize to saved/(saved+used), not aspirational 2M.
+        // WHY: diagnostic seam stays honest as saved/(saved+used) even though the
+        // green ring no longer uses this ratio for fill.
         XCTAssertEqual(
             SidebarRootView.savingsAvoidanceRatio(savedTokens: 50_000, usedTokens: 50_000),
             0.5,
@@ -416,74 +421,62 @@ final class TokenSaverCardSeamTests: XCTestCase {
         XCTAssertEqual(SidebarRootView.savingsAvoidanceRatio(savedTokens: 10, usedTokens: 0), 1)
     }
 
-    // MARK: - Green ring: billed units only (never raw)
+    // MARK: - Green ring: fixed goal (5M today / 35M week)
 
-    func test_savingsRingFraction_unknownBilled_reportsUnavailableNotRawRatio() {
-        // WHY: raw provider tokens overstate the window (~8× cache reads). When
-        // billed units are unknown the ring must be explicitly unavailable —
-        // never savingsAvoidanceRatio(saved, raw).
-        let saved = 100_000
-        let rawTokens = 800_000 // would produce a non-zero raw-derived ratio
+    func test_savingsRingFraction_today_usesFiveMillionGoal() {
+        // WHY: Today ring fill is saved/5M, independent of billed usage.
         let fraction = SidebarRootView.tokenSaverSavingsRingFraction(
-            savedTokens: saved,
-            knownBilledUnits: nil,
+            savedTokens: 2_500_000,
+            goalTokens: SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: true),
             hasComparableUsageWindow: true
         )
-        XCTAssertEqual(fraction, .billedUnavailable)
-        XCTAssertFalse(fraction.isComparable)
-        XCTAssertEqual(fraction.progress, 0)
-        XCTAssertNil(fraction.mixTokens)
-        XCTAssertEqual(fraction.unavailableReason, "billed usage unknown")
-
-        let rawDerived = SidebarRootView.savingsAvoidanceRatio(
-            savedTokens: saved,
-            usedTokens: rawTokens
-        )
-        XCTAssertGreaterThan(rawDerived, 0)
-        XCTAssertNotEqual(fraction.progress, rawDerived,
-                          "Unavailable ring must not paint a raw-derived ratio")
-
-        let label = SidebarRootView.ringsAccessibilityLabel(
-            scope: "week",
-            savedTokens: saved,
-            savedProgress: fraction.progress,
-            savedGoalTokens: 0,
-            savingsRingComparable: fraction.isComparable,
-            savingsRingUnavailableReason: fraction.unavailableReason,
-            claudeUsedProgress: 0,
-            codexUsedProgress: 0,
-            grokUsedProgress: 0
-        )
-        XCTAssertTrue(label.lowercased().contains("unavailable"),
-                      "A11y must say savings share is unavailable: \(label)")
-        XCTAssertTrue(label.lowercased().contains("billed"),
-                      "A11y must name billed-unknown reason: \(label)")
-        XCTAssertFalse(label.contains("~") && label.lowercased().contains("window mix"),
-                       "Must not claim a window-mix percent when billed is unknown: \(label)")
-    }
-
-    func test_savingsRingFraction_knownBilled_usesAvoidanceRatio() {
-        // WHY: when billed is known, fill is saved/(saved+billed) — the honest mix.
-        let fraction = SidebarRootView.tokenSaverSavingsRingFraction(
-            savedTokens: 50_000,
-            knownBilledUnits: 50_000,
-            hasComparableUsageWindow: true
-        )
-        guard case .comparable(let progress, let mix) = fraction else {
+        guard case .comparable(let progress, let goal) = fraction else {
             return XCTFail("Expected comparable ring, got \(fraction)")
         }
         XCTAssertEqual(progress, 0.5, accuracy: 0.000_001)
-        XCTAssertEqual(mix, 100_000)
+        XCTAssertEqual(goal, 5_000_000)
+        XCTAssertTrue(fraction.isComparable)
+        XCTAssertEqual(fraction.mixTokens, 5_000_000)
+    }
+
+    func test_savingsRingFraction_week_usesThirtyFiveMillionGoal() {
+        // WHY: Week ring fill is saved/35M, independent of billed usage.
+        let fraction = SidebarRootView.tokenSaverSavingsRingFraction(
+            savedTokens: 7_000_000,
+            goalTokens: SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: false),
+            hasComparableUsageWindow: true
+        )
+        guard case .comparable(let progress, let goal) = fraction else {
+            return XCTFail("Expected comparable ring, got \(fraction)")
+        }
+        XCTAssertEqual(progress, 0.2, accuracy: 0.000_001)
+        XCTAssertEqual(goal, 35_000_000)
         XCTAssertTrue(fraction.isComparable)
     }
 
+    func test_savingsRingFraction_fullGoal_returnsFull() {
+        // WHY: hitting the fixed goal must paint a complete green ring.
+        let today = SidebarRootView.tokenSaverSavingsRingFraction(
+            savedTokens: 5_000_000,
+            goalTokens: 5_000_000,
+            hasComparableUsageWindow: true
+        )
+        XCTAssertEqual(today.progress, 1)
+        let week = SidebarRootView.tokenSaverSavingsRingFraction(
+            savedTokens: 35_000_000,
+            goalTokens: 35_000_000,
+            hasComparableUsageWindow: true
+        )
+        XCTAssertEqual(week.progress, 1)
+    }
+
     func test_savingsRingFraction_allTime_notFullForNonZeroAttributed() {
-        // WHY: all-time used=0 previously forced savingsAvoidanceRatio(saved, 0)=1.0
-        // and VoiceOver "~100% of window mix" — an unfalsifiable claim.
+        // WHY: all-time has no fixed Today/Week goal window — must stay unavailable,
+        // never claim 100% from a missing denominator.
         let attributed = 96_041_366
         let fraction = SidebarRootView.tokenSaverSavingsRingFraction(
             savedTokens: attributed,
-            knownBilledUnits: nil,
+            goalTokens: 35_000_000,
             hasComparableUsageWindow: false
         )
         XCTAssertEqual(fraction, .noComparableUsageWindow)
@@ -492,14 +485,6 @@ final class TokenSaverCardSeamTests: XCTestCase {
                        "All-time must not paint a full green ring from used=0")
         XCTAssertNotEqual(fraction.progress, 1.0)
         XCTAssertEqual(fraction.unavailableReason, "no comparable usage window")
-
-        // Contrasting the forbidden self-normalize-against-zero path:
-        let forbidden = SidebarRootView.savingsAvoidanceRatio(
-            savedTokens: attributed,
-            usedTokens: 0
-        )
-        XCTAssertEqual(forbidden, 1.0)
-        XCTAssertNotEqual(fraction.progress, forbidden)
 
         let label = SidebarRootView.ringsAccessibilityLabel(
             scope: "all time",
@@ -513,11 +498,11 @@ final class TokenSaverCardSeamTests: XCTestCase {
             grokUsedProgress: 0
         )
         XCTAssertTrue(label.lowercased().contains("unavailable"),
-                      "All-time a11y must not claim 100% mix: \(label)")
+                      "All-time a11y must not claim 100% goal: \(label)")
         XCTAssertTrue(label.lowercased().contains("no comparable usage window"),
                       "All-time a11y must name the reason: \(label)")
-        XCTAssertFalse(label.contains("~100%") || label.contains("100% of window mix"),
-                       "Must not claim ~100% of window mix for all-time: \(label)")
+        XCTAssertFalse(label.contains("~100%") || label.contains("100% of"),
+                       "Must not claim ~100% of goal for all-time: \(label)")
     }
 
     func test_allTime_visibleRowsPlusUnattributed_equalHonestyHeadline() {

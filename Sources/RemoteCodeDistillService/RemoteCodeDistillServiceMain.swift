@@ -280,7 +280,8 @@ struct RemoteCodeDistillServiceMain {
                         contentType: "unknown",
                         engine: record.routeStage?.rawValue ?? "unknown",
                         attributability: record.attributability,
-                        delivered: record.delivered
+                        delivered: record.delivered,
+                        threadID: record.threadID
                     )
                 } catch {
                     FileHandle.standardError.write(Data("RemoteCodeDistillService savings record failed: \(error)\n".utf8))
@@ -294,8 +295,12 @@ struct RemoteCodeDistillServiceMain {
                 statsProvider: statsProvider,
                 startsReady: false,
                 metricsRecorder: sharedMetrics,
-                onSuccess: { request, response in
-                    guard let record = DistillSavingsCalculator.record(for: request, response: response) else {
+                onSuccess: { request, response, threadID in
+                    guard let record = DistillSavingsCalculator.record(
+                        for: request,
+                        response: response,
+                        threadID: threadID
+                    ) else {
                         return
                     }
                     await persistSavings(record)
@@ -858,6 +863,7 @@ private final class DistillSidecarEventWriter: @unchecked Sendable {
         let inputTokens: Int
         let outputTokens: Int
         let savedTokens: Int
+        let threadID: String
 
         enum CodingKeys: String, CodingKey {
             case event
@@ -866,6 +872,7 @@ private final class DistillSidecarEventWriter: @unchecked Sendable {
             case inputTokens = "input_tokens"
             case outputTokens = "output_tokens"
             case savedTokens = "saved_tokens"
+            case threadID = "thread_id"
         }
     }
 
@@ -879,7 +886,8 @@ private final class DistillSidecarEventWriter: @unchecked Sendable {
                 mode: record.mode,
                 inputTokens: record.inputTokens,
                 outputTokens: record.outputTokens,
-                savedTokens: record.savedTokens
+                savedTokens: record.savedTokens,
+                threadID: record.threadID
             )
             guard let data = try? self.encoder.encode(event) else { return }
             FileHandle.standardOutput.write(data)

@@ -21,8 +21,9 @@ public enum Schema {
     public static let checkpointListSchemaVersion: Int =
         sharedIntegrationBaseVersion + 2
 
-    /// Must equal the highest SchemaStep version.
-    public static let currentVersion: Int = checkpointListSchemaVersion
+    /// Must equal the highest SchemaStep version (checkpoint list at 58, then
+    /// Token Saver per-thread attribution at 59).
+    public static let currentVersion: Int = 59
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1078,6 +1079,22 @@ public enum Schema {
         // per-thread catalog revision. Renumber via `checkpointListSchemaVersion`
         // only — never duplicate this SQL as a second fixed SchemaStep.
         SchemaStep(checkpointListSchemaVersion, checkpointListMigrationSQL),
+        // Per-thread savings attribution so Agent final replies can show
+        // "You saved N tokens in this thread" from the local ledger.
+        // Event rows keep thread_id for windowed reports; the permanent
+        // thread_totals table survives event prune so multi-week threads
+        // still show an honest cumulative total.
+        SchemaStep(59, """
+        ALTER TABLE token_saver_savings ADD COLUMN thread_id TEXT NOT NULL DEFAULT '';
+        CREATE INDEX IF NOT EXISTS idx_token_saver_savings_thread
+            ON token_saver_savings(thread_id, created_at_ms);
+        CREATE TABLE IF NOT EXISTS token_saver_thread_totals (
+            thread_id TEXT PRIMARY KEY NOT NULL,
+            saved_tokens INTEGER NOT NULL,
+            runs INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """),
     ]
 
     /// Tables that exist in the schema for historical reasons but have no
