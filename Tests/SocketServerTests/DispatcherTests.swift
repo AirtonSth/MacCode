@@ -2968,6 +2968,233 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(router.planNotesByThread[thread]?.utf8.count, huge.utf8.count)
     }
 
+    /// WHY: multi-MiB prior notes must not ride the v1 save request as
+    /// `expected_notes` — only a 64-hex digest CAS token — or 3G pays 2× body.
+    @MainActor
+    func testAgentPlanNotesSave_v1DigestCASDoesNotTransportOldBody() async throws {
+        let router = FakeRouter()
+        let thread = AgentThreadID()
+        let oldMarker = "OLD-NOTES-UNIQUE-MARKER-\(UUID().uuidString)-"
+        var oldNotes = ""
+        while oldNotes.utf8.count < 2 * 1024 * 1024 {
+            oldNotes += oldMarker
+        }
+        let newMarker = "NEW-NOTES-UNIQUE-MARKER-\(UUID().uuidString)-"
+        var newNotes = ""
+        while newNotes.utf8.count < 2 * 1024 * 1024 {
+            newNotes += newMarker
+        }
+        router.planNotesByThread[thread] = oldNotes
+        let expectedDigest = PlanNotesProjectionV1.contentDigest(of: oldNotes)
+        let requestID = UUID().uuidString
+        let params: [String: JSONValue] = [
+            "thread_id": .string(thread.value.uuidString),
+            "notes": .string(newNotes),
+            "protocol_version": .number(1),
+            "expected_content_digest": .string(expectedDigest),
+            "client_request_id": .string(requestID),
+        ]
+        let request = JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.plan.notes.save",
+            params: params
+        )
+        let encodedRequest = try JSONEncoder().encode(request)
+        let requestUTF8 = String(decoding: encodedRequest, as: UTF8.self)
+        XCTAssertFalse(requestUTF8.contains(oldMarker),
+                       "v1 save must not embed the multi-MiB prior body")
+        XCTAssertFalse(requestUTF8.contains("expected_notes"),
+                       "v1 save must not carry expected_notes at all")
+        XCTAssertTrue(requestUTF8.contains(expectedDigest))
+        XCTAssertLessThan(
+            encodedRequest.count,
+            newNotes.utf8.count + 4 * 1024,
+            "request overhead beyond the new body must stay tiny (digest only)"
+        )
+
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let resp = await dispatcher.dispatch(request)
+        XCTAssertNil(resp.error, String(describing: resp.error))
+        XCTAssertEqual(router.planNotesByThread[thread], newNotes)
+        XCTAssertEqual(router.planNotesByThread[thread]?.utf8.count, newNotes.utf8.count)
+
+        let body = try XCTUnwrap(resp.result?.objectValue)
+        XCTAssertEqual(body["ok"], .bool(true))
+        let newDigest = PlanNotesProjectionV1.contentDigest(of: newNotes)
+        XCTAssertEqual(body["content_digest"]?.stringValue, newDigest)
+        XCTAssertEqual(body["revision"]?.stringValue, newDigest)
+        XCTAssertEqual(body["total_bytes"], .number(Double(newNotes.utf8.count)))
+        XCTAssertNil(body["notes"], "compact save result must not re-emit notes")
+
+        // Receipt replay must be byte-identical to the first success.
+        let firstEncoded = try JSONEncoder().encode(try XCTUnwrap(resp.result))
+        let replay = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(2),
+            method: "agent.plan.notes.save",
+            params: params
+        ))
+        XCTAssertNil(replay.error)
+        let replayEncoded = try JSONEncoder().encode(try XCTUnwrap(replay.result))
+        XCTAssertEqual(replayEncoded, firstEncoded,
+                       "command-receipt replay must be byte-identical")
+        XCTAssertEqual(router.planNotesSaveCallCount, 1,
+                       "receipt hit must not re-run persistence")
+    }
+
+    /// WHY: a stale digest must fail closed with the current revision and write
+    /// nothing — same CAS honesty as legacy expected_notes, without the body.
+    @MainActor
+    func testAgentPlanNotesSave_v1DigestMismatchWritesNothingAndReturnsCurrentRevision() async throws {
+        let router = FakeRouter()
+        let thread = AgentThreadID()
+        let current = String(repeating: "server-authoritative-", count: 50_000)
+        router.planNotesByThread[thread] = current
+        let staleDigest = PlanNotesProjectionV1.contentDigest(of: "client-stale-view")
+        let dispatcher = JSONRPCDispatcher(router: router)
+
+        let rejected = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.plan.notes.save",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "notes": .string("must-not-land"),
+                "protocol_version": .number(1),
+                "expected_content_digest": .string(staleDigest),
+                "client_request_id": .string(UUID().uuidString),
+            ]
+        ))
+        XCTAssertEqual(rejected.error?.code, -32009)
+        XCTAssertEqual(rejected.error?.message, "Plan notes changed on another device.")
+        let data = rejected.error?.data?.objectValue
+        let currentDigest = PlanNotesProjectionV1.contentDigest(of: current)
+        XCTAssertEqual(data?["content_digest"]?.stringValue, currentDigest)
+        XCTAssertEqual(data?["revision"]?.stringValue, currentDigest)
+        XCTAssertEqual(data?["expected_content_digest"]?.stringValue, staleDigest)
+        XCTAssertEqual(router.planNotesByThread[thread], current)
+        XCTAssertEqual(router.planNotesSaveCallCount, 0)
+
+        // Matching digest then saves the full new body.
+        let accepted = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(2),
+            method: "agent.plan.notes.save",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "notes": .string("merged-ok"),
+                "protocol_version": .number(1),
+                "expected_content_digest": .string(currentDigest),
+                "client_request_id": .string(UUID().uuidString),
+            ]
+        ))
+        XCTAssertNil(accepted.error)
+        XCTAssertEqual(router.planNotesByThread[thread], "merged-ok")
+        XCTAssertEqual(accepted.result?.objectValue?["ok"], .bool(true))
+        XCTAssertEqual(
+            accepted.result?.objectValue?["content_digest"]?.stringValue,
+            PlanNotesProjectionV1.contentDigest(of: "merged-ok")
+        )
+    }
+
+    /// WHY: dual-body / malformed v1 must not fall through to legacy CAS or
+    /// success — a modern client would otherwise still pay both bodies.
+    @MainActor
+    func testAgentPlanNotesSave_v1RejectsDualBodyAndMalformedParams() async throws {
+        let router = FakeRouter()
+        let thread = AgentThreadID()
+        let prior = "prior-body"
+        router.planNotesByThread[thread] = prior
+        let digest = PlanNotesProjectionV1.contentDigest(of: prior)
+        let dispatcher = JSONRPCDispatcher(router: router)
+
+        let cases: [[String: JSONValue]] = [
+            [
+                "thread_id": .string(thread.value.uuidString),
+                "notes": .string("n"),
+                "protocol_version": .number(1),
+                "expected_content_digest": .string(digest),
+                "expected_notes": .string(prior),
+            ],
+            [
+                "thread_id": .string(thread.value.uuidString),
+                "notes": .string("n"),
+                "protocol_version": .number(2),
+                "expected_content_digest": .string(digest),
+            ],
+            [
+                "thread_id": .string(thread.value.uuidString),
+                "notes": .string("n"),
+                "protocol_version": .number(1.5),
+                "expected_content_digest": .string(digest),
+            ],
+            [
+                "thread_id": .string(thread.value.uuidString),
+                "notes": .string("n"),
+                "protocol_version": .number(1),
+            ],
+            [
+                "thread_id": .string(thread.value.uuidString),
+                "notes": .string("n"),
+                "protocol_version": .number(1),
+                "expected_content_digest": .string("zzzz"),
+            ],
+        ]
+        for params in cases {
+            let resp = await dispatcher.dispatch(JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(1),
+                method: "agent.plan.notes.save",
+                params: params
+            ))
+            XCTAssertEqual(resp.error?.code, -32602, "\(params)")
+            XCTAssertNil(resp.result)
+            XCTAssertEqual(router.planNotesByThread[thread], prior)
+            XCTAssertEqual(router.planNotesSaveCallCount, 0, "\(params)")
+        }
+    }
+
+    /// WHY: legacy clients that omit protocol_version must keep full-body
+    /// expected_notes CAS and the bool(true) success shape.
+    @MainActor
+    func testAgentPlanNotesSave_legacyExpectedNotesStillWorksWithoutProtocolVersion() async throws {
+        let router = FakeRouter()
+        let thread = AgentThreadID()
+        router.planNotesByThread[thread] = "mac-notes"
+        let dispatcher = JSONRPCDispatcher(router: router)
+
+        let rejected = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.plan.notes.save",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "notes": .string("stale"),
+                "expected_notes": .string("phone-stale"),
+            ]
+        ))
+        XCTAssertEqual(rejected.error?.code, -32009)
+        XCTAssertNil(rejected.error?.data,
+                     "legacy mismatch keeps nil data — do not change old clients")
+        XCTAssertEqual(router.planNotesByThread[thread], "mac-notes")
+
+        let accepted = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(2),
+            method: "agent.plan.notes.save",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "notes": .string("merged"),
+                "expected_notes": .string("mac-notes"),
+            ]
+        ))
+        XCTAssertNil(accepted.error)
+        XCTAssertEqual(accepted.result, .bool(true),
+                       "legacy success shape must stay bool(true)")
+        XCTAssertEqual(router.planNotesByThread[thread], "merged")
+    }
+
     // Verifies that the encode<T> helper's new path (JSONDecoder -> JSONValue) produces the
     // same structure as the old path (JSONSerialization + JSONValue.from) for a representative
     // Codable. This guards against any behavioral divergence introduced by the optimization.

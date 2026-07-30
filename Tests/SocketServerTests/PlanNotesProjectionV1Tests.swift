@@ -74,6 +74,116 @@ final class PlanNotesProjectionV1Tests: XCTestCase {
         XCTAssertNil(caps.expectedContentDigest)
     }
 
+    // MARK: Save v1 digest CAS
+
+    /// WHY: old clients omit protocol_version and must keep the full-body
+    /// `expected_notes` CAS path — a bare digest key must not opt them in.
+    func testParseSaveCaps_absentProtocolVersionIsLegacy() throws {
+        let caps = try PlanNotesProjectionV1.parseSaveCaps([
+            "expected_content_digest": .string(String(repeating: "a", count: 64)),
+            "expected_notes": .string("prior body"),
+        ])
+        XCTAssertNil(caps)
+    }
+
+    /// WHY: a v1 client that still ships the full prior body would double
+    /// bytes on 3G; reject dual-body so modern clients cannot pay both.
+    func testParseSaveCaps_rejectsExpectedNotesOnV1Path() {
+        let digest = PlanNotesProjectionV1.contentDigest(of: "old")
+        let invalid: [[String: JSONValue]] = [
+            [
+                "protocol_version": .number(1),
+                "expected_content_digest": .string(digest),
+                "expected_notes": .string("old"),
+            ],
+            [
+                "protocol_version": .number(1),
+                "expected_content_digest": .string(digest),
+                "expected_notes": .null,
+            ],
+            [
+                "protocol_version": .number(1),
+                "expected_content_digest": .string(digest),
+                "expected_notes": .string(""),
+            ],
+        ]
+        for params in invalid {
+            XCTAssertThrowsError(try PlanNotesProjectionV1.parseSaveCaps(params)) { error in
+                XCTAssertEqual((error as? JSONRPCError)?.code, -32602, "\(params)")
+            }
+        }
+    }
+
+    /// WHY: present-but-invalid v1 must fail closed (no silent legacy CAS).
+    func testParseSaveCaps_rejectsUnknownOrMalformedV1() {
+        let validDigest = PlanNotesProjectionV1.contentDigest(of: "x")
+        let invalid: [[String: JSONValue]] = [
+            ["protocol_version": .number(2), "expected_content_digest": .string(validDigest)],
+            ["protocol_version": .number(0), "expected_content_digest": .string(validDigest)],
+            ["protocol_version": .number(1.5), "expected_content_digest": .string(validDigest)],
+            ["protocol_version": .string("1"), "expected_content_digest": .string(validDigest)],
+            ["protocol_version": .number(.nan)],
+            ["protocol_version": .number(.infinity)],
+            ["protocol_version": .bool(true)],
+            ["protocol_version": .number(1)], // missing digest
+            ["protocol_version": .number(1), "expected_content_digest": .string("not-a-digest")],
+            ["protocol_version": .number(1), "expected_content_digest": .string(String(repeating: "g", count: 64))],
+            ["protocol_version": .number(1), "expected_content_digest": .string(String(repeating: "A", count: 64))],
+            ["protocol_version": .number(1), "expected_content_digest": .number(1)],
+            ["protocol_version": .number(1), "expected_content_digest": .null],
+        ]
+        for params in invalid {
+            XCTAssertThrowsError(try PlanNotesProjectionV1.parseSaveCaps(params)) { error in
+                XCTAssertEqual((error as? JSONRPCError)?.code, -32602, "\(params)")
+            }
+        }
+    }
+
+    func testParseSaveCaps_acceptsValidDigest() throws {
+        let digest = PlanNotesProjectionV1.contentDigest(of: "prior notes")
+        let caps = try XCTUnwrap(try PlanNotesProjectionV1.parseSaveCaps([
+            "protocol_version": .number(1),
+            "expected_content_digest": .string(digest),
+        ]))
+        XCTAssertEqual(caps.expectedContentDigest, digest)
+    }
+
+    /// WHY: success metadata must stay compact (no notes body) and identity
+    /// revision with the new content digest so clients can CAS the next save.
+    func testSaveResult_isCompactAndMatchesNewDigest() {
+        let notes = String(repeating: "new-notes-", count: 10_000)
+        let result = PlanNotesProjectionV1.saveResult(notes: notes)
+        guard case .object(let body) = result else {
+            return XCTFail("expected object")
+        }
+        XCTAssertEqual(body["ok"], .bool(true))
+        XCTAssertNil(body["notes"], "save result must not re-emit the notes body")
+        XCTAssertNil(body["expected_notes"])
+        let digest = PlanNotesProjectionV1.contentDigest(of: notes)
+        XCTAssertEqual(body["content_digest"]?.stringValue, digest)
+        XCTAssertEqual(body["revision"]?.stringValue, digest)
+        XCTAssertEqual(body["total_bytes"], .number(Double(notes.utf8.count)))
+    }
+
+    /// WHY: mismatch must surface current revision so the client rehydrates
+    /// instead of blindly overwriting a concurrent edit.
+    func testSaveDigestMismatchError_carriesCurrentRevision() {
+        let current = "server-wins"
+        let expected = PlanNotesProjectionV1.contentDigest(of: "stale-client")
+        let error = PlanNotesProjectionV1.saveDigestMismatchError(
+            currentNotes: current,
+            expectedDigest: expected
+        )
+        XCTAssertEqual(error.code, -32009)
+        XCTAssertEqual(error.message, "Plan notes changed on another device.")
+        let data = error.data?.objectValue
+        let currentDigest = PlanNotesProjectionV1.contentDigest(of: current)
+        XCTAssertEqual(data?["content_digest"]?.stringValue, currentDigest)
+        XCTAssertEqual(data?["revision"]?.stringValue, currentDigest)
+        XCTAssertEqual(data?["expected_content_digest"]?.stringValue, expected)
+        XCTAssertNil(data?["notes"], "error payload must not ship the full current body")
+    }
+
     // MARK: UTF-8 reassembly
 
     /// WHY: multibyte scalars must never be split, or reassembly yields

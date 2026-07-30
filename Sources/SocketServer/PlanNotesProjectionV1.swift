@@ -3,13 +3,14 @@ import CoreModel
 import Foundation
 
 /// Versioned, byte-paged projection for `agent.plan.notes.get` / compact
-/// `agent.plan.notes.updated` events.
+/// `agent.plan.notes.updated` events / digest-CAS `agent.plan.notes.save`.
 ///
 /// WHY: plan notes are authoritative and may be multi-MiB. Returning the full
-/// string on every get or mirror event can exceed the WebSocket frame/queue
-/// budget on a weak link and drop the live stream. Persistence stays full and
-/// unchanged; only the wire projection is bounded. Legacy clients that omit
-/// `protocol_version` keep the pre-v1 full-string get response.
+/// string on every get or mirror event — or echoing the entire prior body as
+/// `expected_notes` on save — can exceed the WebSocket frame/queue budget on a
+/// weak link and drop the live stream. Persistence stays full and unchanged;
+/// only the wire projection/CAS token is bounded. Legacy clients that omit
+/// `protocol_version` keep the pre-v1 full-string get and full-body CAS save.
 public enum PlanNotesProjectionV1: Sendable {
     public static let protocolVersion = 1
     /// Raw UTF-8 ceiling for one page of note text (before JSON escaping).
@@ -60,6 +61,15 @@ public enum PlanNotesProjectionV1: Sendable {
         }
     }
 
+    /// Opt-in v1 save CAS token — digest of the previously hydrated notes body.
+    public struct SaveCaps: Sendable, Equatable {
+        public let expectedContentDigest: String
+
+        public init(expectedContentDigest: String) {
+            self.expectedContentDigest = expectedContentDigest
+        }
+    }
+
     /// Parse opt-in v1 paging caps.
     ///
     /// - Returns `nil` when `protocol_version` is absent (legacy full-string path).
@@ -103,6 +113,62 @@ public enum PlanNotesProjectionV1: Sendable {
         }
 
         return Caps(offsetBytes: offset, maxBytes: maxBytes, expectedContentDigest: expected)
+    }
+
+    /// Parse opt-in v1 save CAS caps.
+    ///
+    /// - Returns `nil` when `protocol_version` is absent (legacy full-body
+    ///   `expected_notes` path).
+    /// - Throws `invalidParams` when the key is present but the request is not
+    ///   a valid integral v1 digest CAS (no silent downgrade, no dual body).
+    public static func parseSaveCaps(_ params: [String: JSONValue]) throws -> SaveCaps? {
+        guard params["protocol_version"] != nil else { return nil }
+
+        guard let version = strictNonNegativeInt(params["protocol_version"]),
+              version == protocolVersion else {
+            throw JSONRPCError.invalidParams
+        }
+
+        // Modern clients must not pay both the digest and the full prior body.
+        if params["expected_notes"] != nil {
+            throw JSONRPCError.invalidParams
+        }
+
+        guard let digest = params["expected_content_digest"]?.stringValue,
+              isSHA256Hex(digest) else {
+            throw JSONRPCError.invalidParams
+        }
+
+        return SaveCaps(expectedContentDigest: digest)
+    }
+
+    /// Compact v1 save success — no notes body, just CAS/size metadata.
+    public static func saveResult(notes: String) -> JSONValue {
+        let data = Data(notes.utf8)
+        let digest = contentDigest(of: data)
+        return .object([
+            "ok": .bool(true),
+            "content_digest": .string(digest),
+            "revision": .string(digest),
+            "total_bytes": .number(Double(data.count)),
+        ])
+    }
+
+    /// CAS mismatch for save — current digest/revision so the client can rehydrate.
+    public static func saveDigestMismatchError(
+        currentNotes: String,
+        expectedDigest: String
+    ) -> JSONRPCError {
+        let digest = contentDigest(of: currentNotes)
+        return JSONRPCError(
+            code: -32009,
+            message: "Plan notes changed on another device.",
+            data: .object([
+                "content_digest": .string(digest),
+                "expected_content_digest": .string(expectedDigest),
+                "revision": .string(digest),
+            ])
+        )
     }
 
     /// Page `notes` at a UTF-8-safe byte cursor. Never mutates `notes`.

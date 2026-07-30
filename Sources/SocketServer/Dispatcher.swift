@@ -2088,6 +2088,22 @@ public final class JSONRPCDispatcher {
                 if let (_, cached) = commandReceipt(method: req.method, params: params) {
                     return .init(id: id, result: cached)
                 }
+                // Opt-in protocol_version 1: digest CAS (no full prior body on the
+                // wire). Absent version keeps legacy expected_notes full-body CAS.
+                // Present-but-invalid must not silently downgrade.
+                if let saveCaps = try PlanNotesProjectionV1.parseSaveCaps(params) {
+                    let current = try router.agentPlanNotes(thread: tid)
+                    if PlanNotesProjectionV1.contentDigest(of: current) != saveCaps.expectedContentDigest {
+                        throw PlanNotesProjectionV1.saveDigestMismatchError(
+                            currentNotes: current,
+                            expectedDigest: saveCaps.expectedContentDigest
+                        )
+                    }
+                    try router.saveAgentPlanNotes(thread: tid, notes: notes)
+                    let result = PlanNotesProjectionV1.saveResult(notes: notes)
+                    recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                    return .init(id: id, result: result)
+                }
                 if let expected = params["expected_notes"]?.stringValue,
                    try router.agentPlanNotes(thread: tid) != expected {
                     throw JSONRPCError(
