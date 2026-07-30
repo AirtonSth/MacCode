@@ -553,7 +553,8 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func listAgentThreadCheckpointsPage(
         thread: AgentThreadID,
         maxEntries: Int,
-        before: AgentTurnCheckpointCursor?
+        before: AgentTurnCheckpointCursor?,
+        expectedCatalogRevision: Int64?
     ) async throws -> AgentTurnCheckpointPage {
         checkpointPageCallCount += 1
         // Capture immutable Sendable inputs on MainActor, then hop for the
@@ -563,6 +564,11 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         let revision = checkpointCatalogRevision
         let delay = checkpointPageDelayNanoseconds
         let hook = checkpointPageQueryWillRun
+        // Preclaim expected revision before any page materialization — mirrors
+        // the repository read-snapshot fence (no page decode on stale).
+        if let expectedCatalogRevision, expectedCatalogRevision != revision {
+            throw AgentTurnCheckpointListError.staleCatalogRevision(current: revision)
+        }
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue(label: AgentTurnCheckpointListGateway.queueLabel).async {
                 if Thread.isMainThread {
@@ -3364,9 +3370,10 @@ final class DispatcherTests: XCTestCase {
     }
 
     @MainActor
-    func test_agentCheckpointList_refusedOnUnixWebSocketAndNestedBatchBeforeExecution() async throws {
-        // WHY: accepted iOS routes checkpoint list method-specifically over
-        // authenticated HTTP; Unix/WS/batch must not execute or aggregate pages.
+    func test_agentCheckpointList_v1RefusedOnUnixWebSocketAndBatch_legacyRetainsTransport() async throws {
+        // WHY: explicit response_version 1 is HTTP-only / batch-forbidden before
+        // work. Legacy (no response_version) must keep prior Unix/WS/batch paths
+        // and full-array response shape — a regression here breaks base clients.
         let router = FakeRouter()
         let thread = AgentThread(workspaceId: nil, title: "transport", provider: .codex, model: "gpt-5.5")
         router.threadStore = [thread]
@@ -3398,29 +3405,31 @@ final class DispatcherTests: XCTestCase {
             ]
         )
 
-        for req in [legacy, v1] {
-            let unix = await d.dispatchUnixSocket(req)
-            XCTAssertEqual(unix.error?.code, -32600, "Unix must refuse checkpoint list")
-            XCTAssertEqual(
-                unix.error?.data?.objectValue?["reason"],
-                .string("checkpoint_list_http_only")
-            )
-
-            let ws = await d.dispatchWebSocket(req, mutationContext: nil)
-            XCTAssertEqual(ws.error?.code, -32600, "WebSocket must refuse checkpoint list")
-            XCTAssertEqual(
-                ws.error?.data?.objectValue?["reason"],
-                .string("checkpoint_list_http_only")
-            )
-        }
-        XCTAssertEqual(router.checkpointPageCallCount, 0)
+        // Explicit v1: refuse Unix / WS before repository work.
+        let unixV1 = await d.dispatchUnixSocket(v1)
+        XCTAssertEqual(unixV1.error?.code, -32600, "Unix must refuse explicit v1")
         XCTAssertEqual(
-            try router.listAgentThreadCheckpoints(thread: thread.id).count,
-            1,
-            "refusal must happen before any repository access"
+            unixV1.error?.data?.objectValue?["reason"],
+            .string("checkpoint_list_http_only")
         )
+        let wsV1 = await d.dispatchWebSocket(v1, mutationContext: nil)
+        XCTAssertEqual(wsV1.error?.code, -32600, "WebSocket must refuse explicit v1")
+        XCTAssertEqual(
+            wsV1.error?.data?.objectValue?["reason"],
+            .string("checkpoint_list_http_only")
+        )
+        XCTAssertEqual(router.checkpointPageCallCount, 0)
 
-        let nested = await d.dispatchHTTP(
+        // Legacy: Unix / WS still succeed with prior full-array shape.
+        let unixLegacy = await d.dispatchUnixSocket(legacy)
+        XCTAssertNil(unixLegacy.error, "legacy checkpoint.list must work on Unix")
+        XCTAssertNotNil(unixLegacy.result?.arrayValue)
+        let wsLegacy = await d.dispatchWebSocket(legacy, mutationContext: nil)
+        XCTAssertNil(wsLegacy.error, "legacy checkpoint.list must work on WebSocket")
+        XCTAssertNotNil(wsLegacy.result?.arrayValue)
+
+        // Explicit v1 in nested rpc.batch: reject before any sibling executes.
+        let nestedV1 = await d.dispatchHTTP(
             JSONRPCRequest(
                 jsonrpc: "2.0",
                 id: .number(3),
@@ -3443,16 +3452,77 @@ final class DispatcherTests: XCTestCase {
             ),
             mutationContext: nil
         )
-        XCTAssertEqual(nested.error?.code, -32600)
+        XCTAssertEqual(nestedV1.error?.code, -32600)
         XCTAssertEqual(
-            nested.error?.data?.objectValue?["reason"],
+            nestedV1.error?.data?.objectValue?["reason"],
             .string("checkpoint_list_batch_forbidden")
         )
         XCTAssertEqual(router.checkpointPageCallCount, 0)
-        XCTAssertFalse(
-            JSONRPCDispatcher.readOnlyBatchMethods.contains("agent.checkpoint.list"),
-            "checkpoint list must not re-enter readOnlyBatchMethods"
+
+        // Legacy checkpoint.list in nested rpc.batch: still admitted (base host).
+        let nestedLegacy = await d.dispatchHTTP(
+            JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(4),
+                method: "rpc.batch",
+                params: [
+                    "calls": .array([
+                        .object([
+                            "method": .string("system.ping"),
+                            "params": .object([:]),
+                        ]),
+                        .object([
+                            "method": .string("agent.checkpoint.list"),
+                            "params": .object([
+                                "thread_id": .string(thread.id.value.uuidString),
+                            ]),
+                        ]),
+                    ])
+                ]
+            ),
+            mutationContext: nil
         )
+        XCTAssertNil(nestedLegacy.error, "legacy checkpoint.list must remain batch-admitted")
+        guard case .array(let legacyBatchResults) = nestedLegacy.result else {
+            return XCTFail("rpc.batch must return result array")
+        }
+        XCTAssertEqual(legacyBatchResults.count, 2)
+        XCTAssertNotNil(legacyBatchResults[1].arrayValue ?? legacyBatchResults[1].objectValue)
+        XCTAssertTrue(
+            JSONRPCDispatcher.readOnlyBatchMethods.contains("agent.checkpoint.list"),
+            "legacy batch admission requires checkpoint.list in readOnlyBatchMethods"
+        )
+    }
+
+    @MainActor
+    func test_rpcBatch_unrelatedReadOnlyMethodsUnchangedWithoutGlobalCaps() async throws {
+        // WHY: checkpoint v1 must not introduce global 32-item / 256 KiB request /
+        // 700 KiB aggregate caps that change compatibility for every other RPC.
+        let router = FakeRouter()
+        let d = JSONRPCDispatcher(router: router)
+        // More than 32 items would have failed under the removed global cap.
+        let calls: [JSONValue] = (0..<40).map { i in
+            .object([
+                "method": .string("system.ping"),
+                "params": .object([:]),
+            ])
+        }
+        let response = await d.dispatch(
+            JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(1),
+                method: "rpc.batch",
+                params: ["calls": .array(calls)]
+            )
+        )
+        XCTAssertNil(response.error, "rpc.batch must not enforce checkpoint-introduced item caps")
+        guard case .array(let results) = response.result else {
+            return XCTFail("expected result array")
+        }
+        XCTAssertEqual(results.count, 40)
+        for item in results {
+            XCTAssertEqual(item.objectValue?["pong"], .bool(true))
+        }
     }
 
     @MainActor

@@ -29,6 +29,20 @@ public enum PersistenceDataError: Error, CustomStringConvertible {
     }
 }
 
+/// Typed failures for `agent.checkpoint.list` response_version 1 read path.
+public enum AgentTurnCheckpointListError: Error, Equatable, CustomStringConvertible {
+    /// Client `catalog_revision` does not match the live fence for this thread.
+    /// Raised inside the read snapshot **before** page row scan/decode.
+    case staleCatalogRevision(current: Int64)
+
+    public var description: String {
+        switch self {
+        case .staleCatalogRevision(let current):
+            return "checkpoint list catalog revision is stale (current=\(current))"
+        }
+    }
+}
+
 public enum AgentRoutingPersistenceError: Error, Equatable {
     case invalidConfigurationJSON
     case invalidMode(String)
@@ -4088,19 +4102,31 @@ public final class AgentTurnCheckpointRepository {
     /// `diff_patch`, or `file_diffs_json` for page rows. Uses descending keyset
     /// pagination on bounded `(checkpoint_turn_count, list_completed_at,
     /// list_turn_id)` with `LIMIT maxEntries + 1`.
+    ///
+    /// When `expectedCatalogRevision` is set (continuation pages), it is
+    /// preclaimed inside the same read snapshot **before** any page row
+    /// query/decode. A stale fence fails closed with no page work.
     public func listMetadataPage(
         threadId: AgentThreadID,
         maxEntries: Int,
-        before cursor: AgentTurnCheckpointCursor?
+        before cursor: AgentTurnCheckpointCursor?,
+        expectedCatalogRevision: Int64? = nil
     ) throws -> AgentTurnCheckpointPage {
         let limit = max(1, min(maxEntries, AgentTurnCheckpointListWireProjection.maxEntries))
-        // Snapshot revision + page rows under one transaction so a concurrent
-        // mutation cannot splice two catalog generations into one response.
-        return try db.transaction {
+        // Snapshot revision + page rows under one **read** transaction so a
+        // concurrent mutation cannot splice two catalog generations into one
+        // response, without reserving the writer (BEGIN DEFERRED).
+        return try db.readTransaction {
             let catalogRevision = try AgentTurnCheckpointCatalogRevision.current(
                 db: db,
                 threadId: threadId
             )
+            if let expectedCatalogRevision,
+               expectedCatalogRevision != catalogRevision {
+                throw AgentTurnCheckpointListError.staleCatalogRevision(
+                    current: catalogRevision
+                )
+            }
             // WHY: only capture-bounded list_* fields and explicitly capped small
             // scalars may cross the SQLite/Swift boundary. Authoritative raw metadata
             // must stay untouched even for ordering/cursors.

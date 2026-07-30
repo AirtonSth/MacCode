@@ -44,7 +44,8 @@ public final class AgentTurnCheckpointListGateway: @unchecked Sendable {
     public func listMetadataPage(
         threadId: AgentThreadID,
         maxEntries: Int,
-        before cursor: AgentTurnCheckpointCursor?
+        before cursor: AgentTurnCheckpointCursor?,
+        expectedCatalogRevision: Int64? = nil
     ) async throws -> AgentTurnCheckpointPage {
         try await withCheckedThrowingContinuation { continuation in
             queue.async {
@@ -59,7 +60,8 @@ public final class AgentTurnCheckpointListGateway: @unchecked Sendable {
                         .listMetadataPage(
                             threadId: threadId,
                             maxEntries: maxEntries,
-                            before: cursor
+                            before: cursor,
+                            expectedCatalogRevision: expectedCatalogRevision
                         )
                     continuation.resume(returning: page)
                 } catch {

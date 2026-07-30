@@ -78,11 +78,14 @@ public final class SQLiteDB {
     // (~40-50 distinct strings), so unbounded growth is not a practical risk.
     private var stmtCache: [String: OpaquePointer] = [:]
     var beforeStatementStepForTesting: ((String) -> Void)?
+    /// Invoked for every `execute` SQL string (including BEGIN/COMMIT/ROLLBACK).
+    /// Tests use this to prove read paths never issue BEGIN IMMEDIATE or DDL.
+    var beforeExecuteForTesting: ((String) -> Void)?
 
-    // Nesting depth for `transaction`. While > 0, individual execute/step calls
-    // must NOT retry: a mid-transaction retry would re-run only one statement and
-    // could double-apply earlier work. Retry is owned by `transaction` itself so
-    // the whole BEGIN…COMMIT unit restarts after ROLLBACK.
+    // Nesting depth for `transaction` / `readTransaction`. While > 0, individual
+    // execute/step calls must NOT retry: a mid-transaction retry would re-run only
+    // one statement and could double-apply earlier work. Retry is owned by the
+    // transaction helpers so the whole BEGIN…COMMIT unit restarts after ROLLBACK.
     fileprivate var transactionDepth = 0
 
     // MARK: - Transient lock retry (test hooks + policy)
@@ -285,6 +288,7 @@ public final class SQLiteDB {
     }
 
     private func executeDirect(_ sql: String) throws {
+        beforeExecuteForTesting?(sql)
         if let injected = takeInjectedResultCodeForTesting(),
            injected != SQLITE_OK {
             if SQLiteError.isTransientLockCode(injected) {
@@ -347,6 +351,31 @@ public final class SQLiteDB {
                 transactionDepth += 1
                 defer { transactionDepth -= 1 }
                 try execute("BEGIN IMMEDIATE;")
+                do {
+                    let r = try block()
+                    try execute("COMMIT;")
+                    return r
+                } catch {
+                    try? execute("ROLLBACK;")
+                    throw error
+                }
+            }
+        }
+    }
+
+    /// Consistent read snapshot that does **not** reserve the writer.
+    ///
+    /// Uses `BEGIN DEFERRED` so the first SELECT takes a shared read lock only.
+    /// Writers (agent upserts, other repositories) can still acquire the reserved
+    /// lock concurrently. Use `transaction` for any multi-statement write unit.
+    public func readTransaction<T>(_ block: () throws -> T) throws -> T {
+        try withSerializedOperation {
+            try withTransientLockRetry(onRetry: { [self] in
+                releaseReadSnapshotForRetry()
+            }) {
+                transactionDepth += 1
+                defer { transactionDepth -= 1 }
+                try execute("BEGIN DEFERRED;")
                 do {
                     let r = try block()
                     try execute("COMMIT;")

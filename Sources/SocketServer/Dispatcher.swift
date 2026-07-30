@@ -184,7 +184,13 @@ public protocol CommandRouting: AnyObject {
     func listAgentThreadCheckpoints(thread: AgentThreadID) throws -> [AgentTurnCheckpointSummary]
     /// Metadata page for `agent.checkpoint.list` response_version 1.
     /// Must hop off MainActor for SQLite query/decode (see AgentTurnCheckpointListGateway).
-    func listAgentThreadCheckpointsPage(thread: AgentThreadID, maxEntries: Int, before: AgentTurnCheckpointCursor?) async throws -> AgentTurnCheckpointPage
+    /// `expectedCatalogRevision` is preclaimed inside the read snapshot before page scan.
+    func listAgentThreadCheckpointsPage(
+        thread: AgentThreadID,
+        maxEntries: Int,
+        before: AgentTurnCheckpointCursor?,
+        expectedCatalogRevision: Int64?
+    ) async throws -> AgentTurnCheckpointPage
     func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, path: String?) throws -> String
     func revertAgentThreadToCheckpoint(thread: AgentThreadID, checkpointTurnCount: Int) async throws -> AgentTurnCheckpointSummary
     func stopAgentRun(thread: AgentThreadID) throws
@@ -840,20 +846,23 @@ public final class JSONRPCDispatcher {
     /// identity or durable transport receipts. Network servers must call the
     /// mutation-context overload below.
     ///
-    /// `agent.checkpoint.list` is HTTP-only; production Unix uses
-    /// `dispatchUnixSocket`. Unit tests keep the default `.localTest` transport.
+    /// Explicit checkpoint-list v1 is HTTP-only; production Unix tags transport
+    /// via `dispatchUnixSocket`. Unit tests keep the default `.localTest`
+    /// transport so local harnesses can exercise v1 without HTTP framing.
     public func dispatchLocalIPC(_ req: JSONRPCRequest) async -> JSONRPCResponse {
         await dispatchCore(req)
     }
 
-    /// Production Unix-domain socket entry: checkpoint list is forbidden.
+    /// Production Unix-domain socket entry. Legacy checkpoint list retains
+    /// prior behavior; explicit response_version 1 is refused before work.
     public func dispatchUnixSocket(_ req: JSONRPCRequest) async -> JSONRPCResponse {
         await Self.$rpcWireTransport.withValue(.unix) {
             await dispatchLocalIPC(req)
         }
     }
 
-    /// Production WebSocket JSON-RPC entry: checkpoint list is forbidden.
+    /// Production WebSocket JSON-RPC entry. Legacy checkpoint list retains
+    /// prior behavior; explicit response_version 1 is refused before work.
     public func dispatchWebSocket(
         _ req: JSONRPCRequest,
         mutationContext: MutationRequestContext?
@@ -863,7 +872,7 @@ public final class JSONRPCDispatcher {
         }
     }
 
-    /// Production HTTP JSON-RPC entry: checkpoint list is allowed (subject to caps).
+    /// Production HTTP JSON-RPC entry (legacy + explicit v1 checkpoint list).
     public func dispatchHTTP(
         _ req: JSONRPCRequest,
         mutationContext: MutationRequestContext?
@@ -1286,56 +1295,33 @@ public final class JSONRPCDispatcher {
         let id = req.id
         let params = req.params ?? [:]
         do {
-            // HTTP-only gate: both legacy and v1 checkpoint list are forbidden on
-            // Unix/WS and every batch surface before any repository work.
+            // Explicit v1 only: HTTP-only + batch-forbidden before repository work.
+            // Legacy checkpoint.list keeps prior Unix/WS/batch admission.
             if req.method == AgentCheckpointListContract.method {
                 try AgentCheckpointListContract.preflightTransport(
                     method: req.method,
                     transport: Self.rpcWireTransport,
-                    inBatch: Self.rpcInBatch
+                    inBatch: Self.rpcInBatch,
+                    isExplicitV1: AgentCheckpointListContract.isExplicitV1(params: params)
                 )
             }
             switch req.method {
             case "rpc.batch":
                 guard case .array(let calls) = params["calls"] ?? .null else { throw JSONRPCError.invalidParams }
-                // Finite item + complete-request ceilings before any sibling executes.
-                guard calls.count <= AgentCheckpointListContract.maxBatchItems else {
-                    throw JSONRPCError(
-                        code: -32600,
-                        message: "rpc.batch exceeds max item count.",
-                        data: .object([
-                            "reason": .string("max_batch_items"),
-                            "max_batch_items": .number(
-                                Double(AgentCheckpointListContract.maxBatchItems)
-                            ),
-                            "batch_items": .number(Double(calls.count)),
-                        ])
-                    )
-                }
-                let encodedBatch = try JSONEncoder().encode(req)
-                guard encodedBatch.count <= AgentCheckpointListContract.maxBatchRequestBytes else {
-                    throw JSONRPCError(
-                        code: -32602,
-                        message: "rpc.batch exceeds max_request_bytes.",
-                        data: .object([
-                            "reason": .string("max_batch_request_bytes"),
-                            "max_request_bytes": .number(
-                                Double(AgentCheckpointListContract.maxBatchRequestBytes)
-                            ),
-                            "request_bytes": .number(Double(encodedBatch.count)),
-                        ])
-                    )
-                }
-                // Preflight every item before any executes (checkpoint list forbidden).
+                // Checkpoint-specific admission only: reject explicit v1 items
+                // before any sibling executes. Do not apply global item/byte caps
+                // here — those would change compatibility for every other RPC.
                 for callValue in calls {
                     guard let call = callValue.objectValue,
                           let method = call["method"]?.stringValue else {
                         throw JSONRPCError.invalidParams
                     }
+                    let callParams = call["params"]?.objectValue ?? [:]
                     try AgentCheckpointListContract.preflightTransport(
                         method: method,
                         transport: Self.rpcWireTransport,
-                        inBatch: true
+                        inBatch: true,
+                        isExplicitV1: AgentCheckpointListContract.isExplicitV1(params: callParams)
                     )
                     guard Self.isReadOnlyBatchMethod(method) else {
                         return .init(id: id, error: JSONRPCError(
@@ -1346,7 +1332,6 @@ public final class JSONRPCDispatcher {
                     }
                 }
                 var results: [JSONValue] = []
-                var aggregateBytes = 0
                 for (index, callValue) in calls.enumerated() {
                     guard let call = callValue.objectValue,
                           let method = call["method"]?.stringValue else {
@@ -1360,24 +1345,6 @@ public final class JSONRPCDispatcher {
                             method: method,
                             params: callParams
                         ))
-                    }
-                    if let encoded = try? JSONEncoder().encode(response) {
-                        aggregateBytes += encoded.count
-                        if aggregateBytes > AgentCheckpointListContract.maxBatchAggregateResponseBytes {
-                            return AgentCheckpointListContract.encodeBoundedErrorResponse(
-                                id: id,
-                                error: JSONRPCError(
-                                    code: -32603,
-                                    message: "rpc.batch aggregate response exceeds max_response_bytes.",
-                                    data: .object([
-                                        "reason": .string("max_batch_aggregate_response_bytes"),
-                                        "max_response_bytes": .number(
-                                            Double(AgentCheckpointListContract.maxBatchAggregateResponseBytes)
-                                        ),
-                                    ])
-                                )
-                            )
-                        }
                     }
                     if let error = response.error {
                         results.append(.object([
@@ -2647,19 +2614,24 @@ public final class JSONRPCDispatcher {
                             error: error
                         )
                     }
-                    let page = try await router.listAgentThreadCheckpointsPage(
-                        thread: v1.threadId,
-                        maxEntries: v1.maxEntries,
-                        before: v1.before
-                    )
-                    if let clientRevision = v1.catalogRevision,
-                       clientRevision != page.catalogRevision {
-                        return AgentCheckpointListContract.encodeBoundedErrorResponse(
-                            id: id,
-                            error: AgentCheckpointListContract.staleCursorError(
-                                currentRevision: page.catalogRevision
-                            )
+                    let page: AgentTurnCheckpointPage
+                    do {
+                        page = try await router.listAgentThreadCheckpointsPage(
+                            thread: v1.threadId,
+                            maxEntries: v1.maxEntries,
+                            before: v1.before,
+                            expectedCatalogRevision: v1.catalogRevision
                         )
+                    } catch let error as AgentTurnCheckpointListError {
+                        switch error {
+                        case .staleCatalogRevision(let current):
+                            return AgentCheckpointListContract.encodeBoundedErrorResponse(
+                                id: id,
+                                error: AgentCheckpointListContract.staleCursorError(
+                                    currentRevision: current
+                                )
+                            )
+                        }
                     }
                     // Freeze + pack on a dedicated non-MainActor queue.
                     let payload = try await AgentCheckpointListContract.freezeAndPackPageAsync(
@@ -3455,9 +3427,9 @@ public final class JSONRPCDispatcher {
         "surface.health", "surface.read_text", "surface.read_history",
         "agent.thread.list", "agent.message.queue.list", "agent.plan.notes.get",
         "agent.message.list", "agent.message.get", "agent.pending_callbacks.list",
-        // agent.checkpoint.list is HTTP-only and rejected from every batch surface
-        // before execution (see AgentCheckpointListContract.preflightTransport).
-        "agent.thread.read", "agent.checkpoint.diff",
+        // Legacy agent.checkpoint.list remains batch-admitted. Explicit
+        // response_version 1 is rejected by preflightTransport before execution.
+        "agent.thread.read", "agent.checkpoint.list", "agent.checkpoint.diff",
         "git.status", "git.branches", "git.log", "git.diff", "git.pull_request_url", "git.delivery_plan",
         "project.scripts",
         "agent.models.list", "agent.providers.list", "agent.run_as_users.list", "agent.state.current", "agent.prompt_history",
@@ -3503,11 +3475,6 @@ public final class JSONRPCDispatcher {
         }
         if namespace == "fs" || namespace == "files" {
             return "file"
-        }
-        if method == AgentCheckpointListContract.method {
-            // HTTP-only metadata list: still a pure read for capability scoping,
-            // but never admitted into rpc.batch / top-level array batches.
-            return "read"
         }
         if isReadOnlyBatchMethod(method) {
             return "read"

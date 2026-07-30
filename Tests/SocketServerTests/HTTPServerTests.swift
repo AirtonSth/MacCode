@@ -112,10 +112,10 @@ final class HTTPServerTests: XCTestCase {
     }
 
     @MainActor
-    func test_checkpointListRefusedFromTopLevelHTTPBatchBeforeAnySibling() async throws {
-        // WHY: a legal 700 KiB checkpoint page must never ride in a batch where
-        // siblings can aggregate past the weak-link contract; reject before
-        // executing any item.
+    func test_checkpointListV1RefusedFromTopLevelHTTPBatchBeforeAnySibling() async throws {
+        // WHY: explicit v1 is batch-forbidden before any sibling executes.
+        // Unrelated methods and legacy checkpoint.list keep prior batch shape
+        // (no global item/byte caps from this slice).
         let router = FakeRouter()
         let server = DirectHTTPServer(
             port: UInt16.random(in: 33_000...44_000),
@@ -156,8 +156,48 @@ final class HTTPServerTests: XCTestCase {
         XCTAssertEqual(
             router.checkpointPageCallCount,
             0,
-            "top-level batch must reject checkpoint list before any sibling executes"
+            "top-level batch must reject explicit v1 before any sibling executes"
         )
+
+        // Legacy checkpoint.list in top-level batch still executes (base host).
+        let thread = AgentThread(workspaceId: nil, title: "legacy-batch", provider: .codex, model: "m")
+        router.threadStore = [thread]
+        router.checkpointStore = [
+            AgentTurnCheckpointSummary(
+                threadId: thread.id,
+                runId: AgentRunID(),
+                turnId: "t1",
+                checkpointTurnCount: 1,
+                checkpointRef: "r1",
+                status: .ready,
+                files: []
+            )
+        ]
+        let legacyBatchData = await server.dispatchRPC(
+            bodyData: try JSONSerialization.data(withJSONObject: [
+                [
+                    "jsonrpc": "2.0",
+                    "id": "ping",
+                    "method": "system.ping",
+                    "params": [:],
+                ],
+                [
+                    "jsonrpc": "2.0",
+                    "id": "legacy-cp",
+                    "method": "agent.checkpoint.list",
+                    "params": [
+                        "thread_id": thread.id.value.uuidString,
+                    ],
+                ],
+            ])
+        )
+        let legacyBatch = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: legacyBatchData) as? [Any]
+        )
+        XCTAssertEqual(legacyBatch.count, 2)
+        let legacyItem = try XCTUnwrap(legacyBatch[1] as? [String: Any])
+        XCTAssertNil(legacyItem["error"])
+        XCTAssertNotNil(legacyItem["result"] as? [Any])
     }
 
     // MARK: - urlHostLiteral / endpointURLString (IPv6 zone-id URL hosts)

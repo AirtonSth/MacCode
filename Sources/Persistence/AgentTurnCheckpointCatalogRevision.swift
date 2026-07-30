@@ -76,6 +76,9 @@ public enum AgentTurnCheckpointCatalogRevision {
         END;
         """
 
+    /// DDL for the catalog fence. **Migration/setup only** — never call from
+    /// request-path `current()` / list reads (those must not reserve the writer
+    /// or run CREATE IF NOT EXISTS per request).
     public static func ensureTable(_ db: SQLiteDB) throws {
         try db.execute(tableSQL)
         try db.execute(insertTriggerSQL)
@@ -85,8 +88,9 @@ public enum AgentTurnCheckpointCatalogRevision {
 
     /// Revision fence for `threadId`. Threads with no prior list-affecting
     /// mutation report `1` so first-page clients start from a stable baseline.
+    ///
+    /// Read-only: does not CREATE tables or triggers. Schema migration owns DDL.
     public static func current(db: SQLiteDB, threadId: AgentThreadID) throws -> Int64 {
-        try ensureTable(db)
         let st = try db.prepare(
             """
             SELECT revision FROM agent_turn_checkpoint_catalog_meta
@@ -101,9 +105,10 @@ public enum AgentTurnCheckpointCatalogRevision {
     /// Explicit bump for call sites that need a revision change outside row
     /// triggers (tests). Production mutations rely on INSERT/UPDATE/DELETE
     /// triggers so revision stays transactional with the row write.
+    ///
+    /// Assumes schema migration already installed the catalog table/triggers.
     @discardableResult
     public static func bump(db: SQLiteDB, threadId: AgentThreadID) throws -> Int64 {
-        try ensureTable(db)
         let st = try db.prepare(
             """
             INSERT INTO agent_turn_checkpoint_catalog_meta(thread_id, revision)

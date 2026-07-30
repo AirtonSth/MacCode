@@ -1070,6 +1070,116 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
         XCTAssertGreaterThan(second.catalogRevision, first.catalogRevision)
     }
 
+    func testListMetadataPageUsesDeferredReadSnapshotWithoutPerRequestDDL() throws {
+        // WHY: BEGIN IMMEDIATE would reserve the writer and serialize agent
+        // upserts behind every list page. Per-request CREATE IF NOT EXISTS is
+        // also writer DDL and belongs only in migration/setup.
+        let db = try makeDB()
+        let repo = AgentTurnCheckpointRepository(db: db)
+        let (tid, rid) = try seedThreadAndRun(db: db)
+        try repo.upsert(makeHeavyCheckpoint(
+            threadId: tid,
+            turnCount: 1,
+            turnId: "read-seam",
+            runId: rid,
+            completedAt: Date(timeIntervalSince1970: 1_700_005_000)
+        ))
+
+        var executed: [String] = []
+        db.beforeExecuteForTesting = { sql in executed.append(sql) }
+        defer { db.beforeExecuteForTesting = nil }
+
+        let page = try repo.listMetadataPage(threadId: tid, maxEntries: 10, before: nil)
+        XCTAssertEqual(page.items.count, 1)
+
+        let upper = executed.map { $0.uppercased() }
+        XCTAssertTrue(
+            upper.contains(where: { $0.contains("BEGIN DEFERRED") }),
+            "list must open a deferred read snapshot: \(executed)"
+        )
+        XCTAssertFalse(
+            upper.contains(where: { $0.contains("BEGIN IMMEDIATE") }),
+            "list must not reserve the writer via BEGIN IMMEDIATE: \(executed)"
+        )
+        XCTAssertFalse(
+            upper.contains(where: { $0.contains("CREATE ") }),
+            "list/current must not run per-request DDL: \(executed)"
+        )
+
+        // current() alone must also stay free of DDL.
+        executed.removeAll()
+        _ = try AgentTurnCheckpointCatalogRevision.current(db: db, threadId: tid)
+        let currentUpper = executed.map { $0.uppercased() }
+        XCTAssertFalse(
+            currentUpper.contains(where: { $0.contains("CREATE ") }),
+            "CatalogRevision.current must not CREATE IF NOT EXISTS: \(executed)"
+        )
+    }
+
+    func testStaleExpectedCatalogRevisionFailsBeforePageQueryDecode() throws {
+        // WHY: a stale continuation must fail closed inside the same read
+        // snapshot without paying for page row scan/decode work.
+        let db = try makeDB()
+        let repo = AgentTurnCheckpointRepository(db: db)
+        let (tid, rid) = try seedThreadAndRun(db: db)
+        let base = Date(timeIntervalSince1970: 1_700_005_100)
+        for n in 1...4 {
+            try repo.upsert(makeHeavyCheckpoint(
+                threadId: tid,
+                turnCount: n,
+                turnId: "preclaim-\(n)",
+                runId: rid,
+                completedAt: base.addingTimeInterval(TimeInterval(n))
+            ))
+        }
+        let first = try repo.listMetadataPage(threadId: tid, maxEntries: 2, before: nil)
+        let cursor = try XCTUnwrap(first.nextBefore)
+        let expected = first.catalogRevision
+
+        try repo.upsert(makeHeavyCheckpoint(
+            threadId: tid,
+            turnCount: 99,
+            turnId: "preclaim-new",
+            runId: rid,
+            completedAt: base.addingTimeInterval(99)
+        ))
+
+        var steppedSQL: [String] = []
+        db.beforeStatementStepForTesting = { sql in steppedSQL.append(sql) }
+        defer { db.beforeStatementStepForTesting = nil }
+
+        XCTAssertThrowsError(
+            try repo.listMetadataPage(
+                threadId: tid,
+                maxEntries: 2,
+                before: cursor,
+                expectedCatalogRevision: expected
+            )
+        ) { error in
+            guard case AgentTurnCheckpointListError.staleCatalogRevision(let current) = error else {
+                return XCTFail("expected staleCatalogRevision, got \(error)")
+            }
+            XCTAssertGreaterThan(current, expected)
+        }
+
+        // Only the revision SELECT may step — never the page projection SELECT.
+        let pageSelects = steppedSQL.filter {
+            $0.contains("FROM agent_turn_checkpoints")
+                && $0.contains("list_turn_id")
+        }
+        XCTAssertEqual(
+            pageSelects.count,
+            0,
+            "stale preclaim must not scan/decode page rows: \(steppedSQL)"
+        )
+        XCTAssertTrue(
+            steppedSQL.contains(where: {
+                $0.contains("agent_turn_checkpoint_catalog_meta")
+            }),
+            "revision must still be read inside the snapshot"
+        )
+    }
+
     func testDetailOnlyMutationDoesNotBumpCatalogRevision() throws {
         // WHY: rewriting non-emitted payloads (diff/snapshots/raw files_json)
         // must not spuriously invalidate an in-flight pagination session.

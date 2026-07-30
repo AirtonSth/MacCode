@@ -251,15 +251,16 @@ final class SchemaMigrationMatrixTests: XCTestCase {
     }
 
     func test_precedingVersion_to_head_checkpointListStepIsSelfContained() throws {
-        // WHY: the immediately preceding version of the relocatable step must
-        // also reach head. On this branch preceding == shared base (56); final
-        // composition renumbers past Message migrations via one constant.
+        // WHY: the named relocatable step is self-contained from its immediate
+        // predecessor. Composition renumbers `checkpointListSchemaVersion`
+        // past Message slots; tests never hardcode SchemaStep57 / base+1.
         let preceding = Schema.checkpointListSchemaVersion - 1
-        XCTAssertEqual(preceding, Schema.sharedIntegrationBaseVersion)
+        XCTAssertGreaterThanOrEqual(preceding, Schema.sharedIntegrationBaseVersion)
         let db = try migrateFromVersion(n: preceding)
         XCTAssertEqual(try maxVersion(db), preceding)
         try Schema.migrateSteps(db, Schema.steps)
         XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
+        XCTAssertEqual(try maxVersion(db), Schema.checkpointListSchemaVersion)
 
         // Table exists and is per-thread (no global id=1 singleton).
         let cols = try db.prepare(
@@ -321,22 +322,28 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         XCTAssertEqual(row.columnInt64(2), 1)
     }
 
-    func test_checkpointListSchemaVersion_isSingleRelocatableStep() throws {
-        // WHY: controllers renumber one constant at composition time. Multiple
-        // provisional steps (old 57/58/59) collide with Message migrations.
-        let checkpointSteps = Schema.steps.filter {
+    func test_checkpointListSchemaVersion_isSingleNamedRelocatableStep() throws {
+        // WHY: composition assigns one named constant atomically. Tests bind to
+        // `checkpointListSchemaVersion` / `checkpointListMigrationSQL` identity,
+        // never a fixed SchemaStep57 or base+1 equality that collides with Message.
+        let namedSteps = Schema.steps.filter {
+            $0.version == Schema.checkpointListSchemaVersion
+        }
+        XCTAssertEqual(namedSteps.count, 1, "exactly one step uses the named version")
+        XCTAssertEqual(namedSteps[0].sql, Schema.checkpointListMigrationSQL)
+        XCTAssertEqual(Schema.currentVersion, Schema.checkpointListSchemaVersion)
+        XCTAssertGreaterThan(
+            Schema.checkpointListSchemaVersion,
+            Schema.sharedIntegrationBaseVersion,
+            "named step must sit after the shared integration base"
+        )
+        // Any post-base steps on this branch must only be the named checkpoint step
+        // (Message slots are absent here; composition renumbers past them later).
+        let postBase = Schema.steps.filter {
             $0.version > Schema.sharedIntegrationBaseVersion
         }
-        XCTAssertEqual(checkpointSteps.count, 1)
-        XCTAssertEqual(checkpointSteps[0].version, Schema.checkpointListSchemaVersion)
-        XCTAssertEqual(Schema.currentVersion, Schema.checkpointListSchemaVersion)
-        // Residual: provisional number equals base+1 on this branch only.
-        // Final composition must advance past Message slots before merge.
-        XCTAssertEqual(
-            Schema.checkpointListSchemaVersion,
-            Schema.sharedIntegrationBaseVersion + 1,
-            "isolated-branch provisional slot; renumber for merge"
-        )
+        XCTAssertEqual(postBase.count, 1)
+        XCTAssertEqual(postBase[0].version, Schema.checkpointListSchemaVersion)
     }
 
     // MARK: - v25 → head

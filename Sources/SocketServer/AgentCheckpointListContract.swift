@@ -3,9 +3,10 @@ import CoreModel
 
 /// Wire contract for `agent.checkpoint.list` (legacy + response_version 1).
 ///
-/// iOS routes this method-specifically over authenticated HTTP `/v1/rpc`.
-/// Unix IPC, WebSocket multiplexed RPC, nested `rpc.batch`, and top-level
-/// JSON-RPC array batches reject the method before any repository work.
+/// Explicit `response_version: 1` is HTTP JSON-RPC only and is forbidden in
+/// nested `rpc.batch` and top-level JSON-RPC array batches. Legacy calls
+/// (no `response_version`) retain prior Unix / WebSocket / batch behavior and
+/// the historical full-array response shape.
 public enum AgentCheckpointListContract: Sendable {
     public static let method = "agent.checkpoint.list"
     public static let responseVersion = 1
@@ -17,21 +18,13 @@ public enum AgentCheckpointListContract: Sendable {
     public static let maxEncodedResponseBytes = AgentTurnCheckpointListWireProjection.maxEncodedResponseBytes
     public static let maxEncodedResponseIDBytes = maxEncodedItemBytes
     /// Complete encoded JSON-RPC request (id + method + params + escaping).
+    /// Applies to explicit v1 envelopes; legacy transport behavior is unchanged.
     public static let maxEncodedRequestBytes = 16 * 1_024
     public static let maxThreadIDUTF8Bytes = 36
     public static let maxCursorTurnIDUTF8Bytes =
         AgentTurnCheckpointWireIdentity.maximumEncodedTurnIDBytes
     public static let maxCursorCompletedAtUTF8Bytes = 40
     public static let maxWorkspaceIDUTF8Bytes = 36
-
-    // MARK: - General batch ceilings (HTTP array + nested rpc.batch)
-
-    public static let maxBatchItems = 32
-    /// Aggregate encoded responses across one top-level HTTP array batch or one
-    /// nested `rpc.batch` result array. Matches the weak-link single-response
-    /// ceiling so two legal 700 KiB pages cannot compound past the contract.
-    public static let maxBatchAggregateResponseBytes = maxEncodedResponseBytes
-    public static let maxBatchRequestBytes = 256 * 1_024
 
     // MARK: - Stale-cursor recovery
 
@@ -62,16 +55,30 @@ public enum AgentCheckpointListContract: Sendable {
         case localTest
     }
 
+    /// True when the client opted into response_version 1 (explicit key present).
+    public static func isExplicitV1(params: [String: JSONValue]?) -> Bool {
+        params?["response_version"] != nil
+    }
+
+    /// Untyped HTTP/JSONSerialization param map variant.
+    public static func isExplicitV1(params: [String: Any]?) -> Bool {
+        params?["response_version"] != nil
+    }
+
+    /// Transport admission for **explicit v1 only**.
+    /// Legacy `agent.checkpoint.list` (no `response_version`) is a no-op here so
+    /// Unix / WebSocket / batch retain prior host behavior.
     public static func preflightTransport(
         method: String,
         transport: WireTransport,
-        inBatch: Bool
+        inBatch: Bool,
+        isExplicitV1: Bool
     ) throws {
-        guard method == Self.method else { return }
+        guard method == Self.method, isExplicitV1 else { return }
         if inBatch {
             throw JSONRPCError(
                 code: -32600,
-                message: "agent.checkpoint.list is forbidden in batch RPC.",
+                message: "agent.checkpoint.list response_version 1 is forbidden in batch RPC.",
                 data: .object([
                     "reason": .string("checkpoint_list_batch_forbidden"),
                     "method": .string(method),
@@ -85,7 +92,7 @@ public enum AgentCheckpointListContract: Sendable {
         case .unix, .webSocket:
             throw JSONRPCError(
                 code: -32600,
-                message: "agent.checkpoint.list is HTTP JSON-RPC only.",
+                message: "agent.checkpoint.list response_version 1 is HTTP JSON-RPC only.",
                 data: .object([
                     "reason": .string("checkpoint_list_http_only"),
                     "method": .string(method),
@@ -249,20 +256,15 @@ public enum AgentCheckpointListContract: Sendable {
         params: [String: JSONValue],
         fullRequest: JSONRPCRequest
     ) throws -> AgentThreadID {
-        // Legacy preserves prior param laxness for the business keys it already
-        // understood, but still enforces transport/request ceilings so a hostile
-        // envelope cannot exhaust the host before the repository path.
+        // Legacy preserves prior param/response shape. No HTTP-only or batch
+        // gate here — those apply only to explicit response_version 1.
         guard let threadRaw = params["thread_id"]?.stringValue,
               threadRaw.utf8.count <= maxThreadIDUTF8Bytes,
               let threadUUID = UUID(uuidString: threadRaw) else {
             throw JSONRPCError.invalidParams
         }
-        // Legacy responses are unbounded historically; still refuse a hostile id
-        // that cannot even fit a compact error under the weak-link ceiling.
-        if let id, !acceptsResponseID(id) {
-            throw JSONRPCError.invalidRequest
-        }
-        try preflightEncodedRequest(fullRequest)
+        _ = id
+        _ = fullRequest
         return AgentThreadID(threadUUID)
     }
 
