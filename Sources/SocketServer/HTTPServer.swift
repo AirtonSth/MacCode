@@ -1131,6 +1131,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "methods": ["ssh.host.list", "ssh.host.upsert", "ssh.host.delete", "ssh.connect", "ssh.disconnect", "ssh.transfer.upload", "ssh.transfer.download", "ssh.files.local.list", "ssh.files.remote.list", "ssh.files.remote.mkdir", "ssh.files.remote.rename", "ssh.files.remote.delete"]
             ],
             "agent": agent,
+            // Public pre-auth hint only. iOS enables message v1 solely from the
+            // exact authenticated system.capabilities marker.
+            "message_transport_advisory": [
+                "protocol": "agent.message.v1",
+                "version": 1,
+                "list": "bounded-envelope",
+                "get": "rpc-byte-offset",
+                "event": "bounded-preview",
+                "metadata": "offset-zero-only",
+                "digest": "sha256-hex",
+                "revision": "body_revision",
+                "advisory_only": true,
+                "authoritative_rpc": "system.capabilities",
+            ],
             "browser_automation": [
                 "p0": ["navigate", "back", "forward", "reload", "stop", "url.get", "mirror_url.get"],
                 "p1": ["click", "fill", "type", "focus", "hover", "check", "uncheck", "select", "eval", "snapshot", "screenshot", "wait"],

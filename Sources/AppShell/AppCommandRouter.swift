@@ -2594,6 +2594,23 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return try ctx.messageRepo.get(id: id)
     }
 
+    public func getAgentMessageBodyChunk(
+        id: AgentMessageID,
+        offsetBytes: Int,
+        maxContentBytes: Int,
+        expectedBodyRevision: Int?,
+        expectedBodySHA256: String?
+    ) throws -> AgentMessageBodyChunk? {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        return try ctx.messageRepo.bodyChunk(
+            id: id,
+            offsetBytes: offsetBytes,
+            maxContentBytes: maxContentBytes,
+            expectedBodyRevision: expectedBodyRevision,
+            expectedBodySHA256: expectedBodySHA256
+        )
+    }
+
     public func listAgentQueuedMessages(thread: AgentThreadID) throws -> [AgentQueuedMessage] {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         return try ctx.queuedMessageRepo.list(threadId: thread)

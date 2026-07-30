@@ -432,7 +432,7 @@ final class LocalStorageBudgetTests: XCTestCase {
         let cleanupError = ErrorBox()
 
         fixture.db.beforeStatementStepForTesting = { sql in
-            guard sql.contains("INSERT OR REPLACE INTO agent_messages") else { return }
+            guard sql.contains("INSERT INTO agent_messages") else { return }
             writerEnteredStep.signal()
             _ = allowWriterCommit.wait(timeout: .now() + 2)
         }
@@ -499,7 +499,7 @@ final class LocalStorageBudgetTests: XCTestCase {
         let cleanupError = ErrorBox()
 
         fixture.db.beforeStatementStepForTesting = { sql in
-            guard sql.contains("INSERT OR REPLACE INTO agent_messages") else { return }
+            guard sql.contains("INSERT INTO agent_messages") else { return }
             writerEnteredStep.signal()
             _ = allowWriterCommit.wait(timeout: .now() + 2)
         }

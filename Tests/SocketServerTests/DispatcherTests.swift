@@ -791,6 +791,11 @@ final class DispatcherTests: XCTestCase {
         let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "system.capabilities", params: nil))
         guard case .object(let o) = resp.result! else { return XCTFail() }
         XCTAssertEqual(o["app"], .string("remotecode"))
+        XCTAssertEqual(
+            o["message_transport"],
+            AgentMessageTransport.capabilityMarker,
+            "bounded message v1 must be enabled only by this exact authenticated marker"
+        )
     }
 
     @MainActor
@@ -2638,6 +2643,47 @@ final class DispatcherTests: XCTestCase {
     }
 
     @MainActor
+    func test_agentMessageListV1NeverReturnsCursorlessEmptyMorePage() async {
+        let router = FakeRouter()
+        let thread = AgentThread(
+            workspaceId: nil,
+            title: "cursor invariant",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        router.threadStore = [thread]
+        router.messageStore = [
+            AgentMessage(
+                threadId: thread.id,
+                role: .assistant,
+                content: String(repeating: "x", count: 20_000)
+            ),
+        ]
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let response = await dispatcher.dispatch(
+            JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .string(String(repeating: "r", count: 2_000)),
+                method: "agent.message.list",
+                params: [
+                    "thread_id":
+                        .string(thread.id.value.uuidString),
+                    "limit": .number(10),
+                    "response_version": .number(1),
+                    "max_body_bytes": .number(1_024),
+                ]
+            )
+        )
+
+        XCTAssertEqual(response.error?.code, -32041)
+        XCTAssertEqual(
+            response.error?.data?.objectValue?["kind"],
+            .string("list_envelope_too_small"),
+            "if even an identity row cannot fit, return a typed error instead of [] + has_more + null cursor"
+        )
+    }
+
+    @MainActor
     func test_agentMessageGetV1ChunksOverOneMiBWithHashAndExactEnvelopeCap() async throws {
         let router = FakeRouter()
         let t = AgentThread(workspaceId: nil, title: "get-budget", provider: .codex, model: "gpt-5.5")
@@ -2665,17 +2711,25 @@ final class DispatcherTests: XCTestCase {
         var offset = 0
         var reconstructed = ""
         var chunks = 0
+        var bodyRevision: Int?
         while true {
+            var params: [String: JSONValue] = [
+                "message_id": .string(mid.value.uuidString),
+                "response_version": .number(1),
+                "max_bytes": .number(64_000),
+                "offset_bytes": .number(Double(offset)),
+            ]
+            if offset > 0 {
+                params["expected_body_revision"] =
+                    bodyRevision.map { .number(Double($0)) }
+                params["expected_body_sha256"] =
+                    .string(expectedHash)
+            }
             let response = await d.dispatch(JSONRPCRequest(
                 jsonrpc: "2.0",
                 id: .number(2 + chunks),
                 method: "agent.message.get",
-                params: [
-                    "message_id": .string(mid.value.uuidString),
-                    "response_version": .number(1),
-                    "max_bytes": .number(64_000),
-                    "offset_bytes": .number(Double(offset)),
-                ]
+                params: params
             ))
             XCTAssertLessThanOrEqual(
                 try JSONEncoder().encode(response).count,
@@ -2698,10 +2752,28 @@ final class DispatcherTests: XCTestCase {
             )
             XCTAssertEqual(message["body_offset"], .number(Double(offset)))
             XCTAssertEqual(message["body_sha256"], .string(expectedHash))
+            XCTAssertEqual(message["body_revision"], .number(1))
+            bodyRevision = message["body_revision"]?.intValue
             XCTAssertEqual(
                 message["body_byte_count"],
                 .number(Double(body.utf8.count))
             )
+            if offset == 0 {
+                XCTAssertNotNil(message["threadId"])
+                XCTAssertNotNil(message["role"])
+                XCTAssertNotNil(message["createdAt"])
+                XCTAssertNotNil(message["attachments"])
+            } else {
+                XCTAssertEqual(
+                    Set(message.keys),
+                    [
+                        "id", "content", "body_byte_count",
+                        "body_sha256", "body_revision", "body_offset",
+                        "body_next_offset", "body_truncated",
+                    ],
+                    "continuations must not repeat metadata or attachments"
+                )
+            }
             XCTAssertNotNil(content.data(using: .utf8))
             reconstructed += content
             chunks += 1
@@ -2729,6 +2801,45 @@ final class DispatcherTests: XCTestCase {
             expectedHash
         )
 
+        let staleRevision = await d.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(9_996),
+            method: "agent.message.get",
+            params: [
+                "message_id": .string(mid.value.uuidString),
+                "response_version": .number(1),
+                "max_bytes": .number(64_000),
+                "offset_bytes": .number(4),
+                "expected_body_revision": .number(2),
+                "expected_body_sha256": .string(expectedHash),
+            ]
+        ))
+        XCTAssertEqual(staleRevision.error?.code, -32042)
+        XCTAssertEqual(
+            staleRevision.error?.data?.objectValue?["kind"],
+            .string("body_revision_conflict")
+        )
+
+        let wrongDigest = await d.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(9_997),
+            method: "agent.message.get",
+            params: [
+                "message_id": .string(mid.value.uuidString),
+                "response_version": .number(1),
+                "max_bytes": .number(64_000),
+                "offset_bytes": .number(4),
+                "expected_body_revision": .number(1),
+                "expected_body_sha256":
+                    .string(String(repeating: "0", count: 64)),
+            ]
+        ))
+        XCTAssertEqual(wrongDigest.error?.code, -32042)
+        XCTAssertEqual(
+            wrongDigest.error?.data?.objectValue?["kind"],
+            .string("body_digest_mismatch")
+        )
+
         let missingOffset = await d.dispatch(JSONRPCRequest(
             jsonrpc: "2.0",
             id: .number(9_998),
@@ -2754,6 +2865,8 @@ final class DispatcherTests: XCTestCase {
                 "response_version": .number(1),
                 "max_bytes": .number(64_000),
                 "offset_bytes": .number(1),
+                "expected_body_revision": .number(1),
+                "expected_body_sha256": .string(expectedHash),
             ]
         ))
         XCTAssertEqual(midScalar.error?.code, JSONRPCError.invalidParams.code)

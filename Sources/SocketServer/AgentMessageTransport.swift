@@ -17,6 +17,18 @@ public enum AgentMessageTransport {
     public static let attachmentJSONMaxBytes = 16 * 1_024
     public static let attachmentWireMaxBytes = 4 * 1_024
     public static let attachmentCountLimit = 32
+    /// Exact authenticated opt-in. Clients must compare the complete object;
+    /// public HTTP capability data is advisory and never authorizes v1.
+    public static let capabilityMarker: JSONValue = .object([
+        "protocol": .string("agent.message.v1"),
+        "version": .number(1),
+        "list": .string("bounded-envelope"),
+        "get": .string("rpc-byte-offset"),
+        "event": .string("bounded-preview"),
+        "metadata": .string("offset-zero-only"),
+        "digest": .string("sha256-hex"),
+        "revision": .string("body_revision"),
+    ])
 
     public static func clampListMaxBodyBytes(_ raw: Int) -> Int {
         min(max(1, raw), listMaxBodyBytesCap)
@@ -58,6 +70,53 @@ public enum AgentMessageTransport {
             .joined()
     }
 
+    /// Test/in-memory router adapter. Production AppCommandRouter overrides
+    /// this seam with AgentMessageRepository.bodyChunk so this allocation is
+    /// never on the shipped host path.
+    public static func inMemoryBodyChunk(
+        message: AgentMessage,
+        offsetBytes: Int,
+        maxContentBytes: Int
+    ) -> AgentMessageBodyChunk? {
+        let bytes = Array(message.content.utf8)
+        guard offsetBytes >= 0,
+              offsetBytes <= bytes.count,
+              isUTF8Boundary(bytes: bytes, offset: offsetBytes) else {
+            return nil
+        }
+        let end = utf8ChunkEnd(
+            bytes: bytes,
+            offset: offsetBytes,
+            maximumBytes: maxContentBytes
+        )
+        let content = String(
+            decoding: bytes[offsetBytes..<end],
+            as: UTF8.self
+        )
+        let attachments = Array(
+            message.attachments.prefix(attachmentCountLimit)
+        )
+        return AgentMessageBodyChunk(
+            id: message.id,
+            content: content,
+            bodyByteCount: bytes.count,
+            bodySHA256: bodySHA256Hex(message.content),
+            bodyRevision: 1,
+            bodyOffset: offsetBytes,
+            metadata: offsetBytes == 0
+                ? AgentMessageBodyChunkMetadata(
+                    threadId: message.threadId,
+                    role: message.role,
+                    createdAt: message.createdAt,
+                    attachments: attachments,
+                    attachmentCount: message.attachments.count,
+                    attachmentsTruncated:
+                        attachments.count < message.attachments.count
+                  )
+                : nil
+        )
+    }
+
     // MARK: - In-memory routing fallback
 
     public static func pageWithinBodyBudget(
@@ -78,9 +137,12 @@ public enum AgentMessageTransport {
                 message.content.utf8.count,
                 perMessageLimit
             )
-            guard runningBytes + admittedBytes <= targetBudget else { break }
+            guard keptIDs.isEmpty
+                    || runningBytes + admittedBytes <= targetBudget else {
+                break
+            }
             keptIDs.insert(message.id)
-            runningBytes += admittedBytes
+            runningBytes += min(admittedBytes, targetBudget)
         }
 
         let kept = page.messages.filter { keptIDs.contains($0.id) }
@@ -159,6 +221,13 @@ public enum AgentMessageTransport {
         var droppedForEnvelope = false
 
         while true {
+            // A non-empty source must either return at least one identity row
+            // (which owns the pagination cursor) or fail structurally. Returning
+            // an empty envelope with has_more=true and null cursors deadlocks the
+            // client pager.
+            if retained.isEmpty, !source.rows.isEmpty {
+                return nil
+            }
             let maximumContentBytes = retained.reduce(0) {
                 $0 + $1.content.utf8.count
             }
@@ -229,6 +298,7 @@ public enum AgentMessageTransport {
                     || source.truncatedIDs.contains(message.id),
                 bodyByteCount: original,
                 bodySHA256: nil,
+                bodyRevision: nil,
                 bodyOffset: nil,
                 bodyNextOffset: nil,
                 attachmentCount: attachmentCount,
@@ -264,26 +334,22 @@ public enum AgentMessageTransport {
 
     // MARK: - Version 1 get chunks
 
-    /// Byte-range/full hydration response. `offsetBytes` must be a UTF-8 scalar
-    /// boundary. The exact JSON-RPC response is fitted under `maxResponseBytes`.
+    /// Fits one already-SQL-bounded body page under the exact JSON-RPC budget.
+    /// Persistence owns digest/revision and never returns a full body here.
     public static func v1GetResult(
-        message: AgentMessage,
-        offsetBytes: Int,
+        chunk: AgentMessageBodyChunk,
         maxResponseBytes: Int,
         responseID: JSONRPCID?,
         basePayload: (AgentMessage) -> JSONValue
     ) -> JSONValue? {
-        let bytes = Array(message.content.utf8)
+        let offsetBytes = chunk.bodyOffset
         guard offsetBytes >= 0,
-              offsetBytes <= bytes.count,
-              isUTF8Boundary(bytes: bytes, offset: offsetBytes) else {
+              offsetBytes <= chunk.bodyByteCount,
+              (offsetBytes == 0) == (chunk.metadata != nil) else {
             return nil
         }
-        let digest = bodySHA256Hex(message.content)
-        let attachments = boundedAttachments(message.attachments)
-        let attachmentCount = message.attachments.count
         let maximumChunkBytes = min(
-            bytes.count - offsetBytes,
+            chunk.content.utf8.count,
             maxResponseBytes
         )
         var lower = 0
@@ -292,37 +358,52 @@ public enum AgentMessageTransport {
 
         while lower <= upper {
             let proposed = lower + (upper - lower) / 2
-            let end = utf8ChunkEnd(
-                bytes: bytes,
-                offset: offsetBytes,
-                maximumBytes: proposed
+            let content = utf8Prefix(
+                chunk.content,
+                maxBytes: proposed
             )
-            let content = String(
-                decoding: bytes[offsetBytes..<end],
-                as: UTF8.self
-            )
-            let nextOffset: Int? = end < bytes.count ? end : nil
-            let bounded = AgentMessage(
-                id: message.id,
-                threadId: message.threadId,
-                role: message.role,
-                content: content,
-                createdAt: message.createdAt,
-                attachments: attachments
-            )
-            let wire = messageWireObject(
-                base: basePayload(bounded),
-                content: content,
-                bodyAvailable: true,
-                bodyTruncated: nextOffset != nil,
-                bodyByteCount: bytes.count,
-                bodySHA256: digest,
-                bodyOffset: offsetBytes,
-                bodyNextOffset: nextOffset,
-                attachmentCount: attachmentCount,
-                attachmentsTruncated:
-                    attachments.count < attachmentCount
-            )
+            let end = offsetBytes + content.utf8.count
+            let nextOffset: Int? =
+                end < chunk.bodyByteCount ? end : nil
+            let wire: JSONValue
+            if let metadata = chunk.metadata {
+                let bounded = AgentMessage(
+                    id: chunk.id,
+                    threadId: metadata.threadId,
+                    role: metadata.role,
+                    content: content,
+                    createdAt: metadata.createdAt,
+                    attachments: metadata.attachments
+                )
+                wire = messageWireObject(
+                    base: basePayload(bounded),
+                    content: content,
+                    bodyAvailable: true,
+                    bodyTruncated: nextOffset != nil,
+                    bodyByteCount: chunk.bodyByteCount,
+                    bodySHA256: chunk.bodySHA256,
+                    bodyRevision: chunk.bodyRevision,
+                    bodyOffset: offsetBytes,
+                    bodyNextOffset: nextOffset,
+                    attachmentCount: metadata.attachmentCount,
+                    attachmentsTruncated:
+                        metadata.attachmentsTruncated
+                )
+            } else {
+                wire = .object([
+                    "id": .string(chunk.id.value.uuidString),
+                    "content": .string(content),
+                    "body_byte_count":
+                        .number(Double(chunk.bodyByteCount)),
+                    "body_sha256": .string(chunk.bodySHA256),
+                    "body_revision":
+                        .number(Double(chunk.bodyRevision)),
+                    "body_offset": .number(Double(offsetBytes)),
+                    "body_next_offset":
+                        nextOffset.map { .number(Double($0)) } ?? .null,
+                    "body_truncated": .bool(nextOffset != nil),
+                ])
+            }
             let result: JSONValue = .object([
                 "version": .number(1),
                 "message": wire,
@@ -343,7 +424,8 @@ public enum AgentMessageTransport {
 
         guard let best else { return nil }
         // A non-final chunk must always advance; otherwise a client could loop.
-        guard best.end > offsetBytes || offsetBytes == bytes.count else {
+        guard best.end > offsetBytes
+                || offsetBytes == chunk.bodyByteCount else {
             return nil
         }
         return best.result
@@ -388,10 +470,11 @@ public enum AgentMessageTransport {
             content: content,
             bodyAvailable: true,
             bodyTruncated: content.utf8.count < bodyBytes,
-            bodyByteCount: bodyBytes,
-            bodySHA256: bodySHA256Hex(message.content),
-            bodyOffset: nil,
-            bodyNextOffset: nil,
+                bodyByteCount: bodyBytes,
+                bodySHA256: bodySHA256Hex(message.content),
+                bodyRevision: 1,
+                bodyOffset: nil,
+                bodyNextOffset: nil,
             attachmentCount: message.attachments.count,
             attachmentsTruncated:
                 attachments.count < message.attachments.count
@@ -459,6 +542,7 @@ public enum AgentMessageTransport {
         bodyTruncated: Bool,
         bodyByteCount: Int,
         bodySHA256: String?,
+        bodyRevision: Int?,
         bodyOffset: Int?,
         bodyNextOffset: Int?,
         attachmentCount: Int,
@@ -474,6 +558,9 @@ public enum AgentMessageTransport {
             .bool(attachmentsTruncated)
         if let bodySHA256 {
             object["body_sha256"] = .string(bodySHA256)
+        }
+        if let bodyRevision {
+            object["body_revision"] = .number(Double(bodyRevision))
         }
         if let bodyOffset {
             object["body_offset"] = .number(Double(bodyOffset))

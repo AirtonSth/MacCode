@@ -18,10 +18,10 @@ final class ScheduledTaskStoreTests: XCTestCase {
     }
 
     func test_schemaVersionIncludesScheduledTables_becauseUpgradesMustBeAtomic() throws {
-        XCTAssertEqual(Schema.currentVersion, 56)
+        XCTAssertEqual(Schema.currentVersion, 57)
         let statement = try db.prepare("SELECT MAX(version) FROM schema_meta;")
         XCTAssertTrue(try statement.step())
-        XCTAssertEqual(statement.columnInt64(0), 56)
+        XCTAssertEqual(statement.columnInt64(0), 57)
     }
 
     func test_storeErrorLocalizedDescriptionPreservesMessage_becauseXPCReplyMustNotShowError0() {

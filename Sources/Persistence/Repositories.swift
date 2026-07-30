@@ -1,6 +1,7 @@
 import Foundation
 import CoreModel
 import Darwin
+import CryptoKit
 
 let iso = ISO8601DateFormatter()
 
@@ -807,6 +808,68 @@ public struct AgentMessageBodyBudgetResult: Sendable, Equatable {
     }
 }
 
+public enum AgentMessageBodyChunkError: Error, Equatable {
+    case invalidOffset
+    case bodyRevisionConflict
+    case bodyDigestMismatch
+    case bodyIdentityUnavailable
+}
+
+/// Full message metadata is deliberately available only on offset zero.
+/// Continuation pages carry only immutable body identity plus content bytes.
+public struct AgentMessageBodyChunkMetadata: Sendable, Equatable {
+    public let threadId: AgentThreadID
+    public let role: AgentMessageRole
+    public let createdAt: Date
+    public let attachments: [AgentAttachment]
+    public let attachmentCount: Int
+    public let attachmentsTruncated: Bool
+
+    public init(
+        threadId: AgentThreadID,
+        role: AgentMessageRole,
+        createdAt: Date,
+        attachments: [AgentAttachment],
+        attachmentCount: Int,
+        attachmentsTruncated: Bool
+    ) {
+        self.threadId = threadId
+        self.role = role
+        self.createdAt = createdAt
+        self.attachments = attachments
+        self.attachmentCount = attachmentCount
+        self.attachmentsTruncated = attachmentsTruncated
+    }
+}
+
+public struct AgentMessageBodyChunk: Sendable, Equatable {
+    public let id: AgentMessageID
+    public let content: String
+    public let bodyByteCount: Int
+    public let bodySHA256: String
+    public let bodyRevision: Int
+    public let bodyOffset: Int
+    public let metadata: AgentMessageBodyChunkMetadata?
+
+    public init(
+        id: AgentMessageID,
+        content: String,
+        bodyByteCount: Int,
+        bodySHA256: String,
+        bodyRevision: Int,
+        bodyOffset: Int,
+        metadata: AgentMessageBodyChunkMetadata?
+    ) {
+        self.id = id
+        self.content = content
+        self.bodyByteCount = bodyByteCount
+        self.bodySHA256 = bodySHA256
+        self.bodyRevision = bodyRevision
+        self.bodyOffset = bodyOffset
+        self.metadata = metadata
+    }
+}
+
 public final class AgentMessageRepository: @unchecked Sendable {
     let db: SQLiteDB
     private let encoder = JSONEncoder()
@@ -814,13 +877,35 @@ public final class AgentMessageRepository: @unchecked Sendable {
     public init(db: SQLiteDB) { self.db = db }
 
     public func append(_ m: AgentMessage) throws {
-        let st = try db.prepare("INSERT OR REPLACE INTO agent_messages(id, thread_id, role, content, created_at, attachments_json) VALUES(?, ?, ?, ?, ?, ?);")
+        let bodyBytes = m.content.utf8.count
+        let bodySHA256 = Self.bodySHA256Hex(m.content)
+        let st = try db.prepare("""
+            INSERT INTO agent_messages(
+                id, thread_id, role, content, created_at, attachments_json,
+                body_sha256, body_bytes, body_revision
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(id) DO UPDATE SET
+                thread_id = excluded.thread_id,
+                role = excluded.role,
+                content = excluded.content,
+                created_at = excluded.created_at,
+                attachments_json = excluded.attachments_json,
+                body_sha256 = excluded.body_sha256,
+                body_bytes = excluded.body_bytes,
+                body_revision = CASE
+                    WHEN agent_messages.content IS excluded.content
+                    THEN agent_messages.body_revision
+                    ELSE agent_messages.body_revision + 1
+                END;
+            """)
         try st.bind(1, m.id.value.uuidString)
         try st.bind(2, m.threadId.value.uuidString)
         try st.bind(3, m.role.rawValue)
         try st.bind(4, m.content)
         try st.bind(5, iso.string(from: m.createdAt))
         try st.bind(6, try attachmentsJSON(m.attachments))
+        try st.bind(7, bodySHA256)
+        try st.bind(8, bodyBytes)
         _ = try st.step()
     }
 
@@ -1026,7 +1111,8 @@ public final class AgentMessageRepository: @unchecked Sendable {
                    capped_attachments_json, body_bytes, candidate_count,
                    attachment_count, attachment_bytes
             FROM ranked
-            WHERE row_number <= ? AND running_bytes <= ?
+            WHERE row_number <= ?
+              AND (running_bytes <= ? OR row_number = 1)
             ORDER BY \(orderAsc);
         """)
         var index: Int32 = 1
@@ -1175,6 +1261,214 @@ public final class AgentMessageRepository: @unchecked Sendable {
         return (try st.step()) ? message(from: st) : nil
     }
 
+    /// Reads one bounded UTF-8 body page directly from SQLite. Offset zero is
+    /// the only page that crosses message metadata/attachment JSON. Later pages
+    /// select immutable body identity plus `substr(CAST(content AS BLOB), …)`.
+    ///
+    /// Existing pre-v57 rows have their digest materialized once on the first
+    /// offset-zero request. No continuation request reads or hashes the full
+    /// body.
+    public func bodyChunk(
+        id: AgentMessageID,
+        offsetBytes: Int,
+        maxContentBytes: Int,
+        expectedBodyRevision: Int?,
+        expectedBodySHA256: String?
+    ) throws -> AgentMessageBodyChunk? {
+        guard offsetBytes >= 0, maxContentBytes > 0 else {
+            throw AgentMessageBodyChunkError.invalidOffset
+        }
+        if offsetBytes == 0 {
+            guard try materializeBodyIdentityIfNeeded(id: id) else {
+                return nil
+            }
+            return try offsetZeroBodyChunk(
+                id: id,
+                maxContentBytes: maxContentBytes
+            )
+        }
+        guard let expectedBodyRevision else {
+            throw AgentMessageBodyChunkError.bodyRevisionConflict
+        }
+        guard let expectedBodySHA256 else {
+            throw AgentMessageBodyChunkError.bodyDigestMismatch
+        }
+        return try continuationBodyChunk(
+            id: id,
+            offsetBytes: offsetBytes,
+            maxContentBytes: maxContentBytes,
+            expectedBodyRevision: expectedBodyRevision,
+            expectedBodySHA256: expectedBodySHA256.lowercased()
+        )
+    }
+
+    private func materializeBodyIdentityIfNeeded(
+        id: AgentMessageID
+    ) throws -> Bool {
+        try db.transaction {
+            let identity = try db.prepare("""
+                SELECT body_sha256, body_bytes, body_revision
+                FROM agent_messages
+                WHERE id = ?
+                LIMIT 1;
+                """)
+            try identity.bind(1, id.value.uuidString)
+            guard try identity.step() else { return false }
+            if !identity.columnIsNull(0), !identity.columnIsNull(1) {
+                return true
+            }
+            let revision = max(1, Int(identity.columnInt64(2)))
+            let body = try db.prepare("""
+                SELECT content
+                FROM agent_messages
+                WHERE id = ? AND body_revision = ?
+                LIMIT 1;
+                """)
+            try body.bind(1, id.value.uuidString)
+            try body.bind(2, revision)
+            guard try body.step(), let content = body.columnText(0) else {
+                throw AgentMessageBodyChunkError.bodyIdentityUnavailable
+            }
+            let digest = Self.bodySHA256Hex(content)
+            let bytes = content.utf8.count
+            let update = try db.prepare("""
+                UPDATE agent_messages
+                SET body_sha256 = ?, body_bytes = ?
+                WHERE id = ? AND body_revision = ?
+                  AND body_sha256 IS NULL;
+                """)
+            try update.bind(1, digest)
+            try update.bind(2, bytes)
+            try update.bind(3, id.value.uuidString)
+            try update.bind(4, revision)
+            _ = try update.step()
+            return true
+        }
+    }
+
+    private func offsetZeroBodyChunk(
+        id: AgentMessageID,
+        maxContentBytes: Int
+    ) throws -> AgentMessageBodyChunk? {
+        try db.performSync { database in
+            let statement = try database.prepare("""
+                SELECT thread_id, role, created_at,
+                       CASE
+                         WHEN length(CAST(attachments_json AS BLOB)) <= 16384
+                         THEN attachments_json
+                         ELSE '[]'
+                       END,
+                       CASE
+                         WHEN json_valid(attachments_json)
+                              AND json_type(attachments_json) = 'array'
+                         THEN json_array_length(attachments_json)
+                         ELSE 0
+                       END,
+                       length(CAST(attachments_json AS BLOB)),
+                       body_bytes, body_sha256, body_revision,
+                       substr(CAST(content AS BLOB), 1, ?)
+                FROM agent_messages
+                WHERE id = ?
+                LIMIT 1;
+                """)
+            try statement.bind(1, maxContentBytes + 3)
+            try statement.bind(2, id.value.uuidString)
+            guard try statement.step() else { return nil }
+            guard let threadText = statement.columnText(0),
+                  let threadUUID = UUID(uuidString: threadText),
+                  let roleText = statement.columnText(1),
+                  let role = AgentMessageRole(rawValue: roleText),
+                  let createdText = statement.columnText(2),
+                  let createdAt = iso.date(from: createdText),
+                  !statement.columnIsNull(6),
+                  let digest = statement.columnText(7) else {
+                throw AgentMessageBodyChunkError.bodyIdentityUnavailable
+            }
+            let bodyBytes = max(0, Int(statement.columnInt64(6)))
+            let revision = max(1, Int(statement.columnInt64(8)))
+            let rawAttachments = decodeAttachments(statement.columnText(3))
+            let attachmentCount = max(0, Int(statement.columnInt64(4)))
+            let attachmentBytes = max(0, Int(statement.columnInt64(5)))
+            let attachments = Array(rawAttachments.prefix(32))
+            let content = try Self.utf8Chunk(
+                statement.columnBlob(9) ?? Data(),
+                offsetBytes: 0,
+                totalBytes: bodyBytes,
+                maximumBytes: maxContentBytes
+            )
+            return AgentMessageBodyChunk(
+                id: id,
+                content: content,
+                bodyByteCount: bodyBytes,
+                bodySHA256: digest.lowercased(),
+                bodyRevision: revision,
+                bodyOffset: 0,
+                metadata: AgentMessageBodyChunkMetadata(
+                    threadId: AgentThreadID(threadUUID),
+                    role: role,
+                    createdAt: createdAt,
+                    attachments: attachments,
+                    attachmentCount: attachmentCount,
+                    attachmentsTruncated:
+                        attachmentBytes > 16 * 1_024
+                        || attachments.count < attachmentCount
+                )
+            )
+        }
+    }
+
+    private func continuationBodyChunk(
+        id: AgentMessageID,
+        offsetBytes: Int,
+        maxContentBytes: Int,
+        expectedBodyRevision: Int,
+        expectedBodySHA256: String
+    ) throws -> AgentMessageBodyChunk? {
+        try db.performSync { database in
+            let statement = try database.prepare("""
+                SELECT body_bytes, body_sha256, body_revision,
+                       substr(CAST(content AS BLOB), ? + 1, ?)
+                FROM agent_messages
+                WHERE id = ?
+                LIMIT 1;
+                """)
+            try statement.bind(1, offsetBytes)
+            try statement.bind(2, maxContentBytes + 3)
+            try statement.bind(3, id.value.uuidString)
+            guard try statement.step() else { return nil }
+            let revision = max(1, Int(statement.columnInt64(2)))
+            guard revision == expectedBodyRevision else {
+                throw AgentMessageBodyChunkError.bodyRevisionConflict
+            }
+            guard !statement.columnIsNull(0),
+                  let digest = statement.columnText(1) else {
+                throw AgentMessageBodyChunkError.bodyIdentityUnavailable
+            }
+            let bodyBytes = max(0, Int(statement.columnInt64(0)))
+            guard digest.lowercased() == expectedBodySHA256 else {
+                throw AgentMessageBodyChunkError.bodyDigestMismatch
+            }
+            guard offsetBytes <= bodyBytes else {
+                throw AgentMessageBodyChunkError.invalidOffset
+            }
+            let content = try Self.utf8Chunk(
+                statement.columnBlob(3) ?? Data(),
+                offsetBytes: offsetBytes,
+                totalBytes: bodyBytes,
+                maximumBytes: maxContentBytes
+            )
+            return AgentMessageBodyChunk(
+                id: id,
+                content: content,
+                bodyByteCount: bodyBytes,
+                bodySHA256: digest.lowercased(),
+                bodyRevision: revision,
+                bodyOffset: offsetBytes,
+                metadata: nil
+            )
+        }
+    }
+
     /// F13: the earliest user message for a thread, fetched directly (LIMIT 1)
     /// instead of materializing the whole message history. Backs placeholder-title
     /// repair, which only needs the first user message's text and otherwise loaded
@@ -1255,6 +1549,40 @@ public final class AgentMessageRepository: @unchecked Sendable {
             hasMoreNewer: beforeCursor != nil || (afterCursor != nil && rows.count > limit),
             nextAfter: after
         )
+    }
+
+    private static func bodySHA256Hex(_ text: String) -> String {
+        SHA256.hash(data: Data(text.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    private static func utf8Chunk(
+        _ source: Data,
+        offsetBytes: Int,
+        totalBytes: Int,
+        maximumBytes: Int
+    ) throws -> String {
+        guard offsetBytes <= totalBytes else {
+            throw AgentMessageBodyChunkError.invalidOffset
+        }
+        if offsetBytes < totalBytes,
+           let first = source.first,
+           first & 0xC0 == 0x80 {
+            throw AgentMessageBodyChunkError.invalidOffset
+        }
+        var bytes = Data(source.prefix(maximumBytes))
+        for _ in 0..<4 {
+            if let text = String(data: bytes, encoding: .utf8) {
+                if text.isEmpty, offsetBytes < totalBytes {
+                    throw AgentMessageBodyChunkError.invalidOffset
+                }
+                return text
+            }
+            guard !bytes.isEmpty else { break }
+            bytes.removeLast()
+        }
+        throw AgentMessageBodyChunkError.invalidOffset
     }
 
     private func message(from st: SQLiteStatement) -> AgentMessage {

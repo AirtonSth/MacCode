@@ -21,7 +21,7 @@ final class GraphifyUsageRepositoryTests: XCTestCase {
     }
 
     func test_schema54_createsTable() throws {
-        XCTAssertEqual(Schema.currentVersion, 56)
+        XCTAssertEqual(Schema.currentVersion, 57)
         let count: Int = try db.performSync { database in
             let stmt = try database.prepare(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='graphify_usage_events';"

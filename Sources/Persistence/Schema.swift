@@ -10,8 +10,9 @@ public struct SchemaStep {
 
 public enum Schema {
     /// Must equal the highest SchemaStep version (step 53 economy + 54 graphify usage
-    /// + 55 savings honesty axes + 56 credible_v4 cap evidence).
-    public static let currentVersion: Int = 56
+    /// + 55 savings honesty axes + 56 credible_v4 cap evidence
+    /// + 57 immutable agent-message body identity).
+    public static let currentVersion: Int = 57
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -958,6 +959,28 @@ public enum Schema {
         ALTER TABLE token_saver_daily_economy ADD COLUMN graphify_raw_tokens INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE token_saver_daily_economy ADD COLUMN cap_binding TEXT NOT NULL DEFAULT 'none';
         ALTER TABLE token_saver_daily_economy ADD COLUMN window_usage_billed_units REAL NOT NULL DEFAULT 0;
+        """),
+        // Frozen identity for bounded agent.message.get pagination. New writes
+        // materialize these fields once. Existing rows are materialized on their
+        // first offset-zero read because stock SQLite has no SHA-256 function.
+        // The trigger catches every direct content mutator (including Token
+        // Saver capsule cleanup), invalidates the digest, and advances revision
+        // so a client can never splice chunks from two bodies.
+        SchemaStep(57, """
+        ALTER TABLE agent_messages ADD COLUMN body_sha256 TEXT;
+        ALTER TABLE agent_messages ADD COLUMN body_bytes INTEGER;
+        ALTER TABLE agent_messages ADD COLUMN body_revision INTEGER NOT NULL DEFAULT 1;
+        CREATE TRIGGER IF NOT EXISTS trg_agent_message_body_identity_update
+        AFTER UPDATE OF content ON agent_messages
+        WHEN NEW.content IS NOT OLD.content
+             AND NEW.body_revision = OLD.body_revision
+        BEGIN
+            UPDATE agent_messages
+            SET body_sha256 = NULL,
+                body_bytes = length(CAST(NEW.content AS BLOB)),
+                body_revision = OLD.body_revision + 1
+            WHERE id = NEW.id;
+        END;
         """)
     ]
 

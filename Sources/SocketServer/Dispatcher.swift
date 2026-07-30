@@ -144,6 +144,13 @@ public protocol CommandRouting: AnyObject {
     /// thread without issuing one query per thread.
     func threadIdsWithMessages() throws -> Set<AgentThreadID>
     func getAgentMessage(id: AgentMessageID) throws -> AgentMessage?
+    func getAgentMessageBodyChunk(
+        id: AgentMessageID,
+        offsetBytes: Int,
+        maxContentBytes: Int,
+        expectedBodyRevision: Int?,
+        expectedBodySHA256: String?
+    ) throws -> AgentMessageBodyChunk?
     func listAgentQueuedMessages(thread: AgentThreadID) throws -> [AgentQueuedMessage]
     func updateAgentQueuedMessage(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) async throws -> AgentQueuedMessage
     func cancelAgentQueuedMessage(id: AgentQueuedMessageID) throws -> AgentQueuedMessage
@@ -298,6 +305,32 @@ public extension CommandRouting {
             budget: budget,
             contentLimit: contentLimit,
             afterDirection: after != nil
+        )
+    }
+
+    /// Fake/in-memory router compatibility. The production AppCommandRouter
+    /// overrides this and reads a SQLite BLOB range directly.
+    func getAgentMessageBodyChunk(
+        id: AgentMessageID,
+        offsetBytes: Int,
+        maxContentBytes: Int,
+        expectedBodyRevision: Int?,
+        expectedBodySHA256: String?
+    ) throws -> AgentMessageBodyChunk? {
+        guard let message = try getAgentMessage(id: id) else { return nil }
+        let digest = AgentMessageTransport.bodySHA256Hex(message.content)
+        if offsetBytes > 0 {
+            guard expectedBodyRevision == 1 else {
+                throw AgentMessageBodyChunkError.bodyRevisionConflict
+            }
+            guard expectedBodySHA256?.lowercased() == digest else {
+                throw AgentMessageBodyChunkError.bodyDigestMismatch
+            }
+        }
+        return AgentMessageTransport.inMemoryBodyChunk(
+            message: message,
+            offsetBytes: offsetBytes,
+            maxContentBytes: maxContentBytes
         )
     }
 
@@ -1268,6 +1301,8 @@ public final class JSONRPCDispatcher {
                         ])
                     ]),
                     "agent": .object(agentCapabilities),
+                    "message_transport":
+                        AgentMessageTransport.capabilityMarker,
                     "browser_automation": .object([
                         "p0": .array([.string("navigate"), .string("back"), .string("forward"), .string("reload"), .string("url.get"), .string("mirror_url.get")]),
                         "p1_unsupported": .bool(false)
@@ -2195,7 +2230,24 @@ public final class JSONRPCDispatcher {
                         basePayload: messagePayload,
                         encodeCursor: v1MessageCursorPayload
                     ) else {
-                        throw JSONRPCError.invalidParams
+                        throw JSONRPCError(
+                            code: -32041,
+                            message:
+                                "The requested message-list envelope is too small.",
+                            data: .object([
+                                "domain": .string("agent.message"),
+                                "kind":
+                                    .string("list_envelope_too_small"),
+                                "min_bytes": .number(
+                                    Double(
+                                        AgentMessageTransport
+                                            .minimumResponseBytes
+                                    )
+                                ),
+                                "requested_bytes":
+                                    .number(Double(maxBodyBytes)),
+                            ])
+                        )
                     }
                     return .init(id: id, result: result)
                 }
@@ -2211,7 +2263,6 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: .array(try router.listAgentMessages(thread: tid, limit: limit).map(messagePayload)))
             case "agent.message.get":
                 guard let mid = params["message_id"]?.stringValue.flatMap(UUID.init).map(AgentMessageID.init) else { throw JSONRPCError.invalidParams }
-                guard let message = try router.getAgentMessage(id: mid) else { throw JSONRPCError.invalidParams }
                 if let responseVersion = params["response_version"] {
                     guard responseVersion.intValue == 1,
                           let rawMaxBytes = params["max_bytes"]?.intValue,
@@ -2224,17 +2275,83 @@ public final class JSONRPCDispatcher {
                     )
                     guard AgentMessageTransport.supportsResponseBudget(
                         maxBytes
-                    ),
-                          let result = AgentMessageTransport.v1GetResult(
-                        message: message,
-                        offsetBytes: offsetBytes,
+                    ) else {
+                        throw JSONRPCError.invalidParams
+                    }
+                    if offsetBytes > 0 {
+                        guard params["expected_body_revision"]?.intValue != nil,
+                              params["expected_body_sha256"]?.stringValue != nil else {
+                            throw JSONRPCError.invalidParams
+                        }
+                    }
+                    let chunk: AgentMessageBodyChunk
+                    do {
+                        guard let loaded = try router
+                            .getAgentMessageBodyChunk(
+                                id: mid,
+                                offsetBytes: offsetBytes,
+                                maxContentBytes: maxBytes,
+                                expectedBodyRevision:
+                                    params["expected_body_revision"]?
+                                        .intValue,
+                                expectedBodySHA256:
+                                    params["expected_body_sha256"]?
+                                        .stringValue
+                            ) else {
+                            throw JSONRPCError.invalidParams
+                        }
+                        chunk = loaded
+                    } catch let error as AgentMessageBodyChunkError {
+                        switch error {
+                        case .invalidOffset:
+                            throw JSONRPCError.invalidParams
+                        case .bodyRevisionConflict:
+                            throw JSONRPCError(
+                                code: -32042,
+                                message:
+                                    "The message body changed while paging.",
+                                data: .object([
+                                    "domain": .string("agent.message"),
+                                    "kind":
+                                        .string("body_revision_conflict"),
+                                ])
+                            )
+                        case .bodyDigestMismatch:
+                            throw JSONRPCError(
+                                code: -32042,
+                                message:
+                                    "The message body digest changed while paging.",
+                                data: .object([
+                                    "domain": .string("agent.message"),
+                                    "kind":
+                                        .string("body_digest_mismatch"),
+                                ])
+                            )
+                        case .bodyIdentityUnavailable:
+                            throw JSONRPCError(
+                                code: -32043,
+                                message:
+                                    "The message body identity is unavailable.",
+                                data: .object([
+                                    "domain": .string("agent.message"),
+                                    "kind":
+                                        .string("body_identity_unavailable"),
+                                ])
+                            )
+                        }
+                    }
+                    guard let result = AgentMessageTransport.v1GetResult(
+                        chunk: chunk,
                         maxResponseBytes: maxBytes,
                         responseID: id,
                         basePayload: messagePayload
-                          ) else {
+                    ) else {
                         throw JSONRPCError.invalidParams
                     }
                     return .init(id: id, result: result)
+                }
+                guard let message = try router.getAgentMessage(id: mid) else {
+                    throw JSONRPCError.invalidParams
                 }
                 return .init(id: id, result: messagePayload(message))
             case "agent.run.stop":
