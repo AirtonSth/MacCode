@@ -1366,6 +1366,81 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
         }), "the oldest historical end is the first safe pressure drop")
     }
 
+    func testCountPressurePreservesStartBarrierBeforeSameSessionUpdate() throws {
+        // WHY: an update cannot establish a Live Activity. If a hard count cap
+        // fits only one current-session record, the start barrier must win.
+        let tmp = NSTemporaryDirectory() + "rc2-la-count-start-barrier-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let store = LiveActivityAcceptanceOutboxStore(
+            settings: SettingsRepository(db: db),
+            limits: LiveActivityAcceptanceOutboxLimits(
+                recordRetention: 10_000,
+                recordCap: 1,
+                encodedByteCap: 128 * 1024
+            )
+        )
+        let start = makeDelivery(event: .start, generation: 5, revision: 1)
+        let update = makeDelivery(event: .update, generation: 5, revision: 2)
+        try store.enqueue(start, targets: [makeTarget(for: start)])
+        let report = try store.enqueue(update, targets: [makeTarget(for: update)])
+
+        let pending = try store.pending()
+        XCTAssertEqual(report.droppedRecords, 1)
+        XCTAssertEqual(pending.map(\.delivery.idempotencyKey), [
+            start.idempotencyKey
+        ], "count pressure must discard the update before its required start")
+    }
+
+    func testBytePressurePreservesStartBarrierBeforeSameSessionUpdate() throws {
+        // WHY: byte pressure follows the same dependency rule as count
+        // pressure; keeping only the update would leave undeliverable work.
+        let tmp = NSTemporaryDirectory() + "rc2-la-byte-start-barrier-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let stamp = Date(timeIntervalSince1970: 9_100_000)
+        let clock = ManualOutboxClock(now: stamp)
+        let start = makeDelivery(event: .start, generation: 5, revision: 1)
+        let update = makeDelivery(event: .update, generation: 5, revision: 2)
+        let startTarget = makeTarget(for: start)
+        let updateTarget = makeTarget(for: update)
+        let startRecord = LiveActivityAcceptanceRecord(
+            delivery: start,
+            target: startTarget,
+            enqueuedAt: stamp
+        )
+        let updateRecord = LiveActivityAcceptanceRecord(
+            delivery: update,
+            target: updateTarget,
+            enqueuedAt: stamp.addingTimeInterval(1)
+        )
+        let encoder = JSONEncoder()
+        let byteCap = max(
+            try encoder.encode([startRecord]).count,
+            try encoder.encode([updateRecord]).count
+        )
+        XCTAssertGreaterThan(
+            try encoder.encode([startRecord, updateRecord]).count,
+            byteCap
+        )
+        let store = LiveActivityAcceptanceOutboxStore(
+            settings: SettingsRepository(db: db),
+            now: { clock.read() },
+            limits: LiveActivityAcceptanceOutboxLimits(
+                recordRetention: 10_000,
+                recordCap: 20,
+                encodedByteCap: byteCap
+            )
+        )
+        try store.enqueue(start, targets: [startTarget])
+        clock.advance(by: 1)
+        let report = try store.enqueue(update, targets: [updateTarget])
+
+        let pending = try store.pending()
+        XCTAssertEqual(report.droppedRecords, 1)
+        XCTAssertEqual(pending.map(\.delivery.idempotencyKey), [
+            start.idempotencyKey
+        ], "byte pressure must discard the update before its required start")
+    }
+
     func testBytePressureUsesLifecycleOrderNotLateEnqueueTime() throws {
         // WHY: a late-arriving old end has a newer enqueuedAt but an older
         // lifecycle identity. Byte pressure must keep the higher-generation

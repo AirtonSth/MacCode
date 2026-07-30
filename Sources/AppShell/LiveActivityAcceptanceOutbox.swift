@@ -372,6 +372,10 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
         if records.count > limits.recordCap {
             while records.count > limits.recordCap {
                 let current = currentLifecycleRecordIDs(records)
+                let startBarriers = currentStartBarrierRecordIDs(
+                    records,
+                    currentRecordIDs: current
+                )
                 let terminal = neededTerminalBarrierIDs(records)
                 let protected = current.union(terminal)
                 if let idx = records.firstIndex(where: {
@@ -387,6 +391,12 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
                     !current.contains($0.recordID)
                 }) {
                     records.remove(at: idx)
+                } else if let idx = records.firstIndex(where: {
+                    !startBarriers.contains($0.recordID)
+                }) {
+                    // If a cap cannot hold both, the start barrier is the
+                    // deliverable foundation; a later update is disposable.
+                    records.remove(at: idx)
                 } else {
                     records.removeFirst()
                 }
@@ -397,6 +407,10 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
         while encodedByteCount(records, encoder: encoder) > limits.encodedByteCap {
             guard !records.isEmpty else { break }
             let current = currentLifecycleRecordIDs(records)
+            let startBarriers = currentStartBarrierRecordIDs(
+                records,
+                currentRecordIDs: current
+            )
             let terminal = neededTerminalBarrierIDs(records)
             let protected = current.union(terminal)
             if let idx = records.firstIndex(where: {
@@ -414,6 +428,10 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
             }
             if let idx = records.firstIndex(where: {
                 !current.contains($0.recordID)
+            }) {
+                records.remove(at: idx)
+            } else if let idx = records.firstIndex(where: {
+                !startBarriers.contains($0.recordID)
             }) {
                 records.remove(at: idx)
             } else {
@@ -525,6 +543,17 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
             }
         }
         return result
+    }
+
+    private static func currentStartBarrierRecordIDs(
+        _ records: [LiveActivityAcceptanceRecord],
+        currentRecordIDs: Set<String>
+    ) -> Set<String> {
+        Set(records.compactMap { record in
+            guard currentRecordIDs.contains(record.recordID),
+                  record.delivery.event == .start else { return nil }
+            return record.recordID
+        })
     }
 
     private static func neededTerminalBarrierIDs(
