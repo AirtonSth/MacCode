@@ -86,15 +86,17 @@ public struct WorkspaceFileService: Sendable {
                 "identity": identity.json
             ])
         }
+        let limit = max(0, min(maxBytes ?? WorkspaceFileLimits.readBytes, WorkspaceFileLimits.readBytes))
         let strategy = readStrategy(
             fileSize: identity.size,
             cap: Int64(WorkspaceFileLimits.previewThresholdBytes)
         )
         switch strategy {
         case .preview(let headBytes):
+            let headLimit = min(headBytes, limit)
             let handle = try FileHandle(forReadingFrom: file)
             defer { try? handle.close() }
-            let data = try handle.read(upToCount: headBytes) ?? Data()
+            let data = try handle.read(upToCount: headLimit) ?? Data()
             let decoded = try decodeText(data)
             return .object([
                 "path": .string(file.path),
@@ -109,7 +111,6 @@ public struct WorkspaceFileService: Sendable {
                 "identity": identity.json
             ])
         case .full:
-            let limit = max(0, min(maxBytes ?? WorkspaceFileLimits.readBytes, WorkspaceFileLimits.readBytes))
             let handle = try FileHandle(forReadingFrom: file)
             defer { try? handle.close() }
             let data = try handle.read(upToCount: limit + 1) ?? Data()

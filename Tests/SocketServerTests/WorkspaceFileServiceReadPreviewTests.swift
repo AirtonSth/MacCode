@@ -154,4 +154,65 @@ final class WorkspaceFileServiceReadPreviewTests: XCTestCase {
         XCTAssertEqual(content.utf8.count, size,
                        "file at exact threshold must deliver all bytes so the boundary is consistent with the helper")
     }
+
+    // MARK: - Explicit maxBytes on large-file preview
+
+    func testLargeFileAbsentMaxBytesKeepsPreviewHeadBytes() throws {
+        // WHY: Absent max_bytes must keep the deployed large-file preview contract so
+        // existing clients still receive the full previewHeadBytes head, not a silent
+        // zero or an unbounded full-file read over the weak link.
+        let size = WorkspaceFileLimits.previewThresholdBytes + 1024
+        _ = try makeTextFile(name: "absent-cap.txt", byteCount: size)
+
+        let result = try service.read(root: root.path, path: "absent-cap.txt", maxBytes: nil)
+        let obj = try XCTUnwrap(result.objectValue)
+        let content = try XCTUnwrap(obj["content"]?.stringValue)
+
+        XCTAssertTrue(obj["preview"]?.boolValue == true,
+                      "large file without maxBytes must still use the preview path")
+        XCTAssertTrue(obj["truncated"]?.boolValue == true,
+                      "large-file preview without maxBytes must remain truncated")
+        XCTAssertEqual(content.utf8.count, WorkspaceFileLimits.previewHeadBytes,
+                       "absent maxBytes must return the full preview head so behavior matches production")
+    }
+
+    func testLargeFileMaxBytesOneCapsRawContentToOneByte() throws {
+        // WHY: iOS request budgets send max_bytes as a hard weak-link ceiling. Ignoring
+        // it on the preview path used to return ~32 KiB for max_bytes:1, blowing the budget.
+        let size = WorkspaceFileLimits.previewThresholdBytes + 2048
+        _ = try makeTextFile(name: "max-one.txt", byteCount: size, byte: 0x42) // 'B'
+
+        let result = try service.read(root: root.path, path: "max-one.txt", maxBytes: 1)
+        let obj = try XCTUnwrap(result.objectValue)
+        let content = try XCTUnwrap(obj["content"]?.stringValue)
+
+        XCTAssertTrue(obj["preview"]?.boolValue == true,
+                      "large file must stay on the preview path when maxBytes is set")
+        XCTAssertTrue(obj["truncated"]?.boolValue == true,
+                      "max_bytes smaller than the file must mark truncated so clients know content is incomplete")
+        XCTAssertLessThanOrEqual(content.utf8.count, 1,
+                                 "explicit max_bytes:1 must cap raw/ASCII content to at most one byte")
+        XCTAssertEqual(content, "B",
+                       "the single returned byte must be the file head so callers still see a useful sample")
+    }
+
+    func testLargeFileMaxBytesZeroReturnsEmptyTruncated() throws {
+        // WHY: max_bytes:0 is the existing small-file "empty budget" signal; the large-file
+        // preview path must match so agents can request metadata without payload bytes.
+        let size = WorkspaceFileLimits.previewThresholdBytes + 4096
+        _ = try makeTextFile(name: "max-zero.txt", byteCount: size)
+
+        let result = try service.read(root: root.path, path: "max-zero.txt", maxBytes: 0)
+        let obj = try XCTUnwrap(result.objectValue)
+        let content = try XCTUnwrap(obj["content"]?.stringValue)
+
+        XCTAssertTrue(obj["preview"]?.boolValue == true,
+                      "large file with max_bytes:0 must still be classified as preview")
+        XCTAssertTrue(obj["truncated"]?.boolValue == true,
+                      "max_bytes:0 on a non-empty large text file must report truncated like the small-file path")
+        XCTAssertEqual(content, "",
+                       "max_bytes:0 must return empty content so the weak link carries no body bytes")
+        XCTAssertEqual(content.utf8.count, 0,
+                       "empty content must mean zero raw UTF-8 bytes, not a whitespace placeholder")
+    }
 }
