@@ -423,6 +423,12 @@ public func coalescePairingRequest(
 public final class JSONRPCDispatcher {
     let router: CommandRouting
     public nonisolated let commandReceiptMetrics: CommandReceiptMetrics
+    /// Store-independent capability injected by app wiring only while the
+    /// matching upload store is available. HTTP reads the same immutable value
+    /// so public, modern authenticated, and legacy authenticated authorities
+    /// cannot disagree.
+    public nonisolated let agentAttachmentUploadCapability:
+        AgentAttachmentUploadCapabilityAdvertisement?
     private var volatileCommandReceipts = BoundedReceiptCache()
     @TaskLocal private static var centralMutationExecution = false
     /// Bounded unknown-outcome fence (same cap as committed receipts). Does not
@@ -550,10 +556,14 @@ public final class JSONRPCDispatcher {
     ]
     public init(
         router: CommandRouting,
-        commandReceiptMetrics: CommandReceiptMetrics = CommandReceiptMetrics()
+        commandReceiptMetrics: CommandReceiptMetrics = CommandReceiptMetrics(),
+        agentAttachmentUploadCapability:
+            AgentAttachmentUploadCapabilityAdvertisement? = nil
     ) {
         self.router = router
         self.commandReceiptMetrics = commandReceiptMetrics
+        self.agentAttachmentUploadCapability =
+            agentAttachmentUploadCapability
     }
 
     func readConnectionSnapshot() throws -> EventBus.SnapshotBarrierResult<ConnectionSnapshotReadState> {
@@ -1150,6 +1160,16 @@ public final class JSONRPCDispatcher {
             case "system.ping":
                 return .init(id: id, result: .object(["pong": .bool(true), "ts": .number(Date().timeIntervalSince1970)]))
             case "system.capabilities":
+                var agentCapabilities: [String: JSONValue] = [
+                    "providers": .array([.string("codex"), .string("claude"), .string("grok")]),
+                    "supports_stream_events": .bool(true),
+                    "supports_resume": .bool(true)
+                ]
+                if let attachmentUpload =
+                    agentAttachmentUploadCapability {
+                    agentCapabilities["attachment_upload"] =
+                        attachmentUpload.jsonValue
+                }
                 return .init(id: id, result: .object([
                     "app": .string("remotecode"),
                     "api_version": .string("2"),
@@ -1167,11 +1187,7 @@ public final class JSONRPCDispatcher {
                             .string("ssh.files.remote.list")
                         ])
                     ]),
-                    "agent": .object([
-                        "providers": .array([.string("codex"), .string("claude"), .string("grok")]),
-                        "supports_stream_events": .bool(true),
-                        "supports_resume": .bool(true)
-                    ]),
+                    "agent": .object(agentCapabilities),
                     "browser_automation": .object([
                         "p0": .array([.string("navigate"), .string("back"), .string("forward"), .string("reload"), .string("url.get"), .string("mirror_url.get")]),
                         "p1_unsupported": .bool(false)

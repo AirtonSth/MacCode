@@ -12,6 +12,7 @@ import AgentRuntime
 /// Endpoints in V1:
 /// - GET  /v1/discovery
 /// - GET  /v1/capabilities
+/// - GET  /v1/capabilities/authenticated  (bearer required, including loopback)
 /// - GET  /healthz
 /// - GET  /__rc2_static/<grant>/<relative-path>
 public protocol DirectAuthProvider: AnyObject {
@@ -33,6 +34,78 @@ public protocol DirectAuthProvider: AnyObject {
     func cancelPairingRequest(requestId: String) -> Bool
     func listDevices() -> [[String: Any]]
     func revokeDevice(_ id: String)
+}
+
+/// Store-independent advertisement injected into both HTTP capabilities
+/// routes and the legacy authenticated `system.capabilities` RPC. The broad
+/// app wiring must construct this only when its upload store is available, so
+/// every authority reports the same runtime truth without this target needing
+/// to depend on a particular attachment-store implementation.
+public struct AgentAttachmentUploadCapabilityAdvertisement: Sendable, Equatable {
+    public let protocolVersion: Int
+    public let maxBytes: Int
+    public let chunkBytes: Int
+    public let maxChunkCount: Int
+    public let maxFilenameBytes: Int?
+    public let maxMIMETypeBytes: Int?
+    public let contentEncodings: [String]
+    public let cipherOverheadBytes: Int
+
+    public init(
+        protocolVersion: Int,
+        maxBytes: Int,
+        chunkBytes: Int,
+        maxChunkCount: Int,
+        maxFilenameBytes: Int? = nil,
+        maxMIMETypeBytes: Int? = nil,
+        contentEncodings: [String],
+        cipherOverheadBytes: Int
+    ) {
+        self.protocolVersion = protocolVersion
+        self.maxBytes = maxBytes
+        self.chunkBytes = chunkBytes
+        self.maxChunkCount = maxChunkCount
+        self.maxFilenameBytes = maxFilenameBytes
+        self.maxMIMETypeBytes = maxMIMETypeBytes
+        self.contentEncodings = contentEncodings
+        self.cipherOverheadBytes = cipherOverheadBytes
+    }
+
+    var foundationObject: [String: Any] {
+        var value: [String: Any] = [
+            "protocol_version": protocolVersion,
+            "max_bytes": maxBytes,
+            "chunk_bytes": chunkBytes,
+            "max_chunk_count": maxChunkCount,
+            "content_encodings": contentEncodings,
+            "cipher_overhead_bytes": cipherOverheadBytes,
+        ]
+        if let maxFilenameBytes {
+            value["max_filename_bytes"] = maxFilenameBytes
+        }
+        if let maxMIMETypeBytes {
+            value["max_mime_type_bytes"] = maxMIMETypeBytes
+        }
+        return value
+    }
+
+    var jsonValue: JSONValue {
+        var value: [String: JSONValue] = [
+            "protocol_version": .number(Double(protocolVersion)),
+            "max_bytes": .number(Double(maxBytes)),
+            "chunk_bytes": .number(Double(chunkBytes)),
+            "max_chunk_count": .number(Double(maxChunkCount)),
+            "content_encodings": .array(contentEncodings.map(JSONValue.string)),
+            "cipher_overhead_bytes": .number(Double(cipherOverheadBytes)),
+        ]
+        if let maxFilenameBytes {
+            value["max_filename_bytes"] = .number(Double(maxFilenameBytes))
+        }
+        if let maxMIMETypeBytes {
+            value["max_mime_type_bytes"] = .number(Double(maxMIMETypeBytes))
+        }
+        return .object(value)
+    }
 }
 
 /// Defaulted so existing conformers (e.g. test doubles) need no change
@@ -924,12 +997,65 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
     /// Pure helper: decides whether an HTTP `/v1/*` request must present a valid
     /// bearer token. Mirrors the gate below: loopback-only binds are trusted
-    /// (open), pre-token paths are exempt, and a missing auth provider disables
-    /// the gate. Extracted so the auth decision is unit-testable without a live
-    /// socket (a loopback test client is always treated as trusted, so a real
-    /// socket cannot exercise the non-loopback gate).
+    /// (open) for ordinary `/v1/*` routes, pre-token paths are exempt, and a
+    /// missing auth provider disables the gate.
+    ///
+    /// Exception: `GET /v1/capabilities/authenticated` always requires a bearer
+    /// when an auth provider is configured, including loopback-only binds —
+    /// paired iOS cold connect uses this path to prove identity in one round
+    /// trip. Extracted so the auth decision is unit-testable without a live
+    /// socket (a loopback test client is always treated as trusted for other
+    /// routes, so a real socket cannot exercise the non-loopback gate).
     nonisolated static func httpAuthGateRequiresToken(loopbackOnly: Bool, path: String, hasAuthProvider: Bool) -> Bool {
-        !loopbackOnly && path.hasPrefix("/v1") && !authExemptV1Paths.contains(path) && hasAuthProvider
+        guard hasAuthProvider, path.hasPrefix("/v1") else { return false }
+        // Always-gated: identity proof for cold connect; not loopback-trusted.
+        if path == "/v1/capabilities/authenticated" { return true }
+        return !loopbackOnly && !authExemptV1Paths.contains(path)
+    }
+
+    /// Shared capabilities object for public `GET /v1/capabilities` and the
+    /// authenticated envelope's `capabilities` field. Single builder so the
+    /// two routes cannot drift.
+    nonisolated static func capabilitiesPayload(
+        loopbackOnly: Bool,
+        attachmentUpload:
+            AgentAttachmentUploadCapabilityAdvertisement? = nil
+    ) -> [String: Any] {
+        // GAP-3: advertise what the dispatcher actually implements.
+        // git mutations + full browser automation are real (see
+        // Dispatcher.swift git.*/browser.*); hiding them on the
+        // client breaks parity.
+        var agent: [String: Any] = [
+            "providers": ["codex", "claude", "grok"],
+            "supports_stream_events": true,
+            "supports_resume": true,
+            "model_routing": [
+                "auto": true,
+                "admission_receipts": true,
+                "rollout_enabled":
+                    AgentOrchestrationRuntime.defaultRolloutEnabled(),
+            ],
+        ]
+        if let attachmentUpload {
+            agent["attachment_upload"] = attachmentUpload.foundationObject
+        }
+        return [
+            "surface_types": ["terminal", "ssh", "browser", "agentApp", "files", "markdown", "filePreview", "rightSidebarTool"],
+            "ssh": [
+                "methods": ["ssh.host.list", "ssh.host.upsert", "ssh.host.delete", "ssh.connect", "ssh.disconnect", "ssh.transfer.upload", "ssh.transfer.download", "ssh.files.local.list", "ssh.files.remote.list"]
+            ],
+            "agent": agent,
+            "browser_automation": [
+                "p0": ["navigate", "back", "forward", "reload", "url.get", "mirror_url.get"],
+                "p1": ["click", "fill", "type", "focus", "hover", "check", "uncheck", "select", "eval", "snapshot", "screenshot", "wait"],
+                "p1_unsupported": false
+            ],
+            "files": [
+                "methods": ["fs.workspace.list", "fs.workspace.read", "fs.workspace.preview_url", "fs.workspace.create_file", "fs.workspace.rename", "fs.workspace.delete", "files.tab.open", "files.tab.split", "files.state.get", "files.state.update", "files.edit.open", "files.edit.apply_patch", "files.edit.save", "files.edit.discard", "files.edit.close"]
+            ],
+            "git": ["read_only": false],
+            "feature_flags": ["remote_access_enabled": !loopbackOnly]
+        ]
     }
 
     nonisolated static func isAttachmentUploadRPCEnvelope(_ data: Data) -> Bool {
@@ -1553,14 +1679,17 @@ public final class DirectHTTPServer: @unchecked Sendable {
         let requestedAttachmentUpload = method == "POST"
             && path == "/v1/rpc"
             && headers["x-remotecode-attachment-upload"] == "1"
+        var requestBearerVerified = false
         let largeBodyAuthorized: Bool
-        if Self.httpAuthGateRequiresToken(
+        if requestedAttachmentUpload,
+           Self.httpAuthGateRequiresToken(
             loopbackOnly: bindLoopbackOnly,
             path: path,
             hasAuthProvider: auth != nil
         ), let auth {
             if let presentedBearerToken {
                 largeBodyAuthorized = auth.verify(token: presentedBearerToken)
+                requestBearerVerified = largeBodyAuthorized
             } else {
                 largeBodyAuthorized = false
             }
@@ -2079,12 +2208,24 @@ public final class DirectHTTPServer: @unchecked Sendable {
         // "Not authorized". It must be exempt like discovery.
         if Self.httpAuthGateRequiresToken(loopbackOnly: bindLoopbackOnly, path: path, hasAuthProvider: auth != nil),
            let auth = auth {
-            if let token = presentedBearerToken, auth.verify(token: token) {
+            if requestBearerVerified {
                 // ok
+            } else if let token = presentedBearerToken, auth.verify(token: token) {
+                requestBearerVerified = true
             } else {
+                var challengeHeaders = [
+                    "WWW-Authenticate":
+                        wwwAuthenticateHeaderValue(
+                            scheme: "Bearer",
+                            realm: "RC2"
+                        ),
+                ]
+                if path == "/v1/capabilities/authenticated" {
+                    challengeHeaders["Cache-Control"] = "no-store"
+                }
                 send(fd: fd, status: 401, contentType: "text/plain",
                      body: "unauthorized\n".data(using: .utf8)!,
-                additionalHeaders: ["WWW-Authenticate": wwwAuthenticateHeaderValue(scheme: "Bearer", realm: "RC2")]); return
+                     additionalHeaders: challengeHeaders); return
             }
         }
         let requestOwnerFingerprint = Self.connectionOwnerFingerprint(
@@ -2371,6 +2512,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "relay": false,
                 // Optional stream control negotiated on welcome, not here.
                 "stream_interest_v1": Self.supportsStreamInterestControl,
+                // Paired iOS cold connect: one-shot authenticated capabilities
+                // + host/process identity (GET /v1/capabilities/authenticated).
+                "authenticated_capabilities_v1": true,
                 // IMP-MAC_SERVER_SYNC-001: anchor for client clock-drift /
                 // freshness math. Pairs with the WS `heartbeat` frame (ts) so
                 // the client can show an honest "live / last synced Ns ago".
@@ -2378,28 +2522,53 @@ public final class DirectHTTPServer: @unchecked Sendable {
             ]
             sendJSON(fd: fd, status: 200, body: body, acceptEncoding: headers["accept-encoding"])
         case ("GET", "/v1/capabilities"):
-            // GAP-3: advertise what the dispatcher actually implements.
-            // git mutations + full browser automation are real (see
-            // Dispatcher.swift git.*/browser.*); hiding them on the
-            // client breaks parity.
+            // Public / pre-token surface (GAP-9). Unwrapped capabilities only —
+            // never the authenticated identity envelope.
+            sendJSON(
+                fd: fd,
+                status: 200,
+                body: Self.capabilitiesPayload(
+                    loopbackOnly: bindLoopbackOnly,
+                    attachmentUpload:
+                        dispatcher.agentAttachmentUploadCapability
+                ),
+                acceptEncoding: headers["accept-encoding"]
+            )
+        case ("GET", "/v1/capabilities/authenticated"):
+            // Always require a verified bearer (including loopback-only). The
+            // shared HTTP gate records that proof once. Requiring the recorded
+            // proof here also fails closed if the provider is absent or the
+            // gate ever regresses, without verifying the same token twice.
+            guard requestBearerVerified else {
+                send(fd: fd, status: 401, contentType: "text/plain",
+                     body: "unauthorized\n".data(using: .utf8)!,
+                     additionalHeaders: [
+                        "WWW-Authenticate":
+                            wwwAuthenticateHeaderValue(
+                                scheme: "Bearer",
+                                realm: "RC2"
+                            ),
+                        "Cache-Control": "no-store",
+                     ])
+                return
+            }
             let body: [String: Any] = [
-                "surface_types": ["terminal", "ssh", "browser", "agentApp", "files", "markdown", "filePreview", "rightSidebarTool"],
-                "ssh": [
-                    "methods": ["ssh.host.list", "ssh.host.upsert", "ssh.host.delete", "ssh.connect", "ssh.disconnect", "ssh.transfer.upload", "ssh.transfer.download", "ssh.files.local.list", "ssh.files.remote.list"]
-                ],
-                "agent": ["providers": ["codex", "claude", "grok"], "supports_stream_events": true, "supports_resume": true, "model_routing": ["auto": true, "admission_receipts": true, "rollout_enabled": AgentOrchestrationRuntime.defaultRolloutEnabled()]],
-                "browser_automation": [
-                    "p0": ["navigate", "back", "forward", "reload", "url.get", "mirror_url.get"],
-                    "p1": ["click", "fill", "type", "focus", "hover", "check", "uncheck", "select", "eval", "snapshot", "screenshot", "wait"],
-                    "p1_unsupported": false
-                ],
-                "files": [
-                    "methods": ["fs.workspace.list", "fs.workspace.read", "fs.workspace.preview_url", "fs.workspace.create_file", "fs.workspace.rename", "fs.workspace.delete", "files.tab.open", "files.tab.split", "files.state.get", "files.state.update", "files.edit.open", "files.edit.apply_patch", "files.edit.save", "files.edit.discard", "files.edit.close"]
-                ],
-                "git": ["read_only": false],
-                "feature_flags": ["remote_access_enabled": !bindLoopbackOnly]
+                "authenticated": true,
+                "server_id": serverId,
+                "boot_epoch": Int64(bootEpoch),
+                "capabilities": Self.capabilitiesPayload(
+                    loopbackOnly: bindLoopbackOnly,
+                    attachmentUpload:
+                        dispatcher.agentAttachmentUploadCapability
+                )
             ]
-            sendJSON(fd: fd, status: 200, body: body, acceptEncoding: headers["accept-encoding"])
+            sendJSON(
+                fd: fd,
+                status: 200,
+                body: body,
+                acceptEncoding: headers["accept-encoding"],
+                additionalHeaders: ["Cache-Control": "no-store"]
+            )
         default:
             send(fd: fd, status: 404, contentType: "text/plain", body: "not found\n".data(using: .utf8)!)
             return
@@ -3442,9 +3611,22 @@ public final class DirectHTTPServer: @unchecked Sendable {
         }
     }
 
-    private func sendJSON(fd: Int32, status: Int, body: [String: Any], acceptEncoding: String? = nil) {
+    private func sendJSON(
+        fd: Int32,
+        status: Int,
+        body: [String: Any],
+        acceptEncoding: String? = nil,
+        additionalHeaders: [String: String] = [:]
+    ) {
         let data = (try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])) ?? Data()
-        send(fd: fd, status: status, contentType: "application/json", body: data, acceptEncoding: acceptEncoding)
+        send(
+            fd: fd,
+            status: status,
+            contentType: "application/json",
+            body: data,
+            acceptEncoding: acceptEncoding,
+            additionalHeaders: additionalHeaders
+        )
     }
 
     private func reasonPhrase(_ s: Int) -> String {

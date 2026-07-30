@@ -1041,7 +1041,21 @@ final class HTTPServerTests: XCTestCase {
     /// Minimal auth provider used only by the auth-gate tests below.
     /// Not shared with HTTPPairingTests.FakeAuth to keep each file self-contained.
     private final class StubAuth: DirectAuthProvider {
-        func verify(token: String) -> Bool { token == "good-token" }
+        private let verificationLock = NSLock()
+        private var verificationCountStorage = 0
+
+        var verificationCount: Int {
+            verificationLock.lock()
+            defer { verificationLock.unlock() }
+            return verificationCountStorage
+        }
+
+        func verify(token: String) -> Bool {
+            verificationLock.lock()
+            verificationCountStorage += 1
+            verificationLock.unlock()
+            return token == "good-token"
+        }
         func createPairingCode() -> String? { nil }
         func redeemPairingCode(_ code: String, deviceName: String) -> (deviceId: String, token: String)? { nil }
         func listDevices() -> [[String: Any]] { [] }
@@ -1080,6 +1094,35 @@ final class HTTPServerTests: XCTestCase {
                 "\(p) is fetched before a token exists (GAP-9); gating it makes every LAN connect fail 401")
         }
     }
+    func test_httpAuthGate_authenticatedCapabilities_requiresTokenEvenOnLoopback() {
+        // WHY: iOS cold connect must prove bearer/host/process identity in one
+        // request even when the Mac binds loopback-only (local same-machine
+        // harness). Loopback trust must not open this route.
+        XCTAssertTrue(
+            DirectHTTPServer.httpAuthGateRequiresToken(
+                loopbackOnly: true,
+                path: "/v1/capabilities/authenticated",
+                hasAuthProvider: true
+            ),
+            "GET /v1/capabilities/authenticated must require a bearer on loopback-only binds"
+        )
+        XCTAssertTrue(
+            DirectHTTPServer.httpAuthGateRequiresToken(
+                loopbackOnly: false,
+                path: "/v1/capabilities/authenticated",
+                hasAuthProvider: true
+            ),
+            "GET /v1/capabilities/authenticated must require a bearer on non-loopback binds"
+        )
+        XCTAssertFalse(
+            DirectHTTPServer.httpAuthGateRequiresToken(
+                loopbackOnly: true,
+                path: "/v1/capabilities/authenticated",
+                hasAuthProvider: false
+            ),
+            "without an auth provider the pure gate is off (handler still fails closed)"
+        )
+    }
     func test_httpAuthGate_noAuthProviderDisablesGate() {
         XCTAssertFalse(DirectHTTPServer.httpAuthGateRequiresToken(loopbackOnly: false, path: "/v1/rpc", hasAuthProvider: false),
             "with no auth provider configured the gate is disabled (auth not yet provisioned)")
@@ -1094,6 +1137,245 @@ final class HTTPServerTests: XCTestCase {
             "the /v1/ws upgrade must require a token on a non-loopback bind; unauthenticated WS = full event-stream leak")
         XCTAssertFalse(DirectHTTPServer.wsUpgradeRequiresToken(loopbackOnly: true, hasAuthProvider: true),
             "loopback WS upgrade stays open (trusted)")
+    }
+
+    // MARK: - Authenticated capabilities v1 (cold-connect identity + caps)
+
+    @MainActor
+    func test_discoveryAdvertisesAuthenticatedCapabilitiesV1() throws {
+        // WHY: paired iOS cold connect discovers whether the host supports the
+        // one-shot authenticated capabilities route before calling it.
+        let port = UInt16.random(in: 33000...44000)
+        let dispatcher = JSONRPCDispatcher(router: FakeRouter())
+        let s = DirectHTTPServer(port: port, loopbackOnly: true, dispatcher: dispatcher, bootEpoch: 1)
+        try s.start()
+        defer { s.stop() }
+        Thread.sleep(forTimeInterval: 0.05)
+
+        let ex = expectation(description: "discovery authenticated_capabilities_v1")
+        URLSession.shared.dataTask(with: URL(string: "http://127.0.0.1:\(port)/v1/discovery")!) { data, resp, err in
+            XCTAssertNil(err)
+            XCTAssertEqual((resp as? HTTPURLResponse)?.statusCode, 200)
+            let obj = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
+            XCTAssertEqual(obj?["authenticated_capabilities_v1"] as? Bool, true,
+                           "GET /v1/discovery must advertise authenticated_capabilities_v1: true")
+            ex.fulfill()
+        }.resume()
+        wait(for: [ex], timeout: 4)
+    }
+
+    @MainActor
+    func test_publicCapabilities_accessibleWithoutBearer_unwrappedPayload() throws {
+        // WHY: tokenless/legacy clients still fetch GET /v1/capabilities before
+        // pairing; it must stay open and must not grow the authenticated envelope.
+        let port = UInt16.random(in: 33000...44000)
+        let dispatcher = JSONRPCDispatcher(router: FakeRouter())
+        let auth = StubAuth()
+        let s = DirectHTTPServer(
+            port: port,
+            loopbackOnly: true,
+            dispatcher: dispatcher,
+            auth: auth,
+            serverId: "public-caps-server",
+            bootEpoch: 7
+        )
+        try s.start()
+        defer { s.stop() }
+        Thread.sleep(forTimeInterval: 0.05)
+
+        let ex = expectation(description: "public capabilities no bearer")
+        URLSession.shared.dataTask(with: URL(string: "http://127.0.0.1:\(port)/v1/capabilities")!) { data, resp, err in
+            XCTAssertNil(err)
+            XCTAssertEqual((resp as? HTTPURLResponse)?.statusCode, 200)
+            let obj = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
+            XCTAssertNotNil(obj?["surface_types"], "public capabilities must expose the unwrapped payload")
+            XCTAssertNil(obj?["authenticated"], "public /v1/capabilities must not wrap in the authenticated envelope")
+            XCTAssertNil(obj?["server_id"], "public /v1/capabilities must not expose server_id envelope fields")
+            XCTAssertNil(obj?["boot_epoch"], "public /v1/capabilities must not expose boot_epoch envelope fields")
+            XCTAssertNil(obj?["capabilities"], "public route is the capabilities object itself, not nested")
+            ex.fulfill()
+        }.resume()
+        wait(for: [ex], timeout: 4)
+    }
+
+    @MainActor
+    func test_authenticatedCapabilities_rejectsMissingAndInvalidBearer_onLoopback() throws {
+        // WHY: even loopback-only must not leak host identity via this route
+        // without a verified bearer (cold-connect identity proof).
+        let port = UInt16.random(in: 33000...44000)
+        let dispatcher = JSONRPCDispatcher(router: FakeRouter())
+        let auth = StubAuth()
+        let s = DirectHTTPServer(
+            port: port,
+            loopbackOnly: true,
+            dispatcher: dispatcher,
+            auth: auth,
+            serverId: "auth-caps-server",
+            bootEpoch: 3
+        )
+        try s.start()
+        defer { s.stop() }
+        Thread.sleep(forTimeInterval: 0.05)
+
+        let missingEx = expectation(description: "missing bearer 401")
+        URLSession.shared.dataTask(with: URL(string: "http://127.0.0.1:\(port)/v1/capabilities/authenticated")!) { data, resp, err in
+            XCTAssertNil(err)
+            let http = resp as? HTTPURLResponse
+            XCTAssertEqual(http?.statusCode, 401)
+            XCTAssertEqual(
+                http?.value(forHTTPHeaderField: "WWW-Authenticate"),
+                wwwAuthenticateHeaderValue(scheme: "Bearer", realm: "RC2"),
+                "missing bearer must use the same Bearer challenge as protected v1 routes"
+            )
+            XCTAssertEqual(
+                http?.value(forHTTPHeaderField: "Cache-Control"),
+                "no-store"
+            )
+            XCTAssertEqual(String(data: data ?? Data(), encoding: .utf8), "unauthorized\n")
+            missingEx.fulfill()
+        }.resume()
+
+        var badReq = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/capabilities/authenticated")!)
+        badReq.setValue("Bearer wrong-token", forHTTPHeaderField: "Authorization")
+        let badEx = expectation(description: "invalid bearer 401")
+        URLSession.shared.dataTask(with: badReq) { data, resp, err in
+            XCTAssertNil(err)
+            let http = resp as? HTTPURLResponse
+            XCTAssertEqual(http?.statusCode, 401)
+            XCTAssertEqual(
+                http?.value(forHTTPHeaderField: "WWW-Authenticate"),
+                wwwAuthenticateHeaderValue(scheme: "Bearer", realm: "RC2"),
+                "invalid bearer must use the same Bearer challenge as protected v1 routes"
+            )
+            XCTAssertEqual(
+                http?.value(forHTTPHeaderField: "Cache-Control"),
+                "no-store"
+            )
+            XCTAssertEqual(String(data: data ?? Data(), encoding: .utf8), "unauthorized\n")
+            badEx.fulfill()
+        }.resume()
+
+        wait(for: [missingEx, badEx], timeout: 4)
+    }
+
+    @MainActor
+    func test_authenticatedCapabilities_acceptsValidBearer_envelopeAndNoStoreCaching() throws {
+        // WHY: cold connect needs authenticated:true + server_id + boot_epoch +
+        // the exact public capabilities object, and must not be cached.
+        let port = UInt16.random(in: 33000...44000)
+        let attachmentCapability =
+            AgentAttachmentUploadCapabilityAdvertisement(
+                protocolVersion: 3,
+                maxBytes: 25 * 1024 * 1024,
+                chunkBytes: 512 * 1024,
+                maxChunkCount: 50,
+                maxFilenameBytes: 255,
+                maxMIMETypeBytes: 128,
+                contentEncodings: ["protected_chunks_v1"],
+                cipherOverheadBytes: 28
+            )
+        let dispatcher = JSONRPCDispatcher(
+            router: FakeRouter(),
+            agentAttachmentUploadCapability: attachmentCapability
+        )
+        let auth = StubAuth()
+        let serverId = "auth-caps-ok-\(UUID().uuidString.prefix(8))"
+        let bootEpoch: UInt64 = 42
+        let s = DirectHTTPServer(
+            port: port,
+            loopbackOnly: true,
+            dispatcher: dispatcher,
+            auth: auth,
+            serverId: serverId,
+            bootEpoch: bootEpoch
+        )
+        try s.start()
+        defer { s.stop() }
+        Thread.sleep(forTimeInterval: 0.05)
+
+        // Baseline public payload for embed equality.
+        let publicEx = expectation(description: "public caps baseline")
+        var publicCaps: [String: Any]?
+        URLSession.shared.dataTask(with: URL(string: "http://127.0.0.1:\(port)/v1/capabilities")!) { data, _, _ in
+            publicCaps = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
+            publicEx.fulfill()
+        }.resume()
+        wait(for: [publicEx], timeout: 4)
+
+        var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/capabilities/authenticated")!)
+        req.setValue("Bearer good-token", forHTTPHeaderField: "Authorization")
+        let okEx = expectation(description: "authenticated capabilities 200")
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            XCTAssertNil(err)
+            let http = resp as? HTTPURLResponse
+            XCTAssertEqual(http?.statusCode, 200)
+            XCTAssertEqual(
+                http?.value(forHTTPHeaderField: "Cache-Control"),
+                "no-store",
+                "authenticated capabilities must be non-cacheable"
+            )
+            let obj = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
+            XCTAssertEqual(obj?["authenticated"] as? Bool, true)
+            XCTAssertEqual(obj?["server_id"] as? String, serverId)
+            XCTAssertEqual(obj?["boot_epoch"] as? Int, Int(bootEpoch))
+            let embedded = obj?["capabilities"] as? [String: Any]
+            XCTAssertNotNil(embedded, "envelope must embed the capabilities object")
+            let embeddedAgent = embedded?["agent"] as? [String: Any]
+            XCTAssertEqual(
+                embeddedAgent?["attachment_upload"] as? NSDictionary,
+                attachmentCapability.foundationObject as NSDictionary,
+                "modern HTTP authority must preserve the runtime attachment marker"
+            )
+            // Compare canonical JSON so nested key order does not matter.
+            let publicData = (try? JSONSerialization.data(withJSONObject: publicCaps ?? [:], options: [.sortedKeys])) ?? Data()
+            let embeddedData = (try? JSONSerialization.data(withJSONObject: embedded ?? [:], options: [.sortedKeys])) ?? Data()
+            XCTAssertEqual(publicData, embeddedData,
+                           "embedded capabilities must match the public /v1/capabilities payload exactly")
+            okEx.fulfill()
+        }.resume()
+        wait(for: [okEx], timeout: 4)
+        XCTAssertEqual(
+            auth.verificationCount,
+            1,
+            "the cold-connect route must verify its bearer once, not once per internal gate"
+        )
+    }
+
+    @MainActor
+    func test_systemCapabilitiesUsesSameInjectedAttachmentCapability() async {
+        // WHY: marker-absent iOS hosts use authenticated system.capabilities as
+        // the attachment authority. It must receive the same store-dependent
+        // advertisement as the modern HTTP envelope.
+        let attachmentCapability =
+            AgentAttachmentUploadCapabilityAdvertisement(
+                protocolVersion: 3,
+                maxBytes: 25 * 1024 * 1024,
+                chunkBytes: 512 * 1024,
+                maxChunkCount: 50,
+                maxFilenameBytes: 255,
+                maxMIMETypeBytes: 128,
+                contentEncodings: ["protected_chunks_v1"],
+                cipherOverheadBytes: 28
+            )
+        let dispatcher = JSONRPCDispatcher(
+            router: FakeRouter(),
+            agentAttachmentUploadCapability: attachmentCapability
+        )
+        let response = await dispatcher.dispatch(
+            JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(1),
+                method: "system.capabilities",
+                params: nil
+            )
+        )
+
+        XCTAssertNil(response.error)
+        let agent = response.result?.objectValue?["agent"]?.objectValue
+        XCTAssertEqual(
+            agent?["attachment_upload"],
+            attachmentCapability.jsonValue
+        )
     }
 
     private func connectLocalhost(port: UInt16) throws -> Int32 {
