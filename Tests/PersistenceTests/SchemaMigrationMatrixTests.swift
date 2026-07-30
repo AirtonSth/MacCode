@@ -191,8 +191,8 @@ final class SchemaMigrationMatrixTests: XCTestCase {
     }
 
     func test_v56_to_head_installsPerThreadCatalogRevisionAndListProjections() throws {
-        // WHY: shared integration base is 56. The single relocatable checkpoint
-        // step must install list projections + per-thread revision from that base.
+        // WHY: shared integration base is 56. Message identity (57) followed by
+        // the single checkpoint step (58) must migrate as one ordered sequence.
         XCTAssertEqual(Schema.sharedIntegrationBaseVersion, 56)
         let db = try migrateFromVersion(n: Schema.sharedIntegrationBaseVersion)
         let threadID = UUID().uuidString
@@ -337,13 +337,15 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             Schema.sharedIntegrationBaseVersion,
             "named step must sit after the shared integration base"
         )
-        // Any post-base steps on this branch must only be the named checkpoint step
-        // (Message slots are absent here; composition renumbers past them later).
+        // The composed head has exactly the Message identity step followed by
+        // the named checkpoint step. This catches duplicate or reordered slots.
         let postBase = Schema.steps.filter {
             $0.version > Schema.sharedIntegrationBaseVersion
         }
-        XCTAssertEqual(postBase.count, 1)
-        XCTAssertEqual(postBase[0].version, Schema.checkpointListSchemaVersion)
+        XCTAssertEqual(postBase.map(\.version), [
+            Schema.sharedIntegrationBaseVersion + 1,
+            Schema.checkpointListSchemaVersion,
+        ])
     }
 
     // MARK: - v25 → head
