@@ -4989,7 +4989,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let tid = selectedThreadId
         let localRunId = currentRunId ?? tid.flatMap { trackedRunId(for: $0) }
         // Second click while already Stopping: hard-await termination so a
-        // stuck soft interrupt cannot leave the button disabled forever.
+        // stuck soft interrupt cannot leave the button disabled forever. This must
+        // stay AHEAD of the stale-projection branch below: the first Stop can
+        // already have released durable ownership (markStopRequested synthesizes a
+        // cancelled terminal with providerTerminalAcknowledged=false) while the
+        // provider's own teardown is still outstanding, and stopAndAwaitTermination
+        // is the only path that then releases that live adapter session.
         if isStopping, let tid {
             Task { @MainActor in
                 do {
@@ -5005,6 +5010,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                         self.currentRunId = nil
                         self.runStartedAt = nil
                     }
+                } else if !self.hasStoppableRun(threadId: tid) {
+                    // Ownership is only a stale surface projection (no live run, no
+                    // durable pending/running row). That is not a stop timeout, so
+                    // clear it silently instead of blaming the provider.
+                    self.clearStaleRunProjection(threadId: tid)
                 } else {
                     // Loud failure: hard timeout still left ownership — drop the
                     // latch so Stop is usable again and surface the error.
@@ -5014,6 +5024,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     }
                 }
             }
+            return
+        }
+        // Nothing to interrupt: the surface shows Working for a run that neither
+        // this process nor SQLite still lists as active (a projection left behind
+        // by a finished turn, or re-inflated by a recovered provider session).
+        // Latching "Stopping…" here stranded the UI forever — only run lifecycle
+        // events clear that latch and none can arrive for a dead run — so drop the
+        // projection and go idle instead.
+        if let tid, !hasStoppableRun(threadId: tid) {
+            // Keep both best-effort stops the old fall-through performed: a handle
+            // can still be registered under a runId whose thread mapping was
+            // already released, and only stopRun(runId:) can cancel that orphan.
+            if let localRunId { coordinator.stopRun(localRunId) }
+            coordinator.stopRun(threadId: tid)
+            clearStaleRunProjection(threadId: tid)
             return
         }
         // Path B: scheduled runs are owned by the LaunchAgent. Prefer XPC stop
@@ -5040,6 +5065,47 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // show "Stopping..." until the run terminates. Keep the control enabled
         // so a second click can force-stop if soft cancel stalls.
         isStopping = true
+    }
+
+    /// True when Stop has a real target: a coordinator-owned run, a provider start
+    /// still in flight, a durable pending/running row, or a LaunchAgent-owned
+    /// scheduled occurrence. A live adapter session alone does NOT count — a
+    /// recovered session for an already-finished turn is exactly the case that must
+    /// resolve to "nothing to stop" instead of a permanent Stopping… latch.
+    private func hasStoppableRun(threadId: AgentThreadID) -> Bool {
+        if isScheduledThreadRunning?(threadId) == true { return true }
+        if coordinator.activeRunId(threadId: threadId) != nil { return true }
+        if coordinator.hasPendingProviderStart(threadId: threadId) { return true }
+        // A failed durable read must not be reported as "idle": attempting a real
+        // stop is always safer than clearing a projection that may be backing a
+        // live run, so a throwing read counts as stoppable.
+        do {
+            if try coordinator.durableActiveRun(threadId: threadId) != nil { return true }
+        } catch {
+            return true
+        }
+        return false
+    }
+
+    /// Drop every run projection this surface holds for `threadId` and repaint the
+    /// thread from its durable status. Used when Stop finds no live run.
+    private func clearStaleRunProjection(threadId: AgentThreadID) {
+        for (runId, mapped) in runThreads where mapped == threadId {
+            runThreads[runId] = nil
+            terminalRunIds = Self.boundedTerminalRunIds(existing: terminalRunIds, adding: runId)
+        }
+        if selectedThreadId == threadId {
+            currentRunId = nil
+            runStartedAt = nil
+            isStopping = false
+            if let durableStatus = (try? threadRepo.get(id: threadId))?.status {
+                status = durableStatus
+            }
+            clearActivePlanFollowUpSuppressionIfSafe()
+        }
+        stopScheduledLivePoll()
+        scheduleReloadThreads()
+        onRunStateChange?()
     }
 
     /// Stop a specific thread by id, regardless of which thread is currently selected.
@@ -5114,6 +5180,37 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     // MARK: AgentRunObserver
 
+    /// Whether a stream event tagged with `run` may (re)latch the Working /
+    /// running projection for `threadId`.
+    ///
+    /// WHY: `terminalRunIds` is in-memory only, so it is empty in a freshly
+    /// launched process. A recovered provider session re-announces itself on
+    /// reconnect (codex re-emits `mcpServer/startupStatus` plus the `itemStarted`
+    /// it was interrupted on) and those events carry the PREVIOUS, already
+    /// finished runId. That used to flip the surface back to "Working for Ns" for
+    /// a run that ended hours earlier — a latch the user could never clear: Stop
+    /// had no live run to interrupt, so the first click only latched "Stopping…"
+    /// and the second reported a stop timeout while the spinner kept ticking.
+    /// Require live coordinator ownership or a durable pending/running row before
+    /// a stream event may claim the run is active. Timeline paint is unaffected;
+    /// only the run-active latch is gated.
+    private func streamEventMayMarkRunActive(_ run: AgentRunID, threadId: AgentThreadID) -> Bool {
+        if terminalRunIds.contains(run) { return false }
+        if coordinator.activeRunId(threadId: threadId) == run { return true }
+        // Events can precede handle registration: startRun commits the run row as
+        // `.pending` before the provider emits, so the durable row is the proof
+        // that this run is the thread's current turn.
+        if let durable = try? coordinator.durableActiveRun(threadId: threadId), durable.id == run {
+            return true
+        }
+        // Deliberately NOT memoized into `terminalRunIds`: a run row written by
+        // another process (scheduled occurrence) can be invisible to this read for
+        // a moment, and a permanent blacklist would then hide a genuinely live run
+        // forever. The durable read only happens for runs this process does not
+        // own, so a hot streaming run still short-circuits on the check above.
+        return false
+    }
+
     // PERF-MAC_AGENT-010: accumulate streaming events and flush all of them in
     // a single main-actor hop. A fast token stream emits thousands of events/sec;
     // the old code allocated one Task per event. Now the first event schedules
@@ -5177,7 +5274,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             if let count = Self.backgroundShellCount(fromRuntimeEvent: event) {
                 nextBackgroundShellCount = count
             }
-            if !self.terminalRunIds.contains(run) {
+            if self.streamEventMayMarkRunActive(run, threadId: threadId) {
                 nextCurrentRunId = run
                 self.runThreads[run] = threadId
                 if nextStatus != .running { nextStatus = .running }
@@ -5279,7 +5376,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 return
             }
         }
-        if !terminalRunIds.contains(run) {
+        if streamEventMayMarkRunActive(run, threadId: threadId) {
             currentRunId = run
             runThreads[run] = threadId
             if status != .running { status = .running }

@@ -315,16 +315,35 @@ final class AgentAppUXGapsTests: XCTestCase {
     }
 
     func test_isStopping_setOnStop_clearedOnTerminalFinish() async throws {
-        let vm = try makeVM()
+        // UX-MAC_AGENT-STOP-GHOST: the run must be genuinely interruptible for Stop
+        // to latch Stopping…. This test used to fake `status = .running` with no run
+        // at all and assert the latch anyway — that is exactly the state that left
+        // the field UI stuck on "Stopping… (click to force)" forever, because only
+        // run lifecycle events clear the latch and a dead run emits none. A durable
+        // pending/running row is the minimum proof that a stop has a target.
+        let tmp = NSTemporaryDirectory() + "rc2-uxgaps-stop-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coord = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(provider: .codex)]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: WorkspaceID(), cwd: tmp,
+            coordinator: coord, threadRepo: threadRepo, messageRepo: messageRepo,
+            promptHistoryStore: PromptHistoryStore(db: db)
+        )
         vm.createThread(title: "stop-feedback")
-
-        // Simulate an active run by setting status directly.
+        let threadId = try XCTUnwrap(vm.selectedThreadId)
+        try runRepo.upsert(AgentRun(threadId: threadId, provider: .codex,
+                                    model: "gpt-5.6-luna", status: .running))
         vm.status = .running
 
         // Precondition: flag is clear.
         XCTAssertFalse(vm.isStopping)
 
-        // Calling stop() on a VM with no real coordinator handle must still set the flag.
         vm.stop()
         XCTAssertTrue(vm.isStopping,
                       "stop() must set isStopping=true immediately so the UI can show Stopping feedback")
@@ -335,6 +354,22 @@ final class AgentAppUXGapsTests: XCTestCase {
 
         XCTAssertFalse(vm.isStopping,
                        "isStopping must be cleared when the run reaches a terminal state")
+    }
+
+    /// The other half of the same contract: with no live and no durable run, Stop
+    /// has nothing to interrupt, so it must clear the stale projection instead of
+    /// arming a latch that nothing can ever release.
+    func test_stopWithoutAnyRunDoesNotLatchStopping() async throws {
+        let vm = try makeVM()
+        vm.createThread(title: "no-run-stop")
+        vm.status = .running
+
+        vm.stop()
+
+        XCTAssertFalse(vm.isStopping,
+                       "Stop on a thread with no run must not latch Stopping… — that latch is unclearable")
+        XCTAssertNil(vm.currentRunId)
+        XCTAssertNil(vm.runStartedAt)
     }
 
     // MARK: - UX-SR1-BADGE: showsTranslatedBadge seam
