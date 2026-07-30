@@ -2212,17 +2212,32 @@ public final class JSONRPCDispatcher {
                     guard before == nil || after == nil else {
                         throw JSONRPCError.invalidParams
                     }
-                    let budgeted = try router.listAgentMessagesWithinBodyBudget(
-                        thread: tid,
-                        limit: limit,
-                        before: before,
-                        after: after,
-                        budget: maxBodyBytes,
-                        contentLimit:
-                            AgentMessageTransport.sqlContentLimit(
-                                for: maxBodyBytes
+                    let budgeted: AgentMessageBodyBudgetResult
+                    do {
+                        budgeted = try router
+                            .listAgentMessagesWithinBodyBudget(
+                                thread: tid,
+                                limit: limit,
+                                before: before,
+                                after: after,
+                                budget: maxBodyBytes,
+                                contentLimit:
+                                    AgentMessageTransport.sqlContentLimit(
+                                        for: maxBodyBytes
+                                    )
                             )
-                    )
+                    } catch AgentMessagePageCursorError.staleOrInvalid {
+                        throw JSONRPCError(
+                            code: -32044,
+                            message:
+                                "The message-list cursor is stale or invalid.",
+                            data: .object([
+                                "domain": .string("agent.message"),
+                                "kind":
+                                    .string("message_cursor_invalid"),
+                            ])
+                        )
+                    }
                     guard let result = AgentMessageTransport.v1ListResult(
                         from: budgeted,
                         maxResponseBytes: maxBodyBytes,

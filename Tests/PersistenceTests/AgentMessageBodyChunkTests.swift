@@ -170,4 +170,116 @@ final class AgentMessageBodyChunkTests: XCTestCase {
         XCTAssertNotNil(page.nextBefore)
         XCTAssertTrue(page.truncatedIDs.contains(message.id))
     }
+
+    func testListPageRejectsDeletedWrongThreadAndMismatchedDateCursors() throws {
+        let fixture = try makeFixture()
+        let createdAt = Date(timeIntervalSinceReferenceDate: 4_000)
+        let message = AgentMessage(
+            threadId: fixture.thread.id,
+            role: .assistant,
+            content: "cursor-owner",
+            createdAt: createdAt
+        )
+        try fixture.repo.append(message)
+
+        let wrongThread = AgentThread(
+            title: "wrong-thread",
+            provider: .codex,
+            model: "gpt-5"
+        )
+        try AgentThreadRepository(db: fixture.db).upsert(wrongThread)
+        let wrongThreadMessage = AgentMessage(
+            threadId: wrongThread.id,
+            role: .assistant,
+            content: "other owner",
+            createdAt: createdAt
+        )
+        try fixture.repo.append(wrongThreadMessage)
+
+        let wrongThreadCursor = AgentMessageCursor(
+            createdAt: createdAt,
+            id: wrongThreadMessage.id
+        )
+        XCTAssertThrowsError(try fixture.repo.listPageWithinBodyBudget(
+            threadId: fixture.thread.id,
+            limit: 10,
+            before: wrongThreadCursor,
+            budget: 64 * 1_024
+        )) {
+            XCTAssertEqual(
+                $0 as? AgentMessagePageCursorError,
+                .staleOrInvalid
+            )
+        }
+
+        let mismatchedDateCursor = AgentMessageCursor(
+            createdAt: createdAt.addingTimeInterval(1),
+            id: message.id
+        )
+        XCTAssertThrowsError(try fixture.repo.listPageWithinBodyBudget(
+            threadId: fixture.thread.id,
+            limit: 10,
+            before: mismatchedDateCursor,
+            budget: 64 * 1_024
+        )) {
+            XCTAssertEqual(
+                $0 as? AgentMessagePageCursorError,
+                .staleOrInvalid
+            )
+        }
+
+        try fixture.db.execute("""
+            DELETE FROM agent_messages
+            WHERE id = '\(message.id.value.uuidString)';
+            """)
+        let deletedCursor = AgentMessageCursor(
+            createdAt: createdAt,
+            id: message.id
+        )
+        XCTAssertThrowsError(try fixture.repo.listPageWithinBodyBudget(
+            threadId: fixture.thread.id,
+            limit: 10,
+            before: deletedCursor,
+            budget: 64 * 1_024
+        )) {
+            XCTAssertEqual(
+                $0 as? AgentMessagePageCursorError,
+                .staleOrInvalid
+            )
+        }
+    }
+
+    func testSameTimestampKeysetVisitsEveryRowExactlyOnce() throws {
+        let fixture = try makeFixture()
+        let createdAt = Date(timeIntervalSinceReferenceDate: 5_000)
+        let messages = (0..<4).map { index in
+            AgentMessage(
+                threadId: fixture.thread.id,
+                role: .assistant,
+                content: "same-time-\(index)",
+                createdAt: createdAt
+            )
+        }
+        for message in messages {
+            try fixture.repo.append(message)
+        }
+
+        var cursor: AgentMessageCursor?
+        var visited: [AgentMessageID] = []
+        while true {
+            let page = try fixture.repo.listPageWithinBodyBudget(
+                threadId: fixture.thread.id,
+                limit: 1,
+                before: cursor,
+                budget: 64 * 1_024
+            )
+            XCTAssertEqual(page.rows.count, 1)
+            visited.append(contentsOf: page.rows.map(\.id))
+            guard page.hasMoreOlder else { break }
+            cursor = try XCTUnwrap(page.nextBefore)
+        }
+
+        XCTAssertEqual(visited.count, messages.count)
+        XCTAssertEqual(Set(visited), Set(messages.map(\.id)))
+    }
 }

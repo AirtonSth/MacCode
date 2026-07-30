@@ -200,6 +200,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     var stoppedAgentThreads: [AgentThreadID] = []
     var checkpointStore: [AgentTurnCheckpointSummary] = []
     var messageStore: [AgentMessage] = []
+    var messageListBudgetError: AgentMessagePageCursorError?
     var queuedMessageStore: [AgentQueuedMessage] = []
     func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?) throws -> AgentThread {
         guard let idx = threadStore.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
@@ -320,6 +321,29 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
             nextBefore: next,
             hasMoreNewer: beforeCursor != nil || (afterCursor != nil && filtered.count > limit),
             nextAfter: after
+        )
+    }
+    func listAgentMessagesWithinBodyBudget(
+        thread: AgentThreadID,
+        limit: Int,
+        before: AgentMessageCursor?,
+        after: AgentMessageCursor?,
+        budget: Int,
+        contentLimit: Int
+    ) throws -> AgentMessageBodyBudgetResult {
+        if let messageListBudgetError {
+            throw messageListBudgetError
+        }
+        return AgentMessageTransport.pageWithinBodyBudget(
+            page: try listAgentMessagesPage(
+                thread: thread,
+                limit: limit,
+                before: before,
+                after: after
+            ),
+            budget: budget,
+            contentLimit: contentLimit,
+            afterDirection: after != nil
         )
     }
     func getAgentMessage(id: AgentMessageID) throws -> AgentMessage? {
@@ -2680,6 +2704,47 @@ final class DispatcherTests: XCTestCase {
             response.error?.data?.objectValue?["kind"],
             .string("list_envelope_too_small"),
             "if even an identity row cannot fit, return a typed error instead of [] + has_more + null cursor"
+        )
+    }
+
+    @MainActor
+    func test_agentMessageListV1ReturnsTypedErrorForStaleCursor() async {
+        let router = FakeRouter()
+        let thread = AgentThread(
+            workspaceId: nil,
+            title: "stale cursor",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        router.threadStore = [thread]
+        router.messageListBudgetError = .staleOrInvalid
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let response = await dispatcher.dispatch(
+            JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(12),
+                method: "agent.message.list",
+                params: [
+                    "thread_id":
+                        .string(thread.id.value.uuidString),
+                    "limit": .number(10),
+                    "response_version": .number(1),
+                    "max_body_bytes": .number(64 * 1_024),
+                    "before": .object([
+                        "created_at":
+                            .string("2026-07-30T00:00:00Z"),
+                        "id":
+                            .string(UUID().uuidString),
+                    ]),
+                ]
+            )
+        )
+
+        XCTAssertNil(response.result)
+        XCTAssertEqual(response.error?.code, -32044)
+        XCTAssertEqual(
+            response.error?.data?.objectValue?["kind"],
+            .string("message_cursor_invalid")
         )
     }
 

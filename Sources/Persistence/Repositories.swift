@@ -815,6 +815,10 @@ public enum AgentMessageBodyChunkError: Error, Equatable {
     case bodyIdentityUnavailable
 }
 
+public enum AgentMessagePageCursorError: Error, Equatable {
+    case staleOrInvalid
+}
+
 /// Full message metadata is deliberately available only on offset zero.
 /// Continuation pages carry only immutable body identity plus content bytes.
 public struct AgentMessageBodyChunkMetadata: Sendable, Equatable {
@@ -1054,13 +1058,40 @@ public final class AgentMessageRepository: @unchecked Sendable {
         let cappedByteLimit = max(1, contentLimit)
         let cappedAttachmentsByteLimit = max(2, attachmentsByteLimit)
         let cappedAttachmentsCountLimit = max(0, attachmentsCountLimit)
+        guard beforeCursor == nil || afterCursor == nil else {
+            throw AgentMessagePageCursorError.staleOrInvalid
+        }
+        let requestedCursor = afterCursor ?? beforeCursor
+        let cursorRowID: Int64?
+        if let requestedCursor {
+            let validation = try database.prepare("""
+                SELECT rowid, created_at, body_revision
+                FROM agent_messages
+                WHERE id = ? AND thread_id = ?
+                LIMIT 1;
+                """)
+            try validation.bind(
+                1,
+                requestedCursor.id.value.uuidString
+            )
+            try validation.bind(2, threadId.value.uuidString)
+            guard try validation.step(),
+                  validation.columnText(1)
+                    == iso.string(from: requestedCursor.createdAt),
+                  validation.columnInt64(2) >= 1 else {
+                throw AgentMessagePageCursorError.staleOrInvalid
+            }
+            cursorRowID = validation.columnInt64(0)
+        } else {
+            cursorRowID = nil
+        }
         let afterDirection = afterCursor != nil
         let predicate: String
         let orderDesc: String
         let orderAsc: String
         let windowOrder: String
         if let _ = afterCursor {
-            predicate = "thread_id = ? AND (created_at > ? OR (created_at = ? AND rowid > (SELECT rowid FROM agent_messages WHERE id = ?)))"
+            predicate = "thread_id = ? AND (created_at > ? OR (created_at = ? AND rowid > ?))"
             orderDesc = "created_at ASC, rowid ASC"
             orderAsc = "created_at ASC, rowid ASC"
             windowOrder = "created_at ASC, rowid ASC"
@@ -1070,7 +1101,7 @@ public final class AgentMessageRepository: @unchecked Sendable {
             orderAsc = "created_at ASC, rowid ASC"
             windowOrder = "created_at DESC, rowid DESC"
         } else {
-            predicate = "thread_id = ? AND (created_at < ? OR (created_at = ? AND rowid < (SELECT rowid FROM agent_messages WHERE id = ?)))"
+            predicate = "thread_id = ? AND (created_at < ? OR (created_at = ? AND rowid < ?))"
             orderDesc = "created_at DESC, rowid DESC"
             orderAsc = "created_at ASC, rowid ASC"
             windowOrder = "created_at DESC, rowid DESC"
@@ -1123,7 +1154,10 @@ public final class AgentMessageRepository: @unchecked Sendable {
             let created = iso.string(from: cursor.createdAt)
             try statement.bind(index, created); index += 1
             try statement.bind(index, created); index += 1
-            try statement.bind(index, cursor.id.value.uuidString); index += 1
+            guard let cursorRowID else {
+                throw AgentMessagePageCursorError.staleOrInvalid
+            }
+            try statement.bind(index, cursorRowID); index += 1
         }
         try statement.bind(index, limit + 1); index += 1
         try statement.bind(index, cappedByteLimit); index += 1
