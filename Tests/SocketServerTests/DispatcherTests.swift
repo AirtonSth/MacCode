@@ -199,6 +199,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     var stopAgentRunCallCount = 0
     var stoppedAgentThreads: [AgentThreadID] = []
     var checkpointStore: [AgentTurnCheckpointSummary] = []
+    var checkpointPageCallCount = 0
     var messageStore: [AgentMessage] = []
     var messageListBudgetError: AgentMessagePageCursorError?
     var queuedMessageStore: [AgentQueuedMessage] = []
@@ -547,6 +548,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         maxEntries: Int,
         before: AgentTurnCheckpointCursor?
     ) throws -> AgentTurnCheckpointPage {
+        checkpointPageCallCount += 1
         if let checkpointPageOverride { return checkpointPageOverride }
         var rows = checkpointStore
             .filter { $0.threadId == thread }
@@ -2821,6 +2823,135 @@ final class DispatcherTests: XCTestCase {
     }
 
     @MainActor
+    func test_agentCheckpointList_v1RejectsOversizedResponseIDBeforeRepositoryWork() async throws {
+        // WHY: max_response_bytes covers the complete JSON-RPC response. A caller
+        // must not consume that budget with its echoed id and force the release
+        // build to emit one item past the advertised cap.
+        let router = FakeRouter()
+        let thread = AgentThread(
+            workspaceId: nil,
+            title: "bounded-id",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        router.threadStore = [thread]
+        router.checkpointStore = [
+            AgentTurnCheckpointSummary(
+                threadId: thread.id,
+                runId: AgentRunID(),
+                turnId: "turn-1",
+                checkpointTurnCount: 1,
+                checkpointRef: "ref-1",
+                status: .ready,
+                files: []
+            )
+        ]
+        let oversizedID = String(
+            repeating: "x",
+            count: JSONRPCDispatcher.checkpointListV1MaxEncodedResponseIDBytes + 1
+        )
+        let response = await JSONRPCDispatcher(router: router).dispatch(
+            JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .string(oversizedID),
+                method: "agent.checkpoint.list",
+                params: [
+                    "thread_id": .string(thread.id.value.uuidString),
+                    "response_version": .number(1),
+                    "max_entries": .number(1),
+                ]
+            )
+        )
+
+        XCTAssertEqual(response.error?.code, JSONRPCError.invalidRequest.code)
+        XCTAssertNil(response.id, "an invalid hostile id must not be echoed")
+        XCTAssertNil(response.result)
+        XCTAssertEqual(
+            router.checkpointPageCallCount,
+            0,
+            "id admission must run before any list repository work"
+        )
+        XCTAssertLessThanOrEqual(
+            try JSONEncoder().encode(response).count,
+            AgentTurnCheckpointListWireProjection.maxEncodedResponseBytes
+        )
+    }
+
+    @MainActor
+    func test_agentCheckpointList_v1ItemBudgetFailsClosedAtRuntime() async throws {
+        // WHY: the 8 KiB promise must remain enforced in optimized builds. This
+        // deliberately bypasses the production repository projection validator
+        // through the fake router and proves an impossible file-free overflow is
+        // an RPC error, never an assert-only oversized success.
+        let router = FakeRouter()
+        let thread = AgentThread(
+            workspaceId: nil,
+            title: "runtime-item-guard",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        let item = AgentTurnCheckpointSummary(
+            threadId: thread.id,
+            runId: AgentRunID(),
+            turnId: "turn-1",
+            checkpointTurnCount: 1,
+            checkpointRef: "ref",
+            status: .ready,
+            files: [],
+            completedAt: Date(timeIntervalSince1970: 1_700_000_850)
+        )
+        let oversizedRef = String(repeating: "x", count: 16 * 1_024)
+        router.checkpointPageOverride = AgentTurnCheckpointPage(
+            items: [item],
+            listMetadata: [
+                .init(
+                    turnId: .init(
+                        value: "turn-1",
+                        totalEncodedBytes: 8,
+                        sha256: nil,
+                        truncated: false
+                    ),
+                    checkpointRef: .init(
+                        value: oversizedRef,
+                        totalEncodedBytes: oversizedRef.utf8.count + 2,
+                        sha256: nil,
+                        truncated: false
+                    ),
+                    errorMessage: .init(
+                        value: nil,
+                        totalEncodedBytes: 0,
+                        sha256: nil,
+                        truncated: false
+                    )
+                )
+            ],
+            completedAtTokens: ["2023-11-14T22:27:30.000Z"],
+            truncated: false,
+            nextBefore: nil
+        )
+
+        let response = await JSONRPCDispatcher(router: router).dispatch(
+            JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(1),
+                method: "agent.checkpoint.list",
+                params: [
+                    "thread_id": .string(thread.id.value.uuidString),
+                    "response_version": .number(1),
+                    "max_entries": .number(1),
+                ]
+            )
+        )
+
+        XCTAssertEqual(response.error?.code, JSONRPCError.internalError.code)
+        XCTAssertNil(response.result)
+        XCTAssertLessThanOrEqual(
+            try JSONEncoder().encode(response).count,
+            AgentTurnCheckpointListWireProjection.maxEncodedResponseBytes
+        )
+    }
+
+    @MainActor
     func test_agentCheckpointList_v1FractionalCompletedAtCursorContinuesWithoutDuplicate() async throws {
         // WHY: next_before.completed_at must preserve sub-second instants so iOS
         // item equality and the host keyset do not collapse page boundaries.
@@ -3101,6 +3232,36 @@ final class DispatcherTests: XCTestCase {
             "response_version": .number(1),
             "before": .object([
                 "checkpoint_turn_count": .number(1),
+                "completed_at": .string("2026-07-30T12:00:00Z"),
+                "turn_id": .string("turn-1"),
+            ])
+        ], "whole-second cursor was never emitted by v1 and must be rejected")
+
+        await assertInvalidParams([
+            "thread_id": .string(tid),
+            "response_version": .number(1),
+            "before": .object([
+                "checkpoint_turn_count": .number(1),
+                "completed_at": .string("2026-07-30T12:00:00.000Z"),
+                "turn_id": .string(String(repeating: "x", count: 16 * 1_024)),
+            ])
+        ], "oversized turn_id must fail before repository keyset work")
+
+        await assertInvalidParams([
+            "thread_id": .string(tid),
+            "response_version": .number(1),
+            "before": .object([
+                "checkpoint_turn_count": .number(1),
+                "completed_at": .string("2026-07-30T12:00:00.0Z"),
+                "turn_id": .string("turn-1"),
+            ])
+        ], "noncanonical fractional cursor must not broaden the frozen keyset")
+
+        await assertInvalidParams([
+            "thread_id": .string(tid),
+            "response_version": .number(1),
+            "before": .object([
+                "checkpoint_turn_count": .number(1),
                 "completed_at": .string("2023-11-14T22:13:20.000Z"),
                 "turn_id": .string("turn-1"),
                 "unexpected": .bool(true),
@@ -3126,6 +3287,11 @@ final class DispatcherTests: XCTestCase {
                 "turnId": .string("turn-1")
             ])
         ], "v1 cursor aliases must not silently weaken the frozen snake_case contract")
+        XCTAssertEqual(
+            router.checkpointPageCallCount,
+            0,
+            "every invalid cursor/version/limit must fail before repository work"
+        )
     }
 
     @MainActor

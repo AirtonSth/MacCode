@@ -668,6 +668,116 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
         )
     }
 
+    func testListMetadataPageFailsLoudOnInvalidBoundedRunStatusOrDate() throws {
+        // WHY: UUID(), Date(), and `.error` fallbacks make identical corrupt rows
+        // produce different successful pages. The bounded source must reject
+        // corrupt scalar metadata instead of inventing identity, time, or state.
+        for (column, value) in [
+            ("run_id", "not-a-uuid"),
+            ("status", "not-a-checkpoint-status"),
+            ("list_completed_at", "not-a-fixed-iso-token"),
+        ] {
+            let db = try makeDB()
+            let repo = AgentTurnCheckpointRepository(db: db)
+            let (tid, rid) = try seedThreadAndRun(db: db)
+            try repo.upsert(makeHeavyCheckpoint(
+                threadId: tid,
+                turnCount: 1,
+                turnId: "turn-\(column)",
+                runId: rid,
+                completedAt: Date(timeIntervalSince1970: 1_700_000_650)
+            ))
+            if column == "run_id" {
+                // Corruption can come from an old/manual DB even though current
+                // writes are FK-protected; disable the guard only to construct it.
+                try db.execute("PRAGMA foreign_keys = OFF;")
+            }
+            let corrupt = try db.prepare("""
+                UPDATE agent_turn_checkpoints
+                SET \(column) = ?
+                WHERE thread_id = ?;
+                """)
+            try corrupt.bind(1, value)
+            try corrupt.bind(2, tid.value.uuidString)
+            _ = try corrupt.step()
+
+            for attempt in 1...2 {
+                XCTAssertThrowsError(
+                    try repo.listMetadataPage(
+                        threadId: tid,
+                        maxEntries: 1,
+                        before: nil
+                    ),
+                    "\(column) attempt \(attempt) must fail instead of fabricating metadata"
+                ) { error in
+                    XCTAssertTrue(
+                        error is PersistenceDataError,
+                        "\(column) must surface a typed corrupt-checkpoint failure"
+                    )
+                }
+            }
+        }
+    }
+
+    func testListMetadataPageFailsLoudBeforeMaterializingHostileBoundedProjections() throws {
+        // WHY: list_* and files_summary_json are persisted optimization columns,
+        // not trusted input. A manually damaged/old database must not make the
+        // metadata-only cellular path allocate an unbounded Swift String, nor may
+        // inconsistent totals/flags be serialized as an apparently valid page.
+        let hostile = String(repeating: "hostile-🙂-\"-\\-", count: 16_384)
+        let corruptions: [(label: String, column: String, value: String)] = [
+            ("oversized projected turn id", "list_turn_id", hostile),
+            ("oversized projected checkpoint ref", "list_checkpoint_ref", hostile),
+            ("oversized projected error", "list_error_message", hostile),
+            ("oversized file summary", "files_summary_json", hostile),
+            ("oversized projection hash", "list_turn_id_sha256", hostile),
+            (
+                "inconsistent nontruncated total",
+                "list_checkpoint_ref_encoded_bytes",
+                "999"
+            ),
+            ("invalid projection flag", "list_turn_id_truncated", "2"),
+            ("invalid files flag", "files_summary_truncated", "2"),
+        ]
+
+        for corruption in corruptions {
+            let db = try makeDB()
+            let repo = AgentTurnCheckpointRepository(db: db)
+            let (tid, rid) = try seedThreadAndRun(db: db)
+            try repo.upsert(makeHeavyCheckpoint(
+                threadId: tid,
+                turnCount: 1,
+                turnId: "turn-\(corruption.column)",
+                runId: rid,
+                completedAt: Date(timeIntervalSince1970: 1_700_000_675)
+            ))
+            let corrupt = try db.prepare("""
+                UPDATE agent_turn_checkpoints
+                SET \(corruption.column) = ?
+                WHERE thread_id = ?;
+                """)
+            try corrupt.bind(1, corruption.value)
+            try corrupt.bind(2, tid.value.uuidString)
+            _ = try corrupt.step()
+
+            for attempt in 1...2 {
+                XCTAssertThrowsError(
+                    try repo.listMetadataPage(
+                        threadId: tid,
+                        maxEntries: 1,
+                        before: nil
+                    ),
+                    "\(corruption.label) attempt \(attempt) must fail closed"
+                ) { error in
+                    XCTAssertTrue(
+                        error is PersistenceDataError,
+                        "\(corruption.label) must surface typed persisted corruption"
+                    )
+                }
+            }
+        }
+    }
+
     func testListMetadataPage_mixedLegacyAndCapturedRowsPaginatesWithoutLoss() throws {
         // WHY: an upgraded DB is mixed until old checkpoints age out. v1 must
         // return every old and new row exactly once while making unavailable

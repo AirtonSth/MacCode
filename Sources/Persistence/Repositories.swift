@@ -3929,6 +3929,21 @@ public final class AgentTurnCheckpointRepository {
         parseDate(raw)
     }
 
+    /// List v1 keysets may only use the fixed-width capture token persisted by
+    /// schema 58/upsert. Unlike the legacy detail decoder, this path must never
+    /// replace corrupt storage with wall-clock `Date()` because that would make
+    /// pagination change between identical reads.
+    private func parseListCompletedAt(_ raw: String?) throws -> (token: String, date: Date) {
+        guard let raw,
+              raw.utf8.count == 24,
+              let date = Self.completedAtFractional.date(from: raw) else {
+            throw PersistenceDataError.corruptCheckpoint(
+                "invalid bounded list_completed_at token"
+            )
+        }
+        return (raw, date)
+    }
+
     public func nextTurnCount(threadId: AgentThreadID) throws -> Int {
         let st = try db.prepare("""
             SELECT COALESCE(MAX(checkpoint_turn_count), 0) + 1
@@ -4079,16 +4094,44 @@ public final class AgentTurnCheckpointRepository {
         before cursor: AgentTurnCheckpointCursor?
     ) throws -> AgentTurnCheckpointPage {
         let limit = max(1, min(maxEntries, AgentTurnCheckpointListWireProjection.maxEntries))
-        // WHY: list_* columns are the only values the page source may materialize
-        // or compare. Raw metadata must stay untouched even for ordering/cursors.
+        // WHY: only capture-bounded list_* fields and explicitly capped small
+        // scalars may cross the SQLite/Swift boundary. Authoritative raw metadata
+        // must stay untouched even for ordering/cursors.
         let selectList = """
-            SELECT thread_id, run_id,
-                   list_turn_id, list_turn_id_encoded_bytes, list_turn_id_sha256, list_turn_id_truncated,
+            SELECT
+                   CASE WHEN length(CAST(thread_id AS BLOB)) <= 36 THEN thread_id END,
+                   length(CAST(thread_id AS BLOB)),
+                   CASE WHEN length(CAST(run_id AS BLOB)) <= 36 THEN run_id END,
+                   length(CAST(run_id AS BLOB)),
+                   CASE WHEN length(CAST(list_turn_id AS BLOB)) <= \(AgentTurnCheckpointWireIdentity.maximumEncodedTurnIDBytes) THEN list_turn_id END,
+                   length(CAST(list_turn_id AS BLOB)),
+                   list_turn_id_encoded_bytes,
+                   CASE WHEN length(CAST(list_turn_id_sha256 AS BLOB)) <= 64 THEN list_turn_id_sha256 END,
+                   COALESCE(length(CAST(list_turn_id_sha256 AS BLOB)), 0),
+                   list_turn_id_truncated,
                    checkpoint_turn_count,
-                   list_checkpoint_ref, list_checkpoint_ref_encoded_bytes, list_checkpoint_ref_sha256, list_checkpoint_ref_truncated,
-                   status, files_summary_json, files_summary_truncated, assistant_message_id,
-                   list_error_message, list_error_message_encoded_bytes, list_error_message_sha256, list_error_message_truncated,
-                   list_completed_at, list_metadata_unavailable
+                   CASE WHEN length(CAST(list_checkpoint_ref AS BLOB)) <= \(AgentTurnCheckpointListWireProjection.maxEncodedCheckpointRefBytes) THEN list_checkpoint_ref END,
+                   length(CAST(list_checkpoint_ref AS BLOB)),
+                   list_checkpoint_ref_encoded_bytes,
+                   CASE WHEN length(CAST(list_checkpoint_ref_sha256 AS BLOB)) <= 64 THEN list_checkpoint_ref_sha256 END,
+                   COALESCE(length(CAST(list_checkpoint_ref_sha256 AS BLOB)), 0),
+                   list_checkpoint_ref_truncated,
+                   CASE WHEN length(CAST(status AS BLOB)) <= 16 THEN status END,
+                   length(CAST(status AS BLOB)),
+                   CASE WHEN length(CAST(files_summary_json AS BLOB)) <= \(AgentTurnCheckpointListWireProjection.maxEncodedFilesBytes) THEN files_summary_json END,
+                   length(CAST(files_summary_json AS BLOB)),
+                   files_summary_truncated,
+                   CASE WHEN length(CAST(assistant_message_id AS BLOB)) <= 36 THEN assistant_message_id END,
+                   COALESCE(length(CAST(assistant_message_id AS BLOB)), 0),
+                   CASE WHEN length(CAST(list_error_message AS BLOB)) <= \(AgentTurnCheckpointListWireProjection.maxEncodedErrorMessageBytes) THEN list_error_message END,
+                   COALESCE(length(CAST(list_error_message AS BLOB)), 0),
+                   list_error_message_encoded_bytes,
+                   CASE WHEN length(CAST(list_error_message_sha256 AS BLOB)) <= 64 THEN list_error_message_sha256 END,
+                   COALESCE(length(CAST(list_error_message_sha256 AS BLOB)), 0),
+                   list_error_message_truncated,
+                   CASE WHEN length(CAST(list_completed_at AS BLOB)) <= 24 THEN list_completed_at END,
+                   length(CAST(list_completed_at AS BLOB)),
+                   list_metadata_unavailable
             FROM agent_turn_checkpoints
             """
         let sql: String
@@ -4178,53 +4221,356 @@ public final class AgentTurnCheckpointRepository {
         listMetadata: AgentTurnCheckpointListWireProjection.Capture,
         completedAtToken: String
     ) {
-        let filesJSON = st.columnText(12) ?? "[]"
+        try requireBoundedStorageField(
+            st.columnText(0),
+            storedBytes: st.columnInt64(1),
+            maximumBytes: 36,
+            field: "thread_id",
+            nullable: false
+        )
+        try requireBoundedStorageField(
+            st.columnText(2),
+            storedBytes: st.columnInt64(3),
+            maximumBytes: 36,
+            field: "run_id",
+            nullable: false
+        )
+        try requireBoundedStorageField(
+            st.columnText(4),
+            storedBytes: st.columnInt64(5),
+            maximumBytes:
+                AgentTurnCheckpointWireIdentity.maximumEncodedTurnIDBytes,
+            field: "list_turn_id",
+            nullable: false
+        )
+        try requireBoundedStorageField(
+            st.columnText(7),
+            storedBytes: st.columnInt64(8),
+            maximumBytes: 64,
+            field: "list_turn_id_sha256",
+            nullable: true
+        )
+        try requireBoundedStorageField(
+            st.columnText(11),
+            storedBytes: st.columnInt64(12),
+            maximumBytes:
+                AgentTurnCheckpointListWireProjection.maxEncodedCheckpointRefBytes,
+            field: "list_checkpoint_ref",
+            nullable: false
+        )
+        try requireBoundedStorageField(
+            st.columnText(14),
+            storedBytes: st.columnInt64(15),
+            maximumBytes: 64,
+            field: "list_checkpoint_ref_sha256",
+            nullable: true
+        )
+        try requireBoundedStorageField(
+            st.columnText(17),
+            storedBytes: st.columnInt64(18),
+            maximumBytes: 16,
+            field: "status",
+            nullable: false
+        )
+        try requireBoundedStorageField(
+            st.columnText(19),
+            storedBytes: st.columnInt64(20),
+            maximumBytes:
+                AgentTurnCheckpointListWireProjection.maxEncodedFilesBytes,
+            field: "files_summary_json",
+            nullable: false
+        )
+        try requireBoundedStorageField(
+            st.columnText(22),
+            storedBytes: st.columnInt64(23),
+            maximumBytes: 36,
+            field: "assistant_message_id",
+            nullable: true
+        )
+        try requireBoundedStorageField(
+            st.columnText(24),
+            storedBytes: st.columnInt64(25),
+            maximumBytes:
+                AgentTurnCheckpointListWireProjection.maxEncodedErrorMessageBytes,
+            field: "list_error_message",
+            nullable: true
+        )
+        try requireBoundedStorageField(
+            st.columnText(27),
+            storedBytes: st.columnInt64(28),
+            maximumBytes: 64,
+            field: "list_error_message_sha256",
+            nullable: true
+        )
+        try requireBoundedStorageField(
+            st.columnText(30),
+            storedBytes: st.columnInt64(31),
+            maximumBytes: 24,
+            field: "list_completed_at",
+            nullable: false
+        )
+
+        let filesJSON = st.columnText(19) ?? "[]"
         let files: [AgentTurnCheckpointFile]
         do {
             files = try decoder.decode([AgentTurnCheckpointFile].self, from: Data(filesJSON.utf8))
         } catch {
             throw PersistenceDataError.corruptCheckpoint(
-                "invalid files_summary_json for turn \(st.columnText(2) ?? "<unknown>"): \(error)"
+                "invalid files_summary_json for turn \(st.columnText(4) ?? "<unknown>"): \(error)"
             )
+        }
+        guard files.count <= AgentTurnCheckpointListWireProjection.maxFiles,
+              let encodedFiles = try? encoder.encode(files),
+              encodedFiles.count
+                <= AgentTurnCheckpointListWireProjection.maxEncodedFilesBytes else {
+            throw PersistenceDataError.corruptCheckpoint(
+                "invalid bounded files_summary_json projection"
+            )
+        }
+        guard let storedThreadUUID = st.columnText(0).flatMap(UUID.init(uuidString:)),
+              storedThreadUUID == fallbackThreadId.value else {
+            throw PersistenceDataError.corruptCheckpoint(
+                "invalid bounded checkpoint thread_id"
+            )
+        }
+        guard let runUUID = st.columnText(2).flatMap(UUID.init(uuidString:)) else {
+            throw PersistenceDataError.corruptCheckpoint(
+                "invalid bounded checkpoint run_id"
+            )
+        }
+        guard let status = st.columnText(17)
+            .flatMap(AgentTurnCheckpointStatus.init(rawValue:)) else {
+            throw PersistenceDataError.corruptCheckpoint(
+                "invalid bounded checkpoint status"
+            )
+        }
+        let completed = try parseListCompletedAt(st.columnText(30))
+        let checkpointTurnCount = st.columnInt64(10)
+        guard checkpointTurnCount >= 0,
+              checkpointTurnCount <= 9_007_199_254_740_991 else {
+            throw PersistenceDataError.corruptCheckpoint(
+                "invalid bounded checkpoint_turn_count"
+            )
+        }
+        let assistantMessageId: AgentMessageID?
+        if let rawAssistantMessageID = st.columnText(22) {
+            guard let uuid = UUID(uuidString: rawAssistantMessageID) else {
+                throw PersistenceDataError.corruptCheckpoint(
+                    "invalid bounded assistant_message_id"
+                )
+            }
+            assistantMessageId = AgentMessageID(uuid)
+        } else {
+            assistantMessageId = nil
         }
         let listMetadata = AgentTurnCheckpointListWireProjection.Capture(
             turnId: .init(
-                value: st.columnText(2) ?? "",
-                totalEncodedBytes: Int(st.columnInt64(3)),
-                sha256: st.columnText(4),
-                truncated: st.columnInt64(5) != 0
+                value: st.columnText(4),
+                totalEncodedBytes: try boundedListTotal(
+                    st.columnInt64(6),
+                    field: "list_turn_id_encoded_bytes"
+                ),
+                sha256: st.columnText(7),
+                truncated: try boundedListFlag(
+                    st.columnInt64(9),
+                    field: "list_turn_id_truncated"
+                )
             ),
             checkpointRef: .init(
-                value: st.columnText(7) ?? "",
-                totalEncodedBytes: Int(st.columnInt64(8)),
-                sha256: st.columnText(9),
-                truncated: st.columnInt64(10) != 0
+                value: st.columnText(11),
+                totalEncodedBytes: try boundedListTotal(
+                    st.columnInt64(13),
+                    field: "list_checkpoint_ref_encoded_bytes"
+                ),
+                sha256: st.columnText(14),
+                truncated: try boundedListFlag(
+                    st.columnInt64(16),
+                    field: "list_checkpoint_ref_truncated"
+                )
             ),
             errorMessage: .init(
-                value: st.columnText(15),
-                totalEncodedBytes: Int(st.columnInt64(16)),
-                sha256: st.columnText(17),
-                truncated: st.columnInt64(18) != 0
+                value: st.columnText(24),
+                totalEncodedBytes: try boundedListTotal(
+                    st.columnInt64(26),
+                    field: "list_error_message_encoded_bytes"
+                ),
+                sha256: st.columnText(27),
+                truncated: try boundedListFlag(
+                    st.columnInt64(29),
+                    field: "list_error_message_truncated"
+                )
             ),
-            metadataUnavailable: st.columnInt64(20) != 0
+            metadataUnavailable: try boundedListFlag(
+                st.columnInt64(32),
+                field: "list_metadata_unavailable"
+            )
         )
-        let completedAtToken = st.columnText(19) ?? ""
+        try validateListMetadataProjection(listMetadata)
+        guard let turnID = listMetadata.turnId.value,
+              !turnID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw PersistenceDataError.corruptCheckpoint(
+                "invalid empty bounded list_turn_id"
+            )
+        }
         let summary = AgentTurnCheckpointSummary(
-            threadId: AgentThreadID(UUID(uuidString: st.columnText(0) ?? "") ?? fallbackThreadId.value),
-            runId: AgentRunID(UUID(uuidString: st.columnText(1) ?? "") ?? UUID()),
-            turnId: listMetadata.turnId.value ?? "",
-            checkpointTurnCount: Int(st.columnInt64(6)),
+            threadId: AgentThreadID(storedThreadUUID),
+            runId: AgentRunID(runUUID),
+            turnId: turnID,
+            checkpointTurnCount: Int(checkpointTurnCount),
             checkpointRef: listMetadata.checkpointRef.value ?? "",
-            status: AgentTurnCheckpointStatus(rawValue: st.columnText(11) ?? "") ?? .error,
+            status: status,
             files: files,
             fileSnapshots: [],
             diffPatch: nil,
             fileDiffs: [],
-            assistantMessageId: st.columnText(14).flatMap(UUID.init(uuidString:)).map(AgentMessageID.init),
+            assistantMessageId: assistantMessageId,
             errorMessage: listMetadata.errorMessage.value,
-            completedAt: parseCompletedAt(completedAtToken)
+            completedAt: completed.date
         )
-        return (summary, st.columnInt64(13) != 0, listMetadata, completedAtToken)
+        return (
+            summary,
+            try boundedListFlag(
+                st.columnInt64(21),
+                field: "files_summary_truncated"
+            ),
+            listMetadata,
+            completed.token
+        )
+    }
+
+    private func requireBoundedStorageField(
+        _ value: String?,
+        storedBytes: Int64,
+        maximumBytes: Int,
+        field: String,
+        nullable: Bool
+    ) throws {
+        guard storedBytes >= 0,
+              storedBytes <= Int64(maximumBytes),
+              value?.utf8.count == Int(storedBytes)
+                || (nullable && value == nil && storedBytes == 0) else {
+            throw PersistenceDataError.corruptCheckpoint(
+                "oversized or invalid bounded \(field)"
+            )
+        }
+    }
+
+    private func boundedListFlag(_ raw: Int64, field: String) throws -> Bool {
+        guard raw == 0 || raw == 1 else {
+            throw PersistenceDataError.corruptCheckpoint(
+                "invalid bounded \(field)"
+            )
+        }
+        return raw == 1
+    }
+
+    private func boundedListTotal(_ raw: Int64, field: String) throws -> Int {
+        guard raw >= 0, raw <= 9_007_199_254_740_991 else {
+            throw PersistenceDataError.corruptCheckpoint(
+                "invalid bounded \(field)"
+            )
+        }
+        return Int(raw)
+    }
+
+    private func validateListMetadataProjection(
+        _ capture: AgentTurnCheckpointListWireProjection.Capture
+    ) throws {
+        if capture.metadataUnavailable {
+            let prefix = "rc2-legacy-row:"
+            let turnID = capture.turnId.value ?? ""
+            let suffix = turnID.dropFirst(prefix.count)
+            guard turnID.hasPrefix(prefix),
+                  suffix.utf8.count == 32,
+                  suffix.utf8.allSatisfy({
+                      (0x30...0x39).contains($0)
+                        || (0x61...0x66).contains($0)
+                  }),
+                  capture.turnId.truncated,
+                  capture.turnId.totalEncodedBytes == 0,
+                  capture.turnId.sha256 == nil,
+                  capture.checkpointRef.value == "",
+                  capture.checkpointRef.truncated,
+                  capture.checkpointRef.totalEncodedBytes == 0,
+                  capture.checkpointRef.sha256 == nil,
+                  capture.errorMessage.value == nil,
+                  capture.errorMessage.truncated,
+                  capture.errorMessage.totalEncodedBytes == 0,
+                  capture.errorMessage.sha256 == nil else {
+                throw PersistenceDataError.corruptCheckpoint(
+                    "invalid unavailable bounded metadata sentinel"
+                )
+            }
+            return
+        }
+        try validateListProjectionField(
+            capture.turnId,
+            maximumEncodedBytes:
+                AgentTurnCheckpointWireIdentity.maximumEncodedTurnIDBytes,
+            digestIdentity: true,
+            field: "list_turn_id"
+        )
+        try validateListProjectionField(
+            capture.checkpointRef,
+            maximumEncodedBytes:
+                AgentTurnCheckpointListWireProjection.maxEncodedCheckpointRefBytes,
+            digestIdentity: false,
+            field: "list_checkpoint_ref"
+        )
+        try validateListProjectionField(
+            capture.errorMessage,
+            maximumEncodedBytes:
+                AgentTurnCheckpointListWireProjection.maxEncodedErrorMessageBytes,
+            digestIdentity: false,
+            field: "list_error_message"
+        )
+    }
+
+    private func validateListProjectionField(
+        _ projection: AgentTurnCheckpointListWireProjection.Field,
+        maximumEncodedBytes: Int,
+        digestIdentity: Bool,
+        field: String
+    ) throws {
+        guard let value = projection.value else {
+            guard !projection.truncated,
+                  projection.totalEncodedBytes == 0,
+                  projection.sha256 == nil else {
+                throw PersistenceDataError.corruptCheckpoint(
+                    "invalid bounded \(field) null projection"
+                )
+            }
+            return
+        }
+        let projectedBytes =
+            AgentTurnCheckpointWireIdentity.encodedJSONStringByteCount(value)
+        guard projectedBytes <= maximumEncodedBytes else {
+            throw PersistenceDataError.corruptCheckpoint(
+                "oversized encoded bounded \(field)"
+            )
+        }
+        if !projection.truncated {
+            guard projection.totalEncodedBytes == projectedBytes,
+                  projection.sha256 == nil else {
+                throw PersistenceDataError.corruptCheckpoint(
+                    "inconsistent bounded \(field) projection"
+                )
+            }
+            return
+        }
+        guard projection.totalEncodedBytes > maximumEncodedBytes,
+              let hash = projection.sha256,
+              hash.utf8.count == 64,
+              hash.utf8.allSatisfy({
+                  (0x30...0x39).contains($0)
+                    || (0x61...0x66).contains($0)
+              }),
+              !digestIdentity
+                || value == "sha256:\(hash):\(projection.totalEncodedBytes)" else {
+            throw PersistenceDataError.corruptCheckpoint(
+                "invalid truncated bounded \(field) projection"
+            )
+        }
     }
 
     private func decodeCheckpoint(from st: SQLiteStatement, fallbackThreadId: AgentThreadID) throws -> AgentTurnCheckpointSummary {

@@ -190,6 +190,53 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         XCTAssertTrue(st.columnIsNull(7))
     }
 
+    func test_v57_to_head_invalidLegacyCompletedAtUsesFixedBoundedSentinel() throws {
+        // WHY: SQLite strftime returns NULL for malformed legacy dates. Falling
+        // back to the raw completed_at value would copy attacker-sized text into
+        // list_completed_at and violate the capture-time bounded source contract.
+        let db = try migrateFromVersion(n: 57)
+        let threadID = UUID().uuidString
+        let runID = UUID().uuidString
+        try db.execute("""
+            INSERT INTO agent_threads
+                (id, title, provider, model, status, created_at, updated_at)
+            VALUES
+                ('\(threadID)', 'legacy hostile date', 'claude', 'claude-3', 'idle',
+                 '2024-06-01T00:00:00Z', '2024-06-01T00:00:00Z');
+            INSERT INTO agent_runs
+                (id, thread_id, provider, model, status, started_at)
+            VALUES
+                ('\(runID)', '\(threadID)', 'claude', 'claude-3', 'idle',
+                 '2024-06-01T00:00:00Z');
+            """)
+        let hostile = "not-an-iso-date-" + String(repeating: "x", count: 128 * 1_024)
+        let insert = try db.prepare("""
+            INSERT INTO agent_turn_checkpoints
+                (thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref,
+                 status, files_json, completed_at, created_at)
+            VALUES (?, ?, 'legacy-turn', 1, 'legacy-ref', 'ready', '[]', ?,
+                    '2024-06-01T00:00:00Z');
+            """)
+        try insert.bind(1, threadID)
+        try insert.bind(2, runID)
+        try insert.bind(3, hostile)
+        _ = try insert.step()
+
+        try Schema.migrateSteps(db, Schema.steps)
+
+        let row = try db.prepare("""
+            SELECT list_completed_at, length(list_completed_at),
+                   list_metadata_unavailable
+            FROM agent_turn_checkpoints
+            WHERE thread_id = ?;
+            """)
+        try row.bind(1, threadID)
+        XCTAssertTrue(try row.step())
+        XCTAssertEqual(row.columnText(0), "1970-01-01T00:00:00.000Z")
+        XCTAssertEqual(row.columnInt64(1), 24)
+        XCTAssertEqual(row.columnInt64(2), 1)
+    }
+
     // MARK: - v25 → head
 
     /// WHY: v25 introduces token_saver_savings. Users who accumulated savings data at

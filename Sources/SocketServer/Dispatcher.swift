@@ -538,6 +538,12 @@ public final class JSONRPCDispatcher {
         AgentTurnCheckpointListWireProjection.maxEncodedItemBytes
     private static let checkpointListV1MaxEncodedResponseBytes =
         AgentTurnCheckpointListWireProjection.maxEncodedResponseBytes
+    /// A successful v1 response is measured with its JSON-RPC id. Bound the id
+    /// before repository work so an attacker cannot consume the entire advertised
+    /// response budget with correlation metadata and trigger the release-only
+    /// first-item fallback that the old implementation guarded only by `assert`.
+    nonisolated static let checkpointListV1MaxEncodedResponseIDBytes =
+        AgentTurnCheckpointListWireProjection.maxEncodedItemBytes
     private static let checkpointListV1MaxEncodedCheckpointRefBytes =
         AgentTurnCheckpointListWireProjection.maxEncodedCheckpointRefBytes
     private static let checkpointListV1MaxEncodedErrorMessageBytes =
@@ -545,11 +551,6 @@ public final class JSONRPCDispatcher {
     private static let checkpointListISO8601Fractional: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
-    private static let checkpointListISO8601Plain: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
         return formatter
     }()
     private var volatileCommandReceipts = BoundedReceiptCache()
@@ -2526,6 +2527,12 @@ public final class JSONRPCDispatcher {
                 // Opt-in only: absent response_version keeps the legacy full-array path.
                 // Modern-only params (max_entries/before) without the opt-in are ignored.
                 if params["response_version"] != nil {
+                    guard Self.checkpointListV1AcceptsResponseID(id) else {
+                        // An unbounded id cannot be echoed inside the advertised
+                        // complete-response cap. Treat the request itself as invalid
+                        // and do not echo the hostile id.
+                        return .init(id: nil, error: .invalidRequest)
+                    }
                     guard let version = params["response_version"]?.intValue, version == 1 else {
                         throw JSONRPCError.invalidParams
                     }
@@ -2546,7 +2553,7 @@ public final class JSONRPCDispatcher {
                     )
                     return .init(
                         id: id,
-                        result: checkpointPagePayload(page, responseID: id)
+                        result: try checkpointPagePayload(page, responseID: id)
                     )
                 }
                 return .init(id: id, result: encode(try router.listAgentThreadCheckpoints(thread: tid)))
@@ -3684,9 +3691,9 @@ public final class JSONRPCDispatcher {
     }
 
     /// Strict keyset cursor for checkpoint list v1. Absent/null means no cursor;
-    /// any present non-object, incomplete, or non-ISO8601 shape is invalid params.
-    /// Accepts whole-second and fractional `completed_at` so sub-second page
-    /// boundaries round-trip for iOS equality and DB keyset continuation.
+    /// any present non-object, incomplete, noncanonical, or over-budget shape is
+    /// invalid params. A cursor must be an exact round-trip of v1's bounded
+    /// `next_before`, so hostile strings never reach the SQLite keyset.
     private func checkpointCursor(from value: JSONValue?) throws -> AgentTurnCheckpointCursor? {
         guard let value else { return nil }
         if case .null = value { return nil }
@@ -3698,10 +3705,18 @@ public final class JSONRPCDispatcher {
               ],
               let turnCount = object["checkpoint_turn_count"]?.intValue,
               turnCount >= 0,
+              turnCount <= 9_007_199_254_740_991,
               let turnId = object["turn_id"]?.stringValue,
               !turnId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              AgentTurnCheckpointWireIdentity.encodedJSONStringByteCount(turnId)
+                <= AgentTurnCheckpointWireIdentity.maximumEncodedTurnIDBytes,
               let completedRaw = object["completed_at"]?.stringValue,
-              let completedAt = parseCheckpointListISO8601(completedRaw)
+              completedRaw.utf8.count == 24,
+              let completedAt = Self.checkpointListISO8601Fractional.date(
+                from: completedRaw
+              ),
+              Self.checkpointListISO8601Fractional.string(from: completedAt)
+                == completedRaw
         else {
             throw JSONRPCError.invalidParams
         }
@@ -3711,11 +3726,6 @@ public final class JSONRPCDispatcher {
             turnId: turnId,
             completedAtToken: completedRaw
         )
-    }
-
-    private func parseCheckpointListISO8601(_ value: String) -> Date? {
-        Self.checkpointListISO8601Fractional.date(from: value)
-            ?? Self.checkpointListISO8601Plain.date(from: value)
     }
 
     private func checkpointListCompletedAtToken(
@@ -3749,15 +3759,15 @@ public final class JSONRPCDispatcher {
     private func checkpointPagePayload(
         _ page: AgentTurnCheckpointPage,
         responseID: JSONRPCID?
-    ) -> JSONValue {
-        let projected = page.items.enumerated().map { index, summary in
+    ) throws -> JSONValue {
+        let projected = try page.items.enumerated().map { index, summary in
             let listMetadata = page.listMetadata.indices.contains(index)
                 ? page.listMetadata[index]
                 : nil
             let completedAtToken = page.completedAtTokens.indices.contains(index)
                 ? page.completedAtTokens[index]
                 : ""
-            return checkpointItemForV1(
+            return try checkpointItemForV1(
                 summary,
                 sourceFilesTruncated: page.filesTruncated.indices.contains(index)
                     ? page.filesTruncated[index]
@@ -3783,25 +3793,32 @@ public final class JSONRPCDispatcher {
             emitted.append(candidate)
         }
 
-        // Per-item budgets make a first-item overflow impossible for normal JSON-RPC
-        // ids. Keep the history usable rather than returning a list-wide error if a
-        // future encoder changes overhead.
-        if emitted.isEmpty, let first = projected.first {
-            emitted = [first]
+        guard projected.isEmpty || !emitted.isEmpty else {
+            // Response-id admission plus the independent item cap make this
+            // unreachable. Fail closed in release builds if those contracts drift.
+            throw JSONRPCError.internalError
         }
         let finalPayload = checkpointEnvelope(
             items: emitted,
             truncated: page.truncated || emitted.count < projected.count
         )
-        assert(
-            (try? _encoder.encode(
-                JSONRPCResponse(id: responseID, result: finalPayload)
-            ).count).map {
-                $0 <= Self.checkpointListV1MaxEncodedResponseBytes
-            } ?? false,
-            "checkpoint v1 final JSON-RPC response exceeded its encoded budget"
-        )
+        guard let finalBytes = try? _encoder.encode(
+            JSONRPCResponse(id: responseID, result: finalPayload)
+        ).count,
+              finalBytes <= Self.checkpointListV1MaxEncodedResponseBytes else {
+            throw JSONRPCError.internalError
+        }
         return finalPayload
+    }
+
+    nonisolated static func checkpointListV1AcceptsResponseID(
+        _ responseID: JSONRPCID?
+    ) -> Bool {
+        guard let responseID,
+              let encoded = try? JSONEncoder().encode(responseID) else {
+            return responseID == nil
+        }
+        return encoded.count <= checkpointListV1MaxEncodedResponseIDBytes
     }
 
     private func checkpointEnvelope(
@@ -3829,7 +3846,7 @@ public final class JSONRPCDispatcher {
         sourceFilesTruncated: Bool,
         listMetadata: AgentTurnCheckpointListWireProjection.Capture?,
         completedAtToken: String
-    ) -> CheckpointV1ProjectedItem {
+    ) throws -> CheckpointV1ProjectedItem {
         // Prefer capture-time projections from the repository so list never
         // re-hashes oversized raw columns at read/encode time.
         let turnID: CheckpointV1StringProjection
@@ -3923,10 +3940,12 @@ public final class JSONRPCDispatcher {
                 filesTruncated: true
             )
         }
-        assert(
-            encodedByteCount(item) <= Self.checkpointListV1MaxEncodedItemBytes,
-            "checkpoint v1 metadata budgets must fit one complete item"
-        )
+        guard encodedByteCount(item) <= Self.checkpointListV1MaxEncodedItemBytes else {
+            // Projection budgets are a wire contract, not a debug-only invariant.
+            // Fail closed in release builds if a future field makes even the
+            // file-free metadata item exceed the advertised item ceiling.
+            throw JSONRPCError.internalError
+        }
         return CheckpointV1ProjectedItem(
             value: item,
             checkpointTurnCount: summary.checkpointTurnCount,

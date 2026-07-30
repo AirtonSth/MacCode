@@ -52,6 +52,9 @@ public protocol DirectAuthProvider: AnyObject {
 /// Exact `agent.checkpoint_list` capability marker shared by public HTTP
 /// capabilities, authenticated HTTP capabilities, and `system.capabilities`.
 /// Single source so the three surfaces cannot drift on response budgets.
+/// `max_response_bytes` caps one complete JSON-RPC response item, including its
+/// echoed id. A top-level HTTP batch is transport aggregation of independent
+/// response items and remains subject to the server's separate HTTP body cap.
 public enum AgentCheckpointListCapabilityV1 {
     public static let responseVersion = 1
     public static let maxEntries = AgentTurnCheckpointListWireProjection.maxEntries
@@ -3296,6 +3299,16 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 return rpcErrorObject(.invalidRequest, id: wireID)
             }
             rawParams = objectParams
+        }
+        if method == "agent.checkpoint.list",
+           rawParams?.keys.contains("response_version") == true,
+           let stringID = wireID as? String,
+           AgentTurnCheckpointWireIdentity.encodedJSONStringByteCount(stringID)
+                > JSONRPCDispatcher.checkpointListV1MaxEncodedResponseIDBytes {
+            // The HTTP seam restores the exact wire id after dispatcher encoding.
+            // Reject here as well so that restoration cannot reintroduce an
+            // oversized id into a checkpoint response (single or top-level batch).
+            return rpcErrorObject(.invalidRequest, id: NSNull())
         }
         if method == "sync.snapshot" {
             // Handled by `dispatchRPC` single-encode path (C-24); this branch

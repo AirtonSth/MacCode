@@ -1015,7 +1015,7 @@ public enum Schema {
         SET list_turn_id = 'rc2-legacy-row:' || lower(hex(randomblob(16))),
             list_completed_at = COALESCE(
                 strftime('%Y-%m-%dT%H:%M:%fZ', completed_at),
-                completed_at
+                '1970-01-01T00:00:00.000Z'
             )
         WHERE list_metadata_unavailable = 1;
         CREATE UNIQUE INDEX idx_agent_turn_checkpoints_list_keyset
