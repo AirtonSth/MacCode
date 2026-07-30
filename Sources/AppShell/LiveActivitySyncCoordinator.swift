@@ -266,6 +266,19 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
     /// active — even when no turn.completed event arrives for a long stretch.
     public static let heartbeatIntervalNanoseconds: UInt64 = 30_000_000_000
 
+    /// Transient network/outbox failures should not drop a lifecycle transition
+    /// forever; retry a few times before surfacing `onDeliveryError`.
+    public static let deliveryMaxAttempts: Int = 3
+
+    public static func defaultDeliveryRetryDelayNanoseconds(attempt: Int) -> UInt64 {
+        // attempt is 0-based after the first failure.
+        switch attempt {
+        case 0: return 200_000_000
+        case 1: return 500_000_000
+        default: return 1_000_000_000
+        }
+    }
+
     public init(
         serverId: String,
         bootEpoch: UInt64,
@@ -275,7 +288,10 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
         onTokenRegistrationError: @escaping TokenRegistrationError = { _, _ in },
         onDeliveryError: @escaping DeliveryError = { _, _ in },
         deliver: @escaping Delivery,
-        heartbeatIntervalNanoseconds: UInt64 = LiveActivitySyncCoordinator.heartbeatIntervalNanoseconds
+        heartbeatIntervalNanoseconds: UInt64 = LiveActivitySyncCoordinator.heartbeatIntervalNanoseconds,
+        deliveryMaxAttempts: Int = LiveActivitySyncCoordinator.deliveryMaxAttempts,
+        deliveryRetryDelayNanoseconds: @escaping @Sendable (Int) -> UInt64 =
+            LiveActivitySyncCoordinator.defaultDeliveryRetryDelayNanoseconds
     ) {
         let tokenScopeBinder = LiveActivityTokenScopeBinder(
             serverId: serverId,
@@ -284,6 +300,7 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
             initialTargets: initialTokenTargets
         )
         self.tokenScopeBinder = tokenScopeBinder
+        let maxAttempts = max(1, deliveryMaxAttempts)
         var capturedContinuation: AsyncStream<Command>.Continuation?
         let stream = AsyncStream<Command> { capturedContinuation = $0 }
         self.continuation = capturedContinuation!
@@ -298,11 +315,14 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
                 surface != nil || latest.activeRunCount > 0
             }
 
+            /// Returns true only when `deliver` eventually succeeds. Presence is
+            /// advanced by the caller solely on success so a failed `.end` can
+            /// still be retried by the next natural event or heartbeat.
             func emit(
                 event: PrivateLiveActivityEvent,
                 cause: LiveActivitySyncCause,
                 now: Date
-            ) async {
+            ) async -> Bool {
                 stateRevision &+= 1
                 if event == .start {
                     stateRevision = 1
@@ -318,10 +338,47 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
                     stateRevision: stateRevision,
                     now: now
                 )
-                do {
-                    try await deliver(delivery)
-                } catch {
-                    onDeliveryError(error, delivery)
+                var lastError: Error?
+                for attempt in 0..<maxAttempts {
+                    do {
+                        try await deliver(delivery)
+                        return true
+                    } catch {
+                        lastError = error
+                        if attempt + 1 < maxAttempts {
+                            let delay = deliveryRetryDelayNanoseconds(attempt)
+                            if delay > 0 {
+                                try? await Task.sleep(nanoseconds: delay)
+                            }
+                        }
+                    }
+                }
+                if let lastError {
+                    onDeliveryError(lastError, delivery)
+                }
+                return false
+            }
+
+            /// Shared start/update/end decision for projection, surface, and
+            /// heartbeat. Heartbeat is no longer present-only: it also retries a
+            /// stranded `.end` when local presence already cleared.
+            func publishLifecycle(cause: LiveActivitySyncCause, now: Date) async {
+                let nowPresent = presentNow()
+                let event: PrivateLiveActivityEvent
+                if !wasPresent, nowPresent {
+                    activityGeneration &+= 1
+                    tokenScopeBinder.recordGeneration(activityGeneration)
+                    stateRevision = 0
+                    event = .start
+                } else if wasPresent, !nowPresent {
+                    event = .end
+                } else if nowPresent {
+                    event = .update
+                } else {
+                    return
+                }
+                if await emit(event: event, cause: cause, now: now) {
+                    wasPresent = nowPresent
                 }
             }
 
@@ -337,52 +394,21 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
                     latest = projection
                     if cause == .launchReconciliation {
                         surface = nil
+                        activityGeneration &+= 1
+                        tokenScopeBinder.recordGeneration(activityGeneration)
+                        stateRevision = 0
+                        // New boot identity: clear local presence regardless of
+                        // whether the corrective end reaches the backend.
+                        _ = await emit(event: .end, cause: cause, now: now)
                         wasPresent = false
-                        activityGeneration &+= 1
-                        tokenScopeBinder.recordGeneration(activityGeneration)
-                        stateRevision = 0
-                        await emit(event: .end, cause: cause, now: now)
                         continue
                     }
-                    let nowPresent = presentNow()
-                    let event: PrivateLiveActivityEvent
-                    if !wasPresent, nowPresent {
-                        activityGeneration &+= 1
-                        tokenScopeBinder.recordGeneration(activityGeneration)
-                        stateRevision = 0
-                        event = .start
-                    } else if wasPresent, !nowPresent {
-                        event = .end
-                    } else if nowPresent {
-                        event = .update
-                    } else {
-                        wasPresent = nowPresent
-                        continue
-                    }
-                    wasPresent = nowPresent
-                    await emit(event: event, cause: cause, now: now)
+                    await publishLifecycle(cause: cause, now: now)
                 case .surface(let content, let now):
                     surface = content
-                    let nowPresent = presentNow()
-                    let event: PrivateLiveActivityEvent
-                    if !wasPresent, nowPresent {
-                        activityGeneration &+= 1
-                        tokenScopeBinder.recordGeneration(activityGeneration)
-                        stateRevision = 0
-                        event = .start
-                    } else if wasPresent, !nowPresent {
-                        event = .end
-                    } else if nowPresent {
-                        event = .update
-                    } else {
-                        wasPresent = nowPresent
-                        continue
-                    }
-                    wasPresent = nowPresent
-                    await emit(event: event, cause: .changed, now: now)
+                    await publishLifecycle(cause: .changed, now: now)
                 case .heartbeat(let now):
-                    guard presentNow() else { continue }
-                    await emit(event: .update, cause: .changed, now: now)
+                    await publishLifecycle(cause: .changed, now: now)
                 case .flush(let barrier):
                     barrier.resume()
                 }

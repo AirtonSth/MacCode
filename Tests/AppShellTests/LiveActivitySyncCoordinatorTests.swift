@@ -441,20 +441,126 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
 
     func testCoordinatorSurfacesAcceptancePersistenceFailure() async {
         let errors = DeliveryErrorRecorder()
+        let attempts = DeliveryAttemptCounter()
         let sync = LiveActivitySyncCoordinator(
             serverId: "server-1",
             bootEpoch: 3,
             onDeliveryError: { error, delivery in errors.append(error, delivery: delivery) },
-            deliver: { _ in throw OutboxTestError.persistence },
-            heartbeatIntervalNanoseconds: 60_000_000_000_000
+            deliver: { _ in
+                attempts.increment()
+                throw OutboxTestError.persistence
+            },
+            heartbeatIntervalNanoseconds: 60_000_000_000_000,
+            deliveryMaxAttempts: 3,
+            deliveryRetryDelayNanoseconds: { _ in 0 }
         )
         let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
 
         sync.submit(active([run]), cause: .started)
         await sync.flush()
 
+        XCTAssertEqual(attempts.count, 3,
+                       "transient delivery failures must be retried a bounded number of times before giving up")
         XCTAssertEqual(errors.count, 1,
                        "serialized lifecycle delivery must surface durable-acceptance failure instead of swallowing it")
+    }
+
+    func testDeliveryRetriesThenSucceedsWithoutSurfacingError() async {
+        let errors = DeliveryErrorRecorder()
+        let recorder = DeliveryRecorder()
+        let attempts = DeliveryAttemptCounter()
+        let sync = LiveActivitySyncCoordinator(
+            serverId: "server-1",
+            bootEpoch: 4,
+            onDeliveryError: { error, delivery in errors.append(error, delivery: delivery) },
+            deliver: { delivery in
+                let n = attempts.increment()
+                if n < 3 { throw OutboxTestError.persistence }
+                await recorder.append(delivery)
+            },
+            heartbeatIntervalNanoseconds: 60_000_000_000_000,
+            deliveryMaxAttempts: 3,
+            deliveryRetryDelayNanoseconds: { _ in 0 }
+        )
+        let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
+
+        sync.submit(active([run]), cause: .started, now: Date(timeIntervalSince1970: 500))
+        await sync.flush()
+
+        XCTAssertEqual(attempts.count, 3)
+        XCTAssertEqual(errors.count, 0,
+                       "a delivery that succeeds within the retry budget must not fire onDeliveryError")
+        XCTAssertEqual(recorder.deliveries.map(\.event), [.start])
+        XCTAssertEqual(recorder.deliveries.first?.idempotencyKey,
+                       "activity.server-1.4.1.1.start",
+                       "retries must reuse the same revision/idempotency key")
+    }
+
+    func testFailedEndIsRetriedOnHeartbeat() async {
+        let recorder = DeliveryRecorder()
+        let attempts = DeliveryAttemptCounter()
+        let sync = LiveActivitySyncCoordinator(
+            serverId: "server-1",
+            bootEpoch: 5,
+            deliver: { delivery in
+                // Fail only the first end attempt's whole retry budget; later ends succeed.
+                if delivery.event == .end, attempts.increment() <= 3 {
+                    throw OutboxTestError.persistence
+                }
+                await recorder.append(delivery)
+            },
+            heartbeatIntervalNanoseconds: 60_000_000_000_000,
+            deliveryMaxAttempts: 3,
+            deliveryRetryDelayNanoseconds: { _ in 0 }
+        )
+        let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
+
+        sync.submit(active([run]), cause: .started, now: Date(timeIntervalSince1970: 600))
+        await sync.flush()
+        XCTAssertEqual(recorder.deliveries.map(\.event), [.start])
+
+        sync.submit(active([]), cause: .finished(.completed), now: Date(timeIntervalSince1970: 601))
+        await sync.flush()
+        XCTAssertEqual(recorder.deliveries.map(\.event), [.start],
+                       "a fully-failed end must not advance remote lifecycle; local presence stays open for retry")
+
+        // Heartbeat used to no-op when presentNow() was false; it must now re-emit end.
+        sync.submitHeartbeat(now: Date(timeIntervalSince1970: 630))
+        await sync.flush()
+
+        XCTAssertEqual(recorder.deliveries.map(\.event), [.start, .end],
+                       "heartbeat must recover a stranded end after delivery failure")
+    }
+
+    func testFailedStartIsRetriedAsStartNotUpdate() async {
+        let recorder = DeliveryRecorder()
+        let attempts = DeliveryAttemptCounter()
+        let sync = LiveActivitySyncCoordinator(
+            serverId: "server-1",
+            bootEpoch: 6,
+            deliver: { delivery in
+                let n = attempts.increment()
+                // Exhaust first start's retry budget; allow later deliveries.
+                if n <= 3 { throw OutboxTestError.persistence }
+                await recorder.append(delivery)
+            },
+            heartbeatIntervalNanoseconds: 60_000_000_000_000,
+            deliveryMaxAttempts: 3,
+            deliveryRetryDelayNanoseconds: { _ in 0 }
+        )
+        let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
+
+        sync.submit(active([run]), cause: .started, now: Date(timeIntervalSince1970: 700))
+        await sync.flush()
+        XCTAssertTrue(recorder.deliveries.isEmpty)
+
+        sync.submitHeartbeat(now: Date(timeIntervalSince1970: 730))
+        await sync.flush()
+
+        XCTAssertEqual(recorder.deliveries.map(\.event), [.start],
+                       "presence must not advance on failed start; heartbeat recovers with start, not update")
+        XCTAssertEqual(recorder.deliveries.first?.activityGeneration, 2,
+                       "a recovered start after a failed open uses the next generation")
     }
 
     func testV2ContractEncodesRootSharedFieldNamesAndEpochIntegers() throws {
@@ -1876,6 +1982,21 @@ private final class DeliveryErrorRecorder: @unchecked Sendable {
 
     var count: Int { lock.withLock { values.count } }
     var errors: [Error] { lock.withLock { rawErrors } }
+}
+
+private final class DeliveryAttemptCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    @discardableResult
+    func increment() -> Int {
+        lock.withLock {
+            value += 1
+            return value
+        }
+    }
+
+    var count: Int { lock.withLock { value } }
 }
 
 private final class TokenRegistrationGate: @unchecked Sendable {
