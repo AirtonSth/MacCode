@@ -7,10 +7,17 @@ import Foundation
 /// `CommandWrapPolicy`; this type runs the real command and detects — fail-closed — whether
 /// the wrapper is the TERMINAL command feeding the agent before compressing.
 enum CommandWrapRunner {
+    /// Optional best-effort work (Wave A ledger POST) that must not delay stdout delivery.
+    typealias DeferredSideEffect = @Sendable () async -> Void
+
     /// Compresses `captured` stdout (reversible, with the given store floor) using the optional
     /// per-command extraction `query`, returning the emitted bytes (compressed text + recovery
-    /// handle) or nil to fall back to the raw bytes.
-    typealias Compressor = @Sendable (_ captured: Data, _ query: String?, _ storeFloorBytes: Int) async -> Data?
+    /// handle) plus an optional deferred side effect, or nil to fall back to the raw bytes.
+    typealias Compressor = @Sendable (
+        _ captured: Data,
+        _ query: String?,
+        _ storeFloorBytes: Int
+    ) async -> (bytes: Data, deferredSideEffect: DeferredSideEffect?)?
 
     /// Reads from the real command's stdout in 64 KB chunks.
     private static let readChunk = 64 * 1024
@@ -19,24 +26,29 @@ enum CommandWrapRunner {
     /// generous headroom for review-sized output.
     private static let captureCapBytes = 8 * 1024 * 1024
 
-    /// Runs the wrapped command and writes its (possibly compressed) output to our real stdout.
+    /// Runs the wrapped command and writes its (possibly compressed) output to our real stdout
+    /// before any deferred ledger side effect is returned to the caller.
     /// Always returns the REAL command's exit code so the agent's shell sees the true status.
-    static func run(command: String, args: [String], compress: Compressor) async -> Int32 {
+    static func run(
+        command: String,
+        args: [String],
+        compress: Compressor
+    ) async -> (exitCode: Int32, deferredSideEffect: DeferredSideEffect?) {
         let env = ProcessInfo.processInfo.environment
         guard let realExe = resolveRealExecutable(command: command, environment: env) else {
             FileHandle.standardError.write(Data("\(CommandWrapPolicy.commandBasename(command)): command not found\n".utf8))
-            return 127
+            return (127, nil)
         }
 
         // Mutating / disabled invocations run untouched with all streams inherited.
         if CommandWrapPolicy.passthroughReason(command: command, args: args, environment: env) != nil {
-            return runInheritingAllStreams(executable: realExe, args: args)
+            return (runInheritingAllStreams(executable: realExe, args: args), nil)
         }
 
         let captured = runCapturingStdout(executable: realExe, args: args)
         // Too large to hold / already streamed raw, or the spawn failed: nothing left to do.
         if captured.overflowed || captured.spawnFailed {
-            return captured.exitCode
+            return (captured.exitCode, nil)
         }
 
         let text = String(data: captured.stdout, encoding: .utf8)
@@ -52,27 +64,34 @@ enum CommandWrapRunner {
         switch action {
         case .passthrough:
             FileHandle.standardOutput.write(captured.stdout)
+            return (captured.exitCode, nil)
         case .compress:
             let query = CommandWrapPolicy.extractionQuery(forCommand: command)
-            FileHandle.standardOutput.write(await compressedOrRaw(captured.stdout, query: query, compress: compress))
+            let (bytes, deferred) = await compressedOrRaw(captured.stdout, query: query, compress: compress)
+            // Write stdout first; caller awaits deferred only after this returns.
+            FileHandle.standardOutput.write(bytes)
+            return (captured.exitCode, deferred)
         }
-        return captured.exitCode
     }
 
     /// Compress, but emit the RAW bytes whenever compression failed or returned an implausibly
     /// small result (the distill model occasionally answers with a "NONE"/"PASS" token). The
     /// agent's command output is never replaced by garbage.
-    private static func compressedOrRaw(_ raw: Data, query: String?, compress: Compressor) async -> Data {
+    private static func compressedOrRaw(
+        _ raw: Data,
+        query: String?,
+        compress: Compressor
+    ) async -> (Data, DeferredSideEffect?) {
         guard let emitted = await compress(raw, query, CommandWrapPolicy.reversibleStoreFloorBytes),
-              let text = String(data: emitted, encoding: .utf8),
+              let text = String(data: emitted.bytes, encoding: .utf8),
               CommandWrapPolicy.isFaithfulCompression(
                   rawByteCount: raw.count,
                   compressedContentByteCount: CommandWrapPolicy.compressedContentByteCount(text)
               )
         else {
-            return raw
+            return (raw, nil)
         }
-        return emitted
+        return (emitted.bytes, emitted.deferredSideEffect)
     }
 
     private static func lineCount(_ text: String) -> Int {

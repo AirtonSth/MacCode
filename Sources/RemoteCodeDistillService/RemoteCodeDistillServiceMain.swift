@@ -382,9 +382,15 @@ struct RemoteCodeDistillServiceMain {
                 return nil
             }
         }
-        let (out, code) = await cli.run()
-        FileHandle.standardOutput.write(out)
-        Darwin.exit(code)
+        // Flush stdout before any deferred Wave A ledger POST so the pipe
+        // consumer never waits on the sidecar RTT for already-compressed bytes.
+        let result = await cli.runResult()
+        FileHandle.standardOutput.write(result.stdout)
+        try? FileHandle.standardOutput.synchronize()
+        if let deferred = result.deferredSideEffect {
+            await deferred()
+        }
+        Darwin.exit(result.exitCode)
     }
 
     /// Provider-neutral begin/end bridge for skill-controlled nested workers
@@ -494,9 +500,12 @@ struct RemoteCodeDistillServiceMain {
     /// (reversible — a `[[rc:<handle>]]` marker lets the agent recover the exact bytes). Always
     /// exits with the REAL command's status. Fail-open throughout: any failure passes the raw
     /// output through unchanged so a command's output is never lost or corrupted.
+    ///
+    /// Stdout is written inside `CommandWrapRunner.run` before any deferred Wave A ledger POST
+    /// (mirrors `runCLI`: deliver bytes first, then await the side effect).
     private static func runWrap(command: String, arguments: [String]) async {
         let session = createConfiguredURLSession()
-        let exitCode = await CommandWrapRunner.run(command: command, args: arguments) { captured, query, storeFloorBytes in
+        let (exitCode, deferred) = await CommandWrapRunner.run(command: command, args: arguments) { captured, query, storeFloorBytes in
             let env = ProcessInfo.processInfo.environment
             let recoveryContext = ManagedDistillCLI.recoveryContext(environment: env)
             let provider = ManagedDistillCLI.resolveProvider(
@@ -532,11 +541,16 @@ struct RemoteCodeDistillServiceMain {
                     return nil
                 }
             }
-            let (out, code) = await cli.run()
+            // runResult (not run): keep Wave A ledger POST deferred until after stdout is written.
+            let result = await cli.runResult()
             // compress() is fail-open: code 0 carries either the compressed text (+handle) or, on
             // any sidecar failure, the raw bytes verbatim. A non-zero code is the oversize-input
             // rejection — fall back to the captured bytes rather than emitting that error.
-            return code == 0 ? out : nil
+            guard result.exitCode == 0 else { return nil }
+            return (result.stdout, result.deferredSideEffect)
+        }
+        if let deferred {
+            await deferred()
         }
         Darwin.exit(exitCode)
     }

@@ -56,8 +56,70 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     /// Non-ultracode efforts pass no `--settings` so normal runs stay untouched.
     static let ultracodeSettingsJSON = #"{"ultracode":true,"enableWorkflows":true}"#
 
-    static func ultracodeSettingsArgs(_ effort: AgentReasoningEffort?) -> [String] {
-        effort == .ultracode ? ["--settings", ultracodeSettingsJSON] : []
+    /// Env gate for CLI PostToolUse tool-output compression via the managed
+    /// `distill hook post-tool-use` command. Host sets this for Claude runs
+    /// when Token Saver is on; absent means no hook registration (fail open).
+    static let tokenSaverPostToolUseEnvKey = "RC_TOKEN_SAVER_POST_TOOL_USE"
+
+    /// Builds a single `--settings <json>` pair (never two) for the Claude CLI.
+    ///
+    /// - Ultracode effort always injects `ultracode` + `enableWorkflows`.
+    /// - When `RC_TOKEN_SAVER_POST_TOOL_USE=1`, also registers a PostToolUse
+    ///   command hook pointing at the managed `distill` CLI
+    ///   (`hook post-tool-use`, timeout 10s).
+    /// - Both sources merge into ONE JSON payload so argv never carries two
+    ///   `--settings` flags.
+    /// - Flag absent + non-ultracode returns `[]` (byte-identical to baseline).
+    ///
+    /// Shape is always `["--settings", "<json>"]` or `[]` so consumers that
+    /// take `.last` (SDK bridge payload) still receive the JSON string alone.
+    static func ultracodeSettingsArgs(
+        _ effort: AgentReasoningEffort?,
+        environment: [String: String] = [:]
+    ) -> [String] {
+        let wantsUltracode = effort == .ultracode
+        let wantsPostToolUse = environment[tokenSaverPostToolUseEnvKey] == "1"
+        guard wantsUltracode || wantsPostToolUse else { return [] }
+
+        // Preserve the exact historical ultracode-only payload so SDK bridge
+        // equality checks and any string-stable consumers keep matching.
+        if wantsUltracode && !wantsPostToolUse {
+            return ["--settings", ultracodeSettingsJSON]
+        }
+
+        var settings: [String: Any] = [:]
+        if wantsUltracode {
+            settings["ultracode"] = true
+            settings["enableWorkflows"] = true
+        }
+        if wantsPostToolUse {
+            let distillPath = AgentSkillInstaller.defaultManagedCLIBinDirectory()
+                .appendingPathComponent("distill")
+                .path
+            // Claude CLI command hooks take a shell command string; subcommand
+            // args ride on the same string (no separate args field).
+            let command = "\(distillPath) hook post-tool-use"
+            settings["hooks"] = [
+                "PostToolUse": [
+                    [
+                        "matcher": "*",
+                        "hooks": [
+                            [
+                                "type": "command",
+                                "command": command,
+                                "timeout": 10
+                            ] as [String: Any]
+                        ]
+                    ] as [String: Any]
+                ]
+            ]
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: settings, options: [.sortedKeys]),
+              let json = String(data: data, encoding: .utf8) else {
+            // Fail open: drop settings rather than emit invalid JSON.
+            return []
+        }
+        return ["--settings", json]
     }
 
     /// Builds the `claude` CLI argv. Pure + static so the exact flag
@@ -69,7 +131,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         args.append(contentsOf: ["--model", request.model])
         let prompt = request.providerPrompt
         args.append(contentsOf: effortArgs(request.reasoningEffort))
-        args.append(contentsOf: ultracodeSettingsArgs(request.reasoningEffort))
+        args.append(contentsOf: ultracodeSettingsArgs(request.reasoningEffort, environment: request.environment))
         // Resume the prior session so the model keeps full context.
         if let ptid = request.providerThreadId, !ptid.isEmpty {
             args.append(contentsOf: ["--resume", ptid])
@@ -105,7 +167,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         ]
         args.append(contentsOf: ["--model", request.model])
         args.append(contentsOf: effortArgs(request.reasoningEffort))
-        args.append(contentsOf: ultracodeSettingsArgs(request.reasoningEffort))
+        args.append(contentsOf: ultracodeSettingsArgs(request.reasoningEffort, environment: request.environment))
         if let ptid = request.providerThreadId, !ptid.isEmpty {
             args.append(contentsOf: ["--resume", ptid])
         } else {

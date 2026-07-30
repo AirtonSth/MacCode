@@ -121,30 +121,71 @@ public struct ManagedDistillCLI: Sendable {
         return nil
     }
 
-    public func run() async -> (stdout: Data, exitCode: Int32) {
+    /// Result of a CLI invocation. `deferredSideEffect` is optional best-effort
+    /// work (Wave A ledger write) that must not delay delivery of `stdout` when
+    /// the executable can flush stdout first (see `runResult` + service main).
+    public struct RunResult: Sendable {
+        public let stdout: Data
+        public let exitCode: Int32
+        public let deferredSideEffect: (@Sendable () async -> Void)?
+
+        public init(
+            stdout: Data,
+            exitCode: Int32,
+            deferredSideEffect: (@Sendable () async -> Void)? = nil
+        ) {
+            self.stdout = stdout
+            self.exitCode = exitCode
+            self.deferredSideEffect = deferredSideEffect
+        }
+    }
+
+    /// Full result including optional post-stdout side effects. Preferred by the
+    /// executable so Wave A ledger POSTs do not delay the pipe consumer.
+    public func runResult() async -> RunResult {
         if arguments.first == "retrieve" {
-            return await retrieve(handle: arguments.dropFirst().first ?? "")
+            let (out, code) = await retrieve(handle: arguments.dropFirst().first ?? "")
+            return RunResult(stdout: out, exitCode: code)
         }
         if arguments.first == "stats" {
-            return await stats()
+            let (out, code) = await stats()
+            return RunResult(stdout: out, exitCode: code)
         }
         if arguments.first == "dsl" {
-            return dsl(arguments: Array(arguments.dropFirst()))
+            let (out, code) = dsl(arguments: Array(arguments.dropFirst()))
+            return RunResult(stdout: out, exitCode: code)
         }
-        // task-07: `hook` is reserved before any prompt parsing / generic compress path.
-        if let command = arguments.first,
-           TokenSaverProtocolV2.routeCLISubcommand(command) == "hook_handler"
-            || Self.reservedSubcommands.contains(command) {
-            return unsupportedReservedSubcommand(command)
+        // Claude PostToolUse hook: never fall through to generic compress of the
+        // raw hook JSON envelope. Always exit 0 (fail-open) so a live CLI turn
+        // is never blocked by hook failures. Propagate nested deferred ledger work
+        // so the executable can flush stdout before awaiting it.
+        if arguments.first == TokenSaverProtocolV2.reservedHookSubcommand
+            || TokenSaverProtocolV2.routeCLISubcommand(arguments.first ?? "") == "hook_handler" {
+            return await hook(arguments: Array(arguments.dropFirst()))
+        }
+        // Remaining reserved subcommands stay loud (not silent compress).
+        if let command = arguments.first, Self.reservedSubcommands.contains(command) {
+            let (out, code) = unsupportedReservedSubcommand(command)
+            return RunResult(stdout: out, exitCode: code)
         }
         let prompt = arguments.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         return await compress(prompt: prompt)
     }
 
+    /// Runs the CLI and awaits any deferred side effect (ledger write) before
+    /// returning. Unit tests use this; the executable prefers `runResult` so it
+    /// can flush stdout first.
+    public func run() async -> (stdout: Data, exitCode: Int32) {
+        let result = await runResult()
+        if let deferred = result.deferredSideEffect {
+            await deferred()
+        }
+        return (result.stdout, result.exitCode)
+    }
+
     private static let reservedSubcommands: Set<String> = [
         "rank",
         "wrap",
-        TokenSaverProtocolV2.reservedHookSubcommand
     ]
 
     private func unsupportedReservedSubcommand(_ command: String) -> (Data, Int32) {
@@ -164,14 +205,148 @@ public struct ManagedDistillCLI: Sendable {
         return (Data(message.utf8), 0)
     }
 
+    // MARK: - hook post-tool-use (fail-open, always exit 0)
+
+    /// Claude PostToolUse hook handler. Reads Claude's hook JSON on stdin
+    /// (`tool_name` / `tool_input` / `tool_response` / `hook_event_name`), compresses
+    /// the tool output via the existing `/v1/distill` path with `recordSavings: true`,
+    /// and emits `hookSpecificOutput.updatedToolOutput` on success.
+    ///
+    /// ANY failure (malformed input, sidecar down, non-shrink, admission off) yields
+    /// `{}` and exit 0 — never non-zero, never hang the interactive turn.
+    ///
+    /// Propagates nested Wave A ledger `deferredSideEffect` so callers that flush
+    /// stdout first (via `runResult`) never wait on the sidecar RTT for bytes they
+    /// already hold.
+    private func hook(arguments: [String]) async -> RunResult {
+        let emptyOK = RunResult(stdout: Data("{}".utf8), exitCode: 0)
+        guard arguments.first == "post-tool-use" else { return emptyOK }
+
+        guard let envelope = try? JSONSerialization.jsonObject(with: stdin) as? [String: Any] else {
+            return emptyOK
+        }
+        if let event = envelope["hook_event_name"] as? String,
+           event != "PostToolUse" {
+            return emptyOK
+        }
+
+        let toolName = envelope["tool_name"] as? String ?? ""
+        let rawOutput = Self.extractToolOutputText(envelope["tool_response"])
+        guard !rawOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return emptyOK
+        }
+
+        let question = Self.hookContractQuestion(
+            toolName: toolName,
+            toolInput: envelope["tool_input"]
+        )
+        // Cap matches ClaudeAgentSDKBridge post-tool-use: [512, min(len, 12000)].
+        let maxChars = max(512, min(rawOutput.count, 12_000))
+        // Nested CLI reuses the same compress + recordSavings path (including Wave A).
+        let nested = ManagedDistillCLI(
+            arguments: [question],
+            stdin: Data(rawOutput.utf8),
+            state: state,
+            provider: provider ?? "claude",
+            recoveryContext: recoveryContext,
+            invocationID: invocationID,
+            maxOutputCharacters: maxChars,
+            reversibleStoreMinBytes: reversibleStoreMinBytes ?? 256,
+            distillAdmission: distillAdmission,
+            transport: transport
+        )
+        // Use runResult (not run) so Wave A ledger POST stays deferred until after
+        // the hook JSON is delivered to the Claude CLI.
+        let nestedResult = await nested.runResult()
+        guard nestedResult.exitCode == 0 else { return emptyOK }
+
+        // Compress always appends a trailing newline on success; fail-open echoes stdin
+        // (which may also end in \n). Strip trailing newlines on BOTH sides before
+        // deciding whether a real shrink happened — otherwise fail-open looks shorter.
+        let compressed = Self.stripTrailingNewlines(String(decoding: nestedResult.stdout, as: UTF8.self))
+        let rawNormalized = Self.stripTrailingNewlines(rawOutput)
+        guard !compressed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              compressed != rawNormalized,
+              compressed.utf8.count < rawNormalized.utf8.count else {
+            return emptyOK
+        }
+
+        let payload: [String: Any] = [
+            "hookSpecificOutput": [
+                "hookEventName": "PostToolUse",
+                "updatedToolOutput": compressed,
+            ] as [String: Any],
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+            return emptyOK
+        }
+        return RunResult(
+            stdout: data,
+            exitCode: 0,
+            deferredSideEffect: nestedResult.deferredSideEffect
+        )
+    }
+
+    static func stripTrailingNewlines(_ s: String) -> String {
+        var t = s
+        while t.hasSuffix("\n") || t.hasSuffix("\r") {
+            t.removeLast()
+        }
+        return t
+    }
+
+    /// Mirrors ClaudeAgentSDKBridge.mjs `extractToolOutputText`.
+    static func extractToolOutputText(_ value: Any?) -> String {
+        guard let value else { return "" }
+        if let s = value as? String { return s }
+        if let arr = value as? [Any] {
+            return arr.map { extractToolOutputText($0) }.filter { !$0.isEmpty }.joined(separator: "\n")
+        }
+        guard let obj = value as? [String: Any] else {
+            return String(describing: value)
+        }
+        if let content = obj["content"] {
+            return extractToolOutputText(content)
+        }
+        for key in ["text", "output", "stdout", "stderr", "result"] {
+            if let s = obj[key] as? String { return s }
+        }
+        return ""
+    }
+
+    /// Conservative compress contract for the PostToolUse hook (provider-agnostic default).
+    static func hookContractQuestion(toolName: String, toolInput: Any?) -> String {
+        let args = summarizeToolInput(toolInput)
+        let suffix = args.isEmpty ? "" : " Context: \(args)."
+        let name = toolName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if name.isEmpty {
+            return "Compress this tool output for the current task. Preserve errors, warnings, exit codes, identifiers, numbers, paths, and quoted strings verbatim; collapse only repeated or noise lines.\(suffix)"
+        }
+        return "Compress \(name) tool output for the current task. Preserve errors, warnings, exit codes, identifiers, numbers, paths, and quoted strings verbatim; collapse only repeated or noise lines.\(suffix)"
+    }
+
+    private static func summarizeToolInput(_ toolInput: Any?) -> String {
+        guard let obj = toolInput as? [String: Any] else { return "" }
+        var parts: [String] = []
+        for key in ["command", "pattern", "path", "glob", "url"] {
+            if let s = obj[key] as? String {
+                let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !t.isEmpty { parts.append("\(key)=\(t)") }
+            }
+        }
+        let joined = parts.joined(separator: " | ")
+        if joined.count <= 500 { return joined }
+        return String(joined.prefix(500))
+    }
+
     // MARK: - compress (fail-open)
 
-    private func compress(prompt: String) async -> (Data, Int32) {
+    private func compress(prompt: String) async -> RunResult {
         // Fail-open: hand back exactly what was piped in. exit 0 so the agent never
         // sees an error in place of its tool output.
-        func failOpen() -> (Data, Int32) { (stdin, 0) }
+        func failOpen() -> RunResult { RunResult(stdout: stdin, exitCode: 0) }
 
-        guard !stdin.isEmpty else { return (Data(), 0) }
+        guard !stdin.isEmpty else { return RunResult(stdout: Data(), exitCode: 0) }
         guard distillAdmission() else { return failOpen() }
         guard let input = String(data: stdin, encoding: .utf8) else { return failOpen() }
         guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return failOpen() }
@@ -186,11 +361,31 @@ public struct ManagedDistillCLI: Sendable {
             FileHandle.standardError.write(Data(
                 "rc-wave-prepass wave=\(pre.waveID) trigger=\(pre.trigger) saved_bytes=\(pre.savedBytes) frac=\(String(format: "%.3f", pre.savedFraction))\n".utf8
             ))
-            return (Data((pre.output + "\n").utf8), 0)
+            // Compressed bytes are ready now. Ledger write is a deferred side-effect
+            // via the same /v1/distill recordSavings path the normal compress path
+            // uses — never a gate. Exactly one POST; we do not fall through to
+            // normal compress (no double-count).
+            let compressed = Data((pre.output + "\n").utf8)
+            let recordOriginal = input
+            let recordPrompt = prompt
+            let recordPre = pre
+            let recordSelf = self
+            return RunResult(
+                stdout: compressed,
+                exitCode: 0,
+                deferredSideEffect: {
+                    await recordSelf.bestEffortRecordPrepassSavings(
+                        original: recordOriginal,
+                        prompt: recordPrompt,
+                        pre: recordPre
+                    )
+                }
+            )
         }
 
         if ManagedDistillCLI.exceedsStdinCap(byteCount: stdin.count, cap: ManagedDistillCLI.stdinCapBytes) {
-            return await compressChunks(input: input, prompt: prompt)
+            let (out, code) = await compressChunks(input: input, prompt: prompt)
+            return RunResult(stdout: out, exitCode: code)
         }
         guard let state, let url = URL(string: state.baseURL + "/v1/distill") else { return failOpen() }
 
@@ -226,7 +421,77 @@ public struct ManagedDistillCLI: Sendable {
         if let handle = response.originalHandle, !handle.isEmpty {
             out += "\n[[rc:\(handle)]]"
         }
-        return (Data((out + "\n").utf8), 0)
+        return RunResult(stdout: Data((out + "\n").utf8), exitCode: 0)
+    }
+
+    /// Fire one `/v1/distill` POST with `recordSavings: true` and client-supplied
+    /// `precomputedOutput` so the sidecar records the honest original→`pre.output`
+    /// delta via `DistillSavingsCalculator.record` without re-running compression.
+    ///
+    /// Response body is discarded — the caller already holds `pre.output`. Failures
+    /// are swallowed (fail-open); this never gates compressed delivery.
+    private func bestEffortRecordPrepassSavings(
+        original: String,
+        prompt: String,
+        pre: TokenSaverWaveLosslessPrepass.Result
+    ) async {
+        guard pre.savedBytes > 0 else { return }
+        guard distillAdmission() else { return }
+        guard let state, let url = URL(string: state.baseURL + "/v1/distill") else { return }
+
+        let request = DistillRequest(
+            mode: .commandOutput,
+            priority: .agent,
+            input: original,
+            question: prompt.isEmpty ? nil : prompt,
+            provider: provider,
+            recordSavings: true,
+            cacheState: "wave_prepass_\(pre.waveID)",
+            maxOutputCharacters: maxOutputCharacters,
+            reversibleStoreMinBytes: reversibleStoreMinBytes,
+            precomputedOutput: pre.output
+        )
+        guard let body = Self.canonicalBody(request) else { return }
+
+        var urlRequest = URLRequest(url: url)
+        urlRequest.httpMethod = "POST"
+        urlRequest.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyRecoveryScope(to: &urlRequest)
+        // Distinct invocation suffix so a later full-compress of the same bytes (if any)
+        // cannot collide on idempotency with this savings-only prepass record.
+        urlRequest.setValue("\(invocationID).wave-prepass", forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
+        urlRequest.setValue(
+            Self.recoveryOperationID(kind: "distill", canonicalPayload: body),
+            forHTTPHeaderField: "X-RemoteCode-Operation-ID"
+        )
+        urlRequest.httpBody = body
+
+        // Swallow all transport outcomes — ledger is never a gate.
+        _ = await transport(urlRequest)
+    }
+
+    /// Pure seam: the DistillSavingsRecord a Wave A/B prepass hit produces when the
+    /// sidecar's precomputed-output path sees original→compressed (same construction
+    /// as `DistillRequest.responseUsingPrecomputedOutput` + `DistillSavingsCalculator`).
+    /// Used by tests and as the deterministic contract for the ledger delta.
+    public static func prepassSavingsRecord(
+        original: String,
+        compressed: String,
+        provider: String?,
+        waveID: String
+    ) -> DistillSavingsRecord? {
+        let request = DistillRequest(
+            mode: .commandOutput,
+            priority: .agent,
+            input: original,
+            provider: provider,
+            recordSavings: true,
+            cacheState: "wave_prepass_\(waveID)",
+            precomputedOutput: compressed
+        )
+        guard let response = request.responseUsingPrecomputedOutput() else { return nil }
+        return DistillSavingsCalculator.record(for: request, response: response)
     }
 
     private func compressChunks(input: String, prompt: String) async -> (Data, Int32) {

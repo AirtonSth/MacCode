@@ -280,6 +280,143 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         }
     }
 
+    // MARK: - Token Saver CLI PostToolUse hook registration
+
+    private func postToolUseReq(
+        effort: AgentReasoningEffort? = nil,
+        postToolUse: Bool,
+        threadId: AgentThreadID = AgentThreadID()
+    ) -> AgentRunRequest {
+        AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "opus",
+            cwd: "/tmp",
+            prompt: "build it",
+            permissionMode: .supervised,
+            reasoningEffort: effort,
+            environment: postToolUse ? [ClaudeRunner.tokenSaverPostToolUseEnvKey: "1"] : [:]
+        )
+    }
+
+    private func parsedSettingsObject(_ args: [String]) throws -> [String: Any] {
+        guard let raw = settingsValue(args) else {
+            throw NSError(domain: "ClaudeRunnerArgsTests", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "missing --settings value"])
+        }
+        let data = Data(raw.utf8)
+        let obj = try JSONSerialization.jsonObject(with: data)
+        guard let dict = obj as? [String: Any] else {
+            throw NSError(domain: "ClaudeRunnerArgsTests", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "settings JSON is not an object"])
+        }
+        return dict
+    }
+
+    private func settingsFlagCount(_ args: [String]) -> Int {
+        args.filter { $0 == "--settings" }.count
+    }
+
+    private func expectedDistillHookCommand() -> String {
+        AgentSkillInstaller.defaultManagedCLIBinDirectory()
+            .appendingPathComponent("distill")
+            .path + " hook post-tool-use"
+    }
+
+    /// (a) Flag absent + non-ultracode → argv is byte-identical to the baseline
+    /// that never injects `--settings` (HEAD behavior for the default `.cli` path).
+    func test_postToolUseFlagAbsent_nonUltracodeArgvByteIdenticalToBaseline() {
+        // Stable thread id so --session-id does not confound byte comparison.
+        let threadId = AgentThreadID(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!)
+        let baselineReq = postToolUseReq(effort: .high, postToolUse: false, threadId: threadId)
+        let baseline = ClaudeRunner.buildStreamingArgs(baselineReq)
+        let again = ClaudeRunner.buildStreamingArgs(baselineReq)
+
+        // Settings contribution is empty — the only mechanism that could inject
+        // --settings for non-ultracode — so argv cannot gain new flags.
+        XCTAssertEqual(
+            ClaudeRunner.ultracodeSettingsArgs(.high, environment: [:]),
+            [],
+            "flag-absent non-ultracode must contribute zero argv tokens (HEAD-identical)"
+        )
+        XCTAssertNil(settingsValue(baseline),
+                     "flag-absent non-ultracode streaming argv must not include --settings")
+        XCTAssertEqual(baseline, again, "builder must be pure: identical inputs → identical argv")
+
+        // Flag present only adds the single --settings pair; stripping it must
+        // recover the flag-absent baseline byte-for-byte.
+        let withFlag = ClaudeRunner.buildStreamingArgs(
+            postToolUseReq(effort: .high, postToolUse: true, threadId: threadId)
+        )
+        var stripped = withFlag
+        if let i = stripped.firstIndex(of: "--settings") {
+            stripped.remove(at: stripped.index(after: i))
+            stripped.remove(at: i)
+        }
+        XCTAssertEqual(
+            stripped, baseline,
+            "flag-absent argv must be byte-identical to flag-present argv with the --settings pair removed"
+        )
+    }
+
+    /// (b) Flag present + non-ultracode → exactly one --settings JSON with the
+    /// PostToolUse command hook (resolved managed distill path + timeout 10).
+    func test_postToolUseFlagPresent_nonUltracodeRegistersSingleSettingsHook() throws {
+        let args = ClaudeRunner.buildStreamingArgs(postToolUseReq(effort: .high, postToolUse: true))
+        XCTAssertEqual(settingsFlagCount(args), 1,
+                       "must emit exactly one --settings (never two)")
+        let settings = try parsedSettingsObject(args)
+        XCTAssertNil(settings["ultracode"],
+                     "non-ultracode effort must not inject ultracode keys")
+        XCTAssertNil(settings["enableWorkflows"],
+                     "non-ultracode effort must not inject enableWorkflows")
+
+        let hooks = try XCTUnwrap(settings["hooks"] as? [String: Any],
+                                  "settings must register hooks")
+        let postToolUse = try XCTUnwrap(hooks["PostToolUse"] as? [[String: Any]],
+                                        "must register PostToolUse")
+        XCTAssertEqual(postToolUse.count, 1)
+        XCTAssertEqual(postToolUse[0]["matcher"] as? String, "*")
+        let commandHooks = try XCTUnwrap(postToolUse[0]["hooks"] as? [[String: Any]])
+        XCTAssertEqual(commandHooks.count, 1)
+        XCTAssertEqual(commandHooks[0]["type"] as? String, "command")
+        XCTAssertEqual(commandHooks[0]["command"] as? String, expectedDistillHookCommand(),
+                       "hook command must be managed distill path + hook post-tool-use args")
+        // JSONSerialization may box Int as NSNumber; accept numeric 10.
+        let timeout = commandHooks[0]["timeout"] as? NSNumber
+        XCTAssertEqual(timeout?.intValue, 10,
+                       "PostToolUse command hook timeout must be 10 seconds")
+    }
+
+    /// (c) Flag present AND engine .ultracode → exactly one --settings containing
+    /// BOTH the PostToolUse hook and the existing ultracode keys.
+    func test_postToolUseFlagPresent_ultracodeMergesHookAndUltracodeKeys() throws {
+        let args = ClaudeRunner.buildStreamingArgs(postToolUseReq(effort: .ultracode, postToolUse: true))
+        XCTAssertEqual(settingsFlagCount(args), 1,
+                       "ultracode + PostToolUse must merge into a single --settings payload")
+        let settings = try parsedSettingsObject(args)
+        XCTAssertEqual(settings["ultracode"] as? Bool, true,
+                       "ultracode key must survive the merge")
+        XCTAssertEqual(settings["enableWorkflows"] as? Bool, true,
+                       "enableWorkflows must survive the merge so the Workflow tool stays exposed")
+
+        let hooks = try XCTUnwrap(settings["hooks"] as? [String: Any])
+        let postToolUse = try XCTUnwrap(hooks["PostToolUse"] as? [[String: Any]])
+        let commandHooks = try XCTUnwrap(postToolUse[0]["hooks"] as? [[String: Any]])
+        XCTAssertEqual(commandHooks[0]["command"] as? String, expectedDistillHookCommand())
+        XCTAssertEqual((commandHooks[0]["timeout"] as? NSNumber)?.intValue, 10)
+
+        // SDK bridge takes .last of ultracodeSettingsArgs — still the JSON string.
+        let settingsArgs = ClaudeRunner.ultracodeSettingsArgs(
+            .ultracode,
+            environment: [ClaudeRunner.tokenSaverPostToolUseEnvKey: "1"]
+        )
+        XCTAssertEqual(settingsArgs.first, "--settings")
+        XCTAssertEqual(settingsArgs.last, settingsValue(args),
+                       "`.last` must remain the JSON payload so ClaudeAgentSDKBridgeAdapter keeps working")
+        XCTAssertEqual(settingsArgs.count, 2)
+    }
+
     func test_ultracodeIsOfferedToClaudeButNotCodexPicker() {
         XCTAssertTrue(AgentReasoningEffort.claudeSupportedCases.contains(.ultracode),
                       "Claude reasoning models must offer Ultracode in the effort picker")

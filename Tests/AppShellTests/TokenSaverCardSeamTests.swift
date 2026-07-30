@@ -966,6 +966,83 @@ final class TokenSaverCardSeamTests: XCTestCase {
                        "Week: Claude + Codex + CLI rows must equal the Week green headline")
     }
 
+    // MARK: - Session usage caption (session present vs weekly fallback)
+
+    func test_currentSessionUsageCaption_sessionDataPresent_usesSessionLabel() {
+        // WHY: when a live session probe exists, the caption must stay "Session used"
+        // so providers with real session data are not re-labelled as weekly.
+        let caption = SidebarRootView.tokenSaverCurrentSessionUsageCaption(
+            effectiveSessionUsedPercent: 1,
+            effectiveWeeklyUsedPercent: 84
+        )
+        XCTAssertEqual(caption, "Session used 1%")
+        XCTAssertFalse(caption.contains("Week used"),
+                       "Session branch must not fall through to weekly wording: \(caption)")
+        XCTAssertFalse(caption.contains("no session data"),
+                       "Session branch must not append the missing-data explanation: \(caption)")
+    }
+
+    func test_currentSessionUsageCaption_sessionDataMissing_explainsWeeklyFallback() {
+        // WHY: bare "Week used X%" next to Claude's "Session used 1%" looked like a
+        // glitch; the fallback must name that session data is missing.
+        let caption = SidebarRootView.tokenSaverCurrentSessionUsageCaption(
+            effectiveSessionUsedPercent: nil,
+            effectiveWeeklyUsedPercent: 47
+        )
+        XCTAssertEqual(caption, "Week used 47% (no session data)")
+        XCTAssertTrue(caption.contains("(no session data)"),
+                      "Weekly fallback must explain why the window label differs: \(caption)")
+    }
+
+    func test_currentSessionUsageCaption_prefersSessionOverWeeklyWhenBothPresent() {
+        // WHY: effective session % wins; weekly is only the missing-session fallback.
+        let caption = SidebarRootView.tokenSaverCurrentSessionUsageCaption(
+            effectiveSessionUsedPercent: 12.4,
+            effectiveWeeklyUsedPercent: 90
+        )
+        XCTAssertEqual(caption, "Session used 12%")
+    }
+
+    // MARK: - Per-provider compression capability lines
+
+    func test_compressionCapabilityLine_claude_isAutomatic() {
+        // WHY: Claude has real automatic tool-output compression when Token Saver
+        // is on; the row must say so in plain language (static mapping today).
+        XCTAssertEqual(
+            SidebarRootView.tokenSaverProviderCompressionCapabilityLine(for: .claude),
+            "Compresses tool output automatically"
+        )
+    }
+
+    func test_compressionCapabilityLine_codex_compressesButSavingsNotTrackable() {
+        // WHY: Codex gets real automatic tool-output compression (shared wrapper,
+        // same as Grok), but savings cannot yet be recorded/measured for this
+        // provider — the line must say compression is automatic and that
+        // savings aren't trackable, not that compression is unsupported.
+        let line = SidebarRootView.tokenSaverProviderCompressionCapabilityLine(for: .codex)
+        XCTAssertEqual(
+            line,
+            "Compresses tool output automatically — savings not yet trackable for this provider"
+        )
+        XCTAssertTrue(
+            line.lowercased().contains("compresses tool output automatically"),
+            "Codex must claim automatic compression: \(line)"
+        )
+        XCTAssertTrue(
+            line.lowercased().contains("not yet trackable"),
+            "Codex must qualify that savings aren't trackable: \(line)"
+        )
+    }
+
+    func test_compressionCapabilityLine_grok_isAutomatic() {
+        // WHY: Grok uses the shared wrapper path for automatic tool-output
+        // compression when Token Saver is on (same plain copy as Claude).
+        XCTAssertEqual(
+            SidebarRootView.tokenSaverProviderCompressionCapabilityLine(for: .grok),
+            "Compresses tool output automatically"
+        )
+    }
+
     // MARK: - helpers
 
     private func makeTempDir(suffix: String) throws -> URL {

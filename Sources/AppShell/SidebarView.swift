@@ -3264,20 +3264,14 @@ public struct SidebarRootView: View {
     ) -> String {
         switch scope {
         case .currentSession:
-            if let currentSessionUsedPercent = usage.effectiveSessionUsedPercent() {
-                return "Session used \(Self.formatPercent(currentSessionUsedPercent / 100.0))"
-            }
-            // When session probe is missing/bare-zero, surface weekly % under a
-            // honest label instead of painting "Session used 0%".
-            if let weeklyUsedPercent = usage.effectiveWeeklyUsedPercent() {
-                return "Week used \(Self.formatPercent(weeklyUsedPercent / 100.0))"
-            }
-            guard usage.currentSessionLimitTokens > 0 else { return "Session usage not loaded" }
-            let usedProgress = tokenSaverRingProgress(
-                numerator: usage.currentSessionTokens,
-                denominator: usage.currentSessionLimitTokens
+            // Pure seam owns the session/weekly-fallback wording so tests can
+            // lock the explained fallback without rendering SwiftUI.
+            return Self.tokenSaverCurrentSessionUsageCaption(
+                effectiveSessionUsedPercent: usage.effectiveSessionUsedPercent(),
+                effectiveWeeklyUsedPercent: usage.effectiveWeeklyUsedPercent(),
+                currentSessionTokens: usage.currentSessionTokens,
+                currentSessionLimitTokens: usage.currentSessionLimitTokens
             )
-            return "Session used \(Self.formatPercent(usedProgress))"
         case .week:
             if let weeklyUsedPercent = usage.effectiveWeeklyUsedPercent() {
                 return "Weekly used \(Self.formatPercent(weeklyUsedPercent / 100.0))"
@@ -3285,6 +3279,58 @@ public struct SidebarRootView: View {
             let weeklyLimit = max(usage.estimatedRawTokens, tokenSaverDefaultWeeklyLimitTokens(for: provider), 1)
             guard usage.actualProviderTokens > 0 else { return "Weekly usage not loaded" }
             return "Weekly used \(Self.formatTokenCount(usage.actualProviderTokens)) / \(Self.formatTokenCount(weeklyLimit))"
+        }
+    }
+
+    /// Pure seam: Today-scope usage caption, including the explained weekly
+    /// fallback when session probe data is missing/bare-zero.
+    ///
+    /// WHY: Claude often has a live session % while Codex/Grok fall back to
+    /// weekly; without "(no session data)" that mix reads as a UI glitch.
+    nonisolated public static func tokenSaverCurrentSessionUsageCaption(
+        effectiveSessionUsedPercent: Double?,
+        effectiveWeeklyUsedPercent: Double?,
+        currentSessionTokens: Int = 0,
+        currentSessionLimitTokens: Int = 0
+    ) -> String {
+        if let currentSessionUsedPercent = effectiveSessionUsedPercent {
+            return "Session used \(formatPercent(currentSessionUsedPercent / 100.0))"
+        }
+        // When session probe is missing/bare-zero, surface weekly % under an
+        // explained label instead of painting "Session used 0%" or a bare
+        // "Week used X%" that looks inconsistent next to session captions.
+        if let weeklyUsedPercent = effectiveWeeklyUsedPercent {
+            return "Week used \(formatPercent(weeklyUsedPercent / 100.0)) (no session data)"
+        }
+        guard currentSessionLimitTokens > 0 else { return "Session usage not loaded" }
+        let usedProgress: Double = {
+            guard currentSessionTokens > 0, currentSessionLimitTokens > 0 else { return 0 }
+            return min(max(Double(currentSessionTokens) / Double(currentSessionLimitTokens), 0), 1)
+        }()
+        return "Session used \(formatPercent(usedProgress))"
+    }
+
+    /// Static per-provider capability copy for automatic tool-output compression.
+    ///
+    /// Snapshot of today's real support only — not derived from savings math.
+    /// TODO: replace this fixed mapping with a real capability flag (adapter /
+    /// provider matrix) when one is wired through the runtime; do not invent
+    /// integration with in-flight work.
+    nonisolated public static func tokenSaverProviderCompressionCapabilityLine(
+        for provider: AgentProvider
+    ) -> String {
+        switch provider {
+        case .claude:
+            // Claude: automatic tool-output compression when Token Saver is on
+            // (PostToolUse / built-in path; selective tools still pass through).
+            return "Compresses tool output automatically"
+        case .codex:
+            // Codex: shared wrapper compresses tool stdout when Token Saver is on
+            // (same mechanism as Grok); savings recording/measurement not available yet.
+            return "Compresses tool output automatically — savings not yet trackable for this provider"
+        case .grok:
+            // Grok: shared wrapper compresses tool stdout when Token Saver is on.
+            return "Compresses tool output automatically"
         }
     }
 
@@ -3529,6 +3575,15 @@ public struct SidebarRootView: View {
                     .monospacedDigit()
                     .lineLimit(1)
             }
+            // Capability line: honest static support copy under caption/save row.
+            // Presentation only — does not change savings arithmetic.
+            Text(Self.tokenSaverProviderCompressionCapabilityLine(for: provider))
+                .font(DS.Font.caption2)
+                .foregroundColor(DS.Palette.textTertiary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityIdentifier("sidebar.tokenSaver.providerCapability.\(provider.rawValue)")
         }
         .padding(.vertical, 1)
         .accessibilityElement(children: .combine)
