@@ -428,8 +428,11 @@ public struct ManagedDistillCLI: Sendable {
     /// `precomputedOutput` so the sidecar records the honest original→`pre.output`
     /// delta via `DistillSavingsCalculator.record` without re-running compression.
     ///
-    /// Response body is discarded — the caller already holds `pre.output`. Failures
-    /// are swallowed (fail-open); this never gates compressed delivery.
+    /// Response body is discarded — the caller already holds `pre.output`. One bounded
+    /// retry covers a transient hiccup (e.g. the resident sidecar mid-restart); a final
+    /// failure is logged to stderr (wave id + byte count only, never prompt/output
+    /// content) so a dropped ledger write is observable instead of vanishing silently.
+    /// Still never gates compressed delivery either way.
     private func bestEffortRecordPrepassSavings(
         original: String,
         prompt: String,
@@ -467,8 +470,20 @@ public struct ManagedDistillCLI: Sendable {
         )
         urlRequest.httpBody = body
 
-        // Swallow all transport outcomes — ledger is never a gate.
-        _ = await transport(urlRequest)
+        // One bounded retry: a resident local sidecar occasionally misses the first
+        // request during a restart window. Still never a gate — give up after the retry
+        // and log so the drop is diagnosable rather than silent.
+        for attempt in 0..<2 {
+            if let (_, status) = await transport(urlRequest), status == 200 {
+                return
+            }
+            if attempt == 0 {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+        }
+        FileHandle.standardError.write(Data(
+            "rc-wave-prepass ledger-post-failed wave=\(pre.waveID) saved_bytes=\(pre.savedBytes)\n".utf8
+        ))
     }
 
     /// Pure seam: the DistillSavingsRecord a Wave A/B prepass hit produces when the

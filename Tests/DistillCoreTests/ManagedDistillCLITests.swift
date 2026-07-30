@@ -575,7 +575,46 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertEqual(code, 0)
         XCTAssertEqual(String(decoding: out, as: UTF8.self), pre.output + "\n")
         let transportCalls = await calls.count()
-        XCTAssertEqual(transportCalls, 1, "still attempts one best-effort recordSavings POST")
+        XCTAssertEqual(transportCalls, 2, "one bounded retry after the initial failure, then gives up")
+    }
+
+    func test_waveAHit_transientLedgerFailure_recoveredByOneRetry() async {
+        // WHY: bestEffortRecordPrepassSavings used to swallow ANY transport failure on
+        // a single attempt with zero observability — a resident sidecar racing its own
+        // restart window could silently drop a real, already-computed saving. One
+        // bounded retry recovers exactly that transient case without turning the ledger
+        // POST into a blocking gate on the interactive hook path.
+        TokenSaverWaveLiveRollout.activate(.waveA)
+        setenv("RC_TOKEN_SAVER_DISTILL_HINT", "1", 1)
+
+        let line = "same log line that repeats many times for compression"
+        var input = ""
+        for _ in 0..<20 { input += line + "\n" }
+        input += "exit code: 0\n"
+        guard let pre = TokenSaverWaveLosslessPrepass.apply(input: input) else {
+            XCTFail("expected Wave A hit")
+            return
+        }
+
+        let calls = CallCounter()
+        let cli = ManagedDistillCLI(
+            arguments: [],
+            stdin: Data(input.utf8),
+            state: state,
+            provider: "claude"
+        ) { _ in
+            let attempt = await calls.increment()
+            if attempt == 1 {
+                return nil // transient failure on the first attempt only
+            }
+            return (Data("{}".utf8), 200)
+        }
+
+        let (out, code) = await cli.run()
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(String(decoding: out, as: UTF8.self), pre.output + "\n")
+        let transportCalls = await calls.count()
+        XCTAssertEqual(transportCalls, 2, "retry must recover the saving after one transient failure, then stop")
     }
 
     // MARK: - hook post-tool-use
