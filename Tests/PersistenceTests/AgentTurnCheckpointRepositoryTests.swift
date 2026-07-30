@@ -228,7 +228,8 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
         // if those columns were selected; metadata page must still succeed.
         let corrupt = try db.prepare("""
             UPDATE agent_turn_checkpoints
-            SET file_snapshots_json = 'NOT-JSON{{{',
+            SET files_json = 'NOT-JSON{{{',
+                file_snapshots_json = 'NOT-JSON{{{',
                 diff_patch = 'x',
                 file_diffs_json = '{bad'
             WHERE thread_id = ?;
@@ -255,13 +256,21 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
             XCTAssertEqual(item.fileSnapshots, [], "metadata page must never surface snapshots")
             XCTAssertNil(item.diffPatch, "metadata page must never surface diff_patch")
             XCTAssertEqual(item.fileDiffs, [], "metadata page must never surface file diffs")
-            XCTAssertEqual(item.files.count, 1, "files_json summary metadata remains allowed")
+            XCTAssertEqual(item.files.count, 1, "bounded file summary metadata remains available")
         }
+        XCTAssertEqual(page.filesTruncated, [false, false])
 
         let metadataSQL = observedSQL.first { $0.contains("LIMIT") && $0.contains("ORDER BY") }
         XCTAssertNotNil(metadataSQL, "metadata page must issue an ordered LIMIT query")
         let sql = metadataSQL ?? ""
-        XCTAssertTrue(sql.contains("files_json"), "projection may include summary files_json")
+        XCTAssertTrue(
+            sql.contains("files_summary_json"),
+            "production v1 projection must read only the capture-time bounded file summary"
+        )
+        XCTAssertFalse(
+            sql.replacingOccurrences(of: "files_summary_json", with: "").contains("files_json"),
+            "production v1 path must not select the authoritative full files_json"
+        )
         XCTAssertFalse(sql.contains("file_snapshots_json"),
                        "production v1 path must not select file_snapshots_json")
         XCTAssertFalse(sql.contains("diff_patch"),
@@ -275,6 +284,62 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
                 && sql.contains("completed_at DESC")
                 && sql.contains("turn_id DESC"),
             "ORDER BY must be DESC on the full keyset"
+        )
+    }
+
+    func testUpsert_keepsAuthoritativeFilesAndPersistsBoundedMobileSummary() throws {
+        // WHY: bounding only during serialization still forces every list refresh
+        // to read and decode the complete files_json. Capture the mobile summary
+        // once while leaving authoritative checkpoint metadata untouched.
+        let db = try makeDB()
+        let repo = AgentTurnCheckpointRepository(db: db)
+        let (tid, rid) = try seedThreadAndRun(db: db)
+        let segment = String(repeating: "quote-\"-slash-\\-emoji-🙂-", count: 10)
+        let files = (0..<200).map {
+            AgentTurnCheckpointFile(
+                path: "Sources/\(segment)\($0).swift",
+                kind: "modified",
+                additions: $0,
+                deletions: $0 / 2
+            )
+        }
+        let checkpoint = AgentTurnCheckpointSummary(
+            threadId: tid,
+            runId: rid,
+            turnId: "bounded-summary",
+            checkpointTurnCount: 1,
+            checkpointRef: "ref",
+            status: .ready,
+            files: files,
+            completedAt: Date(timeIntervalSince1970: 1_700_000_050)
+        )
+        try repo.upsert(checkpoint)
+
+        let lengths = try db.prepare("""
+            SELECT length(files_json), length(files_summary_json), files_summary_truncated
+            FROM agent_turn_checkpoints
+            WHERE thread_id = ? AND turn_id = ?;
+            """)
+        try lengths.bind(1, tid.value.uuidString)
+        try lengths.bind(2, checkpoint.turnId)
+        XCTAssertTrue(try lengths.step())
+        XCTAssertGreaterThan(Int(lengths.columnInt64(0)), 6 * 1_024)
+        XCTAssertLessThanOrEqual(Int(lengths.columnInt64(1)), 6 * 1_024)
+        XCTAssertEqual(lengths.columnInt64(2), 1)
+
+        let page = try repo.listMetadataPage(
+            threadId: tid,
+            maxEntries: 1,
+            before: nil
+        )
+        XCTAssertEqual(page.items.count, 1)
+        XCTAssertEqual(page.filesTruncated, [true])
+        XCTAssertGreaterThan(page.items[0].files.count, 0)
+        XCTAssertLessThan(page.items[0].files.count, 64)
+        XCTAssertEqual(
+            try repo.list(threadId: tid).first?.files.count,
+            200,
+            "legacy/detail reads must retain the authoritative complete file list"
         )
     }
 
@@ -315,5 +380,137 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
         let allIds = first.items.map(\.turnId) + second.items.map(\.turnId)
         XCTAssertEqual(allIds, ["tie-d", "tie-c", "tie-b", "tie-a"])
         XCTAssertEqual(Set(allIds).count, 4, "pages must be duplicate-free across the keyset")
+    }
+
+    func testListMetadataPage_resolvesOversizedWireCursorInsideExactTieAcrossMutation() throws {
+        // WHY: an oversized provider turn id must not brick history or be echoed
+        // unbounded. The wire digest still has to resume the original SQL keyset
+        // after a between-page insert without a duplicate or global cursor scan.
+        let db = try makeDB()
+        let repo = AgentTurnCheckpointRepository(db: db)
+        let (tid, rid) = try seedThreadAndRun(db: db)
+        let sameCompleted = Date(timeIntervalSince1970: 1_700_000_200)
+        let prefix = String(repeating: "oversized-\"-\\-🙂-", count: 40)
+        func raw(_ suffix: String) -> String { prefix + suffix }
+        for suffix in ["a", "b", "c", "d"] {
+            try repo.upsert(makeHeavyCheckpoint(
+                threadId: tid,
+                turnCount: 9,
+                turnId: raw(suffix),
+                runId: rid,
+                completedAt: sameCompleted
+            ))
+        }
+
+        let first = try repo.listMetadataPage(
+            threadId: tid,
+            maxEntries: 2,
+            before: nil
+        )
+        XCTAssertEqual(first.items.map(\.turnId), [raw("d"), raw("c")])
+        guard let rawCursor = first.nextBefore else {
+            return XCTFail("oversized first page must expose a cursor")
+        }
+        let wireTurnID = AgentTurnCheckpointWireIdentity.projectedTurnID(
+            rawCursor.turnId
+        )
+        XCTAssertTrue(AgentTurnCheckpointWireIdentity.isDigestIdentity(wireTurnID))
+        XCTAssertNotEqual(wireTurnID, rawCursor.turnId)
+
+        // A new row before the already-emitted boundary must not leak into the
+        // continuation or cause an existing row to repeat.
+        try repo.upsert(makeHeavyCheckpoint(
+            threadId: tid,
+            turnCount: 9,
+            turnId: raw("z"),
+            runId: rid,
+            completedAt: sameCompleted
+        ))
+        var observedSQL: [String] = []
+        db.beforeStatementStepForTesting = { sql in
+            if sql.contains("FROM agent_turn_checkpoints") {
+                observedSQL.append(sql)
+            }
+        }
+        defer { db.beforeStatementStepForTesting = nil }
+
+        let second = try repo.listMetadataPage(
+            threadId: tid,
+            maxEntries: 2,
+            before: AgentTurnCheckpointCursor(
+                checkpointTurnCount: rawCursor.checkpointTurnCount,
+                completedAt: rawCursor.completedAt,
+                turnId: wireTurnID
+            )
+        )
+        XCTAssertEqual(second.items.map(\.turnId), [raw("b"), raw("a")])
+        XCTAssertFalse(second.truncated)
+        let combined = first.items.map(\.turnId) + second.items.map(\.turnId)
+        XCTAssertEqual(Set(combined).count, 4)
+        XCTAssertFalse(combined.contains(raw("z")))
+        XCTAssertTrue(
+            observedSQL.contains {
+                $0.contains("checkpoint_turn_count = ?")
+                    && $0.contains("completed_at = ?")
+                    && $0.contains("SELECT turn_id")
+            },
+            "digest resolution must scan only the exact count/timestamp tie"
+        )
+    }
+
+    func testListMetadataPage_ambiguousDigestIdentityFailsInsteadOfChoosingARow() throws {
+        // WHY: even a deliberately constructed digest alias must fail loud; choosing
+        // either matching storage row would make pagination authorization ambiguous.
+        let db = try makeDB()
+        let repo = AgentTurnCheckpointRepository(db: db)
+        let (tid, rid) = try seedThreadAndRun(db: db)
+        let completed = Date(timeIntervalSince1970: 1_700_000_300)
+        let oversized = String(repeating: "collision-source-🙂", count: 40)
+        let digestIdentity = AgentTurnCheckpointWireIdentity.projectedTurnID(oversized)
+        XCTAssertTrue(AgentTurnCheckpointWireIdentity.isDigestIdentity(digestIdentity))
+        for turnID in [oversized, digestIdentity] {
+            try repo.upsert(makeHeavyCheckpoint(
+                threadId: tid,
+                turnCount: 11,
+                turnId: turnID,
+                runId: rid,
+                completedAt: completed
+            ))
+        }
+
+        XCTAssertThrowsError(try repo.listMetadataPage(
+            threadId: tid,
+            maxEntries: 1,
+            before: AgentTurnCheckpointCursor(
+                checkpointTurnCount: 11,
+                completedAt: completed,
+                turnId: digestIdentity
+            )
+        )) { error in
+            guard case PersistenceDataError.corruptCheckpoint(let message) = error else {
+                return XCTFail("expected explicit corrupt cursor identity, got \(error)")
+            }
+            XCTAssertTrue(message.contains("missing or ambiguous"))
+        }
+    }
+
+    func testWireIdentityEncodedByteCountMatchesJSONEncoderForEscapedAndUnicodeStrings() throws {
+        // WHY: every metadata cap and disclosed total is expressed in actual wire
+        // bytes. A hand-counting drift for escaping or multi-byte scalars could let
+        // one adversarial checkpoint exceed the mobile response budget.
+        let values = [
+            "",
+            "plain",
+            "\"/\\\u{8}\t\n\u{c}\r\u{1}",
+            "accent-é emoji-🙂 separator-\u{2028}"
+        ]
+
+        for value in values {
+            XCTAssertEqual(
+                AgentTurnCheckpointWireIdentity.encodedJSONStringByteCount(value),
+                try JSONEncoder().encode(value).count,
+                "wire byte count drifted for \(String(reflecting: value))"
+            )
+        }
     }
 }

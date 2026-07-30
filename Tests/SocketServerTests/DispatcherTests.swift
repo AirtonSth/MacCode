@@ -2511,6 +2511,8 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(first["diffPatch"], .string("diff-1"))
         XCTAssertEqual(first["fileSnapshots"]?.arrayValue?.count, 1)
         XCTAssertEqual(first["fileDiffs"]?.arrayValue?.count, 1)
+        XCTAssertNil(first["filesTruncated"],
+                     "the legacy item shape must not gain a v1-only disclosure field")
         XCTAssertEqual(second["turnId"], .string("turn-2"))
         XCTAssertEqual(second["diffPatch"], .string("diff-2"))
     }
@@ -2569,6 +2571,8 @@ final class DispatcherTests: XCTestCase {
                            "every v1 item must explicitly serialize diffPatch: null")
             XCTAssertEqual(item["fileDiffs"], .array([]),
                            "every v1 item must explicitly serialize fileDiffs: []")
+            XCTAssertEqual(item["filesTruncated"], .bool(false),
+                           "a complete files projection must disclose that it was not truncated")
             XCTAssertNotEqual(item["files"], .array([]), "files summary metadata remains allowed")
         }
         guard case .object(let cursor) = page["next_before"] else {
@@ -2637,6 +2641,167 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(items.count, 100)
         XCTAssertEqual(page["truncated"], .bool(true))
         XCTAssertNotEqual(page["next_before"], .null)
+    }
+
+    @MainActor
+    func test_agentCheckpointList_v1CapsEncodedFilesAndKeepsHundredItemResponseBelowOneMiB() async throws {
+        // WHY: max_entries bounds rows, not bytes. Files and persisted display
+        // strings are independently untrusted; all of them must fit together in
+        // the final encoded JSON-RPC response, including JSON escaping.
+        let router = FakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "v1-byte-cap", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        let escapedSegment = String(repeating: "quote-\"-slash-\\-emoji-🙂-", count: 12)
+        let adversarialTurnID = String(
+            repeating: "turn-\"-slash-\\-emoji-🙂-",
+            count: 24
+        )
+        let adversarialCheckpointRef = String(
+            repeating: "ref-\"-slash-\\-emoji-🙂-",
+            count: 96
+        )
+        let adversarialError = String(
+            repeating: "error-\"-slash-\\-emoji-🙂-",
+            count: 128
+        )
+        let adversarialFiles = (0..<128).map { index in
+            AgentTurnCheckpointFile(
+                path: "Sources/\(escapedSegment)\(index).swift",
+                kind: "modified",
+                additions: index,
+                deletions: index / 2
+            )
+        }
+        router.checkpointStore = (1...100).map { index in
+            AgentTurnCheckpointSummary(
+                threadId: thread.id,
+                runId: AgentRunID(),
+                turnId: "\(adversarialTurnID)\(index)",
+                checkpointTurnCount: index,
+                checkpointRef: "\(adversarialCheckpointRef)\(index)",
+                status: .ready,
+                files: adversarialFiles,
+                errorMessage: "\(adversarialError)\(index)",
+                completedAt: Date(timeIntervalSince1970: TimeInterval(index))
+            )
+        }
+        let dispatcher = JSONRPCDispatcher(router: router)
+
+        let response = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.checkpoint.list",
+            params: [
+                "thread_id": .string(thread.id.value.uuidString),
+                "response_version": .number(1),
+                "max_entries": .number(100)
+            ]
+        ))
+
+        guard case .object(let page)? = response.result,
+              case .array(let items) = page["items"] else {
+            return XCTFail("v1 byte-budget request must return an envelope")
+        }
+        XCTAssertGreaterThan(items.count, 0)
+        XCTAssertLessThan(
+            items.count,
+            100,
+            "the final-envelope guard must stop between complete adversarial items"
+        )
+        XCTAssertEqual(page["truncated"], .bool(true))
+        guard case .object(let nextBefore)? = page["next_before"],
+              case .object(let finalItem)? = items.last else {
+            return XCTFail("a dynamically stopped page must resume after its final complete item")
+        }
+        XCTAssertEqual(nextBefore["checkpoint_turn_count"], finalItem["checkpointTurnCount"])
+        XCTAssertEqual(nextBefore["turn_id"], finalItem["turnId"])
+        for itemValue in items {
+            guard case .object(let item) = itemValue,
+                  case .array(let files)? = item["files"] else {
+                return XCTFail("every v1 item must contain a files array")
+            }
+            XCTAssertEqual(item["filesTruncated"], .bool(true))
+            XCTAssertEqual(item["metadataTruncated"], .bool(true))
+            XCTAssertEqual(item["turn_id_truncated"], .bool(true))
+            XCTAssertEqual(item["checkpoint_ref_truncated"], .bool(true))
+            XCTAssertEqual(item["error_message_truncated"], .bool(true))
+            guard let turnHash = item["turn_id_sha256"]?.stringValue,
+                  let turnBytes = item["turn_id_total_encoded_bytes"]?.intValue,
+                  let refHash = item["checkpoint_ref_sha256"]?.stringValue,
+                  let refBytes = item["checkpoint_ref_total_encoded_bytes"]?.intValue,
+                  let errorHash = item["error_message_sha256"]?.stringValue,
+                  let errorBytes = item["error_message_total_encoded_bytes"]?.intValue else {
+                return XCTFail("truncated metadata must disclose exact totals and full hashes")
+            }
+            XCTAssertEqual(turnHash.count, 64)
+            XCTAssertEqual(refHash.count, 64)
+            XCTAssertEqual(errorHash.count, 64)
+            XCTAssertGreaterThan(turnBytes, 256)
+            XCTAssertGreaterThan(refBytes, 512)
+            XCTAssertGreaterThan(errorBytes, 1_024)
+            XCTAssertEqual(
+                item["turnId"],
+                .string("sha256:\(turnHash):\(turnBytes)"),
+                "an oversized identity must use the complete digest, never a clipped prefix"
+            )
+            XCTAssertLessThanOrEqual(
+                try JSONEncoder().encode(itemValue).count,
+                8 * 1_024,
+                "every independently complete item must obey the exact encoded-byte budget"
+            )
+            XCTAssertGreaterThan(files.count, 0)
+            XCTAssertLessThan(files.count, 64,
+                              "the encoded 6 KiB budget must bind before the independent 64-file cap")
+            guard case .object(let firstFile)? = files.first,
+                  case .object(let lastFile)? = files.last else {
+                return XCTFail("projected file entries must remain complete objects")
+            }
+            XCTAssertEqual(firstFile["path"], .string(adversarialFiles[0].path))
+            XCTAssertEqual(lastFile["path"], .string(adversarialFiles[files.count - 1].path),
+                           "the host must keep a complete prefix in stored order, never truncate a path")
+        }
+
+        let encodedResponse = try JSONEncoder().encode(response)
+        XCTAssertLessThan(
+            encodedResponse.count,
+            700 * 1_024,
+            "the measured final JSON-RPC envelope must leave substantial margin below the 1 MiB WS frame ceiling"
+        )
+
+        let tinyFiles = (0..<65).map {
+            AgentTurnCheckpointFile(path: "f\($0)", kind: "modified", additions: 0, deletions: 0)
+        }
+        router.checkpointStore = [
+            AgentTurnCheckpointSummary(
+                threadId: thread.id,
+                runId: AgentRunID(),
+                turnId: "count-cap",
+                checkpointTurnCount: 1,
+                checkpointRef: "count-cap",
+                status: .ready,
+                files: tinyFiles
+            )
+        ]
+        let countCapResponse = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(2),
+            method: "agent.checkpoint.list",
+            params: [
+                "thread_id": .string(thread.id.value.uuidString),
+                "response_version": .number(1),
+                "max_entries": .number(1)
+            ]
+        ))
+        guard case .object(let countPage)? = countCapResponse.result,
+              case .array(let countItems)? = countPage["items"],
+              case .object(let countItem)? = countItems.first,
+              case .array(let cappedFiles)? = countItem["files"] else {
+            return XCTFail("count-cap response must remain a valid v1 item")
+        }
+        XCTAssertEqual(cappedFiles.count, 64)
+        XCTAssertEqual(countItem["filesTruncated"], .bool(true),
+                       "the independent count cap must disclose the omitted 65th entry")
+        XCTAssertEqual(countItem["metadataTruncated"], .bool(false))
     }
 
     @MainActor

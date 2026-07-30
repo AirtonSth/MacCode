@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public enum AgentPermissionMode: String, Codable, Sendable, CaseIterable {
@@ -1486,6 +1487,71 @@ public struct AgentTurnCheckpointSummary: Codable, Sendable, Equatable, Identifi
     }
 }
 
+/// Bounded, stable identity used only by the checkpoint-list v1 wire projection.
+/// Normal turn ids remain byte-for-byte exact. An oversized legacy/provider id is
+/// represented by its complete SHA-256 plus original encoded length so it cannot
+/// dominate a mobile response or be confused with a clipped prefix.
+public enum AgentTurnCheckpointWireIdentity {
+    public static let maximumEncodedTurnIDBytes = 256
+    public static let digestPrefix = "sha256:"
+
+    public static func projectedTurnID(_ raw: String) -> String {
+        let encodedBytes = encodedJSONStringByteCount(raw)
+        guard encodedBytes > maximumEncodedTurnIDBytes else { return raw }
+        return "\(digestPrefix)\(sha256(raw)):\(encodedBytes)"
+    }
+
+    public static func isDigestIdentity(_ value: String) -> Bool {
+        guard value.hasPrefix(digestPrefix) else { return false }
+        let remainder = value.dropFirst(digestPrefix.count)
+        let components = remainder.split(separator: ":", omittingEmptySubsequences: false)
+        guard components.count == 2,
+              components[0].count == 64,
+              components[0].allSatisfy({ $0.isHexDigit }),
+              let encodedBytes = Int(components[1]),
+              encodedBytes > maximumEncodedTurnIDBytes else {
+            return false
+        }
+        return true
+    }
+
+    public static func sha256(_ raw: String) -> String {
+        var hasher = SHA256()
+        var chunk: [UInt8] = []
+        chunk.reserveCapacity(4 * 1_024)
+        for byte in raw.utf8 {
+            chunk.append(byte)
+            if chunk.count == chunk.capacity {
+                hasher.update(data: Data(chunk))
+                chunk.removeAll(keepingCapacity: true)
+            }
+        }
+        if !chunk.isEmpty {
+            hasher.update(data: Data(chunk))
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Exact byte count produced by the repository's default JSONEncoder for a
+    /// standalone String, without allocating a second whole-string Data buffer.
+    public static func encodedJSONStringByteCount(_ raw: String) -> Int {
+        var count = 2 // surrounding quotes
+        for scalar in raw.unicodeScalars {
+            switch scalar.value {
+            case 0x08, 0x09, 0x0A, 0x0C, 0x0D:
+                count += 2
+            case 0x00...0x1F:
+                count += 6
+            case 0x22, 0x2F, 0x5C:
+                count += 2
+            default:
+                count += scalar.utf8.count
+            }
+        }
+        return count
+    }
+}
+
 /// Keyset cursor for `agent.checkpoint.list` response_version 1.
 /// Ordered by `(checkpointTurnCount, completedAt, turnId)` descending; `turnId` is the final tie-breaker.
 public struct AgentTurnCheckpointCursor: Codable, Sendable, Equatable {
@@ -1510,15 +1576,20 @@ public struct AgentTurnCheckpointCursor: Codable, Sendable, Equatable {
 /// Items are summary-compatible but heavy payload fields are always empty/null.
 public struct AgentTurnCheckpointPage: Codable, Sendable, Equatable {
     public let items: [AgentTurnCheckpointSummary]
+    /// Parallel to `items`; true means the persisted mobile summary omitted one
+    /// or more authoritative file entries. Empty preserves older test/router callers.
+    public let filesTruncated: [Bool]
     public let truncated: Bool
     public let nextBefore: AgentTurnCheckpointCursor?
 
     public init(
         items: [AgentTurnCheckpointSummary],
+        filesTruncated: [Bool] = [],
         truncated: Bool,
         nextBefore: AgentTurnCheckpointCursor?
     ) {
         self.items = items
+        self.filesTruncated = filesTruncated
         self.truncated = truncated
         self.nextBefore = nextBefore
     }

@@ -3788,6 +3788,8 @@ public final class AgentProposedPlanRepository {
 
 public final class AgentTurnCheckpointRepository {
     let db: SQLiteDB
+    private static let checkpointListV1MaxFiles = 64
+    private static let checkpointListV1MaxEncodedFilesBytes = 6 * 1_024
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
@@ -3796,14 +3798,15 @@ public final class AgentTurnCheckpointRepository {
     public func upsert(_ checkpoint: AgentTurnCheckpointSummary) throws {
         let filesData = try encoder.encode(checkpoint.files)
         let filesJSON = String(data: filesData, encoding: .utf8) ?? "[]"
+        let fileSummary = try boundedFileSummary(checkpoint.files)
         let snapshotsData = try encoder.encode(checkpoint.fileSnapshots)
         let snapshotsJSON = String(data: snapshotsData, encoding: .utf8) ?? "[]"
         let fileDiffsData = try encoder.encode(checkpoint.fileDiffs)
         let fileDiffsJSON = String(data: fileDiffsData, encoding: .utf8) ?? "[]"
         let now = iso.string(from: Date())
         let st = try db.prepare("""
-            INSERT INTO agent_turn_checkpoints(thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status, files_json, assistant_message_id, error_message, completed_at, created_at, file_snapshots_json, diff_patch, file_diffs_json)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO agent_turn_checkpoints(thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status, files_json, assistant_message_id, error_message, completed_at, created_at, file_snapshots_json, diff_patch, file_diffs_json, files_summary_json, files_summary_truncated)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(thread_id, turn_id) DO UPDATE SET
                 run_id=excluded.run_id,
                 checkpoint_turn_count=excluded.checkpoint_turn_count,
@@ -3813,6 +3816,8 @@ public final class AgentTurnCheckpointRepository {
                 file_snapshots_json=excluded.file_snapshots_json,
                 diff_patch=excluded.diff_patch,
                 file_diffs_json=excluded.file_diffs_json,
+                files_summary_json=excluded.files_summary_json,
+                files_summary_truncated=excluded.files_summary_truncated,
                 assistant_message_id=excluded.assistant_message_id,
                 error_message=excluded.error_message,
                 completed_at=excluded.completed_at;
@@ -3831,7 +3836,31 @@ public final class AgentTurnCheckpointRepository {
         try st.bind(12, snapshotsJSON)
         try st.bind(13, checkpoint.diffPatch)
         try st.bind(14, fileDiffsJSON)
+        try st.bind(15, fileSummary.json)
+        try st.bind(16, fileSummary.truncated ? Int64(1) : Int64(0))
         _ = try st.step()
+    }
+
+    private func boundedFileSummary(
+        _ files: [AgentTurnCheckpointFile]
+    ) throws -> (json: String, truncated: Bool) {
+        var kept: [AgentTurnCheckpointFile] = []
+        kept.reserveCapacity(min(files.count, Self.checkpointListV1MaxFiles))
+        var encoded = try encoder.encode(kept)
+        for file in files {
+            guard kept.count < Self.checkpointListV1MaxFiles else { break }
+            let candidate = kept + [file]
+            let candidateData = try encoder.encode(candidate)
+            guard candidateData.count <= Self.checkpointListV1MaxEncodedFilesBytes else {
+                break
+            }
+            kept = candidate
+            encoded = candidateData
+        }
+        return (
+            String(data: encoded, encoding: .utf8) ?? "[]",
+            kept.count < files.count
+        )
     }
 
     public func nextTurnCount(threadId: AgentThreadID) throws -> Int {
@@ -3972,9 +4001,11 @@ public final class AgentTurnCheckpointRepository {
 
     /// Metadata-only page for mobile/3G clients (`agent.checkpoint.list` response_version 1).
     ///
-    /// Projects summary columns only (including `files_json` metadata). Never selects
-    /// `file_snapshots_json`, `diff_patch`, or `file_diffs_json`. Uses descending keyset
-    /// pagination on `(checkpoint_turn_count, completed_at, turn_id)` with `LIMIT maxEntries + 1`.
+    /// Projects summary columns only, including the capture-time bounded
+    /// `files_summary_json`. Never selects authoritative `files_json`,
+    /// `file_snapshots_json`, `diff_patch`, or `file_diffs_json`. Uses descending
+    /// keyset pagination on `(checkpoint_turn_count, completed_at, turn_id)` with
+    /// `LIMIT maxEntries + 1`.
     public func listMetadataPage(
         threadId: AgentThreadID,
         maxEntries: Int,
@@ -3984,7 +4015,7 @@ public final class AgentTurnCheckpointRepository {
         let sql: String
         if cursor == nil {
             sql = """
-            SELECT thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status, files_json, assistant_message_id, error_message, completed_at
+            SELECT thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status, files_summary_json, files_summary_truncated, assistant_message_id, error_message, completed_at
             FROM agent_turn_checkpoints
             WHERE thread_id = ?
             ORDER BY checkpoint_turn_count DESC, completed_at DESC, turn_id DESC
@@ -3992,7 +4023,7 @@ public final class AgentTurnCheckpointRepository {
             """
         } else {
             sql = """
-            SELECT thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status, files_json, assistant_message_id, error_message, completed_at
+            SELECT thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status, files_summary_json, files_summary_truncated, assistant_message_id, error_message, completed_at
             FROM agent_turn_checkpoints
             WHERE thread_id = ?
               AND (
@@ -4007,25 +4038,72 @@ public final class AgentTurnCheckpointRepository {
         let st = try db.prepare(sql)
         try st.bind(1, threadId.value.uuidString)
         if let cursor {
+            let storageTurnID = try storageTurnID(
+                for: cursor,
+                threadId: threadId
+            )
             let completed = iso.string(from: cursor.completedAt)
             try st.bind(2, Int64(cursor.checkpointTurnCount))
             try st.bind(3, Int64(cursor.checkpointTurnCount))
             try st.bind(4, completed)
             try st.bind(5, Int64(cursor.checkpointTurnCount))
             try st.bind(6, completed)
-            try st.bind(7, cursor.turnId)
+            try st.bind(7, storageTurnID)
             try st.bind(8, Int64(limit + 1))
         } else {
             try st.bind(2, Int64(limit + 1))
         }
-        var rows: [AgentTurnCheckpointSummary] = []
+        var rows: [(summary: AgentTurnCheckpointSummary, filesTruncated: Bool)] = []
         while try st.step() {
             rows.append(try decodeCheckpointMetadata(from: st, fallbackThreadId: threadId))
         }
         let truncated = rows.count > limit
-        let items = Array(rows.prefix(limit))
+        let pageRows = Array(rows.prefix(limit))
+        let items = pageRows.map(\.summary)
         let nextBefore = truncated ? items.last.map(AgentTurnCheckpointCursor.init(from:)) : nil
-        return AgentTurnCheckpointPage(items: items, truncated: truncated, nextBefore: nextBefore)
+        return AgentTurnCheckpointPage(
+            items: items,
+            filesTruncated: pageRows.map(\.filesTruncated),
+            truncated: truncated,
+            nextBefore: nextBefore
+        )
+    }
+
+    /// Resolves an oversized v1 wire identity only inside its exact keyset tie.
+    /// This avoids a global scan and never guesses on a collision or ambiguous row.
+    private func storageTurnID(
+        for cursor: AgentTurnCheckpointCursor,
+        threadId: AgentThreadID
+    ) throws -> String {
+        guard AgentTurnCheckpointWireIdentity.isDigestIdentity(cursor.turnId) else {
+            return cursor.turnId
+        }
+        let st = try db.prepare("""
+            SELECT turn_id
+            FROM agent_turn_checkpoints
+            WHERE thread_id = ?
+              AND checkpoint_turn_count = ?
+              AND completed_at = ?
+            ORDER BY turn_id DESC;
+            """)
+        try st.bind(1, threadId.value.uuidString)
+        try st.bind(2, Int64(cursor.checkpointTurnCount))
+        try st.bind(3, iso.string(from: cursor.completedAt))
+        var matches: [String] = []
+        while try st.step() {
+            guard let raw = st.columnText(0),
+                  AgentTurnCheckpointWireIdentity.projectedTurnID(raw) == cursor.turnId else {
+                continue
+            }
+            matches.append(raw)
+            if matches.count > 1 { break }
+        }
+        guard matches.count == 1, let match = matches.first else {
+            throw PersistenceDataError.corruptCheckpoint(
+                "checkpoint v1 cursor identity is missing or ambiguous"
+            )
+        }
+        return match
     }
 
     /// Decode a metadata projection row. Heavy payload columns are never present;
@@ -4033,7 +4111,7 @@ public final class AgentTurnCheckpointRepository {
     private func decodeCheckpointMetadata(
         from st: SQLiteStatement,
         fallbackThreadId: AgentThreadID
-    ) throws -> AgentTurnCheckpointSummary {
+    ) throws -> (summary: AgentTurnCheckpointSummary, filesTruncated: Bool) {
         let filesJSON = st.columnText(6) ?? "[]"
         let files: [AgentTurnCheckpointFile]
         do {
@@ -4043,7 +4121,7 @@ public final class AgentTurnCheckpointRepository {
                 "invalid files_json for turn \(st.columnText(2) ?? "<unknown>"): \(error)"
             )
         }
-        return AgentTurnCheckpointSummary(
+        return (AgentTurnCheckpointSummary(
             threadId: AgentThreadID(UUID(uuidString: st.columnText(0) ?? "") ?? fallbackThreadId.value),
             runId: AgentRunID(UUID(uuidString: st.columnText(1) ?? "") ?? UUID()),
             turnId: st.columnText(2) ?? "",
@@ -4054,10 +4132,10 @@ public final class AgentTurnCheckpointRepository {
             fileSnapshots: [],
             diffPatch: nil,
             fileDiffs: [],
-            assistantMessageId: st.columnText(7).flatMap(UUID.init(uuidString:)).map(AgentMessageID.init),
-            errorMessage: st.columnText(8),
-            completedAt: parseDate(st.columnText(9))
-        )
+            assistantMessageId: st.columnText(8).flatMap(UUID.init(uuidString:)).map(AgentMessageID.init),
+            errorMessage: st.columnText(9),
+            completedAt: parseDate(st.columnText(10))
+        ), st.columnInt64(7) != 0)
     }
 
     private func decodeCheckpoint(from st: SQLiteStatement, fallbackThreadId: AgentThreadID) throws -> AgentTurnCheckpointSummary {

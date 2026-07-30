@@ -11,8 +11,8 @@ public struct SchemaStep {
 public enum Schema {
     /// Must equal the highest SchemaStep version (step 53 economy + 54 graphify usage
     /// + 55 savings honesty axes + 56 credible_v4 cap evidence
-    /// + 57 immutable agent-message body identity).
-    public static let currentVersion: Int = 57
+    /// + 57 immutable agent-message body identity + 58 checkpoint summaries).
+    public static let currentVersion: Int = 58
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -981,6 +981,13 @@ public enum Schema {
                 body_revision = OLD.body_revision + 1
             WHERE id = NEW.id;
         END;
+        """),
+        // Mobile checkpoint list projection. Keep full files_json and snapshots
+        // authoritative; list v1 reads only this capture-time bounded summary.
+        // Existing rows default to an honestly truncated empty summary until rewritten.
+        SchemaStep(58, """
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN files_summary_json TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN files_summary_truncated INTEGER NOT NULL DEFAULT 1;
         """)
     ]
 

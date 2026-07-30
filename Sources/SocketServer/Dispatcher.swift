@@ -530,6 +530,12 @@ public final class JSONRPCDispatcher {
     /// cannot disagree.
     public nonisolated let agentAttachmentUploadCapability:
         AgentAttachmentUploadCapabilityAdvertisement?
+    private static let checkpointListV1MaxFilesPerItem = 64
+    private static let checkpointListV1MaxEncodedFilesBytesPerItem = 6 * 1_024
+    private static let checkpointListV1MaxEncodedItemBytes = 8 * 1_024
+    private static let checkpointListV1MaxEncodedResponseBytes = 700 * 1_024
+    private static let checkpointListV1MaxEncodedCheckpointRefBytes = 512
+    private static let checkpointListV1MaxEncodedErrorMessageBytes = 1_024
     private var volatileCommandReceipts = BoundedReceiptCache()
     @TaskLocal private static var centralMutationExecution = false
     /// Bounded unknown-outcome fence (same cap as committed receipts). Does not
@@ -2521,7 +2527,10 @@ public final class JSONRPCDispatcher {
                         maxEntries: maxEntries,
                         before: before
                     )
-                    return .init(id: id, result: checkpointPagePayload(page))
+                    return .init(
+                        id: id,
+                        result: checkpointPagePayload(page, responseID: id)
+                    )
                 }
                 return .init(id: id, result: encode(try router.listAgentThreadCheckpoints(thread: tid)))
             case "agent.checkpoint.diff":
@@ -3679,48 +3688,266 @@ public final class JSONRPCDispatcher {
         )
     }
 
+    private struct CheckpointV1ProjectedItem {
+        let value: JSONValue
+        let checkpointTurnCount: Int
+        let completedAt: Date
+        let turnID: String
+    }
+
+    private struct CheckpointV1StringProjection {
+        let value: String?
+        let originalEncodedBytes: Int
+        let sha256: String?
+        let truncated: Bool
+    }
+
     /// Wire envelope for response_version 1: exactly `items`, `truncated`, `next_before`.
-    /// Each item is summary-compatible with heavy payload fields forced empty/null.
-    /// (`JSONEncoder` omits nil optionals, so `diffPatch` is forced to `.null` explicitly.)
-    private func checkpointPagePayload(_ page: AgentTurnCheckpointPage) -> JSONValue {
-        let items: [JSONValue] = page.items.map { summary in
-            let stripped = AgentTurnCheckpointSummary(
-                threadId: summary.threadId,
-                runId: summary.runId,
-                turnId: summary.turnId,
-                checkpointTurnCount: summary.checkpointTurnCount,
-                checkpointRef: summary.checkpointRef,
-                status: summary.status,
-                files: summary.files,
-                fileSnapshots: [],
-                diffPatch: nil,
-                fileDiffs: [],
-                assistantMessageId: summary.assistantMessageId,
-                errorMessage: summary.errorMessage,
-                completedAt: summary.completedAt
+    /// Each complete item is capped independently, then the final encoded JSON-RPC
+    /// response is measured while adding items. A page stops only between items and
+    /// returns a cursor for the final emitted row.
+    private func checkpointPagePayload(
+        _ page: AgentTurnCheckpointPage,
+        responseID: JSONRPCID?
+    ) -> JSONValue {
+        let projected = page.items.enumerated().map { index, summary in
+            checkpointItemForV1(
+                summary,
+                sourceFilesTruncated: page.filesTruncated.indices.contains(index)
+                    ? page.filesTruncated[index]
+                    : false
             )
-            guard case .object(var obj) = encode(stripped) else {
-                return encode(stripped)
-            }
-            obj["fileSnapshots"] = .array([])
-            obj["diffPatch"] = .null
-            obj["fileDiffs"] = .array([])
-            return .object(obj)
         }
+        var emitted: [CheckpointV1ProjectedItem] = []
+        emitted.reserveCapacity(projected.count)
+
+        for candidate in projected {
+            let prospective = emitted + [candidate]
+            let payload = checkpointEnvelope(
+                items: prospective,
+                truncated: true
+            )
+            let response = JSONRPCResponse(id: responseID, result: payload)
+            guard let encoded = try? _encoder.encode(response),
+                  encoded.count <= Self.checkpointListV1MaxEncodedResponseBytes else {
+                break
+            }
+            emitted.append(candidate)
+        }
+
+        // Per-item budgets make a first-item overflow impossible for normal JSON-RPC
+        // ids. Keep the history usable rather than returning a list-wide error if a
+        // future encoder changes overhead.
+        if emitted.isEmpty, let first = projected.first {
+            emitted = [first]
+        }
+        let finalPayload = checkpointEnvelope(
+            items: emitted,
+            truncated: page.truncated || emitted.count < projected.count
+        )
+        assert(
+            (try? _encoder.encode(
+                JSONRPCResponse(id: responseID, result: finalPayload)
+            ).count).map {
+                $0 <= Self.checkpointListV1MaxEncodedResponseBytes
+            } ?? false,
+            "checkpoint v1 final JSON-RPC response exceeded its encoded budget"
+        )
+        return finalPayload
+    }
+
+    private func checkpointEnvelope(
+        items: [CheckpointV1ProjectedItem],
+        truncated: Bool
+    ) -> JSONValue {
         var object: [String: JSONValue] = [
-            "items": .array(items),
-            "truncated": .bool(page.truncated)
+            "items": .array(items.map(\.value)),
+            "truncated": .bool(truncated),
         ]
-        if let cursor = page.nextBefore {
+        if truncated, let cursor = items.last {
             object["next_before"] = .object([
                 "checkpoint_turn_count": .number(Double(cursor.checkpointTurnCount)),
                 "completed_at": .string(iso8601(cursor.completedAt)),
-                "turn_id": .string(cursor.turnId)
+                "turn_id": .string(cursor.turnID),
             ])
         } else {
             object["next_before"] = .null
         }
         return .object(object)
+    }
+
+    private func checkpointItemForV1(
+        _ summary: AgentTurnCheckpointSummary,
+        sourceFilesTruncated: Bool
+    ) -> CheckpointV1ProjectedItem {
+        let turnID = checkpointTurnIDForV1(summary.turnId)
+        let checkpointRef = checkpointStringForV1(
+            summary.checkpointRef,
+            maximumEncodedBytes: Self.checkpointListV1MaxEncodedCheckpointRefBytes
+        )
+        let errorMessage = checkpointStringForV1(
+            summary.errorMessage,
+            maximumEncodedBytes: Self.checkpointListV1MaxEncodedErrorMessageBytes
+        )
+        var fileProjection = checkpointFilesForV1(summary.files)
+        fileProjection.truncated = fileProjection.truncated || sourceFilesTruncated
+        let metadataTruncated = turnID.truncated
+            || checkpointRef.truncated
+            || errorMessage.truncated
+
+        func encodedItem(
+            files: [AgentTurnCheckpointFile],
+            filesTruncated: Bool
+        ) -> JSONValue {
+            let stripped = AgentTurnCheckpointSummary(
+                threadId: summary.threadId,
+                runId: summary.runId,
+                turnId: turnID.value ?? "",
+                checkpointTurnCount: summary.checkpointTurnCount,
+                checkpointRef: checkpointRef.value ?? "",
+                status: summary.status,
+                files: files,
+                fileSnapshots: [],
+                diffPatch: nil,
+                fileDiffs: [],
+                assistantMessageId: summary.assistantMessageId,
+                errorMessage: errorMessage.value,
+                completedAt: summary.completedAt
+            )
+            guard case .object(var object) = encode(stripped) else {
+                return encode(stripped)
+            }
+            object["fileSnapshots"] = .array([])
+            object["diffPatch"] = .null
+            object["fileDiffs"] = .array([])
+            object["filesTruncated"] = .bool(filesTruncated)
+            object["metadataTruncated"] = .bool(metadataTruncated)
+            object["turn_id_truncated"] = .bool(turnID.truncated)
+            object["turn_id_total_encoded_bytes"] = .number(
+                Double(turnID.originalEncodedBytes)
+            )
+            object["turn_id_sha256"] = turnID.sha256.map(JSONValue.string) ?? .null
+            object["checkpoint_ref_truncated"] = .bool(checkpointRef.truncated)
+            object["checkpoint_ref_total_encoded_bytes"] = .number(
+                Double(checkpointRef.originalEncodedBytes)
+            )
+            object["checkpoint_ref_sha256"] =
+                checkpointRef.sha256.map(JSONValue.string) ?? .null
+            object["error_message_truncated"] = .bool(errorMessage.truncated)
+            object["error_message_total_encoded_bytes"] = .number(
+                Double(errorMessage.originalEncodedBytes)
+            )
+            object["error_message_sha256"] =
+                errorMessage.sha256.map(JSONValue.string) ?? .null
+            return .object(object)
+        }
+
+        var item = encodedItem(
+            files: fileProjection.files,
+            filesTruncated: fileProjection.truncated
+        )
+        while encodedByteCount(item) > Self.checkpointListV1MaxEncodedItemBytes,
+              !fileProjection.files.isEmpty {
+            fileProjection.files.removeLast()
+            fileProjection.truncated = true
+            item = encodedItem(
+                files: fileProjection.files,
+                filesTruncated: true
+            )
+        }
+        assert(
+            encodedByteCount(item) <= Self.checkpointListV1MaxEncodedItemBytes,
+            "checkpoint v1 metadata budgets must fit one complete item"
+        )
+        return CheckpointV1ProjectedItem(
+            value: item,
+            checkpointTurnCount: summary.checkpointTurnCount,
+            completedAt: summary.completedAt,
+            turnID: turnID.value ?? ""
+        )
+    }
+
+    private func checkpointTurnIDForV1(
+        _ raw: String
+    ) -> CheckpointV1StringProjection {
+        let originalEncodedBytes =
+            AgentTurnCheckpointWireIdentity.encodedJSONStringByteCount(raw)
+        let projected = AgentTurnCheckpointWireIdentity.projectedTurnID(raw)
+        let truncated = projected != raw
+        return CheckpointV1StringProjection(
+            value: projected,
+            originalEncodedBytes: originalEncodedBytes,
+            sha256: truncated
+                ? AgentTurnCheckpointWireIdentity.sha256(raw)
+                : nil,
+            truncated: truncated
+        )
+    }
+
+    private func checkpointStringForV1(
+        _ raw: String?,
+        maximumEncodedBytes: Int
+    ) -> CheckpointV1StringProjection {
+        guard let raw else {
+            return CheckpointV1StringProjection(
+                value: nil,
+                originalEncodedBytes: 0,
+                sha256: nil,
+                truncated: false
+            )
+        }
+        let originalEncodedBytes =
+            AgentTurnCheckpointWireIdentity.encodedJSONStringByteCount(raw)
+        guard originalEncodedBytes > maximumEncodedBytes else {
+            return CheckpointV1StringProjection(
+                value: raw,
+                originalEncodedBytes: originalEncodedBytes,
+                sha256: nil,
+                truncated: false
+            )
+        }
+        var preview = ""
+        for character in raw {
+            let candidate = preview + String(character)
+            guard encodedByteCount(candidate) <= maximumEncodedBytes else { break }
+            preview = candidate
+        }
+        return CheckpointV1StringProjection(
+            value: preview,
+            originalEncodedBytes: originalEncodedBytes,
+            sha256: AgentTurnCheckpointWireIdentity.sha256(raw),
+            truncated: true
+        )
+    }
+
+    private func encodedByteCount<T: Encodable>(_ value: T) -> Int {
+        (try? _encoder.encode(value).count) ?? Int.max
+    }
+
+    /// Keeps complete file entries in their stored order. The array budget uses
+    /// the exact compact JSON bytes for each encoded entry plus separators/brackets;
+    /// an entry that would cross the budget, and every later entry, is omitted.
+    private func checkpointFilesForV1(
+        _ files: [AgentTurnCheckpointFile]
+    ) -> (files: [AgentTurnCheckpointFile], truncated: Bool) {
+        var kept: [AgentTurnCheckpointFile] = []
+        kept.reserveCapacity(min(files.count, Self.checkpointListV1MaxFilesPerItem))
+        var encodedArrayBytes = 2 // `[` and `]`
+
+        for file in files {
+            guard kept.count < Self.checkpointListV1MaxFilesPerItem,
+                  let encoded = try? _encoder.encode(file) else {
+                break
+            }
+            let separatorBytes = kept.isEmpty ? 0 : 1
+            guard encodedArrayBytes + separatorBytes + encoded.count
+                    <= Self.checkpointListV1MaxEncodedFilesBytesPerItem else {
+                break
+            }
+            kept.append(file)
+            encodedArrayBytes += separatorBytes + encoded.count
+        }
+        return (kept, kept.count < files.count)
     }
 
     private func parseISO8601(_ value: String) -> Date {
