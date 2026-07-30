@@ -1,18 +1,26 @@
 import Foundation
 
-/// Opt-in `git.diff` bounded response (v1) for cellular-safe wire windows.
+/// Opt-in bounded diff response (v1) for cellular-safe wire windows.
 ///
-/// WHY: iOS already requests `response_version` / `max_bytes` / `max_lines`. Without
-/// host support the Dispatcher returned the full patch as a bare string, so a weak
-/// link still paid for the entire diff. Legacy callers omit `response_version` and
-/// must keep receiving that bare string.
+/// Shared by `git.diff` and `agent.checkpoint.diff` so both endpoints use exactly
+/// one UTF-8/LF-safe clipping implementation. iOS requests `response_version` /
+/// `max_bytes` / `max_lines` (planned checkpoint window: 128 KiB / 500 lines).
+/// Without host support the Dispatcher returned the full patch as a bare string,
+/// so a weak link still paid for the entire diff (and can hit the outer 8 MiB
+/// HTTP compatibility ceiling). Legacy callers omit `response_version` and must
+/// keep receiving that bare string byte-for-byte — even if `max_bytes` /
+/// `max_lines` happen to be present.
 ///
 /// Line semantics match the iOS decoder: empty string = 0 lines; otherwise Swift
-/// `split(separator: "\n", omittingEmptySubsequences: false)`.
+/// `split(separator: "\n", omittingEmptySubsequences: false)`. Literal LF only:
+/// CRLF contains an LF delimiter; lone CR does not.
 public enum GitDiffBoundedResponse: Sendable {
     public static let version = 1
     public static let maxBytesCeiling = 1_048_576
     public static let maxLinesCeiling = 10_000
+    /// Planned iOS `agent.checkpoint.diff` request window.
+    public static let checkpointDefaultMaxBytes = 128 * 1024
+    public static let checkpointDefaultMaxLines = 500
 
     public struct Window: Sendable, Equatable {
         public let text: String
@@ -35,7 +43,7 @@ public enum GitDiffBoundedResponse: Sendable {
         }
     }
 
-    /// Line count matching the iOS decoder.
+    /// Line count matching the iOS decoder (LF delimiters only).
     public static func lineCount(_ text: String) -> Int {
         guard !text.isEmpty else { return 0 }
         var count = 1
@@ -48,8 +56,9 @@ public enum GitDiffBoundedResponse: Sendable {
     /// Parse opt-in wire caps. Returns `nil` when `response_version` is absent (legacy).
     /// Throws `invalidParams` when the key is present but the triple is not a valid v1 request.
     ///
-    /// WHY fail closed before `router.gitDiff`: invalid caps must not pay for an
-    /// expensive full-patch generation only to reject the response afterward.
+    /// WHY fail closed before `router.gitDiff` / `router.agentCheckpointDiff`: invalid
+    /// caps must not pay for an expensive full-patch generation only to reject the
+    /// response afterward.
     public static func parseOptInCaps(_ params: [String: JSONValue]) throws -> (maxBytes: Int, maxLines: Int)? {
         guard params["response_version"] != nil else { return nil }
         guard let responseVersion = params["response_version"]?.intValue,
@@ -63,11 +72,11 @@ public enum GitDiffBoundedResponse: Sendable {
         return (maxBytes, maxLines)
     }
 
-    /// Prefix of `text` at most both caps. One Character walk; no per-line String map.
+    /// Prefix of `text` at most both caps. One Unicode-scalar walk; no per-line String map.
     ///
     /// `truncated` is true exactly when any original text was omitted. A byte cap
     /// may clip mid-line so `truncated` can be true while the returned line count
-    /// still equals `total_lines`.
+    /// still equals `total_lines`. Never splits a UTF-8 scalar.
     public static func bound(text: String, maxBytes: Int, maxLines: Int) -> Window {
         guard !text.isEmpty else {
             return Window(text: "", truncated: false, totalLines: 0)

@@ -1,11 +1,13 @@
 import XCTest
 @testable import SocketServer
 
-/// Pure unit tests for the `git.diff` bounded-response v1 window.
+/// Pure unit tests for the shared bounded-diff v1 window
+/// (`git.diff` and `agent.checkpoint.diff`).
 ///
 /// WHY: iOS already ships the request/decoder half. These tests pin host clipping
 /// semantics so a weak cellular link never receives more than the requested caps
-/// while still reporting honest truncation and original line counts.
+/// while still reporting honest truncation and original line counts. Endpoint
+/// tests in `DispatcherTests` prove each RPC actually routes through this helper.
 final class GitDiffBoundedResponseTests: XCTestCase {
 
     // MARK: Line count (iOS decoder parity)
@@ -143,6 +145,18 @@ final class GitDiffBoundedResponseTests: XCTestCase {
         ])
         XCTAssertEqual(caps?.maxBytes, 128 * 1024)
         XCTAssertEqual(caps?.maxLines, 400)
+    }
+
+    /// WHY: planned iOS checkpoint selection uses 128 KiB / 500 lines; those
+    /// values must sit inside the host ceilings and parse as a valid v1 opt-in.
+    func testParseOptInCaps_acceptsPlannedCheckpointWindow() throws {
+        let caps = try GitDiffBoundedResponse.parseOptInCaps([
+            "response_version": .number(1),
+            "max_bytes": .number(Double(GitDiffBoundedResponse.checkpointDefaultMaxBytes)),
+            "max_lines": .number(Double(GitDiffBoundedResponse.checkpointDefaultMaxLines)),
+        ])
+        XCTAssertEqual(caps?.maxBytes, 128 * 1024)
+        XCTAssertEqual(caps?.maxLines, 500)
     }
 
     func testParseOptInCaps_rejectsInvalidBounds() {

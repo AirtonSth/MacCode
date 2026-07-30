@@ -2163,7 +2163,26 @@ public final class JSONRPCDispatcher {
                 // the iOS fake (which uses checkpoint_turn_count) stayed green.
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let turnCount = (params["turn_count"] ?? params["checkpoint_turn_count"])?.intValue else { throw JSONRPCError.invalidParams }
-                return .init(id: id, result: .string(try router.agentCheckpointDiff(thread: tid, checkpointTurnCount: turnCount, path: params["path"]?.stringValue)))
+                // Opt-in v1 caps validated before the checkpoint patch load so a
+                // malformed cellular request never pays for a full unbounded diff.
+                // Shares GitDiffBoundedResponse with git.diff (one clip algorithm).
+                let caps = try GitDiffBoundedResponse.parseOptInCaps(params)
+                let diff = try router.agentCheckpointDiff(
+                    thread: tid,
+                    checkpointTurnCount: turnCount,
+                    path: params["path"]?.stringValue
+                )
+                if let caps {
+                    let window = GitDiffBoundedResponse.bound(
+                        text: diff,
+                        maxBytes: caps.maxBytes,
+                        maxLines: caps.maxLines
+                    )
+                    return .init(id: id, result: window.json)
+                }
+                // Legacy: bare string for callers that omit response_version
+                // (even if max_bytes / max_lines happen to be present).
+                return .init(id: id, result: .string(diff))
             case "agent.checkpoint.revert":
                 // QA-XPLAT :19 -- accept both keys (see agent.checkpoint.diff above).
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),

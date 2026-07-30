@@ -481,7 +481,11 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func listAgentThreadCheckpoints(thread: AgentThreadID) throws -> [AgentTurnCheckpointSummary] {
         checkpointStore.filter { $0.threadId == thread }
     }
+    var agentCheckpointDiffCallCount = 0
+    var stubAgentCheckpointDiff: String?
     func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, path: String?) throws -> String {
+        agentCheckpointDiffCallCount += 1
+        if let stubAgentCheckpointDiff { return stubAgentCheckpointDiff }
         guard let checkpoint = checkpointStore.first(where: { $0.threadId == thread && $0.checkpointTurnCount == checkpointTurnCount }) else {
             return ""
         }
@@ -2868,6 +2872,257 @@ final class DispatcherTests: XCTestCase {
             XCTAssertEqual(resp.error?.code, -32602, "case \(idx) must be invalid params")
             XCTAssertEqual(router.gitDiffCallCount, 0,
                            "case \(idx) must not invoke router.gitDiff before validation")
+        }
+    }
+
+    // MARK: - agent.checkpoint.diff bounded response v1
+
+    /// Builds a thread+checkpoint setup with a stubbed full-thread patch.
+    @MainActor
+    private func checkpointDiffFixture(
+        patch: String
+    ) -> (router: FakeRouter, threadID: String) {
+        let router = FakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "checkpoint-bound", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        router.stubAgentCheckpointDiff = patch
+        // Seed a real checkpoint so non-stub path remains available if stub is cleared.
+        router.checkpointStore = [AgentTurnCheckpointSummary(
+            threadId: thread.id,
+            runId: AgentRunID(),
+            turnId: "turn-1",
+            checkpointTurnCount: 1,
+            checkpointRef: "local-diff:test:turn-1",
+            status: .ready,
+            files: [AgentTurnCheckpointFile(path: "README.md", kind: "modified", additions: 1, deletions: 0)],
+            diffPatch: patch,
+            fileDiffs: []
+        )]
+        return (router, thread.id.value.uuidString)
+    }
+
+    @MainActor
+    func test_agentCheckpointDiff_withoutResponseVersion_returnsExactLegacyBareString() async {
+        // WHY: iOS currently auto-requests checkpoint diffs on selection with the
+        // legacy bare-string contract. max_bytes / max_lines alone must not opt in
+        // or older clients would fail to decode an object as a string.
+        let patch = "diff --git a/README.md b/README.md\n+changed\n"
+        let fixture = checkpointDiffFixture(patch: patch)
+        let d = JSONRPCDispatcher(router: fixture.router)
+
+        let bare = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.checkpoint.diff", params: [
+            "thread_id": .string(fixture.threadID),
+            "turn_count": .number(1),
+        ]))
+        XCTAssertNil(bare.error)
+        XCTAssertEqual(bare.result, .string(patch),
+                       "absent response_version must keep the exact legacy bare-string result")
+
+        // Caps without response_version remain legacy (byte-for-byte same string).
+        let withCaps = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.checkpoint.diff", params: [
+            "thread_id": .string(fixture.threadID),
+            "turn_count": .number(1),
+            "max_bytes": .number(Double(GitDiffBoundedResponse.checkpointDefaultMaxBytes)),
+            "max_lines": .number(Double(GitDiffBoundedResponse.checkpointDefaultMaxLines)),
+        ]))
+        XCTAssertNil(withCaps.error)
+        XCTAssertEqual(withCaps.result, .string(patch),
+                       "max_* without response_version must not change shape or content")
+        XCTAssertEqual(fixture.router.agentCheckpointDiffCallCount, 2)
+    }
+
+    @MainActor
+    func test_agentCheckpointDiff_optInV1_returnsExactEnvelopeAndTruthfulTotalLines() async {
+        // WHY: the wire envelope is the only shape modern iOS will paint; total_lines
+        // must describe the original patch so the client can show honest truncation.
+        let fixture = checkpointDiffFixture(patch: "a\nb\nc\nd")
+        let d = JSONRPCDispatcher(router: fixture.router)
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.checkpoint.diff", params: [
+            "thread_id": .string(fixture.threadID),
+            "turn_count": .number(1),
+            "response_version": .number(1),
+            "max_bytes": .number(1024),
+            "max_lines": .number(2),
+        ]))
+
+        XCTAssertNil(resp.error)
+        guard case .object(let body)? = resp.result else {
+            return XCTFail("opt-in v1 must return a bounded object, not a bare string")
+        }
+        XCTAssertEqual(body["version"], .number(1))
+        XCTAssertEqual(body["text"], .string("a\nb"))
+        XCTAssertEqual(body["truncated"], .bool(true))
+        XCTAssertEqual(body["total_lines"], .number(4),
+                       "total_lines must be the original exact line count, not the returned prefix")
+        XCTAssertEqual(body.count, 4, "no extra keys that a strict client might reject")
+        // Proves the endpoint used the shared helper (same clip as pure unit tests).
+        let expected = GitDiffBoundedResponse.bound(text: "a\nb\nc\nd", maxBytes: 1024, maxLines: 2)
+        XCTAssertEqual(body["text"], .string(expected.text))
+        XCTAssertEqual(body["truncated"], .bool(expected.truncated))
+        XCTAssertEqual(body["total_lines"], .number(Double(expected.totalLines)))
+        XCTAssertEqual(fixture.router.agentCheckpointDiffCallCount, 1)
+    }
+
+    @MainActor
+    func test_agentCheckpointDiff_optInV1_honors128KiBAnd500LineLimits() async {
+        // WHY: planned iOS selection request is max_bytes=128*1024, max_lines=500.
+        // Both caps must bind independently through the shared helper.
+        let manyLines = (0..<600).map { "L\($0)" }.joined(separator: "\n")
+        let lineFixture = checkpointDiffFixture(patch: manyLines)
+        let d = JSONRPCDispatcher(router: lineFixture.router)
+
+        let byLines = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.checkpoint.diff", params: [
+            "thread_id": .string(lineFixture.threadID),
+            "turn_count": .number(1),
+            "response_version": .number(1),
+            "max_bytes": .number(Double(GitDiffBoundedResponse.checkpointDefaultMaxBytes)),
+            "max_lines": .number(Double(GitDiffBoundedResponse.checkpointDefaultMaxLines)),
+        ]))
+        XCTAssertNil(byLines.error)
+        guard case .object(let lineBody)? = byLines.result,
+              case .string(let lineText)? = lineBody["text"] else {
+            return XCTFail("expected v1 object with text")
+        }
+        XCTAssertEqual(GitDiffBoundedResponse.lineCount(lineText), 500)
+        XCTAssertEqual(lineBody["truncated"], .bool(true))
+        XCTAssertEqual(lineBody["total_lines"], .number(600))
+        XCTAssertLessThanOrEqual(lineText.utf8.count, GitDiffBoundedResponse.checkpointDefaultMaxBytes)
+
+        // Byte cap binds first: one long line exceeds 128 KiB.
+        let longLine = String(repeating: "x", count: GitDiffBoundedResponse.checkpointDefaultMaxBytes + 50)
+        let byteFixture = checkpointDiffFixture(patch: longLine)
+        let d2 = JSONRPCDispatcher(router: byteFixture.router)
+        let byBytes = await d2.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.checkpoint.diff", params: [
+            "thread_id": .string(byteFixture.threadID),
+            "turn_count": .number(1),
+            "response_version": .number(1),
+            "max_bytes": .number(Double(GitDiffBoundedResponse.checkpointDefaultMaxBytes)),
+            "max_lines": .number(Double(GitDiffBoundedResponse.checkpointDefaultMaxLines)),
+        ]))
+        XCTAssertNil(byBytes.error)
+        guard case .object(let byteBody)? = byBytes.result,
+              case .string(let byteText)? = byteBody["text"] else {
+            return XCTFail("expected v1 object with text")
+        }
+        XCTAssertEqual(byteText.utf8.count, GitDiffBoundedResponse.checkpointDefaultMaxBytes)
+        XCTAssertEqual(byteBody["truncated"], .bool(true))
+        XCTAssertEqual(byteBody["total_lines"], .number(1),
+                       "byte clip mid-line keeps total_lines == original while truncated")
+        let expected = GitDiffBoundedResponse.bound(
+            text: longLine,
+            maxBytes: GitDiffBoundedResponse.checkpointDefaultMaxBytes,
+            maxLines: GitDiffBoundedResponse.checkpointDefaultMaxLines
+        )
+        XCTAssertEqual(byteText, expected.text, "endpoint must use the shared clip helper")
+    }
+
+    @MainActor
+    func test_agentCheckpointDiff_optInV1_crlfVsLoneCR() async {
+        // WHY: Swift treats CRLF as one Character; the wire contract is LF-only.
+        // Endpoint must honor the shared helper, not Character-based split.
+        let fixture = checkpointDiffFixture(patch: "a\r\nb\r\nc")
+        let d = JSONRPCDispatcher(router: fixture.router)
+
+        let crlf = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.checkpoint.diff", params: [
+            "thread_id": .string(fixture.threadID),
+            "turn_count": .number(1),
+            "response_version": .number(1),
+            "max_bytes": .number(1024),
+            "max_lines": .number(2),
+        ]))
+        guard case .object(let crlfBody)? = crlf.result,
+              case .string(let crlfText)? = crlfBody["text"] else {
+            return XCTFail("expected v1 object")
+        }
+        XCTAssertEqual(GitDiffBoundedResponse.lineCount(crlfText), 2)
+        XCTAssertEqual(crlfBody["truncated"], .bool(true))
+        XCTAssertEqual(crlfBody["total_lines"], .number(3))
+        let expectedCRLF = GitDiffBoundedResponse.bound(text: "a\r\nb\r\nc", maxBytes: 1024, maxLines: 2)
+        XCTAssertEqual(crlfText, expectedCRLF.text)
+
+        let lone = checkpointDiffFixture(patch: "a\rb")
+        let d2 = JSONRPCDispatcher(router: lone.router)
+        let loneCR = await d2.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.checkpoint.diff", params: [
+            "thread_id": .string(lone.threadID),
+            "turn_count": .number(1),
+            "response_version": .number(1),
+            "max_bytes": .number(1024),
+            "max_lines": .number(1),
+        ]))
+        guard case .object(let loneBody)? = loneCR.result else {
+            return XCTFail("expected v1 object")
+        }
+        XCTAssertEqual(loneBody["text"], .string("a\rb"))
+        XCTAssertEqual(loneBody["truncated"], .bool(false))
+        XCTAssertEqual(loneBody["total_lines"], .number(1))
+    }
+
+    @MainActor
+    func test_agentCheckpointDiff_optInV1_neverSplitsMultibyteUTF8() async {
+        // WHY: cutting mid-scalar would hand the client invalid UTF-8. Diffs can
+        // contain multi-byte glyphs; the endpoint must reuse the scalar-safe helper.
+        let patch = "☃☃☃" // 3 bytes each
+        let fixture = checkpointDiffFixture(patch: patch)
+        let d = JSONRPCDispatcher(router: fixture.router)
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.checkpoint.diff", params: [
+            "thread_id": .string(fixture.threadID),
+            "turn_count": .number(1),
+            "response_version": .number(1),
+            "max_bytes": .number(4),
+            "max_lines": .number(10),
+        ]))
+        XCTAssertNil(resp.error)
+        guard case .object(let body)? = resp.result,
+              case .string(let text)? = body["text"] else {
+            return XCTFail("expected v1 object with text")
+        }
+        XCTAssertLessThanOrEqual(text.utf8.count, 4)
+        XCTAssertEqual(text, "☃")
+        XCTAssertEqual(body["truncated"], .bool(true))
+        XCTAssertEqual(body["total_lines"], .number(1))
+        XCTAssertFalse(text.unicodeScalars.contains("\u{FFFD}"))
+        let expected = GitDiffBoundedResponse.bound(text: patch, maxBytes: 4, maxLines: 10)
+        XCTAssertEqual(text, expected.text, "endpoint must use the shared clip helper")
+    }
+
+    @MainActor
+    func test_agentCheckpointDiff_invalidOptInCaps_failClosedBeforeRouter() async {
+        // WHY: selection can fire immediately; invalid caps must not load a large
+        // checkpoint patch only to reject the response afterward.
+        let fixture = checkpointDiffFixture(patch: "should-not-be-fetched")
+        let d = JSONRPCDispatcher(router: fixture.router)
+        let tid = fixture.threadID
+
+        let cases: [[String: JSONValue]] = [
+            ["thread_id": .string(tid), "turn_count": .number(1),
+             "response_version": .number(2), "max_bytes": .number(100), "max_lines": .number(10)],
+            ["thread_id": .string(tid), "turn_count": .number(1),
+             "response_version": .number(1), "max_lines": .number(10)],
+            ["thread_id": .string(tid), "turn_count": .number(1),
+             "response_version": .number(1), "max_bytes": .number(100)],
+            ["thread_id": .string(tid), "turn_count": .number(1),
+             "response_version": .number(1), "max_bytes": .number(1.5), "max_lines": .number(10)],
+            ["thread_id": .string(tid), "turn_count": .number(1),
+             "response_version": .number(1), "max_bytes": .number(100), "max_lines": .number(0)],
+            ["thread_id": .string(tid), "turn_count": .number(1),
+             "response_version": .number(1),
+             "max_bytes": .number(Double(GitDiffBoundedResponse.maxBytesCeiling + 1)),
+             "max_lines": .number(10)],
+            ["thread_id": .string(tid), "turn_count": .number(1),
+             "response_version": .number(1), "max_bytes": .number(100),
+             "max_lines": .number(Double(GitDiffBoundedResponse.maxLinesCeiling + 1))],
+        ]
+
+        for (idx, params) in cases.enumerated() {
+            fixture.router.agentCheckpointDiffCallCount = 0
+            let resp = await d.dispatch(JSONRPCRequest(
+                jsonrpc: "2.0", id: .number(idx + 1), method: "agent.checkpoint.diff", params: params
+            ))
+            XCTAssertEqual(resp.error?.code, -32602, "case \(idx) must be invalid params")
+            XCTAssertEqual(fixture.router.agentCheckpointDiffCallCount, 0,
+                           "case \(idx) must not invoke router.agentCheckpointDiff before validation")
         }
     }
 }
