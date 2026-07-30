@@ -1694,10 +1694,21 @@ public final class JSONRPCDispatcher {
                         return .init(id: id, result: snapshot)
                     }
                     fields["surface_seq"] = .number(Double(snapshotSequence))
+                    // Optional bounded read, same discipline as surface.read_history.
+                    // Absent max_bytes keeps the previous unbounded response, so older
+                    // clients are byte-for-byte unaffected.
+                    fields = SurfaceReadTextWindow.applied(
+                        to: fields,
+                        maxBytes: params["max_bytes"]?.intValue
+                    )
                     return .init(id: id, result: .object(fields))
                 }
                 let text = try router.readText(surface: sid)
-                return .init(id: id, result: .string(text))
+                let window = SurfaceReadTextWindow.tail(
+                    of: text,
+                    maxBytes: params["max_bytes"]?.intValue
+                )
+                return .init(id: id, result: .string(window.text))
             case "surface.read_history":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 let before = params["before_chunk_id"]?.intValue.map(Int64.init)
