@@ -59,6 +59,41 @@ final class PetLiveActivityCopyTests: XCTestCase {
         XCTAssertFalse(output.preview.contains("elephant - Claude"))
     }
 
+    func testItemStartedPreviewPrefersThinkingAndRejectsRuntimeNoise() {
+        // WHY: Lock Screen was showing "claude runtime: claude.session.snapshot";
+        // Agent App copy is Thinking / replies / tool runs.
+        let thinking = PetController.itemStartedPreview(payload: [
+            "item": .object([
+                "id": .string("r1"),
+                "type": .string("reasoning"),
+                "body": .string("Considering how to run the distill checks.")
+            ])
+        ])
+        XCTAssertEqual(thinking, "Considering how to run the distill checks.")
+
+        let tool = PetController.itemStartedPreview(payload: [
+            "item": .object([
+                "id": .string("t1"),
+                "type": .string("commandExecution"),
+                "summary": .string("git status"),
+                "body": .string("git status --short")
+            ])
+        ])
+        XCTAssertEqual(tool, "Running: git status")
+
+        let noise = PetController.itemStartedPreview(payload: [
+            "item": .object([
+                "id": .string("n1"),
+                "type": .string("tool"),
+                "summary": .string("claude.session.snapshot"),
+                "body": .string("")
+            ])
+        ])
+        XCTAssertNil(noise, "dotted provider method ids must not become LA description")
+        XCTAssertTrue(PetController.isProviderRuntimeNoise("claude runtime: claude.session.snapshot"))
+        XCTAssertFalse(PetController.isProviderRuntimeNoise("Running: git status"))
+    }
+
     func testSingleActiveAttentionBeatsLastThreadUpdate() {
         let active = PetActiveThreadItem(
             threadID: threadA,

@@ -539,20 +539,48 @@ public final class PetController {
         return next
     }
 
-    private static func itemStartedPreview(payload: [String: JSONValue]) -> String? {
+    /// Agent App-style Live Activity line from an item.started payload.
+    /// Thinking / assistant text / tool runs — never provider-runtime method ids.
+    nonisolated static func itemStartedPreview(payload: [String: JSONValue]) -> String? {
         guard let item = payload["item"]?.objectValue else { return nil }
-        if let summary = nonempty(item["summary"]) { return summary }
         let type = item["type"]?.stringValue ?? "tool"
-        if type == "assistantMessage" || type == "reasoning" {
-            if let body = nonempty(item["body"]) { return body }
-            return type == "reasoning" ? "Thinking…" : "Writing…"
+        if type == "reasoning" {
+            if let body = friendlyPreview(nonempty(item["body"])) { return body }
+            return "Thinking…"
+        }
+        if type == "assistantMessage" {
+            if let body = friendlyPreview(nonempty(item["body"])) { return body }
+            return "Writing…"
+        }
+        if type == "plan" {
+            return friendlyPreview(nonempty(item["summary"]) ?? nonempty(item["body"]))
+        }
+        // Prefer human summary; reject dotted runtime method names.
+        if let summary = nonempty(item["summary"]) {
+            if isProviderRuntimeNoise(summary) {
+                // No user-facing summary — do not invent a generic "Running: tool"
+                // line for provider telemetry methods.
+                return nil
+            }
+            if let friendly = friendlyPreview(summary) {
+                return "Running: \(friendly)"
+            }
         }
         let label = activityLabel(type: type, summary: nil, body: nonempty(item["body"]))
-        return "Running: \(label)"
+        guard let friendly = friendlyPreview(label), !isProviderRuntimeNoise(friendly) else {
+            return nil
+        }
+        // Skip bare type fallbacks when body/summary had no human content.
+        if friendly == type || friendly == "tool" || friendly == "command" {
+            if nonempty(item["body"]) == nil { return nil }
+        }
+        return "Running: \(friendly)"
     }
 
-    private static func itemCompletedPreview(payload: [String: JSONValue]) -> String? {
-        if let summary = nonempty(payload["summary"]) { return summary }
+    nonisolated static func itemCompletedPreview(payload: [String: JSONValue]) -> String? {
+        if let summary = friendlyPreview(nonempty(payload["summary"])) {
+            return "Ran: \(summary)"
+        }
         // completed often carries only item_id; keep prior cache if no text.
         if let state = payload["state"]?.stringValue, state == "failed" {
             return "Failed: tool"
@@ -560,13 +588,36 @@ public final class PetController {
         return nil
     }
 
-    private static func turnCompletedPreview(payload: [String: JSONValue]) -> String? {
-        if let final = nonempty(payload["final"]) { return final }
-        if let final = nonempty(payload["final_message"]) { return final }
+    nonisolated static func turnCompletedPreview(payload: [String: JSONValue]) -> String? {
+        if let final = friendlyPreview(nonempty(payload["final"])) { return final }
+        if let final = friendlyPreview(nonempty(payload["final_message"])) { return final }
         return nil
     }
 
-    private static func activityLabel(type: String, summary: String?, body: String?) -> String {
+    /// Drop provider-runtime telemetry ("claude runtime: …", dotted method ids).
+    nonisolated static func isProviderRuntimeNoise(_ raw: String) -> Bool {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return true }
+        let lower = trimmed.lowercased()
+        if lower.contains(" runtime: ") { return true }
+        if lower.hasPrefix("runtime:") { return true }
+        if trimmed.contains("."), !trimmed.contains(" "),
+           trimmed.unicodeScalars.allSatisfy({
+               CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-")).contains($0)
+           }) {
+            return true
+        }
+        return false
+    }
+
+    nonisolated private static func friendlyPreview(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !isProviderRuntimeNoise(trimmed) else { return nil }
+        return String(trimmed.prefix(140))
+    }
+
+    nonisolated private static func activityLabel(type: String, summary: String?, body: String?) -> String {
         if let summary, !summary.isEmpty { return summary }
         if let body {
             let line = body.split(whereSeparator: \.isNewline).first.map(String.init) ?? body
@@ -575,14 +626,14 @@ public final class PetController {
         }
         switch type {
         case "commandExecution": return "command"
-        case "fileChange": return "file"
+        case "fileChange": return "file edit"
         case "webSearch": return "search"
-        case "mcpToolCall", "dynamicToolCall", "collabToolCall": return "tool"
+        case "mcpToolCall", "dynamicToolCall", "collabToolCall", "tool": return "tool"
         default: return type
         }
     }
 
-    private static func nonempty(_ value: JSONValue?) -> String? {
+    nonisolated private static func nonempty(_ value: JSONValue?) -> String? {
         guard let raw = value?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else { return nil }
