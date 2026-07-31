@@ -1103,7 +1103,10 @@ public final class AppContext {
                     // path still uses deliver(_:) and is never gated here).
                     SystemNotifier.shared.post(content)
                     Task {
-                        await self.privateNotificationBridge.deliverThreadOutcomeRemote(content)
+                        await self.privateNotificationBridge.deliverThreadOutcomeRemote(
+                            content,
+                            phase: status
+                        )
                     }
                 }
             }

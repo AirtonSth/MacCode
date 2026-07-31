@@ -439,7 +439,7 @@ final class AppIdentityNotificationTests: XCTestCase {
             title: "Build fix",
             phase: .completed
         ))
-        await bridge.deliverThreadOutcomeRemote(content)
+        await bridge.deliverThreadOutcomeRemote(content, phase: .completed)
 
         // Visible alert + coalesced silent catch-up wake for iOS auto-sync.
         XCTAssertEqual(api.alertRequests.count, 2)
@@ -463,10 +463,10 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertTrue(silent.idempotencyKey.hasPrefix("catchup."))
     }
 
-    func testPrivateNotificationBridgeSuppressesFinishAlertWhenLiveActivityArmed() async throws {
-        // WHY: with LA on Lock Screen, a second "Thread finished" banner is
-        // redundant — keep silent catch-up so iOS still mirrors host state.
-        let dir = NSTemporaryDirectory() + "RC2PrivateBridgeLA-" + UUID().uuidString
+    func testPrivateNotificationBridgeDoesNotArmFromLegacyLiveActivityTokenAlone() async throws {
+        // WHY: push-to-start / legacy liveActivityToken latches forever and must
+        // not suppress finish banners when no activity_update courier exists.
+        let dir = NSTemporaryDirectory() + "RC2PrivateBridgeLegacy-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
         let accountStore = PrivateAccountSessionStore(repo: ctx.settingsRepo)
         let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
@@ -482,6 +482,53 @@ final class AppIdentityNotificationTests: XCTestCase {
         UserDefaults.standard.removeObject(forKey: "private.silentCatchUp.lastBucket")
         UserDefaults.standard.removeObject(forKey: "private.silentCatchUp.lastBuckets")
 
+        XCTAssertFalse(bridge.isLiveActivityUpdateChannelArmed())
+
+        let content = try XCTUnwrap(RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread-legacy",
+            workspaceId: "ws-legacy",
+            title: "No card yet",
+            phase: .completed
+        ))
+        await bridge.deliverThreadOutcomeRemote(content, phase: .completed)
+
+        XCTAssertEqual(api.alertRequests.count, 2, "legacy token alone must still send visible finish banner")
+        XCTAssertEqual(api.alertRequests.first?.silent, false)
+        XCTAssertEqual(api.alertRequests.first?.title, "Thread finished")
+    }
+
+    func testPrivateNotificationBridgeSuppressesFinishAlertWhenActivityUpdateArmed() async throws {
+        // WHY: with an activity_update courier (LA on Lock Screen), a second
+        // "Thread finished" banner is redundant — keep silent catch-up only.
+        let dir = NSTemporaryDirectory() + "RC2PrivateBridgeLA-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let accountStore = PrivateAccountSessionStore(repo: ctx.settingsRepo)
+        let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
+        let api = RecordingPrivateAccountAPI()
+        accountStore.save(api.session)
+        targetStore.save(
+            pushToken: "apns-token",
+            pushTokenType: "apns",
+            liveActivityToken: nil,
+            deviceId: "device-1"
+        )
+        try targetStore.upsert(PrivatePushTargetRecord(
+            deviceId: "device-1",
+            serverId: "server-1",
+            purpose: .activityUpdate,
+            environment: .sandbox,
+            token: "activity-update-token",
+            activityGeneration: 1,
+            activityId: "activity-1",
+            bootEpoch: 1,
+            activitySessionId: "server-1:1:1",
+            contractVersion: 2,
+            capabilities: ["live_activity_v2"]
+        ))
+        let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
+        UserDefaults.standard.removeObject(forKey: "private.silentCatchUp.lastBucket")
+        UserDefaults.standard.removeObject(forKey: "private.silentCatchUp.lastBuckets")
+
         XCTAssertTrue(bridge.isLiveActivityUpdateChannelArmed())
 
         let content = try XCTUnwrap(RemoteCodeNotificationContent.threadOutcome(
@@ -490,7 +537,7 @@ final class AppIdentityNotificationTests: XCTestCase {
             title: "Ship labels",
             phase: .completed
         ))
-        await bridge.deliverThreadOutcomeRemote(content)
+        await bridge.deliverThreadOutcomeRemote(content, phase: .completed)
 
         XCTAssertEqual(api.alertRequests.count, 1, "only silent catch-up, no visible finish banner")
         let only = try XCTUnwrap(api.alertRequests.first)

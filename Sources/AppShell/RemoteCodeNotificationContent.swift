@@ -47,28 +47,37 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
             !isNestedWorker
         }
 
-        /// Remote "Thread finished/failed/cancelled" APNs banner is redundant on
-        /// Lock Screen when a Live Activity update channel can already show the
-        /// terminal phase. Attention (approval/question) is never gated here.
+        /// Remote terminal APNs banner when a Live Activity card can already
+        /// show the outcome. Attention (approval/question) is never gated here.
+        ///
+        /// - Not armed → always deliver (no LA cover).
+        /// - Armed + cancelled → still deliver: LA soft-maps cancel toward a
+        ///   "ready" phase, so the explicit "Thread cancelled" banner is the
+        ///   only clear stop signal.
+        /// - Armed + completed/failed/interrupted → suppress (LA covers it).
         public static func shouldDeliverRemoteFinishAlert(
+            phase: AgentRunStatus,
             liveActivityUpdateChannelArmed: Bool
         ) -> Bool {
-            !liveActivityUpdateChannelArmed
+            guard liveActivityUpdateChannelArmed else { return true }
+            switch phase {
+            case .cancelled:
+                return true
+            case .completed, .failed, .interrupted:
+                return false
+            case .pending, .running:
+                return false
+            }
         }
 
-        /// Host-side armed check: legacy push-to-start/liveActivityToken **or**
-        /// any non-empty activity_update courier means iOS can receive LA
-        /// content-state (including terminal end). Pure for unit tests.
+        /// Host-side armed check: a **current** activity_update courier (not
+        /// push-to-start / legacy liveActivityToken). Legacy start tokens latch
+        /// for the life of the install and would suppress finish banners forever
+        /// even with no card on Lock Screen.
         public static func isLiveActivityUpdateChannelArmed(
-            legacyLiveActivityToken: String?,
             activityUpdateTokens: [String]
         ) -> Bool {
-            if let token = legacyLiveActivityToken?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-               !token.isEmpty {
-                return true
-            }
-            return activityUpdateTokens.contains {
+            activityUpdateTokens.contains {
                 !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             }
         }

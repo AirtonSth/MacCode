@@ -1196,31 +1196,32 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
     /// Test seam: observe the durable silent-wake outbox.
     public var silentWakeOutboxForTests: SilentWakeOutbox { silentWakeOutbox }
 
-    /// Whether the paired device can receive Live Activity content-state
-    /// (legacy liveActivityToken and/or activity_update couriers). Pure policy
-    /// lives on `AgentAppPushPolicy`; this is the store-backed lookup.
+    /// Whether the paired device has an activity_update courier (active LA
+    /// update channel). Pure policy lives on `AgentAppPushPolicy`.
     public func isLiveActivityUpdateChannelArmed() -> Bool {
-        let legacy = pushTargetStore.load()?.liveActivityToken
         let updateTokens = ((try? pushTargetStore.records()) ?? [])
             .filter { $0.purpose == .activityUpdate }
             .map(\.token)
         return RemoteCodeNotificationContent.AgentAppPushPolicy
-            .isLiveActivityUpdateChannelArmed(
-                legacyLiveActivityToken: legacy,
-                activityUpdateTokens: updateTokens
-            )
+            .isLiveActivityUpdateChannelArmed(activityUpdateTokens: updateTokens)
     }
 
     /// Terminal main-agent finish remote path: suppress the visible APNs banner
     /// when a Live Activity update channel is already armed (Lock Screen covers
-    /// the outcome). Still forces silent catch-up so iOS mirrors host state.
-    /// Attention / user-action banners must use `deliver(_:)` instead.
-    public func deliverThreadOutcomeRemote(_ content: RemoteCodeNotificationContent) async {
+    /// completed/failed). Cancelled still alerts. Always forces silent catch-up
+    /// when suppressed so iOS mirrors host state. Attention uses `deliver(_:)`.
+    public func deliverThreadOutcomeRemote(
+        _ content: RemoteCodeNotificationContent,
+        phase: AgentRunStatus
+    ) async {
         let armed = isLiveActivityUpdateChannelArmed()
         guard RemoteCodeNotificationContent.AgentAppPushPolicy
-            .shouldDeliverRemoteFinishAlert(liveActivityUpdateChannelArmed: armed) else {
+            .shouldDeliverRemoteFinishAlert(
+                phase: phase,
+                liveActivityUpdateChannelArmed: armed
+            ) else {
             Self.log.info(
-                "remote_finish_alert_suppressed reason=live_activity_channel_armed id=\(content.identifier, privacy: .public)"
+                "remote_finish_alert_suppressed reason=live_activity_channel_armed phase=\(String(describing: phase), privacy: .public) id=\(content.identifier, privacy: .public)"
             )
             await deliverSilentCatchUp(
                 hostHint: content.userInfo["workspaceId"] ?? content.identifier,
