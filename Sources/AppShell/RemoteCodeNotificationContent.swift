@@ -46,6 +46,32 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
         public static func shouldNotifyUserAction(isNestedWorker: Bool) -> Bool {
             !isNestedWorker
         }
+
+        /// Remote "Thread finished/failed/cancelled" APNs banner is redundant on
+        /// Lock Screen when a Live Activity update channel can already show the
+        /// terminal phase. Attention (approval/question) is never gated here.
+        public static func shouldDeliverRemoteFinishAlert(
+            liveActivityUpdateChannelArmed: Bool
+        ) -> Bool {
+            !liveActivityUpdateChannelArmed
+        }
+
+        /// Host-side armed check: legacy push-to-start/liveActivityToken **or**
+        /// any non-empty activity_update courier means iOS can receive LA
+        /// content-state (including terminal end). Pure for unit tests.
+        public static func isLiveActivityUpdateChannelArmed(
+            legacyLiveActivityToken: String?,
+            activityUpdateTokens: [String]
+        ) -> Bool {
+            if let token = legacyLiveActivityToken?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !token.isEmpty {
+                return true
+            }
+            return activityUpdateTokens.contains {
+                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+        }
     }
 
     /// Pure helper: maps a run outcome to (title, body, identifier suffix, threadIdentifier).

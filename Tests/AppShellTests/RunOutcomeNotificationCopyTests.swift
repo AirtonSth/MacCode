@@ -293,4 +293,54 @@ final class RunOutcomeNotificationCopyTests: XCTestCase {
             )
         )
     }
+
+    // MARK: - Finish banner vs Live Activity redundancy
+
+    func testRemoteFinishAlertSuppressedWhenLiveActivityChannelArmed() {
+        // WHY: Lock Screen already shows terminal LA state — a second
+        // "Thread finished" banner is noise. Attention is a different path.
+        XCTAssertFalse(
+            RemoteCodeNotificationContent.AgentAppPushPolicy.shouldDeliverRemoteFinishAlert(
+                liveActivityUpdateChannelArmed: true
+            )
+        )
+        XCTAssertTrue(
+            RemoteCodeNotificationContent.AgentAppPushPolicy.shouldDeliverRemoteFinishAlert(
+                liveActivityUpdateChannelArmed: false
+            )
+        )
+        // Attention policy is independent of LA arming.
+        XCTAssertTrue(
+            RemoteCodeNotificationContent.AgentAppPushPolicy.shouldNotifyUserAction(
+                isNestedWorker: false
+            )
+        )
+    }
+
+    func testLiveActivityChannelArmedFromLegacyOrActivityUpdateToken() {
+        XCTAssertFalse(
+            RemoteCodeNotificationContent.AgentAppPushPolicy.isLiveActivityUpdateChannelArmed(
+                legacyLiveActivityToken: nil,
+                activityUpdateTokens: []
+            )
+        )
+        XCTAssertFalse(
+            RemoteCodeNotificationContent.AgentAppPushPolicy.isLiveActivityUpdateChannelArmed(
+                legacyLiveActivityToken: "   ",
+                activityUpdateTokens: ["", "  "]
+            )
+        )
+        XCTAssertTrue(
+            RemoteCodeNotificationContent.AgentAppPushPolicy.isLiveActivityUpdateChannelArmed(
+                legacyLiveActivityToken: "legacy-la-token",
+                activityUpdateTokens: []
+            )
+        )
+        XCTAssertTrue(
+            RemoteCodeNotificationContent.AgentAppPushPolicy.isLiveActivityUpdateChannelArmed(
+                legacyLiveActivityToken: nil,
+                activityUpdateTokens: ["activity-update-token"]
+            )
+        )
+    }
 }

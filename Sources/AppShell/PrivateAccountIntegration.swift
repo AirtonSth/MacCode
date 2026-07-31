@@ -1196,6 +1196,42 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
     /// Test seam: observe the durable silent-wake outbox.
     public var silentWakeOutboxForTests: SilentWakeOutbox { silentWakeOutbox }
 
+    /// Whether the paired device can receive Live Activity content-state
+    /// (legacy liveActivityToken and/or activity_update couriers). Pure policy
+    /// lives on `AgentAppPushPolicy`; this is the store-backed lookup.
+    public func isLiveActivityUpdateChannelArmed() -> Bool {
+        let legacy = pushTargetStore.load()?.liveActivityToken
+        let updateTokens = ((try? pushTargetStore.records()) ?? [])
+            .filter { $0.purpose == .activityUpdate }
+            .map(\.token)
+        return RemoteCodeNotificationContent.AgentAppPushPolicy
+            .isLiveActivityUpdateChannelArmed(
+                legacyLiveActivityToken: legacy,
+                activityUpdateTokens: updateTokens
+            )
+    }
+
+    /// Terminal main-agent finish remote path: suppress the visible APNs banner
+    /// when a Live Activity update channel is already armed (Lock Screen covers
+    /// the outcome). Still forces silent catch-up so iOS mirrors host state.
+    /// Attention / user-action banners must use `deliver(_:)` instead.
+    public func deliverThreadOutcomeRemote(_ content: RemoteCodeNotificationContent) async {
+        let armed = isLiveActivityUpdateChannelArmed()
+        guard RemoteCodeNotificationContent.AgentAppPushPolicy
+            .shouldDeliverRemoteFinishAlert(liveActivityUpdateChannelArmed: armed) else {
+            Self.log.info(
+                "remote_finish_alert_suppressed reason=live_activity_channel_armed id=\(content.identifier, privacy: .public)"
+            )
+            await deliverSilentCatchUp(
+                hostHint: content.userInfo["workspaceId"] ?? content.identifier,
+                force: true,
+                coalesceClass: .other
+            )
+            return
+        }
+        await deliver(content)
+    }
+
     public func deliver(_ content: RemoteCodeNotificationContent) async {
         guard let session = accountStore.load() else {
             recordWakeNotSent(reason: "no_session")

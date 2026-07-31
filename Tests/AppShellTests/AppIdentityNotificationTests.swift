@@ -439,7 +439,7 @@ final class AppIdentityNotificationTests: XCTestCase {
             title: "Build fix",
             phase: .completed
         ))
-        await bridge.deliver(content)
+        await bridge.deliverThreadOutcomeRemote(content)
 
         // Visible alert + coalesced silent catch-up wake for iOS auto-sync.
         XCTAssertEqual(api.alertRequests.count, 2)
@@ -461,6 +461,42 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertTrue(silent.silent, "second request must be the silent content-available catch-up")
         XCTAssertEqual(silent.data["rc2_catch_up"], "1")
         XCTAssertTrue(silent.idempotencyKey.hasPrefix("catchup."))
+    }
+
+    func testPrivateNotificationBridgeSuppressesFinishAlertWhenLiveActivityArmed() async throws {
+        // WHY: with LA on Lock Screen, a second "Thread finished" banner is
+        // redundant — keep silent catch-up so iOS still mirrors host state.
+        let dir = NSTemporaryDirectory() + "RC2PrivateBridgeLA-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let accountStore = PrivateAccountSessionStore(repo: ctx.settingsRepo)
+        let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
+        let api = RecordingPrivateAccountAPI()
+        accountStore.save(api.session)
+        targetStore.save(
+            pushToken: "apns-token",
+            pushTokenType: "apns",
+            liveActivityToken: "legacy-la-token",
+            deviceId: "device-1"
+        )
+        let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
+        UserDefaults.standard.removeObject(forKey: "private.silentCatchUp.lastBucket")
+        UserDefaults.standard.removeObject(forKey: "private.silentCatchUp.lastBuckets")
+
+        XCTAssertTrue(bridge.isLiveActivityUpdateChannelArmed())
+
+        let content = try XCTUnwrap(RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread-2",
+            workspaceId: "ws-2",
+            title: "Ship labels",
+            phase: .completed
+        ))
+        await bridge.deliverThreadOutcomeRemote(content)
+
+        XCTAssertEqual(api.alertRequests.count, 1, "only silent catch-up, no visible finish banner")
+        let only = try XCTUnwrap(api.alertRequests.first)
+        XCTAssertTrue(only.silent)
+        XCTAssertEqual(only.data["rc2_catch_up"], "1")
+        XCTAssertNotEqual(only.title, "Thread finished")
     }
 
     func testLiveActivitySnapshotContentStateMatchesOnDeviceSchemaKeys() throws {

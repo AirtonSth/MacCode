@@ -1098,9 +1098,12 @@ public final class AppContext {
                     phase: status,
                     isNestedWorker: self.isNestedAgentWorker(runId: rid, threadId: tid)
                 ) {
+                    // Mac desktop toast always. Remote iOS banner is suppressed
+                    // when Live Activity already covers Lock Screen (attention
+                    // path still uses deliver(_:) and is never gated here).
                     SystemNotifier.shared.post(content)
                     Task {
-                        await self.privateNotificationBridge.deliver(content)
+                        await self.privateNotificationBridge.deliverThreadOutcomeRemote(content)
                     }
                 }
             }
