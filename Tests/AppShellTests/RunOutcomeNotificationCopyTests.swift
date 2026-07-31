@@ -199,4 +199,98 @@ final class RunOutcomeNotificationCopyTests: XCTestCase {
                        "interrupted (provider crash) maps to failed copy, not cancelled, because the user did not stop it")
         XCTAssertEqual(content?.userInfo["outcome"], "failed")
     }
+
+    // MARK: - Main-agent / subagent push policy
+
+    func testNestedWorkerReceiptIsDetected() {
+        // WHY: subagents must never produce Agent App push banners.
+        XCTAssertTrue(
+            RemoteCodeNotificationContent.AgentAppPushPolicy.isNestedWorker(
+                parentReceiptId: UUID(),
+                nodeId: "root"
+            )
+        )
+        XCTAssertTrue(
+            RemoteCodeNotificationContent.AgentAppPushPolicy.isNestedWorker(
+                parentReceiptId: nil,
+                nodeId: "worker-1"
+            )
+        )
+        XCTAssertFalse(
+            RemoteCodeNotificationContent.AgentAppPushPolicy.isNestedWorker(
+                parentReceiptId: nil,
+                nodeId: "root"
+            )
+        )
+        XCTAssertFalse(
+            RemoteCodeNotificationContent.AgentAppPushPolicy.isNestedWorker(
+                parentReceiptId: nil,
+                nodeId: nil
+            )
+        )
+    }
+
+    func testThreadOutcomeSuppressedForNestedWorkers() {
+        XCTAssertNil(
+            RemoteCodeNotificationContent.threadOutcome(
+                threadId: "child",
+                title: "subagent work",
+                phase: .completed,
+                isNestedWorker: true
+            ),
+            "nested/subagent finish must not create a push notification"
+        )
+        XCTAssertNotNil(
+            RemoteCodeNotificationContent.threadOutcome(
+                threadId: "main",
+                title: "parent work",
+                phase: .completed,
+                isNestedWorker: false
+            ),
+            "main agent finish must still notify"
+        )
+    }
+
+    func testUserActionPushMainOnly() {
+        XCTAssertNil(
+            RemoteCodeNotificationContent.userActionNeeded(
+                threadId: "child",
+                threadTitle: "worker",
+                actionTitle: "Approve: Run command",
+                requestId: "r1",
+                isNestedWorker: true
+            ),
+            "subagent approval must not push"
+        )
+        let content = RemoteCodeNotificationContent.userActionNeeded(
+            threadId: "main",
+            workspaceId: "ws-1",
+            threadTitle: "ship labels",
+            actionTitle: "Approve: Run command",
+            requestId: "r2",
+            isNestedWorker: false
+        )
+        XCTAssertEqual(content?.title, "Approve: Run command")
+        XCTAssertEqual(content?.userInfo["threadId"], "main")
+        XCTAssertEqual(content?.userInfo["workspaceId"], "ws-1")
+        XCTAssertEqual(content?.userInfo["outcome"], "attention")
+        XCTAssertTrue(content?.body.contains("ship labels") == true)
+    }
+
+    func testRunningPhaseNeverNotifiesEvenForMainAgent() {
+        XCTAssertFalse(
+            RemoteCodeNotificationContent.AgentAppPushPolicy.shouldNotifyThreadOutcome(
+                phase: .running,
+                isNestedWorker: false
+            )
+        )
+        XCTAssertNil(
+            RemoteCodeNotificationContent.threadOutcome(
+                threadId: "t",
+                title: "live",
+                phase: .running,
+                isNestedWorker: false
+            )
+        )
+    }
 }

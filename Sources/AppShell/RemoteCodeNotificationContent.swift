@@ -13,6 +13,41 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
     public static let threadUpdateCategoryIdentifier = "RemoteCodeThreadUpdate"
     public static let openActionIdentifier = "thread.open"
 
+    /// Agent App visible push policy (main agent only).
+    ///
+    /// - Subagent / nested orchestration workers never produce push banners.
+    /// - Main agent banners only for terminal outcomes or user-action requests
+    ///   (approval / question). Mid-run progress stays stream-only.
+    public enum AgentAppPushPolicy: Sendable {
+        /// Orchestration receipts with a parent are nested workers (subagents).
+        public static func isNestedWorker(
+            parentReceiptId: UUID?,
+            nodeId: String?
+        ) -> Bool {
+            if parentReceiptId != nil { return true }
+            guard let nodeId else { return false }
+            let trimmed = nodeId.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !trimmed.isEmpty && trimmed != "root"
+        }
+
+        public static func shouldNotifyThreadOutcome(
+            phase: AgentRunStatus,
+            isNestedWorker: Bool
+        ) -> Bool {
+            guard !isNestedWorker else { return false }
+            switch phase {
+            case .completed, .failed, .interrupted, .cancelled:
+                return true
+            case .pending, .running:
+                return false
+            }
+        }
+
+        public static func shouldNotifyUserAction(isNestedWorker: Bool) -> Bool {
+            !isNestedWorker
+        }
+    }
+
     /// Pure helper: maps a run outcome to (title, body, identifier suffix, threadIdentifier).
     /// Extracted for testability without touching UNUserNotificationCenter.
     nonisolated static func outcomeNotificationParts(
@@ -51,8 +86,14 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
         threadId: String,
         workspaceId: String? = nil,
         title: String?,
-        phase: AgentRunStatus
+        phase: AgentRunStatus,
+        isNestedWorker: Bool = false
     ) -> RemoteCodeNotificationContent? {
+        guard AgentAppPushPolicy.shouldNotifyThreadOutcome(
+            phase: phase,
+            isNestedWorker: isNestedWorker
+        ) else { return nil }
+
         let normalizedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
         let displayTitle = (normalizedTitle?.isEmpty == false) ? normalizedTitle! : "Thread"
 
@@ -81,6 +122,44 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
             body: parts.body,
             categoryIdentifier: Self.threadUpdateCategoryIdentifier,
             threadIdentifier: parts.threadIdentifier,
+            userInfo: userInfo
+        )
+    }
+
+    /// Visible push when the main agent needs the user (approval / question).
+    /// Never used for nested/subagent workers.
+    public static func userActionNeeded(
+        threadId: String,
+        workspaceId: String? = nil,
+        threadTitle: String?,
+        actionTitle: String,
+        requestId: String,
+        isNestedWorker: Bool = false
+    ) -> RemoteCodeNotificationContent? {
+        guard AgentAppPushPolicy.shouldNotifyUserAction(isNestedWorker: isNestedWorker) else {
+            return nil
+        }
+        let normalizedThread = threadTitle?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayThread = (normalizedThread?.isEmpty == false) ? normalizedThread! : "Thread"
+        let normalizedAction = actionTitle
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let action = normalizedAction.isEmpty ? "Action needed" : normalizedAction
+        var userInfo: [String: String] = [
+            "threadId": threadId,
+            "outcome": "attention",
+            "requestId": requestId,
+            "category": Self.threadUpdateCategoryIdentifier,
+        ]
+        if let workspaceId, !workspaceId.trimmingCharacters(in: .whitespaces).isEmpty {
+            userInfo["workspaceId"] = workspaceId
+        }
+        return RemoteCodeNotificationContent(
+            identifier: "thread.\(threadId).attention.\(requestId)",
+            title: action,
+            body: "\(displayThread) needs your attention.",
+            categoryIdentifier: Self.threadUpdateCategoryIdentifier,
+            threadIdentifier: threadId,
             userInfo: userInfo
         )
     }

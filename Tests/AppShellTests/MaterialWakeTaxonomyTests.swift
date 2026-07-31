@@ -3,9 +3,9 @@ import XCTest
 
 final class MaterialWakeTaxonomyTests: XCTestCase {
     func testPhaseACriticalLifecycleClassifications() {
-        // WHY: run lifecycle kinds already have producers; they must keep waking
-        // a suspended phone for started/completed/failed transitions.
-        XCTAssertEqual(MaterialWakeTaxonomy.classification(forEventKind: "agent.run.started"), .criticalAlertAndSilent)
+        // WHY: terminal lifecycle + security kinds wake a suspended phone.
+        // agent.run.started is not a push trigger (finish / user-action only).
+        XCTAssertEqual(MaterialWakeTaxonomy.classification(forEventKind: "agent.run.started"), .streamOnly)
         XCTAssertEqual(MaterialWakeTaxonomy.classification(forEventKind: "agent.run.completed"), .criticalAlertAndSilent)
         XCTAssertEqual(MaterialWakeTaxonomy.classification(forEventKind: "agent.run.failed"), .criticalAlertAndSilent)
         XCTAssertEqual(MaterialWakeTaxonomy.classification(forEventKind: "host.boot_epoch"), .silentForce)
@@ -73,7 +73,7 @@ final class MaterialWakeTaxonomyTests: XCTestCase {
         )
         XCTAssertEqual(
             MaterialWakeTaxonomy.coalesceClass(forEventKind: "agent.run.started"),
-            .runProgress
+            .other
         )
         XCTAssertEqual(
             MaterialWakeTaxonomy.coalesceClass(forEventKind: "agent.request.opened"),

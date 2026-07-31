@@ -1090,6 +1090,12 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         )
     }
 
+    /// Lookup the durable admission receipt for a run, if any.
+    /// Used by host notification policy to suppress subagent push banners.
+    public func admissionReceipt(for runId: AgentRunID) throws -> AgentOrchestrationAdmissionReceipt? {
+        try repository.receipt(runId: runId)
+    }
+
     public func autoConfiguration(
         replacing configuration: AgentRoutingConfiguration,
         expectedRevision: Int,

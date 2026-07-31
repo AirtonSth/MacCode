@@ -954,6 +954,13 @@ public final class AppContext {
                 ]
                 if let turnId = request.turnId { requestPayload["turn_id"] = .string(turnId) }
                 EventBus.shared.publish(kind: "agent.request.opened", payload: .object(requestPayload))
+                // Visible push for main-agent approvals only (subagents stay quiet).
+                self.postAgentUserActionPushIfNeeded(
+                    threadId: tid,
+                    runId: runId,
+                    requestId: request.id,
+                    actionTitle: "Approve: \(PetApprovalActionLabel.label(for: request.kind))"
+                )
             case .requestResolved(let requestId, let state):
                 try? self.providerPendingCallbackRepo.resolve(threadId: tid, requestId: requestId, kind: .approval, state: state)
                 EventBus.shared.publish(kind: "agent.request.resolved", payload: .object([
@@ -989,6 +996,12 @@ public final class AppContext {
                 ]
                 if let turnId = request.turnId { userInputPayload["turn_id"] = .string(turnId) }
                 EventBus.shared.publish(kind: "agent.user_input.requested", payload: .object(userInputPayload))
+                self.postAgentUserActionPushIfNeeded(
+                    threadId: tid,
+                    runId: runId,
+                    requestId: request.id,
+                    actionTitle: request.isSecret ? "Secret input requested" : "Input requested"
+                )
             case .userInputResolved(let requestId, let answer):
                 try? self.providerPendingCallbackRepo.resolve(threadId: tid, requestId: requestId, kind: .userInput, state: .resolved)
                 EventBus.shared.publish(kind: "agent.user_input.resolved", payload: .object([
@@ -1076,11 +1089,14 @@ public final class AppContext {
                 // window; otherwise Force gets one premature drain and the promoted
                 // message remains stranded with no later lifecycle callback.
                 self.ensureQueueDrainWaiterIfNeeded(threadId: tid)
+                // Main agent only: nested/subagent workers must not fire
+                // system or private push banners (parent owns user-facing UX).
                 if let content = RemoteCodeNotificationContent.threadOutcome(
                     threadId: tid.value.uuidString,
                     workspaceId: (try? self.threadRepo.get(id: tid)?.workspaceId)?.value.uuidString,
                     title: try? self.threadRepo.get(id: tid)?.title,
-                    phase: status
+                    phase: status,
+                    isNestedWorker: self.isNestedAgentWorker(runId: rid, threadId: tid)
                 ) {
                     SystemNotifier.shared.post(content)
                     Task {
@@ -1555,6 +1571,51 @@ public final class AppContext {
                 .path
         }
         return env
+    }
+
+    /// Nested orchestration workers (subagents) carry a parent receipt. Main
+    /// agent root runs have `parentReceiptId == nil` and `nodeId == "root"`.
+    func isNestedAgentWorker(runId: AgentRunID, threadId: AgentThreadID) -> Bool {
+        if let receipt = try? orchestrationRuntime.admissionReceipt(for: runId),
+           RemoteCodeNotificationContent.AgentAppPushPolicy.isNestedWorker(
+            parentReceiptId: receipt.parentReceiptId,
+            nodeId: receipt.nodeId
+           ) {
+            return true
+        }
+        // Fall back when the event only carries the thread id of a nested worker.
+        if let active = try? runRepo.latestActive(for: threadId),
+           let receipt = try? orchestrationRuntime.admissionReceipt(for: active.id),
+           RemoteCodeNotificationContent.AgentAppPushPolicy.isNestedWorker(
+            parentReceiptId: receipt.parentReceiptId,
+            nodeId: receipt.nodeId
+           ) {
+            return true
+        }
+        return false
+    }
+
+    /// System + private APNs banner when the main agent needs the user.
+    /// Subagent / nested workers never produce push (parent owns UX).
+    func postAgentUserActionPushIfNeeded(
+        threadId: AgentThreadID,
+        runId: AgentRunID,
+        requestId: String,
+        actionTitle: String
+    ) {
+        let nested = isNestedAgentWorker(runId: runId, threadId: threadId)
+        guard let content = RemoteCodeNotificationContent.userActionNeeded(
+            threadId: threadId.value.uuidString,
+            workspaceId: (try? threadRepo.get(id: threadId)?.workspaceId)?.value.uuidString,
+            threadTitle: try? threadRepo.get(id: threadId)?.title,
+            actionTitle: actionTitle,
+            requestId: requestId,
+            isNestedWorker: nested
+        ) else { return }
+        SystemNotifier.shared.post(content)
+        Task {
+            await privateNotificationBridge.deliver(content)
+        }
     }
 
     /// Always-on, content-free metadata for the provider-neutral Subagents

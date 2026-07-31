@@ -37,8 +37,9 @@ public enum MaterialWakeCoalesceClass: String, Sendable, Equatable, CaseIterable
 /// Frozen kind → wake class map (plan A-003 default). Expansions only via phase flags.
 public enum MaterialWakeTaxonomy: Sendable {
     /// Core Phase A lifecycle kinds that already have producers under `wake_phase_a`.
+    /// Note: `agent.run.started` is intentionally excluded — Agent App visible
+    /// push is only for terminal outcomes / user-action requests (main agent).
     public static let phaseACoreKinds: Set<String> = [
-        "agent.run.started",
         "agent.run.completed",
         "agent.run.failed",
         "host.boot_epoch",
@@ -62,13 +63,15 @@ public enum MaterialWakeTaxonomy: Sendable {
 
     public static func classification(forEventKind kind: String) -> MaterialWakeClass {
         switch kind {
-        case "agent.run.started",
-             "agent.run.completed",
+        case "agent.run.completed",
              "agent.run.failed",
              "agent.request.opened",
              "agent.user_input.requested",
              "agent.run.error":
             return .criticalAlertAndSilent
+        // Mid-run start is not a user-facing push trigger (finish / action only).
+        case "agent.run.started":
+            return .streamOnly
         case "notification.created":
             return .silent
         case "host.boot_epoch":
@@ -114,8 +117,10 @@ public enum MaterialWakeTaxonomy: Sendable {
              "agent.run.error",
              "agent.run.failed":
             return .attention
-        case "agent.run.started", "agent.run.completed":
+        case "agent.run.completed":
             return .runProgress
+        case "agent.run.started":
+            return .other
         case "notification.created":
             return .notification
         case "host.boot_epoch":
