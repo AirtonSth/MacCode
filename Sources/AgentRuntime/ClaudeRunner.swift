@@ -109,6 +109,8 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             // Claude CLI command hooks take a shell command string; subcommand
             // args ride on the same string (no separate args field).
             let command = "\(distillPath) hook post-tool-use"
+            // 45s: nested advisors often compress multi-file Read/Grep payloads;
+            // 10s caused silent fail-open (zero model-mode rows on large nested turns).
             settings["hooks"] = [
                 "PostToolUse": [
                     [
@@ -117,7 +119,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
                             [
                                 "type": "command",
                                 "command": command,
-                                "timeout": 10
+                                "timeout": 45
                             ] as [String: Any]
                         ]
                     ] as [String: Any]

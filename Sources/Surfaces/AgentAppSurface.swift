@@ -9778,8 +9778,8 @@ public struct AgentAppView: View {
     ///
     /// - Requires `measuredTokens > 0` so estimates only **raise** a proven ledger
     ///   figure — never invent a chip from assistant text alone.
-    /// - Product copy (locked): "You saved N tokens in this thread"
-    ///   + optional " + Auto used cheaper models at the same quality".
+    /// - Product copy: measured **tool-output / command-output** ledger savings
+    ///   (not total provider bill / cumulative usage). Optional Auto note.
     nonisolated static func tokenSaverThreadFooterText(
         displayTokens: Int,
         measuredTokens: Int,
@@ -9788,7 +9788,9 @@ public struct AgentAppView: View {
     ) -> String? {
         guard enabled, measuredTokens > 0, displayTokens > 0 else { return nil }
         let amount = formatTokenCountForFooter(displayTokens)
-        let base = "Token Saver: You saved \(amount) tokens in this thread"
+        // Explicit scope so users do not equate this chip with provider
+        // actualTokens / context size (often multi-million on long Grok runs).
+        let base = "Token Saver: \(amount) tool-output tokens saved (local ledger; not total provider usage)"
         if autoRoutingActive {
             return base + " + Auto used cheaper models at the same quality"
         }
@@ -9858,8 +9860,8 @@ public struct AgentAppView: View {
             .accessibilityIdentifier("agent.tokenSaver.threadFooter")
             .help(
                 autoRouting
-                    ? "Tokens saved in this thread, plus Auto routing to cheaper models without dropping quality"
-                    : "Token Saver estimated savings for this thread (local ledger + credible legs)"
+                    ? "Measured tool/command-output savings from the local Token Saver ledger (not full provider usage), plus Auto routing to cheaper models"
+                    : "Measured tool/command-output savings from the local Token Saver ledger only — not total provider or context tokens"
             )
             .transition(.opacity.combined(with: .move(edge: .top)))
         }

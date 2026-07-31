@@ -63,12 +63,12 @@ const SUPPORTED_IMAGE_MIME_TYPES = new Set([
 const TOKEN_SAVER_MIN_BYTES = 1024;
 const TOKEN_SAVER_MIN_LINES = 10;
 const TOKEN_SAVER_STORE_MIN_BYTES = 2048;
-const TOKEN_SAVER_HOOK_TIMEOUT_MS = 1000;
-// Exact-byte tools + Skill content are the ONLY carve-outs: distilling file
-// content / edit echoes would break verbatim edits, and skill bodies must stay
-// complete (never Distill/summary/handle). Every OTHER tool is compressed
-// (no allowlist).
-const TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['read', 'edit', 'write', 'multiedit', 'notebookedit', 'grep', 'skill']);
+// Nested large Read/Grep + sidecar RTT; 1s caused silent fail-open / zero model-mode.
+const TOKEN_SAVER_HOOK_TIMEOUT_MS = 45000;
+// Edit echoes + Skill bodies stay full (verbatim edits / complete skills).
+// Read/Grep are compressed with reversible [[rc:handle]] so large exploration
+// reaches the ledger (previously excluded → near-zero PTU savings on advisors).
+const TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['edit', 'write', 'multiedit', 'notebookedit', 'skill']);
 // AGENTS.md: never distill exact-output shell tools. Bash commands whose primary
 // binary is one of these must stay full stdout for line slices / matches.
 const TOKEN_SAVER_EXACT_OUTPUT_BASH = new Set([
@@ -384,7 +384,7 @@ async function tokenSaverPostToolUse(input) {
     // honest; rare edge cases where the marker tips length are fail-open.
     recordSavings: true,
     runMode: 'optimize',
-    maxOutputCharacters: Math.max(512, Math.min(rawOutput.length, 12000)),
+    maxOutputCharacters: Math.max(512, Math.min(rawOutput.length, 48000)),
     cacheState: 'tool_output_hooked',
     reversibleStoreMinBytes: TOKEN_SAVER_STORE_MIN_BYTES,
   });

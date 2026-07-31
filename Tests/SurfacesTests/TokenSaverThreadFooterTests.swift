@@ -32,24 +32,30 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         ))
     }
 
-    func test_footerText_measuredOnly_usesYouSavedCopy() {
-        // WHY: product-locked first-person claim.
+    func test_footerText_measuredOnly_usesLedgerNotProviderUsageCopy() {
+        // WHY: chip must not be read as total provider/context usage (e.g. 6.6M).
         let text = AgentAppView.tokenSaverThreadFooterText(
             displayTokens: 100_000,
             measuredTokens: 100_000,
             enabled: true
         )
-        XCTAssertEqual(text, "Token Saver: You saved 100K tokens in this thread")
+        XCTAssertEqual(
+            text,
+            "Token Saver: 100K tool-output tokens saved (local ledger; not total provider usage)"
+        )
     }
 
-    func test_footerText_estimatedAboveMeasured_stillUsesYouSavedCopy() {
-        // WHY: figure may include dialect/graphify legs, but copy stays "You saved".
+    func test_footerText_estimatedAboveMeasured_stillUsesLedgerScopeCopy() {
+        // WHY: figure may include dialect/graphify legs; still tool-output ledger scope.
         let text = AgentAppView.tokenSaverThreadFooterText(
             displayTokens: 150_000,
             measuredTokens: 100_000,
             enabled: true
         )
-        XCTAssertEqual(text, "Token Saver: You saved 150K tokens in this thread")
+        XCTAssertEqual(
+            text,
+            "Token Saver: 150K tool-output tokens saved (local ledger; not total provider usage)"
+        )
     }
 
     func test_footerText_autoRouting_usesPlusAutoNote() {
@@ -62,7 +68,7 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         )
         XCTAssertEqual(
             text,
-            "Token Saver: You saved 3.1K tokens in this thread + Auto used cheaper models at the same quality"
+            "Token Saver: 3.1K tool-output tokens saved (local ledger; not total provider usage) + Auto used cheaper models at the same quality"
         )
     }
 
@@ -75,7 +81,7 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         )
         XCTAssertEqual(
             text,
-            "Token Saver: You saved 3.1K tokens in this thread + Auto used cheaper models at the same quality"
+            "Token Saver: 3.1K tool-output tokens saved (local ledger; not total provider usage) + Auto used cheaper models at the same quality"
         )
     }
 
@@ -91,9 +97,27 @@ final class TokenSaverThreadFooterTests: XCTestCase {
             measuredTokens: 410_000,
             enabled: true
         )
-        XCTAssertEqual(first, "Token Saver: You saved 12.5K tokens in this thread")
-        XCTAssertEqual(later, "Token Saver: You saved 410K tokens in this thread")
+        XCTAssertEqual(
+            first,
+            "Token Saver: 12.5K tool-output tokens saved (local ledger; not total provider usage)"
+        )
+        XCTAssertEqual(
+            later,
+            "Token Saver: 410K tool-output tokens saved (local ledger; not total provider usage)"
+        )
         XCTAssertNotEqual(first, later)
+    }
+
+    func test_footerText_explicitlySeparatesFromProviderUsage() {
+        // WHY: item 4 — never present ledger chip as total provider actualTokens.
+        let text = AgentAppView.tokenSaverThreadFooterText(
+            displayTokens: 3_800,
+            measuredTokens: 3_399,
+            enabled: true
+        )!
+        XCTAssertTrue(text.contains("tool-output"))
+        XCTAssertTrue(text.contains("not total provider usage"))
+        XCTAssertFalse(text.localizedCaseInsensitiveContains("you saved"))
     }
 
     func test_displayTokens_atLeastMeasuredWhenEnabled() {

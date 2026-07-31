@@ -240,8 +240,10 @@ public struct ManagedDistillCLI: Sendable {
             toolName: toolName,
             toolInput: envelope["tool_input"]
         )
-        // Cap matches ClaudeAgentSDKBridge post-tool-use: [512, min(len, 12000)].
-        let maxChars = max(512, min(rawOutput.count, 12_000))
+        // Cap raised from 12k→48k so large Read/Grep tool results can reach the
+        // sidecar model stage (and ledger as command-output (model)), not only a
+        // tiny deterministic head. Floor stays 512.
+        let maxChars = max(512, min(rawOutput.count, 48_000))
         // Nested CLI reuses the same compress + recordSavings path (including Wave A).
         let nested = ManagedDistillCLI(
             arguments: [question],
