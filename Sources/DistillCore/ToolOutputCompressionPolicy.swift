@@ -25,6 +25,9 @@ public enum ToolCompressionSkipReason: String, Sendable, Equatable {
     case excludedTool = "excluded_tool"
     case notAllowlisted = "not_allowlisted"
     case belowThreshold = "below_threshold"
+    case multimodalImage = "multimodal_image"
+    /// Bash/shell tool whose `command` is exact-output (rg/sed/cat/…) or exact git blob/match.
+    case exactOutputShell = "exact_output_shell"
 }
 
 public struct ToolCompressionDecision: Sendable, Equatable {
@@ -43,8 +46,9 @@ public struct ToolCompressionDecision: Sendable, Equatable {
 }
 
 public struct ToolOutputCompressionPolicy: Sendable, Equatable {
+    /// Mutation tools must stay raw so the model never plans edits from a lossy view.
+    /// Large `Read` is allowlisted (skeleton/BERT path) — not excluded.
     public static let defaultExcludedTools: Set<String> = [
-        "Read",
         "Edit",
         "Write",
         "MultiEdit",
@@ -55,7 +59,8 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
         "Bash",
         "Grep",
         "Glob",
-        "WebFetch"
+        "WebFetch",
+        "Read"
     ]
 
     public let minBytes: Int
@@ -93,11 +98,17 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
         let skipReason: ToolCompressionSkipReason?
         if isExcluded(toolName) {
             skipReason = .excludedTool
-        } else if profile == .passthrough {
-            skipReason = .notAllowlisted
+        } else if ToolOutputMultimodalGuard.looksLikeImagePayload(output) {
+            // Text Distill cannot safely rewrite image/base64 tool payloads.
+            skipReason = .multimodalImage
+        } else if isExactOutputShellTool(toolName: toolName, toolArgumentsSummary: toolArgumentsSummary) {
+            // Align with CommandWrapPolicy / Claude SDK bridge: never rewrite exact stdout.
+            skipReason = .exactOutputShell
         } else if !meetsSizeThreshold(output) {
             skipReason = .belowThreshold
         } else {
+            // Default: compress allowlisted + other non-excluded tools (Task, MCP, …)
+            // with extractive contracts. Mutation tools already excluded above.
             skipReason = nil
         }
 
@@ -126,12 +137,15 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
         switch normalize(toolName) {
         case "grep", "glob":
             return .conservative
-        case "bash":
+        case "bash", "read":
+            // Read: extractive keep (skeleton/BERT); Bash: noise collapse. Neither is abstract rewrite.
             return .moderate
         case "webfetch":
             return .aggressive
         default:
-            return .passthrough
+            // Non-mutation tools default to extractive moderate compression (Task/MCP/etc.).
+            // Exclusions still block Edit/Write. Unknown names are not silent no-ops.
+            return .moderate
         }
     }
 
@@ -160,6 +174,9 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
         case .conservative:
             return "Compress search output without dropping any match line. Preserve paths, line numbers, matched text, and quoted strings verbatim; only collapse duplicate/context noise.\(suffix)"
         case .moderate:
+            if normalize(toolName) == "read" {
+                return "Compress file read output for the current task. Prefer signatures, exports, types, and task-relevant spans; elide large bodies only when a retrieve handle covers the original; preserve paths, line numbers, identifiers, and quoted strings verbatim.\(suffix)"
+            }
             return "Compress command output. Preserve exit codes, failing test names, errors, warnings, assertions, numbers, paths, and quoted strings verbatim; collapse repeated progress noise.\(suffix)"
         case .aggressive:
             return "Compress fetched web content for the current task. Preserve URLs, titles, code, API signatures, numbers, and quoted strings verbatim; keep retrieve-worthy details explicit.\(suffix)"
@@ -178,5 +195,54 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
             .replacingOccurrences(of: "-", with: "")
             .replacingOccurrences(of: "_", with: "")
             .lowercased()
+    }
+
+    /// True when this is a shell tool whose command string is exact-output family
+    /// (rg/grep/sed/cat/…, git grep|show|cat-file|blame). Summary may be
+    /// `command=rg -n foo` (hook args) or a raw shell line.
+    public func isExactOutputShellTool(toolName: String, toolArgumentsSummary: String?) -> Bool {
+        let name = normalize(toolName)
+        guard name == "bash" || name == "shell" || name == "terminal" else { return false }
+        guard let summary = toolArgumentsSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !summary.isEmpty else {
+            return false
+        }
+        // Prefer `command=…` field from summarizeToolInput; else use full summary.
+        let command: String
+        if let range = summary.range(of: "command=") {
+            command = String(summary[range.upperBound...])
+                .components(separatedBy: " | ")
+                .first?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? summary
+        } else {
+            command = summary
+        }
+        return Self.shellCommandLooksExactOutput(command)
+    }
+
+    /// Segment-aware check shared with wrapper intent: pipes/and chains may mix tools.
+    public static func shellCommandLooksExactOutput(_ command: String) -> Bool {
+        let segments = command
+            .components(separatedBy: CharacterSet(charactersIn: "|&;\n"))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        for segment in segments {
+            let tokens = segment
+                .split(whereSeparator: { $0.isWhitespace })
+                .map(String.init)
+                .filter { !$0.isEmpty }
+            guard let primaryRaw = tokens.first else { continue }
+            let primary = (primaryRaw as NSString).lastPathComponent.lowercased()
+            if WrappedCommandCatalog.isExactOutputCommand(primary) {
+                return true
+            }
+            if primary == "git" {
+                let args = Array(tokens.dropFirst())
+                if CommandWrapPolicy.isExactGitSubcommand(args) {
+                    return true
+                }
+            }
+        }
+        return false
     }
 }

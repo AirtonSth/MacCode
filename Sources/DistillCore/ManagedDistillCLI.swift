@@ -231,15 +231,44 @@ public struct ManagedDistillCLI: Sendable {
         }
 
         let toolName = envelope["tool_name"] as? String ?? ""
+        // Multimodal: any image part in tool_response → fail-open before text extract.
+        // WHY: extractToolOutputText flattens text only; compressing would replace the whole
+        // tool_response and drop the image (advisor: mixed text+image defect).
+        if Self.toolResponseContainsImage(envelope["tool_response"]) {
+            return emptyOK
+        }
         let rawOutput = Self.extractToolOutputText(envelope["tool_response"])
         guard !rawOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return emptyOK
         }
 
-        let question = Self.hookContractQuestion(
+        // Policy gate: mutation tools stay raw; image-like text blobs skip Distill;
+        // exact-output Bash (rg/sed/cat/…) stays raw; small outputs fail-open.
+        // Prefer raw `command` from tool_input for exact-output shell detection;
+        // fall back to summarized fields for contracts.
+        let argsSummary = Self.summarizeToolInput(envelope["tool_input"])
+        let bashCommand: String? = {
+            guard let obj = envelope["tool_input"] as? [String: Any],
+                  let cmd = obj["command"] as? String else { return nil }
+            let t = cmd.trimmingCharacters(in: .whitespacesAndNewlines)
+            return t.isEmpty ? nil : t
+        }()
+        // Thresholds align with CommandWrapPolicy defaults (aggressive wrap path),
+        // not the conservative 2k/30 hook plan defaults — small noisy Bash still compresses.
+        let decision = ToolOutputCompressionPolicy(
+            minBytes: CommandWrapPolicy.defaultMinBytes,
+            minLines: CommandWrapPolicy.defaultMinLines,
+            reversibleStoreMinBytes: reversibleStoreMinBytes ?? CommandWrapPolicy.reversibleStoreFloorBytes
+        ).decision(
             toolName: toolName,
-            toolInput: envelope["tool_input"]
+            output: rawOutput,
+            toolArgumentsSummary: bashCommand.map { "command=\($0)" } ?? (argsSummary.isEmpty ? nil : argsSummary)
         )
+        guard decision.shouldCompress else {
+            return emptyOK
+        }
+
+        let question = decision.contractQuestion
         // Cap raised from 12k→48k so large Read/Grep tool results can reach the
         // sidecar model stage (and ledger as command-output (model)), not only a
         // tiny deterministic head. Floor stays 512.
@@ -253,7 +282,7 @@ public struct ManagedDistillCLI: Sendable {
             recoveryContext: recoveryContext,
             invocationID: invocationID,
             maxOutputCharacters: maxChars,
-            reversibleStoreMinBytes: reversibleStoreMinBytes ?? 256,
+            reversibleStoreMinBytes: decision.reversibleStoreMinBytes,
             distillAdmission: distillAdmission,
             transport: transport
         )
@@ -297,6 +326,32 @@ public struct ManagedDistillCLI: Sendable {
         return t
     }
 
+    /// True when tool_response contains an image content block or image-like base64 blob.
+    static func toolResponseContainsImage(_ value: Any?) -> Bool {
+        guard let value else { return false }
+        if let s = value as? String {
+            return ToolOutputMultimodalGuard.looksLikeImagePayload(s)
+        }
+        if let arr = value as? [Any] {
+            return arr.contains { toolResponseContainsImage($0) }
+        }
+        guard let obj = value as? [String: Any] else { return false }
+        if let type = obj["type"] as? String, type.lowercased() == "image" {
+            return true
+        }
+        if let mime = obj["mimeType"] as? String, mime.lowercased().hasPrefix("image/") {
+            return true
+        }
+        if let content = obj["content"] {
+            return toolResponseContainsImage(content)
+        }
+        // Nested data field may be base64 image.
+        if let data = obj["data"] as? String, ToolOutputMultimodalGuard.looksLikeImagePayload(data) {
+            return true
+        }
+        return false
+    }
+
     /// Mirrors ClaudeAgentSDKBridge.mjs `extractToolOutputText`.
     static func extractToolOutputText(_ value: Any?) -> String {
         guard let value else { return "" }
@@ -317,17 +372,17 @@ public struct ManagedDistillCLI: Sendable {
     }
 
     /// Conservative compress contract for the PostToolUse hook (provider-agnostic default).
+    /// Prefer `ToolOutputCompressionPolicy.decision(...).contractQuestion` at call sites.
     static func hookContractQuestion(toolName: String, toolInput: Any?) -> String {
         let args = summarizeToolInput(toolInput)
-        let suffix = args.isEmpty ? "" : " Context: \(args)."
-        let name = toolName.trimmingCharacters(in: .whitespacesAndNewlines)
-        if name.isEmpty {
-            return "Compress this tool output for the current task. Preserve errors, warnings, exit codes, identifiers, numbers, paths, and quoted strings verbatim; collapse only repeated or noise lines.\(suffix)"
-        }
-        return "Compress \(name) tool output for the current task. Preserve errors, warnings, exit codes, identifiers, numbers, paths, and quoted strings verbatim; collapse only repeated or noise lines.\(suffix)"
+        return ToolOutputCompressionPolicy().decision(
+            toolName: toolName.isEmpty ? "Bash" : toolName,
+            output: String(repeating: "x\n", count: 40),
+            toolArgumentsSummary: args.isEmpty ? nil : args
+        ).contractQuestion
     }
 
-    private static func summarizeToolInput(_ toolInput: Any?) -> String {
+    static func summarizeToolInput(_ toolInput: Any?) -> String {
         guard let obj = toolInput as? [String: Any] else { return "" }
         var parts: [String] = []
         for key in ["command", "pattern", "path", "glob", "url"] {

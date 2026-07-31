@@ -5,18 +5,59 @@ final class ToolOutputCompressionPolicyTests: XCTestCase {
     private let policy = ToolOutputCompressionPolicy()
 
     func test_defaultExcludedToolsPassThroughFileMutationTools() {
-        for tool in ["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"] {
+        for tool in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
             let decision = policy.decision(toolName: tool, output: largeOutput())
             XCTAssertFalse(decision.shouldCompress, "\(tool) must stay raw by default")
-            XCTAssertEqual(decision.profile, .passthrough)
             XCTAssertEqual(decision.skipReason, .excludedTool)
         }
+    }
+
+    func test_largeReadIsAllowlistedForExtractiveCompression() {
+        let decision = policy.decision(toolName: "Read", output: largeOutput())
+        XCTAssertTrue(decision.shouldCompress, "large Read should compress via skeleton/BERT path")
+        XCTAssertEqual(decision.profile, .moderate)
+        XCTAssertNil(decision.skipReason)
+        XCTAssertTrue(decision.contractQuestion.localizedCaseInsensitiveContains("file read"))
+    }
+
+    func test_imagePayloadSkipsTextDistill() {
+        let jpegish = String(repeating: "/9j/4AAQSkZJRgABAQAAAQABAAD", count: 40)
+        let decision = policy.decision(toolName: "Read", output: jpegish)
+        XCTAssertFalse(decision.shouldCompress)
+        XCTAssertEqual(decision.skipReason, .multimodalImage)
+    }
+
+    func test_bashExactOutputShellSkipsCompression() {
+        let large = largeOutput()
+        let rg = policy.decision(
+            toolName: "Bash",
+            output: large,
+            toolArgumentsSummary: "command=rg -n fail Sources"
+        )
+        XCTAssertFalse(rg.shouldCompress)
+        XCTAssertEqual(rg.skipReason, .exactOutputShell)
+
+        let gitGrep = policy.decision(
+            toolName: "Bash",
+            output: large,
+            toolArgumentsSummary: "command=git grep -n TODO"
+        )
+        XCTAssertFalse(gitGrep.shouldCompress)
+        XCTAssertEqual(gitGrep.skipReason, .exactOutputShell)
+
+        let make = policy.decision(
+            toolName: "Bash",
+            output: large,
+            toolArgumentsSummary: "command=make test"
+        )
+        XCTAssertTrue(make.shouldCompress)
     }
 
     func test_profilesMatchPlanForSearchShellAndWebFetch() {
         XCTAssertEqual(policy.decision(toolName: "Grep", output: largeOutput()).profile, .conservative)
         XCTAssertEqual(policy.decision(toolName: "Glob", output: largeOutput()).profile, .conservative)
         XCTAssertEqual(policy.decision(toolName: "Bash", output: largeOutput()).profile, .moderate)
+        XCTAssertEqual(policy.decision(toolName: "Read", output: largeOutput()).profile, .moderate)
         XCTAssertEqual(policy.decision(toolName: "WebFetch", output: largeOutput()).profile, .aggressive)
     }
 

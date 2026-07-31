@@ -1049,6 +1049,74 @@ public final class DistillHTTPServer: @unchecked Sendable {
         return (requiresOperationID ? context.hasCompleteMutationContext : context.hasCompleteScope) ? context : nil
     }
 
+    /// Lossy deterministic crushers with store-before-loss (command-output only).
+    /// Returns a ready response when stack/test/source/diff/HTML crushers win; nil to
+    /// fall through to EncoderFirst (lossless → BERT → E4B).
+    private func tryScopedLossyCommandOutput(
+        request: DistillRequest,
+        scopedContext: TokenSaverRecoveryRequestContext?,
+        scopedRecoveryStore: TokenSaverScopedRecoveryStoring?
+    ) async -> DistillResponse? {
+        guard request.mode == .commandOutput,
+              request.effectiveRunMode == .optimize,
+              let scopedContext,
+              let scopedRecoveryStore else {
+            return nil
+        }
+        // Cheap size + shape gate: avoid prepareOriginal on tiny / non-lossy payloads.
+        let input = request.input
+        let lineCount = input.split(separator: "\n", omittingEmptySubsequences: false).count
+        guard input.utf8.count >= 2_048 || lineCount >= 30 else { return nil }
+        guard CommandOutputLossyRouter.isLossyCandidate(input) else { return nil }
+        guard distillAdmission() else { return nil }
+
+        do {
+            let preparation = try scopedRecoveryStore.prepareOriginal(
+                Data(input.utf8),
+                context: scopedContext,
+                lane: "deterministic_lossy"
+            )
+            guard preparation.readBackVerified,
+                  try scopedRecoveryStore.retrieveOriginal(
+                    capability: preparation.capability,
+                    context: scopedContext
+                  ) == Data(input.utf8) else {
+                return nil
+            }
+            guard let routed = CommandOutputLossyRouter.routeIfBeneficial(
+                input: input,
+                handle: preparation.capability,
+                query: request.question
+            ), routed.output != input else {
+                return nil
+            }
+            guard try scopedRecoveryStore.markDelivered(
+                capability: preparation.capability,
+                idempotencyKey: preparation.idempotencyKey,
+                context: scopedContext,
+                outcome: .sentUnknown
+            ) else {
+                return nil
+            }
+            let inputTokens = TokenEstimator.estimate(input)
+            let outputTokens = TokenEstimator.estimate(routed.output)
+            return DistillResponse(
+                requestID: request.id,
+                output: routed.output,
+                inputCharacters: input.count,
+                inputTokens: inputTokens,
+                outputTokens: outputTokens,
+                originalHandle: preparation.capability,
+                recoveryIdempotencyKey: preparation.idempotencyKey,
+                runMode: .optimize,
+                routeStage: .deterministic
+            )
+        } catch {
+            // Fail open to EncoderFirst / model path.
+            return nil
+        }
+    }
+
     /// LOSSLESS-ONLY UNSCOPED TIER.
     /// Prefer the scheduler candidate when it is already a byte-exact expandable
     /// reduction; otherwise (command-output only) attempt a fresh LogCollapser RLE.
@@ -1266,6 +1334,26 @@ public final class DistillHTTPServer: @unchecked Sendable {
                 denyDistill(connection: connection)
                 return
             }
+
+            // Store-before-loss + lossy deterministic crushers (stack/test/source/diff/HTML)
+            // before BERT/LLM. Only when scoped recovery can mint a handle — never serve
+            // unrecoverable element-dropping reductions.
+            if let early = await tryScopedLossyCommandOutput(
+                request: distillRequest,
+                scopedContext: scopedContext,
+                scopedRecoveryStore: scopedRecoveryStore
+            ) {
+                if distillRequest.mode == .commandOutput {
+                    await metrics.recordToolOutputCompressed()
+                }
+                if let onSuccess {
+                    await onSuccess(distillRequest, early, savingsThreadID)
+                }
+                await metrics.recordSuccess()
+                send(status: 200, body: early, connection: connection)
+                return
+            }
+
             let compressed = try await scheduler.submit(distillRequest)
             // A toggle can change while an in-flight model call finishes. Do not
             // store originals, publish reduced output, or record savings after

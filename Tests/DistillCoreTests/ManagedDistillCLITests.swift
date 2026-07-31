@@ -772,6 +772,74 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertEqual(String(decoding: out, as: UTF8.self), "{}")
     }
 
+    func test_hookPostToolUse_editTool_skipsCompressionWithoutTransport() async throws {
+        // WHY: mutation tools must stay byte-exact so the model never patches from a lossy view.
+        let large = String(repeating: "old line that would compress\n", count: 40)
+        let hookJSON: [String: Any] = [
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Edit",
+            "tool_input": ["path": "Foo.swift"],
+            "tool_response": large,
+        ]
+        let stdin = try JSONSerialization.data(withJSONObject: hookJSON)
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "post-tool-use"],
+            stdin: stdin,
+            state: state
+        ) { _ in
+            XCTFail("Edit tool must not call Distill transport")
+            return nil
+        }
+        let (out, code) = await cli.run()
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(String(decoding: out, as: UTF8.self), "{}")
+    }
+
+    func test_hookPostToolUse_bashRg_skipsCompressionWithoutTransport() async throws {
+        // Council O-exact-output: Bash + rg must stay raw even when stdout is large.
+        let large = String(repeating: "Sources/Foo.swift:1: match\n", count: 40)
+        let hookJSON: [String: Any] = [
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": ["command": "rg -n match Sources"],
+            "tool_response": large,
+        ]
+        let stdin = try JSONSerialization.data(withJSONObject: hookJSON)
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "post-tool-use"],
+            stdin: stdin,
+            state: state
+        ) { _ in
+            XCTFail("exact-output Bash must not call Distill transport")
+            return nil
+        }
+        let (out, code) = await cli.run()
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(String(decoding: out, as: UTF8.self), "{}")
+    }
+
+    func test_hookPostToolUse_imagePayload_skipsCompressionWithoutTransport() async throws {
+        let jpegish = String(repeating: "/9j/4AAQSkZJRgABAQAAAQABAAD", count: 80)
+        let hookJSON: [String: Any] = [
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read",
+            "tool_input": ["path": "shot.png"],
+            "tool_response": #"{"type":"image","data":"\#(jpegish)"}"#,
+        ]
+        let stdin = try JSONSerialization.data(withJSONObject: hookJSON)
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "post-tool-use"],
+            stdin: stdin,
+            state: state
+        ) { _ in
+            XCTFail("image tool output must not call Distill transport")
+            return nil
+        }
+        let (out, code) = await cli.run()
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(String(decoding: out, as: UTF8.self), "{}")
+    }
+
     func test_retrieve_success_returnsOriginal() async {
         let json = #"{"handle":"h","found":true,"original":"the original bytes"}"#
         let cli = ManagedDistillCLI(arguments: ["retrieve", "h"], stdin: Data(), state: state) { request in
