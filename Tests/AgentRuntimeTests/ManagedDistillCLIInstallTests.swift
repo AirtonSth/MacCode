@@ -29,6 +29,77 @@ final class ManagedDistillCLIInstallTests: XCTestCase {
         XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: url.path))
     }
 
+    func test_ensureDistillCLI_repairsMissingAndDanglingLinks_forAnyUserHome() throws {
+        // WHY: automatic reinstall must work under any user's home (not only the
+        // developer who first enabled Token Saver). Missing + dangling must heal.
+        let home = tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let binary = try fakeServiceBinary(in: home)
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let distill = installer.distillCLIURL()
+
+        // Missing → create
+        XCTAssertFalse(installer.isDistillCLIHealthy())
+        _ = try installer.ensureDistillCLI(serviceBinaryURL: binary)
+        XCTAssertTrue(installer.isDistillCLIHealthy())
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: distill.path), binary.path)
+
+        // Dangling (target deleted) → reinstall to a live binary
+        let deadTarget = home.appendingPathComponent("fake/RemoteCodeDistillService-dead")
+        try FileManager.default.createDirectory(at: deadTarget.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("dead".utf8).write(to: deadTarget)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: deadTarget.path)
+        try? FileManager.default.removeItem(at: distill)
+        try FileManager.default.createSymbolicLink(at: distill, withDestinationURL: deadTarget)
+        try FileManager.default.removeItem(at: deadTarget)
+        XCTAssertFalse(installer.isDistillCLIHealthy())
+        _ = try installer.ensureDistillCLI(serviceBinaryURL: binary)
+        XCTAssertTrue(installer.isDistillCLIHealthy())
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: distill.path), binary.path)
+
+        // Idempotent healthy path
+        _ = try installer.ensureDistillCLI(serviceBinaryURL: binary)
+        XCTAssertTrue(installer.isDistillCLIHealthy())
+    }
+
+    func test_ensureDistillCLI_recoversBinaryFromExistingManagedWrappers() throws {
+        // WHY: after an app relocate, Bundle.main may not resolve but wrappers
+        // still point at the live service — reinstall distill from those links.
+        // Prefer an unresolvable explicit path so resolution falls through to
+        // managed-wrapper recovery (not Bundle.main / SwiftPM on the host).
+        let home = tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let binary = try fakeServiceBinary(in: home)
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let binDir = home.appendingPathComponent(".remote-code/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: binDir.appendingPathComponent("git"),
+            withDestinationURL: binary
+        )
+        XCTAssertFalse(installer.isDistillCLIHealthy())
+        // Non-executable preferred forces wrapper recovery on this installer home.
+        let bogus = home.appendingPathComponent("missing/RemoteCodeDistillService")
+        let url = try installer.ensureDistillCLI(serviceBinaryURL: bogus)
+        XCTAssertTrue(installer.isDistillCLIHealthy())
+        let dest = try FileManager.default.destinationOfSymbolicLink(atPath: url.path)
+        XCTAssertEqual(
+            URL(fileURLWithPath: dest).resolvingSymlinksInPath().path,
+            binary.resolvingSymlinksInPath().path,
+            "must recover from git wrapper when preferred binary is dead"
+        )
+    }
+
+    func test_installCommandWrappers_alwaysInstallsDistillBesideWrappers() throws {
+        let home = tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let binary = try fakeServiceBinary(in: home)
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let installed = try installer.installCommandWrappers(serviceBinaryURL: binary)
+        XCTAssertTrue(installed.contains("distill"))
+        XCTAssertTrue(installer.isDistillCLIHealthy())
+    }
+
     func test_installResolvesRealBuiltBinaryWhenNotProvided() throws {
         let home = tempHome()
         defer { try? FileManager.default.removeItem(at: home) }

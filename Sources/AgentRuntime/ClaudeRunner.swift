@@ -93,9 +93,19 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             settings["enableWorkflows"] = true
         }
         if wantsPostToolUse {
-            let distillPath = AgentSkillInstaller.defaultManagedCLIBinDirectory()
-                .appendingPathComponent("distill")
-                .path
+            // Prefer the managed bin stamped on the nested child environment so
+            // provider-proxy Claude hooks hit the same wrappers as PATH wraps.
+            // Fall back to the default ~/.remote-code/bin when the host did not
+            // inject RC_REMOTE_CODE_MANAGED_BIN (primary Agent App turns).
+            let managedOverride = environment["RC_REMOTE_CODE_MANAGED_BIN"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let binDirectory: URL
+            if let managedOverride, !managedOverride.isEmpty {
+                binDirectory = URL(fileURLWithPath: managedOverride, isDirectory: true)
+            } else {
+                binDirectory = AgentSkillInstaller.defaultManagedCLIBinDirectory()
+            }
+            let distillPath = binDirectory.appendingPathComponent("distill").path
             // Claude CLI command hooks take a shell command string; subcommand
             // args ride on the same string (no separate args field).
             let command = "\(distillPath) hook post-tool-use"

@@ -484,6 +484,105 @@ final class ProviderProxyPolicyTests: XCTestCase {
         }
     }
 
+    func test_nestedCLIAgentAppDelegation_promotesClaudeCodexGrokAgentTurns() throws {
+        // WHY: product requires nested shell `claude`/`codex`/`grok` to enter
+        // Agent App (full Token Saver) when the turn ABI is agent-shaped.
+        let prompt = "/tmp/rc-nested-prompt.txt"
+        let claude = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "claude",
+            arguments: [
+                "--print", "--model", "opus", "--effort", "max",
+                "--permission-mode", "plan", "--output-format", "json",
+                "--no-session-persistence"
+            ],
+            promptFile: prompt
+        ))
+        XCTAssertEqual(claude.provider, .claude)
+        XCTAssertEqual(claude.model, "opus")
+        XCTAssertEqual(claude.reasoningEffort, .max)
+        XCTAssertEqual(claude.permissionMode, .supervised)
+        XCTAssertEqual(claude.outputFormat, .json)
+        XCTAssertNil(claude.runtimeProfile)
+        XCTAssertTrue(claude.arguments.contains("agent-app"))
+        XCTAssertFalse(claude.arguments.contains("--runtime-profile"))
+
+        let codex = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "codex",
+            arguments: ["exec", "--json", "--full-auto", "do the work"],
+            promptFile: prompt
+        ))
+        XCTAssertEqual(codex.provider, .codex)
+        XCTAssertEqual(codex.permissionMode, .fullAccess)
+        XCTAssertEqual(codex.outputFormat, .json)
+        XCTAssertNil(codex.runtimeProfile)
+
+        let grok = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: [
+                "--model", "grok-4.5", "--effort", "high",
+                "--prompt", "investigate", "--always-approve"
+            ],
+            promptFile: prompt
+        ))
+        XCTAssertEqual(grok.provider, .grok)
+        XCTAssertEqual(grok.reasoningEffort, .high)
+        XCTAssertEqual(grok.permissionMode, .fullAccess)
+        XCTAssertNil(grok.runtimeProfile)
+    }
+
+    func test_nestedCLIAgentAppDelegation_rejectsAdminVersionAndResume() {
+        let prompt = "/tmp/rc-nested-prompt.txt"
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "claude",
+            arguments: ["--version"],
+            promptFile: prompt
+        ))
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "claude",
+            arguments: ["mcp", "list"],
+            promptFile: prompt
+        ))
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "claude",
+            arguments: ["--print", "--resume", "sess-1"],
+            promptFile: prompt
+        ))
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "codex",
+            arguments: ["exec", "resume", "sess-1"],
+            promptFile: prompt
+        ))
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "grok",
+            arguments: ["--help"]
+        ))
+        // Restricted tool allowlist (advisor ABI) must stay on raw proxy + PTU.
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "claude",
+            arguments: [
+                "--print", "--model", "opus", "--effort", "max",
+                "--permission-mode", "plan",
+                "--tools", "Read,Glob,Grep",
+                "--output-format", "json"
+            ]
+        ))
+        XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "claude",
+            arguments: ["--print", "--model", "opus", "--effort", "high"]
+        ))
+    }
+
+    func test_nestedCLIAgentAppDelegation_samGrokWorkerKeepsRuntimeProfile() throws {
+        let delegation = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: samGrokWorkerArguments(effort: "high"),
+            promptFile: "/tmp/worker-prompt.txt"
+        ))
+        XCTAssertEqual(delegation.runtimeProfile, .samGrokWorkerV1)
+        XCTAssertEqual(delegation.outputFormat, .grokJSON)
+        XCTAssertTrue(delegation.arguments.contains("sam-grok-worker-v1"))
+    }
+
     func test_agentAppSocketPathUsesInjectedScopeThenBundledChannelFallback() {
         // WHY: nested agents carry an exact host socket, while a human running
         // `remote-code agent-app` in Terminal must still reach its bundled

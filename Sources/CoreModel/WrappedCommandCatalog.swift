@@ -44,10 +44,10 @@ public enum WrappedCommandCatalog {
         "git", "gh", "glab",
         "swift", "xcodebuild",
         // package managers / install
-        "npm", "yarn", "pnpm", "pip", "pip3", "poetry", "bundle", "composer", "gem", "brew",
+        "npm", "yarn", "pnpm", "bun", "bunx", "pip", "pip3", "poetry", "bundle", "composer", "gem", "brew",
         // build tools
         "make", "cmake", "ninja", "gradle", "mvn", "dotnet", "cargo", "go", "rustc", "tsc", "javac",
-        // test runners
+        // test runners (bun test is the bun binary; node test runners stay listed)
         "pytest", "jest", "mocha", "rspec", "phpunit",
         // linters
         "eslint", "pylint", "flake8", "rubocop", "swiftlint", "shellcheck", "golangci-lint", "stylelint", "hadolint",

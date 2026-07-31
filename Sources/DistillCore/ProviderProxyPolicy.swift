@@ -3,11 +3,16 @@ import Darwin
 import Foundation
 
 public enum ProviderAgentAppOutputFormat: String, Sendable, Equatable {
+    case text = "text"
+    case json = "json"
     case grokJSON = "grok-json"
 }
 
-/// Lossless bridge for the one raw provider ABI whose contract is exactly
-/// representable by `remote-code agent-app`.
+/// Lossless bridge from a nested provider CLI into `remote-code agent-app`.
+///
+/// `runtimeProfile` is set only for the closed `sam-grok-worker-v1` ABI. General
+/// nested Claude/Codex/Grok turns omit it so the host Agent App path owns Token
+/// Saver (PATH wrappers, dialect, Claude PostToolUse) like a UI subagent.
 public struct ProviderAgentAppDelegation: Sendable, Equatable {
     public let provider: AgentProvider
     public let promptFile: String
@@ -15,17 +20,44 @@ public struct ProviderAgentAppDelegation: Sendable, Equatable {
     public let reasoningEffort: AgentReasoningEffort
     public let permissionMode: AgentPermissionMode
     public let outputFormat: ProviderAgentAppOutputFormat
+    public let runtimeProfile: AgentAppRuntimeProfile?
+
+    public init(
+        provider: AgentProvider,
+        promptFile: String,
+        model: String,
+        reasoningEffort: AgentReasoningEffort,
+        permissionMode: AgentPermissionMode,
+        outputFormat: ProviderAgentAppOutputFormat,
+        runtimeProfile: AgentAppRuntimeProfile? = nil
+    ) {
+        self.provider = provider
+        self.promptFile = promptFile
+        self.model = model
+        self.reasoningEffort = reasoningEffort
+        self.permissionMode = permissionMode
+        self.outputFormat = outputFormat
+        self.runtimeProfile = runtimeProfile
+    }
 
     public var arguments: [String] {
-        [
+        var args = [
             "agent-app", provider.rawValue,
-            "--prompt-file", promptFile,
-            "--model", model,
+            "--prompt-file", promptFile
+        ]
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedModel.isEmpty {
+            args.append(contentsOf: ["--model", trimmedModel])
+        }
+        args.append(contentsOf: [
             "--permission", permissionMode.rawValue,
             "--reasoning-effort", reasoningEffort.rawValue,
-            "--output-format", outputFormat.rawValue,
-            "--runtime-profile", AgentAppRuntimeProfile.samGrokWorkerV1.rawValue
-        ]
+            "--output-format", outputFormat.rawValue
+        ])
+        if let runtimeProfile {
+            args.append(contentsOf: ["--runtime-profile", runtimeProfile.rawValue])
+        }
+        return args
     }
 }
 
@@ -1119,8 +1151,530 @@ public enum ProviderProxyPolicy {
             model: "grok-4.5",
             reasoningEffort: effort,
             permissionMode: .autoAcceptEdits,
-            outputFormat: .grokJSON
+            outputFormat: .grokJSON,
+            runtimeProfile: .samGrokWorkerV1
         )
+    }
+
+    /// Promote a nested shell-launched provider CLI into Agent App when the turn
+    /// ABI is agent-shaped and a host-materialized absolute `promptFile` is ready.
+    ///
+    /// Fail closed (return nil → raw provider proxy with Token Saver) for:
+    /// administrative subcommands, version/help, relative prompt paths, or
+    /// unknown option shapes. Does not invent Token Saver admission — the host
+    /// Agent App pipeline applies its own receipt.
+    ///
+    /// Callers must materialize stdin / inline prompts into `promptFile` first.
+    public static func nestedCLIAgentAppDelegation(
+        providerBasename: String,
+        arguments: [String],
+        promptFile: String
+    ) -> ProviderAgentAppDelegation? {
+        let absolutePrompt = promptFile.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (absolutePrompt as NSString).isAbsolutePath,
+              !absolutePrompt.isEmpty,
+              let provider = AgentProvider(rawValue: commandBasename(providerBasename))
+        else {
+            return nil
+        }
+        // Prefer the closed sam-grok-worker mapping when the argv is exact.
+        if let exact = samGrokWorkerAgentAppDelegation(
+            providerBasename: providerBasename,
+            arguments: arguments
+        ) {
+            return exact
+        }
+
+        switch provider {
+        case .claude:
+            return nestedClaudeAgentAppDelegation(arguments: arguments, promptFile: absolutePrompt)
+        case .codex:
+            return nestedCodexAgentAppDelegation(arguments: arguments, promptFile: absolutePrompt)
+        case .grok:
+            return nestedGrokAgentAppDelegation(arguments: arguments, promptFile: absolutePrompt)
+        }
+    }
+
+    /// Whether the nested CLI can be promoted once a prompt file is available.
+    /// Used to decide whether to read stdin / write a temp prompt before spawn.
+    public static func nestedCLIAgentAppEligible(
+        providerBasename: String,
+        arguments: [String]
+    ) -> Bool {
+        guard let provider = AgentProvider(rawValue: commandBasename(providerBasename)) else {
+            return false
+        }
+        if samGrokWorkerAgentAppDelegation(
+            providerBasename: providerBasename,
+            arguments: arguments
+        ) != nil {
+            return true
+        }
+        switch provider {
+        case .claude:
+            return nestedClaudeAgentAppEligible(arguments: arguments)
+        case .codex:
+            return nestedCodexAgentAppEligible(arguments: arguments)
+        case .grok:
+            return nestedGrokAgentAppEligible(arguments: arguments)
+        }
+    }
+
+    /// Extract an absolute `--prompt-file` from argv when present and well-formed.
+    public static func nestedCLIPromptFile(arguments: [String]) -> String? {
+        var index = 0
+        while index < arguments.count {
+            let argument = arguments[index]
+            if argument == "--" { return nil }
+            if argument == "--prompt-file", index + 1 < arguments.count {
+                let path = arguments[index + 1]
+                return (path as NSString).isAbsolutePath ? path : nil
+            }
+            if argument.hasPrefix("--prompt-file=") {
+                let path = String(argument.dropFirst("--prompt-file=".count))
+                return (path as NSString).isAbsolutePath ? path : nil
+            }
+            index += 1
+        }
+        return nil
+    }
+
+    /// Inline prompt text from common provider flags/positionals (not stdin).
+    public static func nestedCLIInlinePrompt(
+        providerBasename: String,
+        arguments: [String]
+    ) -> String? {
+        guard let provider = AgentProvider(rawValue: commandBasename(providerBasename)) else {
+            return nil
+        }
+        switch provider {
+        case .claude:
+            return nestedClaudeInlinePrompt(arguments: arguments)
+        case .codex:
+            return nestedCodexInlinePrompt(arguments: arguments)
+        case .grok:
+            return nestedGrokInlinePrompt(arguments: arguments)
+        }
+    }
+
+    // MARK: - nested CLI parsers (private)
+
+    private static func nestedClaudeAgentAppEligible(arguments: [String]) -> Bool {
+        let scan = scanNestedArguments(
+            arguments,
+            valueOptions: [
+                "--model", "--effort", "--output-format", "--input-format",
+                "--permission-mode", "--tools", "--allowed-tools", "--allowedTools",
+                "--disallowed-tools", "--disallowedTools", "--append-system-prompt",
+                "--system-prompt", "--setting-sources", "--settings",
+                "--session-id", "--resume", "-r"
+            ],
+            flagOptions: [
+                "--continue", "-c", "--debug", "--disable-slash-commands",
+                "--fork-session", "--help", "-h", "--ide", "--include-partial-messages",
+                "--no-session-persistence", "--print", "-p", "--strict-mcp-config",
+                "--verbose", "--version", "-V"
+            ]
+        )
+        guard !scan.malformed else { return false }
+        if scan.flags.contains("--version") || scan.flags.contains("-V")
+            || scan.flags.contains("--help") || scan.flags.contains("-h") {
+            return false
+        }
+        let admin: Set<String> = [
+            "agents", "auth", "config", "doctor", "install",
+            "mcp", "plugin", "plugins", "update"
+        ]
+        if let first = scan.positionals.first, admin.contains(first) {
+            return false
+        }
+        // Session continuation is host-owned on Agent App; keep raw for resume.
+        if !scan.flags.isDisjoint(with: ["--resume", "-r", "--continue", "-c", "--session-id", "--fork-session"]) {
+            return false
+        }
+        // Agent App cannot honor a restricted tool allowlist (`--tools Read,Glob,Grep`
+        // on sam-claude-advisor). Keep those turns on the raw proxy so PostToolUse
+        // still compresses without elevating plan-only advisors to full tools.
+        if let tools = scan.optionValues["--tools"]?.last
+            ?? scan.optionValues["--allowed-tools"]?.last
+            ?? scan.optionValues["--allowedTools"]?.last {
+            let normalized = tools
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+            let fullish: Set<String> = ["*", "default", "all"]
+            if !normalized.isEmpty, normalized.allSatisfy({ !fullish.contains($0) }) {
+                return false
+            }
+        }
+        return scan.flags.contains("--print") || scan.flags.contains("-p")
+    }
+
+    private static func nestedClaudeAgentAppDelegation(
+        arguments: [String],
+        promptFile: String
+    ) -> ProviderAgentAppDelegation? {
+        guard nestedClaudeAgentAppEligible(arguments: arguments) else { return nil }
+        let scan = scanNestedArguments(
+            arguments,
+            valueOptions: [
+                "--model", "--effort", "--output-format", "--input-format",
+                "--permission-mode", "--tools", "--allowed-tools", "--allowedTools",
+                "--disallowed-tools", "--disallowedTools", "--append-system-prompt",
+                "--system-prompt", "--setting-sources", "--settings",
+                "--session-id", "--resume", "-r"
+            ],
+            flagOptions: [
+                "--continue", "-c", "--debug", "--disable-slash-commands",
+                "--fork-session", "--help", "-h", "--ide", "--include-partial-messages",
+                "--no-session-persistence", "--print", "-p", "--strict-mcp-config",
+                "--verbose", "--version", "-V"
+            ]
+        )
+        guard !scan.malformed else { return nil }
+        let model = scan.optionValues["--model"]?.last ?? ""
+        let effort = AgentReasoningEffort(
+            rawValue: scan.optionValues["--effort"]?.last ?? "medium"
+        ) ?? .medium
+        let permission = mapClaudePermission(
+            scan.optionValues["--permission-mode"]?.last
+        )
+        let output: ProviderAgentAppOutputFormat = {
+            switch (scan.optionValues["--output-format"]?.last ?? "").lowercased() {
+            case "json": return .json
+            case "grok-json": return .grokJSON
+            default: return .text
+            }
+        }()
+        return ProviderAgentAppDelegation(
+            provider: .claude,
+            promptFile: promptFile,
+            model: model,
+            reasoningEffort: effort == .ultracode ? .xhigh : effort,
+            permissionMode: permission,
+            outputFormat: output,
+            runtimeProfile: nil
+        )
+    }
+
+    private static func nestedClaudeInlinePrompt(arguments: [String]) -> String? {
+        let scan = scanNestedArguments(
+            arguments,
+            valueOptions: [
+                "--model", "--effort", "--output-format", "--input-format",
+                "--permission-mode", "--tools", "--allowed-tools", "--allowedTools",
+                "--disallowed-tools", "--disallowedTools", "--append-system-prompt",
+                "--system-prompt", "--setting-sources", "--settings",
+                "--session-id", "--resume", "-r"
+            ],
+            flagOptions: [
+                "--continue", "-c", "--debug", "--disable-slash-commands",
+                "--fork-session", "--help", "-h", "--ide", "--include-partial-messages",
+                "--no-session-persistence", "--print", "-p", "--strict-mcp-config",
+                "--verbose", "--version", "-V"
+            ]
+        )
+        guard !scan.malformed else { return nil }
+        // Prefer explicit positionals after flags (claude --print "prompt").
+        let joined = scan.positionals.joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return joined.isEmpty ? nil : joined
+    }
+
+    private static func mapClaudePermission(_ raw: String?) -> AgentPermissionMode {
+        switch (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "acceptedits", "accept-edits", "auto", "workspace":
+            return .autoAcceptEdits
+        case "bypasspermissions", "bypass-permissions", "dontask", "full_access", "full-access":
+            return .fullAccess
+        default:
+            return .supervised
+        }
+    }
+
+    private static func nestedCodexAgentAppEligible(arguments: [String]) -> Bool {
+        let scan = scanNestedArguments(
+            arguments,
+            valueOptions: [
+                "--sandbox", "--ask-for-approval", "-a", "--config", "-c",
+                "--model", "-m", "--image", "--color", "--cd", "-C",
+                "--profile", "-p"
+            ],
+            flagOptions: [
+                "--dangerously-bypass-approvals-and-sandbox", "--ephemeral",
+                "--full-auto", "--help", "-h", "--ignore-user-config", "--json",
+                "--oss", "--search", "--skip-git-repo-check", "--strict-config",
+                "--version", "-V"
+            ]
+        )
+        guard !scan.malformed else { return false }
+        if scan.flags.contains("--version") || scan.flags.contains("-V")
+            || scan.flags.contains("--help") || scan.flags.contains("-h") {
+            return false
+        }
+        guard scan.positionals.first == "exec" else { return false }
+        // `codex exec resume` is session continuation — keep raw.
+        if scan.positionals.dropFirst().first == "resume" { return false }
+        return true
+    }
+
+    private static func nestedCodexAgentAppDelegation(
+        arguments: [String],
+        promptFile: String
+    ) -> ProviderAgentAppDelegation? {
+        guard nestedCodexAgentAppEligible(arguments: arguments) else { return nil }
+        let scan = scanNestedArguments(
+            arguments,
+            valueOptions: [
+                "--sandbox", "--ask-for-approval", "-a", "--config", "-c",
+                "--model", "-m", "--image", "--color", "--cd", "-C",
+                "--profile", "-p"
+            ],
+            flagOptions: [
+                "--dangerously-bypass-approvals-and-sandbox", "--ephemeral",
+                "--full-auto", "--help", "-h", "--ignore-user-config", "--json",
+                "--oss", "--search", "--skip-git-repo-check", "--strict-config",
+                "--version", "-V"
+            ]
+        )
+        guard !scan.malformed else { return nil }
+        let model = scan.optionValues["--model"]?.last
+            ?? scan.optionValues["-m"]?.last
+            ?? ""
+        let permission: AgentPermissionMode = {
+            if scan.flags.contains("--dangerously-bypass-approvals-and-sandbox")
+                || scan.flags.contains("--full-auto") {
+                return .fullAccess
+            }
+            return .autoAcceptEdits
+        }()
+        let output: ProviderAgentAppOutputFormat =
+            scan.flags.contains("--json") ? .json : .text
+        return ProviderAgentAppDelegation(
+            provider: .codex,
+            promptFile: promptFile,
+            model: model,
+            reasoningEffort: .medium,
+            permissionMode: permission,
+            outputFormat: output,
+            runtimeProfile: nil
+        )
+    }
+
+    private static func nestedCodexInlinePrompt(arguments: [String]) -> String? {
+        let scan = scanNestedArguments(
+            arguments,
+            valueOptions: [
+                "--sandbox", "--ask-for-approval", "-a", "--config", "-c",
+                "--model", "-m", "--image", "--color", "--cd", "-C",
+                "--profile", "-p"
+            ],
+            flagOptions: [
+                "--dangerously-bypass-approvals-and-sandbox", "--ephemeral",
+                "--full-auto", "--help", "-h", "--ignore-user-config", "--json",
+                "--oss", "--search", "--skip-git-repo-check", "--strict-config",
+                "--version", "-V"
+            ]
+        )
+        guard !scan.malformed, scan.positionals.first == "exec" else { return nil }
+        let rest = scan.positionals.dropFirst().filter { $0 != "resume" }
+        let joined = rest.joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return joined.isEmpty ? nil : joined
+    }
+
+    private static func nestedGrokAgentAppEligible(arguments: [String]) -> Bool {
+        if samGrokWorkerAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: arguments
+        ) != nil {
+            return true
+        }
+        let scan = scanNestedArguments(
+            arguments,
+            valueOptions: [
+                "--prompt-file", "--prompt", "-p", "--rules",
+                "--permission-mode", "--sandbox", "--model", "-m",
+                "--effort", "--reasoning-effort", "--output-format",
+                "--input-format", "--disallowed-tools", "--allowed-tools",
+                "--settings", "--resume", "-r", "--session-id"
+            ],
+            flagOptions: [
+                "--always-approve", "--auto-update", "--continue",
+                "--help", "-h", "--list-models", "--memory", "--no-auto-update",
+                "--no-memory", "--no-plan", "--no-subagents", "--plan",
+                "--subagents", "--version", "-V"
+            ]
+        )
+        guard !scan.malformed else { return false }
+        if scan.flags.contains("--version") || scan.flags.contains("-V")
+            || scan.flags.contains("--help") || scan.flags.contains("-h")
+            || scan.flags.contains("--list-models") {
+            return false
+        }
+        if !scan.flags.isDisjoint(with: ["--resume", "-r", "--continue", "--session-id", "--fork-session"]) {
+            return false
+        }
+        // Agent turn needs an explicit prompt channel (file, flag, or stdin later).
+        let hasPromptChannel =
+            scan.optionValues["--prompt-file"]?.contains(where: { !$0.isEmpty }) == true
+            || scan.optionValues["--prompt"]?.contains(where: { !$0.isEmpty }) == true
+            || scan.optionValues["-p"]?.contains(where: { !$0.isEmpty }) == true
+            || !scan.positionals.isEmpty
+        // Empty positionals + no prompt flags still eligible if stdin will supply prompt
+        // (headless agent patterns). Require at least model or always-approve/sandbox
+        // agent shape — not bare `grok` with nothing.
+        if hasPromptChannel { return true }
+        return scan.optionValues["--model"]?.isEmpty == false
+            || scan.flags.contains("--always-approve")
+            || scan.optionValues["--sandbox"] != nil
+    }
+
+    private static func nestedGrokAgentAppDelegation(
+        arguments: [String],
+        promptFile: String
+    ) -> ProviderAgentAppDelegation? {
+        if let exact = samGrokWorkerAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: arguments
+        ) {
+            return exact
+        }
+        guard nestedGrokAgentAppEligible(arguments: arguments) else { return nil }
+        let scan = scanNestedArguments(
+            arguments,
+            valueOptions: [
+                "--prompt-file", "--prompt", "-p", "--rules",
+                "--permission-mode", "--sandbox", "--model", "-m",
+                "--effort", "--reasoning-effort", "--output-format",
+                "--input-format", "--disallowed-tools", "--allowed-tools",
+                "--settings", "--resume", "-r", "--session-id"
+            ],
+            flagOptions: [
+                "--always-approve", "--auto-update", "--continue",
+                "--help", "-h", "--list-models", "--memory", "--no-auto-update",
+                "--no-memory", "--no-plan", "--no-subagents", "--plan",
+                "--subagents", "--version", "-V"
+            ]
+        )
+        guard !scan.malformed else { return nil }
+        let model = scan.optionValues["--model"]?.last
+            ?? scan.optionValues["-m"]?.last
+            ?? "grok-4.5"
+        let effortRaw = scan.optionValues["--effort"]?.last
+            ?? scan.optionValues["--reasoning-effort"]?.last
+            ?? "medium"
+        let effort = AgentReasoningEffort(rawValue: effortRaw) ?? .medium
+        let permission: AgentPermissionMode = {
+            if scan.flags.contains("--always-approve") { return .fullAccess }
+            switch (scan.optionValues["--permission-mode"]?.last ?? "").lowercased() {
+            case "acceptedits", "accept-edits", "auto", "workspace":
+                return .autoAcceptEdits
+            case "full_access", "full-access", "bypasspermissions":
+                return .fullAccess
+            default:
+                return .supervised
+            }
+        }()
+        let output: ProviderAgentAppOutputFormat = {
+            switch (scan.optionValues["--output-format"]?.last ?? "").lowercased() {
+            case "json": return .json
+            case "grok-json": return .grokJSON
+            default: return .text
+            }
+        }()
+        return ProviderAgentAppDelegation(
+            provider: .grok,
+            promptFile: promptFile,
+            model: model,
+            reasoningEffort: effort,
+            permissionMode: permission,
+            outputFormat: output,
+            runtimeProfile: nil
+        )
+    }
+
+    private static func nestedGrokInlinePrompt(arguments: [String]) -> String? {
+        let scan = scanNestedArguments(
+            arguments,
+            valueOptions: [
+                "--prompt-file", "--prompt", "-p", "--rules",
+                "--permission-mode", "--sandbox", "--model", "-m",
+                "--effort", "--reasoning-effort", "--output-format",
+                "--input-format", "--disallowed-tools", "--allowed-tools",
+                "--settings", "--resume", "-r", "--session-id"
+            ],
+            flagOptions: [
+                "--always-approve", "--auto-update", "--continue",
+                "--help", "-h", "--list-models", "--memory", "--no-auto-update",
+                "--no-memory", "--no-plan", "--no-subagents", "--plan",
+                "--subagents", "--version", "-V"
+            ]
+        )
+        guard !scan.malformed else { return nil }
+        if let prompt = scan.optionValues["--prompt"]?.last
+            ?? scan.optionValues["-p"]?.last {
+            let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        let joined = scan.positionals.joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return joined.isEmpty ? nil : joined
+    }
+
+    private struct NestedArgScan {
+        var flags = Set<String>()
+        var optionValues: [String: [String]] = [:]
+        var positionals: [String] = []
+        var malformed = false
+    }
+
+    private static func scanNestedArguments(
+        _ arguments: [String],
+        valueOptions: Set<String>,
+        flagOptions: Set<String>
+    ) -> NestedArgScan {
+        let optionBoundary = arguments.firstIndex(of: "--") ?? arguments.endIndex
+        var scan = NestedArgScan()
+        var index = 0
+        while index < optionBoundary {
+            let argument = arguments[index]
+            if valueOptions.contains(argument) {
+                scan.flags.insert(argument)
+                guard index + 1 < optionBoundary else {
+                    scan.malformed = true
+                    return scan
+                }
+                scan.optionValues[argument, default: []].append(arguments[index + 1])
+                index += 2
+                continue
+            }
+            if let option = valueOptions.first(where: { argument.hasPrefix("\($0)=") }) {
+                scan.flags.insert(option)
+                scan.optionValues[option, default: []].append(
+                    String(argument.dropFirst(option.count + 1))
+                )
+                index += 1
+                continue
+            }
+            if argument.hasPrefix("-") {
+                guard flagOptions.contains(argument) else {
+                    scan.malformed = true
+                    return scan
+                }
+                scan.flags.insert(argument)
+                index += 1
+                continue
+            }
+            scan.positionals.append(argument)
+            index += 1
+        }
+        if optionBoundary < arguments.count {
+            // Everything after `--` is prompt content for some CLIs.
+            let tail = arguments[(optionBoundary + 1)...].joined(separator: " ")
+            if !tail.isEmpty { scan.positionals.append(tail) }
+        }
+        return scan
     }
 
     /// Target provider for the explicit `remote-code agent-app …` ABI. Parse

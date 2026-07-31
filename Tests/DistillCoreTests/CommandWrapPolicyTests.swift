@@ -205,7 +205,7 @@ final class CommandWrapPolicyTests: XCTestCase {
         // One representative per newly-endorsed category (package managers, build tools,
         // test runners, linters, containers/IaC) must be forced-wrapped, never exact-output.
         let representatives = [
-            "npm", "brew",       // package managers / install
+            "npm", "brew", "bun", "bunx", // package managers / install (bun used heavily by empath)
             "make", "cargo",     // build tools
             "pytest", "jest",    // test runners
             "eslint", "shellcheck", // linters
