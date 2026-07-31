@@ -469,6 +469,101 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         XCTAssertNil(controller.modelForTests.activeBadgeText)
     }
 
+    func test_itemStartedProgressRepublishKeepsElapsedAndUpdatesLastUpdatePreview() async throws {
+        // WHY: material agent.item.started must refresh Live Activity last-update
+        // preview without wiping startedAt (elapsed in pet detail / LA statusLine).
+        // A prior path called applyActiveThreadIDs with an empty startedByThread
+        // map and dropped the "1m" suffix on every tool event.
+        let directory = NSTemporaryDirectory() + "RC2PetLAProgress-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let workspace = try router.createWorkspace(name: "elephant", cwd: NSTemporaryDirectory())
+        let thread = AgentThread(
+            workspaceId: workspace.id,
+            title: "teste o funcionamento do distill",
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            hasUnread: false
+        )
+        try context.threadRepo.upsert(thread)
+        let runID = AgentRunID()
+        let startedAt = Date().addingTimeInterval(-90)
+        try context.runRepo.upsert(AgentRun(
+            id: runID,
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: startedAt
+        ))
+        SettingsStore(db: context.db).save(AppSettings(petEnabled: true, petReadyCounterEnabled: false))
+
+        let controller = try PetController(context: context, router: router, openSettings: { _ in false })
+        controller.start()
+        defer { controller.stop() }
+
+        context.coordinator.onActiveRunProjectionChanged?(
+            ActiveRunProjection(runs: [.init(threadId: thread.id, runId: runID)]),
+            .started
+        )
+        try await Task.sleep(nanoseconds: 40_000_000)
+
+        let before = try XCTUnwrap(controller.modelForTests.activeThreads.first)
+        XCTAssertNil(before.lastUpdatePreview)
+        XCTAssertTrue(
+            before.detail?.contains("1m") == true,
+            "projection with runRepo startedAt must embed elapsed; got \(before.detail ?? "nil")"
+        )
+        let detailBefore = before.detail
+
+        EventBus.shared.publish(kind: "agent.item.started", payload: .object([
+            "thread_id": .string(thread.id.value.uuidString),
+            "item": .object([
+                "id": .string("item-git"),
+                "type": .string("commandExecution"),
+                "summary": .string("git status"),
+                "body": .string("git status --short")
+            ])
+        ]))
+        try await Task.sleep(nanoseconds: 40_000_000)
+
+        let after = try XCTUnwrap(controller.modelForTests.activeThreads.first)
+        XCTAssertEqual(
+            after.lastUpdatePreview,
+            "git status",
+            "item.started must land lastUpdatePreview for single-active LA description"
+        )
+        XCTAssertEqual(
+            after.detail,
+            detailBefore,
+            "progress republish must preserve startedAt-derived elapsed detail"
+        )
+        XCTAssertTrue(after.detail?.contains("1m") == true)
+    }
+
+    func test_mergingStartedAtByThreadPreservesRetainedWhenIncomingEmpty() {
+        let a = AgentThreadID(UUID(uuidString: "11111111-1111-1111-1111-111111111111")!)
+        let b = AgentThreadID(UUID(uuidString: "22222222-2222-2222-2222-222222222222")!)
+        let t0 = Date(timeIntervalSince1970: 1_000)
+        let t1 = Date(timeIntervalSince1970: 2_000)
+        let merged = PetController.mergingStartedAtByThread(
+            activeThreadIDs: [a],
+            incoming: [:],
+            retained: [a: t0, b: t1]
+        )
+        XCTAssertEqual(merged[a], t0, "empty incoming must keep retained startedAt for still-active threads")
+        XCTAssertNil(merged[b], "inactive threads must leave the cache")
+
+        let overridden = PetController.mergingStartedAtByThread(
+            activeThreadIDs: [a],
+            incoming: [a: t1],
+            retained: [a: t0]
+        )
+        XCTAssertEqual(overridden[a], t1, "host projection startedAt wins when provided")
+    }
+
     func test_controllerHydratesPersistentAttentionKindsBeforeRendering() throws {
         let directory = NSTemporaryDirectory() + "RC2PetHydration-\(UUID().uuidString)"
         let context = try AppContext(channel: .debug, appSupportOverride: directory)

@@ -44,6 +44,9 @@ public final class PetController {
     /// Latest material progress text per active agent thread for Live Activity
     /// single-active preview (tools / assistant). Not used by the pet popover.
     private var lastUpdatePreviewByThread: [AgentThreadID: String] = [:]
+    /// Host run start times for active threads. Progress republish must not
+    /// wipe these — empty startedByThread maps used to drop elapsed detail.
+    private var startedAtByThread: [AgentThreadID: Date] = [:]
     private(set) var handledEventOutOfOrderForTests = false
     private(set) var handledEventCountForTests = 0
     private(set) var lastScheduledTransientMillisecondsForTests: Int64?
@@ -509,7 +512,31 @@ public final class PetController {
 
     private func republishActiveThreadsForLiveActivity() {
         // Rebuild active rows so lastUpdatePreview is embedded, then push LA.
-        refreshActiveThreadsFromCoordinator()
+        // Prefer currently projected active thread IDs (with cached startedAt)
+        // so material item/turn updates never drop elapsed or empty the list
+        // when coordinator snapshot lags the projection callback.
+        let projectedIDs = model.activeThreads.map(\.threadID)
+        if projectedIDs.isEmpty {
+            refreshActiveThreadsFromCoordinator()
+            return
+        }
+        applyActiveThreadIDs(projectedIDs, startedByThread: startedAtByThread)
+    }
+
+    /// Merge host-provided startedAt values with the retained cache for threads
+    /// that remain active. Pure so unit tests can prove progress republish does
+    /// not erase elapsed anchors.
+    nonisolated static func mergingStartedAtByThread(
+        activeThreadIDs: [AgentThreadID],
+        incoming: [AgentThreadID: Date],
+        retained: [AgentThreadID: Date]
+    ) -> [AgentThreadID: Date] {
+        let activeSet = Set(activeThreadIDs)
+        var next = retained.filter { activeSet.contains($0.key) }
+        for (id, date) in incoming where activeSet.contains(id) {
+            next[id] = date
+        }
+        return next
     }
 
     private static func itemStartedPreview(payload: [String: JSONValue]) -> String? {
@@ -773,6 +800,13 @@ public final class PetController {
         // Drop progress cache for threads that are no longer active.
         let activeSet = Set(threadIDs)
         lastUpdatePreviewByThread = lastUpdatePreviewByThread.filter { activeSet.contains($0.key) }
+        // Preserve startedAt across progress-only republishes (empty incoming
+        // map must not clear elapsed embedded in pet detail / LA statusLine).
+        startedAtByThread = Self.mergingStartedAtByThread(
+            activeThreadIDs: threadIDs,
+            incoming: startedByThread,
+            retained: startedAtByThread
+        )
 
         let items = PetActiveThreadProjector.items(threadIDs: threadIDs) { [weak self] threadID in
             guard let self,
@@ -785,7 +819,7 @@ public final class PetController {
                 workspaceName: workspaceName,
                 providerName: PetActiveThreadProjector.providerLabel(thread.provider),
                 threadTitle: thread.title,
-                startedAt: startedByThread[threadID],
+                startedAt: self.startedAtByThread[threadID],
                 lastUpdatePreview: self.lastUpdatePreviewByThread[threadID]
             )
         }
