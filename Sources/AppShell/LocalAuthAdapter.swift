@@ -292,6 +292,19 @@ public final class LocalAuthAdapter: DirectAuthProvider {
     public func revokeDevice(_ id: String) {
         try? repo.revoke(id: id)
         auditLoud(actor: "system", action: "device.revoke", detail: id)
+        // Material wake taxonomy classifies device.revoke as criticalAlert, but
+        // without an EventBus publisher a revoked/kicked device never surfaces
+        // to MaterialWakeCoordinator (or remote subscribers). Match AppContext
+        // publish shape: kind + object payload with the device id.
+        // Necessary-but-not-yet-sufficient: no consumer currently turns a
+        // criticalAlert-class EventBus event into an actual delivered alert, so
+        // this event is correctly classified but inert until that consumer exists.
+        EventBus.shared.publish(
+            kind: "device.revoke",
+            payload: .object([
+                "device_id": .string(id),
+            ])
+        )
     }
 
     // MARK: - Internal audit helper

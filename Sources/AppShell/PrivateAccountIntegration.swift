@@ -633,6 +633,9 @@ public final class PrivateAccountSessionStore: @unchecked Sendable {
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
 
+    /// Shared settings store for durable silent-wake outbox persistence.
+    public var settingsRepository: SettingsRepository { repo }
+
     public init(repo: SettingsRepository) {
         self.repo = repo
     }
@@ -1117,13 +1120,61 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
     private let pushTargetStore: PrivatePushTargetStore
     private let api: PrivateAccountAPI
     private let sessionRefresher: PrivatePushSessionRefresher
+    /// Durable retry outbox for failed silent catch-up sends. Gated by
+    /// `ConnectionFeatureFlags.wakeOutboxEnabled` at enqueue and drain time.
+    private let silentWakeOutbox: SilentWakeOutbox
+    /// Indirection so the outbox send closure can bind after `self` exists.
+    private let silentWakeSendBox: SilentWakeOutboxSendBox
 
-    public init(accountStore: PrivateAccountSessionStore, pushTargetStore: PrivatePushTargetStore, api: PrivateAccountAPI = URLSessionPrivateAccountAPI()) {
+    /// Holds the outbox → bridge send handler without a process-wide singleton.
+    private final class SilentWakeOutboxSendBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var handler: (@Sendable (SilentWakeOutboxRecord) async throws -> Void)?
+
+        func bind(_ handler: @escaping @Sendable (SilentWakeOutboxRecord) async throws -> Void) {
+            lock.withLock { self.handler = handler }
+        }
+
+        func send(_ record: SilentWakeOutboxRecord) async throws {
+            let handler = lock.withLock { self.handler }
+            guard let handler else { throw SilentWakeOutboxError.bridgeUnavailable }
+            try await handler(record)
+        }
+    }
+
+    public init(
+        accountStore: PrivateAccountSessionStore,
+        pushTargetStore: PrivatePushTargetStore,
+        api: PrivateAccountAPI = URLSessionPrivateAccountAPI(),
+        settings: SettingsRepository? = nil,
+        silentWakeOutbox: SilentWakeOutbox? = nil
+    ) {
         self.accountStore = accountStore
         self.pushTargetStore = pushTargetStore
         self.api = api
         self.sessionRefresher = PrivatePushSessionRefresher(accountStore: accountStore, api: api)
+        let sendBox = SilentWakeOutboxSendBox()
+        self.silentWakeSendBox = sendBox
+        if let silentWakeOutbox {
+            self.silentWakeOutbox = silentWakeOutbox
+        } else {
+            let store = SilentWakeOutboxStore(
+                settings: settings ?? accountStore.settingsRepository
+            )
+            self.silentWakeOutbox = SilentWakeOutbox(store: store) { record in
+                try await sendBox.send(record)
+            }
+        }
+        sendBox.bind { [weak self] record in
+            guard let self else { throw SilentWakeOutboxError.bridgeUnavailable }
+            try await self.performSilentCatchUpDelivery(record)
+        }
+        // Survive Mac relaunch when the flag is canary-on: drain durable backlog.
+        self.silentWakeOutbox.resumePending()
     }
+
+    /// Test seam: observe the durable silent-wake outbox.
+    public var silentWakeOutboxForTests: SilentWakeOutbox { silentWakeOutbox }
 
     public func deliver(_ content: RemoteCodeNotificationContent) async {
         guard let session = accountStore.load() else {
@@ -1278,6 +1329,7 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         var contract = payload
         contract.catchUp = true
         let data = contract.asPushData()
+        let idempotencyKey = "catchup.\(coalesceClass.rawValue).\(hostHint).\(bucket)"
         HostWakeMetrics.shared.increment(.silentAttempt)
         do {
             let result = try await sessionRefresher.perform(session: session) { accessToken in
@@ -1288,7 +1340,7 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                     data: data,
                     pushToken: target.pushToken,
                     pushTokenType: target.pushTokenType,
-                    idempotencyKey: "catchup.\(coalesceClass.rawValue).\(hostHint).\(bucket)",
+                    idempotencyKey: idempotencyKey,
                     silent: true
                 )
             }
@@ -1304,6 +1356,66 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         } catch {
             HostWakeMetrics.shared.increment(.silentFailed)
             Self.log.error("Silent catch-up push failed: \(String(describing: error), privacy: .public)")
+            // Durable retry only behind wake_outbox. Flag off preserves log-and-drop.
+            if ConnectionFeatureFlags.wakeOutboxEnabled {
+                let record = SilentWakeOutboxRecord(
+                    coalesceClass: coalesceClass,
+                    hostHint: hostHint,
+                    force: force,
+                    payload: contract,
+                    idempotencyKey: idempotencyKey
+                )
+                do {
+                    try silentWakeOutbox.accept(record)
+                } catch {
+                    Self.log.error(
+                        "Silent catch-up outbox enqueue failed: \(String(describing: error), privacy: .public)"
+                    )
+                }
+            }
+        }
+    }
+
+    /// Replay a durable silent catch-up record using the original idempotency key.
+    func performSilentCatchUpDelivery(_ record: SilentWakeOutboxRecord) async throws {
+        guard let session = accountStore.load(), session.user.subscribed else {
+            throw SilentWakeOutboxError.missingSessionOrTarget
+        }
+        guard let target = pushTargetStore.load() else {
+            throw SilentWakeOutboxError.missingSessionOrTarget
+        }
+        var contract = record.payload
+        contract.catchUp = true
+        let data = contract.asPushData()
+        HostWakeMetrics.shared.increment(.silentAttempt)
+        do {
+            let result = try await sessionRefresher.perform(session: session) { accessToken in
+                try await self.api.deliverAlert(
+                    accessToken: accessToken,
+                    title: "",
+                    body: "",
+                    data: data,
+                    pushToken: target.pushToken,
+                    pushTokenType: target.pushTokenType,
+                    idempotencyKey: record.idempotencyKey,
+                    silent: true
+                )
+            }
+            if result.shouldDropSubscription {
+                pushTargetStore.clear()
+            }
+            if result.delivered {
+                HostWakeMetrics.shared.increment(.silentSent)
+                return
+            }
+            // Non-throwing rate-limit: retry via outbox without inventing success.
+            HostWakeMetrics.shared.increment(.silent429)
+            throw SilentWakeOutboxError.notDelivered(result.errorCode)
+        } catch let error as SilentWakeOutboxError {
+            throw error
+        } catch {
+            HostWakeMetrics.shared.increment(.silentFailed)
+            throw error
         }
     }
 

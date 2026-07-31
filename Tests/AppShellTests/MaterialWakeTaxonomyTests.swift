@@ -187,6 +187,47 @@ final class MaterialWakeTaxonomyTests: XCTestCase {
         )
     }
 
+    func testDeviceRevokeHasRealPublisher() throws {
+        // WHY: device.revoke was taxonomy-only with zero publishers, so a
+        // revoked/kicked device never woke the material-wake path. LocalAuthAdapter
+        // must publish the kind with the device id.
+        let published = try Self.eventBusPublishKinds(inRelativePaths: [
+            "Sources/AppShell/LocalAuthAdapter.swift",
+        ])
+        XCTAssertTrue(
+            published.contains("device.revoke"),
+            "LocalAuthAdapter.revokeDevice must EventBus.publish(kind: device.revoke)"
+        )
+        XCTAssertEqual(
+            MaterialWakeTaxonomy.classification(forEventKind: "device.revoke"),
+            .criticalAlert
+        )
+        XCTAssertTrue(MaterialWakeTaxonomy.phaseACoreKinds.contains("device.revoke"))
+    }
+
+    func testGitConflictIsDeadTaxonomyStreamOnly() {
+        // WHY: no git-conflict detector exists in SocketServer/AppShell; listing
+        // it as Phase B silentOrAlert invents a wake path that can never fire
+        // from a real producer. Unknown/dead kinds fail closed as stream_only.
+        XCTAssertEqual(
+            MaterialWakeTaxonomy.classification(forEventKind: "git.conflict"),
+            .streamOnly
+        )
+        XCTAssertEqual(
+            MaterialWakeTaxonomy.coalesceClass(forEventKind: "git.conflict"),
+            .other,
+            "dead kinds must not share the real git coalesce bucket"
+        )
+        // Real git producers remain Phase B.
+        for kind in ["git.commit", "git.push", "git.checkout", "git.branch_created"] {
+            XCTAssertEqual(
+                MaterialWakeTaxonomy.classification(forEventKind: kind),
+                .silentOrAlert,
+                "\(kind) still has a real publisher and stays Phase B"
+            )
+        }
+    }
+
     /// Extract `EventBus.shared.publish(kind: "…")` string literals from host sources.
     private static func eventBusPublishKinds(inRelativePaths paths: [String]) throws -> Set<String> {
         // Tests/AppShellTests/ThisFile.swift → repo root.

@@ -75,7 +75,7 @@ public enum MaterialWakeTaxonomy: Sendable {
             return .silentForce
         case "device.revoke":
             return .criticalAlert
-        case "git.commit", "git.push", "git.conflict", "git.checkout", "git.branch_created":
+        case "git.commit", "git.push", "git.checkout", "git.branch_created":
             return .silentOrAlert // Phase B
         case "settings.updated":
             return .silent // Phase C digest
@@ -120,7 +120,7 @@ public enum MaterialWakeTaxonomy: Sendable {
             return .notification
         case "host.boot_epoch":
             return .boot
-        case "git.commit", "git.push", "git.conflict", "git.checkout", "git.branch_created":
+        case "git.commit", "git.push", "git.checkout", "git.branch_created":
             return .git
         default:
             return .other
