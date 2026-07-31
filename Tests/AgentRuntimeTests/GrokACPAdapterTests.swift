@@ -152,7 +152,14 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         let box = GrokACPEventBox()
         try await adapter.recoverSession(request) { box.append($0) }
         XCTAssertTrue(adapter.hasSession(threadId: request.threadId))
-        XCTAssertTrue(box.assistantText.contains("replayed"))
+        // Recovery restores ACP context for pull (`readThread`), not by pushing
+        // historical tools into the live onEvent stream (Claude/Codex contract).
+        XCTAssertFalse(box.assistantText.contains("replayed"),
+                       "recover must not push load replay into the live event stream")
+        let history = try await adapter.readThread(threadId: request.threadId)
+        XCTAssertTrue(Self.assistantText(in: history).contains("replayed"),
+                      "session/load after process death must restore readable ACP context via readThread")
+        XCTAssertTrue(Self.toolCallIds(in: history).contains("load-tool-1"))
         XCTAssertEqual(adapter.listSessions().first?.providerThreadId, "saved-session")
     }
 
@@ -433,6 +440,72 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         adapter.stopAll()
     }
 
+    func test_sendTurnAfterProcessDeathDoesNotPublishLoadReplayUnderNewPrompt() async throws {
+        // WHY: follow-up after ACP process death used to drain session/load
+        // replay into the live turn (143 prior steps under the new bubble).
+        // Load must restore provider context silently; only the new prompt's
+        // work may appear on the follow-up event stream.
+        let peer = try FakeGrokACPPeer(mode: .loadThenPrompt)
+        defer { peer.remove() }
+        let threadId = AgentThreadID()
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path)
+        let box = GrokACPEventBox()
+
+        _ = try await adapter.sendTurn(makeRequest(
+            threadId: threadId,
+            providerThreadId: "saved-session"
+        )) { box.append($0) }
+        let finished = try await box.waitFinished(timeout: 3)
+
+        XCTAssertEqual(finished.status, .completed)
+        XCTAssertFalse(box.assistantText.contains("replayed"),
+                       "session/load historical text must not enter the follow-up turn stream")
+        XCTAssertFalse(box.toolCallIds.contains("load-tool-1"),
+                       "session/load historical tools must not enter the follow-up turn stream")
+        XCTAssertTrue(box.assistantText.contains("fresh-follow-up"),
+                      "only the new prompt response may stream after load+prompt")
+        XCTAssertEqual(box.turnStartedCount, 1,
+                       "exactly one user-facing turn after sealed load hydration")
+        XCTAssertEqual(peer.launchCount, 1)
+        adapter.stopAll()
+    }
+
+    func test_recoverThenSendTurnDoesNotInheritReplayTurnIdentity() async throws {
+        // WHY: recoverSession records load history for readThread and seals so
+        // the next sendTurn mints a fresh turnStarted — never inherits replay.
+        let peer = try FakeGrokACPPeer(mode: .loadThenPrompt)
+        defer { peer.remove() }
+        let threadId = AgentThreadID()
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path)
+
+        let recovered = GrokACPEventBox()
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: "saved-session"
+        )) { recovered.append($0) }
+        let history = try await adapter.readThread(threadId: threadId)
+        XCTAssertTrue(Self.assistantText(in: history).contains("replayed"),
+                      "recoverSession restores ACP context via readThread")
+        XCTAssertTrue(Self.toolCallIds(in: history).contains("load-tool-1"))
+        XCTAssertFalse(recovered.assistantText.contains("replayed"),
+                       "recover must not push replay into the live event stream")
+
+        let followUp = GrokACPEventBox()
+        _ = try await adapter.sendTurn(makeRequest(
+            threadId: threadId,
+            providerThreadId: "saved-session"
+        )) { followUp.append($0) }
+        _ = try await followUp.waitFinished(timeout: 3)
+
+        XCTAssertFalse(followUp.assistantText.contains("replayed"),
+                       "follow-up must not re-stream recovery replay text")
+        XCTAssertFalse(followUp.toolCallIds.contains("load-tool-1"),
+                       "follow-up must not re-stream recovery tools")
+        XCTAssertTrue(followUp.assistantText.contains("fresh-follow-up"))
+        XCTAssertEqual(followUp.turnStartedCount, 1)
+        adapter.stopAll()
+    }
+
     func test_cancelThenProcessDeathRecoversContextThroughSessionLoad() async throws {
         let peer = try FakeGrokACPPeer(mode: .cancel)
         defer { peer.remove() }
@@ -463,8 +536,11 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
             providerThreadId: providerThreadId
         )) { replay.append($0) }
 
-        XCTAssertTrue(replay.assistantText.contains("replayed"),
+        let history = try await relaunched.readThread(threadId: threadId)
+        XCTAssertTrue(Self.assistantText(in: history).contains("replayed"),
                       "session/load after process death must restore the prior readable ACP context")
+        XCTAssertFalse(replay.assistantText.contains("replayed"),
+                       "recovery must not push historical ACP replay into a live run stream")
         XCTAssertEqual(relaunched.listSessions().first?.providerThreadId, providerThreadId)
         XCTAssertEqual(peer.launchCount, 2,
                        "recovery proof must use a new ACP process and the prior provider session identity")
@@ -494,8 +570,11 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
             providerThreadId: savedProviderThreadId
         )) { recovered.append($0) }
 
-        XCTAssertTrue(recovered.assistantText.contains("replayed"),
+        let history = try await adapter.readThread(threadId: threadId)
+        XCTAssertTrue(Self.assistantText(in: history).contains("replayed"),
                       "recovery must load the saved ACP identity into a fresh process")
+        XCTAssertFalse(recovered.assistantText.contains("replayed"),
+                       "forced-cancel recovery must not push load replay into the live stream")
         XCTAssertEqual(peer.launchCount, 2)
         adapter.stopAll()
     }
@@ -794,6 +873,20 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
             interactionMode: interactionMode, runAsUser: runAsUser
         )
     }
+
+    private static func assistantText(in events: [AssistantEvent]) -> String {
+        events.compactMap {
+            if case .itemDelta(_, let body, _, _) = $0 { return body }
+            return nil
+        }.joined()
+    }
+
+    private static func toolCallIds(in events: [AssistantEvent]) -> [String] {
+        events.compactMap {
+            if case .itemStarted(let item) = $0, item.type == .tool { return item.id }
+            return nil
+        }
+    }
 }
 
 private enum GrokACPTestWaitError: Error {
@@ -805,6 +898,14 @@ private final class GrokACPEventBox: @unchecked Sendable {
     private var events: [AgentRunEvent] = []
     var errors: [String] { lock.withLock { events.compactMap { if case .error(let text) = $0 { return text }; return nil } } }
     var assistantText: String { lock.withLock { events.compactMap { if case .event(.itemDelta(_, let body, _, _)) = $0 { return body }; return nil }.joined() } }
+    var toolCallIds: [String] {
+        lock.withLock {
+            events.compactMap {
+                if case .event(.itemStarted(let item)) = $0, item.type == .tool { return item.id }
+                return nil
+            }
+        }
+    }
     var turnStartedCount: Int {
         lock.withLock {
             events.filter {
@@ -872,13 +973,14 @@ private final class GrokACPEventBox: @unchecked Sendable {
 
 private final class FakeGrokACPPeer {
     enum Mode: String {
-        case permission, cancel, ignoreCancel, crash, load, discovery, plan
+        case permission, cancel, ignoreCancel, crash, load, loadThenPrompt, discovery, plan
         case auth, rateLimit, network, invalidResume, invalidJSON, immediateResponse, promptWriteFailure
     }
     let root: URL
     let path: String
     let launchCountPath: String
     let promptCountPath: String
+    let sessionIdPath: String
 
     var launchCount: Int {
         ((try? String(contentsOfFile: launchCountPath, encoding: .utf8)) ?? "").count
@@ -893,10 +995,12 @@ private final class FakeGrokACPPeer {
         let script = root.appendingPathComponent("grok")
         launchCountPath = root.appendingPathComponent("launch-count").path
         promptCountPath = root.appendingPathComponent("prompt-count").path
+        sessionIdPath = root.appendingPathComponent("session-id").path
         let body = #"""
         #!/bin/sh
         mode="MODE"
         current_mode="default"
+        session_id="session-fixed"
         printf x >> "COUNT_PATH"
         while IFS= read -r line; do
           if printf '%s' "$line" | grep -q '"method":"initialize"'; then
@@ -904,6 +1008,8 @@ private final class FakeGrokACPPeer {
               printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":true},"sessionCapabilities":{}},"_meta":{"agentVersion":"0.2.101"}}}\n' "$id"
           elif printf '%s' "$line" | grep -q '"method":"session.*new"'; then
               id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
+              session_id="session-fixed"
+              printf '%s' "$session_id" > "SESSION_ID_PATH"
               if [ "$mode" = promptWriteFailure ]; then
                 exec 0<&-
               fi
@@ -918,10 +1024,13 @@ private final class FakeGrokACPPeer {
           elif printf '%s' "$line" | grep -q '"method":"session.*load"'; then
               id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
               loaded_session=$(printf '%s' "$line" | sed -E 's/.*"sessionId":"([^"]+)".*/\1/')
+              session_id="$loaded_session"
+              printf '%s' "$session_id" > "SESSION_ID_PATH"
               if [ "$mode" = invalidResume ]; then
                 printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"session not found: invalid resume"}}\n' "$id"
                 continue
               fi
+              printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"tool_call","toolCallId":"load-tool-1","title":"prior tool","rawInput":{"command":"echo prior"},"_meta":{"isReplay":true,"eventId":"replay-tool-1"}}}}\n' "$loaded_session"
               printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replayed"},"_meta":{"isReplay":true,"eventId":"replay-1"}}}}\n' "$loaded_session"
               printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s"}}\n' "$id" "$loaded_session"
           elif printf '%s' "$line" | grep -q '"method":"session.*set_model"'; then
@@ -934,6 +1043,7 @@ private final class FakeGrokACPPeer {
           elif printf '%s' "$line" | grep -q '"method":"session.*prompt"'; then
               printf p >> "PROMPT_COUNT_PATH"
               id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
+              if [ -f "SESSION_ID_PATH" ]; then session_id=$(cat "SESSION_ID_PATH"); fi
               if [ "$mode" = crash ]; then kill -ABRT $$; fi
               if [ "$mode" = cancel ] || [ "$mode" = ignoreCancel ]; then prompt_id="$id"; continue; fi
               if [ "$mode" = auth ]; then
@@ -950,6 +1060,11 @@ private final class FakeGrokACPPeer {
               fi
               if [ "$mode" = invalidJSON ]; then
                 printf 'not-json\n'
+                continue
+              fi
+              if [ "$mode" = loadThenPrompt ]; then
+                printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"fresh-follow-up"}}}}\n' "$session_id"
+                printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
                 continue
               fi
               if [ "$mode" = immediateResponse ]; then
@@ -982,6 +1097,7 @@ private final class FakeGrokACPPeer {
             .replacingOccurrences(of: "MODE", with: mode.rawValue)
             .replacingOccurrences(of: "PROMPT_COUNT_PATH", with: promptCountPath)
             .replacingOccurrences(of: "COUNT_PATH", with: launchCountPath)
+            .replacingOccurrences(of: "SESSION_ID_PATH", with: sessionIdPath)
         try body.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
         path = script.path

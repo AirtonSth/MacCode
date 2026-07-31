@@ -553,9 +553,39 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 return replaced
             }
             replaced?.client.stop()
-            for (method, params) in bufferedNotifications.drain() {
-                handleNotification(method: method, params: params, session: session)
+            // session/load replays the full prior conversation as ordinary
+            // session/update notifications (no reliable wire flag on every build).
+            //
+            // Contract (align Grok with Claude/Codex): history is a *pull*
+            // (`readThread`), never a push of historical tools into a live run.
+            //
+            // - load + prompt (sendTurn after process death): hydrate mapper
+            //   state only — do not publish timeline items under the new bubble.
+            // - load, no prompt (recoverSession): record replay into
+            //   session.history for readThread, still no live onEvent push.
+            // - session/new: publish pre-prompt notifications normally.
+            // Then seal so beginTurn always mints a fresh user-facing turn.
+            let loadNotifications = bufferedNotifications.drain()
+            if loadExisting {
+                for (method, params) in loadNotifications {
+                    if shouldStartPrompt {
+                        hydrateNotification(method: method, params: params, session: session)
+                    } else {
+                        recordHydratedTimeline(method: method, params: params, session: session)
+                    }
+                }
+                // Silent/record paths discard mapper-emitted threadStarted; publish
+                // identity once so resume-cursor persistence stays deterministic.
+                emit(
+                    .threadStarted(threadId: session.providerThreadId, providerThreadId: session.providerThreadId),
+                    session: session
+                )
+            } else {
+                for (method, params) in loadNotifications {
+                    handleNotification(method: method, params: params, session: session)
+                }
             }
+            session.mapper.sealHydration()
             if shouldStartPrompt {
                 try await startPrompt(request, session: session, onEvent: onEvent)
             } else {
@@ -691,6 +721,46 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             return
         }
         for event in session.mapper.consumeSessionUpdate(update) { emit(event, session: session) }
+    }
+
+    /// Apply load-time `session/update` to mapper session state only.
+    /// Does not publish timeline events onto the follow-up run's onEvent path.
+    private func hydrateNotification(method: String, params: Any?, session: Session) {
+        guard method == "session/update",
+              let params = params as? [String: Any],
+              params["sessionId"] as? String == session.providerThreadId,
+              let update = params["update"] as? [String: Any] else {
+            // Load-time `_x.ai/*` subagent rows are dropped here intentionally:
+            // they already exist in durable history and must not re-enter a run.
+            return
+        }
+        // Discard timeline events; mode/commands/usage still land on the mapper.
+        _ = session.mapper.consumeSessionUpdate(update)
+        if update["sessionUpdate"] as? String == "current_mode_update",
+           let modeId = update["currentModeId"] as? String {
+            session.mode = modeId
+        }
+    }
+
+    /// `session/load` replay for recoverSession: keep history for `readThread`
+    /// without pushing into the live `onEvent` path (avoids durable stream
+    /// pollution / SR1 re-translation of historical text).
+    private func recordHydratedTimeline(method: String, params: Any?, session: Session) {
+        guard method == "session/update",
+              let params = params as? [String: Any],
+              params["sessionId"] as? String == session.providerThreadId,
+              let update = params["update"] as? [String: Any] else {
+            return
+        }
+        let events = session.mapper.consumeSessionUpdate(update)
+        if update["sessionUpdate"] as? String == "current_mode_update",
+           let modeId = update["currentModeId"] as? String {
+            session.mode = modeId
+        }
+        guard !events.isEmpty else { return }
+        lock.lock()
+        session.history.append(contentsOf: events)
+        lock.unlock()
     }
 
     private func handleServerRequest(

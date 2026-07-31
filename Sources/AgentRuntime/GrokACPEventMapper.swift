@@ -57,6 +57,23 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         return events
     }
 
+    /// Clear any synthetic turn opened while absorbing `session/load` replay.
+    ///
+    /// WHY: ACP `session/load` re-emits historical `session/update`s. If those
+    /// leave `turnId` set, the next user prompt's `beginTurn()` no-ops into the
+    /// replay turn and the UI counts prior tools as "Work so far · N steps in
+    /// this turn" under the new user bubble.
+    public func sealHydration() {
+        lock.lock(); defer { lock.unlock() }
+        reasoningItemId = nil
+        assistantItemId = nil
+        turnId = nil
+        finished = true
+        currentAssistantPhase = ""
+        finalAssistantMessage = nil
+        sawDetachedShellSpawn = false
+    }
+
     public func consumeSessionUpdate(_ update: [String: Any]) -> [AssistantEvent] {
         lock.lock(); defer { lock.unlock() }
         var events: [AssistantEvent] = []
@@ -66,15 +83,18 @@ public final class GrokACPEventMapper: @unchecked Sendable {
             return []
         }
         ensureThread(&events)
-        // After finishTurn, turnId is nil and finished is true. ensureTurn would
-        // mint a fresh turnStarted; if the coordinator already cleared seq for the
-        // run, that collides with durable seq 1 (often pre-turn servers_updated).
+        guard let kind = update["sessionUpdate"] as? String else { return events }
+
+        // After finishTurn / sealHydration, turnId is nil and finished is true.
+        // Timeline content must not mint a fresh turnStarted (durable seq 1
+        // collision). Session *state* (mode, commands, usage) still applies so
+        // a follow-up prompt sees negotiated mode after load hydration.
         if finished {
+            applySessionStateOnly(kind: kind, update: update, events: &events)
             return events
         }
         ensureTurn(&events)
         let now = Self.now
-        guard let kind = update["sessionUpdate"] as? String else { return events }
 
         switch kind {
         case "agent_thought_chunk":
@@ -158,21 +178,13 @@ public final class GrokACPEventMapper: @unchecked Sendable {
             }
 
         case "usage_update":
-            if let usage = Self.usage(update["usage"] as? [String: Any] ?? update) {
-                latestUsage = usage
-                events.append(.tokenUsage(usage))
-            }
+            applyUsageUpdate(update, events: &events)
 
         case "available_commands_update":
-            availableCommands = (update["availableCommands"] as? [[String: Any]] ?? []).compactMap { raw in
-                guard let name = raw["name"] as? String, !name.isEmpty else { return nil }
-                return GrokACPAvailableCommand(name: name, description: raw["description"] as? String)
-            }
-            events.append(Self.runtimeEvent(method: kind, payload: update))
+            applyAvailableCommandsUpdate(update, events: &events)
 
         case "current_mode_update":
-            currentModeId = update["currentModeId"] as? String
-            events.append(Self.runtimeEvent(method: kind, payload: update))
+            applyCurrentModeUpdate(update, events: &events)
 
         case "config_option_update", "session_info_update", "user_message_chunk":
             events.append(Self.runtimeEvent(method: kind, payload: update))
@@ -194,6 +206,47 @@ public final class GrokACPEventMapper: @unchecked Sendable {
             events.append(Self.runtimeEvent(method: kind, payload: update))
         }
         return events
+    }
+
+    /// Session state that must survive after sealHydration / finishTurn without
+    /// reopening a user-facing turn.
+    private func applySessionStateOnly(
+        kind: String,
+        update: [String: Any],
+        events: inout [AssistantEvent]
+    ) {
+        switch kind {
+        case "usage_update":
+            applyUsageUpdate(update, events: &events)
+        case "available_commands_update":
+            applyAvailableCommandsUpdate(update, events: &events)
+        case "current_mode_update":
+            applyCurrentModeUpdate(update, events: &events)
+        case "config_option_update", "session_info_update":
+            events.append(Self.runtimeEvent(method: kind, payload: update))
+        default:
+            break
+        }
+    }
+
+    private func applyUsageUpdate(_ update: [String: Any], events: inout [AssistantEvent]) {
+        if let usage = Self.usage(update["usage"] as? [String: Any] ?? update) {
+            latestUsage = usage
+            events.append(.tokenUsage(usage))
+        }
+    }
+
+    private func applyAvailableCommandsUpdate(_ update: [String: Any], events: inout [AssistantEvent]) {
+        availableCommands = (update["availableCommands"] as? [[String: Any]] ?? []).compactMap { raw in
+            guard let name = raw["name"] as? String, !name.isEmpty else { return nil }
+            return GrokACPAvailableCommand(name: name, description: raw["description"] as? String)
+        }
+        events.append(Self.runtimeEvent(method: "available_commands_update", payload: update))
+    }
+
+    private func applyCurrentModeUpdate(_ update: [String: Any], events: inout [AssistantEvent]) {
+        currentModeId = update["currentModeId"] as? String
+        events.append(Self.runtimeEvent(method: "current_mode_update", payload: update))
     }
 
     public func finishTurn(stopReason: String, usage: [String: Any]?) -> [AssistantEvent] {

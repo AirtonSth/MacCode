@@ -690,6 +690,63 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(text, "once")
     }
 
+    func test_sealHydrationClearsReplayTurnSoBeginTurnMintsFreshUserTurn() {
+        // WHY: session/load replay used to leave turnId set; beginTurn no-oped
+        // and follow-up prompts inherited prior tool_call steps.
+        let mapper = GrokACPEventMapper(sessionId: "s-load")
+        let replay = mapper.consumeSessionUpdate([
+            "sessionUpdate": "tool_call",
+            "toolCallId": "old-tool-1",
+            "title": "prior work",
+            "rawInput": ["command": "echo old"],
+            "_meta": ["isReplay": true, "eventId": "replay-tool-1"]
+        ])
+        XCTAssertTrue(replay.contains { if case .turnStarted = $0 { return true }; return false })
+        XCTAssertTrue(replay.contains {
+            if case .itemStarted(let item) = $0 { return item.id == "old-tool-1" }
+            return false
+        })
+
+        mapper.sealHydration()
+
+        let next = mapper.beginTurn()
+        XCTAssertEqual(next.filter { if case .turnStarted = $0 { return true }; return false }.count, 1,
+                       "after sealHydration, beginTurn must mint a new user-facing turn")
+        let live = mapper.consumeSessionUpdate([
+            "sessionUpdate": "tool_call",
+            "toolCallId": "new-tool-1",
+            "title": "fresh work",
+            "rawInput": ["command": "echo new"]
+        ])
+        XCTAssertTrue(live.contains {
+            if case .itemStarted(let item) = $0 {
+                return item.id == "new-tool-1" && item.turnId != ""
+            }
+            return false
+        })
+        XCTAssertFalse(live.contains {
+            if case .itemStarted(let item) = $0 { return item.id == "old-tool-1" }
+            return false
+        }, "prior load tools must not reappear on the sealed follow-up turn")
+    }
+
+    func test_sealHydrationStillAppliesModeAndCommandsWithoutReopeningTurn() {
+        let mapper = GrokACPEventMapper(sessionId: "s-state")
+        mapper.sealHydration()
+        let events = mapper.consumeSessionUpdate([
+            "sessionUpdate": "available_commands_update",
+            "availableCommands": [["name": "compact", "description": "Compress"]]
+        ]) + mapper.consumeSessionUpdate([
+            "sessionUpdate": "current_mode_update",
+            "currentModeId": "acceptEdits"
+        ])
+        XCTAssertEqual(mapper.availableCommands.map(\.name), ["compact"])
+        XCTAssertEqual(mapper.currentModeId, "acceptEdits")
+        XCTAssertFalse(events.contains { if case .turnStarted = $0 { return true }; return false },
+                       "post-seal state updates must not mint a turn")
+        XCTAssertFalse(events.contains { if case .itemStarted = $0 { return true }; return false })
+    }
+
     func test_permissionRequestPreservesExactOptionIds() throws {
         let parsed = try GrokACPPermissionRequest.parse(id: .int(0), params: [
             "sessionId": "s",
