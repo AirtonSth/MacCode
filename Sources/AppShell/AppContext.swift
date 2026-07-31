@@ -1564,10 +1564,22 @@ public final class AppContext {
         env["REMOTE_CODE_PROVIDER_INSTANCE_ID"] = thread?.providerInstanceId ?? provider.rawValue
         // Managed PATH is host-local (not inside the compact receipt JSON).
         if receipt.capabilities.managedPath == true {
-            let managedBin = makeAgentSkillInstaller().managedCLIBinURL.path
+            let installer = makeAgentSkillInstaller()
+            // Automatic reinstall for any user on every admitted turn: missing
+            // or dangling ~/.remote-code/bin/distill is repaired before PATH is
+            // stamped (PostToolUse + `| distill` need a live binary).
+            do {
+                _ = try installer.ensureDistillCLI()
+            } catch {
+                NSLog(
+                    "RemoteCode: ensureDistillCLI before agent turn failed: \(error.localizedDescription)"
+                )
+            }
+            let managedBin = installer.managedCLIBinURL.path
             let currentPath = baseEnvironment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
             let pathParts = currentPath.split(separator: ":").map(String.init).filter { $0 != managedBin }
             env["PATH"] = ([managedBin] + pathParts).joined(separator: ":")
+            env["RC_REMOTE_CODE_MANAGED_BIN"] = managedBin
         }
         // Claude PostToolUse needs the sidecar state file path (not a secret).
         if receipt.capabilities.postToolUse == true {
@@ -1645,6 +1657,17 @@ public final class AppContext {
             "REMOTE_CODE_PROVIDER_INSTANCE_ID": thread?.providerInstanceId ?? provider.rawValue,
         ]) { _, new in new }
         let installer = makeAgentSkillInstaller()
+        // Nested launches inherit managed bin; keep distill healthy whenever Token
+        // Saver is admitted so child shells and PostToolUse hooks never see a gap.
+        if tokenSaverRuntimeAdmitted {
+            do {
+                _ = try installer.ensureDistillCLI()
+            } catch {
+                NSLog(
+                    "RemoteCode: ensureDistillCLI before subagent env failed: \(error.localizedDescription)"
+                )
+            }
+        }
         let managedBin = installer.managedCLIBinURL.path
         let basePath = environment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
         environment["PATH"] = AppCommandRouter.providerPathWithManagedWrappers(
@@ -2022,20 +2045,44 @@ public final class AppContext {
         }
 
         if tokenSaverEnabled {
-            do {
-                let appPrivate = try installer.installAppPrivateDistillSkill(
+            // Install each paid integration independently. A skill-copy failure
+            // must not leave `~/.remote-code/bin/distill` missing while npm/claude
+            // wrappers remain (PostToolUse + `| distill` then fail open silently).
+            // Resolve the service binary once so every user gets the same target
+            // for distill + wrappers (including recovery from existing wrappers).
+            let sharedBinary = AgentSkillInstaller.resolveServiceBinary()
+            var appPrivateResult: AgentSkillInstallResult?
+            capture("app-private Distill skill") {
+                appPrivateResult = try installer.installAppPrivateDistillSkill(
                     sourceRevision: "github-main-remote-code-template-v2"
                 )
-                _ = try installer.installDistillCLI(appSupportDirectory: appSupportDirectory)
-                _ = try installer.installCommandWrappers()
+            }
+            capture("Distill CLI ensure") {
+                _ = try installer.ensureDistillCLI(serviceBinaryURL: sharedBinary)
+            }
+            capture("command wrappers") {
+                _ = try installer.installCommandWrappers(serviceBinaryURL: sharedBinary)
+            }
+            // Re-ensure after wrappers: recovers from catalog refresh races and
+            // from hosts where only wrappers survived a prior partial install.
+            capture("Distill CLI re-ensure") {
+                _ = try installer.ensureDistillCLI(serviceBinaryURL: sharedBinary)
+            }
+            capture("retrieve MCP") {
                 try installer.installRetrieveMCP()
-                // Warm login-shell env so agent turns get profile secret/PATH parity.
-                LoginShellEnvironment.prewarm()
-                managedDistillSkillInstallResults = [appPrivate]
-            } catch {
-                failures.append("paid integration install: \((error as NSError).localizedDescription)")
-                removePaidIntegration()
+            }
+            LoginShellEnvironment.prewarm()
+            if let appPrivateResult {
+                managedDistillSkillInstallResults = [appPrivateResult]
+            } else {
                 managedDistillSkillInstallResults = []
+            }
+            // Loud residual when the managed distill binary is still unhealthy —
+            // Token Saver techniques that depend on it will fail open.
+            if !installer.isDistillCLIHealthy() {
+                failures.append(
+                    "Distill CLI unhealthy at \(installer.distillCLIURL().path) after Token Saver install"
+                )
             }
         } else {
             removePaidIntegration()

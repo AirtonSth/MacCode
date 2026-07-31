@@ -242,6 +242,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     - Emit `Dict:` early only when aliases reduce repetition (never secrets/people/paths/URLs as aliases).
 
     Command-output policy (Token Saver — default-pipe; only exact-output / GUI / skill are exempt):
+    - **Native Grok/Codex tools** (`read_file`, `grep`, `search_replace`, `list_dir`, …) are **not** PATH-wrappable and provider PostToolUse cannot rewrite their output (Grok hooks are passive; Codex has no `updatedToolOutput`). For large corpus work: prefer Graphify query when active, or `run_terminal_command` / shell with `| distill` / wrapped catalog tools. Use native `read_file`/`grep` only for small targeted slices you need byte-exactly.
     - MANDATORY default: for **every** non-GUI shell command that is pipable and whose full stdout you do **not** need byte-exactly next, end with `| distill "<question>"` (use `pipefail` when exit status matters). Rule of thumb: if you will only use a summary / pass-fail / key lines, you MUST pipe.
       Applies to: build, test, lint, install, docker, kubectl, terraform, find, ls, git log/status/diff summaries, package managers, python/bun one-shots, compound scripts, CI/logs, and **any other ordinary command** not listed under NEVER below.
       Host PATH wrappers may also auto-compress some catalog commands; still pipe `| distill` yourself so extraction is explicit and nothing eligible is left raw.
@@ -344,17 +345,34 @@ public final class AgentSkillInstaller: @unchecked Sendable {
 
     /// Add host runtime guidance to an exact raw provider CLI invocation without
     /// changing its prompt transport, sandbox, tools, persistence, or output ABI.
+    ///
+    /// Nested `claude` / `codex` / `grok` launches go through this seam (via
+    /// `ProviderProxyRunner.providerRuntimeArguments`). For Claude, Agent App
+    /// runs already register PostToolUse via `ClaudeRunner.ultracodeSettingsArgs`.
+    /// The raw provider-proxy path must do the same when Token Saver admits
+    /// `RC_TOKEN_SAVER_POST_TOOL_USE=1` — otherwise nested Claude (advisor,
+    /// spawn_subagent, shell `claude`) burns tokens with zero tool-output
+    /// compression while lifecycle still shows Nested - Claude receipts.
     public static func providerProxyArguments(
         provider: AgentProvider,
         arguments: [String],
         environment: [String: String]
     ) -> [String] {
+        // Claude PostToolUse is independent of the dialect prompt: nested
+        // advisors use only Read/Glob/Grep, so PATH wrappers never fire and
+        // hooks are the only provider-native rewrite path (Agents.md).
+        var rewritten = ensuringClaudePostToolUseSettings(
+            provider: provider,
+            arguments: arguments,
+            environment: environment
+        )
+
         let prompt = tokenSaverProviderPrompt("", environment: environment)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty,
-              isSupportedProviderTurn(provider: provider, arguments: arguments)
+              isSupportedProviderTurn(provider: provider, arguments: rewritten)
         else {
-            return arguments
+            return rewritten
         }
 
         switch provider {
@@ -363,32 +381,70 @@ public final class AgentSkillInstaller: @unchecked Sendable {
                 prompt,
                 option: "--rules",
                 provider: provider,
-                arguments: arguments
+                arguments: rewritten
             )
         case .claude:
             return mergingProviderPrompt(
                 prompt,
                 option: "--append-system-prompt",
                 provider: provider,
-                arguments: arguments
+                arguments: rewritten
             )
         case .codex:
-            let scan = scanProviderArguments(provider: provider, arguments: arguments)
-            guard !scan.malformed else { return arguments }
+            let scan = scanProviderArguments(provider: provider, arguments: rewritten)
+            guard !scan.malformed else { return rewritten }
             let configValues = (scan.optionValues["--config"] ?? [])
                 + (scan.optionValues["-c"] ?? [])
             let hasDeveloperOverride = configValues.contains {
                 $0.hasPrefix("developer_instructions=")
             }
-            guard !hasDeveloperOverride else { return arguments }
+            guard !hasDeveloperOverride else { return rewritten }
             let quoted = "\""
                 + prompt
                     .replacingOccurrences(of: "\\", with: "\\\\")
                     .replacingOccurrences(of: "\"", with: "\\\"")
                     .replacingOccurrences(of: "\n", with: "\\n")
                 + "\""
-            return ["--config", "developer_instructions=\(quoted)"] + arguments
+            return ["--config", "developer_instructions=\(quoted)"] + rewritten
         }
+    }
+
+    /// Inject Claude CLI `--settings` PostToolUse hooks on the raw provider-proxy
+    /// path when Token Saver has admitted the Claude PostToolUse lane.
+    ///
+    /// Fail-open rules:
+    /// - Non-Claude providers: unchanged.
+    /// - Flag absent / not admitted: unchanged (byte-identical argv).
+    /// - Administrative / unsupported turns: unchanged.
+    /// - Caller already passed `--settings`: leave intact (never double-inject).
+    /// - Settings builder fails: leave argv unchanged.
+    static func ensuringClaudePostToolUseSettings(
+        provider: AgentProvider,
+        arguments: [String],
+        environment: [String: String]
+    ) -> [String] {
+        guard provider == .claude else { return arguments }
+        guard environment[ClaudeRunner.tokenSaverPostToolUseEnvKey] == "1" else {
+            return arguments
+        }
+        guard isSupportedProviderTurn(provider: .claude, arguments: arguments) else {
+            return arguments
+        }
+        // Respect an explicit caller settings payload (merge would risk
+        // overriding user/provider JSON we do not own).
+        if arguments.contains("--settings") {
+            return arguments
+        }
+        // Reuse the Agent App settings builder so proxy and ClaudeRunner never
+        // drift on hook command, matcher, or timeout.
+        let settingsArgs = ClaudeRunner.ultracodeSettingsArgs(
+            nil,
+            environment: environment
+        )
+        guard settingsArgs.count == 2, settingsArgs[0] == "--settings" else {
+            return arguments
+        }
+        return settingsArgs + arguments
     }
 
     /// Restrict prompt/rules injection to provider invocations whose turn ABI
@@ -836,17 +892,113 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// symlink — not a shebang script — so there is no Python dependency (N1) and the CLI
     /// is fail-open (writes raw stdin back on any error; see ManagedDistillCLI).
     /// `serviceBinaryURL` is resolved automatically when not provided (tests inject it).
+    ///
+    /// Idempotent and automatic for any user: repairs missing, dangling, or stale
+    /// links under that user's home (`~/.remote-code/bin` + `~/.local/bin` bridge).
     @discardableResult
     public func installDistillCLI(appSupportDirectory: URL, serviceBinaryURL: URL? = nil) throws -> URL {
+        try ensureDistillCLI(serviceBinaryURL: serviceBinaryURL)
+    }
+
+    /// Ensure the managed `distill` basename and PATH bridge exist and point at a
+    /// live `RemoteCodeDistillService`. Safe to call on every Token Saver reconcile
+    /// and before every admitted agent turn — no-ops when already healthy.
+    ///
+    /// Resolution order (works for any macOS user account):
+    /// 1. explicit `serviceBinaryURL` when executable
+    /// 2. `resolveServiceBinary` (app bundle aux, process siblings, SwiftPM)
+    /// 3. recover from any existing healthy managed wrapper in this installer's
+    ///    `cliBinDirectory` (e.g. `git`/`claude` still pointing at the service)
+    @discardableResult
+    public func ensureDistillCLI(serviceBinaryURL: URL? = nil) throws -> URL {
         try fileManager.createDirectory(at: cliBinDirectory, withIntermediateDirectories: true)
+        let binary = try resolveServiceBinaryForManagedInstall(preferred: serviceBinaryURL)
         let url = distillCLIURL()
-        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
+        if distillLinkNeedsRepair(at: url, expectedBinary: binary) {
+            try? fileManager.removeItem(at: url)
+            try fileManager.createSymbolicLink(at: url, withDestinationURL: binary)
+        }
+        linkManagedDistillOntoPath(target: url)
+        // Second path-bridge pass: if ~/.local/bin/distill still missing (first
+        // attempt failed on a race), retry once.
+        if !fileManager.fileExists(atPath: distillPathLinkURL().path) {
+            linkManagedDistillOntoPath(target: url)
+        }
+        guard isHealthyDistillLink(at: url) else {
             throw AgentSkillCLIError.serviceBinaryUnavailable
         }
-        try? fileManager.removeItem(at: url) // replace any prior symlink or legacy script
-        try fileManager.createSymbolicLink(at: url, withDestinationURL: binary)
-        linkManagedDistillOntoPath(target: url)
         return url
+    }
+
+    /// True when managed `distill` exists and resolves to an executable service binary.
+    public func isDistillCLIHealthy() -> Bool {
+        isHealthyDistillLink(at: distillCLIURL())
+    }
+
+    private func resolveServiceBinaryForManagedInstall(preferred: URL?) throws -> URL {
+        if let preferred, fileManager.isExecutableFile(atPath: preferred.path) {
+            return preferred.resolvingSymlinksInPath()
+        }
+        // Prefer this installer's managed-bin wrappers (per-user home) before
+        // process-global resolution. After app moves/upgrades, wrappers often
+        // still point at the live service while Bundle.main / SwiftPM paths lag;
+        // also keeps sandboxed test homes from picking up the host SPM binary.
+        if let recovered = recoverServiceBinaryFromManagedWrappers() {
+            return recovered
+        }
+        if let resolved = Self.resolveServiceBinary(fileManager: fileManager),
+           fileManager.isExecutableFile(atPath: resolved.path) {
+            return resolved.resolvingSymlinksInPath()
+        }
+        throw AgentSkillCLIError.serviceBinaryUnavailable
+    }
+
+    /// When the app bundle path changed or Bundle.main is wrong, recover the
+    /// service binary from any remaining healthy managed symlink for this user.
+    private func recoverServiceBinaryFromManagedWrappers() -> URL? {
+        var names = ["claude", "codex", "grok", "git", "npm", "remote-code", "ls", "distill"]
+        names.append(contentsOf: WrappedCommandCatalog.commands)
+        var seen = Set<String>()
+        for name in names where seen.insert(name).inserted {
+            let link = cliBinDirectory.appendingPathComponent(name)
+            guard let absolute = resolvedSymlinkTarget(at: link),
+                  fileManager.isExecutableFile(atPath: absolute.path),
+                  absolute.lastPathComponent == "RemoteCodeDistillService"
+                    || absolute.path.contains("RemoteCodeDistillService") else {
+                continue
+            }
+            return absolute
+        }
+        return nil
+    }
+
+    private func resolvedSymlinkTarget(at link: URL) -> URL? {
+        guard let dest = try? fileManager.destinationOfSymbolicLink(atPath: link.path) else {
+            return nil
+        }
+        if (dest as NSString).isAbsolutePath {
+            return URL(fileURLWithPath: dest).resolvingSymlinksInPath()
+        }
+        return link.deletingLastPathComponent()
+            .appendingPathComponent(dest)
+            .resolvingSymlinksInPath()
+    }
+
+    private func distillLinkNeedsRepair(at url: URL, expectedBinary: URL) -> Bool {
+        guard let current = resolvedSymlinkTarget(at: url) else {
+            // Missing, or a regular file (legacy script) — always replace.
+            return true
+        }
+        if !fileManager.isExecutableFile(atPath: current.path) {
+            return true
+        }
+        return current.resolvingSymlinksInPath().path
+            != expectedBinary.resolvingSymlinksInPath().path
+    }
+
+    private func isHealthyDistillLink(at url: URL) -> Bool {
+        guard let target = resolvedSymlinkTarget(at: url) else { return false }
+        return fileManager.isExecutableFile(atPath: target.path)
     }
 
     public func uninstallDistillCLI() throws -> AgentSkillUninstallResult {
@@ -899,6 +1051,12 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             }
             try fileManager.createSymbolicLink(at: link, withDestinationURL: binary)
             installed.append(command)
+        }
+        // Always keep the managed `distill` basename next to wrappers for every
+        // user. PostToolUse hooks and voluntary `| distill` resolve this path.
+        _ = try ensureDistillCLI(serviceBinaryURL: binary)
+        if !installed.contains("distill") {
+            installed.append("distill")
         }
         return installed
     }
@@ -1333,20 +1491,55 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     public static func resolveServiceBinary(fileManager: FileManager = .default) -> URL? {
         if let bundled = Bundle.main.url(forAuxiliaryExecutable: "RemoteCodeDistillService"),
            fileManager.isExecutableFile(atPath: bundled.path) {
-            return bundled
+            return bundled.resolvingSymlinksInPath()
+        }
+        // Packaged apps also place the service next to the main binary under
+        // Contents/MacOS (not only as an "auxiliary executable" lookup).
+        if let executables = Bundle.main.executableURL?.deletingLastPathComponent() {
+            let sibling = executables.appendingPathComponent("RemoteCodeDistillService")
+            if fileManager.isExecutableFile(atPath: sibling.path) {
+                return sibling.resolvingSymlinksInPath()
+            }
         }
         let executableDirectory = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
         if let sibling = firstServiceSibling(in: [executableDirectory], fileManager: fileManager) {
-            return sibling
+            return sibling.resolvingSymlinksInPath()
         }
         let cwd = URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
         for candidate in swiftPMServiceBinaryCandidates(in: cwd, fileManager: fileManager) {
             if fileManager.isExecutableFile(atPath: candidate.path) {
-                return candidate
+                return candidate.resolvingSymlinksInPath()
             }
         }
         if let sibling = firstServiceSibling(in: xctestBundleSearchDirectories(), fileManager: fileManager) {
-            return sibling
+            return sibling.resolvingSymlinksInPath()
+        }
+        // Last resort for any user: recover from their existing managed wrappers
+        // under the default home managed bin (installers with custom homes use
+        // the instance method recoverServiceBinaryFromManagedWrappers).
+        let defaultBin = defaultManagedCLIBinDirectory()
+        let probeNames = ["claude", "codex", "grok", "git", "npm", "ls", "remote-code"]
+            + WrappedCommandCatalog.commands
+        var seen = Set<String>()
+        for name in probeNames where seen.insert(name).inserted {
+            let link = defaultBin.appendingPathComponent(name)
+            guard let dest = try? fileManager.destinationOfSymbolicLink(atPath: link.path) else {
+                continue
+            }
+            let absolute: URL
+            if (dest as NSString).isAbsolutePath {
+                absolute = URL(fileURLWithPath: dest).resolvingSymlinksInPath()
+            } else {
+                absolute = link.deletingLastPathComponent()
+                    .appendingPathComponent(dest)
+                    .resolvingSymlinksInPath()
+            }
+            guard fileManager.isExecutableFile(atPath: absolute.path),
+                  absolute.lastPathComponent == "RemoteCodeDistillService"
+                    || absolute.path.contains("RemoteCodeDistillService") else {
+                continue
+            }
+            return absolute
         }
         return nil
     }

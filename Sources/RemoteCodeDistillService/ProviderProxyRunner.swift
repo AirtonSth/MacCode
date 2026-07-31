@@ -22,23 +22,39 @@ enum ProviderProxyRunner {
         let liveRuntime = validatedPaidRuntime(environment: env)
         let runtimeEnvironment = liveRuntime.environment
 
-        // The deterministic sam-grok-worker ABI is fully representable by the
-        // native Agent App middleware. Promote it before raw permission/receipt
-        // handling so the persisted Agent App run is the sole lifecycle row.
+        // Nested provider CLIs with a parent Agent App scope promote into
+        // `remote-code agent-app` so Token Saver (PATH wrappers, dialect, Claude
+        // PostToolUse, Graphify) runs through the same host pipeline as UI
+        // subagents. Fail open to the raw provider path when the ABI is not
+        // agent-shaped. If stdin was already consumed for promotion, fail loud
+        // instead of spawning a raw CLI with an empty prompt.
         let parentRunScope = runtimeEnvironment["RC_REMOTE_CODE_ROOT_RUN_ID"]
             ?? runtimeEnvironment["RC_TOKEN_SAVER_ROOT_RUN_ID"]
             ?? runtimeEnvironment["RC_TOKEN_SAVER_ATTEMPT_ID"]
         if runtimeEnvironment["RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE"] == "1",
            ProviderProxyPolicy.hasTelemetryScope(environment: runtimeEnvironment),
            parentRunScope.flatMap(UUID.init(uuidString:)) != nil,
-           let delegation = ProviderProxyPolicy.samGrokWorkerAgentAppDelegation(
-                providerBasename: basename,
-                arguments: arguments
+           AgentDelegationCapabilityTransport.isWellFormed(
+            runtimeEnvironment[AgentDelegationCapabilityTransport.environmentKey] ?? ""
            ) {
-            return runAgentAppDelegation(
-                delegation,
+            switch materializeNestedAgentAppDelegation(
+                providerBasename: basename,
+                arguments: arguments,
                 environment: runtimeEnvironment
-            ).exitCode
+            ) {
+            case .promote(let delegation):
+                return runAgentAppDelegation(
+                    delegation,
+                    environment: runtimeEnvironment
+                ).exitCode
+            case .notEligible:
+                break
+            case .failed(let reason):
+                FileHandle.standardError.write(
+                    Data("remote-code agent-app: \(reason)\n".utf8)
+                )
+                return 1
+            }
         }
 
         // Fail open: no telemetry scope → raw exec, no receipt.
@@ -225,6 +241,106 @@ enum ProviderProxyRunner {
             arguments: delegation.arguments,
             environment: environment
         )
+    }
+
+    private enum NestedAgentAppMaterialization {
+        case promote(ProviderAgentAppDelegation)
+        case notEligible
+        case failed(String)
+    }
+
+    /// Build an Agent App delegation for nested `claude` / `codex` / `grok`.
+    /// Materializes stdin or inline prompts into a private temp file the host
+    /// can read; never rewrites the caller's original argv for the raw path.
+    private static func materializeNestedAgentAppDelegation(
+        providerBasename: String,
+        arguments: [String],
+        environment: [String: String]
+    ) -> NestedAgentAppMaterialization {
+        // Closed sam-grok-worker shape first (already absolute --prompt-file).
+        if let exact = ProviderProxyPolicy.samGrokWorkerAgentAppDelegation(
+            providerBasename: providerBasename,
+            arguments: arguments
+        ) {
+            return .promote(exact)
+        }
+        guard ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: providerBasename,
+            arguments: arguments
+        ) else {
+            return .notEligible
+        }
+
+        let promptFile: String
+        if let existing = ProviderProxyPolicy.nestedCLIPromptFile(arguments: arguments) {
+            promptFile = existing
+        } else if let inline = ProviderProxyPolicy.nestedCLIInlinePrompt(
+            providerBasename: providerBasename,
+            arguments: arguments
+        ) {
+            guard let written = writeNestedPromptTempFile(
+                contents: inline,
+                environment: environment
+            ) else {
+                return .failed("could not materialize nested prompt file")
+            }
+            promptFile = written
+        } else {
+            // Agent turns often put the prompt on stdin (e.g. claude --print).
+            // Reading stdin is irreversible — do not fall back to raw after this.
+            let stdinData = FileHandle.standardInput.readDataToEndOfFile()
+            guard let text = String(data: stdinData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !text.isEmpty else {
+                return .failed("nested agent turn required a non-empty stdin prompt")
+            }
+            guard let written = writeNestedPromptTempFile(
+                contents: text,
+                environment: environment
+            ) else {
+                return .failed("could not materialize nested stdin prompt file")
+            }
+            promptFile = written
+        }
+
+        guard let delegation = ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: providerBasename,
+            arguments: arguments,
+            promptFile: promptFile
+        ) else {
+            return .failed("nested agent-app mapping rejected a prepared prompt file")
+        }
+        return .promote(delegation)
+    }
+
+    private static func writeNestedPromptTempFile(
+        contents: String,
+        environment: [String: String]
+    ) -> String? {
+        let base: URL
+        if let appSupport = environment["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !appSupport.isEmpty {
+            base = URL(fileURLWithPath: appSupport, isDirectory: true)
+                .appendingPathComponent("AgentRuntime", isDirectory: true)
+                .appendingPathComponent("nested-prompts", isDirectory: true)
+        } else {
+            base = FileManager.default.temporaryDirectory
+                .appendingPathComponent("remotecode-nested-prompts", isDirectory: true)
+        }
+        do {
+            try FileManager.default.createDirectory(
+                at: base,
+                withIntermediateDirectories: true
+            )
+            let file = base.appendingPathComponent(
+                "\(UUID().uuidString.lowercased()).txt"
+            )
+            try Data(contents.utf8).write(to: file, options: .atomic)
+            return file.path
+        } catch {
+            return nil
+        }
     }
 
     /// Inject the same host-owned runtime guidance used by Agent App adapters

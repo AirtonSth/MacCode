@@ -215,4 +215,154 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
             XCTAssertFalse(args.isEmpty)
         }
     }
+
+    func test_providerProxyArguments_nestedClaudeInjectsPostToolUseSettings() throws {
+        // WHY: Elephant Task 1 nested Claude advisors (2.5M+ tokens each) recorded
+        // Nested - Claude lifecycle receipts but zero token_saver_savings rows —
+        // provider proxy set RC_TOKEN_SAVER_POST_TOOL_USE without injecting the
+        // Claude CLI --settings PostToolUse hook that Agent App ClaudeRunner adds.
+        // Advisor ABI is print+plan+Read/Glob/Grep only; PATH wrappers never fire.
+        let env = TokenSaverExecutionReceiptSeam.environment(from: admit(.claude))
+        XCTAssertEqual(env[ClaudeRunner.tokenSaverPostToolUseEnvKey], "1")
+
+        let advisorArgv = [
+            "--print",
+            "--model", "opus",
+            "--effort", "max",
+            "--permission-mode", "plan",
+            "--tools", "Read,Glob,Grep",
+            "--no-session-persistence",
+            "--output-format", "json"
+        ]
+        let args = AgentSkillInstaller.providerProxyArguments(
+            provider: .claude,
+            arguments: advisorArgv,
+            environment: env
+        )
+        XCTAssertEqual(args.filter { $0 == "--settings" }.count, 1,
+                       "nested Claude must get exactly one --settings for PostToolUse")
+        guard let settingsIndex = args.firstIndex(of: "--settings"),
+              settingsIndex + 1 < args.count,
+              let data = args[settingsIndex + 1].data(using: .utf8),
+              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let hooks = object["hooks"] as? [String: Any],
+              let post = hooks["PostToolUse"] as? [[String: Any]],
+              let commandHooks = post.first?["hooks"] as? [[String: Any]],
+              let command = commandHooks.first?["command"] as? String
+        else {
+            return XCTFail("PostToolUse hook settings missing on nested Claude proxy argv")
+        }
+        XCTAssertTrue(command.hasSuffix("distill hook post-tool-use"),
+                      "hook must point at managed distill post-tool-use: \(command)")
+        // Original advisor ABI must survive (prompt transport, tools, plan mode).
+        XCTAssertTrue(args.contains("--print"))
+        XCTAssertTrue(args.contains("plan"))
+        XCTAssertTrue(args.contains("Read,Glob,Grep"))
+    }
+
+    func test_providerProxyArguments_nestedClaudeSkipsSettingsWhenTokenSaverOff() {
+        // WHY: fail-open — without POST_TOOL_USE the proxy must not rewrite argv.
+        let args = AgentSkillInstaller.providerProxyArguments(
+            provider: .claude,
+            arguments: ["--print", "--model", "opus", "-p", "hi"],
+            environment: [:]
+        )
+        XCTAssertFalse(args.contains("--settings"))
+        XCTAssertEqual(args, ["--print", "--model", "opus", "-p", "hi"])
+    }
+
+    func test_providerProxyArguments_nestedClaudeRespectsExistingSettings() {
+        // WHY: never clobber an explicit caller --settings payload.
+        let env = TokenSaverExecutionReceiptSeam.environment(from: admit(.claude))
+        let original = ["--print", "--settings", "{\"custom\":true}", "-p", "hi"]
+        let args = AgentSkillInstaller.providerProxyArguments(
+            provider: .claude,
+            arguments: original,
+            environment: env
+        )
+        XCTAssertEqual(args.filter { $0 == "--settings" }.count, 1)
+        XCTAssertTrue(args.contains("{\"custom\":true}"))
+    }
+
+    func test_providerProxyArguments_allProvidersGetDialectOnSupportedNestedTurns() {
+        // WHY: product requires dialect + managed PATH for Claude/Codex/Grok nested
+        // raw CLI. PostToolUse rewrite is Claude-only (upstream ceiling: Codex has no
+        // updatedToolOutput; Grok PostToolUse is passive per docs.x.ai hooks guide).
+        // PATH wrappers (incl. bun/bunx) remain the primary auto-compress lever for
+        // Codex/Grok shell tool output.
+        struct Case {
+            let provider: AgentProvider
+            let argv: [String]
+            let dialectMarker: String
+        }
+        let cases: [Case] = [
+            Case(provider: .claude, argv: ["--print", "--model", "opus", "-p", "nested"], dialectMarker: "--append-system-prompt"),
+            Case(provider: .codex, argv: ["exec", "--json", "do work"], dialectMarker: "developer_instructions="),
+            Case(provider: .grok, argv: ["--prompt", "do work", "--model", "grok-4.5"], dialectMarker: "--rules"),
+        ]
+        for c in cases {
+            let env = TokenSaverExecutionReceiptSeam.environment(from: admit(c.provider))
+            XCTAssertEqual(env["RC_TOKEN_SAVER_DISTILL_HINT"], "1", "\(c.provider)")
+            let args = AgentSkillInstaller.providerProxyArguments(
+                provider: c.provider,
+                arguments: c.argv,
+                environment: env
+            )
+            let joined = args.joined(separator: " ")
+            XCTAssertTrue(
+                joined.contains(c.dialectMarker) || joined.contains("| distill") || joined.contains("MANDATORY"),
+                "\(c.provider) nested argv must carry Token Saver dialect (\(c.dialectMarker)): \(joined.prefix(200))"
+            )
+            if c.provider == .claude {
+                XCTAssertTrue(args.contains("--settings"), "Claude nested must inject PostToolUse --settings")
+            } else {
+                XCTAssertFalse(args.contains("--settings"), "\(c.provider) must not invent Claude-only --settings")
+            }
+        }
+    }
+
+    func test_crossProviderNestedChildEnv_frontsManagedPathAndPreservesThreadForAllPairs() {
+        // WHY: ProviderProxyRunner.makeChildEnvironment must put managed wrappers first
+        // for every parent→child pair so PATH wraps fire under Codex/Grok/Claude shell.
+        // Savings attribute to parent thread_id (same as Nested receipts on Elephant).
+        let managed = "/tmp/rc-managed-bin-matrix"
+        for parent in providers {
+            for child in providers {
+                var parentEnv = TokenSaverExecutionReceiptSeam.environment(from: admit(parent))
+                parentEnv["REMOTE_CODE_AGENT_PROVIDER"] = parent.rawValue
+                parentEnv["RC_REMOTE_CODE_MANAGED_BIN"] = managed
+                parentEnv["PATH"] = "/usr/bin:/bin"
+                parentEnv["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"] = threadID
+
+                let retargeted = TokenSaverExecutionReceiptSeam.reAdmitSidecarIfAvailable(
+                    receipt: admit(parent),
+                    sidecarAvailable: true,
+                    provider: child,
+                    waveLive: "wave-a"
+                )
+                var childEnv = TokenSaverExecutionReceiptSeam.environment(from: retargeted)
+                childEnv["RC_REMOTE_CODE_MANAGED_BIN"] = managed
+                // Mirror proxy PATH rewrite when managed_path admitted.
+                if retargeted.capabilities.managedPath == true {
+                    let parts = (parentEnv["PATH"] ?? "")
+                        .split(separator: ":")
+                        .map(String.init)
+                        .filter { $0 != managed }
+                    childEnv["PATH"] = ([managed] + parts).joined(separator: ":")
+                }
+                let path = childEnv["PATH"] ?? ""
+                XCTAssertTrue(
+                    path.hasPrefix("\(managed):") || path == managed,
+                    "\(parent)→\(child) PATH must front managed bin: \(path)"
+                )
+                XCTAssertEqual(childEnv["RC_TOKEN_SAVER_THREAD_ID"], threadID, "\(parent)→\(child) thread")
+                XCTAssertEqual(childEnv["RC_TOKEN_SAVER_DISTILL_HINT"], "1", "\(parent)→\(child) distill")
+                if child == .claude {
+                    XCTAssertEqual(childEnv["RC_TOKEN_SAVER_POST_TOOL_USE"], "1", "\(parent)→\(child) PTU")
+                } else {
+                    XCTAssertNil(childEnv["RC_TOKEN_SAVER_POST_TOOL_USE"], "\(parent)→\(child) no PTU")
+                }
+            }
+        }
+    }
 }
