@@ -41,6 +41,9 @@ public final class PetController {
     private var previousActiveRunProjectionHandler:
         ((ActiveRunProjection, ActiveRunProjectionCause) -> Void)?
     private var installedActiveRunProjectionHandler = false
+    /// Latest material progress text per active agent thread for Live Activity
+    /// single-active preview (tools / assistant). Not used by the pet popover.
+    private var lastUpdatePreviewByThread: [AgentThreadID: String] = [:]
     private(set) var handledEventOutOfOrderForTests = false
     private(set) var handledEventCountForTests = 0
     private(set) var lastScheduledTransientMillisecondsForTests: Int64?
@@ -439,9 +442,13 @@ public final class PetController {
                 advanceProjectionWatermark(to: event.seq)
             }
         }
+        // Material agent progress → Live Activity single-active description.
+        // Deltas/progress are prefiltered noise and never reach here.
+        let liveActivityProgressChanged = noteLiveActivityProgress(from: event)
         guard let domainEvent = PetEventDecoder.decode(event) else {
             if projectionFailed { model.routeError = projectionErrorMessage }
             if projectionChanged || attentionProjectionChanged { scheduleAttentionRefresh() }
+            if liveActivityProgressChanged { republishActiveThreadsForLiveActivity() }
             return
         }
         let reduction = reducer.reduce(domainEvent, atMilliseconds: monotonicMilliseconds())
@@ -461,7 +468,98 @@ public final class PetController {
         if projectionFailed { model.routeError = projectionErrorMessage }
         if projectionChanged || reduction.shouldRefreshAttention {
             scheduleAttentionRefresh()
+        } else if liveActivityProgressChanged {
+            republishActiveThreadsForLiveActivity()
         }
+    }
+
+    /// Capture latest human-readable progress for the Live Activity description.
+    /// Returns true when the cache changed so the surface can be republished.
+    @discardableResult
+    private func noteLiveActivityProgress(from event: EventBus.Event) -> Bool {
+        guard case .object(let payload) = event.payload,
+              let threadUUID = payload["thread_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+        else { return false }
+        let threadID = AgentThreadID(threadUUID)
+        let preview: String?
+        switch event.kind {
+        case "agent.item.started":
+            preview = Self.itemStartedPreview(payload: payload)
+        case "agent.item.completed":
+            preview = Self.itemCompletedPreview(payload: payload)
+        case "agent.turn.completed":
+            preview = Self.turnCompletedPreview(payload: payload)
+        case "agent.run.started":
+            preview = "Working…"
+        case "agent.run.finished", "agent.run.completed", "agent.run.failed", "agent.run.cancelled":
+            lastUpdatePreviewByThread.removeValue(forKey: threadID)
+            return true
+        default:
+            return false
+        }
+        guard let preview,
+              let redacted = PetAttentionRedactor.safeContextLabel(preview),
+              !redacted.isEmpty else {
+            return false
+        }
+        if lastUpdatePreviewByThread[threadID] == redacted { return false }
+        lastUpdatePreviewByThread[threadID] = redacted
+        return true
+    }
+
+    private func republishActiveThreadsForLiveActivity() {
+        // Rebuild active rows so lastUpdatePreview is embedded, then push LA.
+        refreshActiveThreadsFromCoordinator()
+    }
+
+    private static func itemStartedPreview(payload: [String: JSONValue]) -> String? {
+        guard let item = payload["item"]?.objectValue else { return nil }
+        if let summary = nonempty(item["summary"]) { return summary }
+        let type = item["type"]?.stringValue ?? "tool"
+        if type == "assistantMessage" || type == "reasoning" {
+            if let body = nonempty(item["body"]) { return body }
+            return type == "reasoning" ? "Thinking…" : "Writing…"
+        }
+        let label = activityLabel(type: type, summary: nil, body: nonempty(item["body"]))
+        return "Running: \(label)"
+    }
+
+    private static func itemCompletedPreview(payload: [String: JSONValue]) -> String? {
+        if let summary = nonempty(payload["summary"]) { return summary }
+        // completed often carries only item_id; keep prior cache if no text.
+        if let state = payload["state"]?.stringValue, state == "failed" {
+            return "Failed: tool"
+        }
+        return nil
+    }
+
+    private static func turnCompletedPreview(payload: [String: JSONValue]) -> String? {
+        if let final = nonempty(payload["final"]) { return final }
+        if let final = nonempty(payload["final_message"]) { return final }
+        return nil
+    }
+
+    private static func activityLabel(type: String, summary: String?, body: String?) -> String {
+        if let summary, !summary.isEmpty { return summary }
+        if let body {
+            let line = body.split(whereSeparator: \.isNewline).first.map(String.init) ?? body
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return String(trimmed.prefix(80)) }
+        }
+        switch type {
+        case "commandExecution": return "command"
+        case "fileChange": return "file"
+        case "webSearch": return "search"
+        case "mcpToolCall", "dynamicToolCall", "collabToolCall": return "tool"
+        default: return type
+        }
+    }
+
+    private static func nonempty(_ value: JSONValue?) -> String? {
+        guard let raw = value?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else { return nil }
+        return raw
     }
 
     private func apply(_ reduction: PetEventReduction) {
@@ -672,6 +770,10 @@ public final class PetController {
         _ threadIDs: [AgentThreadID],
         startedByThread: [AgentThreadID: Date] = [:]
     ) {
+        // Drop progress cache for threads that are no longer active.
+        let activeSet = Set(threadIDs)
+        lastUpdatePreviewByThread = lastUpdatePreviewByThread.filter { activeSet.contains($0.key) }
+
         let items = PetActiveThreadProjector.items(threadIDs: threadIDs) { [weak self] threadID in
             guard let self,
                   let thread = try? self.context.threadRepo.get(id: threadID) else {
@@ -683,7 +785,8 @@ public final class PetController {
                 workspaceName: workspaceName,
                 providerName: PetActiveThreadProjector.providerLabel(thread.provider),
                 threadTitle: thread.title,
-                startedAt: startedByThread[threadID]
+                startedAt: startedByThread[threadID],
+                lastUpdatePreview: self.lastUpdatePreviewByThread[threadID]
             )
         }
         model.apply(activeThreads: items)

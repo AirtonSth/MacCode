@@ -78,7 +78,11 @@ public enum PetLiveActivityCopy: Sendable {
                 : row.title
             // Prefer pet detail (ws - provider - title - elapsed) on status when present.
             let status = row.detail ?? "1 active run"
+            // Single-active description: latest material thread update (tools /
+            // assistant) when known; identity detail only as fallback. Attention
+            // still wins so "Needs you" stays visible.
             let preview = attentionPreview
+                ?? row.lastUpdatePreview
                 ?? row.detail
                 ?? title
             let ids = routeIDs(from: row.route)

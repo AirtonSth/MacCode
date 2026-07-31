@@ -34,6 +34,55 @@ final class PetLiveActivityCopyTests: XCTestCase {
                 || (active.detail?.contains("ship") == true)
         )
         XCTAssertEqual(output.threadId, threadA.value.uuidString)
+        // No lastUpdatePreview → identity/detail fallback (legacy shape).
+        XCTAssertEqual(output.preview, active.detail)
+    }
+
+    func testSingleActivePreviewPrefersLastThreadUpdateOverIdentityDetail() {
+        // WHY: Lock Screen description must track Mac mid-run progress (tools /
+        // assistant), not restating "workspace - provider - title" alone.
+        let active = PetActiveThreadItem(
+            threadID: threadA,
+            workspaceID: workspace,
+            workspaceName: "elephant",
+            providerName: "Claude",
+            threadTitle: "teste o funcionamento do distill",
+            startedAt: Date(timeIntervalSince1970: 100),
+            lastUpdatePreview: "Running: git status",
+            now: Date(timeIntervalSince1970: 160)
+        )
+        guard let output = PetLiveActivityCopy.make(.init(
+            active: [active], needsYou: [], completed: []
+        )) else { return XCTFail("expected single-active surface") }
+        XCTAssertEqual(output.preview, "Running: git status")
+        XCTAssertEqual(output.statusLine, active.detail)
+        XCTAssertFalse(output.preview.contains("elephant - Claude"))
+    }
+
+    func testSingleActiveAttentionBeatsLastThreadUpdate() {
+        let active = PetActiveThreadItem(
+            threadID: threadA,
+            workspaceID: workspace,
+            workspaceName: "elephant",
+            providerName: "Claude",
+            threadTitle: "mid run",
+            lastUpdatePreview: "Running: ls"
+        )
+        let needs = PetAttentionItem(
+            id: "cb1",
+            kind: .callback(.approval, isStale: false),
+            title: "Approve: Run command",
+            detail: "elephant - Claude - mid run",
+            workspaceName: "elephant",
+            createdAt: Date(),
+            route: .agentThread(threadID: threadA, workspaceID: workspace),
+            source: .callback(threadID: threadA, requestID: "r1", kind: .approval)
+        )
+        guard let output = PetLiveActivityCopy.make(.init(
+            active: [active], needsYou: [needs], completed: []
+        )) else { return XCTFail("expected surface") }
+        XCTAssertTrue(output.preview.hasPrefix("Needs you"))
+        XCTAssertTrue(output.preview.contains("Approve: Run command"))
     }
 
     func testMultiActiveUsesOverviewAndPrefersNeedsYouInPreview() {

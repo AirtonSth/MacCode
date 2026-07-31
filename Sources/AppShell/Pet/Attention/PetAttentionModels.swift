@@ -145,12 +145,15 @@ public struct PetAttentionSnapshot: Sendable, Equatable {
 /// In-flight agent thread row for the pet popover. Primary title is fixed
 /// privacy-safe copy; secondary detail shows workspace, provider, thread
 /// title (redacted), and optional elapsed. Membership comes from the live
-/// active-run projection.
+/// active-run projection. `lastUpdatePreview` is Live Activity-only (single
+/// active description) and is not shown on the pet popover row.
 public struct PetActiveThreadItem: Sendable, Equatable, Identifiable {
     public let id: String
     public let threadID: AgentThreadID
     public let title: String
     public let detail: String?
+    /// Latest material agent progress for Live Activity single-active preview.
+    public let lastUpdatePreview: String?
     public let workspaceName: String?
     public let route: PetAttentionRoute
 
@@ -161,6 +164,7 @@ public struct PetActiveThreadItem: Sendable, Equatable, Identifiable {
         providerName: String? = nil,
         threadTitle: String? = nil,
         startedAt: Date? = nil,
+        lastUpdatePreview: String? = nil,
         now: Date = Date()
     ) {
         self.id = "active:\(threadID.value.uuidString)"
@@ -178,6 +182,7 @@ public struct PetActiveThreadItem: Sendable, Equatable, Identifiable {
         )
         self.title = presentation.title
         self.detail = presentation.detail
+        self.lastUpdatePreview = PetAttentionRedactor.safeContextLabel(lastUpdatePreview)
         self.route = .agentThread(threadID: threadID, workspaceID: workspaceID)
     }
 }
@@ -188,7 +193,8 @@ public enum PetActiveThreadProjector {
         workspaceName: String?,
         providerName: String?,
         threadTitle: String?,
-        startedAt: Date?
+        startedAt: Date?,
+        lastUpdatePreview: String?
     )
 
     public static func items(
@@ -208,6 +214,7 @@ public enum PetActiveThreadProjector {
                 providerName: meta?.providerName,
                 threadTitle: meta?.threadTitle,
                 startedAt: meta?.startedAt,
+                lastUpdatePreview: meta?.lastUpdatePreview,
                 now: now
             )
         }

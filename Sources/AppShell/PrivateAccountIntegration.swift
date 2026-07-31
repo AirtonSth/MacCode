@@ -167,8 +167,9 @@ public struct PrivateLiveActivitySnapshot: Equatable, Sendable {
 
     /// Builds a mid-run "running" snapshot for a Live Activity `.update` heartbeat.
     /// Extracted (like `terminal`) so the title fallback, preview selection and
-    /// 140-char clamp are unit-testable without driving the coordinator. `finalMessage`
-    /// is the latest assistant turn text, shown as the card preview when present.
+    /// 140-char clamp are unit-testable without driving the coordinator.
+    /// `lastUpdatePreview` (alias of historical `finalMessage`) is the latest
+    /// assistant/tool progress line for the single-active description.
     public static func running(
         threadId: String,
         workspaceId: String?,
@@ -177,10 +178,29 @@ public struct PrivateLiveActivitySnapshot: Equatable, Sendable {
         runStartDate: Date?,
         now: Date = Date()
     ) -> PrivateLiveActivitySnapshot {
+        running(
+            threadId: threadId,
+            workspaceId: workspaceId,
+            title: title,
+            lastUpdatePreview: finalMessage,
+            runStartDate: runStartDate,
+            now: now
+        )
+    }
+
+    /// Single-active mid-run snapshot with explicit last-update preview text.
+    public static func running(
+        threadId: String,
+        workspaceId: String?,
+        title: String?,
+        lastUpdatePreview: String?,
+        runStartDate: Date?,
+        now: Date = Date()
+    ) -> PrivateLiveActivitySnapshot {
         let normalizedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
         let displayTitle = (normalizedTitle?.isEmpty == false) ? normalizedTitle! : "Thread"
-        let finalText = finalMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let preview = (finalText?.isEmpty == false) ? String(finalText!.prefix(140)) : displayTitle
+        let updateText = lastUpdatePreview?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let preview = (updateText?.isEmpty == false) ? String(updateText!.prefix(140)) : displayTitle
         return PrivateLiveActivitySnapshot(
             title: displayTitle,
             statusLine: "Working…",

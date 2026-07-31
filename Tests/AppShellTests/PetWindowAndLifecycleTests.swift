@@ -262,7 +262,8 @@ final class PetWindowAndLifecycleTests: XCTestCase {
                 workspaceName: "star",
                 providerName: id == threadA ? "Codex" : "Claude",
                 threadTitle: id == threadA ? "make title for agent run" : secretTitle,
-                startedAt: id == threadA ? Date(timeIntervalSince1970: 880) : nil
+                startedAt: id == threadA ? Date(timeIntervalSince1970: 880) : nil,
+                lastUpdatePreview: nil as String?
             )
         }
 
