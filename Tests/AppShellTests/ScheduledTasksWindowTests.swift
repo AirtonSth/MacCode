@@ -28,10 +28,24 @@ final class ScheduledTasksWindowTests: XCTestCase {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
         let newWorkspace = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.newWorkspace\")"))
         let scheduleTasks = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.scheduleTasks\")"))
+        let reportBug = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.reportBug\")"))
         let updateControl = try XCTUnwrap(source.range(of: "if vm.showsUpdateControl"))
 
         XCTAssertLessThan(newWorkspace.lowerBound, scheduleTasks.lowerBound)
-        XCTAssertLessThan(scheduleTasks.lowerBound, updateControl.lowerBound)
+        XCTAssertLessThan(scheduleTasks.lowerBound, reportBug.lowerBound)
+        XCTAssertLessThan(reportBug.lowerBound, updateControl.lowerBound)
+    }
+
+    func test_sidebarReportBugOpensMailtoToMaintainer_becauseBugReportsMustReachSupport() throws {
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("title: \"Report Bug\""),
+                      "sidebar must expose a Report Bug action under Schedule Tasks")
+        XCTAssertTrue(source.contains("samuelfajreldines@gmail.com"),
+                      "Report Bug must address the maintainer mailbox")
+        XCTAssertTrue(source.contains("mailto"),
+                      "Report Bug must open a mailto: compose window")
+        XCTAssertTrue(source.contains("NSWorkspace.shared.open"),
+                      "Report Bug must hand off to the system mail client")
     }
 
     func test_scheduleTasksOpensInMainContent_notOnlyDetachedWindow() throws {

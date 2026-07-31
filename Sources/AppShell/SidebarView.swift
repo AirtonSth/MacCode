@@ -2364,6 +2364,13 @@ public struct SidebarRootView: View {
                 .accessibilityIdentifier("sidebar.scheduleTasks")
                 .accessibilityAddTraits(vm.isScheduledTasksSelected ? .isSelected : [])
 
+                Button(action: reportBug) {
+                    sidebarActionRow(symbol: "ladybug", title: "Report Bug")
+                }
+                .buttonStyle(.plain)
+                .help("Report a bug via email")
+                .accessibilityIdentifier("sidebar.reportBug")
+
                 if vm.showsUpdateControl {
                     Button { vm.checkForUpdates() } label: {
                         sidebarActionRow(
@@ -2534,6 +2541,18 @@ public struct SidebarRootView: View {
             vm.filterText = ""
         }
         return .handled
+    }
+
+    /// Opens the system mail client to report a bug to the maintainer.
+    private func reportBug() {
+        var components = URLComponents()
+        components.scheme = "mailto"
+        components.path = "samuelfajreldines@gmail.com"
+        components.queryItems = [
+            URLQueryItem(name: "subject", value: "RemoteCode Bug Report")
+        ]
+        guard let url = components.url else { return }
+        NSWorkspace.shared.open(url)
     }
 
     private var workspaceFilterField: some View {
