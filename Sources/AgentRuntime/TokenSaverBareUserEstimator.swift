@@ -10,13 +10,15 @@ public enum TokenSaverAttributedCapBinding: String, Sendable, Equatable {
 }
 
 /// Counterfactual vs a **bare agent** (no RemoteCode: no pipes/dialect, no Graphify,
-/// no model-auto). Designed for a **daily-replicable credible total**:
+/// no model-auto, full tool re-reads every turn). Designed for a **daily-replicable
+/// credible total**:
 ///
 /// ```
 /// totalCredible = measuredPipes
 ///               + dialect(from observed/calibrated output share)
 ///               + graphify(only with activity signals, capped)
-/// // model-auto is NOT mixed into the token total (different unit / weak evidence)
+///               + cacheAmortization(measured × extra turns, capped)
+///               + orchestration(Auto cheaper-model token-equivalent when active)
 /// ```
 ///
 /// Factors below are calibrated from live coding-agent streams on this product
@@ -28,9 +30,10 @@ public struct TokenSaverBareUserBreakdown: Sendable, Equatable {
     public let estimatedDialect: Int
     /// Graphify query-first vs broader file exploration (capped; needs signals).
     public let estimatedGraphify: Int
-    /// Token-equivalent of model-auto — **excluded from totalCredible** (shown only
-    /// as a separate diagnostic when non-zero).
+    /// Token-equivalent of model-auto (cheaper models at same quality) when active.
     public let estimatedOrchestration: Int
+    /// Multi-turn cache re-read impact of earlier tool-output savings.
+    public let estimatedCacheAmortization: Int
     /// Output-share actually used in the dialect leg (for telemetry/UI).
     public let appliedOutputShare: Double
     /// True when dialect/graphify used calibrated defaults vs live stream shares.
@@ -51,6 +54,7 @@ public struct TokenSaverBareUserBreakdown: Sendable, Equatable {
         estimatedDialect: Int,
         estimatedGraphify: Int,
         estimatedOrchestration: Int = 0,
+        estimatedCacheAmortization: Int = 0,
         appliedOutputShare: Double = 0,
         usedCalibratedDefaults: Bool = true,
         dialectRawTokens: Int = 0,
@@ -63,6 +67,7 @@ public struct TokenSaverBareUserBreakdown: Sendable, Equatable {
         self.estimatedDialect = max(0, estimatedDialect)
         self.estimatedGraphify = max(0, estimatedGraphify)
         self.estimatedOrchestration = max(0, estimatedOrchestration)
+        self.estimatedCacheAmortization = max(0, estimatedCacheAmortization)
         self.appliedOutputShare = min(max(appliedOutputShare, 0), 1)
         self.usedCalibratedDefaults = usedCalibratedDefaults
         self.dialectRawTokens = max(0, dialectRawTokens)
@@ -72,20 +77,28 @@ public struct TokenSaverBareUserBreakdown: Sendable, Equatable {
         self.usageAnchoredAvailable = usageAnchoredAvailable
     }
 
-    /// Credible total for headline/ring: measured + dialect + graphify only.
+    /// Credible total for headline/chip: measured pipes + dialect + graphify +
+    /// multi-turn cache impact + Auto orchestration token-equivalent.
     public var totalCredible: Int {
         TokenSaverBareUserEstimator.saturatingAdd(
             measuredToolOutput,
             estimatedDialect,
-            estimatedGraphify
+            estimatedGraphify,
+            estimatedOrchestration,
+            estimatedCacheAmortization
         )
     }
 
-    /// Alias for product UI — bare-user total is the credible stack, not orch.
+    /// Alias for product UI — full bare-user counterfactual stack.
     public var totalEstimatedVsBareUser: Int { totalCredible }
 
     public var attributedOnly: Int {
-        TokenSaverBareUserEstimator.saturatingAdd(estimatedDialect, estimatedGraphify)
+        TokenSaverBareUserEstimator.saturatingAdd(
+            estimatedDialect,
+            estimatedGraphify,
+            estimatedOrchestration,
+            estimatedCacheAmortization
+        )
     }
 
     public static let empty = TokenSaverBareUserBreakdown(
@@ -93,6 +106,7 @@ public struct TokenSaverBareUserBreakdown: Sendable, Equatable {
         estimatedDialect: 0,
         estimatedGraphify: 0,
         estimatedOrchestration: 0,
+        estimatedCacheAmortization: 0,
         appliedOutputShare: 0,
         usedCalibratedDefaults: true
     )
@@ -121,6 +135,11 @@ public struct TokenSaverBareUserObservation: Sendable, Equatable {
     /// Median tokens of local Read/Grep/Glob exploration samples (Phase 2).
     /// nil → use calibrated exploration fallback (still clamped).
     public let medianExplorationTokens: Int?
+    /// Agent turns in the window (for multi-turn cache amortization of tool-output savings).
+    /// 0/1 → no amortization credit.
+    public let turnCount: Int
+    /// Provider `cacheReadInputTokens` in the window when known (raw, not billed units).
+    public let cacheReadInputTokens: Int
 
     public init(
         windowProviderTokens: Int,
@@ -131,7 +150,9 @@ public struct TokenSaverBareUserObservation: Sendable, Equatable {
         assistantChars: Int = 0,
         graphifySignalCount: Int = 0,
         graphifyAnswerTokens: Int = 0,
-        medianExplorationTokens: Int? = nil
+        medianExplorationTokens: Int? = nil,
+        turnCount: Int = 0,
+        cacheReadInputTokens: Int = 0
     ) {
         self.windowProviderTokens = max(0, windowProviderTokens)
         self.windowProviderBilledTokenUnits = windowProviderBilledTokenUnits.map { max(0, $0) }
@@ -142,6 +163,8 @@ public struct TokenSaverBareUserObservation: Sendable, Equatable {
         self.graphifySignalCount = max(0, graphifySignalCount)
         self.graphifyAnswerTokens = max(0, graphifyAnswerTokens)
         self.medianExplorationTokens = medianExplorationTokens.map { max(0, $0) }
+        self.turnCount = max(0, turnCount)
+        self.cacheReadInputTokens = max(0, cacheReadInputTokens)
     }
 
     public static let empty = TokenSaverBareUserObservation(windowProviderTokens: 0)
@@ -232,6 +255,7 @@ public enum TokenSaverBareUserEstimator {
                 estimatedDialect: 0,
                 estimatedGraphify: 0,
                 estimatedOrchestration: 0,
+                estimatedCacheAmortization: 0,
                 appliedOutputShare: 0,
                 usedCalibratedDefaults: true,
                 dialectRawTokens: 0,
@@ -282,16 +306,26 @@ public enum TokenSaverBareUserEstimator {
             graphify: graphifyRaw
         )
 
-        // Orchestration: keep 0 in credible token total. Field reserved for a future
-        // cost chip; do not invent token-equivalent without pricing join.
-        _ = orchestrationActive
-        let orchestration = 0
+        // Auto / model routing: cheaper models at same quality. Token-equivalent is
+        // a bounded share of measured pipes (not a pricing join).
+        let orchestration = orchestrationActive
+            ? estimateOrchestrationTokens(measured: measured)
+            : 0
+
+        // Multi-turn: compressed tool results would otherwise re-enter every later
+        // turn's context / cache. Credit measured once per extra turn (capped).
+        let cacheAmort = estimateCacheAmortizationTokens(
+            measured: measured,
+            turnCount: observation.turnCount,
+            cacheReadInputTokens: observation.cacheReadInputTokens
+        )
 
         return TokenSaverBareUserBreakdown(
             measuredToolOutput: measured,
             estimatedDialect: capped.dialect,
             estimatedGraphify: capped.graphify,
             estimatedOrchestration: orchestration,
+            estimatedCacheAmortization: cacheAmort,
             appliedOutputShare: share,
             usedCalibratedDefaults: usedDefault,
             dialectRawTokens: dialectRaw,
@@ -300,6 +334,48 @@ public enum TokenSaverBareUserEstimator {
             windowUsageBilledUnits: billedKnown,
             usageAnchoredAvailable: usageAnchoredAvailable
         )
+    }
+
+    // MARK: - Cache amortization / Auto
+
+    /// Max extra turns that multiply measured tool-output into cache impact.
+    /// WHY: unbounded turn × measured would invent multi-million fantasy on long threads.
+    public static let cacheAmortizationMaxExtraTurns: Int = 50
+
+    /// Fraction of measured pipes credited as Auto cheaper-model token-equivalent.
+    public static let orchestrationShareOfMeasured: Double = 0.25
+
+    /// Multi-turn cache impact of earlier tool-output savings.
+    ///
+    /// Primary: `measured × min(turns − 1, maxExtraTurns)` — each subsequent turn
+    /// would re-read the avoided full tool payload.
+    /// Floor from known `cacheReadInputTokens`: when the provider reports large
+    /// cache reads and we have measured pipes, credit a small billed-weighted
+    /// slice so the chip reflects real provider usage pressure (cache reads are
+    /// ~0.1× uncached in Anthropic-style billing).
+    public static func estimateCacheAmortizationTokens(
+        measured: Int,
+        turnCount: Int,
+        cacheReadInputTokens: Int = 0
+    ) -> Int {
+        let m = max(0, measured)
+        guard m > 0 else { return 0 }
+        let extraTurns = min(max(0, turnCount - 1), cacheAmortizationMaxExtraTurns)
+        let fromTurns = saturatingMul(m, extraTurns)
+        // Billed-weight signal: cache reads dominate long Claude threads (~0.1× uncached).
+        // Cap at measured × maxExtraTurns so day/week cards cannot invent unbounded fantasy.
+        let maxCap = saturatingMul(m, cacheAmortizationMaxExtraTurns)
+        let fromCacheReads = min(
+            clampedInt(from: Double(max(0, cacheReadInputTokens)) * 0.1),
+            maxCap
+        )
+        return max(fromTurns, fromCacheReads)
+    }
+
+    public static func estimateOrchestrationTokens(measured: Int) -> Int {
+        let m = max(0, measured)
+        guard m > 0 else { return 0 }
+        return clampedInt(from: Double(m) * orchestrationShareOfMeasured)
     }
 
     // MARK: - Window helpers (UI)
@@ -604,6 +680,15 @@ public enum TokenSaverBareUserEstimator {
             total = sum
         }
         return total
+    }
+
+    /// Non-negative Int multiply that saturates at `Int.max`.
+    static func saturatingMul(_ a: Int, _ b: Int) -> Int {
+        let x = max(0, a)
+        let y = max(0, b)
+        let (product, overflow) = x.multipliedReportingOverflow(by: y)
+        if overflow { return Int.max }
+        return product
     }
 
     /// Prefer the most restrictive component when values tie.

@@ -59,9 +59,14 @@ public enum CommandWrapPolicy {
 
     // MARK: - passthrough (never compress, regardless of size / pipeline position)
 
-    /// Reasons a wrapped command must run untouched even when its stdout reaches the agent:
-    /// it mutates files (so its stdout is not summarizable review output) or the user
-    /// disabled wrapping. Returns nil when the command is eligible for compression.
+    /// Reasons a wrapped command must run untouched even when its stdout reaches the agent.
+    /// Returns nil when the command is eligible for compression.
+    ///
+    /// Product rule (2026-07): **compress all wrapped-command stdout** except the
+    /// exact-output family (rg/sed/cat/jq/…), exact git blob/match subcommands, and
+    /// full patch dumps. There is **no** read-only subcommand allowlist — `gh api`,
+    /// `git push` status text, merges, etc. all distill when terminal-to-agent and
+    /// above threshold. Mutating *side effects* still run; only stdout may shrink.
     public static func passthroughReason(command: String, args: [String], environment: [String: String]) -> String? {
         if isDisabled(environment: environment) { return "disabled" }
         let name = commandBasename(command)
@@ -85,9 +90,7 @@ public enum CommandWrapPolicy {
         if isExactPatchInvocation(command: name, args: args) {
             return "exact_patch_output"
         }
-        if requiresReadOnlySubcommand(name), !isAllowedReadOnlyInvocation(command: name, args: args) {
-            return "mutating_subcommand"
-        }
+        // No subcommand allowlist: every other wrapped invocation is compress-eligible.
         return nil
     }
 
@@ -159,10 +162,14 @@ public enum CommandWrapPolicy {
             || argument.hasPrefix("--color-words")
     }
 
+    /// Legacy helper kept for tests/diagnostics. **Not** used by `passthroughReason`
+    /// (product: compress all wrapped subcommands except exact-output carve-outs).
     private static func requiresReadOnlySubcommand(_ command: String) -> Bool {
         ["git", "gh", "glab", "swift", "xcodebuild"].contains(command)
     }
 
+    /// Legacy allowlist (unused by compress gate). Prefer `passthroughReason == nil`
+    /// for eligibility; kept so historical tests can still describe old boundaries.
     static func isAllowedReadOnlyInvocation(command: String, args: [String]) -> Bool {
         let normalized = args
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }

@@ -972,10 +972,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let graphifyCheck = tokenSaverGraphifyActiveCheck
         let threadId = selectedThreadId
         let repo = tokenSaverSavingsRepo
-        // Capture assistant size on MainActor (messages are UI state).
+        // Capture assistant size + turn/usage on MainActor (UI/timeline state).
         let assistantChars = messages
             .filter { $0.role == .assistant }
             .reduce(0) { $0 + $1.content.utf8.count }
+        let turnCount = max(timeline.turns.count, messages.filter { $0.role == .user }.count)
+        let usage = timeline.tokenUsage
+        let cacheRead = usage?.cacheReadInputTokens ?? 0
+        let providerRaw = usage.map { max(0, $0.inputTokens) + max(0, $0.outputTokens) } ?? 0
+        let providerBilled = usage.map { $0.billedTotalTokenUnits } ?? 0
+        let autoRouting = routingMode == .auto
         tokenSaverFooterReloadTask = Task { [weak self] in
             // Eligibility/settings reads off-main so a savings burst does not
             // stack cold SettingsStore performSync on the MainActor.
@@ -995,7 +1001,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 measuredDelivered: measured,
                 assistantChars: assistantChars,
                 tokenSaverEnabled: eligible,
-                graphifyActive: graphifyActive
+                graphifyActive: graphifyActive,
+                turnCount: turnCount,
+                cacheReadInputTokens: cacheRead,
+                providerRawTokens: providerRaw,
+                providerBilledTokenUnits: providerBilled > 0 ? providerBilled : nil,
+                autoRoutingActive: autoRouting
             )
             await MainActor.run { [weak self] in
                 guard let self, !self.isDisposed, !Task.isCancelled else { return }
@@ -6570,6 +6581,10 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
                     return AgentAppView.cappedVisibleText(value, limit: AgentAppView.commandPreviewCharacterLimit, truncatedLabel: "hidden from preview")
                 }
             }
+            // Prefer humanized meta for opaque task/timeout payloads over raw API keys.
+            if let human = humanizedStructuredPreview(from: obj) {
+                return human
+            }
             // Unknown shape: a clean one-line key: value digest. Scalars show their value;
             // arrays/objects show a compact shape hint (not Swift's brace-y debug description).
             let digest = obj.keys.sorted().prefix(4).map { key -> String in
@@ -6579,6 +6594,275 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         }
         // Non-JSON body is already a human-readable input/description.
         return AgentAppView.cappedVisibleText(body, limit: AgentAppView.commandPreviewCharacterLimit, truncatedLabel: "hidden from preview")
+    }
+
+    // MARK: Tool card presentation (collapsed density)
+
+    /// L1 title for tool rows: short tool name without full shell pipelines or call UUIDs.
+    /// Does not mutate stored summary/body — pure display transform.
+    static func toolDisplayLabel(for item: AssistantItem) -> String {
+        var label = basePrimaryText(for: item)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Provider titles sometimes embed `[bg]` + the whole command.
+        label = label.replacingOccurrences(
+            of: #"^\[bg\]\s*"#,
+            with: "",
+            options: .regularExpression
+        )
+        label = label.replacingOccurrences(
+            of: #"(?i)^background:\s*"#,
+            with: "",
+            options: .regularExpression
+        )
+        // "Get task output: call-<uuid>" / trailing call ids
+        label = label.replacingOccurrences(
+            of: #"(?i)(?::\s*|\s+)call-[0-9a-f-]{8,}\s*$"#,
+            with: "",
+            options: .regularExpression
+        )
+        label = label.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ":")))
+        if looksLikeShellCommand(label) {
+            return shellToolFamilyName(for: item)
+        }
+        if label.contains("_"), !label.contains(" "), label.count <= 64 {
+            return label
+                .split(separator: "_")
+                .map { part in
+                    let s = String(part)
+                    return s.prefix(1).uppercased() + s.dropFirst().lowercased()
+                }
+                .joined(separator: " ")
+        }
+        // Collapse very long titles that aren't pure shell (still too noisy for L1).
+        if label.count > 48, toolCommandPreview(for: item) != nil {
+            return shellToolFamilyName(for: item)
+        }
+        return label.isEmpty ? item.type.rawValue : label
+    }
+
+    /// Collapsed L2 summary: meaningful last command, no distill pipe, short paths.
+    /// Full command remains available via `toolCommandPreview` when expanded.
+    /// When stages are elided, appends `· +N more` so density never silently drops intent.
+    static func toolCommandSummary(for item: AssistantItem) -> String? {
+        guard let full = toolCommandPreview(for: item) else { return nil }
+        // Structured human previews are already short — keep them.
+        if full.contains(" · ") || full.hasPrefix("timeout ") || full.hasSuffix(" task") || full.hasSuffix(" tasks") {
+            return full
+        }
+        return summarizeShellishCommand(full)
+    }
+
+    /// True when the tool ran (or is running) detached/backgrounded.
+    static func isBackgroundTool(for item: AssistantItem) -> Bool {
+        if let summary = item.summary?.lowercased(),
+           summary.contains("[bg]")
+            || summary.contains("background shell")
+            || summary.contains("background agent")
+            || summary.hasPrefix("background") {
+            return true
+        }
+        guard let obj = toolInputObject(for: item) else { return false }
+        if let flag = obj["background"] as? Bool { return flag }
+        if let flag = obj["background"] as? NSNumber { return flag.boolValue }
+        if let flag = obj["run_in_background"] as? Bool { return flag }
+        if let flag = obj["run_in_background"] as? NSNumber { return flag.boolValue }
+        return false
+    }
+
+    /// Token Saver distill wrapper was present on the command (display chip only).
+    static func toolCommandWasDistilled(for item: AssistantItem) -> Bool {
+        guard let raw = rawShellCommand(for: item) ?? toolCommandPreview(for: item) else { return false }
+        return raw.range(of: #"\|\s*distill\b"#, options: .regularExpression) != nil
+    }
+
+    /// Compact elapsed label (`12s`, `1m 53s`) from start→end timestamps.
+    static func durationLabel(fromMs: Int64, toMs: Int64) -> String? {
+        let elapsedMs = max(0, Int(toMs - fromMs))
+        return formatDurationMs(elapsedMs)
+    }
+
+    /// Duration for finished timeline items only (≥1s). Streaming stays nil in v1 —
+    /// no per-row live clock (perf + "Working for Xs" already covers the active run).
+    static func toolDurationLabel(for item: AssistantItem, nowMs: Int64? = nil) -> String? {
+        _ = nowMs // reserved for a future ElapsedTickSchedule path
+        switch item.state {
+        case .streaming:
+            return nil
+        case .completed, .failed, .cancelled:
+            guard let finished = item.finishedAtMs else { return nil }
+            let elapsedMs = max(0, Int(finished - item.startedAtMs))
+            // Suppress 0s walls when providers stamp started==finished.
+            guard elapsedMs >= 1_000 else { return nil }
+            return formatDurationMs(elapsedMs)
+        }
+    }
+
+    /// Accessibility label: status + tool name + optional summary + duration (not color-only).
+    static func toolAccessibilityLabel(for item: AssistantItem, nowMs: Int64? = nil) -> String {
+        var parts: [String] = [verb(for: item), toolDisplayLabel(for: item)]
+        if isBackgroundTool(for: item) { parts.append("background") }
+        if toolCommandWasDistilled(for: item) { parts.append("distilled") }
+        if let summary = toolCommandSummary(for: item), !summary.isEmpty {
+            parts.append(summary)
+        }
+        if let duration = toolDurationLabel(for: item, nowMs: nowMs) {
+            parts.append(duration)
+        }
+        return parts.joined(separator: ", ")
+    }
+
+    /// Humanize task/timeout shaped inputs for collapsed display.
+    static func humanizedStructuredPreview(from obj: [String: Any]) -> String? {
+        var parts: [String] = []
+        if let ids = obj["task_ids"] as? [Any], !ids.isEmpty {
+            parts.append(ids.count == 1 ? "1 task" : "\(ids.count) tasks")
+        } else if let id = obj["task_id"] {
+            let text = shortValue(id)
+            if !text.isEmpty, text != "—" { parts.append("task \(text)") }
+        }
+        if let timeout = intMillis(from: obj["timeout_ms"]) ?? intMillis(from: obj["timeout"]) {
+            if let label = formatDurationMs(timeout) {
+                parts.append("timeout \(label)")
+            }
+        }
+        // Only claim this path when we humanized the noisy keys providers dump by default.
+        let noisyKeys: Set<String> = ["task_ids", "task_id", "timeout_ms", "timeout", "call_id", "id"]
+        let otherKeys = obj.keys.filter { !noisyKeys.contains($0) }
+        guard !parts.isEmpty, otherKeys.isEmpty || otherKeys.count <= 1 else { return nil }
+        return parts.joined(separator: " · ")
+    }
+
+    static func summarizeShellishCommand(_ command: String) -> String {
+        var s = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return s }
+        var elided = 0
+        // Drop Token Saver distill pipes (presentation only; body stays intact).
+        // Count as elided so Token Saver proof is not silently erased (chip + "+N more").
+        if let range = s.range(of: #"\s*2>&1\s*\|\s*distill\b[\s\S]*$"#, options: .regularExpression) {
+            s = String(s[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            elided += 1
+        } else if let range = s.range(of: #"\s*\|\s*distill\b[\s\S]*$"#, options: .regularExpression) {
+            s = String(s[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            elided += 1
+        }
+        // Drop only closed-allowlist leading segments (`cd`, `export`, `source`, `.`, `set -e…`).
+        let segments = s
+            .components(separatedBy: "&&")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if segments.count > 1 {
+            var kept = segments
+            while let first = kept.first, isDisposableLeadingShellSegment(first), kept.count > 1 {
+                kept.removeFirst()
+                elided += 1
+            }
+            s = kept.first ?? s
+            if kept.count > 1 {
+                // Additional trailing stages after the primary command stay collapsed.
+                elided += kept.count - 1
+            }
+        }
+        let home = NSHomeDirectory()
+        if !home.isEmpty {
+            s = s.replacingOccurrences(of: home, with: "~")
+        }
+        // Collapse `/Users/name/...` even when not exactly NSHomeDirectory (remote paths).
+        s = s.replacingOccurrences(
+            of: #"/Users/[^/\s]+/"#,
+            with: "~/",
+            options: .regularExpression
+        )
+        let limit = 96
+        if s.count > limit {
+            s = String(s.prefix(limit - 1)) + "…"
+        }
+        if elided > 0 {
+            return "\(s) · +\(elided) more"
+        }
+        return s
+    }
+
+    /// Leading shell setup stages safe to hide behind `· +N more` (never hide `rm` etc.).
+    static func isDisposableLeadingShellSegment(_ segment: String) -> Bool {
+        let t = segment.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if t.hasPrefix("cd ") || t == "cd" { return true }
+        if t.hasPrefix("export ") { return true }
+        if t.hasPrefix("source ") || t.hasPrefix(". ") { return true }
+        if t.hasPrefix("set -") || t == "set -e" || t == "set -eo pipefail" { return true }
+        return false
+    }
+
+    /// Raw `command`/`cmd`/`script` string from tool input JSON (uncapped), if present.
+    static func rawShellCommand(for item: AssistantItem) -> String? {
+        guard let obj = toolInputObject(for: item) else { return nil }
+        for key in ["command", "cmd", "script"] {
+            if let value = (obj[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                return value
+            }
+        }
+        return nil
+    }
+
+    static func looksLikeShellCommand(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard t.count >= 8 else { return false }
+        if t.contains("&&") || t.contains("|") { return true }
+        if t.hasPrefix("cd ") || t.hasPrefix("git ") || t.hasPrefix("npm ") || t.hasPrefix("swift ") {
+            return true
+        }
+        if t.contains("/Users/") || t.hasPrefix("~/") { return true }
+        return false
+    }
+
+    static func shellToolFamilyName(for item: AssistantItem) -> String {
+        if let summary = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !summary.isEmpty,
+           !looksLikeShellCommand(summary.replacingOccurrences(of: #"^\[bg\]\s*"#, with: "", options: .regularExpression)),
+           summary.count <= 32,
+           !summary.contains(":") {
+            return summary.replacingOccurrences(of: #"^\[bg\]\s*"#, with: "", options: .regularExpression)
+        }
+        switch item.type {
+        case .commandExecution: return "Shell"
+        default: return "Shell"
+        }
+    }
+
+    static func toolInputObject(for item: AssistantItem) -> [String: Any]? {
+        let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty,
+              let data = body.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return obj
+    }
+
+    static func intMillis(from value: Any?) -> Int? {
+        switch value {
+        case let i as Int: return i
+        case let i as Int64: return Int(i)
+        case let n as NSNumber: return n.intValue
+        case let s as String:
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            return Int(trimmed)
+        default: return nil
+        }
+    }
+
+    static func formatDurationMs(_ ms: Int) -> String? {
+        guard ms >= 0 else { return nil }
+        if ms < 1000 { return "\(max(ms, 0))ms" }
+        let totalSeconds = ms / 1000
+        if totalSeconds < 60 { return "\(totalSeconds)s" }
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+        if minutes < 60 {
+            return seconds == 0 ? "\(minutes)m" : "\(minutes)m \(seconds)s"
+        }
+        let hours = minutes / 60
+        let remMinutes = minutes % 60
+        return remMinutes == 0 ? "\(hours)h" : "\(hours)h \(remMinutes)m"
     }
 
     /// UX-MAC_AGENT-OPEN-SPLIT: the openable target of a tool call — Read/Edit-style
@@ -9734,15 +10018,14 @@ public struct AgentAppView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    /// Pure seam: thread footer figure — same bare-user credible stack as the
-    /// sidebar card (measured + dialect + graphify), thread-scoped.
+    /// Pure seam: thread footer figure — full bare-user credible stack
+    /// (measured tool-output + dialect + graphify + multi-turn cache impact + Auto).
     ///
-    /// - `measuredDelivered`: permanent ledger total for the thread.
-    /// - Thread-local billed floor: `max(measured, assistantTokens)`. The host has
-    ///   no per-thread provider-usage ledger yet; this floor is evidence the user
-    ///   already saw in the thread (assistant text + measured pipes), never a
-    ///   global day aggregate or raw cache-inflated count. Caps still apply.
-    /// - Graphify only when active **and** signal count > 0.
+    /// - `measuredDelivered`: permanent ledger total for the thread (floor).
+    /// - Prefers real provider usage when present; else thread-local floor from
+    ///   assistant text + measured pipes so dialect legs can run.
+    /// - Cache amortization uses turn count and/or `cacheReadInputTokens`.
+    /// - Auto routing contributes an orchestration token-equivalent.
     ///
     /// Invariant: result ≥ measuredDelivered when enabled (estimates never lower
     /// the thread figure).
@@ -9751,24 +10034,35 @@ public struct AgentAppView: View {
         assistantChars: Int,
         tokenSaverEnabled: Bool,
         graphifyActive: Bool,
-        graphifySignalCount: Int = 0
+        graphifySignalCount: Int = 0,
+        turnCount: Int = 0,
+        cacheReadInputTokens: Int = 0,
+        providerRawTokens: Int = 0,
+        providerBilledTokenUnits: Double? = nil,
+        autoRoutingActive: Bool = false
     ) -> Int {
         let measured = max(0, measuredDelivered)
         guard tokenSaverEnabled else { return measured }
         let assistantTokens = max(0, assistantChars) / Int(TokenSaverBareUserEstimator.charsPerToken)
-        // Thread-local usage floor so usage-anchored dialect/graphify can run
-        // without inventing global billed windows.
-        let threadBilledFloor = Double(max(measured, assistantTokens, 1))
+        // Prefer live provider usage when the thread has it; otherwise a local floor
+        // so dialect can still credit without inventing global day aggregates.
+        let rawFloor = max(measured, assistantTokens, providerRawTokens, 1)
+        let billedFloor: Double = {
+            if let billed = providerBilledTokenUnits, billed > 0 { return billed }
+            return Double(rawFloor)
+        }()
         let breakdown = TokenSaverBareUserEstimator.estimate(
             measuredToolOutputSaved: measured,
             tokenSaverEnabled: true,
             graphifyActive: graphifyActive,
-            orchestrationActive: false,
+            orchestrationActive: autoRoutingActive,
             observation: TokenSaverBareUserObservation(
-                windowProviderTokens: Int(threadBilledFloor),
-                windowProviderBilledTokenUnits: threadBilledFloor,
+                windowProviderTokens: rawFloor,
+                windowProviderBilledTokenUnits: billedFloor,
                 assistantChars: max(0, assistantChars),
-                graphifySignalCount: graphifyActive ? max(0, graphifySignalCount) : 0
+                graphifySignalCount: graphifyActive ? max(0, graphifySignalCount) : 0,
+                turnCount: max(0, turnCount),
+                cacheReadInputTokens: max(0, cacheReadInputTokens)
             )
         )
         return max(measured, breakdown.totalCredible)
@@ -9778,8 +10072,8 @@ public struct AgentAppView: View {
     ///
     /// - Requires `measuredTokens > 0` so estimates only **raise** a proven ledger
     ///   figure — never invent a chip from assistant text alone.
-    /// - Product copy: measured **tool-output / command-output** ledger savings
-    ///   (not total provider bill / cumulative usage). Optional Auto note.
+    /// - Product copy: full savings stack (tool-output + dialect + cache impact),
+    ///   not tool-output alone. Optional Auto note.
     nonisolated static func tokenSaverThreadFooterText(
         displayTokens: Int,
         measuredTokens: Int,
@@ -9788,9 +10082,7 @@ public struct AgentAppView: View {
     ) -> String? {
         guard enabled, measuredTokens > 0, displayTokens > 0 else { return nil }
         let amount = formatTokenCountForFooter(displayTokens)
-        // Explicit scope so users do not equate this chip with provider
-        // actualTokens / context size (often multi-million on long Grok runs).
-        let base = "Token Saver: \(amount) tool-output tokens saved (local ledger; not total provider usage)"
+        let base = "Token Saver: \(amount) tokens saved (tool-output + dialect + cache impact)"
         if autoRoutingActive {
             return base + " + Auto used cheaper models at the same quality"
         }
@@ -10530,12 +10822,31 @@ public struct AgentAppView: View {
     @ViewBuilder
     private func toolRow(_ item: AssistantItem) -> some View {
         let presentation = AgentTimelineItemPresentation.make(for: item)
-        let command = AgentTimelineItemPresentation.toolCommandPreview(for: item)
+        let displayLabel = AgentTimelineItemPresentation.toolDisplayLabel(for: item)
+        // Prefer uncapped raw shell for expand/copy so live body caps cannot mangle JSON.
+        let commandFull = AgentTimelineItemPresentation.rawShellCommand(for: item)
+            ?? AgentTimelineItemPresentation.toolCommandPreview(for: item)
+        let commandSummary = AgentTimelineItemPresentation.toolCommandSummary(for: item)
+        let isBackground = AgentTimelineItemPresentation.isBackgroundTool(for: item)
+        let wasDistilled = AgentTimelineItemPresentation.toolCommandWasDistilled(for: item)
+        // v1: finished rows only (≥1s). Live elapsed stays on the transcript "Working for" line.
+        let duration = AgentTimelineItemPresentation.toolDurationLabel(for: item)
         let output = presentation.detail
         let hasOutput = (output?.isEmpty == false)
-        // A long command is also worth expanding even when there's no output yet.
-        let canExpand = hasOutput || (command.map { $0.count > 160 || $0.contains("\n") } ?? false)
+        let fullDiffersFromSummary = (commandFull != nil && commandFull != commandSummary)
+        // Expand when there is output, a longer full command, or multi-line input.
+        let canExpand = hasOutput
+            || fullDiffersFromSummary
+            || (commandFull.map { $0.count > 96 || $0.contains("\n") } ?? false)
         let expanded = expandedTools.contains(item.id)
+        let statusColor: Color = {
+            switch item.state {
+            case .streaming: return DS.Palette.accent
+            case .failed: return DS.Palette.danger
+            case .cancelled: return DS.Palette.textTertiary
+            case .completed: return DS.Palette.textSecondary
+            }
+        }()
         VStack(alignment: .leading, spacing: DS.Space.xs) {
             Button {
                 guard canExpand else { return }
@@ -10543,13 +10854,48 @@ public struct AgentAppView: View {
             } label: {
                 HStack(spacing: DS.Space.sm) {
                     Image(systemName: presentation.icon)
-                        .font(.system(size: 10)).foregroundColor(DS.Palette.textSecondary)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(statusColor)
+                        .frame(width: 12)
                     (Text("\(presentation.verb) ")
                         .font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
-                     + Text(presentation.label)
-                        .font(DS.Font.mono).foregroundColor(DS.Palette.text))
+                     + Text(displayLabel)
+                        .font(DS.Font.bodyStrong).foregroundColor(DS.Palette.text))
                     .lineLimit(1).truncationMode(.tail)
+                    if isBackground {
+                        Text("Background")
+                            .font(DS.Font.caption2.weight(.semibold))
+                            .foregroundColor(DS.Palette.accent)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(DS.Palette.accent.opacity(0.12))
+                            .clipShape(Capsule())
+                            .accessibilityLabel("Background")
+                    }
+                    if wasDistilled {
+                        Text("Distilled")
+                            .font(DS.Font.caption2.weight(.semibold))
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(DS.Palette.surface)
+                            .clipShape(Capsule())
+                            .accessibilityLabel("Distilled")
+                    }
                     Spacer(minLength: 0)
+                    if item.state == .streaming {
+                        Text("Running")
+                            .font(DS.Font.caption2.weight(.semibold))
+                            .foregroundColor(DS.Palette.accent)
+                    } else if item.state == .failed {
+                        Text("Failed")
+                            .font(DS.Font.caption2.weight(.semibold))
+                            .foregroundColor(DS.Palette.danger)
+                    } else if let duration {
+                        Text(duration)
+                            .font(DS.Font.caption2.monospacedDigit())
+                            .foregroundColor(DS.Palette.textTertiary)
+                    }
                     if canExpand {
                         Image(systemName: expanded ? "chevron.down" : "chevron.right")
                             .font(.system(size: 8)).foregroundColor(DS.Palette.textTertiary)
@@ -10559,21 +10905,38 @@ public struct AgentAppView: View {
             }
             .buttonStyle(.plain)
             .help(canExpand ? (expanded ? "Hide details" : "Show command and output") : "No further detail")
+            .accessibilityLabel(
+                AgentTimelineItemPresentation.toolAccessibilityLabel(for: item)
+            )
 
-            // The command / input that ran (e.g. the bash command) — the key context that
-            // was missing. Always visible (truncated when collapsed); full when expanded.
-            // UX-MAC_AGENT-OPEN-SPLIT: when the input is a file path or URL, a trailing
-            // button opens it in a split panel (Files / Browser) to the right.
-            // Collapsed: one-line command peek (chat density). Full multi-line
-            // command only when the user expands the row.
-            if let command, !command.isEmpty {
+            // L2: collapsed command summary (not the full cd && … | distill pipeline).
+            // UX-MAC_AGENT-OPEN-SPLIT: file/URL tools keep an open-in-split affordance.
+            if let summary = commandSummary, !summary.isEmpty {
                 HStack(alignment: .top, spacing: DS.Space.xs) {
-                    Text(command)
+                    Text(summary)
                         .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary)
                         .textSelection(.enabled)
                         .lineLimit(expanded ? nil : 1)
                         .truncationMode(.tail)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .help(commandFull ?? summary)
+                    if let full = commandFull, !full.isEmpty {
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(full, forType: .string)
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 10))
+                                .foregroundColor(DS.Palette.textTertiary)
+                                .frame(width: 22, height: 22)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .dsPointingHandCursor()
+                        .help("Copy full command")
+                        .accessibilityIdentifier("agent.tool.copyCommand.\(item.id)")
+                        .accessibilityLabel("Copy full command")
+                    }
                     if let target = AgentTimelineItemPresentation.toolOpenTarget(for: item) {
                         Button {
                             switch target {
@@ -10584,6 +10947,8 @@ public struct AgentAppView: View {
                             Image(systemName: "arrow.up.forward.square")
                                 .font(.system(size: 10))
                                 .foregroundColor(DS.Palette.textTertiary)
+                                .frame(width: 22, height: 22)
+                                .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                         .dsPointingHandCursor()
@@ -10595,6 +10960,19 @@ public struct AgentAppView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(DS.Palette.surface)
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            }
+
+            // Expanded: full command (when longer/different than the summary) + output.
+            if expanded, let full = commandFull, fullDiffersFromSummary, !full.isEmpty {
+                Text(full)
+                    .font(DS.Font.monoSmall)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, DS.Space.sm).padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(DS.Palette.surface.opacity(0.7))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .accessibilityIdentifier("agent.tool.fullCommand.\(item.id)")
             }
 
             // Output, collapsed by default and capped so a noisy command can't blow up
@@ -10611,6 +10989,7 @@ public struct AgentAppView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("agent.tool.row.\(item.id)")
     }
 
     // A collapsed burst of consecutive tool calls: "Ran N commands" with a count chip,
@@ -10671,8 +11050,10 @@ public struct AgentAppView: View {
                 .padding(.leading, 20)
             } else if streaming, !expanded, let latest = items.last {
                 // Live peek at the current non-image command without forcing open.
-                let preview = AgentTimelineItemPresentation.toolCommandPreview(for: latest)
-                    ?? AgentTimelineItemPresentation.make(for: latest).label
+                // Prefer the collapsed summary so cd/distill pipelines stay scannable.
+                let preview = AgentTimelineItemPresentation.toolCommandSummary(for: latest)
+                    ?? AgentTimelineItemPresentation.toolCommandPreview(for: latest)
+                    ?? AgentTimelineItemPresentation.toolDisplayLabel(for: latest)
                 if !preview.isEmpty {
                     Text(preview)
                         .font(DS.Font.monoSmall)

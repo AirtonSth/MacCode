@@ -33,10 +33,46 @@ final class TokenSaverBareUserEstimatorTests: XCTestCase {
         // O ≈ 100M * 0.007 = 700k; dialect V=2 → ~700k before caps
         XCTAssertLessThan(b.estimatedDialect, 2_000_000, "dialect must stay on output scale, not 44% of used")
         XCTAssertGreaterThan(b.estimatedDialect, 100_000)
-        XCTAssertEqual(b.estimatedOrchestration, 0, "orch excluded from token total")
-        XCTAssertEqual(b.totalCredible, measured + b.estimatedDialect + b.estimatedGraphify)
-        // Attributed capped vs measured/used
-        XCTAssertLessThanOrEqual(b.attributedOnly, Int(Double(measured) * 4.0) + 1)
+        // Auto active → orchestration = 25% of measured enters totalCredible
+        XCTAssertEqual(b.estimatedOrchestration, measured / 4)
+        XCTAssertEqual(
+            b.totalCredible,
+            measured + b.estimatedDialect + b.estimatedGraphify
+                + b.estimatedOrchestration + b.estimatedCacheAmortization
+        )
+    }
+
+    func test_cacheAmortization_scalesWithTurnsAndCaps() {
+        // WHY: multi-turn re-read of compressed tool output must raise the figure.
+        let measured = 5_000
+        let none = TokenSaverBareUserEstimator.estimateCacheAmortizationTokens(
+            measured: measured, turnCount: 1
+        )
+        XCTAssertEqual(none, 0)
+        let multi = TokenSaverBareUserEstimator.estimateCacheAmortizationTokens(
+            measured: measured, turnCount: 77
+        )
+        XCTAssertEqual(multi, measured * TokenSaverBareUserEstimator.cacheAmortizationMaxExtraTurns)
+        let fromCache = TokenSaverBareUserEstimator.estimateCacheAmortizationTokens(
+            measured: measured, turnCount: 0, cacheReadInputTokens: 1_000_000
+        )
+        // 0.1 × 1M = 100k, capped at measured × 50 = 250k → 100k
+        XCTAssertEqual(fromCache, 100_000)
+    }
+
+    func test_orchestration_shareOfMeasuredWhenActive() {
+        let b = TokenSaverBareUserEstimator.estimate(
+            measuredToolOutputSaved: 8_000,
+            tokenSaverEnabled: true,
+            graphifyActive: false,
+            orchestrationActive: true,
+            observation: TokenSaverBareUserObservation(
+                windowProviderTokens: 50_000,
+                windowProviderBilledTokenUnits: 50_000
+            )
+        )
+        XCTAssertEqual(b.estimatedOrchestration, 2_000)
+        XCTAssertGreaterThanOrEqual(b.totalCredible, 8_000 + 2_000)
     }
 
     func test_graphifyRequiresSignals() {

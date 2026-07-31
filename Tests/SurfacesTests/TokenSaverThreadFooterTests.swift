@@ -32,8 +32,8 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         ))
     }
 
-    func test_footerText_measuredOnly_usesLedgerNotProviderUsageCopy() {
-        // WHY: chip must not be read as total provider/context usage (e.g. 6.6M).
+    func test_footerText_includesFullStackCopyNotToolOutputOnly() {
+        // WHY: product now surfaces dialect + cache impact, not tool-output alone.
         let text = AgentAppView.tokenSaverThreadFooterText(
             displayTokens: 100_000,
             measuredTokens: 100_000,
@@ -41,12 +41,11 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         )
         XCTAssertEqual(
             text,
-            "Token Saver: 100K tool-output tokens saved (local ledger; not total provider usage)"
+            "Token Saver: 100K tokens saved (tool-output + dialect + cache impact)"
         )
     }
 
-    func test_footerText_estimatedAboveMeasured_stillUsesLedgerScopeCopy() {
-        // WHY: figure may include dialect/graphify legs; still tool-output ledger scope.
+    func test_footerText_estimatedAboveMeasured_sameScopeCopy() {
         let text = AgentAppView.tokenSaverThreadFooterText(
             displayTokens: 150_000,
             measuredTokens: 100_000,
@@ -54,7 +53,7 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         )
         XCTAssertEqual(
             text,
-            "Token Saver: 150K tool-output tokens saved (local ledger; not total provider usage)"
+            "Token Saver: 150K tokens saved (tool-output + dialect + cache impact)"
         )
     }
 
@@ -68,7 +67,7 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         )
         XCTAssertEqual(
             text,
-            "Token Saver: 3.1K tool-output tokens saved (local ledger; not total provider usage) + Auto used cheaper models at the same quality"
+            "Token Saver: 3.1K tokens saved (tool-output + dialect + cache impact) + Auto used cheaper models at the same quality"
         )
     }
 
@@ -81,7 +80,7 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         )
         XCTAssertEqual(
             text,
-            "Token Saver: 3.1K tool-output tokens saved (local ledger; not total provider usage) + Auto used cheaper models at the same quality"
+            "Token Saver: 3.1K tokens saved (tool-output + dialect + cache impact) + Auto used cheaper models at the same quality"
         )
     }
 
@@ -99,24 +98,24 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         )
         XCTAssertEqual(
             first,
-            "Token Saver: 12.5K tool-output tokens saved (local ledger; not total provider usage)"
+            "Token Saver: 12.5K tokens saved (tool-output + dialect + cache impact)"
         )
         XCTAssertEqual(
             later,
-            "Token Saver: 410K tool-output tokens saved (local ledger; not total provider usage)"
+            "Token Saver: 410K tokens saved (tool-output + dialect + cache impact)"
         )
         XCTAssertNotEqual(first, later)
     }
 
-    func test_footerText_explicitlySeparatesFromProviderUsage() {
-        // WHY: item 4 — never present ledger chip as total provider actualTokens.
+    func test_footerText_doesNotClaimToolOutputOnly() {
+        // WHY: item 4 — chip must include dialect/cache legs, not deny them.
         let text = AgentAppView.tokenSaverThreadFooterText(
             displayTokens: 3_800,
             measuredTokens: 3_399,
             enabled: true
         )!
-        XCTAssertTrue(text.contains("tool-output"))
-        XCTAssertTrue(text.contains("not total provider usage"))
+        XCTAssertTrue(text.contains("tool-output + dialect + cache impact"))
+        XCTAssertFalse(text.contains("not total provider usage"))
         XCTAssertFalse(text.localizedCaseInsensitiveContains("you saved"))
     }
 
@@ -133,13 +132,16 @@ final class TokenSaverThreadFooterTests: XCTestCase {
     }
 
     func test_displayTokens_disabled_returnsMeasuredOnly() {
-        // WHY: paid-feature off → no dialect/graphify inflation.
+        // WHY: paid-feature off → no dialect/graphify/cache inflation.
         let display = AgentAppView.tokenSaverThreadFooterDisplayTokens(
             measuredDelivered: 80_000,
             assistantChars: 400_000,
             tokenSaverEnabled: false,
             graphifyActive: true,
-            graphifySignalCount: 20
+            graphifySignalCount: 20,
+            turnCount: 40,
+            cacheReadInputTokens: 5_000_000,
+            autoRoutingActive: true
         )
         XCTAssertEqual(display, 80_000)
     }
@@ -155,6 +157,51 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         )
         XCTAssertGreaterThan(display, measured,
                              "large assistant output should raise credible total above pure ledger")
+    }
+
+    func test_displayTokens_multiTurnCacheAmortizationRaisesFigure() {
+        // WHY: elephant-class long threads must credit multi-turn re-read impact
+        // of tool-output savings — not show bare measured alone.
+        let measured = 4_534
+        let noTurns = AgentAppView.tokenSaverThreadFooterDisplayTokens(
+            measuredDelivered: measured,
+            assistantChars: 0,
+            tokenSaverEnabled: true,
+            graphifyActive: false,
+            turnCount: 1
+        )
+        let manyTurns = AgentAppView.tokenSaverThreadFooterDisplayTokens(
+            measuredDelivered: measured,
+            assistantChars: 0,
+            tokenSaverEnabled: true,
+            graphifyActive: false,
+            turnCount: 77,
+            cacheReadInputTokens: 5_000_000
+        )
+        XCTAssertGreaterThan(manyTurns, noTurns)
+        XCTAssertGreaterThan(manyTurns, measured * 10,
+                             "77-turn thread must show large cache-amortized savings")
+    }
+
+    func test_displayTokens_autoRoutingAddsOrchestration() {
+        let measured = 10_000
+        let without = AgentAppView.tokenSaverThreadFooterDisplayTokens(
+            measuredDelivered: measured,
+            assistantChars: 0,
+            tokenSaverEnabled: true,
+            graphifyActive: false,
+            turnCount: 1,
+            autoRoutingActive: false
+        )
+        let withAuto = AgentAppView.tokenSaverThreadFooterDisplayTokens(
+            measuredDelivered: measured,
+            assistantChars: 0,
+            tokenSaverEnabled: true,
+            graphifyActive: false,
+            turnCount: 1,
+            autoRoutingActive: true
+        )
+        XCTAssertGreaterThan(withAuto, without)
     }
 
     func test_formatTokenCount_millions() {

@@ -765,11 +765,22 @@ final class TokenSaverCardSeamTests: XCTestCase {
             graphifyActive: true,
             graphifySignalCount: 0
         )
-        XCTAssertEqual(day.totalCredible, day.measuredToolOutput + day.estimatedDialect + day.estimatedGraphify)
-        XCTAssertEqual(week.totalCredible, week.measuredToolOutput + week.estimatedDialect + week.estimatedGraphify)
+        XCTAssertEqual(
+            day.totalCredible,
+            day.measuredToolOutput + day.estimatedDialect + day.estimatedGraphify
+                + day.estimatedOrchestration + day.estimatedCacheAmortization
+        )
+        XCTAssertEqual(
+            week.totalCredible,
+            week.measuredToolOutput + week.estimatedDialect + week.estimatedGraphify
+                + week.estimatedOrchestration + week.estimatedCacheAmortization
+        )
         XCTAssertEqual(day.estimatedGraphify, 0, "no fake graphify signals")
+        // Day/week seams pass no turnCount/auto → cache + orch stay 0.
         XCTAssertEqual(day.estimatedOrchestration, 0)
         XCTAssertEqual(week.estimatedOrchestration, 0)
+        XCTAssertEqual(day.estimatedCacheAmortization, 0)
+        XCTAssertEqual(week.estimatedCacheAmortization, 0)
         // dialect ≈ 0.007 * U capped by 4*M → day ~ min(1.05M, 1M) + M
         XCTAssertLessThan(day.totalCredible, 2_000_000, "day must stay credible, not 66% of usage")
         XCTAssertGreaterThan(week.totalCredible, day.totalCredible)

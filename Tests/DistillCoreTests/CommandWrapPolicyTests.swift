@@ -6,10 +6,12 @@ final class CommandWrapPolicyTests: XCTestCase {
     private let noEnv: [String: String] = [:]
 
     func test_isWrapped_coversCompressibleFamilyOnly() {
-        for c in ["find", "ls", "git", "gh", "glab", "swift", "xcodebuild", "/usr/bin/git"] {
+        for c in ["find", "ls", "git", "gh", "glab", "swift", "xcodebuild", "/usr/bin/git",
+                  "curl", "aws", "python3"] {
             XCTAssertTrue(CommandWrapPolicy.isWrapped(c), "\(c) must be wrapped")
         }
         // Exact-output tools must NOT be PATH-wrapped (agent needs full stdout).
+        // `node` stays unwrapped (agent runtime / bridge); use bun/python for script compress.
         for c in ["rg", "grep", "sed", "cat", "head", "tail", "awk", "jq", "echo", "node", "rm"] {
             XCTAssertFalse(CommandWrapPolicy.isWrapped(c), "\(c) must NOT be wrapped")
         }
@@ -53,7 +55,10 @@ final class CommandWrapPolicyTests: XCTestCase {
         XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "ls", args: ["-la"], environment: noEnv))
     }
 
-    func test_passthroughReason_allowsReadOnlySubcommandsAndRejectsMutatingOnes() {
+    func test_passthroughReason_compressesAllSubcommandsExceptExactOutputCarveOuts() {
+        // WHY: product rule — distill every wrapped command (incl. former "mutating"
+        // allowlist rejects like gh api / git push stdout). Only exact-output /
+        // exact-patch families stay passthrough.
         XCTAssertEqual(
             CommandWrapPolicy.passthroughReason(command: "git", args: ["diff"], environment: noEnv),
             "exact_patch_output"
@@ -63,30 +68,36 @@ final class CommandWrapPolicyTests: XCTestCase {
         XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "git", args: ["status"], environment: noEnv))
         XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "git", args: ["branch", "--show-current"], environment: noEnv))
         XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "git", args: ["remote", "-v"], environment: noEnv))
-        XCTAssertEqual(
+        XCTAssertNil(
             CommandWrapPolicy.passthroughReason(command: "git", args: ["push"], environment: noEnv),
-            "mutating_subcommand",
-            "git push must keep raw inherited streams and exact behavior"
+            "git push stdout is compress-eligible; side effects still run"
         )
-        XCTAssertEqual(CommandWrapPolicy.passthroughReason(command: "git", args: ["branch", "-D", "feature"], environment: noEnv), "mutating_subcommand")
-        XCTAssertEqual(CommandWrapPolicy.passthroughReason(command: "git", args: ["remote", "add", "origin", "url"], environment: noEnv), "mutating_subcommand")
+        XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "git", args: ["branch", "-D", "feature"], environment: noEnv))
+        XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "git", args: ["remote", "add", "origin", "url"], environment: noEnv))
 
         XCTAssertEqual(
             CommandWrapPolicy.passthroughReason(command: "gh", args: ["pr", "diff", "12"], environment: noEnv),
             "exact_patch_output"
         )
         XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "gh", args: ["pr", "diff", "12", "--name-only"], environment: noEnv))
-        XCTAssertEqual(CommandWrapPolicy.passthroughReason(command: "gh", args: ["pr", "merge", "12"], environment: noEnv), "mutating_subcommand")
+        XCTAssertNil(
+            CommandWrapPolicy.passthroughReason(command: "gh", args: ["pr", "merge", "12"], environment: noEnv),
+            "merge status text may distill"
+        )
+        XCTAssertNil(
+            CommandWrapPolicy.passthroughReason(command: "gh", args: ["api", "repos/o/r/pulls/1"], environment: noEnv),
+            "gh api was the elephant undercount hole — must compress"
+        )
         XCTAssertEqual(
             CommandWrapPolicy.passthroughReason(command: "glab", args: ["mr", "diff", "12"], environment: noEnv),
             "exact_patch_output"
         )
         XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "glab", args: ["mr", "diff", "12", "--name-status"], environment: noEnv))
-        XCTAssertEqual(CommandWrapPolicy.passthroughReason(command: "glab", args: ["mr", "merge", "12"], environment: noEnv), "mutating_subcommand")
+        XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "glab", args: ["mr", "merge", "12"], environment: noEnv))
 
         XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "swift", args: ["test"], environment: noEnv))
         XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "xcodebuild", args: ["test"], environment: noEnv))
-        XCTAssertEqual(CommandWrapPolicy.passthroughReason(command: "swift", args: ["package", "reset"], environment: noEnv), "mutating_subcommand")
+        XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "swift", args: ["package", "reset"], environment: noEnv))
     }
 
     func test_fullPatchInvocationsStayExactUnlessExplicitlySummaryOnly() {
@@ -203,13 +214,14 @@ final class CommandWrapPolicyTests: XCTestCase {
 
     func test_wrappedCommandCatalog_includesEndorsedForcedWrapCategories() {
         // One representative per newly-endorsed category (package managers, build tools,
-        // test runners, linters, containers/IaC) must be forced-wrapped, never exact-output.
+        // test runners, linters, containers/IaC, HTTP/cloud, python) must be forced-wrapped.
         let representatives = [
             "npm", "brew", "bun", "bunx", // package managers / install (bun used heavily by empath)
             "make", "cargo",     // build tools
             "pytest", "jest",    // test runners
             "eslint", "shellcheck", // linters
-            "docker", "terraform"  // containers / IaC
+            "docker", "terraform",  // containers / IaC
+            "curl", "aws", "python3" // HTTP / cloud / scripts (all providers)
         ]
         for c in representatives {
             XCTAssertTrue(WrappedCommandCatalog.commands.contains(c), "\(c) must be in the forced wrap catalog")

@@ -10,8 +10,9 @@ import Foundation
 /// Split:
 /// - **exact-output family**: line slices, search matches, file dumps — agent needs every line.
 ///   Never install wrappers; agent instructions must skip `| distill`.
-/// - **compressible family**: listings, builds, CI, noisy logs — safe to wrap/compress when
-///   the invocation is read-only (mutating subcommands rejected by `CommandWrapPolicy`).
+/// - **compressible family**: everything else that gets a PATH wrapper. Subcommands are not
+///   allowlisted — `CommandWrapPolicy` compresses any terminal-to-agent stdout above threshold
+///   (except exact-output / exact-patch carve-outs).
 ///
 /// Provider basenames (`grok` / `claude` / `codex`) are **not** listed here. Nested
 /// provider interception is a separate always-on controller — see `ProviderProxyCatalog`.
@@ -38,7 +39,8 @@ public enum WrappedCommandCatalog {
     // MARK: Compressible wrap targets
 
     /// Ordered for deterministic install/uninstall; `commandSet` is the membership view.
-    /// Only these get PATH wrappers that may compress terminal-to-agent stdout.
+    /// These binaries get PATH wrappers; **all** their subcommands compress when eligible
+    /// (no read-only allowlist). Exact-output basenames are never listed here.
     public static let commands: [String] = [
         "find", "ls",
         "git", "gh", "glab",
@@ -52,7 +54,11 @@ public enum WrappedCommandCatalog {
         // linters
         "eslint", "pylint", "flake8", "rubocop", "swiftlint", "shellcheck", "golangci-lint", "stylelint", "hadolint",
         // containers / IaC
-        "docker", "kubectl", "helm", "terraform", "terragrunt", "pulumi"
+        "docker", "kubectl", "helm", "terraform", "terragrunt", "pulumi",
+        // HTTP / cloud CLIs (common noisy agent stdout across Claude/Codex/Grok)
+        "curl", "wget", "aws", "gcloud", "az",
+        // script interpreters often used for one-shot agents (not exact-output)
+        "python", "python3"
     ]
 
     public static let commandSet: Set<String> = Set(commands)

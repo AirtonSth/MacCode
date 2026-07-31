@@ -399,4 +399,122 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
             }
         }
     }
+
+    func test_wrapPolicy_noAllowlist_compressesGhApiAndMutatingStdoutForAllProviders() {
+        // WHY: PATH wrap policy is provider-neutral (same binary for Claude/Codex/Grok
+        // shells and nested proxies). Former allowlist blocked gh api — elephant undercount.
+        // Compress eligibility must not depend on which provider owns the run.
+        let noEnv: [String: String] = [:]
+        let mustCompress: [(String, [String])] = [
+            ("gh", ["api", "repos/o/r/pulls/1"]),
+            ("gh", ["pr", "merge", "12"]),
+            ("gh", ["pr", "list", "--json", "number,title"]),
+            ("git", ["push"]),
+            ("git", ["status"]),
+            ("git", ["log", "--oneline", "-20"]),
+            ("curl", ["-s", "https://example.com/api"]),
+            ("python3", ["script.py"]),
+            ("aws", ["s3", "ls"]),
+        ]
+        for (cmd, args) in mustCompress {
+            XCTAssertTrue(
+                CommandWrapPolicy.isWrapped(cmd) || WrappedCommandCatalog.commands.contains(cmd),
+                "\(cmd) must be PATH-wrapped so Grok/Codex (no PostToolUse rewrite) can compress"
+            )
+            XCTAssertNil(
+                CommandWrapPolicy.passthroughReason(command: cmd, args: args, environment: noEnv),
+                "\(cmd) \(args.joined(separator: " ")) must compress (no allowlist)"
+            )
+        }
+        // Exact-output carve-outs still apply for every provider.
+        XCTAssertEqual(
+            CommandWrapPolicy.passthroughReason(command: "rg", args: ["pattern"], environment: noEnv),
+            "exact_output_command"
+        )
+        XCTAssertEqual(
+            CommandWrapPolicy.passthroughReason(command: "sed", args: ["-n", "1,10p", "f"], environment: noEnv),
+            "exact_output_command"
+        )
+        XCTAssertEqual(
+            CommandWrapPolicy.passthroughReason(command: "git", args: ["diff"], environment: noEnv),
+            "exact_patch_output"
+        )
+        XCTAssertEqual(
+            CommandWrapPolicy.passthroughReason(command: "git", args: ["show", "HEAD:file"], environment: noEnv),
+            "exact_output_subcommand"
+        )
+    }
+
+    func test_dialectPrompt_allProviders_requirePipeAndDocumentNoAllowlist() {
+        // WHY: voluntary | distill + wrapper policy must be identical for every
+        // admitted provider and nested shape (gate = DISTILL_HINT, not provider).
+        for provider in providers {
+            let env = TokenSaverExecutionReceiptSeam.environment(from: admit(provider))
+            let prompt = AgentSkillInstaller.tokenSaverProviderPrompt("work", environment: env)
+            XCTAssertTrue(prompt.contains("| distill"), "\(provider)")
+            XCTAssertTrue(
+                prompt.contains("gh api") || prompt.contains("all subcommands"),
+                "\(provider) dialect must document no-allowlist / gh api coverage"
+            )
+            XCTAssertTrue(
+                prompt.contains("primary") && (prompt.contains("nested") || prompt.contains("subagent")),
+                "\(provider) must apply to primary+nested"
+            )
+            XCTAssertTrue(prompt.contains("NEVER pipe") || prompt.contains("exact-output") || prompt.contains("rg"),
+                          "\(provider) exact-output skip must remain")
+        }
+    }
+
+    func test_footerDisplayStack_providerAgnostic_multiTurnAndAuto() {
+        // WHY: chip stack (tool-output + dialect + cache + Auto) is pure and must
+        // not depend on which provider produced the measured ledger row.
+        // Surfaces import is not required — estimator is shared; footer seams
+        // live in Surfaces but use the same bare-user stack.
+        let measured = 4_534
+        let multi = TokenSaverBareUserEstimator.estimate(
+            measuredToolOutputSaved: measured,
+            tokenSaverEnabled: true,
+            graphifyActive: false,
+            orchestrationActive: true,
+            observation: TokenSaverBareUserObservation(
+                windowProviderTokens: 200_000,
+                windowProviderBilledTokenUnits: 50_000,
+                turnCount: 77,
+                cacheReadInputTokens: 5_000_000
+            )
+        )
+        XCTAssertGreaterThan(multi.estimatedCacheAmortization, measured * 10)
+        XCTAssertEqual(
+            multi.estimatedOrchestration,
+            TokenSaverBareUserEstimator.estimateOrchestrationTokens(measured: measured)
+        )
+        XCTAssertGreaterThan(multi.totalCredible, measured * 10)
+        // Off → measured only for every provider identity.
+        let off = TokenSaverBareUserEstimator.estimate(
+            measuredToolOutputSaved: measured,
+            tokenSaverEnabled: false,
+            graphifyActive: true,
+            orchestrationActive: true,
+            observation: TokenSaverBareUserObservation(
+                windowProviderTokens: 200_000,
+                windowProviderBilledTokenUnits: 50_000,
+                turnCount: 77,
+                cacheReadInputTokens: 5_000_000
+            )
+        )
+        XCTAssertEqual(off.totalCredible, measured)
+    }
+
+    func test_catalog_expandedHTTPCloudAndPython_availableToAllProviders() {
+        // WHY: Grok/Codex rely on PATH wrap for auto compress; catalog must cover
+        // noisy CLIs used by every agent shape (primary + nested).
+        for name in ["curl", "wget", "aws", "gcloud", "az", "python", "python3"] {
+            XCTAssertTrue(WrappedCommandCatalog.commands.contains(name), name)
+            XCTAssertFalse(WrappedCommandCatalog.exactOutputCommandSet.contains(name), name)
+        }
+        // Still never wrap provider binaries or exact-output.
+        for name in ["claude", "codex", "grok", "rg", "sed", "jq", "node"] {
+            XCTAssertFalse(WrappedCommandCatalog.commands.contains(name), "\(name) must not be in wrap catalog")
+        }
+    }
 }

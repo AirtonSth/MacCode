@@ -85,6 +85,129 @@ final class ToolRowPresentationTests: XCTestCase {
         XCTAssertEqual(p.label, "Bash")
     }
 
+    // MARK: Tool card density (UX-MAC_AGENT-TOOL-CARD)
+
+    func test_toolDisplayLabel_stripsBgAndShellPipelineFromTitle() {
+        // WHY: Grok titles often paste `[bg] cd … && git push…` into summary; L1 must
+        // stay a short tool name so the row is scannable.
+        let item = toolItem(
+            body: #"{"command":"cd /Users/sam/dev/app && git push origin production 2>&1 | distill \"reason\"","background":true}"#,
+            summary: "[bg] cd /Users/sam/dev/app && git push origin production 2>&1 | distill \"reason\""
+        )
+        XCTAssertEqual(AgentTimelineItemPresentation.toolDisplayLabel(for: item), "Shell")
+        XCTAssertTrue(AgentTimelineItemPresentation.isBackgroundTool(for: item))
+    }
+
+    func test_toolDisplayLabel_stripsCallUUIDFromGetTaskOutput() {
+        let item = toolItem(
+            body: #"{"task_ids":[1],"timeout_ms":180000}"#,
+            summary: "Get task output: call-3566c18b-b595-4299-91fe-088abdba8159-25"
+        )
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.toolDisplayLabel(for: item),
+            "Get task output",
+            "call UUIDs are provider noise on L1 — keep the human tool name only"
+        )
+    }
+
+    func test_toolCommandSummary_prefersLastCommandAndStripsDistill() {
+        // WHY: collapsed L2 must show the intent (`git push`), not cd + distill wrapper —
+        // and must advertise elision (`+N more`) so Token Saver is not silently hidden.
+        let item = toolItem(
+            body: #"{"command":"cd /Users/samuelfajreldines/dev/pamela-studio && git push origin production 2>&1 | distill \"push success or failure reason\""}"#,
+            summary: "Bash"
+        )
+        let summary = AgentTimelineItemPresentation.toolCommandSummary(for: item)
+        XCTAssertEqual(summary, "git push origin production · +2 more")
+        XCTAssertTrue(AgentTimelineItemPresentation.toolCommandWasDistilled(for: item))
+        let full = AgentTimelineItemPresentation.rawShellCommand(for: item)
+        XCTAssertTrue(full?.contains("distill") == true,
+                      "full preview retains the real command for expand/copy")
+        XCTAssertNotEqual(summary, full)
+    }
+
+    func test_toolCommandPreview_humanizesTaskTimeoutPayload() {
+        // WHY: raw `task_ids: [1] timeout_ms: 180000` reads like a debug dump.
+        let item = toolItem(
+            body: #"{"task_ids":[1],"timeout_ms":180000}"#,
+            summary: "Get task output"
+        )
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.toolCommandPreview(for: item),
+            "1 task · timeout 3m"
+        )
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.toolCommandSummary(for: item),
+            "1 task · timeout 3m"
+        )
+    }
+
+    func test_formatDurationMs_boundaries() {
+        XCTAssertEqual(AgentTimelineItemPresentation.formatDurationMs(450), "450ms")
+        XCTAssertEqual(AgentTimelineItemPresentation.formatDurationMs(12_000), "12s")
+        XCTAssertEqual(AgentTimelineItemPresentation.formatDurationMs(113_000), "1m 53s")
+        XCTAssertEqual(AgentTimelineItemPresentation.formatDurationMs(180_000), "3m")
+        XCTAssertEqual(AgentTimelineItemPresentation.formatDurationMs(3_600_000), "1h")
+    }
+
+    func test_toolDurationLabel_usesFinishedAtWhenCompleted() {
+        let item = AssistantItem(
+            id: "i", turnId: "t", type: .tool, state: .completed,
+            summary: "Bash", body: #"{"command":"ls"}"#,
+            startedAtMs: 1_000, finishedAtMs: 13_500
+        )
+        XCTAssertEqual(AgentTimelineItemPresentation.toolDurationLabel(for: item), "12s")
+    }
+
+    func test_toolDurationLabel_streamingStaysNilInV1() {
+        // WHY: per-row live clocks are a known transcript perf trap; "Working for Xs"
+        // already covers the active run. Streaming must not paint a duration.
+        let item = AssistantItem(
+            id: "i", turnId: "t", type: .tool, state: .streaming,
+            summary: "Bash", body: #"{"command":"sleep 1"}"#,
+            startedAtMs: 0
+        )
+        XCTAssertNil(AgentTimelineItemPresentation.toolDurationLabel(for: item))
+        XCTAssertNil(AgentTimelineItemPresentation.toolDurationLabel(for: item, nowMs: 90_000))
+    }
+
+    func test_toolDurationLabel_suppressesSubSecondFinished() {
+        let item = AssistantItem(
+            id: "i", turnId: "t", type: .tool, state: .completed,
+            summary: "Bash", body: #"{"command":"ls"}"#,
+            startedAtMs: 1_000, finishedAtMs: 1_400
+        )
+        XCTAssertNil(AgentTimelineItemPresentation.toolDurationLabel(for: item),
+                     "0s walls from equal/near-equal timestamps must not clutter finished rows")
+    }
+
+    func test_toolAccessibilityLabel_includesStatusNameAndBackground() {
+        let item = toolItem(
+            body: #"{"command":"git status","background":true}"#,
+            summary: "[bg] git status"
+        )
+        let label = AgentTimelineItemPresentation.toolAccessibilityLabel(for: item)
+        XCTAssertTrue(label.localizedCaseInsensitiveContains("ran"))
+        XCTAssertTrue(label.localizedCaseInsensitiveContains("background"))
+        XCTAssertTrue(label.contains("git status") || label.localizedCaseInsensitiveContains("shell"))
+    }
+
+    func test_isBackgroundTool_fromRunInBackgroundFlag() {
+        let item = toolItem(body: #"{"command":"echo hi","run_in_background":true}"#, summary: "Bash")
+        XCTAssertTrue(AgentTimelineItemPresentation.isBackgroundTool(for: item))
+        let fg = toolItem(body: #"{"command":"echo hi"}"#, summary: "Bash")
+        XCTAssertFalse(AgentTimelineItemPresentation.isBackgroundTool(for: fg))
+    }
+
+    func test_summarizeShellishCommand_shortensHomePaths() {
+        let home = NSHomeDirectory()
+        let cmd = "swift test --package-path \(home)/dev/remote-code/macos-app"
+        let summary = AgentTimelineItemPresentation.summarizeShellishCommand(cmd)
+        XCTAssertTrue(summary.hasPrefix("swift test --package-path ~/"),
+                      "home directory must collapse to ~ for density; got \(summary)")
+        XCTAssertFalse(summary.contains(home))
+    }
+
     func test_cappedDetailStripsANSIEscapeCodes() {
         let ansi = "\u{001B}[32mPASS\u{001B}[0m all tests \u{001B}[1;31mFAIL\u{001B}[0m none"
         let clean = AgentTimelineItemPresentation.cappedDetail(ansi)
