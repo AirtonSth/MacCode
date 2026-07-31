@@ -100,11 +100,11 @@ final class TokenSaverDailyEconomyRepositoryTests: XCTestCase {
 
     func test_v4_roundTripsDialectRawCapBindingAndFormulaVersion() throws {
         // WHY: collapse detection needs pre-cap legs + which bound applied; mixed
-        // formula versions must be labelled (credible_v4), never silently compared.
+        // formula versions must be labelled (credible_v5), never silently compared.
         let db = try makeDB()
         let repo = TokenSaverDailyEconomyRepository(db: db)
         let dayMs = repo.dayStartMs()
-        XCTAssertEqual(TokenSaverDailyEconomyRepository.formulaVersion, "credible_v4")
+        XCTAssertEqual(TokenSaverDailyEconomyRepository.formulaVersion, "credible_v5")
         let record = TokenSaverDailyEconomyRecord(
             dayStartMs: dayMs,
             measuredTokens: 2,
@@ -126,7 +126,7 @@ final class TokenSaverDailyEconomyRepositoryTests: XCTestCase {
         XCTAssertEqual(loaded.graphifyRawTokens, 12_345)
         XCTAssertEqual(loaded.capBinding, "no_proof_allowance")
         XCTAssertEqual(loaded.windowUsageBilledUnits, 9_832_294.0, accuracy: 0.001)
-        XCTAssertEqual(loaded.formulaVersion, "credible_v4")
+        XCTAssertEqual(loaded.formulaVersion, "credible_v5")
         XCTAssertEqual(loaded.totalCredible, 10)
     }
 }

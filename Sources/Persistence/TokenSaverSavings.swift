@@ -1,5 +1,23 @@
 import Foundation
 
+/// One thread's permanent delivered savings + run count for multi-turn cache
+/// amortization into the day/week Token Saver card (matches thread-footer stack).
+public struct TokenSaverThreadCacheAmortizationInput: Sendable, Equatable {
+    public let threadID: String
+    public let savedTokens: Int
+    public let runs: Int
+    /// Last delivered provider label for this thread (`claude` / `codex` / `grok` / …).
+    public let provider: String
+
+    public init(threadID: String, savedTokens: Int, runs: Int, provider: String = "unknown") {
+        self.threadID = threadID
+        self.savedTokens = max(0, savedTokens)
+        self.runs = max(0, runs)
+        let p = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        self.provider = p.isEmpty ? "unknown" : p
+    }
+}
+
 /// Token Saver saved-token totals for one provider across the permanent
 /// accumulator. Event rows may be pruned, but this aggregate keeps growing so
 /// the user can see all tokens Token Saver has saved for them.
@@ -372,6 +390,57 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
             try stmt.bind(1, thread)
             guard try stmt.step() else { return 0 }
             return Int(stmt.columnInt64(0))
+        }
+    }
+
+    /// Threads with delivered savings in `[dayStartMs, dayEndMsExclusive)` plus their
+    /// permanent totals/runs — used to fold multi-turn cache amortization into the
+    /// day/week Token Saver card (same stack as the thread footer).
+    public func threadCacheAmortizationInputs(
+        dayStartMs: Int64,
+        dayEndMsExclusive: Int64
+    ) throws -> [TokenSaverThreadCacheAmortizationInput] {
+        try db.performSync { database in
+            let stmt = try database.prepare("""
+                SELECT t.thread_id,
+                       COALESCE(t.saved_tokens, 0),
+                       COALESCE(t.runs, 0),
+                       COALESCE((
+                           SELECT s.provider
+                           FROM token_saver_savings s
+                           WHERE s.thread_id = t.thread_id
+                             AND s.delivered = 1
+                             AND TRIM(s.thread_id) != ''
+                           ORDER BY s.created_at_ms DESC
+                           LIMIT 1
+                       ), 'unknown')
+                FROM token_saver_thread_totals t
+                WHERE t.thread_id IN (
+                    SELECT DISTINCT thread_id
+                    FROM token_saver_savings
+                    WHERE delivered = 1
+                      AND created_at_ms >= ?
+                      AND created_at_ms < ?
+                      AND TRIM(thread_id) != ''
+                );
+            """)
+            defer { stmt.reset() }
+            try stmt.bind(1, dayStartMs)
+            try stmt.bind(2, dayEndMsExclusive)
+            var rows: [TokenSaverThreadCacheAmortizationInput] = []
+            while try stmt.step() {
+                let id = (stmt.columnText(0) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !id.isEmpty else { continue }
+                rows.append(TokenSaverThreadCacheAmortizationInput(
+                    threadID: id,
+                    savedTokens: Int(stmt.columnInt64(1)),
+                    runs: Int(stmt.columnInt64(2)),
+                    provider: (stmt.columnText(3) ?? "unknown")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .lowercased()
+                ))
+            }
+            return rows
         }
     }
 

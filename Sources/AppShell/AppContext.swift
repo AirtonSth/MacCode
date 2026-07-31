@@ -4087,6 +4087,15 @@ public final class AppContext {
                 minSamples: TokenSaverBareUserEstimator.minSamplesForLiveShare
             )
             try? graphifyUsageRepo.prune(nowMs: nowMs)
+            // Multi-turn cache impact: same stack as the Agent App thread footer so a
+            // 7.0M thread chip is reflected in the sidebar day card (not measured-only).
+            let threadInputs = (try? tokenSaverSavingsRepo.threadCacheAmortizationInputs(
+                dayStartMs: dayStartMs,
+                dayEndMsExclusive: dayEndMs
+            )) ?? []
+            let threadCacheAmort = TokenSaverBareUserEstimator.sumThreadCacheAmortization(
+                inputs: threadInputs.map { (savedTokens: $0.savedTokens, runs: $0.runs) }
+            )
             let breakdown = TokenSaverBareUserEstimator.estimate(
                 measuredToolOutputSaved: measured,
                 tokenSaverEnabled: settings.tokenSaverEnabled,
@@ -4100,6 +4109,11 @@ public final class AppContext {
                     medianExplorationTokens: medianExploration
                 )
             )
+            // Fold thread cache amort into total (estimate path has turnCount=0 here).
+            let totalCredible = TokenSaverBareUserEstimator.saturatingAdd(
+                breakdown.totalCredible,
+                threadCacheAmort
+            )
             let iso = ISO8601DateFormatter().string(from: now)
             _ = try tokenSaverDailyEconomyRepo.upsert(
                 TokenSaverDailyEconomyRecord(
@@ -4108,12 +4122,15 @@ public final class AppContext {
                     dialectTokens: breakdown.estimatedDialect,
                     graphifyTokens: breakdown.estimatedGraphify,
                     orchestrationTokens: breakdown.estimatedOrchestration,
-                    totalCredible: breakdown.totalCredible,
+                    totalCredible: totalCredible,
                     windowUsageTokens: windowUsage,
                     formulaVersion: TokenSaverDailyEconomyRepository.formulaVersion,
                     appliedOutputShare: breakdown.appliedOutputShare,
                     graphifySignalCount: signalCount,
                     updatedAt: iso,
+                    dialectRawTokens: breakdown.dialectRawTokens,
+                    graphifyRawTokens: breakdown.graphifyRawTokens,
+                    capBinding: breakdown.capBinding.rawValue,
                     // Persistence stores 0 when billed is unknown (field is non-optional).
                     // WHY: same fail-closed rule — do not write raw tokens as billed.
                     windowUsageBilledUnits: windowBilled ?? 0

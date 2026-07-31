@@ -62,9 +62,9 @@ public struct TokenSaverDailyEconomyRecord: Sendable, Equatable {
 /// Persists per-day credible totals so Week = Σ(day.total_credible).
 /// Does **not** backfill historical days; only upserts days that are recomputed going forward.
 public final class TokenSaverDailyEconomyRepository: @unchecked Sendable {
-    /// v4: monotone caps + billed denominator + displacement bound + raw/cap evidence columns.
-    /// WHY: label mixed v3/v4 rows so they are never silently compared.
-    public static let formulaVersion = "credible_v4"
+    /// v5: v4 + multi-turn cache amortization from active threads (thread footer stack).
+    /// WHY: label mixed rows so they are never silently compared across formula revs.
+    public static let formulaVersion = "credible_v5"
 
     private let db: SQLiteDB
     private let calendar: Calendar

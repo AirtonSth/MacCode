@@ -378,6 +378,35 @@ public enum TokenSaverBareUserEstimator {
         return clampedInt(from: Double(m) * orchestrationShareOfMeasured)
     }
 
+    /// Sum multi-turn cache impact across threads active in a day/week window.
+    /// Uses permanent thread `savedTokens` × activity (`runs` as turn proxy) so the
+    /// sidebar card matches the thread footer stack (Image 1 → Image 2).
+    public static func sumThreadCacheAmortization(
+        savedTokens: Int,
+        runs: Int
+    ) -> Int {
+        // runs is compress-event count; treat as turn proxy (at least 1 when savings exist).
+        let turnProxy = max(runs, savedTokens > 0 ? 1 : 0)
+        return estimateCacheAmortizationTokens(
+            measured: savedTokens,
+            turnCount: turnProxy,
+            cacheReadInputTokens: 0
+        )
+    }
+
+    public static func sumThreadCacheAmortization(
+        inputs: [(savedTokens: Int, runs: Int)]
+    ) -> Int {
+        var total = 0
+        for row in inputs {
+            total = saturatingAdd(total, sumThreadCacheAmortization(
+                savedTokens: row.savedTokens,
+                runs: row.runs
+            ))
+        }
+        return total
+    }
+
     // MARK: - Window helpers (UI)
 
     /// Sum provider usage from `TokenSaverDayUsage` buckets for Today vs Week.
@@ -671,7 +700,7 @@ public enum TokenSaverBareUserEstimator {
     }
 
     /// Non-negative Int addition that saturates at `Int.max` instead of trapping.
-    static func saturatingAdd(_ values: Int...) -> Int {
+    public static func saturatingAdd(_ values: Int...) -> Int {
         var total = 0
         for value in values {
             let v = max(0, value)

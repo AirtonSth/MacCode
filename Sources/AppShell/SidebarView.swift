@@ -352,6 +352,9 @@ public final class SidebarViewModel: ObservableObject {
     /// Persisted daily credible totals (Week = Σ). Empty until first recompute.
     @Published public private(set) var tokenSaverDailyEconomyToday: TokenSaverDailyEconomyRecord?
     @Published public private(set) var tokenSaverDailyEconomyWeekTotal: Int = 0
+    /// Multi-turn cache amortization by provider for the current calendar day
+    /// (same stack as Agent App thread footers). Keyed by provider rawValue.
+    @Published public private(set) var tokenSaverProviderCacheAmortToday: [String: Int] = [:]
     @Published public private(set) var tokenSaverProjectGovernance: [TokenSaverProjectGovernance] = []
     @Published public private(set) var tokenSaverGovernanceNotice: String?
     @Published public var showsTokenSaverModelDownload = false
@@ -631,6 +634,7 @@ public final class SidebarViewModel: ObservableObject {
             tokenSaverSavingsSummary = .empty
             tokenSaverDailyEconomyToday = nil
             tokenSaverDailyEconomyWeekTotal = 0
+            tokenSaverProviderCacheAmortToday = [:]
             tokenSaverLocalUsageBaseline = nil
             tokenSaverLocalUsageUpdate = nil
             return
@@ -653,6 +657,7 @@ public final class SidebarViewModel: ObservableObject {
                 self.tokenSaverSavingsSummary = result.summary
                 self.tokenSaverDailyEconomyToday = result.economyToday
                 self.tokenSaverDailyEconomyWeekTotal = result.economyWeekTotal
+                self.tokenSaverProviderCacheAmortToday = result.providerCacheAmortToday
                 self.updateTokenSaverLocalUsage(
                     from: result.snapshot,
                     emitPositiveChange: trackLocalUsageChange
@@ -866,6 +871,7 @@ public final class SidebarViewModel: ObservableObject {
             tokenSaverSavingsSummary = .empty
             tokenSaverDailyEconomyToday = nil
             tokenSaverDailyEconomyWeekTotal = 0
+            tokenSaverProviderCacheAmortToday = [:]
             return
         }
         // Keep today's economy row fresh so Week = Σ dailies stays aligned.
@@ -879,6 +885,7 @@ public final class SidebarViewModel: ObservableObject {
         tokenSaverSavingsSummary = result.summary
         tokenSaverDailyEconomyToday = result.economyToday
         tokenSaverDailyEconomyWeekTotal = result.economyWeekTotal
+        tokenSaverProviderCacheAmortToday = result.providerCacheAmortToday
         updateTokenSaverLocalUsage(from: result.snapshot, emitPositiveChange: false)
     }
 
@@ -893,7 +900,8 @@ public final class SidebarViewModel: ObservableObject {
         snapshot: TokenSaverUsageSnapshot,
         summary: TokenSaverSavingsSummary,
         economyToday: TokenSaverDailyEconomyRecord?,
-        economyWeekTotal: Int
+        economyWeekTotal: Int,
+        providerCacheAmortToday: [String: Int]
     ) {
         await Task.detached {
             let snapshot = TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).load()
@@ -913,7 +921,23 @@ public final class SidebarViewModel: ObservableObject {
                 toDayStartMs: todayMs,
                 toDayEndMsExclusive: weekEndMs
             ).total) ?? 0
-            return (snapshot, summary, economyToday, weekTotal)
+            let dayEndMs = Int64(weekEndExclusive.timeIntervalSince1970 * 1000)
+            let amortInputs = (try? savingsRepo.threadCacheAmortizationInputs(
+                dayStartMs: todayMs,
+                dayEndMsExclusive: dayEndMs
+            )) ?? []
+            var byProvider: [String: Int] = [:]
+            for row in amortInputs {
+                let credit = TokenSaverBareUserEstimator.sumThreadCacheAmortization(
+                    savedTokens: row.savedTokens,
+                    runs: row.runs
+                )
+                byProvider[row.provider, default: 0] = TokenSaverBareUserEstimator.saturatingAdd(
+                    byProvider[row.provider] ?? 0,
+                    credit
+                )
+            }
+            return (snapshot, summary, economyToday, weekTotal, byProvider)
         }.value
     }
 
@@ -3199,6 +3223,15 @@ public struct SidebarRootView: View {
         }
     }
 
+    /// Measured + multi-turn cache amort for provider rows (Today uses live amort map;
+    /// Week falls back to measured-only until week amort is persisted per day).
+    private func tokenSaverScopedProviderEstimatedSave(_ provider: AgentProvider) -> Int {
+        let measured = tokenSaverScopedProviderSaved(provider)
+        guard tokenSaverDetailsScope == .currentSession else { return measured }
+        let amort = vm.tokenSaverProviderCacheAmortToday[provider.rawValue] ?? 0
+        return TokenSaverBareUserEstimator.saturatingAdd(measured, amort)
+    }
+
     /// Fixed green-ring goal for the selected scope (5M today / 35M week).
     private func tokenSaverSavingsGoalTokens(for scope: TokenSaverUsageScope) -> Int {
         Self.tokenSaverSavingsGoalTokens(isDailyScope: scope == .currentSession)
@@ -3330,11 +3363,10 @@ public struct SidebarRootView: View {
             // (PostToolUse / built-in path; selective tools still pass through).
             return "Compresses tool output automatically"
         case .codex:
-            // Codex: shared wrapper compresses tool stdout when Token Saver is on
-            // (same mechanism as Grok); savings recording/measurement not available yet.
-            return "Compresses tool output automatically — savings not yet trackable for this provider"
+            // Codex: PATH wrappers + | distill (no PostToolUse rewrite upstream).
+            return "Compresses tool output automatically"
         case .grok:
-            // Grok: shared wrapper compresses tool stdout when Token Saver is on.
+            // Grok: PATH wrappers + | distill (PostToolUse is passive upstream).
             return "Compresses tool output automatically"
         }
     }
@@ -3548,9 +3580,10 @@ public struct SidebarRootView: View {
     private func tokenSaverProviderRow(provider: AgentProvider) -> some View {
         let snapshot = tokenSaverDetailsSnapshot
         let usage = tokenSaverProviderUsage(provider, in: snapshot)
-        // WHY: details rows use measured/attributed ledger only — never the retired
-        // usage-fraction teaser — so they reconcile with the single primary figure.
-        let value = tokenSaverScopedProviderSaved(provider)
+        // WHY: rows use measured ledger + multi-turn cache amort (Today) so a
+        // thread footer (e.g. 7.0M) is reflected on the provider line, not only
+        // the headline.
+        let value = tokenSaverScopedProviderEstimatedSave(provider)
         let prefix = vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled
             ? "Estimated save "
             : "Estimated potential "

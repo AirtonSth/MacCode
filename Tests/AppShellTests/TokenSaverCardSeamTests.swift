@@ -1010,23 +1010,12 @@ final class TokenSaverCardSeamTests: XCTestCase {
         )
     }
 
-    func test_compressionCapabilityLine_codex_compressesButSavingsNotTrackable() {
-        // WHY: Codex gets real automatic tool-output compression (shared wrapper,
-        // same as Grok), but savings cannot yet be recorded/measured for this
-        // provider — the line must say compression is automatic and that
-        // savings aren't trackable, not that compression is unsupported.
-        let line = SidebarRootView.tokenSaverProviderCompressionCapabilityLine(for: .codex)
+    func test_compressionCapabilityLine_codex_isAutomatic() {
+        // WHY: Codex PATH wrappers + | distill record to the same ledger as Grok;
+        // copy must not claim savings are untrackable.
         XCTAssertEqual(
-            line,
-            "Compresses tool output automatically — savings not yet trackable for this provider"
-        )
-        XCTAssertTrue(
-            line.lowercased().contains("compresses tool output automatically"),
-            "Codex must claim automatic compression: \(line)"
-        )
-        XCTAssertTrue(
-            line.lowercased().contains("not yet trackable"),
-            "Codex must qualify that savings aren't trackable: \(line)"
+            SidebarRootView.tokenSaverProviderCompressionCapabilityLine(for: .codex),
+            "Compresses tool output automatically"
         )
     }
 
