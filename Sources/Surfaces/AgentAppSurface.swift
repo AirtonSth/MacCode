@@ -10072,8 +10072,8 @@ public struct AgentAppView: View {
     ///
     /// - Requires `measuredTokens > 0` so estimates only **raise** a proven ledger
     ///   figure — never invent a chip from assistant text alone.
-    /// - Product copy: full savings stack (tool-output + dialect + cache impact),
-    ///   not tool-output alone. Optional Auto note.
+    /// - Product copy: full stack in plain language (tool output, shorter answers,
+    ///   multi-turn cache). Optional Auto note for cheaper models.
     nonisolated static func tokenSaverThreadFooterText(
         displayTokens: Int,
         measuredTokens: Int,
@@ -10082,9 +10082,10 @@ public struct AgentAppView: View {
     ) -> String? {
         guard enabled, measuredTokens > 0, displayTokens > 0 else { return nil }
         let amount = formatTokenCountForFooter(displayTokens)
-        let base = "Token Saver: \(amount) tokens saved (tool-output + dialect + cache impact)"
+        // Keep the chip scannable: one number + short list of what is inside it.
+        let base = "Token Saver: \(amount) tokens saved (tool output, shorter answers, multi-turn cache)"
         if autoRoutingActive {
-            return base + " + Auto used cheaper models at the same quality"
+            return base + " · Auto picked cheaper models at the same quality"
         }
         return base
     }

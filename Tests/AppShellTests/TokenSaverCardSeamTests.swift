@@ -1001,31 +1001,26 @@ final class TokenSaverCardSeamTests: XCTestCase {
 
     // MARK: - Per-provider compression capability lines
 
-    func test_compressionCapabilityLine_claude_isAutomatic() {
-        // WHY: Claude has real automatic tool-output compression when Token Saver
-        // is on; the row must say so in plain language (static mapping today).
-        XCTAssertEqual(
-            SidebarRootView.tokenSaverProviderCompressionCapabilityLine(for: .claude),
-            "Compresses tool output automatically"
-        )
+    func test_compressionCapabilityLine_claude_namesHooksAndWrappers() {
+        // WHY: Claude is the only provider with PostToolUse rewrite; copy must
+        // say hooks so users understand why Claude can save more on native tools.
+        let line = SidebarRootView.tokenSaverProviderCompressionCapabilityLine(for: .claude)
+        XCTAssertTrue(line.lowercased().contains("hook"), line)
+        XCTAssertTrue(line.lowercased().contains("wrapper"), line)
     }
 
-    func test_compressionCapabilityLine_codex_isAutomatic() {
-        // WHY: Codex PATH wrappers + | distill record to the same ledger as Grok;
-        // copy must not claim savings are untrackable.
-        XCTAssertEqual(
-            SidebarRootView.tokenSaverProviderCompressionCapabilityLine(for: .codex),
-            "Compresses tool output automatically"
-        )
+    func test_compressionCapabilityLine_codex_namesWrappersAndDistill() {
+        // WHY: Codex has no updatedToolOutput; honest copy points at shell path.
+        let line = SidebarRootView.tokenSaverProviderCompressionCapabilityLine(for: .codex)
+        XCTAssertTrue(line.lowercased().contains("wrapper") || line.lowercased().contains("shell"), line)
+        XCTAssertTrue(line.lowercased().contains("distill"), line)
     }
 
-    func test_compressionCapabilityLine_grok_isAutomatic() {
-        // WHY: Grok uses the shared wrapper path for automatic tool-output
-        // compression when Token Saver is on (same plain copy as Claude).
-        XCTAssertEqual(
-            SidebarRootView.tokenSaverProviderCompressionCapabilityLine(for: .grok),
-            "Compresses tool output automatically"
-        )
+    func test_compressionCapabilityLine_grok_namesWrappersAndDistill() {
+        // WHY: Grok PostToolUse is passive; same shell path as Codex.
+        let line = SidebarRootView.tokenSaverProviderCompressionCapabilityLine(for: .grok)
+        XCTAssertTrue(line.lowercased().contains("wrapper") || line.lowercased().contains("shell"), line)
+        XCTAssertTrue(line.lowercased().contains("distill"), line)
     }
 
     // MARK: - helpers

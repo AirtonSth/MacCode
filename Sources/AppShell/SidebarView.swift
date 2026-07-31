@@ -3359,15 +3359,14 @@ public struct SidebarRootView: View {
     ) -> String {
         switch provider {
         case .claude:
-            // Claude: automatic tool-output compression when Token Saver is on
-            // (PostToolUse / built-in path; selective tools still pass through).
-            return "Compresses tool output automatically"
+            // Claude: PostToolUse rewrite + PATH wrappers + | distill.
+            return "Compresses tool output via hooks and shell wrappers"
         case .codex:
-            // Codex: PATH wrappers + | distill (no PostToolUse rewrite upstream).
-            return "Compresses tool output automatically"
+            // Codex: no upstream updatedToolOutput; PATH wrappers + | distill only.
+            return "Compresses shell tool output via wrappers and | distill"
         case .grok:
-            // Grok: PATH wrappers + | distill (PostToolUse is passive upstream).
-            return "Compresses tool output automatically"
+            // Grok: PostToolUse is passive; PATH wrappers + | distill only.
+            return "Compresses shell tool output via wrappers and | distill"
         }
     }
 
@@ -3753,9 +3752,16 @@ public struct SidebarRootView: View {
         return "Estimate ready"
     }
 
-    /// WHY: honest measured-vs-estimated wording instead of undermining the card.
+    /// WHY: plain-language inventory of every leg in the number, without selling
+    /// Anthropic list price or inventing dollar savings. Keep scannable in the popover.
     nonisolated public static let tokenSaverBillingEvidenceDisclaimer =
-        "Measured savings come from the local compression ledger. Dialect and Graphify legs are estimates under the same cap and are labelled as such — not billed savings. Billing claims require joined provider usage evidence."
+        "What this number includes: compressed tool output from the local Distill ledger "
+        + "(shell wrappers, | distill, and Claude hooks); shorter dialect answers; Graphify "
+        + "when the agent actually queries the graph; multi-turn savings from re-reading "
+        + "smaller tool results; and Auto when it picks a cheaper model at the same quality. "
+        + "Nested agent work credits the parent thread. Exact-output tools (rg, sed, jq, full "
+        + "patches) stay full on purpose and are not counted. Compressions that fail delivery "
+        + "are not counted either. This is not your provider bill or Anthropic cache pricing."
 
     // Internal alias exposed for the pure seam above. Mirrors `formatTokenCount`
     // which is private; keeping it nonisolated and public lets tests call it.

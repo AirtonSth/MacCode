@@ -33,7 +33,7 @@ final class TokenSaverThreadFooterTests: XCTestCase {
     }
 
     func test_footerText_includesFullStackCopyNotToolOutputOnly() {
-        // WHY: product now surfaces dialect + cache impact, not tool-output alone.
+        // WHY: chip lists every leg the user can understand without jargon soup.
         let text = AgentAppView.tokenSaverThreadFooterText(
             displayTokens: 100_000,
             measuredTokens: 100_000,
@@ -41,7 +41,7 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         )
         XCTAssertEqual(
             text,
-            "Token Saver: 100K tokens saved (tool-output + dialect + cache impact)"
+            "Token Saver: 100K tokens saved (tool output, shorter answers, multi-turn cache)"
         )
     }
 
@@ -53,12 +53,12 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         )
         XCTAssertEqual(
             text,
-            "Token Saver: 150K tokens saved (tool-output + dialect + cache impact)"
+            "Token Saver: 150K tokens saved (tool output, shorter answers, multi-turn cache)"
         )
     }
 
     func test_footerText_autoRouting_usesPlusAutoNote() {
-        // WHY: product-locked Auto note with same-quality cheaper models.
+        // WHY: Auto is a real savings leg; say cheaper models without sales fluff.
         let text = AgentAppView.tokenSaverThreadFooterText(
             displayTokens: 3_100,
             measuredTokens: 2_000,
@@ -67,7 +67,7 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         )
         XCTAssertEqual(
             text,
-            "Token Saver: 3.1K tokens saved (tool-output + dialect + cache impact) + Auto used cheaper models at the same quality"
+            "Token Saver: 3.1K tokens saved (tool output, shorter answers, multi-turn cache) · Auto picked cheaper models at the same quality"
         )
     }
 
@@ -80,7 +80,7 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         )
         XCTAssertEqual(
             text,
-            "Token Saver: 3.1K tokens saved (tool-output + dialect + cache impact) + Auto used cheaper models at the same quality"
+            "Token Saver: 3.1K tokens saved (tool output, shorter answers, multi-turn cache) · Auto picked cheaper models at the same quality"
         )
     }
 
@@ -98,23 +98,25 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         )
         XCTAssertEqual(
             first,
-            "Token Saver: 12.5K tokens saved (tool-output + dialect + cache impact)"
+            "Token Saver: 12.5K tokens saved (tool output, shorter answers, multi-turn cache)"
         )
         XCTAssertEqual(
             later,
-            "Token Saver: 410K tokens saved (tool-output + dialect + cache impact)"
+            "Token Saver: 410K tokens saved (tool output, shorter answers, multi-turn cache)"
         )
         XCTAssertNotEqual(first, later)
     }
 
     func test_footerText_doesNotClaimToolOutputOnly() {
-        // WHY: item 4 — chip must include dialect/cache legs, not deny them.
+        // WHY: chip must name answer + cache legs, not look like pure tool-output.
         let text = AgentAppView.tokenSaverThreadFooterText(
             displayTokens: 3_800,
             measuredTokens: 3_399,
             enabled: true
         )!
-        XCTAssertTrue(text.contains("tool-output + dialect + cache impact"))
+        XCTAssertTrue(text.contains("tool output"))
+        XCTAssertTrue(text.contains("shorter answers"))
+        XCTAssertTrue(text.contains("multi-turn cache"))
         XCTAssertFalse(text.contains("not total provider usage"))
         XCTAssertFalse(text.localizedCaseInsensitiveContains("you saved"))
     }

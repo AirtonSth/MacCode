@@ -491,17 +491,25 @@ final class TokenSaverUXGatingTests: XCTestCase {
     }
 
     func test_tokenSaverBillingEvidenceDisclaimerIsExplicit() {
-        // WHY: footer must distinguish measured ledger vs estimated legs without
-        // undermining the whole card.
-        let disclosure = SidebarRootView.tokenSaverBillingEvidenceDisclaimer
-        XCTAssertTrue(disclosure.lowercased().contains("provider usage")
-                      || disclosure.lowercased().contains("provider usage evidence"))
-        XCTAssertTrue(disclosure.lowercased().contains("not billed savings")
-                      || disclosure.lowercased().contains("not billed"))
-        XCTAssertTrue(disclosure.lowercased().contains("measured"),
-                      "Disclaimer must state what is measured: \(disclosure)")
-        XCTAssertTrue(disclosure.lowercased().contains("estimate"),
-                      "Disclaimer must label estimates: \(disclosure)")
+        // WHY: popover must list every savings leg in plain language and still
+        // refuse to claim provider list-price dollars.
+        let disclosure = SidebarRootView.tokenSaverBillingEvidenceDisclaimer.lowercased()
+        XCTAssertTrue(disclosure.contains("tool output") || disclosure.contains("distill"),
+                      "Must mention measured tool-output path: \(disclosure)")
+        XCTAssertTrue(disclosure.contains("dialect") || disclosure.contains("shorter"),
+                      "Must mention dialect / shorter answers: \(disclosure)")
+        XCTAssertTrue(disclosure.contains("graphify"),
+                      "Must mention Graphify: \(disclosure)")
+        XCTAssertTrue(disclosure.contains("multi-turn") || disclosure.contains("re-reading"),
+                      "Must mention multi-turn cache impact: \(disclosure)")
+        XCTAssertTrue(disclosure.contains("auto"),
+                      "Must mention Auto routing: \(disclosure)")
+        XCTAssertTrue(disclosure.contains("parent thread") || disclosure.contains("nested"),
+                      "Must mention nested → parent attribution: \(disclosure)")
+        XCTAssertTrue(disclosure.contains("rg") || disclosure.contains("exact-output") || disclosure.contains("exact"),
+                      "Must say exact-output tools are skipped: \(disclosure)")
+        XCTAssertTrue(disclosure.contains("not") && (disclosure.contains("bill") || disclosure.contains("pricing")),
+                      "Must refuse provider bill claims: \(disclosure)")
     }
 
     func test_tokenSaverCardHeadline_blockedButDisabled_returnsEnableCopy() {
