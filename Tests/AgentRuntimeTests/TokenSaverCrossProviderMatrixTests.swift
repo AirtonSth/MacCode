@@ -271,8 +271,9 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
         XCTAssertEqual(args, ["--print", "--model", "opus", "-p", "hi"])
     }
 
-    func test_providerProxyArguments_nestedClaudeRespectsExistingSettings() {
-        // WHY: never clobber an explicit caller --settings payload.
+    func test_providerProxyArguments_nestedClaudeMergesPostToolUseIntoInlineSettings() throws {
+        // WHY: nested CLIs that already pass inline --settings must still get
+        // PostToolUse hooks (prior skip left zero model-mode savings on advisors).
         let env = TokenSaverExecutionReceiptSeam.environment(from: admit(.claude))
         let original = ["--print", "--settings", "{\"custom\":true}", "-p", "hi"]
         let args = AgentSkillInstaller.providerProxyArguments(
@@ -281,7 +282,40 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
             environment: env
         )
         XCTAssertEqual(args.filter { $0 == "--settings" }.count, 1)
-        XCTAssertTrue(args.contains("{\"custom\":true}"))
+        guard let idx = args.firstIndex(of: "--settings"),
+              idx + 1 < args.count,
+              let data = args[idx + 1].data(using: .utf8),
+              let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return XCTFail("merged --settings JSON missing")
+        }
+        XCTAssertEqual(obj["custom"] as? Bool, true, "caller keys must survive merge")
+        let hooks = try XCTUnwrap(obj["hooks"] as? [String: Any])
+        XCTAssertNotNil(hooks["PostToolUse"], "PostToolUse must be merged in")
+    }
+
+    func test_tokenSaverDialect_forcesShellAndGraphifyCoverageForAllProviders() {
+        // WHY: Grok/Codex native tools cannot rewrite; dialect must force
+        // Graphify + shell+|distill coverage for Claude/Codex/Grok alike.
+        for provider in providers {
+            var env = TokenSaverExecutionReceiptSeam.environment(from: admit(provider))
+            let distillPrompt = AgentSkillInstaller.tokenSaverProviderPrompt("base", environment: env)
+            XCTAssertTrue(
+                distillPrompt.contains("| distill") || distillPrompt.contains("default-pipe"),
+                "\(provider) must require shell | distill"
+            )
+            XCTAssertTrue(
+                distillPrompt.contains("read_file") || distillPrompt.contains("native")
+                    || distillPrompt.contains("Coverage first"),
+                "\(provider) must constrain native multi-file reads"
+            )
+            env["RC_GRAPHIFY_ENABLED"] = "1"
+            env["RC_GRAPHIFY_GRAPH_JSON"] = "/tmp/graph.json"
+            let withGraphify = AgentSkillInstaller.tokenSaverProviderPrompt("base", environment: env)
+            XCTAssertTrue(
+                withGraphify.contains("graphify query") || withGraphify.contains("Query-first"),
+                "\(provider) must inject Graphify query-first when RC_GRAPHIFY_ENABLED=1"
+            )
+        }
     }
 
     func test_providerProxyArguments_allProvidersGetDialectOnSupportedNestedTurns() {

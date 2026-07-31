@@ -128,11 +128,12 @@ public enum GraphifyStableSkillText {
 
     /// Compact mandatory rules — always the same text for prompt-cache friendliness.
     public static let agentInstructionsBody = """
-    CRITICAL (Graphify / codebase map — RemoteCode):
+    CRITICAL (Graphify / codebase map — RemoteCode — Claude / Codex / Grok):
     - Canonical graph path is ONLY `$RC_GRAPHIFY_GRAPH_JSON` (and `$RC_GRAPHIFY_ARTIFACT_ROOT`). Host stores graphs under Application Support by default — NOT `./graphify-out/` in the repo. Missing `graphify-out/` in the working tree does NOT mean there is no graph.
     - To check if a graph exists: `test -f "$RC_GRAPHIFY_GRAPH_JSON" && echo yes` (or `ls "$RC_GRAPHIFY_GRAPH_JSON"`). Never answer "no graph" from a failed look at repo `graphify-out/`.
-    - Before broad greps/globs/multi-file reads for architecture, ownership, or "where is X", run: `graphify query "<question>" --graph "$RC_GRAPHIFY_GRAPH_JSON"` when that env var is set.
+    - **Query-first (mandatory when `$RC_GRAPHIFY_GRAPH_JSON` is set):** before broad greps/globs/multi-file `read_file`/`grep`/`list_dir`/native file walks for architecture, ownership, or "where is X", run: `graphify query "<question>" --graph "$RC_GRAPHIFY_GRAPH_JSON"`. Prefer this over flooding the context with raw files.
     - Use `graphify path "A" "B" --graph "$RC_GRAPHIFY_GRAPH_JSON"` and `graphify explain "Symbol" --graph "$RC_GRAPHIFY_GRAPH_JSON"` instead of reading whole modules.
+    - After a useful graph answer, open **only** the specific files/symbols it points to (small native reads). Do not re-walk the tree with native tools after a successful query.
     - If `$RC_GRAPHIFY_GRAPH_JSON` is unset: check `$RC_GRAPHIFY_ARTIFACT_ROOT/graph.json`, then fail open (normal tools). Never invent or require a repo-local `graphify-out/`.
     - If multiple roots are listed in `$RC_GRAPHIFY_ROOTS`, pick the root that matches the question; query each only if needed (still via `$RC_GRAPHIFY_GRAPH_JSON` when present).
     - If `$RC_GRAPHIFY_AMBIGUOUS=1`, `$RC_GRAPHIFY_STALE=1`, or binary/graph is unavailable, fail open and use normal tools (state that briefly). Prefer graph query again on the next turn after the host refreshes.

@@ -241,11 +241,15 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     - Do not output a rewritten/compressed version of the latest user prompt unless the user explicitly asks to compress text.
     - Emit `Dict:` early only when aliases reduce repetition (never secrets/people/paths/URLs as aliases).
 
-    Command-output policy (Token Saver — default-pipe; only exact-output / GUI / skill are exempt):
-    - **Native Grok/Codex tools** (`read_file`, `grep`, `search_replace`, `list_dir`, …) are **not** PATH-wrappable and provider PostToolUse cannot rewrite their output (Grok hooks are passive; Codex has no `updatedToolOutput`). For large corpus work: prefer Graphify query when active, or `run_terminal_command` / shell with `| distill` / wrapped catalog tools. Use native `read_file`/`grep` only for small targeted slices you need byte-exactly.
-    - MANDATORY default: for **every** non-GUI shell command that is pipable and whose full stdout you do **not** need byte-exactly next, end with `| distill "<question>"` (use `pipefail` when exit status matters). Rule of thumb: if you will only use a summary / pass-fail / key lines, you MUST pipe.
+    Command-output / exploration policy (Token Saver — Claude + Codex + Grok, primary + nested + subagents):
+    - **Coverage first (mandatory for large surveys):** do **not** flood context with native multi-file `read_file` / `grep` / `list_dir` / tree walks. Order:
+      1) When `$RC_GRAPHIFY_ENABLED=1` and `$RC_GRAPHIFY_GRAPH_JSON` is set → `graphify query|path|explain` first.
+      2) Else / after graph → shell via `run_terminal_command` / Bash using PATH-wrapped tools (`git`, `bun`, `npm`, `find`, `ls`, tests, builds, …) and/or end with `| distill "<question>"`.
+      3) Native file tools only for **small, targeted** slices you need byte-exactly (one file, known path, short range).
+    - **Why:** Grok/Codex cannot rewrite native tool output (passive/no `updatedToolOutput`). Claude PostToolUse may compress some tools, but shell wrappers + `| distill` maximize measured savings on all three providers. Prefer shell+compress for noisy builds/tests/logs.
+    - MANDATORY default-pipe: for **every** non-GUI pipable shell command whose full stdout you do **not** need byte-exactly next, end with `| distill "<question>"` (`pipefail` when exit status matters). If you only need summary / pass-fail / key lines, you MUST pipe.
       Applies to: build, test, lint, install, docker, kubectl, terraform, find, ls, git log/status/diff summaries, package managers, python/bun one-shots, compound scripts, CI/logs, and **any other ordinary command** not listed under NEVER below.
-      Host PATH wrappers may also auto-compress some catalog commands; still pipe `| distill` yourself so extraction is explicit and nothing eligible is left raw.
+      Host PATH wrappers may also auto-compress catalog commands; still pipe `| distill` yourself so extraction is explicit.
     - NEVER pipe `| distill` only when you need the **exact** full stdout (or the tool is not a normal shell pipe target):
       search/match: rg, grep, egrep, fgrep, ag, ugrep, git grep
       line/stream edit or dump: sed, awk, cat, head, tail, nl, cut, tr, paste
@@ -261,6 +265,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     - Wait for `distill` before continuing when you did pipe it.
 
     Examples:
+    - `graphify query "where is mark-as-completed?" --graph "$RC_GRAPHIFY_GRAPH_JSON"`  # when Graphify active
     - `bun test 2>&1 | distill "Did tests pass? Return PASS or FAIL, followed by failing test names if any."`
     - `git log --oneline -50 | distill "Summarize recent commits by theme."`
     - `python3 script.py 2>&1 | distill "What failed? Key errors only."`
@@ -279,7 +284,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     Prefixes when used: S=state, C=context, D=action, R=risk, O=outcome, N=no-go, P=proof.
     Dict/`#` vars only when they reduce repetition. Never alias secrets, people, IDs, paths, URLs.
     Do not return a rewritten/compressed copy of the user's prompt unless explicitly asked to compress text.
-    Token Saver — MANDATORY default-pipe on primary agents, same-provider subagents, and cross-provider nested runs (Claude/Codex/Grok). For **every** non-GUI pipable shell command whose full stdout you do **not** need byte-exactly next, end with `| distill "<question>"` (`pipefail` when exit status matters). If you only need summary/pass-fail/key lines, you MUST pipe. Host wrappers may also auto-compress; still pipe yourself for an explicit extraction question.
+    Token Saver — Claude/Codex/Grok (primary, nested, subagents): large surveys → Graphify query-first when `$RC_GRAPHIFY_GRAPH_JSON` is set, else shell + PATH wrappers / `| distill`. Avoid flooding native multi-file read_file/grep (Grok/Codex cannot rewrite those; Claude PostToolUse helps but shell coverage is higher). Native reads only for small exact slices.
+    MANDATORY default-pipe: for **every** non-GUI pipable shell command whose full stdout you do **not** need byte-exactly next, end with `| distill "<question>"` (`pipefail` when exit status matters). If you only need summary/pass-fail/key lines, you MUST pipe. Host wrappers may also auto-compress; still pipe yourself for an explicit extraction question.
     NEVER pipe `| distill` only for exact-output (agent needs full stdout): rg, grep, egrep, fgrep, sed, awk, cat, head, tail, nl, cut, tr, diff, jq, yq, git grep/show/cat-file/blame; also patches/hashes/tokens, GUI/interactive/TUI, non-pipable, or service unavailable — state the skip briefly.
     Omitting `| distill` on a non-exact, non-GUI shell command is a policy violation.
     NEVER Distill skill content: Skill tool output and requested/returned SKILL bodies must stay complete/verbatim (no summary, `[[rc:]]` handle, truncation, or savings accounting).
@@ -430,18 +436,44 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         guard isSupportedProviderTurn(provider: .claude, arguments: arguments) else {
             return arguments
         }
-        // Respect an explicit caller settings payload (merge would risk
-        // overriding user/provider JSON we do not own).
-        if arguments.contains("--settings") {
-            return arguments
-        }
         // Reuse the Agent App settings builder so proxy and ClaudeRunner never
         // drift on hook command, matcher, or timeout.
         let settingsArgs = ClaudeRunner.ultracodeSettingsArgs(
             nil,
             environment: environment
         )
-        guard settingsArgs.count == 2, settingsArgs[0] == "--settings" else {
+        guard settingsArgs.count == 2, settingsArgs[0] == "--settings",
+              let ptuJSON = settingsArgs[1].data(using: .utf8),
+              let ptuObject = try? JSONSerialization.jsonObject(with: ptuJSON) as? [String: Any],
+              let ptuHooks = ptuObject["hooks"] as? [String: Any] else {
+            return arguments
+        }
+        // Merge into an existing inline JSON --settings when present (nested CLIs
+        // sometimes already pass --settings). File-path --settings stays untouched.
+        if let settingsIndex = arguments.firstIndex(of: "--settings"),
+           settingsIndex + 1 < arguments.count {
+            let existing = arguments[settingsIndex + 1]
+            if existing.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{"),
+               let existingData = existing.data(using: .utf8),
+               var existingObject = try? JSONSerialization.jsonObject(with: existingData) as? [String: Any] {
+                var hooks = existingObject["hooks"] as? [String: Any] ?? [:]
+                if hooks["PostToolUse"] == nil {
+                    hooks["PostToolUse"] = ptuHooks["PostToolUse"]
+                    existingObject["hooks"] = hooks
+                    if let merged = try? JSONSerialization.data(
+                        withJSONObject: existingObject,
+                        options: [.sortedKeys]
+                    ),
+                       let mergedJSON = String(data: merged, encoding: .utf8) {
+                        var out = arguments
+                        out[settingsIndex + 1] = mergedJSON
+                        return out
+                    }
+                }
+                // Already has PostToolUse — leave intact.
+                return arguments
+            }
+            // Path-form --settings: cannot safely merge; leave intact (fail open).
             return arguments
         }
         return settingsArgs + arguments

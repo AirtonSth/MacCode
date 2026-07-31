@@ -360,7 +360,7 @@ final class ClaudeRunnerArgsTests: XCTestCase {
     }
 
     /// (b) Flag present + non-ultracode → exactly one --settings JSON with the
-    /// PostToolUse command hook (resolved managed distill path + timeout 10).
+    /// PostToolUse command hook (resolved managed distill path + timeout 45).
     func test_postToolUseFlagPresent_nonUltracodeRegistersSingleSettingsHook() throws {
         let args = ClaudeRunner.buildStreamingArgs(postToolUseReq(effort: .high, postToolUse: true))
         XCTAssertEqual(settingsFlagCount(args), 1,
@@ -382,10 +382,10 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         XCTAssertEqual(commandHooks[0]["type"] as? String, "command")
         XCTAssertEqual(commandHooks[0]["command"] as? String, expectedDistillHookCommand(),
                        "hook command must be managed distill path + hook post-tool-use args")
-        // JSONSerialization may box Int as NSNumber; accept numeric 10.
+        // JSONSerialization may box Int as NSNumber; accept numeric 45.
         let timeout = commandHooks[0]["timeout"] as? NSNumber
-        XCTAssertEqual(timeout?.intValue, 10,
-                       "PostToolUse command hook timeout must be 10 seconds")
+        XCTAssertEqual(timeout?.intValue, 45,
+                       "PostToolUse command hook timeout must be 45 seconds for nested large tools")
     }
 
     /// (c) Flag present AND engine .ultracode → exactly one --settings containing
@@ -404,7 +404,7 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         let postToolUse = try XCTUnwrap(hooks["PostToolUse"] as? [[String: Any]])
         let commandHooks = try XCTUnwrap(postToolUse[0]["hooks"] as? [[String: Any]])
         XCTAssertEqual(commandHooks[0]["command"] as? String, expectedDistillHookCommand())
-        XCTAssertEqual((commandHooks[0]["timeout"] as? NSNumber)?.intValue, 10)
+        XCTAssertEqual((commandHooks[0]["timeout"] as? NSNumber)?.intValue, 45)
 
         // SDK bridge takes .last of ultracodeSettingsArgs — still the JSON string.
         let settingsArgs = ClaudeRunner.ultracodeSettingsArgs(

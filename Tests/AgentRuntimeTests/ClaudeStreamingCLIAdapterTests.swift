@@ -1819,8 +1819,8 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         // small"); it must remain AND so output compresses when EITHER threshold trips.
         XCTAssertTrue(source.contains("<= TOKEN_SAVER_MIN_BYTES && lineCount(output) <= TOKEN_SAVER_MIN_LINES"),
                       "skip guard must stay AND so a >1KB OR >10-line output is compressed")
-        XCTAssertTrue(source.contains("TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['read', 'edit', 'write', 'multiedit', 'notebookedit', 'grep', 'skill'])"),
-                      "exact-byte file tools, Grep, and Skill are exempt (skill content must stay complete)")
+        XCTAssertTrue(source.contains("TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['edit', 'write', 'multiedit', 'notebookedit', 'skill'])"),
+                      "edit/write/skill stay exempt; Read/Grep compress for Token Saver coverage")
         XCTAssertTrue(source.contains("skill_content"),
                       "Skill exclusion must use a dedicated skip reason so PostToolUse never compresses skill bodies")
         XCTAssertTrue(source.contains("TOKEN_SAVER_EXACT_OUTPUT_BASH"),
