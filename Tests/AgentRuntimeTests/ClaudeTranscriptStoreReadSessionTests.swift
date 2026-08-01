@@ -197,4 +197,57 @@ final class ClaudeTranscriptStoreReadSessionTests: XCTestCase {
         XCTAssertTrue(events.isEmpty,
                       "readSession must return empty when no transcript file exists for the providerThreadId")
     }
+
+    // MARK: - concurrent path-cache access (crash regression)
+
+    /// WHY: ClaudeTranscriptStore is shared by ClaudeStreamingCLIAdapter
+    /// (seedTranscriptOutsideLock) and AgentRunCoordinator.readThread without
+    /// an external adapter lock around pathIndex. Concurrent dictionary
+    /// mutation corrupted storage and crashed production with
+    /// NSInvalidArgumentException: -[__NSTaggedDate count] inside setPath.
+    /// This hammers concurrent cold+warm resolution on one shared store so
+    /// unsynchronized pathIndex access fails under load.
+    func test_readSession_concurrentPathResolution_doesNotCorruptCache() throws {
+        let base = try makeTempDir()
+        defer { try? fm.removeItem(at: base) }
+
+        let configRoot = base.appendingPathComponent("config/projects", isDirectory: true)
+        let threadIds = (0..<16).map { "thread-concurrent-\($0)" }
+        for id in threadIds {
+            _ = try writeTranscript(projectsRoot: configRoot, threadId: id, messageCount: 2)
+        }
+
+        let store = ClaudeTranscriptStore(fileManager: fm)
+        let env: [String: String] = [
+            "CLAUDE_CONFIG_DIR": base.appendingPathComponent("config").path
+        ]
+
+        let iterationsPerThread = 40
+        let totalIterations = threadIds.count * iterationsPerThread
+        let lock = NSLock()
+        var emptyResults = 0
+        var unexpectedBodies = 0
+
+        DispatchQueue.concurrentPerform(iterations: totalIterations) { index in
+            let threadId = threadIds[index % threadIds.count]
+            let events = store.readSession(providerThreadId: threadId, environment: env)
+            let bodies = events.compactMap { event -> String? in
+                if case .itemDelta(_, let body, _, _) = event { return body }
+                return nil
+            }
+            lock.lock()
+            if events.isEmpty {
+                emptyResults += 1
+            }
+            if !bodies.contains("response 0") || !bodies.contains("response 1") {
+                unexpectedBodies += 1
+            }
+            lock.unlock()
+        }
+
+        XCTAssertEqual(emptyResults, 0,
+                       "concurrent readSession must still resolve every seeded transcript path")
+        XCTAssertEqual(unexpectedBodies, 0,
+                       "concurrent path-cache access must not return wrong or partial transcript content")
+    }
 }

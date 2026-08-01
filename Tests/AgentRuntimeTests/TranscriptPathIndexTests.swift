@@ -4,6 +4,10 @@ import XCTest
 /// Tests for TranscriptPathIndex — the pure in-memory cache that maps
 /// providerThreadId -> transcript file URL so ClaudeTranscriptStore avoids
 /// re-enumerating ~/.claude/projects on every readSession call.
+///
+/// Concurrency of the shared store's path cache is covered by
+/// ClaudeTranscriptStoreReadSessionTests.test_readSession_concurrentPathResolution_doesNotCorruptCache
+/// (the index itself is intentionally not thread-safe).
 final class TranscriptPathIndexTests: XCTestCase {
 
     // MARK: - set then get returns the stored path

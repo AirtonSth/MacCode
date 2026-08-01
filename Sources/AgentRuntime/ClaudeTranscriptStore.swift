@@ -2,8 +2,9 @@ import Foundation
 import CoreModel
 
 /// Pure in-memory cache: providerThreadId -> transcript file URL.
-/// Thread-safety is the caller's responsibility (ClaudeTranscriptStore is
-/// @unchecked Sendable and guards access itself).
+/// Not thread-safe by itself. ClaudeTranscriptStore serializes all access
+/// through `pathIndexLock` so a shared store can serve concurrent readSession
+/// calls without racing the underlying dictionary.
 public struct TranscriptPathIndex {
     private var storage: [String: URL] = [:]
 
@@ -26,6 +27,10 @@ public struct TranscriptPathIndex {
 public final class ClaudeTranscriptStore: @unchecked Sendable {
     private let fileManager: FileManager
     private let maxEvents: Int
+    /// Guards `pathIndex` only. Disk existence checks and project-tree
+    /// enumeration run outside this lock so concurrent recovery does not
+    /// serialize on filesystem I/O.
+    private let pathIndexLock = NSLock()
     private var pathIndex = TranscriptPathIndex()
 
     public init(fileManager: FileManager = .default, maxEvents: Int = 5_000) {
@@ -42,7 +47,11 @@ public final class ClaudeTranscriptStore: @unchecked Sendable {
     }
 
     private func transcriptFile(providerThreadId: String, environment: [String: String]) -> URL? {
-        if let cached = pathIndex.path(forProviderThreadId: providerThreadId) {
+        pathIndexLock.lock()
+        let cached = pathIndex.path(forProviderThreadId: providerThreadId)
+        pathIndexLock.unlock()
+
+        if let cached {
             if fileManager.fileExists(atPath: cached.path) {
                 return cached
             }
@@ -51,7 +60,9 @@ public final class ClaudeTranscriptStore: @unchecked Sendable {
         for projectsRoot in projectsRoots(environment: environment) {
             let direct = projectsRoot.appendingPathComponent(providerThreadId + ".jsonl")
             if fileManager.fileExists(atPath: direct.path) {
+                pathIndexLock.lock()
                 pathIndex.setPath(direct, forProviderThreadId: providerThreadId)
+                pathIndexLock.unlock()
                 return direct
             }
             guard let enumerator = fileManager.enumerator(
@@ -63,7 +74,9 @@ public final class ClaudeTranscriptStore: @unchecked Sendable {
             }
             for case let url as URL in enumerator {
                 guard url.lastPathComponent == providerThreadId + ".jsonl" else { continue }
+                pathIndexLock.lock()
                 pathIndex.setPath(url, forProviderThreadId: providerThreadId)
+                pathIndexLock.unlock()
                 return url
             }
         }
