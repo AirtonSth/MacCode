@@ -1976,17 +1976,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     /// P2: threads visible in the rail after applying the search query.
-    /// Empty query returns all threads (no filtering).
+    /// Empty query returns all non-subagent threads (nested workers stay off-rail).
     public var filteredThreads: [AgentThread] {
         AgentAppViewModel.filterThreads(threads, query: threadSearchQuery)
     }
 
-    /// Pure helper: returns threads whose title or model contains `query`,
-    /// case-insensitively. Empty query keeps all threads.
+    /// Pure helper: drops orchestrated nested-worker rows, then applies search.
+    /// Empty query keeps every non-subagent thread.
+    /// WHY: "Subagent · …" rows are AgentAppMiddleware nested workers; product
+    /// rule is Subagents-under-parent chrome, not first-class rail entries.
     nonisolated public static func filterThreads(_ threads: [AgentThread], query: String) -> [AgentThread] {
+        let rail = threads.filter { !AgentThreadTitle.isSubagentThreadTitle($0.title) }
         let q = query.trimmingCharacters(in: .whitespaces)
-        guard !q.isEmpty else { return threads }
-        return threads.filter {
+        guard !q.isEmpty else { return rail }
+        return rail.filter {
             $0.title.localizedCaseInsensitiveContains(q) ||
             $0.model.localizedCaseInsensitiveContains(q)
         }
@@ -7343,6 +7346,12 @@ public struct AgentAppView: View {
     // UX-MAC_AGENT-013: inline custom-model entry replaces the blocking NSAlert.
     @State private var showCustomModelField = false
     @State private var customModelDraft = ""
+    /// Composer Simple (attach/model/send) vs Power (full toolbar).
+    @AppStorage("agent.composer.chromeMode.v1") private var composerChromeModeRaw =
+        AgentComposerChromeMode.simple.rawValue
+    private var composerChromeMode: AgentComposerChromeMode {
+        AgentComposerChromeMode(rawValue: composerChromeModeRaw) ?? .simple
+    }
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
@@ -7577,7 +7586,10 @@ public struct AgentAppView: View {
             // TurnRenderBlock trees for 200+ settled tools on every body pass was
             // a main-thread tax during long live turns.
             let workCount = turnRenderBlockCount(settled)
-            let workBlocks = expandCompletedWork ? turnRenderBlocks(settled) : []
+            let workBlocks = AgentCompletedWorkPresentation.shouldBuildBlocks(
+                expandCompletedWork: expandCompletedWork,
+                workItemCount: workCount
+            ) ? turnRenderBlocks(settled) : []
             return TurnRenderInputs(
                 turnPlans: turnPlans,
                 visibleBlocks: turnRenderBlocks(activeVisible),
@@ -7594,7 +7606,10 @@ public struct AgentAppView: View {
         let visibleAssistant = turn.finished ? renderable.filter { finalIDs.contains($0.id) } : renderable
         let visibleBlocks = turnRenderBlocks(visibleAssistant)
         let workCount = turnRenderBlockCount(workItems)
-        let completedWorkBlocks = expandCompletedWork ? turnRenderBlocks(workItems) : []
+        let completedWorkBlocks = AgentCompletedWorkPresentation.shouldBuildBlocks(
+            expandCompletedWork: expandCompletedWork,
+            workItemCount: workCount
+        ) ? turnRenderBlocks(workItems) : []
         let shouldRenderFinal = turn.finalAssistantMessage != nil
             && shouldRenderFinalAssistantMessage(turn, persistedAssistantTexts: persistedAssistantTexts)
             // If every item was scoped out as pre-follow-up, don't re-paint the
@@ -8633,10 +8648,22 @@ public struct AgentAppView: View {
                     } else {
                         Color.clear.frame(width: 8, height: 8)
                     }
+                    Text(AgentThreadRailRowCopy.monogram(for: t.provider))
+                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .frame(width: 16, height: 16)
+                        .background(DS.Palette.surfaceRaised)
+                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                        .accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: 1) {
                         Text(AgentThreadTitle.display(t.title)).font(DS.Font.bodyDense.weight(t.hasUnread ? .semibold : .regular))
                             .foregroundColor(DS.Palette.text).lineLimit(1)
-                        Text("\(t.provider.rawValue) · \(t.model)")
+                        Text(AgentThreadRailRowCopy.subtitle(
+                            provider: t.provider,
+                            model: t.model,
+                            updatedAt: t.updatedAt,
+                            now: vm.currentTime()
+                        ))
                             .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary).lineLimit(1)
                     }
                     Spacer(minLength: 0)
@@ -8769,37 +8796,8 @@ public struct AgentAppView: View {
             timeline
             backgroundAwaitBanner
             pendingCallbackRows
-            if let message = vm.historyReplayNotice {
-                inlineInfoBanner(
-                    message,
-                    identifier: "agent.history.replay.notice",
-                    dismiss: { vm.dismissHistoryReplayNotice() }
-                )
-            }
-            if let message = Self.visibleStatusMessage(vm.statusMessage) {
-                inlineStatusBanner(
-                    message,
-                    identifier: "agent.status.message",
-                    dismiss: { vm.dismissStatusMessage() }
-                )
-            }
-            if let message = vm.providerThreadSnapshotStatusMessage {
-                inlineStatusBanner(
-                    message,
-                    identifier: "agent.provider.snapshot.stale",
-                    dismiss: { vm.dismissProviderThreadSnapshotStatusMessage() },
-                    retry: { vm.retryProviderThreadSnapshotRead() }
-                )
-            }
-            if let banner = Self.standaloneQueueStatusBanner(vm.queueStatusMessage, queuedCount: vm.queuedMessages.count) {
-                inlineStatusBanner(
-                    banner.message,
-                    identifier: "agent.queue.status",
-                    dismiss: { vm.dismissQueueStatusMessage() },
-                    offersCopy: banner.offersCopy,
-                    retry: banner.offersRetry ? { Task { await vm.send() } } : nil
-                )
-            }
+            // Unified system strip: severity-ordered, capped (replaces stacked banners).
+            systemStatusStrip
             queuedMessagesSection
             // F1: render the composer inside a scope that observes only the composer
             // text, so a keystroke re-renders the composer subtree and NOT this body
@@ -8853,6 +8851,8 @@ public struct AgentAppView: View {
                 .foregroundColor(DS.Palette.textTertiary)
                 .lineLimit(1).truncationMode(.middle)
             Spacer(minLength: 0)
+            // Unified working phase strip (replaces separate awaiting/shell/status pills).
+            workingPhaseStrip
             // Provider-neutral Subagents activity for the selected thread only
             // (admission receipts + coordinator). Compact badge + popover; does
             // not touch transcript/composer or aggregate sibling threads.
@@ -8867,16 +8867,6 @@ public struct AgentAppView: View {
                     orchestrateActive: vm.routingMode == .auto
                 )
             }
-            // CLAUDE-BG-LIFECYCLE: mirrors the Claude CLI's own "1 shell"
-            // status-line indicator, so background shells / async subagents are
-            // visible WHILE they run — not only after the turn ends via the
-            // awaiting pill beside it.
-            if vm.backgroundShellCount > 0 {
-                DSPill(Self.backgroundShellLabel(vm.backgroundShellCount), tone: .accent)
-                    .help("Claude is running background work; the turn is held open until it finishes")
-            }
-            DSPill(vm.isAwaitingBackgroundWork ? "awaiting" : vm.status.rawValue,
-                   tone: vm.isAwaitingBackgroundWork ? .warning : statusTone(vm.status))
             DSIconButton("list.bullet.rectangle", help: "Toggle plan") {
                 planSidebarIntent = vm.showPlanSidebar ? .forcedHidden : .forcedVisible
                 vm.showPlanSidebar.toggle()
@@ -10244,14 +10234,8 @@ public struct AgentAppView: View {
     }
 
     // IMP-MAC_AGENT-007: tappable starter prompts on an empty thread reduce
-    // blank-page friction and hint at what the agent can do.
-    private static let emptyConversationStarters: [(icon: String, title: String, prompt: String)] = [
-        ("magnifyingglass", "Explain this codebase", "Give me a high-level tour of this codebase: the main modules, how they fit together, and where to start reading."),
-        ("ant", "Find and fix a bug", "Find a bug in the current changes and fix it. Show me the diff and explain the root cause."),
-        ("checklist", "Plan a change", "I want to add a feature. Help me plan it step by step before writing any code."),
-        ("text.alignleft", "Write tests", "Add tests for the most recently changed files. Cover the edge cases.")
-    ]
-
+    // blank-page friction and hint at what the agent can do. Copy is shared with iOS
+    // via AgentEmptyConversationStarters for parity.
     private var emptyConversation: some View {
         VStack(spacing: DS.Space.lg) {
             Image(systemName: "sparkles")
@@ -10273,7 +10257,7 @@ public struct AgentAppView: View {
                     .multilineTextAlignment(.center)
             }
             VStack(spacing: DS.Space.sm) {
-                ForEach(Self.emptyConversationStarters, id: \.title) { starter in
+                ForEach(AgentEmptyConversationStarters.all) { starter in
                     Button {
                         vm.prompt = starter.prompt
                         vm.focusTick &+= 1
@@ -11519,15 +11503,29 @@ public struct AgentAppView: View {
 
     private var compactComposerToolbar: some View {
         HStack(spacing: DS.Space.sm) {
-            attachmentButton
-            // macOS user that will execute the agent (sudo -u). Distinct from
-            // provider-instance Source (CODEX_HOME / personal-vs-work CLI config).
-            runAsUserMenu
-            // Provider instance / CLI identity (not OS user).
-            sourceMenu
-            modelMenu
-            permissionMenu
-            executionMenu
+            if AgentComposerChromePresentation.shows(.attach, mode: composerChromeMode) {
+                attachmentButton
+            }
+            // Power-only: run-as, source, permission, execution.
+            if AgentComposerChromePresentation.shows(.runAsUser, mode: composerChromeMode) {
+                // macOS user that will execute the agent (sudo -u). Distinct from
+                // provider-instance Source (CODEX_HOME / personal-vs-work CLI config).
+                runAsUserMenu
+            }
+            if AgentComposerChromePresentation.shows(.source, mode: composerChromeMode) {
+                // Provider instance / CLI identity (not OS user).
+                sourceMenu
+            }
+            if AgentComposerChromePresentation.shows(.model, mode: composerChromeMode) {
+                modelMenu
+            }
+            if AgentComposerChromePresentation.shows(.permission, mode: composerChromeMode) {
+                permissionMenu
+            }
+            if AgentComposerChromePresentation.shows(.execution, mode: composerChromeMode) {
+                executionMenu
+            }
+            composerChromeModeToggle
             Spacer(minLength: DS.Space.xs)
             if vm.selectedThreadRunIsStartingOrRunning {
                 Image(systemName: "arrow.triangle.2.circlepath")
@@ -11543,7 +11541,184 @@ public struct AgentAppView: View {
                     .frame(width: DS.Border.hairline, height: 18)
                     .padding(.horizontal, DS.Space.xxs)
             }
-            sendStopButton
+            if AgentComposerChromePresentation.shows(.sendStop, mode: composerChromeMode) {
+                sendStopButton
+            }
+        }
+    }
+
+    private var composerChromeModeToggle: some View {
+        Button {
+            let current = composerChromeMode
+            composerChromeModeRaw = (current == .simple ? AgentComposerChromeMode.power : .simple).rawValue
+        } label: {
+            Image(systemName: composerChromeMode == .simple ? "chevron.up.circle" : "chevron.down.circle")
+                .font(.system(size: 12, weight: .medium))
+                .frame(width: 26, height: 26)
+        }
+        .buttonStyle(.plain)
+        .foregroundColor(DS.Palette.textSecondary)
+        .help(composerChromeMode == .simple
+              ? AgentComposerChromePresentation.toggleAccessibilityLabelSimple
+              : AgentComposerChromePresentation.toggleAccessibilityLabelPower)
+        .accessibilityLabel(composerChromeMode == .simple
+            ? AgentComposerChromePresentation.toggleAccessibilityLabelSimple
+            : AgentComposerChromePresentation.toggleAccessibilityLabelPower)
+        .accessibilityIdentifier("agent.composer.chromeMode")
+        .accessibilityValue(composerChromeMode.rawValue)
+    }
+
+    // MARK: System status strip + working phase strip
+
+    @ViewBuilder
+    private var systemStatusStrip: some View {
+        let queueStandalone = Self.standaloneQueueStatusMessage(
+            vm.queueStatusMessage,
+            queuedCount: vm.queuedMessages.count
+        )
+        let candidates = AgentSystemStripPresentation.items(
+            historyReplayNotice: vm.historyReplayNotice,
+            statusMessage: Self.visibleStatusMessage(vm.statusMessage),
+            providerSnapshotStatus: vm.providerThreadSnapshotStatusMessage,
+            standaloneQueueStatus: queueStandalone
+        )
+        let collapsed = AgentSystemStripPresentation.collapse(candidates)
+        if !collapsed.visible.isEmpty {
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                ForEach(collapsed.visible) { item in
+                    systemStripRow(item)
+                }
+                if collapsed.overflowCount > 0 {
+                    Text("+\(collapsed.overflowCount) more status")
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .padding(.horizontal, DS.Space.lg)
+                        .accessibilityIdentifier("agent.systemStrip.overflow")
+                }
+            }
+            .accessibilityIdentifier("agent.systemStrip")
+        }
+    }
+
+    private func systemStripRow(_ item: AgentSystemStripItem) -> some View {
+        let tone: Color = {
+            switch item.severity {
+            case .error: return DS.Palette.danger
+            case .warning: return DS.Palette.warning
+            case .info: return DS.Palette.textSecondary
+            }
+        }()
+        let icon: String = {
+            switch item.severity {
+            case .error: return "exclamationmark.triangle.fill"
+            case .warning: return "exclamationmark.circle.fill"
+            case .info: return "info.circle"
+            }
+        }()
+        return HStack(alignment: .center, spacing: DS.Space.sm) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(tone)
+                .frame(width: 14, height: 14, alignment: .center)
+            Text(item.message)
+                .font(DS.Font.caption)
+                .foregroundColor(item.severity == .info ? DS.Palette.textSecondary : DS.Palette.text)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if item.offersCopy {
+                Button("Copy") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(item.message, forType: .string)
+                }
+                .buttonStyle(.plain)
+                .font(DS.Font.caption)
+                .accessibilityIdentifier("\(item.id).copy")
+            }
+            if item.offersRetry {
+                Button("Retry") {
+                    switch item.id {
+                    case "agent.provider.snapshot.stale":
+                        vm.retryProviderThreadSnapshotRead()
+                    case "agent.queue.status":
+                        Task { await vm.send() }
+                    default:
+                        break
+                    }
+                }
+                .buttonStyle(.plain)
+                .font(DS.Font.caption)
+                .accessibilityIdentifier("\(item.id).retry")
+            }
+            if item.offersDismiss {
+                Button {
+                    switch item.id {
+                    case "agent.history.replay.notice":
+                        vm.dismissHistoryReplayNotice()
+                    case "agent.status.message":
+                        vm.dismissStatusMessage()
+                    case "agent.provider.snapshot.stale":
+                        vm.dismissProviderThreadSnapshotStatusMessage()
+                    case "agent.queue.status":
+                        vm.dismissQueueStatusMessage()
+                    default:
+                        break
+                    }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .frame(width: 16, height: 16, alignment: .center)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(DS.Palette.textTertiary)
+                .accessibilityLabel("Dismiss")
+                .accessibilityIdentifier("\(item.id).dismiss")
+            }
+        }
+        .padding(.horizontal, DS.Space.lg)
+        .padding(.vertical, DS.Space.sm)
+        .background(item.severity == .error
+            ? DS.Palette.danger.opacity(0.09)
+            : DS.Palette.surfaceRaised)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier(item.id)
+    }
+
+    @ViewBuilder
+    private var workingPhaseStrip: some View {
+        let runLive = vm.selectedThreadRunIsStartingOrRunning
+        let activeSubagents = vm.subagentActivity.activeCount
+        let phase = AgentWorkingStripPresentation.phase(
+            runIsLive: runLive,
+            isAwaitingBackground: vm.isAwaitingBackgroundWork,
+            backgroundShellCount: vm.backgroundShellCount,
+            activeSubagentCount: activeSubagents,
+            hasStreamingTools: vm.timeline.turns.contains { turn in
+                !turn.finished && turn.items.contains {
+                    $0.state == .streaming && AgentAppView.isGroupableTool($0.type)
+                }
+            }
+        )
+        let elapsed: Int? = {
+            guard runLive || vm.isAwaitingBackgroundWork else { return nil }
+            guard let start = vm.runStartedAt else { return nil }
+            return max(0, Int(vm.currentTime().timeIntervalSince(start)))
+        }()
+        if let label = AgentWorkingStripPresentation.label(phase: phase, elapsedSeconds: elapsed) {
+            let tone: DSPill.Tone = {
+                switch phase {
+                case .awaitingBackground: return .warning
+                case .subagents, .tools, .thinking: return .accent
+                case .idle: return .neutral
+                }
+            }()
+            DSPill(label, tone: tone)
+                .help(phase.accessibilityLabel)
+                .accessibilityIdentifier("agent.workingPhase")
+                .accessibilityLabel(phase.accessibilityLabel)
+        } else {
+            DSPill(vm.status.rawValue, tone: statusTone(vm.status))
+                .accessibilityIdentifier("agent.status.pill")
         }
     }
 
