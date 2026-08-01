@@ -378,6 +378,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// The UI holds only a bounded recent message page. Older durable messages
     /// remain in SQLite and are intentionally outside the hot screen-memory set.
     @Published public private(set) var messageHistoryIsPartial = false
+    /// True while an older-page keyset load is in flight (UI disable / spinner).
+    /// Derived from `loadingOlderGeneration != 0` for ownership-safe clears.
+    @Published public private(set) var isLoadingOlderMessages = false
+    /// Monotonic owner token for the active older-page load (0 = idle).
+    /// Stale Tasks must not clear a newer load's flag (SSHRemoteView pattern).
+    private var loadingOlderGeneration: UInt64 = 0
     /// After the user sends a follow-up (including a queued one), ignore
     /// `activePlanUpdated` events from the prior turn so the stale checklist
     /// cannot reappear under the new user bubble. Cleared when the next run
@@ -648,6 +654,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         checkpointRevertUndoExpiryTask = nil
         messageHistoryLoadTask?.cancel()
         messageHistoryLoadTask = nil
+        cancelOlderMessageLoad()
         if let tokenSaverFooterObserver {
             NotificationCenter.default.removeObserver(tokenSaverFooterObserver)
             self.tokenSaverFooterObserver = nil
@@ -1699,9 +1706,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     // MARK: Bounded message history
-    /// Hot transcript window for a 16 GB MacBook class machine (~0.6% of RAM).
-    nonisolated static let fullLoadBodyBudgetBytes = 96 * 1024 * 1024
-    nonisolated static let messageHistoryPageLimit = 2_000
+    /// Hot transcript body budget for the UI process. Durable history stays in
+    /// SQLite; only this many UTF-8 body bytes stay resident in `messages`.
+    /// (Was 96 MB — too large for huge threads; older rows load via keyset pages.)
+    nonisolated static let fullLoadBodyBudgetBytes = 16 * 1024 * 1024
+    /// Hot message page (newest first). Older durable rows remain outside the
+    /// hot UI window (`messageHistoryIsPartial`) and load on demand.
+    nonisolated static let messageHistoryPageLimit = 200
 
     private func loadAllMessages(_ id: AgentThreadID) {
         // SQLite access remains on the app's established DB actor, but the query is
@@ -1716,6 +1727,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             messages = []
             messageHistoryIsPartial = false
         }
+        // Invalidate any in-flight older-page load (thread switch or re-select).
+        // Bumping generation makes stale Task defers no-ops; UI flag clears now.
+        cancelOlderMessageLoad()
         let repository = messageRepo
         messageHistoryLoadTask = Task { @MainActor [weak self] in
             let loaded = await Self.loadMessagePageOffMain(repository: repository, threadId: id)
@@ -1814,16 +1828,101 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     nonisolated static func loadMessagePageOffMain(
         repository: AgentMessageRepository,
-        threadId: AgentThreadID
+        threadId: AgentThreadID,
+        before: AgentMessageCursor? = nil
     ) async -> AgentMessageBodyBudgetResult? {
         await Task.detached(priority: .userInitiated) {
             try? repository.listPageWithinBodyBudget(
                 threadId: threadId,
                 limit: messageHistoryPageLimit,
+                before: before,
                 budget: fullLoadBodyBudgetBytes,
                 contentLimit: AssistantTimelineState.liveTextLimit
             )
         }.value
+    }
+
+    /// Pure merge: older page prepended before current hot rows (dedupe by id).
+    /// WHY: keyset `before` pages must expand the hot window without dropping
+    /// in-memory mirrors or reordering the newest suffix.
+    nonisolated static func mergeOlderMessagePage(
+        older: [AgentMessage],
+        current: [AgentMessage]
+    ) -> [AgentMessage] {
+        guard !older.isEmpty else { return current }
+        var seen = Set(current.map(\.id))
+        var prefix: [AgentMessage] = []
+        prefix.reserveCapacity(older.count)
+        for message in older where !seen.contains(message.id) {
+            seen.insert(message.id)
+            prefix.append(message)
+        }
+        return prefix + current
+    }
+
+    /// Invalidate ownership of any in-flight older-page load and clear UI flag.
+    private func cancelOlderMessageLoad() {
+        loadingOlderGeneration &+= 1
+        if isLoadingOlderMessages { isLoadingOlderMessages = false }
+    }
+
+    /// Load the next older keyset page into `messages` when history is partial.
+    /// Durable SQLite rows remain; this only expands the hot UI window.
+    ///
+    /// Ownership uses a generation token (not a bare bool): only the live load
+    /// may clear loading. A stale Task after thread switch / newer load is a no-op.
+    public func loadOlderMessages() {
+        guard !isDisposed, !isLoadingOlderMessages, messageHistoryIsPartial,
+              let threadId = selectedThreadId,
+              let oldest = messages.first else { return }
+        loadingOlderGeneration &+= 1
+        let myGeneration = loadingOlderGeneration
+        isLoadingOlderMessages = true
+        let repository = messageRepo
+        let cursor = AgentMessageCursor(createdAt: oldest.createdAt, id: oldest.id)
+        let expectedThread = threadId
+        Task { @MainActor [weak self] in
+            defer {
+                // Only the live owner clears. Stale gens leave a newer load alone.
+                if let self,
+                   Self.shouldClearLoadingOlderMessages(
+                    myGeneration: myGeneration,
+                    currentGeneration: self.loadingOlderGeneration
+                   ) {
+                    self.loadingOlderGeneration = 0
+                    self.isLoadingOlderMessages = false
+                }
+            }
+            let loaded = await Self.loadMessagePageOffMain(
+                repository: repository,
+                threadId: expectedThread,
+                before: cursor
+            )
+            guard let self, !self.isDisposed,
+                  self.selectedThreadId == expectedThread,
+                  Self.shouldClearLoadingOlderMessages(
+                    myGeneration: myGeneration,
+                    currentGeneration: self.loadingOlderGeneration
+                  ) else { return }
+            guard let loaded else { return }
+            self.messages = Self.mergeOlderMessagePage(
+                older: loaded.rows,
+                current: self.messages
+            )
+            self.messageHistoryIsPartial = loaded.hasMoreOlder
+            if !loaded.hasMoreOlder {
+                NSLog("[AgentApp] older message pages exhausted for thread \(expectedThread.value.uuidString)")
+            }
+        }
+    }
+
+    /// Pure ownership gate (SSHRemoteView `shouldClearLoading` pattern).
+    /// True only when this Task still owns the active older-page load.
+    nonisolated static func shouldClearLoadingOlderMessages(
+        myGeneration: UInt64,
+        currentGeneration: UInt64
+    ) -> Bool {
+        myGeneration == currentGeneration && myGeneration != 0
     }
 
     /// Safety valve for a pathological thread: keep the NEWEST bodies in full and blank
@@ -8057,10 +8156,16 @@ public struct AgentAppView: View {
             // the last structural change. Re-materialize the turn payloads from the
             // live timeline (shallow O(entries) map, no re-sort); messages are
             // append-only immutable rows, so their cached copies stay.
-            return Self.rematerializedTranscriptEntries(
+            //
+            // CRITICAL: write rematerialized entries BACK into the cache so a turn
+            // that completes mid-signature stays baseline-finished and
+            // shouldRematerializeTurn stops returning true on every later tick.
+            let refreshed = Self.rematerializedTranscriptEntries(
                 cached: transcriptCache.entries,
                 turns: vm.timeline.turns
             )
+            transcriptCache.entries = refreshed
+            return refreshed
         }
         let merged = Self.mergeTranscriptEntries(messages: vm.messages, turns: vm.timeline.turns)
         transcriptCache.signature = signature
@@ -8068,24 +8173,50 @@ public struct AgentAppView: View {
         return merged
     }
 
-    /// F1: rewrite the cached `.turn` entries with the CURRENT timeline snapshots
-    /// (matched by turnId) while preserving the cached order. The transcript cache
-    /// memoizes only the merge/sort, not the payloads: turn content mutates on every
-    /// streaming delta / state flip / completion without changing the structural
-    /// signature, so a cache hit must not serve the stale value copies.
+    /// F1 + large-thread stream path: rewrite cached `.turn` payloads from the
+    /// live timeline while preserving cached ORDER.
+    ///
+    /// - **Unfinished / live turns** always take the live snapshot (streaming
+    ///   bodies must not freeze — F1).
+    /// - **Finished turns** keep the cached payload unless completion structure
+    ///   changed (`finished`, item count, or final text). Token deltas on a live
+    ///   turn must not rebuild every finished turn's item tree (O(paint-window)).
     nonisolated static func rematerializedTranscriptEntries(
         cached: [TranscriptEntry],
-        turns: [AssistantTurnSnapshot]
+        turns: [AssistantTurnSnapshot],
+        liveTurnIds: Set<String>? = nil
     ) -> [TranscriptEntry] {
         guard !turns.isEmpty else { return cached }
         var turnsById = [String: AssistantTurnSnapshot](minimumCapacity: turns.count)
         for turn in turns { turnsById[turn.turnId] = turn }
+        let explicitLive = liveTurnIds
         return cached.map { entry in
-            guard case .turn(let stale) = entry, let live = turnsById[stale.turnId] else {
-                return entry
+            guard case .turn(let stale) = entry else { return entry }
+            guard let live = turnsById[stale.turnId] else { return entry }
+            if Self.shouldRematerializeTurn(stale: stale, live: live, liveTurnIds: explicitLive) {
+                return .turn(live)
             }
-            return .turn(live)
+            return entry
         }
+    }
+
+    /// Pure gate for stream-tick rematerialization scope.
+    nonisolated static func shouldRematerializeTurn(
+        stale: AssistantTurnSnapshot,
+        live: AssistantTurnSnapshot,
+        liveTurnIds: Set<String>? = nil
+    ) -> Bool {
+        if let liveTurnIds, liveTurnIds.contains(live.turnId) {
+            return true
+        }
+        // Always refresh unfinished turns (streaming body/output/state).
+        if !live.finished { return true }
+        // Completion transition or structural change on a finished turn.
+        if stale.finished != live.finished { return true }
+        if stale.items.count != live.items.count { return true }
+        if stale.finalAssistantMessage != live.finalAssistantMessage { return true }
+        // Stable finished turn: keep cached payload (skip full item-tree copy).
+        return false
     }
 
     private var visibleTranscriptEntries: [TranscriptEntry] {
@@ -9122,11 +9253,28 @@ public struct AgentAppView: View {
                             .frame(width: 0, height: 0)
                             .accessibilityHidden(true)
                             if vm.messageHistoryIsPartial {
-                                Text("Showing the recent message window. Earlier messages remain stored locally and are not kept in screen memory.")
-                                    .font(DS.Font.caption)
-                                    .foregroundColor(DS.Palette.textTertiary)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .accessibilityIdentifier("agent.transcript.partialMessageHistory")
+                                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                                    Text("Showing the recent message window. Earlier messages remain stored locally.")
+                                        .font(DS.Font.caption)
+                                        .foregroundColor(DS.Palette.textTertiary)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .accessibilityIdentifier("agent.transcript.partialMessageHistory")
+                                    Button {
+                                        vm.loadOlderMessages()
+                                    } label: {
+                                        if vm.isLoadingOlderMessages {
+                                            ProgressView()
+                                                .controlSize(.small)
+                                        } else {
+                                            Label("Load older messages", systemImage: "arrow.up.circle")
+                                                .font(DS.Font.caption)
+                                        }
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
+                                    .disabled(vm.isLoadingOlderMessages)
+                                    .accessibilityIdentifier("agent.transcript.loadOlderMessages")
+                                }
                             }
                             if hiddenCount > 0 {
                                 runningHiddenTranscriptRow(

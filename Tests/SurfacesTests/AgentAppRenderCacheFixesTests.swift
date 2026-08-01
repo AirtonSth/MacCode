@@ -113,6 +113,149 @@ final class AgentAppRenderCacheFixesTests: XCTestCase {
                        "a turn absent from the live timeline falls back to its cached snapshot — never dropped")
     }
 
+    /// WHY: token deltas on a live turn must not rebuild every finished turn's
+    /// item tree (large-thread stream path). Stable finished turns keep cache.
+    func test_rematerialize_skipsStableFinishedTurnsOnStreamTick() {
+        let finishedStale = turn(
+            "done",
+            items: [item("id", turnId: "done", body: "answer", state: .completed)],
+            final: "answer",
+            finished: true
+        )
+        let liveStale = turn(
+            "live",
+            items: [item("il", turnId: "live", body: "Hel", state: .streaming)]
+        )
+        let cached: [AgentAppView.TranscriptEntry] = [.turn(finishedStale), .turn(liveStale)]
+
+        // Live finished payload mutates body (should NOT be taken for stable finished).
+        let finishedLive = turn(
+            "done",
+            items: [item("id", turnId: "done", body: "answer SHOULD NOT REPLACE", state: .completed)],
+            final: "answer",
+            finished: true
+        )
+        let liveLive = turn(
+            "live",
+            items: [item("il", turnId: "live", body: "Hello streamed", state: .streaming)]
+        )
+
+        XCTAssertFalse(
+            AgentAppView.shouldRematerializeTurn(stale: finishedStale, live: finishedLive),
+            "stable finished turns skip rematerialize"
+        )
+        XCTAssertTrue(
+            AgentAppView.shouldRematerializeTurn(stale: liveStale, live: liveLive),
+            "unfinished turns always rematerialize"
+        )
+
+        let refreshed = AgentAppView.rematerializedTranscriptEntries(
+            cached: cached,
+            turns: [finishedLive, liveLive]
+        )
+        guard case .turn(let servedFinished) = refreshed[0],
+              case .turn(let servedLive) = refreshed[1] else {
+            return XCTFail("turn entries preserved")
+        }
+        XCTAssertEqual(servedFinished.items.first?.body, "answer",
+                       "finished turn keeps cached body on stream tick")
+        XCTAssertEqual(servedLive.items.first?.body, "Hello streamed",
+                       "live turn takes streamed body")
+    }
+
+    func test_hotMessagePageLimit_isBoundedForLargeThreads() {
+        XCTAssertLessThanOrEqual(
+            AgentAppViewModel.messageHistoryPageLimit,
+            200,
+            "hot UI page must not rehydrate multi-thousand-row histories at once"
+        )
+        XCTAssertLessThanOrEqual(
+            AgentAppViewModel.fullLoadBodyBudgetBytes,
+            16 * 1024 * 1024,
+            "hot body budget must stay well below the old 96 MB full-thread load"
+        )
+    }
+
+    func test_idlePaintWindow_boundsLargeThread() {
+        XCTAssertEqual(AgentAppView.idleTranscriptWindowCount, 30)
+        let entries: [AgentAppView.TranscriptEntry] = (0..<100).map { i in
+            .message(msg(TimeInterval(i), content: "m\(i)"))
+        }
+        let visible = AgentAppView.visibleTranscriptWindow(
+            entries: entries,
+            status: .completed,
+            runStartedAt: nil
+        )
+        XCTAssertEqual(visible.count, AgentAppView.idleTranscriptWindowCount)
+        XCTAssertEqual(visible.map(\.id), Array(entries.suffix(30)).map(\.id))
+    }
+
+    /// WHY: older durable rows must prepend into the hot window without
+    /// duplicating ids already present (load-older keyset path).
+    func test_mergeOlderMessagePage_prependsWithoutDuplicates() {
+        // Same AgentMessage instance appears in older page and hot window (shared id).
+        let shared = msg(2, content: "shared")
+        let olderPage = [msg(1, content: "old-a"), shared]
+        let hot = [shared, msg(3, content: "new")]
+        let merged = AgentAppViewModel.mergeOlderMessagePage(older: olderPage, current: hot)
+        XCTAssertEqual(merged.count, 3, "duplicate id must not double")
+        XCTAssertEqual(merged.map(\.content), ["old-a", "shared", "new"])
+    }
+
+    /// WHY: after a live turn finishes, the cache baseline must reflect finished
+    /// so later stream ticks do not keep rematerializing it (cache write-back).
+    func test_shouldRematerialize_falseAfterFinishedBaseline() {
+        let finished = turn(
+            "t1",
+            items: [item("i1", turnId: "t1", body: "done", state: .completed)],
+            final: "done",
+            finished: true
+        )
+        // Same structural snapshot (as if cache was write-back after complete)
+        XCTAssertFalse(
+            AgentAppView.shouldRematerializeTurn(stale: finished, live: finished),
+            "write-back baseline finished==live finished must skip rematerialize"
+        )
+    }
+
+    /// WHY: generation ownership — only the live older-page Task may clear loading.
+    /// A-load then switch/bump then B-load: A's defer must NOT clear B's generation.
+    func test_shouldClearLoadingOlderMessages_generationOwnership() {
+        // Live load owns gen 5
+        XCTAssertTrue(
+            AgentAppViewModel.shouldClearLoadingOlderMessages(
+                myGeneration: 5,
+                currentGeneration: 5
+            ),
+            "matching non-zero gen clears"
+        )
+        // Stale after cancelOlderMessageLoad / newer load bumped gen
+        XCTAssertFalse(
+            AgentAppViewModel.shouldClearLoadingOlderMessages(
+                myGeneration: 5,
+                currentGeneration: 6
+            ),
+            "stale gen must not clear a newer load's ownership"
+        )
+        // Idle / cleared
+        XCTAssertFalse(
+            AgentAppViewModel.shouldClearLoadingOlderMessages(
+                myGeneration: 0,
+                currentGeneration: 0
+            ),
+            "zero gen is idle — not a live owner"
+        )
+        // Simulate A=1, switch bumps to 2 (cancel), B starts and becomes 3:
+        // A's defer with myGen=1 must not clear while current=3
+        XCTAssertFalse(
+            AgentAppViewModel.shouldClearLoadingOlderMessages(
+                myGeneration: 1,
+                currentGeneration: 3
+            ),
+            "A's stale defer after A-switch-B must leave B's load alone"
+        )
+    }
+
     // MARK: - F40: item-count hash must not cancel for equal-count turns
 
     /// WHY: the Claude parser routes hook/status items into a parallel "" turn

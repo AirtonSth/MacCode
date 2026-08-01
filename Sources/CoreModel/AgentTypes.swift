@@ -1380,10 +1380,18 @@ public enum AgentThreadTitle {
     public static let defaultTitle = "New thread"
     public static let legacyDefaultTitle = "Thread"
     public static let displayLimit = 28
+    /// Nested-worker titles from AgentAppMiddleware (`"Subagent · …"`).
+    public static let subagentTitlePrefix = "Subagent ·"
 
     public static func isPlaceholder(_ title: String) -> Bool {
         let normalized = title.trimmingCharacters(in: .whitespacesAndNewlines)
         return normalized.isEmpty || normalized == defaultTitle || normalized == legacyDefaultTitle
+    }
+
+    /// True when the title is an orchestrated nested-worker row (not a rail entry).
+    public static func isSubagentThreadTitle(_ title: String) -> Bool {
+        let normalized = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.hasPrefix(subagentTitlePrefix)
     }
 
     public static func titleFromFirstMessage(_ text: String) -> String {
