@@ -409,7 +409,8 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             )
         guard controlAccepted else {
             // Control overflow used to terminate; that killed healthy 3G sessions
-            // under event load. Degrade path owns recovery — stay open.
+            // under event load. Application backlog must never force a close when
+            // only the control reserve is temporarily full — degrade owns recovery.
             lock.unlock()
             return .queueFull
         }

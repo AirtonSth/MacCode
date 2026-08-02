@@ -715,7 +715,11 @@ final class SnapshotChunkTransferTests: XCTestCase {
             method: "sync.snapshot.begin",
             params: baseParams(connectionID: connectionID)
         )
-        XCTAssertEqual((secondBegin["error"] as? [String: Any])?["code"] as? Int, -32602)
+        let secondBeginError = try XCTUnwrap(secondBegin["error"] as? [String: Any])
+        XCTAssertEqual(secondBeginError["code"] as? Int, -32602)
+        let collisionData = try XCTUnwrap(secondBeginError["data"] as? [String: Any])
+        XCTAssertEqual(collisionData["reason"] as? String, "snapshot_reservation_held")
+        XCTAssertEqual(collisionData["retryable"] as? Bool, true)
         XCTAssertEqual(router.snapshotReadCount, 1, "failed begin must not re-read host state")
 
         // Commit mismatch leaves reservation/transfer intact (no adopt).

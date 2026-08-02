@@ -402,7 +402,9 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
     func test_connectionWatermark_beginSnapshotIsSingleFlightFence() {
         // WHY: Two concurrent snapshot adoptions on one connection would race
         // pending/filtered sets. beginSnapshot must refuse a second in-flight
-        // snapshot so adoption remains a single fence.
+        // snapshot so adoption remains a single fence. HTTPServer maps the
+        // collision to -32602 + data.reason=snapshot_reservation_held so clients
+        // wait out the transfer-cache lease instead of thrashing begin.
         let watermark = ConnectionSequenceWatermark(initialSequence: 0)
         XCTAssertTrue(watermark.beginSnapshot())
         XCTAssertFalse(watermark.beginSnapshot(),

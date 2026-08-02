@@ -2697,13 +2697,17 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         if outbound.enqueueControl(opcode: 0x1, data: heartbeatData) == .accepted {
                             _ = outbound.enqueueControl(opcode: 0x9, data: payload)
                         } else if outbound.enqueueControl(opcode: 0x9, data: payload) == .queueFull {
-                            // Still full after degrade: skip this tick; do not close.
+                            // Still full after degrade: skip this tick; do not
+                            // close a healthy socket solely for control backlog.
+                            NSLog("[RC2.WS] outbound pressure class=queue_or_backpressure control=heartbeat_skip")
                             emitPressureBaseline()
                         }
                     case .closed:
                         break
                     }
                 case .timedOut:
+                    // Host-side heartbeat timeout (distinct from queue pressure).
+                    NSLog("[RC2.WS] disconnect class=host_heartbeat_timeout")
                     _ = outbound.terminate(
                         errorData: nil,
                         closingData: self.connectionClosingData(
@@ -3627,7 +3631,18 @@ public final class DirectHTTPServer: @unchecked Sendable {
             ownerFingerprint: ownerFingerprint
         )
         if let watermark, !watermark.beginSnapshot() {
-            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+            NSLog("[RC2.WS] snapshot_reservation_collision method=sync.snapshot")
+            return rpcJSONData(rpcErrorObject(
+                JSONRPCError(
+                    code: JSONRPCError.invalidParams.code,
+                    message: JSONRPCError.invalidParams.message,
+                    data: .object([
+                        "reason": .string("snapshot_reservation_held"),
+                        "retryable": .bool(true),
+                    ])
+                ),
+                id: wireID
+            ))
         }
 
         let knownRevisions: ConnectionDomainRevisions?
@@ -3835,7 +3850,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
             ownerFingerprint: ownerFingerprint
         )
         if let watermark, !watermark.beginSnapshot() {
-            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+            // Single-flight collision: secret-free reason so clients wait out
+            // the transfer-cache lease instead of thrashing another begin.
+            NSLog("[RC2.WS] snapshot_reservation_collision method=sync.snapshot.begin")
+            return rpcJSONData(rpcErrorObject(
+                JSONRPCError(
+                    code: JSONRPCError.invalidParams.code,
+                    message: JSONRPCError.invalidParams.message,
+                    data: .object([
+                        "reason": .string("snapshot_reservation_held"),
+                        "retryable": .bool(true),
+                    ])
+                ),
+                id: wireID
+            ))
         }
 
         let knownRevisions: ConnectionDomainRevisions?
