@@ -214,6 +214,12 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         let parser = CodexParser()
         let timeline = TimelineAggregator()
         let outBuf = LineBuffer()
+        // Serializes the stdout readabilityHandler against the termination
+        // drain: nil-ing a readabilityHandler does not wait for a callback
+        // already running, and LineBuffer/CodexParser are not thread-safe.
+        // Matches ClaudeRunner / GrokRunner so concurrent Dictionary mutation
+        // cannot SIGABRT on the same teardown race class.
+        let stdoutReadLock = NSLock()
         let cancelFlag = AgentCancelFlag()
         let emitLine: (String) -> Void = { line in
             if let runtimeEvent = ProviderRuntimeEvent.fromJSONLine(line, provider: .codex, source: "codex.exec.json") {
@@ -228,6 +234,8 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         }
 
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+            stdoutReadLock.lock()
+            defer { stdoutReadLock.unlock() }
             let data = handle.availableData
             if data.isEmpty { return }
             for line in outBuf.take(data) {
@@ -255,10 +263,14 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
             // and EOF via the handler — drain them explicitly, then flush
             // the final unterminated line. Without this the closing
             // `turn.completed` (and the answer) is regularly lost.
+            // Under the lock: an in-flight readabilityHandler callback may
+            // still be reading/parsing concurrently.
+            stdoutReadLock.lock()
             let tail = BoundedPipeDrain.readRemaining(from: stdoutPipe.fileHandleForReading)
             for line in outBuf.take(tail) + outBuf.flush() {
                 emitLine(line)
             }
+            stdoutReadLock.unlock()
             let status: AgentRunStatus
             if cancelFlag.isCancelled || p.terminationReason == .uncaughtSignal { status = .cancelled }
             else if p.terminationStatus == 0 { status = .completed }

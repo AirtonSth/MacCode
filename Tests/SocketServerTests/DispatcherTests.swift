@@ -5248,6 +5248,44 @@ final class DispatcherTests: XCTestCase {
                        "attachment presence/absence must not mutate plan_notes")
     }
 
+    /// WHY: iOS AgentAttachmentUploadCapability.isUsableV3 freezes these exact
+    /// numbers. Drift here silently disables protected upload on the phone.
+    @MainActor
+    func testSystemCapabilities_protectedV3AdvertisementMatchesIOSFrozenContract() async throws {
+        let dispatcher = JSONRPCDispatcher(
+            router: FakeRouter(),
+            agentAttachmentUploadCapability: .protectedV3
+        )
+        let response = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0", id: .number(1), method: "system.capabilities", params: nil
+        ))
+        let upload = response.result?.objectValue?["agent"]?
+            .objectValue?["attachment_upload"]?.objectValue
+        let uploadObject = try XCTUnwrap(upload, "system.capabilities must advertise attachment_upload when v3 store is wired")
+
+        XCTAssertEqual(uploadObject["protocol_version"]?.intValue, 3)
+        XCTAssertEqual(uploadObject["max_bytes"]?.intValue, 25 * 1024 * 1024)
+        XCTAssertEqual(uploadObject["chunk_bytes"]?.intValue, 512 * 1024)
+        XCTAssertEqual(uploadObject["max_chunk_count"]?.intValue, 50)
+        XCTAssertEqual(uploadObject["cipher_overhead_bytes"]?.intValue, 28)
+        let encodings = uploadObject["content_encodings"]?.arrayValue?
+            .compactMap(\.stringValue) ?? []
+        XCTAssertTrue(
+            encodings.contains("protected_chunks_v1"),
+            "iOS requires protected_chunks_v1 in content_encodings for isUsableV3"
+        )
+        // Mirror of iOS AgentAttachmentUploadCapability.isUsableV3 checks.
+        XCTAssertEqual(AgentAttachmentUploadCapabilityAdvertisement.protectedV3.protocolVersion, 3)
+        XCTAssertEqual(AgentAttachmentUploadCapabilityAdvertisement.protectedV3.maxBytes, 25 * 1024 * 1024)
+        XCTAssertEqual(AgentAttachmentUploadCapabilityAdvertisement.protectedV3.chunkBytes, 512 * 1024)
+        XCTAssertEqual(AgentAttachmentUploadCapabilityAdvertisement.protectedV3.maxChunkCount, 50)
+        XCTAssertEqual(AgentAttachmentUploadCapabilityAdvertisement.protectedV3.cipherOverheadBytes, 28)
+        XCTAssertTrue(
+            AgentAttachmentUploadCapabilityAdvertisement.protectedV3.contentEncodings
+                .contains("protected_chunks_v1")
+        )
+    }
+
     // Verifies that the encode<T> helper's new path (JSONDecoder -> JSONValue) produces the
     // same structure as the old path (JSONSerialization + JSONValue.from) for a representative
     // Codable. This guards against any behavioral divergence introduced by the optimization.

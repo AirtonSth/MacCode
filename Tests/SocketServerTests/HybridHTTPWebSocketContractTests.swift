@@ -200,6 +200,119 @@ final class HybridHTTPWebSocketContractTests: XCTestCase {
         ), "HTTP hybrid path must authorize when owner has no live WebSocket")
     }
 
+    func test_activeWebSocketRegistry_sameOwnerReplaceKeepsPhysicalLivenessUntilRemoved() {
+        // WHY: same-owner reconnect must make the new id the only hybrid authority
+        // while the half-closed predecessor stays physically live. Removing the
+        // successor alone must not open WS-absent HTTP fallback (hasConnection
+        // false) because HTTPServer.hybridConnectionAuthorized allows unregistered
+        // ids only when the owner has no live WS.
+        let registry = ActiveWebSocketConnectionRegistry()
+        let watermark = ConnectionSequenceWatermark(initialSequence: 1)
+        let otherWatermark = ConnectionSequenceWatermark(initialSequence: 9)
+
+        // 1. Insert old same-owner WS, insert new same-owner WS.
+        registry.insert("conn-old", ownerFingerprint: "owner-a", watermark: watermark)
+        XCTAssertTrue(registry.hasConnection(ownedBy: "owner-a"))
+        XCTAssertEqual(registry.ownerFingerprint(for: "conn-old"), "owner-a")
+
+        registry.insert("conn-other", ownerFingerprint: "owner-b", watermark: otherWatermark)
+        registry.insert("conn-new", ownerFingerprint: "owner-a", watermark: watermark)
+
+        // 2. New is the only current hybrid authority; old is unauthorized.
+        XCTAssertNil(
+            registry.ownerFingerprint(for: "conn-old"),
+            "predecessor must lose hybrid authority after same-owner replace"
+        )
+        XCTAssertEqual(registry.ownerFingerprint(for: "conn-new"), "owner-a")
+        XCTAssertTrue(registry.hasConnection(ownedBy: "owner-a"))
+        XCTAssertTrue(
+            DirectHTTPServer.hybridConnectionAuthorized(
+                connectionID: "conn-new",
+                ownerFingerprint: "owner-a",
+                registeredOwner: { registry.ownerFingerprint(for: "conn-new") },
+                ownerHasLiveConnection: { registry.hasConnection(ownedBy: "owner-a") }
+            ),
+            "new live connection_id must authorize hybrid snapshot after supersede"
+        )
+        XCTAssertFalse(
+            DirectHTTPServer.hybridConnectionAuthorized(
+                connectionID: "conn-old",
+                ownerFingerprint: "owner-a",
+                registeredOwner: { registry.ownerFingerprint(for: "conn-old") },
+                ownerHasLiveConnection: { registry.hasConnection(ownedBy: "owner-a") }
+            ),
+            "demoted predecessor connection_id must not authorize hybrid HTTP"
+        )
+        XCTAssertFalse(
+            DirectHTTPServer.hybridConnectionAuthorized(
+                connectionID: "conn-stale",
+                ownerFingerprint: "owner-a",
+                registeredOwner: { registry.ownerFingerprint(for: "conn-stale") },
+                ownerHasLiveConnection: { registry.hasConnection(ownedBy: "owner-a") }
+            ),
+            "unregistered id must stay fail-closed while any same-owner WS is physically live"
+        )
+
+        // 5. Different owners remain unaffected through the replace.
+        XCTAssertEqual(registry.ownerFingerprint(for: "conn-other"), "owner-b")
+        XCTAssertTrue(registry.hasConnection(ownedBy: "owner-b"))
+        XCTAssertTrue(
+            DirectHTTPServer.hybridConnectionAuthorized(
+                connectionID: "conn-other",
+                ownerFingerprint: "owner-b",
+                registeredOwner: { registry.ownerFingerprint(for: "conn-other") },
+                ownerHasLiveConnection: { registry.hasConnection(ownedBy: "owner-b") }
+            )
+        )
+
+        // 3. Remove new while old remains physically live: hasConnection stays true;
+        //    stale/unregistered HTTP authorization remains false.
+        registry.remove("conn-new")
+        XCTAssertTrue(
+            registry.hasConnection(ownedBy: "owner-a"),
+            "demoted predecessor must keep physical liveness after successor remove"
+        )
+        XCTAssertNil(registry.ownerFingerprint(for: "conn-new"))
+        XCTAssertNil(registry.ownerFingerprint(for: "conn-old"))
+        XCTAssertFalse(
+            DirectHTTPServer.hybridConnectionAuthorized(
+                connectionID: "conn-stale",
+                ownerFingerprint: "owner-a",
+                registeredOwner: { registry.ownerFingerprint(for: "conn-stale") },
+                ownerHasLiveConnection: { registry.hasConnection(ownedBy: "owner-a") }
+            ),
+            "WS-absent fallback must not open while a demoted predecessor is still live"
+        )
+        XCTAssertFalse(
+            DirectHTTPServer.hybridConnectionAuthorized(
+                connectionID: "conn-old",
+                ownerFingerprint: "owner-a",
+                registeredOwner: { registry.ownerFingerprint(for: "conn-old") },
+                ownerHasLiveConnection: { registry.hasConnection(ownedBy: "owner-a") }
+            ),
+            "demoted predecessor remains unauthorized after successor remove"
+        )
+        // Other owner still live and authorized.
+        XCTAssertTrue(registry.hasConnection(ownedBy: "owner-b"))
+        XCTAssertEqual(registry.ownerFingerprint(for: "conn-other"), "owner-b")
+
+        // 4. Remove old: only then WS-absent fallback can become true.
+        registry.remove("conn-old")
+        XCTAssertFalse(registry.hasConnection(ownedBy: "owner-a"))
+        XCTAssertTrue(
+            DirectHTTPServer.hybridConnectionAuthorized(
+                connectionID: "conn-stale",
+                ownerFingerprint: "owner-a",
+                registeredOwner: { registry.ownerFingerprint(for: "conn-stale") },
+                ownerHasLiveConnection: { registry.hasConnection(ownedBy: "owner-a") }
+            ),
+            "authenticated HTTP hybrid path may proceed once no physical WS remains for owner"
+        )
+        // 5 (cont). Different owners remain unaffected after owner-a drain.
+        XCTAssertTrue(registry.hasConnection(ownedBy: "owner-b"))
+        XCTAssertEqual(registry.ownerFingerprint(for: "conn-other"), "owner-b")
+    }
+
     func test_boundedUnknownReceiptCache_evictsOldestWithoutStoringPayloads() {
         // WHY: unknown fences must not grow unbounded or cache secret payloads.
         var cache = BoundedUnknownReceiptCache(cap: 2)

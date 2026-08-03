@@ -1080,6 +1080,10 @@ final class ActiveWebSocketConnectionRegistry: @unchecked Sendable {
     private struct Entry {
         let ownerFingerprint: String
         let watermark: ConnectionSequenceWatermark
+        /// Current hybrid authority for this owner. Physically live predecessors
+        /// keep an entry after same-owner replace but lose authority so
+        /// `ownerFingerprint(for:)` fails closed while `hasConnection` stays true.
+        var isHybridAuthority: Bool
     }
 
     private let lock = NSLock()
@@ -1091,7 +1095,22 @@ final class ActiveWebSocketConnectionRegistry: @unchecked Sendable {
         watermark: ConnectionSequenceWatermark
     ) {
         lock.lock()
-        entries[connectionID] = Entry(ownerFingerprint: ownerFingerprint, watermark: watermark)
+        // One hybrid-authority connection per owner. A replacement WS supersedes
+        // half-closed predecessors for hybrid registration without erasing their
+        // physical liveness: removing the successor alone must not open the
+        // WS-absent HTTP fallback while a predecessor TCP socket is still draining.
+        for (key, var entry) in entries {
+            guard entry.ownerFingerprint == ownerFingerprint, key != connectionID else {
+                continue
+            }
+            entry.isHybridAuthority = false
+            entries[key] = entry
+        }
+        entries[connectionID] = Entry(
+            ownerFingerprint: ownerFingerprint,
+            watermark: watermark,
+            isHybridAuthority: true
+        )
         lock.unlock()
     }
 
@@ -1101,22 +1120,29 @@ final class ActiveWebSocketConnectionRegistry: @unchecked Sendable {
     ) -> ConnectionSequenceWatermark? {
         lock.lock(); defer { lock.unlock() }
         guard let entry = entries[connectionID],
-              entry.ownerFingerprint == ownerFingerprint else {
+              entry.ownerFingerprint == ownerFingerprint,
+              entry.isHybridAuthority else {
             return nil
         }
         return entry.watermark
     }
 
-    /// Owner fingerprint registered for `connectionID`, if any live entry exists.
+    /// Owner fingerprint for the *current hybrid authority* connection_id only.
+    /// Demoted physically live predecessors return nil so unregistered/stale
+    /// HTTP ids stay fail-closed while `hasConnection` still reports liveness.
     func ownerFingerprint(for connectionID: String) -> String? {
         lock.lock(); defer { lock.unlock() }
-        return entries[connectionID]?.ownerFingerprint
+        guard let entry = entries[connectionID], entry.isHybridAuthority else {
+            return nil
+        }
+        return entry.ownerFingerprint
     }
 
-    /// True when this owner currently holds at least one live WebSocket entry.
-    /// Used by the hybrid HTTP path: while a live WS exists, only that
-    /// connection_id may authorize mutations/snapshots; when none exist,
-    /// authenticated HTTP may proceed with host/boot identity alone.
+    /// True when this owner currently holds at least one *physically live*
+    /// WebSocket entry (including demoted same-owner predecessors).
+    /// Used by the hybrid HTTP path: while any live WS exists, only the current
+    /// hybrid-authority connection_id may authorize mutations/snapshots; when
+    /// none exist, authenticated HTTP may proceed with host/boot identity alone.
     func hasConnection(ownedBy ownerFingerprint: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return entries.values.contains { $0.ownerFingerprint == ownerFingerprint }
