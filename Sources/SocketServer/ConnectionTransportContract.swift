@@ -175,7 +175,11 @@ public struct ConnectionSnapshotReadState: Equatable, Sendable {
 
 @MainActor
 public protocol ConnectionSnapshotRouting: AnyObject {
-    func readConnectionSnapshotState() throws -> ConnectionSnapshotReadState
+    /// Capture host layout/surface state for `sync.snapshot`.
+    ///
+    /// AgentThread SQLite list/decode must hop off MainActor (see
+    /// `AgentThreadListGateway`). Surface/browser capture remains MainActor-safe.
+    func readConnectionSnapshotState() async throws -> ConnectionSnapshotReadState
 }
 
 enum ConnectionProtocolFailure: Error, Equatable, CustomStringConvertible {

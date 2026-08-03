@@ -8,9 +8,37 @@ private final class Phase3SnapshotFakeRouter: FakeRouter, ConnectionSnapshotRout
     let surfaceID = UUID().uuidString
     let threadID = UUID().uuidString
     private(set) var snapshotReadCount = 0
+    var snapshotReadStarted: DispatchSemaphore?
+    var snapshotReadRelease: DispatchSemaphore?
+    /// When set, the expensive portion of the read runs off MainActor (mirrors
+    /// production AgentThreadListGateway hop) so MainActor/HTTP stay free.
+    var offMainDelayNanoseconds: UInt64 = 0
+    nonisolated(unsafe) private(set) var threadQueryOnMainCount = 0
+    nonisolated(unsafe) private(set) var threadQueryOffMainCount = 0
 
-    func readConnectionSnapshotState() throws -> ConnectionSnapshotReadState {
+    func readConnectionSnapshotState() async throws -> ConnectionSnapshotReadState {
         snapshotReadCount += 1
+        if snapshotReadCount == 1,
+           let snapshotReadStarted,
+           let snapshotReadRelease {
+            snapshotReadStarted.signal()
+            _ = snapshotReadRelease.wait(timeout: .now() + 2)
+        }
+        let delay = offMainDelayNanoseconds
+        if delay > 0 {
+            // Capture probe counters off MainActor like AgentThreadListGateway.
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                DispatchQueue(label: "io.remotecode.test.connection-snapshot-thread-list").async {
+                    if Thread.isMainThread {
+                        self.threadQueryOnMainCount += 1
+                    } else {
+                        self.threadQueryOffMainCount += 1
+                    }
+                    Thread.sleep(forTimeInterval: TimeInterval(delay) / 1_000_000_000)
+                    continuation.resume()
+                }
+            }
+        }
         return ConnectionSnapshotReadState(
             selectedWorkspaceId: workspaceID,
             workspaces: [.object(["id": .string(workspaceID), "name": .string("Snapshot")])],
@@ -54,6 +82,166 @@ private final class Phase3SnapshotAuth: DirectAuthProvider {
 }
 
 final class ConnectionSnapshotPhase3Tests: XCTestCase {
+    func test_dispatcherSnapshotRead_doesNotHoldEventBusBarrierAcrossSlowStateRead() async throws {
+        let router = await MainActor.run { Phase3SnapshotFakeRouter() }
+        let stateReadStarted = DispatchSemaphore(value: 0)
+        let releaseStateRead = DispatchSemaphore(value: 0)
+        await MainActor.run {
+            router.snapshotReadStarted = stateReadStarted
+            router.snapshotReadRelease = releaseStateRead
+        }
+
+        let snapshotTask = Task { @MainActor in
+            try await JSONRPCDispatcher(router: router).readConnectionSnapshot()
+        }
+        XCTAssertEqual(stateReadStarted.wait(timeout: .now() + 2), .success)
+
+        let publishDone = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            EventBus.shared.publish(kind: "snapshot.responsiveness", payload: .object([:]))
+            publishDone.signal()
+        }
+        XCTAssertEqual(
+            publishDone.wait(timeout: .now() + 0.05),
+            .success,
+            "snapshot construction must not block EventBus publication"
+        )
+
+        releaseStateRead.signal()
+        let result = try await snapshotTask.value
+        XCTAssertEqual(result.metadata.sequence, EventBus.shared.currentSeq)
+    }
+
+    func test_dispatcherSnapshotRead_offMainThreadQueryKeepsMainActorAndEventBusResponsive() async throws {
+        // WHY: production hops AgentThread list/decode off MainActor. While that
+        // work is delayed, EventBus publish and MainActor heartbeats must still
+        // progress (HTTP/RPC acceptance shares MainActor with the dispatcher).
+        let router = await MainActor.run {
+            let router = Phase3SnapshotFakeRouter()
+            router.offMainDelayNanoseconds = 40_000_000
+            return router
+        }
+
+        var heartbeats = 0
+        let heartbeat = Task { @MainActor in
+            while !Task.isCancelled {
+                heartbeats += 1
+                try? await Task.sleep(nanoseconds: 2_000_000)
+            }
+        }
+
+        let snapshotTask = Task { @MainActor in
+            try await JSONRPCDispatcher(router: router).readConnectionSnapshot()
+        }
+
+        // Give the off-main hop a moment to start, then prove EventBus is free.
+        try await Task.sleep(nanoseconds: 5_000_000)
+        let publishDone = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            EventBus.shared.publish(kind: "snapshot.off_main.responsiveness", payload: .object([:]))
+            publishDone.signal()
+        }
+        XCTAssertEqual(
+            publishDone.wait(timeout: .now() + 0.05),
+            .success,
+            "metadata fence must not hold EventBus while thread list runs off-main"
+        )
+
+        let result = try await snapshotTask.value
+        heartbeat.cancel()
+        _ = await heartbeat.result
+
+        let offMain = await MainActor.run { router.threadQueryOffMainCount }
+        let onMain = await MainActor.run { router.threadQueryOnMainCount }
+        XCTAssertEqual(onMain, 0)
+        XCTAssertGreaterThanOrEqual(
+            offMain,
+            1,
+            "each snapshot attempt must enumerate threads off MainActor"
+        )
+        XCTAssertGreaterThan(
+            heartbeats,
+            3,
+            "MainActor must keep pumping while snapshot thread query is delayed off-main"
+        )
+        XCTAssertEqual(result.metadata.sequence, EventBus.shared.currentSeq)
+    }
+
+    func test_dispatcherSnapshotRead_timeoutIsFailFastAndSingleFlight() async throws {
+        let router = await MainActor.run {
+            let router = Phase3SnapshotFakeRouter()
+            router.offMainDelayNanoseconds = 200_000_000
+            return router
+        }
+        let dispatcher = await MainActor.run { JSONRPCDispatcher(router: router) }
+
+        let first: Task<Int?, Never> = Task { @MainActor in
+            do {
+                _ = try await dispatcher.readConnectionSnapshot(timeoutNanoseconds: 5_000_000)
+                return nil
+            } catch let error as JSONRPCError {
+                return error.code
+            } catch {
+                return nil
+            }
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        let firstCode = await first.value
+        XCTAssertEqual(firstCode, JSONRPCDispatcher.snapshotTimedOut.code)
+
+        let secondStarted = DispatchTime.now().uptimeNanoseconds
+        let second: Task<Int?, Never> = Task { @MainActor in
+            do {
+                _ = try await dispatcher.readConnectionSnapshot(timeoutNanoseconds: 5_000_000)
+                return nil
+            } catch let error as JSONRPCError {
+                return error.code
+            } catch {
+                return nil
+            }
+        }
+        let secondCode = await second.value
+        XCTAssertEqual(secondCode, JSONRPCDispatcher.snapshotTimedOut.code)
+        XCTAssertLessThan(
+            HTTPRequestPhaseMetrics.elapsedMilliseconds(since: secondStarted),
+            50,
+            "a stale physical read must not make later callers wait or spawn another read"
+        )
+
+        try await Task.sleep(nanoseconds: 250_000_000)
+        let readCount = await MainActor.run { router.snapshotReadCount }
+        XCTAssertEqual(readCount, 1)
+    }
+
+    func test_requestPhaseMetrics_areSecretFreeAndJSONSerializable() throws {
+        let metrics = HTTPRequestPhaseMetrics()
+        metrics.record(.admit, latencyMilliseconds: 2)
+        metrics.record(.snapshotRead, latencyMilliseconds: 3)
+        metrics.record(.snapshotEncode, latencyMilliseconds: 4)
+        metrics.record(.responseWrite, latencyMilliseconds: 5)
+        metrics.recordCancelled()
+        metrics.recordTimedOut()
+        metrics.recordFenceRetry()
+        metrics.recordFenceExhausted()
+        metrics.recordWriteAborted()
+
+        let snapshot = metrics.snapshot()
+        XCTAssertEqual(snapshot.snapshotRead.count, 1)
+        XCTAssertEqual(snapshot.snapshotEncode.maxMilliseconds, 4)
+        XCTAssertEqual(snapshot.cancelledTotal, 1)
+        XCTAssertEqual(snapshot.timedOutTotal, 1)
+        XCTAssertEqual(snapshot.fenceRetryTotal, 1)
+        XCTAssertEqual(snapshot.fenceExhaustedTotal, 1)
+        XCTAssertEqual(snapshot.writeAbortedTotal, 1)
+
+        let object = DirectHTTPServer.requestPhaseMetricsJSON(snapshot)
+        XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: object))
+        let text = String(data: try JSONSerialization.data(withJSONObject: object), encoding: .utf8) ?? ""
+        XCTAssertFalse(text.contains("token"))
+        XCTAssertFalse(text.contains("owner"))
+        XCTAssertFalse(text.contains("payload"))
+    }
+
     @MainActor
     func test_syncSnapshotImmediatelyAfterWelcomeSeesRegisteredConnection() async throws {
         let router = Phase3SnapshotFakeRouter()

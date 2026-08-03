@@ -29,12 +29,12 @@ final class ConnectionSnapshotRouterPhase3Tests: XCTestCase {
             paneID: nil,
             title: "Browser"
         )
-        let persistedFiles = try router.createSurface(
-            workspace: workspaceOne.id,
-            type: .files,
+        let persistedFiles = SurfaceDescriptor(type: .files, title: "Persisted Files")
+        try context.apply(.addSurface(
+            workspaceOne.id,
             paneID: nil,
-            title: "Persisted Files"
-        )
+            descriptor: persistedFiles
+        ))
         let fallbackFiles = SurfaceDescriptor(type: .files, title: "Fallback Files")
         try context.apply(.addSurface(
             workspaceOne.id,
@@ -58,8 +58,8 @@ final class ConnectionSnapshotRouterPhase3Tests: XCTestCase {
             deviceID: "phase3-test-device"
         )
 
-        let first = try router.readConnectionSnapshotState()
-        let second = try router.readConnectionSnapshotState()
+        let first = try await router.readConnectionSnapshotState()
+        let second = try await router.readConnectionSnapshotState()
         XCTAssertEqual(first, second, "unchanged host state must serialize deterministically")
         XCTAssertNoThrow(try ConnectionTransportFrame.snapshot(ConnectionSnapshotFrame(
             protocolVersion: 3,
@@ -144,14 +144,15 @@ final class ConnectionSnapshotRouterPhase3Tests: XCTestCase {
         _ = context
     }
 
-    func test_realRouterSnapshot_returnsEmptyStateAfterContextDeallocation() throws {
+    func test_realRouterSnapshot_returnsEmptyStateAfterContextDeallocation() async throws {
         var context: AppContext? = try makeContext()
         let router = AppCommandRouter(context: try XCTUnwrap(context))
         context?.router = router
         context = nil
 
+        let state = try await router.readConnectionSnapshotState()
         XCTAssertEqual(
-            try router.readConnectionSnapshotState(),
+            state,
             ConnectionSnapshotReadState(
                 selectedWorkspaceId: nil,
                 workspaces: [],
@@ -163,12 +164,83 @@ final class ConnectionSnapshotRouterPhase3Tests: XCTestCase {
         )
     }
 
-    func test_realRouterSnapshot_propagatesRepositoryReadFailure() throws {
+    func test_realRouterSnapshot_propagatesRepositoryReadFailure() async throws {
         let (context, router) = try make()
         _ = try router.createWorkspace(name: "Broken", cwd: NSTemporaryDirectory())
         try context.db.execute("DROP TABLE agent_threads;")
 
-        XCTAssertThrowsError(try router.readConnectionSnapshotState())
+        do {
+            _ = try await router.readConnectionSnapshotState()
+            XCTFail("expected repository read failure to propagate")
+        } catch {
+            // Gateway surface SQLite errors; do not swallow into empty snapshot.
+        }
+    }
+
+    func test_realRouterSnapshot_threadListRunsOffMainActorAndKeepsMainResponsive() async throws {
+        // WHY: Dispatcher/AppCommandRouter are @MainActor; the connection-snapshot
+        // AgentThread SQLite list/decode must hop to AgentThreadListGateway so a
+        // slow list cannot monopolize the main run loop / HTTP acceptance.
+        let (context, router) = try make()
+        _ = try router.createWorkspace(name: "Gateway", cwd: NSTemporaryDirectory())
+        _ = try router.createAgentThread(
+            workspace: try XCTUnwrap(context.state.window.selectedWorkspaceID),
+            title: "Off-main thread",
+            provider: .codex,
+            model: "gpt-5",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+
+        AgentThreadListGateway.resetExecutionProbesForTesting()
+        AgentThreadListGateway.queryDelayNanosecondsForTesting = 40_000_000
+        defer { AgentThreadListGateway.resetExecutionProbesForTesting() }
+
+        var heartbeats = 0
+        let heartbeat = Task { @MainActor in
+            while !Task.isCancelled {
+                heartbeats += 1
+                try? await Task.sleep(nanoseconds: 2_000_000)
+            }
+        }
+
+        let state = try await router.readConnectionSnapshotState()
+        heartbeat.cancel()
+        _ = await heartbeat.result
+
+        XCTAssertFalse(state.agentThreads.isEmpty)
+        XCTAssertEqual(AgentThreadListGateway.queryCallCountForTesting, 1)
+        XCTAssertEqual(AgentThreadListGateway.queryOnMainActorCountForTesting, 0)
+        XCTAssertEqual(AgentThreadListGateway.queryOffMainActorCountForTesting, 1)
+        XCTAssertGreaterThan(
+            heartbeats,
+            3,
+            "MainActor run loop must keep pumping while snapshot thread list is delayed"
+        )
+    }
+
+    func test_realRouterSnapshot_threadListCancellationDoesNotLeaveContinuationHanging() async throws {
+        // WHY: a timed-out HTTP snapshot must release its caller immediately;
+        // the queued SQLite read may finish later, but it must not resume a
+        // cancelled continuation or strand the dispatcher single-flight.
+        let (context, router) = try make()
+        _ = try router.createWorkspace(name: "Cancelled gateway", cwd: NSTemporaryDirectory())
+        AgentThreadListGateway.resetExecutionProbesForTesting()
+        AgentThreadListGateway.queryDelayNanosecondsForTesting = 500_000_000
+        defer { AgentThreadListGateway.resetExecutionProbesForTesting() }
+
+        let task = Task {
+            try await context.agentThreadListGateway.list()
+        }
+        try await Task.sleep(nanoseconds: 10_000_000)
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("cancelled gateway read must not return a successful list")
+        } catch is CancellationError {
+            // Expected: cancellation resumes the continuation immediately.
+        }
     }
 
     private func make() throws -> (AppContext, AppCommandRouter) {

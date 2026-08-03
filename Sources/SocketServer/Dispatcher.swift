@@ -527,6 +527,42 @@ public func coalescePairingRequest(
     }
 }
 
+private final class ConnectionSnapshotReadOutcome: @unchecked Sendable {
+    typealias Value = EventBus.SnapshotBarrierResult<ConnectionSnapshotReadState>
+
+    private let lock = NSLock()
+    private var completion: Result<Value, Error>?
+    private var continuation: CheckedContinuation<Result<Value, Error>, Never>?
+
+    func wait() async -> Result<Value, Error> {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if let completion {
+                lock.unlock()
+                continuation.resume(returning: completion)
+            } else {
+                self.continuation = continuation
+                lock.unlock()
+            }
+        }
+    }
+
+    @discardableResult
+    func resolve(_ completion: Result<Value, Error>) -> Bool {
+        lock.lock()
+        guard self.completion == nil else {
+            lock.unlock()
+            return false
+        }
+        self.completion = completion
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: completion)
+        return true
+    }
+}
+
 @MainActor
 public final class JSONRPCDispatcher {
     let router: CommandRouting
@@ -553,6 +589,10 @@ public final class JSONRPCDispatcher {
     /// Bounded unknown-outcome fence (same cap as committed receipts). Does not
     /// store request payloads or secrets — only owner fingerprint + params hash.
     private var volatileUnknownReceipts = BoundedUnknownReceiptCache()
+    /// At most one physical snapshot state read may outlive a timed-out caller.
+    /// The task is retained until the underlying router continuation finishes,
+    /// preventing repeated timeouts from accumulating unbounded SQLite reads.
+    private var activeConnectionSnapshotRead: (id: UUID, task: Task<Void, Never>)?
     public nonisolated static let hostMutationMethods = HostMutationContract.methods
     private nonisolated static let durableSynchronousMutationMethods: Set<String> = [
         "workspace.create",
@@ -685,13 +725,164 @@ public final class JSONRPCDispatcher {
             agentAttachmentUploadCapability
     }
 
-    func readConnectionSnapshot() throws -> EventBus.SnapshotBarrierResult<ConnectionSnapshotReadState> {
+    /// Default wall budget for one `sync.snapshot` state capture (including
+    /// fence retries). Matches the WS welcome lower bound (5s) and stays well
+    /// below cellular transfer budgets so HTTP baseline cannot monopolize the
+    /// host indefinitely.
+    public nonisolated static let connectionSnapshotTimeoutNanoseconds: UInt64 = 5_000_000_000
+
+    /// Retryable when the sequence fence cannot stabilize under concurrent
+    /// host mutations. Clients should reconnect or re-issue baseline.
+    public nonisolated static let snapshotSequenceFenceUnstable = JSONRPCError(
+        code: -32012,
+        message: "Snapshot sequence fence unstable; retry baseline.",
+        data: .object([
+            "reason": .string("snapshot_sequence_fence_unstable"),
+            "retryable": .bool(true),
+        ])
+    )
+
+    /// Retryable when the snapshot read exceeds the host wall budget.
+    public nonisolated static let snapshotTimedOut = JSONRPCError(
+        code: -32013,
+        message: "Snapshot read timed out; retry baseline.",
+        data: .object([
+            "reason": .string("snapshot_timed_out"),
+            "retryable": .bool(true),
+        ])
+    )
+
+    /// Retryable when the peer disconnects (or the host cancels) mid-snapshot.
+    public nonisolated static let snapshotCancelled = JSONRPCError(
+        code: -32014,
+        message: "Snapshot cancelled.",
+        data: .object([
+            "reason": .string("snapshot_cancelled"),
+            "retryable": .bool(true),
+        ])
+    )
+
+    func readConnectionSnapshot(
+        timeoutNanoseconds: UInt64 = JSONRPCDispatcher.connectionSnapshotTimeoutNanoseconds,
+        phaseMetrics: HTTPRequestPhaseMetrics? = nil
+    ) async throws -> EventBus.SnapshotBarrierResult<ConnectionSnapshotReadState> {
         guard let snapshotRouter = router as? ConnectionSnapshotRouting else {
             throw JSONRPCError.notSupported("sync.snapshot")
         }
-        return try EventBus.shared.withSnapshotBarrier {
-            try snapshotRouter.readConnectionSnapshotState()
+
+        // Snapshot reads can touch SQLite (off-MainActor via AgentThreadListGateway),
+        // browser surfaces, and JSON conversion. Do not hold EventBus's publisher
+        // lock across that work: compare the cheap metadata before/after the read
+        // instead, retrying when an event crossed the capture window. The
+        // watermark then remains an honest sequence fence without starving
+        // event delivery or HTTP recovery while the snapshot is built.
+        //
+        // A deadline races the physical read through a one-shot outcome. The
+        // caller therefore returns even if an off-main continuation ignores
+        // cancellation. One retained task per dispatcher bounds those stale
+        // reads; while it exists, later callers fail fast with the same
+        // retryable timeout rather than waiting behind or spawning another read.
+        let readStarted = DispatchTime.now().uptimeNanoseconds
+        do {
+            guard activeConnectionSnapshotRead == nil else {
+                throw Self.snapshotTimedOut
+            }
+
+            let readID = UUID()
+            let outcome = ConnectionSnapshotReadOutcome()
+            let readTask = Task { @MainActor [weak self] in
+                guard let self else {
+                    outcome.resolve(.failure(Self.snapshotCancelled))
+                    return
+                }
+
+                do {
+                    for attempt in 0..<3 {
+                        try Task.checkCancellation()
+                        let before = EventBus.shared.snapshotMetadata()
+                        let state = try await snapshotRouter.readConnectionSnapshotState()
+                        try Task.checkCancellation()
+                        let after = EventBus.shared.snapshotMetadata()
+                        if before == after {
+                            outcome.resolve(.success(EventBus.SnapshotBarrierResult(
+                                state: state,
+                                metadata: after
+                            )))
+                            self.finishConnectionSnapshotRead(id: readID)
+                            return
+                        }
+                        phaseMetrics?.recordFenceRetry()
+                        if attempt == 2 {
+                            phaseMetrics?.recordFenceExhausted()
+                            throw Self.snapshotSequenceFenceUnstable
+                        }
+                    }
+                    phaseMetrics?.recordFenceExhausted()
+                    throw Self.snapshotSequenceFenceUnstable
+                } catch {
+                    outcome.resolve(.failure(error))
+                    self.finishConnectionSnapshotRead(id: readID)
+                }
+            }
+            activeConnectionSnapshotRead = (readID, readTask)
+
+            let timeoutTask = Task {
+                do {
+                    try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                    readTask.cancel()
+                    outcome.resolve(.failure(Self.snapshotTimedOut))
+                } catch is CancellationError {
+                    // Read/caller completed first; normal deadline teardown.
+                } catch {
+                    outcome.resolve(.failure(error))
+                }
+            }
+
+            let completion = await withTaskCancellationHandler {
+                await outcome.wait()
+            } onCancel: {
+                readTask.cancel()
+                timeoutTask.cancel()
+                outcome.resolve(.failure(Self.snapshotCancelled))
+            }
+            timeoutTask.cancel()
+            _ = await timeoutTask.result
+            let result = try completion.get()
+            phaseMetrics?.record(
+                .snapshotRead,
+                latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: readStarted)
+            )
+            return result
+        } catch is CancellationError {
+            phaseMetrics?.recordCancelled()
+            phaseMetrics?.record(
+                .snapshotRead,
+                latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: readStarted)
+            )
+            throw Self.snapshotCancelled
+        } catch let error as JSONRPCError {
+            if error.code == Self.snapshotTimedOut.code {
+                phaseMetrics?.recordTimedOut()
+            } else if error.code == Self.snapshotCancelled.code {
+                phaseMetrics?.recordCancelled()
+            }
+            phaseMetrics?.record(
+                .snapshotRead,
+                latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: readStarted)
+            )
+            throw error
+        } catch {
+            phaseMetrics?.record(
+                .snapshotRead,
+                latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: readStarted)
+            )
+            throw error
         }
+    }
+
+    private func finishConnectionSnapshotRead(id: UUID) {
+        guard activeConnectionSnapshotRead?.id == id else { return }
+        activeConnectionSnapshotRead = nil
     }
 
     private func commandReceipt(method: String, params: [String: JSONValue]) -> (String, JSONValue)? {

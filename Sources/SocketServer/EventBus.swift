@@ -418,6 +418,26 @@ public final class EventBus: @unchecked Sendable {
         return (lastSeq, recent)
     }
 
+    /// Cheap counters for `/v1/health` and readiness probes.
+    ///
+    /// Avoids re-encoding every retained event on the health path (which used
+    /// to allocate under concurrent HTTP load). Uses the same `recentBytes`
+    /// ring accounting publish already maintains.
+    public func healthCounters() -> (
+        lastSeq: Int64,
+        retainedCount: Int,
+        retainedBytes: Int,
+        oldestRetainedSeq: Int64
+    ) {
+        lock.lock(); defer { lock.unlock() }
+        return (
+            lastSeq,
+            recent.count,
+            recentBytes,
+            recent.first?.seq ?? 0
+        )
+    }
+
     public func snapshotMetadata() -> SnapshotMetadata {
         lock.lock(); defer { lock.unlock() }
         return snapshotMetadataLocked()

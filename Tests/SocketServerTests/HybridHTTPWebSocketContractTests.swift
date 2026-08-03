@@ -138,7 +138,7 @@ private final class HybridReceiptRouter: FakeRouter, CommandReceiptStateRouting,
         }
     }
 
-    func readConnectionSnapshotState() throws -> ConnectionSnapshotReadState {
+    func readConnectionSnapshotState() async throws -> ConnectionSnapshotReadState {
         ConnectionSnapshotReadState(
             selectedWorkspaceId: workspaceID,
             workspaces: [.object(["id": .string(workspaceID), "name": .string("Hybrid")])],

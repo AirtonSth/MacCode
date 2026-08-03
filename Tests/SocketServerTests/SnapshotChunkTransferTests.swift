@@ -12,7 +12,7 @@ private final class ChunkSnapshotFakeRouter: FakeRouter, ConnectionSnapshotRouti
     let threadID = UUID().uuidString
     private(set) var snapshotReadCount = 0
 
-    func readConnectionSnapshotState() throws -> ConnectionSnapshotReadState {
+    func readConnectionSnapshotState() async throws -> ConnectionSnapshotReadState {
         snapshotReadCount += 1
         return ConnectionSnapshotReadState(
             selectedWorkspaceId: workspaceID,

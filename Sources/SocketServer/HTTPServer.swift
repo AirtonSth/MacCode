@@ -1326,6 +1326,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
     /// Live connection-level metrics surfaced via /v1/health.
     let wsTracker = WSConnectionTracker()
+    /// Secret-free HTTP/RPC phase aggregates (admit/read/encode/write).
+    public let requestPhaseMetrics = HTTPRequestPhaseMetrics()
     private let activeWebSocketConnections = ActiveWebSocketConnectionRegistry()
     /// TTL/memory-bounded cache for opt-in resumable `sync.snapshot` chunks.
     let snapshotChunkTransfers = SnapshotChunkTransferCache()
@@ -1342,6 +1344,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
     private var _listenerPublicationState: ListenerPublicationState = .idle
     private var _listenerPublishAttempt: Int = 0
     private let listenerRetryPolicy = ListenerRetryPolicy.default
+    /// Test seam: nanoseconds budget for `sync.snapshot` state capture (default 5s).
+    var snapshotReadTimeoutNanosecondsForTesting: UInt64?
+
 
     static let maximumAcceptedConnections = AcceptedSocketRegistry.defaultMaximumDescriptors
     var acceptedSocketCountForTests: Int { acceptedSockets.count }
@@ -1447,10 +1452,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
             throw POSIXError(POSIXErrorCode(rawValue: savedErrno) ?? .EIO)
         }
 
-        // Dual-stack: optional IPv6 listener. Failure is non-fatal so IPv4
-        // clients keep working (do not invent a relay or break v4-only paths).
-        listenFD6 = Self.bindIPv6Listener(port: port, loopbackOnly: bindLoopbackOnly)
-
+        // Publish health/discovery as soon as IPv4 is accepting. Dual-stack
+        // IPv6 is best-effort and must not delay loopback/LAN readiness.
         let acceptanceGeneration = acceptedSockets.activate()
         let listenerDescriptor = listenFD
         let t = Thread { [weak self] in
@@ -1462,19 +1465,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
         t.name = "RC2.HTTPAccept"
         t.start()
         accept = t
-
-        if listenFD6 >= 0 {
-            let v6 = listenFD6
-            let t6 = Thread { [weak self] in
-                self?.acceptLoop(
-                    listenerDescriptor: v6,
-                    acceptanceGeneration: acceptanceGeneration
-                )
-            }
-            t6.name = "RC2.HTTPAccept6"
-            t6.start()
-            accept6 = t6
-        }
 
         let bindAddr = bindLoopbackOnly ? "127.0.0.1" : "0.0.0.0"
         let successPayload = serverListenerEventPayload(bound: true, address: bindAddr, port: port)
@@ -1492,6 +1482,22 @@ public final class DirectHTTPServer: @unchecked Sendable {
             nextRetryMs: nil,
             errorCode: nil
         )
+
+        // Dual-stack: optional IPv6 listener after IPv4 is already published.
+        // Failure is non-fatal so IPv4 clients keep working.
+        listenFD6 = Self.bindIPv6Listener(port: port, loopbackOnly: bindLoopbackOnly)
+        if listenFD6 >= 0 {
+            let v6 = listenFD6
+            let t6 = Thread { [weak self] in
+                self?.acceptLoop(
+                    listenerDescriptor: v6,
+                    acceptanceGeneration: acceptanceGeneration
+                )
+            }
+            t6.name = "RC2.HTTPAccept6"
+            t6.start()
+            accept6 = t6
+        }
     }
 
     public func stop() {
@@ -2872,29 +2878,27 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
         switch (method, path) {
         case ("GET", "/healthz"):
+            // Liveness only: independent of WebSocket sessions and snapshot work.
             send(fd: fd, status: 200, contentType: "text/plain", body: "ok\n".data(using: .utf8)!)
         case ("GET", "/v1/health"):
             // IMP-MAC_SERVER_SYNC-009: authenticated sync diagnostics so
             // power users / support can answer "why is sync slow". Gated by
             // the /v1 auth check above (not in the exempt list). Sourced from
-            // EventBus's public snapshot — last emitted seq plus the retained
-            // replay window (count + encoded bytes) the client re-baselines
-            // against. Connection-level metrics (active WS clients, backpressure,
-            // slow-client evictions) are sourced from wsTracker.
-            let snap = EventBus.shared.snapshot()
-            let retainedBytes = snap.recent.reduce(0) { acc, ev in
-                acc + ((try? JSONEncoder().encode(ev).count) ?? 0)
-            }
+            // EventBus health counters (no re-encode of retained events) plus
+            // connection/phase aggregates. Independent of any live WebSocket.
+            let events = EventBus.shared.healthCounters()
             let receiptMetrics = commandReceiptMetrics.snapshot()
+            let phaseMetrics = requestPhaseMetrics.snapshot()
             let body: [String: Any] = [
                 "status": "ok",
                 "server_id": serverId,
                 "server_time": Date().timeIntervalSince1970,
+                "listener_state": listenerPublicationState.rawValue,
                 "events": [
-                    "last_seq": snap.lastSeq,
-                    "retained_count": snap.recent.count,
-                    "retained_bytes": retainedBytes,
-                    "oldest_retained_seq": snap.recent.first?.seq ?? 0
+                    "last_seq": events.lastSeq,
+                    "retained_count": events.retainedCount,
+                    "retained_bytes": events.retainedBytes,
+                    "oldest_retained_seq": events.oldestRetainedSeq
                 ],
                 "connections": connectionMetricsJSON(
                     activeClients: wsTracker.activeClients,
@@ -2905,6 +2909,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     framesRejectedOrEvicted: wsTracker.framesRejectedOrEvicted,
                     outboundQueueWait: wsTracker.outboundQueueWaitMetrics
                 ),
+                "request_phases": Self.requestPhaseMetricsJSON(phaseMetrics),
                 "command_receipts": [
                     "claims_total": receiptMetrics.claimsTotal,
                     "new_claims_total": receiptMetrics.newClaimsTotal,
@@ -2948,6 +2953,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // closing, so subsequent RPCs reuse this TCP connection.
             // Only Sendable values are captured by value; subID is nil on
             // this path and is intentionally not touched by the Task.
+            //
+            // Disconnect mid-RPC: a watchdog cancels the work Task when the
+            // accepted socket is closed so slow snapshots cannot keep CPU
+            // after the peer is gone. HTTP remains independent of WS queues.
             handedOff = true
             let ae = headers["accept-encoding"]
             let registry = acceptedSockets
@@ -2957,20 +2966,61 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // priority so stop/input/control Tasks can preempt on the host.
             // Does not change wire fields, response routing, or method behavior.
             let rpcTaskPriority = RPCDispatchSchedulerClass.taskPriority(for: bodyData)
+            let admitStarted = DispatchTime.now().uptimeNanoseconds
             Task(priority: rpcTaskPriority) { [weak self] in
                 guard let self else {
                     registry.close(fd)
                     return
                 }
-                let respData = await self.dispatchRPC(
-                    bodyData: bodyData,
-                    ownerFingerprint: requestOwnerFingerprint
+                self.requestPhaseMetrics.record(
+                    .admit,
+                    latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: admitStarted)
                 )
+                let work = Task(priority: rpcTaskPriority) {
+                    await self.dispatchRPC(
+                        bodyData: bodyData,
+                        ownerFingerprint: requestOwnerFingerprint
+                    )
+                }
+                let watchdog = Task {
+                    while !Task.isCancelled {
+                        if !registry.isActive(fd) || !Self.isRPCPeerConnected(fd: fd) {
+                            registry.close(fd)
+                            work.cancel()
+                            return
+                        }
+                        do {
+                            try await Task.sleep(nanoseconds: 5_000_000)
+                        } catch {
+                            return
+                        }
+                    }
+                }
+                let respData = await work.value
+                watchdog.cancel()
+                _ = await watchdog.result
                 guard registry.isActive(fd) else {
+                    self.requestPhaseMetrics.recordCancelled()
                     registry.close(fd)
                     return
                 }
-                self.send(fd: fd, status: 200, contentType: "application/json", body: respData, acceptEncoding: ae)
+                let writeStarted = DispatchTime.now().uptimeNanoseconds
+                let wrote = self.send(
+                    fd: fd,
+                    status: 200,
+                    contentType: "application/json",
+                    body: respData,
+                    acceptEncoding: ae
+                )
+                self.requestPhaseMetrics.record(
+                    .responseWrite,
+                    latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: writeStarted)
+                )
+                if !wrote {
+                    self.requestPhaseMetrics.recordWriteAborted()
+                    registry.close(fd)
+                    return
+                }
                 if rpcClientClose || !registry.isActive(fd) {
                     registry.close(fd)
                     return
@@ -3201,6 +3251,41 @@ public final class DirectHTTPServer: @unchecked Sendable {
         }
     }
 
+    nonisolated static func requestPhaseMetricsJSON(
+        _ metrics: HTTPRequestPhaseMetricsSnapshot
+    ) -> [String: Any] {
+        func lane(_ value: HTTPRequestPhaseLaneSnapshot) -> [String: Any] {
+            [
+                "count": value.count,
+                "total": value.totalMilliseconds.isFinite ? max(0, value.totalMilliseconds) : 0,
+                "max": value.maxMilliseconds.isFinite ? max(0, value.maxMilliseconds) : 0,
+            ]
+        }
+        return [
+            "admit_ms": lane(metrics.admit),
+            "snapshot_read_ms": lane(metrics.snapshotRead),
+            "snapshot_encode_ms": lane(metrics.snapshotEncode),
+            "response_write_ms": lane(metrics.responseWrite),
+            "cancelled_total": metrics.cancelledTotal,
+            "timed_out_total": metrics.timedOutTotal,
+            "fence_retry_total": metrics.fenceRetryTotal,
+            "fence_exhausted_total": metrics.fenceExhaustedTotal,
+            "write_aborted_total": metrics.writeAbortedTotal,
+        ]
+    }
+
+    /// Non-consuming peer probe for the handed-off RPC socket. Registry state
+    /// alone cannot observe a remote FIN while no request reader owns the fd.
+    nonisolated static func isRPCPeerConnected(fd: Int32) -> Bool {
+        var byte: UInt8 = 0
+        let result = withUnsafeMutableBytes(of: &byte) { buffer in
+            Darwin.recv(fd, buffer.baseAddress, 1, MSG_PEEK | MSG_DONTWAIT)
+        }
+        if result > 0 { return true }
+        if result == 0 { return false }
+        return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR
+    }
+
     /// QA-003: pure async request/response seam — decode → dispatch →
     /// encode with no semaphore and no socket. Lets framing, compression,
     /// and auth-gating be unit-tested deterministically by feeding body
@@ -3297,16 +3382,19 @@ public final class DirectHTTPServer: @unchecked Sendable {
         // host/boot/owner/watermark gates as the legacy full path.
         if let object = root as? [String: Any],
            let method = object["method"] as? String {
+            let phaseMetrics = wireTransport == .http ? requestPhaseMetrics : nil
             switch method {
             case "sync.snapshot":
                 return await dispatchSyncSnapshotRPCData(
                     object,
-                    ownerFingerprint: ownerFingerprint
+                    ownerFingerprint: ownerFingerprint,
+                    phaseMetrics: phaseMetrics
                 )
             case "sync.snapshot.begin":
                 return await dispatchSyncSnapshotBeginRPCData(
                     object,
-                    ownerFingerprint: ownerFingerprint
+                    ownerFingerprint: ownerFingerprint,
+                    phaseMetrics: phaseMetrics
                 )
             case "sync.snapshot.chunk":
                 return await dispatchSyncSnapshotChunkRPCData(
@@ -3521,7 +3609,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// C-24: single-encode `sync.snapshot` JSON-RPC success path.
     private func dispatchSyncSnapshotRPCData(
         _ object: [String: Any],
-        ownerFingerprint: String
+        ownerFingerprint: String,
+        phaseMetrics: HTTPRequestPhaseMetrics?
     ) async -> Data {
         let fallbackID = strictRPCID(
             object["id"],
@@ -3542,7 +3631,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return await encodeSyncSnapshotResponse(
             rawParams: rawParams,
             wireID: wireID,
-            ownerFingerprint: ownerFingerprint
+            ownerFingerprint: ownerFingerprint,
+            phaseMetrics: phaseMetrics
         )
     }
 
@@ -3589,7 +3679,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
     private func encodeSyncSnapshotResponse(
         rawParams: [String: Any],
         wireID: Any,
-        ownerFingerprint: String
+        ownerFingerprint: String,
+        phaseMetrics: HTTPRequestPhaseMetrics? = nil
     ) async -> Data {
         // Wave 4: optional knownDomainRevisions enables partial/delta snapshots.
         let allowedKeys: Set<String> = [
@@ -3676,7 +3767,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
             if let watermark, !snapshotAdopted { watermark.cancelSnapshot() }
         }
         do {
-            let snapshot = try await dispatcher.readConnectionSnapshot()
+            let snapshot = try await dispatcher.readConnectionSnapshot(
+                timeoutNanoseconds: snapshotReadTimeoutNanosecondsForTesting
+                    ?? JSONRPCDispatcher.connectionSnapshotTimeoutNanoseconds,
+                phaseMetrics: phaseMetrics
+            )
             if let watermark {
                 guard activeWebSocketConnections.watermark(
                     for: connectionID,
@@ -3734,7 +3829,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 id: SnapshotRPCWireID(wireID),
                 result: frame
             )
+            let encodeStarted = DispatchTime.now().uptimeNanoseconds
             let data = try JSONEncoder().encode(envelope)
+            phaseMetrics?.record(
+                .snapshotEncode,
+                latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: encodeStarted)
+            )
             // Same absolute ceiling as a bare transport frame (plus small RPC wrap).
             guard data.count <= ConnectionTransportFrame.maximumEncodedBytes + 256 else {
                 return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
@@ -3751,7 +3851,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
     private func dispatchSyncSnapshotBeginRPCData(
         _ object: [String: Any],
-        ownerFingerprint: String
+        ownerFingerprint: String,
+        phaseMetrics: HTTPRequestPhaseMetrics?
     ) async -> Data {
         let fallbackID = strictRPCID(
             object["id"],
@@ -3772,7 +3873,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return await encodeSyncSnapshotBeginResponse(
             rawParams: rawParams,
             wireID: wireID,
-            ownerFingerprint: ownerFingerprint
+            ownerFingerprint: ownerFingerprint,
+            phaseMetrics: phaseMetrics
         )
     }
 
@@ -3811,7 +3913,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
     private func encodeSyncSnapshotBeginResponse(
         rawParams: [String: Any],
         wireID: Any,
-        ownerFingerprint: String
+        ownerFingerprint: String,
+        phaseMetrics: HTTPRequestPhaseMetrics? = nil
     ) async -> Data {
         let allowedKeys: Set<String> = [
             "connectionId", "expectedHostId", "expectedBootEpoch", "supportedStateVersion",
@@ -3914,7 +4017,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
             if let watermark, !reservationHeld { watermark.cancelSnapshot() }
         }
         do {
-            let snapshot = try await dispatcher.readConnectionSnapshot()
+            let snapshot = try await dispatcher.readConnectionSnapshot(
+                timeoutNanoseconds: snapshotReadTimeoutNanosecondsForTesting
+                    ?? JSONRPCDispatcher.connectionSnapshotTimeoutNanoseconds,
+                phaseMetrics: phaseMetrics
+            )
             if let watermark {
                 guard activeWebSocketConnections.watermark(
                     for: connectionID,
@@ -3948,7 +4055,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 state: state
             )
             // Encode the authoritative frame once — chunks resume these bytes.
+            let encodeStarted = DispatchTime.now().uptimeNanoseconds
             let frameBytes = try JSONEncoder().encode(frame)
+            phaseMetrics?.record(
+                .snapshotEncode,
+                latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: encodeStarted)
+            )
             guard frameBytes.count <= ConnectionTransportFrame.maximumEncodedBytes else {
                 return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
             }
@@ -5162,7 +5274,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
         )
     }
 
-    private func send(fd: Int32, status: Int, contentType: String, body: Data, acceptEncoding: String? = nil, additionalHeaders: [String: String] = [:]) {
+    @discardableResult
+    private func send(fd: Int32, status: Int, contentType: String, body: Data, acceptEncoding: String? = nil, additionalHeaders: [String: String] = [:]) -> Bool {
         var responseBody = body
         var extraHeaders = ""
         if contentType.contains("application/json"),
@@ -5183,10 +5296,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
         // instead of concatenating into one Data — avoids a full-body copy
         // per response, which doubled transient memory for large payloads
         // (agent.message.list / git.diff).
-        guard writeAll(fd: fd, data: Data(head.utf8)) else { return }
+        guard writeAll(fd: fd, data: Data(head.utf8)) else { return false }
         if !responseBody.isEmpty {
-            _ = writeAll(fd: fd, data: responseBody)
+            return writeAll(fd: fd, data: responseBody)
         }
+        return true
     }
 
     enum StaticFileByteRange: Equatable {

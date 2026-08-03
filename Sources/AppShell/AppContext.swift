@@ -299,6 +299,8 @@ public final class AppContext {
     public let turnCheckpointRepo: AgentTurnCheckpointRepository
     /// Off-MainActor owner for `agent.checkpoint.list` metadata pages.
     public let checkpointListGateway: AgentTurnCheckpointListGateway
+    /// Off-MainActor owner for connection-snapshot AgentThread list/decode.
+    public let agentThreadListGateway: AgentThreadListGateway
     public let tokenSaverSavingsRepo: TokenSaverSavingsRepository
     public let tokenSaverDailyEconomyRepo: TokenSaverDailyEconomyRepository
     public let graphifyUsageRepo: GraphifyUsageRepository
@@ -494,6 +496,7 @@ public final class AppContext {
         self.proposedPlanRepo = AgentProposedPlanRepository(db: db)
         self.turnCheckpointRepo = AgentTurnCheckpointRepository(db: db)
         self.checkpointListGateway = AgentTurnCheckpointListGateway(db: db)
+        self.agentThreadListGateway = AgentThreadListGateway(db: db)
         self.tokenSaverSavingsRepo = TokenSaverSavingsRepository(db: db)
         self.tokenSaverDailyEconomyRepo = TokenSaverDailyEconomyRepository(db: db)
         self.graphifyUsageRepo = GraphifyUsageRepository(db: db)

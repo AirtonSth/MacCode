@@ -565,7 +565,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    public func readConnectionSnapshotState() throws -> ConnectionSnapshotReadState {
+    public func readConnectionSnapshotState() async throws -> ConnectionSnapshotReadState {
         guard let ctx = context else {
             return ConnectionSnapshotReadState(
                 selectedWorkspaceId: nil,
@@ -578,15 +578,31 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         let workspaceIDs = ctx.state.window.workspaces
         let workspaces = workspaceIDs.compactMap { ctx.state.workspaces[$0] }
-        let threads = try ctx.threadRepo.list(workspaceId: nil)
+        // Capture all MainActor-owned layout/surface inputs before suspending for
+        // SQLite. Otherwise a local persistence/layout callback can run during
+        // the await and mix two host-state versions in one snapshot.
+        var descriptorsByWorkspace: [String: [SurfaceDescriptor]] = [:]
+        var browserURLs: [String: String] = [:]
+        for workspace in workspaces {
+            var descriptors: [SurfaceDescriptor] = []
+            forEachSurface(in: workspace.layout) { descriptors.append($0) }
+            descriptorsByWorkspace[workspace.id.value.uuidString] = descriptors
+            for descriptor in descriptors where descriptor.type == .browser {
+                browserURLs[descriptor.id.value.uuidString] =
+                    (try? browserSurface(descriptor.id).currentURL())
+                    ?? descriptor.metadata["url"]
+                    ?? ""
+            }
+        }
+        // SQLite list/decode must never run on MainActor (Dispatcher is @MainActor).
+        let threads = try await ctx.agentThreadListGateway.list(workspaceId: nil)
         var surfaceGroups: [ConnectionSnapshotWorkspaceItems] = []
         var threadGroups: [ConnectionSnapshotWorkspaceItems] = []
         var browserStates: [ConnectionSnapshotSurfaceState] = []
         var filesStates: [ConnectionSnapshotSurfaceState] = []
 
         for workspace in workspaces {
-            var descriptors: [SurfaceDescriptor] = []
-            forEachSurface(in: workspace.layout) { descriptors.append($0) }
+            let descriptors = descriptorsByWorkspace[workspace.id.value.uuidString] ?? []
             let workspaceThreads = threads
                 .filter { $0.workspaceId == workspace.id }
                 .sorted { $0.id.value.uuidString < $1.id.value.uuidString }
@@ -607,7 +623,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             for descriptor in descriptors {
                 switch descriptor.type {
                 case .browser:
-                    let url = (try? browserSurface(descriptor.id).currentURL())
+                    let url = browserURLs[descriptor.id.value.uuidString]
                         ?? descriptor.metadata["url"]
                         ?? ""
                     browserStates.append(ConnectionSnapshotSurfaceState(
