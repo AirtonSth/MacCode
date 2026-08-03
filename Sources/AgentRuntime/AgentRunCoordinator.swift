@@ -901,9 +901,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// Seconds a checkpoint revert stays reversible after it runs.
     public static let checkpointRevertUndoWindow: TimeInterval = 10
     private let lock = NSLock()
-    /// Serializes persisted AssistantEvent snapshots with their EventBus
-    /// publication. The recursive form also tolerates persistence diagnostics
-    /// emitted while a buffered snapshot is being flushed.
+    /// Serializes stream-buffer mutation, SQLite flush, and resume-cursor writes
+    /// against mirror snapshot capture. Must not be held across observer /
+    /// onAssistantEvent fan-out or stopRun — host callbacks can block on main
+    /// while the HTTP mirror path waits on this lock. Recursive so nested
+    /// flush helpers can re-enter during a snapshot barrier.
     private let mirrorEventLock = NSRecursiveLock()
     private static let externalReceiptLeaseRenewalInterval: TimeInterval = 6 * 60 * 60
     private static let externalReceiptLeaseRetryInterval: TimeInterval = 60
@@ -3892,43 +3894,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     return
                 }
             }
-            mirrorEventLock.lock()
-            defer { mirrorEventLock.unlock() }
-            lock.lock()
-            let priorBufferedRunId = pendingStreamRunIds[threadId].flatMap { owner in
-                owner == runId ? nil : owner
-            }
-            lock.unlock()
-            if let priorBufferedRunId {
-                _ = flushPendingStreamWritesResult(
-                    runId: priorBufferedRunId,
-                    threadId: threadId
-                )
-            }
-            // A failed SQLite flush must not turn the retry prefix into an
-            // unbounded spool. Before accepting another provider event, retry a
-            // prefix that already reached either high-water mark. If it is still
-            // locked, stop the provider at the durable resume cursor and fail
-            // loud; the retained prefix remains available for a later retry.
-            lock.lock()
-            let saturatedRetry = pendingStreamWrites[threadId].map {
-                Self.shouldFlushStreamBatch(
-                    pendingCount: $0.count,
-                    pendingBytes: $0.encodedByteCount,
-                    sinceLastFlushMs: 0
-                )
-            } ?? false
-            lock.unlock()
-            if saturatedRetry,
-               let retryError = flushPendingStreamWritesResult(runId: runId, threadId: threadId) {
-                recordMirrorPersistenceFailure(retryError, threadId: threadId)
-                emitPersistenceIssue("run.stream_event.retry_saturated", error: retryError, runId: runId, threadId: threadId)
-                stopRun(runId)
-                return
-            }
-            lock.lock()
-            let s = allocateStreamSequenceLocked(runId: runId, threadId: threadId)
-            lock.unlock()
+            // Encode/compact outside the mirror lock. Sequence allocation and
+            // buffer ownership still require the lock; encoding does not.
             let data: Data?
             do {
                 data = try streamEventEncoder.encode(ev)
@@ -3937,11 +3904,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 emitPersistenceIssue("run.stream_event.encode", error: error, runId: runId, threadId: threadId)
                 data = nil
             }
-            // PERF-MAC_AGENT-007: buffer the per-event writes (stream event +
-            // optional provider-event log) and flush them in batches instead of
-            // 2-3 synchronous transactions per delta. Prune cadence and diagnostics
-            // are coalesced into the flush. The payload compactor runs outside the
-            // lock (as before) since it is an external, structure-preserving call.
+            let preparedWrite: (payloadJSON: String, providerEvent: ProviderRuntimeEvent?)?
             if let data, let json = String(data: data, encoding: .utf8) {
                 let payloadJSON = Self.boundedPersistedStreamPayload(
                     streamPayloadCompactor?(json) ?? json
@@ -3949,144 +3912,235 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 let providerEvent: ProviderRuntimeEvent?
                 if case .providerRuntime(let runtimeEvent) = ev {
                     providerEvent = Self.boundedProviderRuntimeEvent(runtimeEvent)
-                } else { providerEvent = nil }
-                lock.lock()
-                if let owner = pendingStreamRunIds[threadId], owner != runId {
-                    lock.unlock()
-                    let error = NSError(
-                        domain: "RemoteCode.AgentRunCoordinator",
-                        code: 409,
-                        userInfo: [NSLocalizedDescriptionKey: "Buffered mirror events changed run ownership."]
-                    )
-                    recordMirrorPersistenceFailure(error, threadId: threadId)
-                    emitPersistenceIssue("run.stream_event.owner", error: error, runId: runId, threadId: threadId)
-                    return
+                } else {
+                    providerEvent = nil
                 }
-                var batch = pendingStreamWrites[threadId] ?? StreamWriteBatch()
-                batch.append(StreamWriteItem(seq: s, kind: ev.debugDescription, payloadJSON: payloadJSON, providerEvent: providerEvent))
-                pendingStreamWrites[threadId] = batch
-                pendingStreamRunIds[threadId] = runId
-                // Prune at most once per `streamEventPruneInterval` events per thread.
-                let pruneCount = (streamEventsSincePrune[threadId] ?? 0) + 1
-                let pruneDue = pruneCount >= Self.streamEventPruneInterval
-                streamEventsSincePrune[threadId] = pruneDue ? 0 : pruneCount
-                if pruneDue { pendingStreamPrunes.insert(threadId) }
-                let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-                let lastMs = lastStreamFlushMs[threadId] ?? nowMs
-                lastStreamFlushMs[threadId] = lastStreamFlushMs[threadId] ?? nowMs
-                var flushNow: BatchFlush?
-                if Self.shouldFlushStreamBatch(
-                    pendingCount: batch.count,
-                    pendingBytes: batch.encodedByteCount,
-                    sinceLastFlushMs: nowMs - lastMs
-                ) || pruneDue {
-                    flushNow = takeStreamFlushLocked(threadId: threadId, pruneDue: pruneDue, nowMs: nowMs)
-                }
-                lock.unlock()
-                if let flushNow {
-                    flushStreamWrites(flushNow, runId: runId, threadId: threadId)
-                }
+                preparedWrite = (payloadJSON, providerEvent)
+            } else {
+                preparedWrite = nil
             }
-            switch ev {
-            case .threadStarted(let eventThreadId, let providerThreadId):
-                let resumeCursor = providerThreadId ?? eventThreadId
-                do {
-                    if var session = try providerSessionRepo?.get(threadId: threadId) {
-                        var payload = ProviderSessionRuntimePayload.decode(session.runtimePayloadJSON)
-                        session.resumeCursor = resumeCursor
-                        payload.providerThreadId = resumeCursor
-                        payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
-                        session.runtimePayloadJSON = payload.encoded()
-                        session.updatedAt = Date()
-                        try providerSessionRepo?.upsert(session)
-                    }
-                    if var thread = try threadRepo.get(id: threadId) {
-                        thread.providerThreadId = resumeCursor
-                        thread.updatedAt = Date()
-                        try threadRepo.upsert(thread)
-                    }
-                } catch {
-                    emitPersistenceIssue("provider_session.resume_cursor.update", error: error, runId: runId, threadId: threadId)
-                }
-            case .providerRuntime(let runtimeEvent):
-                updateProviderRuntimePayloadFromProviderEvent(runtimeEvent, threadId: threadId, runId: runId)
-            case .turnStarted(let turnId):
+
+            // Hold mirrorEventLock only for durability + resume-cursor serialization.
+            // Never notify observers / onAssistantEvent (or stopRun) while the lock
+            // is held: host callbacks can block on main-queue work, and the HTTP
+            // mirror snapshot path waits on this same lock on the main actor.
+            enum MirrorEventPostAction {
+                case publish
+                case saturatedRetry(Error)
+                case ownerConflict(Error)
+                case activePlanBudget(Error)
+                case resumeCursorFailure(Error)
+            }
+            let postAction: MirrorEventPostAction = {
+                mirrorEventLock.lock()
+                defer { mirrorEventLock.unlock() }
+
                 lock.lock()
-                activeTurnIds[runId] = turnId
+                let priorBufferedRunId = pendingStreamRunIds[threadId].flatMap { owner in
+                    owner == runId ? nil : owner
+                }
                 lock.unlock()
-                updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
-                    payload.activeTurnId = turnId
-                    payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
-                }
-            case .requestOpened(let request):
-                updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
-                    payload.pendingApprovalRequestIds = Self.boundedRuntimeIdentifiers(
-                        existing: payload.pendingApprovalRequestIds,
-                        adding: request.id
+                if let priorBufferedRunId {
+                    _ = flushPendingStreamWritesResult(
+                        runId: priorBufferedRunId,
+                        threadId: threadId
                     )
-                    payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
                 }
-            case .requestResolved(let requestId, _):
-                updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
-                    payload.pendingApprovalRequestIds.removeAll { $0 == requestId }
-                    payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
-                }
-            case .userInputRequested(let request):
-                updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
-                    payload.pendingUserInputRequestIds = Self.boundedRuntimeIdentifiers(
-                        existing: payload.pendingUserInputRequestIds,
-                        adding: request.id
-                    )
-                    payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
-                }
-            case .userInputResolved(let requestId, _):
-                updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
-                    payload.pendingUserInputRequestIds.removeAll { $0 == requestId }
-                    payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
-                }
-            case .turnCompleted(let turnId, let finalMessage):
+                // A failed SQLite flush must not turn the retry prefix into an
+                // unbounded spool. Before accepting another provider event, retry a
+                // prefix that already reached either high-water mark. If it is still
+                // locked, stop the provider at the durable resume cursor and fail
+                // loud; the retained prefix remains available for a later retry.
                 lock.lock()
-                activeTurnIds[runId] = turnId
+                let saturatedRetry = pendingStreamWrites[threadId].map {
+                    Self.shouldFlushStreamBatch(
+                        pendingCount: $0.count,
+                        pendingBytes: $0.encodedByteCount,
+                        sinceLastFlushMs: 0
+                    )
+                } ?? false
                 lock.unlock()
-                if let msg = finalMessage,
-                   let persisted = persistAssistantIfMissing(msg, threadId: threadId, runId: runId) {
+                if saturatedRetry,
+                   let retryError = flushPendingStreamWritesResult(runId: runId, threadId: threadId) {
+                    recordMirrorPersistenceFailure(retryError, threadId: threadId)
+                    return .saturatedRetry(retryError)
+                }
+
+                lock.lock()
+                let s = allocateStreamSequenceLocked(runId: runId, threadId: threadId)
+                lock.unlock()
+                // PERF-MAC_AGENT-007: buffer the per-event writes (stream event +
+                // optional provider-event log) and flush them in batches instead of
+                // 2-3 synchronous transactions per delta. Prune cadence and diagnostics
+                // are coalesced into the flush.
+                if let preparedWrite {
                     lock.lock()
-                    activeAssistantMessageIds[runId] = persisted.id
+                    if let owner = pendingStreamRunIds[threadId], owner != runId {
+                        lock.unlock()
+                        let error = NSError(
+                            domain: "RemoteCode.AgentRunCoordinator",
+                            code: 409,
+                            userInfo: [NSLocalizedDescriptionKey: "Buffered mirror events changed run ownership."]
+                        )
+                        recordMirrorPersistenceFailure(error, threadId: threadId)
+                        return .ownerConflict(error)
+                    }
+                    var batch = pendingStreamWrites[threadId] ?? StreamWriteBatch()
+                    batch.append(StreamWriteItem(
+                        seq: s,
+                        kind: ev.debugDescription,
+                        payloadJSON: preparedWrite.payloadJSON,
+                        providerEvent: preparedWrite.providerEvent
+                    ))
+                    pendingStreamWrites[threadId] = batch
+                    pendingStreamRunIds[threadId] = runId
+                    // Prune at most once per `streamEventPruneInterval` events per thread.
+                    let pruneCount = (streamEventsSincePrune[threadId] ?? 0) + 1
+                    let pruneDue = pruneCount >= Self.streamEventPruneInterval
+                    streamEventsSincePrune[threadId] = pruneDue ? 0 : pruneCount
+                    if pruneDue { pendingStreamPrunes.insert(threadId) }
+                    let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+                    let lastMs = lastStreamFlushMs[threadId] ?? nowMs
+                    lastStreamFlushMs[threadId] = lastStreamFlushMs[threadId] ?? nowMs
+                    var flushNow: BatchFlush?
+                    if Self.shouldFlushStreamBatch(
+                        pendingCount: batch.count,
+                        pendingBytes: batch.encodedByteCount,
+                        sinceLastFlushMs: nowMs - lastMs
+                    ) || pruneDue {
+                        flushNow = takeStreamFlushLocked(threadId: threadId, pruneDue: pruneDue, nowMs: nowMs)
+                    }
                     lock.unlock()
-                }
-                if finalMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
-                    updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
-                        payload.activePlan = nil
-                        payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                    if let flushNow {
+                        flushStreamWrites(flushNow, runId: runId, threadId: threadId)
                     }
                 }
-            case .activePlanUpdated(let plan):
-                guard Self.activePlanFitsCompactBudget(plan) else {
-                    let error = NSError(
-                        domain: "RemoteCode.AgentRunCoordinator",
-                        code: 413,
-                        userInfo: [NSLocalizedDescriptionKey: "Active plan exceeds the compact recovery-state budget."]
-                    )
-                    emitPersistenceIssue("provider_session.active_plan.budget", error: error, runId: runId, threadId: threadId)
-                    stopRun(runId)
-                    return
+
+                var resumeCursorFailure: Error?
+                switch ev {
+                case .threadStarted(let eventThreadId, let providerThreadId):
+                    let resumeCursor = providerThreadId ?? eventThreadId
+                    do {
+                        if var session = try providerSessionRepo?.get(threadId: threadId) {
+                            var payload = ProviderSessionRuntimePayload.decode(session.runtimePayloadJSON)
+                            session.resumeCursor = resumeCursor
+                            payload.providerThreadId = resumeCursor
+                            payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                            session.runtimePayloadJSON = payload.encoded()
+                            session.updatedAt = Date()
+                            try providerSessionRepo?.upsert(session)
+                        }
+                        if var thread = try threadRepo.get(id: threadId) {
+                            thread.providerThreadId = resumeCursor
+                            thread.updatedAt = Date()
+                            try threadRepo.upsert(thread)
+                        }
+                    } catch {
+                        resumeCursorFailure = error
+                    }
+                case .providerRuntime(let runtimeEvent):
+                    updateProviderRuntimePayloadFromProviderEvent(runtimeEvent, threadId: threadId, runId: runId)
+                case .turnStarted(let turnId):
+                    lock.lock()
+                    activeTurnIds[runId] = turnId
+                    lock.unlock()
+                    updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                        payload.activeTurnId = turnId
+                        payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                    }
+                case .requestOpened(let request):
+                    updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                        payload.pendingApprovalRequestIds = Self.boundedRuntimeIdentifiers(
+                            existing: payload.pendingApprovalRequestIds,
+                            adding: request.id
+                        )
+                        payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                    }
+                case .requestResolved(let requestId, _):
+                    updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                        payload.pendingApprovalRequestIds.removeAll { $0 == requestId }
+                        payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                    }
+                case .userInputRequested(let request):
+                    updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                        payload.pendingUserInputRequestIds = Self.boundedRuntimeIdentifiers(
+                            existing: payload.pendingUserInputRequestIds,
+                            adding: request.id
+                        )
+                        payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                    }
+                case .userInputResolved(let requestId, _):
+                    updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                        payload.pendingUserInputRequestIds.removeAll { $0 == requestId }
+                        payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                    }
+                case .turnCompleted(let turnId, let finalMessage):
+                    lock.lock()
+                    activeTurnIds[runId] = turnId
+                    lock.unlock()
+                    if let msg = finalMessage,
+                       let persisted = persistAssistantIfMissing(msg, threadId: threadId, runId: runId) {
+                        lock.lock()
+                        activeAssistantMessageIds[runId] = persisted.id
+                        lock.unlock()
+                    }
+                    if finalMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+                        updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                            payload.activePlan = nil
+                            payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                        }
+                    }
+                case .activePlanUpdated(let plan):
+                    guard Self.activePlanFitsCompactBudget(plan) else {
+                        return .activePlanBudget(NSError(
+                            domain: "RemoteCode.AgentRunCoordinator",
+                            code: 413,
+                            userInfo: [NSLocalizedDescriptionKey: "Active plan exceeds the compact recovery-state budget."]
+                        ))
+                    }
+                    updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                        payload.activePlan = plan
+                        payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                    }
+                case .error(let message, _):
+                    // Same durable reason seam as AgentRunEvent.error — stream-level
+                    // error rows must also fill agent_runs.error_message on terminal.
+                    lock.lock()
+                    latestRunErrorMessages[runId] = message
+                    lock.unlock()
+                default:
+                    break
                 }
-                updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
-                    payload.activePlan = plan
-                    payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+
+                if let resumeCursorFailure {
+                    return .resumeCursorFailure(resumeCursorFailure)
                 }
-            case .error(let message, _):
-                // Same durable reason seam as AgentRunEvent.error — stream-level
-                // error rows must also fill agent_runs.error_message on terminal.
-                lock.lock()
-                latestRunErrorMessages[runId] = message
-                lock.unlock()
-            default:
+                return .publish
+            }()
+
+            switch postAction {
+            case .saturatedRetry(let error):
+                emitPersistenceIssue("run.stream_event.retry_saturated", error: error, runId: runId, threadId: threadId)
+                stopRun(runId)
+                return
+            case .ownerConflict(let error):
+                emitPersistenceIssue("run.stream_event.owner", error: error, runId: runId, threadId: threadId)
+                return
+            case .activePlanBudget(let error):
+                emitPersistenceIssue("provider_session.active_plan.budget", error: error, runId: runId, threadId: threadId)
+                stopRun(runId)
+                return
+            case .resumeCursorFailure(let error):
+                emitPersistenceIssue("provider_session.resume_cursor.update", error: error, runId: runId, threadId: threadId)
+            case .publish:
                 break
             }
+
             for observer in observersSnapshot() {
                 observer.runCoordinator(self, didReceive: ev, run: runId, threadId: threadId)
             }
+            // Preserve prior EventBus contract: publish whenever encode produced
+            // Data (even if UTF-8 conversion failed and no buffer row was written).
             if data != nil {
                 onAssistantEvent?(ev, threadId, runId)
             }
@@ -5620,51 +5674,70 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         threadId: AgentThreadID,
         runId: AgentRunID
     ) {
-        mirrorEventLock.lock()
-        defer { mirrorEventLock.unlock() }
+        // Persist under the mirror lock, then release before observer / EventBus
+        // fan-out. Host callbacks must not run while snapshot readers wait on
+        // the same lock (see provider-event handle path).
+        enum ImmediatePublishOutcome {
+            case published
+            case failed(operation: String, error: Error)
+        }
+        let outcome: ImmediatePublishOutcome = {
+            mirrorEventLock.lock()
+            defer { mirrorEventLock.unlock() }
 
-        lock.lock()
-        let eventSequence = allocateStreamSequenceLocked(runId: runId, threadId: threadId)
-        lock.unlock()
+            lock.lock()
+            let eventSequence = allocateStreamSequenceLocked(runId: runId, threadId: threadId)
+            lock.unlock()
 
-        let data: Data
-        do {
-            data = try streamEventEncoder.encode(event)
-        } catch {
-            recordMirrorPersistenceFailure(error, threadId: threadId)
-            emitPersistenceIssue("run.stream_event.encode", error: error, runId: runId, threadId: threadId)
-            return
-        }
-        guard let json = String(data: data, encoding: .utf8) else {
-            let error = NSError(
-                domain: "RemoteCode.AgentRunCoordinator",
-                code: 422,
-                userInfo: [NSLocalizedDescriptionKey: "AssistantEvent JSON was not UTF-8."]
-            )
-            recordMirrorPersistenceFailure(error, threadId: threadId)
-            emitPersistenceIssue("run.stream_event.encode", error: error, runId: runId, threadId: threadId)
-            return
-        }
-        do {
-            try runRepo.appendStreamEvent(
-                runId: runId,
-                seq: eventSequence,
-                kind: event.debugDescription,
-                payloadJSON: streamPayloadCompactor?(json) ?? json
-            )
-        } catch {
-            recordMirrorPersistenceFailure(error, threadId: threadId)
-            emitPersistenceIssue("run.stream_event.append", error: error, runId: runId, threadId: threadId)
-            return
-        }
-        do {
-            try providerSessionRepo?.updateDiagnostics(
-                threadId: threadId,
-                lastEventKind: event.debugDescription,
-                lastErrorMessage: nil
-            )
-        } catch {
-            emitPersistenceIssue("provider_session.diagnostics.update", error: error, runId: runId, threadId: threadId)
+            let data: Data
+            do {
+                data = try streamEventEncoder.encode(event)
+            } catch {
+                recordMirrorPersistenceFailure(error, threadId: threadId)
+                return .failed(operation: "run.stream_event.encode", error: error)
+            }
+            guard let json = String(data: data, encoding: .utf8) else {
+                let error = NSError(
+                    domain: "RemoteCode.AgentRunCoordinator",
+                    code: 422,
+                    userInfo: [NSLocalizedDescriptionKey: "AssistantEvent JSON was not UTF-8."]
+                )
+                recordMirrorPersistenceFailure(error, threadId: threadId)
+                return .failed(operation: "run.stream_event.encode", error: error)
+            }
+            do {
+                try runRepo.appendStreamEvent(
+                    runId: runId,
+                    seq: eventSequence,
+                    kind: event.debugDescription,
+                    payloadJSON: streamPayloadCompactor?(json) ?? json
+                )
+            } catch {
+                recordMirrorPersistenceFailure(error, threadId: threadId)
+                return .failed(operation: "run.stream_event.append", error: error)
+            }
+            do {
+                try providerSessionRepo?.updateDiagnostics(
+                    threadId: threadId,
+                    lastEventKind: event.debugDescription,
+                    lastErrorMessage: nil
+                )
+            } catch {
+                // Diagnostics failure is non-fatal to publication; emit after unlock.
+                return .failed(operation: "provider_session.diagnostics.update", error: error)
+            }
+            return .published
+        }()
+
+        switch outcome {
+        case .failed(let operation, let error):
+            emitPersistenceIssue(operation, error: error, runId: runId, threadId: threadId)
+            // Diagnostics-only failures still publish the already-persisted event.
+            if operation != "provider_session.diagnostics.update" {
+                return
+            }
+        case .published:
+            break
         }
         for observer in observersSnapshot() {
             observer.runCoordinator(self, didReceive: event, run: runId, threadId: threadId)

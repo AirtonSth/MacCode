@@ -2218,7 +2218,15 @@ public final class AppContext {
                 currentSessionUsedPercent: usage.currentSessionUsedPercent,
                 currentSessionResetsAt: usage.currentSessionResetsAtMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) }
             )
-            NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+            // WHY: live `.accountUsage` is emitted on the provider parse queue
+            // (Codex handleLine → coordinator → this method). Synchronous
+            // NotificationCenter.post waits for OperationQueue observers
+            // (queue: .main UI reloads) via waitUntilFinished and can deadlock
+            // the parse path against main/mirror locks (see hang evidence:
+            // remotecode.codex-app-server.parse blocked 745s). Schedule so the
+            // write returns without waiting on observers; MainActor Task +
+            // debounce match the token-usage write completion path.
+            scheduleTokenSaverUsageChangedNotification()
         } catch {
             NSLog("RemoteCode Token Saver account usage record failed: \(error)")
         }
@@ -2291,7 +2299,9 @@ public final class AppContext {
         do {
             _ = try TokenSaverUsageStore(appSupportDirectory: appSupportDirectory)
                 .clearAccountUsagePercentages(provider: provider)
-            NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+            // Same non-blocking path as recordTokenSaverAccountUsage — account-
+            // usage store mutations must not wait on NotificationCenter observers.
+            scheduleTokenSaverUsageChangedNotification()
         } catch {
             NSLog("RemoteCode Token Saver account usage clear failed (\(provider.rawValue)): \(error)")
         }

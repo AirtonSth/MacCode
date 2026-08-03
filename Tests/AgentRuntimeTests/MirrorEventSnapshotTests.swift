@@ -339,6 +339,86 @@ final class MirrorEventSnapshotTests: XCTestCase {
         )
     }
 
+    func testMirrorSnapshotDoesNotWaitBehindOnAssistantEventHostCallback() async throws {
+        // WHY: hang report (error2.txt) showed main HTTP mirror snapshot blocked on
+        // mirrorEventLock while the codex parse queue held that lock across
+        // handle -> onAssistantEvent -> NotificationCenter / NSOperation.wait.
+        // Host callbacks must run after the lock is released so snapshot/watermark
+        // capture cannot deadlock against provider event processing.
+        let appSupport = NSTemporaryDirectory() + "rc2-mirror-snapshot-host-callback-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: appSupport).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "host-callback", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let runner = ControlledMirrorRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: runner]
+        )
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: appSupport,
+            prompt: "test host callback lock scope"
+        ))
+
+        let callbackEntered = DispatchSemaphore(value: 0)
+        let releaseCallback = DispatchSemaphore(value: 0)
+        coordinator.onAssistantEvent = { event, _, _ in
+            guard case .turnStarted(let turnId) = event, turnId == "lock-scope-turn" else { return }
+            callbackEntered.signal()
+            releaseCallback.wait()
+        }
+
+        let emitFinished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            runner.emit(.event(.turnStarted(turnId: "lock-scope-turn")))
+            emitFinished.signal()
+        }
+        XCTAssertEqual(
+            callbackEntered.wait(timeout: .now() + 2),
+            .success,
+            "provider event must reach onAssistantEvent"
+        )
+
+        // While the host callback is still blocked, a concurrent mirror snapshot
+        // must complete. If handle still holds mirrorEventLock across the
+        // callback, this times out (same shape as the 745s hang).
+        let snapshotFinished = DispatchSemaphore(value: 0)
+        var snapshotError: Error?
+        var snapshotEvents: [AssistantEvent] = []
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                snapshotEvents = try coordinator.withMirrorEventSnapshot(threadId: thread.id) { $0 }
+            } catch {
+                snapshotError = error
+            }
+            snapshotFinished.signal()
+        }
+        XCTAssertEqual(
+            snapshotFinished.wait(timeout: .now() + 2),
+            .success,
+            "mirror snapshot must not block behind an in-flight onAssistantEvent host callback"
+        )
+        XCTAssertNil(snapshotError)
+        XCTAssertTrue(
+            snapshotEvents.contains {
+                if case .turnStarted(let turnId) = $0 { return turnId == "lock-scope-turn" }
+                return false
+            },
+            "snapshot taken during the host callback must still flush the buffered stream event"
+        )
+
+        releaseCallback.signal()
+        XCTAssertEqual(emitFinished.wait(timeout: .now() + 2), .success)
+    }
+
     func testBufferedEventsKeepTheirEmittingRunAcrossFailedStartAndRetry() async throws {
         let appSupport = NSTemporaryDirectory() + "rc2-mirror-snapshot-owner-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: appSupport) }
