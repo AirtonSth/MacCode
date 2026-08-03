@@ -144,6 +144,48 @@ final class ConnectionSnapshotRouterPhase3Tests: XCTestCase {
         _ = context
     }
 
+    func test_httpWorkspaceListAwaitsOffMainAuthoritativeReadAndProjectsBusy() async throws {
+        let (context, router) = try make()
+        let workspace = try router.createWorkspace(name: "HTTP list", cwd: "/tmp/http-list")
+        var thread = AgentThread(
+            workspaceId: workspace.id,
+            title: "Running HTTP thread",
+            provider: .codex,
+            model: "gpt-5"
+        )
+        thread.status = .running
+        try context.threadRepo.upsert(thread)
+
+        AgentThreadListGateway.resetExecutionProbesForTesting()
+        WorkspaceListGateway.resetExecutionProbesForTesting()
+        defer {
+            AgentThreadListGateway.resetExecutionProbesForTesting()
+            WorkspaceListGateway.resetExecutionProbesForTesting()
+        }
+
+        let response = await JSONRPCDispatcher(router: router).dispatchHTTP(
+            JSONRPCRequest(jsonrpc: "2.0", id: .string("workspace-list"), method: "workspace.list", params: [:]),
+            mutationContext: nil
+        )
+        XCTAssertNil(response.error, "workspace.list must not fail: \(response.error?.message ?? "unknown error")")
+
+        guard case .array(let values)? = response.result,
+              let listed = values.compactMap(\.objectValue).first(where: {
+                  $0["id"]?.objectValue?["value"]?.stringValue == workspace.id.value.uuidString
+              }) else {
+            return XCTFail("workspace.list must return the authoritative workspace array")
+        }
+        XCTAssertEqual(listed["id"]?.objectValue?["value"]?.stringValue, workspace.id.value.uuidString)
+        XCTAssertEqual(listed["metadata"]?.objectValue?["busy"], .string("true"),
+                       "HTTP workspace.list must preserve the running-thread busy projection")
+        XCTAssertEqual(AgentThreadListGateway.queryOnMainActorCountForTesting, 0,
+                       "workspace.list SQLite must execute through the off-MainActor thread gateway")
+        XCTAssertEqual(AgentThreadListGateway.queryOffMainActorCountForTesting, 1)
+        XCTAssertEqual(WorkspaceListGateway.projectionOnMainActorCountForTesting, 0,
+                       "workspace.list busy projection must not resume into MainActor work")
+        XCTAssertEqual(WorkspaceListGateway.projectionOffMainActorCountForTesting, 1)
+    }
+
     func test_realRouterSnapshot_returnsEmptyStateAfterContextDeallocation() async throws {
         var context: AppContext? = try makeContext()
         let router = AppCommandRouter(context: try XCTUnwrap(context))

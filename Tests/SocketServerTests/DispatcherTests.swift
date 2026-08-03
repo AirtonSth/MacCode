@@ -10,6 +10,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     var window = AppWindow()
 
     func listWorkspaces() throws -> [Workspace] { workspaces }
+    func listWorkspacesAuthoritative() async throws -> [Workspace] { workspaces }
     func currentWindow() throws -> AppWindow { window }
     func listWindows() throws -> [AppWindow] { [window] }
     func createWindow(title: String?) throws -> AppWindow { AppWindow(title: title ?? "w") }

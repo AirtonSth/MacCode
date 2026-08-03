@@ -565,6 +565,28 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
+    /// Authoritative workspace.list read for request/response transports.
+    /// MainActor captures the live layout and surface activity inputs; durable
+    /// thread state and the busy projection are completed by the gateway off
+    /// MainActor before the response is encoded.
+    public func listWorkspacesAuthoritative() async throws -> [Workspace] {
+        guard let ctx = context else { return [] }
+        let snapshots = ctx.state.window.workspaces.compactMap { id -> WorkspaceListReadSnapshot? in
+            guard let workspace = ctx.state.workspaces[id] else { return nil }
+            var busySurfaceIDs = Set<SurfaceID>()
+            forEachSurface(in: workspace.layout) { descriptor in
+                if isWorkspaceActivitySurface(descriptor) {
+                    busySurfaceIDs.insert(descriptor.id)
+                }
+            }
+            return WorkspaceListReadSnapshot(
+                workspace: workspace,
+                busySurfaceIDs: busySurfaceIDs
+            )
+        }
+        return try await ctx.workspaceListGateway.list(snapshots: snapshots)
+    }
+
     public func readConnectionSnapshotState() async throws -> ConnectionSnapshotReadState {
         guard let ctx = context else {
             return ConnectionSnapshotReadState(

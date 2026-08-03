@@ -57,6 +57,51 @@ public final class AgentThreadListGateway: @unchecked Sendable {
         }
     }
 
+    private final class WorkspaceIDsOperation: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Set<WorkspaceID>, Error>?
+        private var cancelled = false
+        private var finished = false
+
+        func install(_ continuation: CheckedContinuation<Set<WorkspaceID>, Error>) {
+            lock.lock()
+            if cancelled || finished {
+                lock.unlock()
+                continuation.resume(throwing: CancellationError())
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+        }
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            let continuation = self.continuation
+            self.continuation = nil
+            lock.unlock()
+            continuation?.resume(throwing: CancellationError())
+        }
+
+        func beginWork() -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            return !cancelled && !finished
+        }
+
+        func finish(_ result: Result<Set<WorkspaceID>, Error>) {
+            lock.lock()
+            guard !finished else {
+                lock.unlock()
+                return
+            }
+            finished = true
+            let continuation = self.continuation
+            self.continuation = nil
+            lock.unlock()
+            continuation?.resume(with: result)
+        }
+    }
+
     public static let queueLabel = "io.remotecode.agent-thread-list"
 
     private let queue: DispatchQueue
@@ -109,6 +154,50 @@ public final class AgentThreadListGateway: @unchecked Sendable {
                     operation.finish(.failure(error))
                 }
             }
+            }
+        }, onCancel: {
+            operation.cancel()
+        })
+    }
+
+    /// Returns only workspaces with a running thread. This is the cheap
+    /// workspace-list projection path; it deliberately avoids decoding every
+    /// thread and its routing JSON when the caller only needs busy IDs.
+    public func runningWorkspaceIDs(in workspaceIDs: [WorkspaceID]) async throws -> Set<WorkspaceID> {
+        guard !workspaceIDs.isEmpty else { return [] }
+        let operation = WorkspaceIDsOperation()
+        return try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Set<WorkspaceID>, Error>) in
+                operation.install(continuation)
+                queue.async {
+                    guard operation.beginWork() else { return }
+                    Self.recordQueryExecutorForTesting()
+                    Self.queryWillRunForTesting?()
+                    let delay = Self.queryDelayNanosecondsForTesting
+                    if delay > 0 {
+                        Thread.sleep(forTimeInterval: TimeInterval(delay) / 1_000_000_000)
+                    }
+                    guard operation.beginWork() else { return }
+                    do {
+                        let placeholders = workspaceIDs.map { _ in "?" }.joined(separator: ",")
+                        let statement = try self.db.prepare(
+                            "SELECT DISTINCT workspace_id FROM agent_threads WHERE workspace_id IN (\(placeholders)) AND status = 'running';"
+                        )
+                        for (index, workspaceID) in workspaceIDs.enumerated() {
+                            try statement.bind(Int32(index + 1), workspaceID.value.uuidString)
+                        }
+                        var result = Set<WorkspaceID>()
+                        while try statement.step() {
+                            if let raw = statement.columnText(0),
+                               let uuid = UUID(uuidString: raw) {
+                                result.insert(WorkspaceID(uuid))
+                            }
+                        }
+                        operation.finish(.success(result))
+                    } catch {
+                        operation.finish(.failure(error))
+                    }
+                }
             }
         }, onCancel: {
             operation.cancel()

@@ -74,6 +74,7 @@ public struct AgentRoutingRequest: Sendable, Equatable {
 public protocol CommandRouting: AnyObject {
     // window/workspace/pane/surface
     func listWorkspaces() throws -> [Workspace]
+    func listWorkspacesAuthoritative() async throws -> [Workspace]
     func currentWindow() throws -> AppWindow
     func listWindows() throws -> [AppWindow]
     func createWindow(title: String?) throws -> AppWindow
@@ -1858,7 +1859,7 @@ public final class JSONRPCDispatcher {
                 guard let sessionID = params["session_id"]?.stringValue else { throw JSONRPCError.invalidParams }
                 return .init(id: id, result: try router.filesEditClose(sessionID: sessionID))
             case "workspace.list":
-                let ws = try router.listWorkspaces()
+                let ws = try await router.listWorkspacesAuthoritative()
                 return .init(id: id, result: encode(ws))
             case "workspace.current":
                 let w = try router.currentWindow()
