@@ -691,20 +691,11 @@ public final class PaneTabsView: NSObject {
     }
 
     static func isSurfaceBusy(_ desc: SurfaceDescriptor, router: AppCommandRouter?) -> Bool {
-        if SurfaceRegistry.shared.surface(desc.id)?.isBusy == true { return true }
-        // Agent App: busy is per-surface (selected thread / surface-owned run),
-        // never "any thread in the workspace is running". That rollup made every
-        // Agent App tab spin when only one tab had a live run.
-        // Fallback for a stale/unregistered surface VM: only the surface's own
-        // bound thread (metadata selected_thread) may light the spinner.
-        guard desc.type == .agentApp,
-              let context = router?.context,
-              let raw = desc.metadata["selected_thread"],
-              let uuid = UUID(uuidString: raw),
-              let thread = try? context.threadRepo.get(id: AgentThreadID(uuid)) else {
-            return false
-        }
-        return thread.status == .running
+        _ = router
+        // The live registry is the only source of truth for tab busy state.
+        // A stale or unregistered descriptor must not synchronously consult
+        // persistence, and is therefore treated as idle.
+        return SurfaceRegistry.shared.surface(desc.id)?.isBusy == true
     }
 
     /// PERF: batch overload kept for call-site compatibility. Busy is
@@ -716,23 +707,12 @@ public final class PaneTabsView: NSObject {
     }
 
     /// PERF: retained for call sites that still batch tab busy refresh.
-    /// Returns workspace IDs that have at least one running agent thread — used
-    /// only as a cheap prefilter hint; tab busy itself is per-surface.
+    /// The batch busy overload ignores this prefilter, so do not read
+    /// persistence here; an empty set preserves the API without blocking UI.
     static func runningWorkspaceIDs(for surfaces: [SurfaceDescriptor], router: AppCommandRouter?) -> Set<WorkspaceID> {
-        guard let context = router?.context else { return [] }
-        let ids: [WorkspaceID] = surfaces.compactMap { desc in
-            guard desc.type == .agentApp else { return nil }
-            return workspaceID(for: desc, router: router)
-        }
-        guard !ids.isEmpty else { return [] }
-        return (try? context.threadRepo.runningWorkspaceIds(in: ids)) ?? []
-    }
-
-    private static func workspaceID(for desc: SurfaceDescriptor, router: AppCommandRouter?) -> WorkspaceID? {
-        if let raw = desc.metadata["workspace"], let uuid = UUID(uuidString: raw) {
-            return WorkspaceID(uuid)
-        }
-        return router?.context?.state.window.selectedWorkspaceID
+        _ = surfaces
+        _ = router
+        return []
     }
 
     private func currentWorkspaceID() -> WorkspaceID? {

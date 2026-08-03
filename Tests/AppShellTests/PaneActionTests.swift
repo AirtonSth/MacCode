@@ -176,7 +176,7 @@ final class PaneActionTests: XCTestCase {
         XCTAssertEqual(updated.layout.paneIDs().count, 2)
     }
 
-    func test_sidebarWorkspaceRowsRollUpRunningThreads() throws {
+    func test_sidebarWorkspaceRowsDoNotSynchronouslyReadRunningThreads() throws {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "busy", cwd: NSTemporaryDirectory())
         var thread = AgentThread(workspaceId: ws.id, title: "Long task", provider: .codex, model: "gpt-5.5")
@@ -186,10 +186,10 @@ final class PaneActionTests: XCTestCase {
         let vm = SidebarViewModel(context: ctx, router: router)
         vm.reload()
 
-        XCTAssertEqual(vm.workspaces.first(where: { $0.id == ws.id })?.metadata["busy"], "true",
-                       "a running agent thread must put the same spinner state on the workspace row, even before the Agent tab is rebuilt")
-        XCTAssertTrue(vm.isWorkspaceBusy(vm.workspaces.first(where: { $0.id == ws.id })!),
-                      "workspace row rendering must read the router's busy metadata, not only live SurfaceRegistry state")
+        XCTAssertNil(vm.workspaces.first(where: { $0.id == ws.id })?.metadata["busy"],
+                     "local workspace listing must not synchronously read durable thread state")
+        XCTAssertFalse(vm.isWorkspaceBusy(vm.workspaces.first(where: { $0.id == ws.id })!),
+                       "workspace busy state must come from live runtime surfaces")
     }
 
     func test_agentSurfaceBusyRollsUpRunningThreadForTabSpinner() async throws {
@@ -398,15 +398,25 @@ final class PaneActionTests: XCTestCase {
         XCTAssertFalse(PaneTabsView.isSurfaceBusy(idleDesc, router: router),
                        "an Agent App tab without a bound running thread must not spin for sibling threads")
 
-        // Bound to the running thread → spinner (fallback when live surface is stale).
-        var boundDesc = idleDesc
-        boundDesc.metadata["selected_thread"] = runningThread.id.value.uuidString
-        XCTAssertTrue(PaneTabsView.isSurfaceBusy(boundDesc, router: router),
-                      "tab spinner fallback may use the surface-bound selected_thread when that thread is running")
+        // A stale/unregistered descriptor must not synchronously query SQLite to
+        // infer busy state. The live SurfaceRegistry owns this display signal.
+        let unregisteredDesc = SurfaceDescriptor(
+            type: .agentApp,
+            title: "Stale Agent",
+            iconName: "sparkles",
+            metadata: [
+                "workspace": ws.id.value.uuidString,
+                "selected_thread": runningThread.id.value.uuidString
+            ]
+        )
+        XCTAssertNil(SurfaceRegistry.shared.surface(unregisteredDesc.id))
+        XCTAssertFalse(PaneTabsView.isSurfaceBusy(unregisteredDesc, router: router),
+                       "an unregistered surface must not infer busy by synchronously reading SQLite")
 
         // Bound to an idle thread → no spinner even if another workspace thread runs.
-        boundDesc.metadata["selected_thread"] = idleThread.id.value.uuidString
-        XCTAssertFalse(PaneTabsView.isSurfaceBusy(boundDesc, router: router),
+        var idleBoundDesc = idleDesc
+        idleBoundDesc.metadata["selected_thread"] = idleThread.id.value.uuidString
+        XCTAssertFalse(PaneTabsView.isSurfaceBusy(idleBoundDesc, router: router),
                        "a tab bound to an idle thread must not spin for other running workspace threads")
     }
 
@@ -1440,15 +1450,16 @@ final class PaneActionTests: XCTestCase {
             "per-tab path must not mark a tab busy for an unbound sibling running thread"
         )
 
-        // Bound to the running thread: both paths busy.
+        // A durable running row alone is not enough to synchronously infer UI
+        // busy state. The live surface/coordinator event must own that signal.
         desc.metadata["selected_thread"] = other.id.value.uuidString
-        XCTAssertTrue(
+        XCTAssertFalse(
             PaneTabsView.isSurfaceBusy(desc, runningWorkspaceIDs: runningFull, router: router),
-            "batch path must busy a tab bound to a running thread"
+            "batch path must not query SQLite to busy a stale surface descriptor"
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             PaneTabsView.isSurfaceBusy(desc, router: router),
-            "per-tab path must busy a tab bound to a running thread"
+            "per-tab path must not query SQLite to busy a stale surface descriptor"
         )
     }
 }

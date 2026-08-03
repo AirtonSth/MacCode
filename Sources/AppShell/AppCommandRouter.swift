@@ -548,17 +548,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func listWorkspaces() throws -> [Workspace] {
         guard let ctx = context else { return [] }
         let ids = ctx.state.window.workspaces
-        // PERF-008: batch thread-busy check -- one query for all workspace ids
-        // instead of one threadRepo.list(workspaceId:) call per workspace.
-        let runningSet = (try? ctx.threadRepo.runningWorkspaceIds(in: ids)) ?? []
         return ids.compactMap { id in
             guard var ws = ctx.state.workspaces[id] else { return nil }
-            let surfaceBusy = ws.layout.paneIDs().contains { pid in
-                (ws.layout.find(paneID: pid)?.surfaces ?? []).contains {
-                    isWorkspaceActivitySurface($0)
-                }
+            // This synchronous path feeds local UI/layout callers only. Busy
+            // state must come from live in-memory surfaces; the authoritative
+            // HTTP read performs the durable thread projection off MainActor.
+            let busy = ws.layout.paneIDs().contains { pid in
+                (ws.layout.find(paneID: pid)?.surfaces ?? []).contains { isWorkspaceActivitySurface($0) }
             }
-            let busy = surfaceBusy || runningSet.contains(id)
             if busy { ws.metadata["busy"] = "true" }
             else { ws.metadata.removeValue(forKey: "busy") }
             return ws
@@ -727,13 +724,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func isWorkspaceBusy(_ id: WorkspaceID) -> Bool {
         guard let ctx = context,
               let ws = ctx.state.workspaces[id] else { return false }
-        let surfaceBusy = ws.layout.paneIDs().contains { pid in
+        return ws.layout.paneIDs().contains { pid in
             (ws.layout.find(paneID: pid)?.surfaces ?? []).contains {
                 isWorkspaceActivitySurface($0)
             }
         }
-        let threadBusy = ((try? ctx.threadRepo.list(workspaceId: id)) ?? []).contains { $0.status == .running }
-        return surfaceBusy || threadBusy
     }
 
     private func isWorkspaceActivitySurface(_ descriptor: SurfaceDescriptor) -> Bool {
@@ -6502,7 +6497,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     @discardableResult
     public func promoteWorkspaceIfBusy(_ id: WorkspaceID) -> Bool {
-        guard isWorkspaceBusy(id) else { return false }
+        guard let ctx = context,
+              (isWorkspaceBusy(id)
+               || ((try? ctx.threadRepo.runningWorkspaceIds(in: [id])) ?? []).contains(id)) else {
+            return false
+        }
         return promoteWorkspaceForActivity(id)
     }
 

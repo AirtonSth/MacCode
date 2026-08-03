@@ -386,9 +386,8 @@ public final class SidebarViewModel: ObservableObject {
     /// Not persisted; cleared on app quit.
     private(set) var removedWorkspaceStack: [WorkspaceUndoEntry] = []
     /// PERF-MAC_SIDEBAR-001 (test seam): counts how many times
-    /// `busyTooltip(for:)` issues a `threadRepo.list(workspaceId:)` DB call.
-    /// Production code never reads this; tests assert it stays bounded so
-    /// N health events * M workspaces does not produce N*M DB round-trips.
+    /// Legacy test seam retained for source compatibility. Busy tooltips are
+    /// now derived from live in-memory surfaces and must not read SQLite.
     var threadListCallCount: Int = 0
     private var privateAccountObserver: NSObjectProtocol?
     private var tokenSaverUsageObserver: NSObjectProtocol?
@@ -1880,15 +1879,6 @@ public final class SidebarViewModel: ObservableObject {
     /// Returns a tooltip string describing the active busy source for `ws`,
     /// or nil when the workspace is idle.
     public func busyTooltip(for ws: Workspace) -> String? {
-        let threadTitles: [String]
-        if let router, let ctx = context {
-            threadListCallCount += 1
-            threadTitles = ((try? ctx.threadRepo.list(workspaceId: ws.id)) ?? [])
-                .filter { $0.status == .running }
-                .map(\.title)
-        } else {
-            threadTitles = []
-        }
         let surfaceTitles: [String] = ws.layout.paneIDs().flatMap { pid -> [String] in
             guard let pane = ws.layout.find(paneID: pid) else { return [] }
             return pane.surfaces.compactMap { desc -> String? in
@@ -1901,7 +1891,7 @@ public final class SidebarViewModel: ObservableObject {
                 }
             }
         }
-        return Self.busyTooltip(runningThreadTitles: threadTitles, busySurfaceTitles: surfaceTitles)
+        return Self.busyTooltip(runningThreadTitles: [], busySurfaceTitles: surfaceTitles)
     }
 
     public func reorderWorkspace(_ dragged: WorkspaceID, before target: WorkspaceID) {

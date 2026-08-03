@@ -5,21 +5,9 @@ import Persistence
 
 /// Perf regression guard for PERF-MAC_SIDEBAR-001 (todo-QA/macos-app.md:79).
 ///
-/// WHY: `SidebarViewModel.busyTooltip(for:)` issues one `threadRepo.list(workspaceId:)`
-/// DB call per workspace per invocation.  Every `SurfaceRuntimeBus` health event
-/// triggers `refreshSurfaceRuntimeState` -> `sidebar.refresh` -> SwiftUI re-render,
-/// which calls `busyTooltip(for:)` for every busy workspace indicator.  With N
-/// synthetic health events and M workspaces the call volume is N*M -- each a
-/// synchronous SQLite round-trip on the main thread, producing sidebar jank as
-/// workspaces and active-surface counts grow.
-///
-/// The `threadListCallCount` seam on `SidebarViewModel` (internal, never read by
-/// production code) makes this volume observable in unit tests so regressions are
-/// caught before they ship rather than discovered via profiling.
-///
-/// The current bound is N*M (no coalescing).  When coalescing lands the bound
-/// drops to at most M per refresh cycle; at that point the skip on
-/// `test_threadListCallCount_bounded_by_workspaceCount_not_eventCount` can be removed.
+/// WHY: busy tooltip rendering happens during frequent runtime updates. It must
+/// stay entirely in-memory so those updates never turn into synchronous SQLite
+/// work on the main actor.
 @MainActor
 final class SidebarRefreshPerfGuardTests: XCTestCase {
 
@@ -36,31 +24,22 @@ final class SidebarRefreshPerfGuardTests: XCTestCase {
 
     // MARK: - Seam correctness
 
-    /// WHY: the counter must increment exactly once per `busyTooltip(for:)` call
-    /// that reaches the `threadRepo.list` branch (i.e. when both `router` and
-    /// `context` are non-nil).  If the counter does not move the seam is broken
-    /// and no perf assertion can be trusted.
-    func test_threadListCallCount_incrementsOncePerBusyTooltipCall() throws {
-        let (ctx, router, vm) = try make(prefix: "seam")
+    /// WHY: a tooltip call must not perform a durable thread read.
+    func test_busyTooltip_doesNotReadSQLite() throws {
+        let (_, router, vm) = try make(prefix: "seam")
         let ws = try router.createWorkspace(name: "w", cwd: NSTemporaryDirectory())
         vm.reload()
         let wsValue = try XCTUnwrap(vm.workspaces.first(where: { $0.id == ws.id }))
 
-        XCTAssertEqual(vm.threadListCallCount, 0,
-            "counter must start at zero before any busyTooltip call")
-
         _ = vm.busyTooltip(for: wsValue)
 
-        XCTAssertEqual(vm.threadListCallCount, 1,
-            "a single busyTooltip call must produce exactly one threadRepo.list DB call; " +
-            "if this fails the seam is broken and N*M jank cannot be measured or gated")
+        XCTAssertEqual(vm.threadListCallCount, 0,
+            "busyTooltip must not synchronously query SQLite")
     }
 
-    /// WHY: M workspaces * 1 explicit call per workspace = M DB hits.
-    /// This anchors the per-call invariant for multiple workspaces so any
-    /// accidental double-counting (e.g. calling list() twice per workspace)
-    /// is immediately visible.
-    func test_threadListCallCount_scalesLinearlyWithWorkspaceCount() throws {
+    /// WHY: repeated tooltip rendering must remain read-free regardless of the
+    /// number of workspaces.
+    func test_busyTooltip_remainsReadFreeAcrossWorkspaces() throws {
         let M = 5
         let (_, router, vm) = try make(prefix: "linear")
         for i in 0..<M {
@@ -73,24 +52,11 @@ final class SidebarRefreshPerfGuardTests: XCTestCase {
             _ = vm.busyTooltip(for: ws)
         }
 
-        XCTAssertEqual(vm.threadListCallCount, loaded.count,
-            "calling busyTooltip once per workspace must produce exactly M=\(loaded.count) " +
-            "threadRepo.list calls -- any deviation means either the seam double-counts " +
-            "or some calls bypass the counter")
+        XCTAssertEqual(vm.threadListCallCount, 0,
+            "busyTooltip must not issue one SQLite read per workspace")
     }
 
-    // MARK: - N*M volume baseline (current behavior)
-
-    /// WHY: N health events * M workspaces = N*M `threadRepo.list` DB calls under the
-    /// current implementation (no coalescing).  This test documents and pins that
-    /// exact volume so any change that makes it WORSE (e.g. calling list() twice per
-    /// workspace) is caught immediately.
-    ///
-    /// The simulated "health event" path is: each event calls `busyTooltip(for:)` for
-    /// every workspace (matching what `refreshSurfaceRuntimeState` -> SwiftUI re-render
-    /// does in production).  N=4, M=3 gives 12 DB calls -- a meaningful sample while
-    /// keeping test latency negligible.
-    func test_threadListCallCount_isNTimesM_underCurrentNoCoalescing() throws {
+    func test_busyTooltip_remainsReadFreeAcrossRefreshes() throws {
         let N = 4  // synthetic health events
         let M = 3  // workspaces
         let (_, router, vm) = try make(prefix: "NxM")
@@ -110,19 +76,11 @@ final class SidebarRefreshPerfGuardTests: XCTestCase {
             }
         }
 
-        let expectedNxM = N * loaded.count
-        XCTAssertEqual(vm.threadListCallCount, expectedNxM,
-            "N=\(N) health events * M=\(loaded.count) workspaces must produce exactly \(expectedNxM) " +
-            "threadRepo.list calls under the current no-coalescing implementation. " +
-            "A higher number means the call volume regressed further; a lower number " +
-            "means coalescing landed (update the test and remove the skip below).")
+        XCTAssertEqual(vm.threadListCallCount, 0,
+            "repeated runtime refreshes must not add synchronous SQLite reads")
     }
 
-    /// WHY: the GOAL after coalescing lands is at most M calls per refresh cycle,
-    /// not N*M.  This test is skipped today because the current code IS N*M.
-    /// When coalescing is implemented: remove the XCTSkip, lower the bound to M,
-    /// and the test becomes the permanent regression gate (PERF-MAC_SIDEBAR-001).
-    func test_threadListCallCount_bounded_by_workspaceCount_not_eventCount() throws {
+    func test_busyTooltip_hasNoSynchronousDatabaseCeiling() throws {
 
         let N = 4
         let M = 3
@@ -140,15 +98,7 @@ final class SidebarRefreshPerfGuardTests: XCTestCase {
             }
         }
 
-        // Current ceiling: N*M (one threadRepo.list per (event, workspace)) -- this
-        // is the documented Performance #1 baseline. The regression gate pins that
-        // ceiling so it cannot grow. PERF-MAC_SIDEBAR-001 (todo-performance) should
-        // coalesce this to <= M (one per workspace per refresh); when that lands,
-        // lower this bound to `loaded.count` and it becomes the improvement gate.
-        XCTAssertLessThanOrEqual(vm.threadListCallCount, N * loaded.count,
-            "threadRepo.list calls must not exceed the N*M ceiling (N=\(N) events x M=\(loaded.count) " +
-            "workspaces); growing past it means a new per-event DB hit -- sidebar jank as workspaces grow")
-        XCTAssertGreaterThan(vm.threadListCallCount, 0,
-            "the instrumentation must actually count calls (a zero would mean the seam is not wired)")
+        XCTAssertEqual(vm.threadListCallCount, 0,
+            "busyTooltip must remain read-free after repeated runtime refreshes")
     }
 }
