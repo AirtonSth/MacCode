@@ -4,8 +4,8 @@ import XCTest
 @testable import Persistence
 @testable import SocketServer
 
-/// Pins LocalAuthAdapter's authorized-owner fingerprint to the trusted row,
-/// never to client-supplied pairing metadata.
+/// Pins LocalAuthAdapter's authorized-owner fingerprint to the verified bearer,
+/// never to Mac identity or client-supplied pairing metadata.
 @MainActor
 final class LocalAuthAdapterOwnerFingerprintTests: XCTestCase {
 
@@ -17,9 +17,9 @@ final class LocalAuthAdapterOwnerFingerprintTests: XCTestCase {
         return (auth, repo, dir)
     }
 
-    /// WHY: without a clientDeviceID the durable owner must still be stable for
-    /// the trusted device row, and must never echo raw ids or bearer material.
-    func test_authorizedOwnerFingerprint_usesDeviceRowIdWhenNoClientDeviceID() throws {
+    /// WHY: HTTP authorization must depend only on the bearer while preserving
+    /// a revocation-checkable, non-secret durable fingerprint.
+    func test_authorizedOwnerFingerprint_usesTokenHashWithoutMacIdentity() throws {
         let (auth, repo, dir) = try makeAuth()
         defer { try? FileManager.default.removeItem(atPath: dir) }
         auth.onPairingRequest = { _ in }
@@ -27,7 +27,7 @@ final class LocalAuthAdapterOwnerFingerprintTests: XCTestCase {
         let req = try repo.createPairingRequest(deviceName: "iPhone-no-client-id")
         let approved = try XCTUnwrap(try repo.approvePairingRequest(id: req.id))
         let token = approved.token
-        let deviceId = approved.0.id
+        let tokenHash = approved.0.tokenHash
 
         let fingerprint = try XCTUnwrap(auth.authorizedOwnerFingerprint(token: token))
         XCTAssertEqual(fingerprint.count, 64)
@@ -35,11 +35,11 @@ final class LocalAuthAdapterOwnerFingerprintTests: XCTestCase {
         XCTAssertEqual(
             fingerprint,
             LocalAuthAdapter.opaqueAuthorizedOwnerFingerprint(
-                stableIdentity: "device:\(deviceId)"
+                stableIdentity: "token:\(tokenHash)"
             )
         )
         XCTAssertNotEqual(fingerprint, token)
-        XCTAssertFalse(fingerprint.contains(deviceId))
+        XCTAssertFalse(fingerprint.contains(approved.0.id))
         XCTAssertEqual(
             auth.authorizedOwnerFingerprint(token: token),
             fingerprint,
@@ -49,18 +49,17 @@ final class LocalAuthAdapterOwnerFingerprintTests: XCTestCase {
             auth.authorizedOwnerFingerprint(token: "not-a-real-token"),
             "invalid tokens must not produce an owner fingerprint"
         )
-        // Default token-derived path would change with bearer; stable path must not
-        // equal a raw connectionOwnerFingerprint of the bearer when identity is used.
+        // The upload fingerprint is domain-separated from general connection
+        // ownership even though both derive only from the verified bearer.
         XCTAssertNotEqual(
             fingerprint,
             DirectHTTPServer.connectionOwnerFingerprint(token: token)
         )
     }
 
-    /// WHY: two devices can claim the same clientDeviceID. Separate trust rows
-    /// must remain separate upload owners even when that untrusted string is
-    /// byte-identical.
-    func test_authorizedOwnerFingerprint_doesNotMergeRowsWithSameClientDeviceID() throws {
+    /// WHY: separate bearer tokens must remain separate upload owners even when
+    /// client-supplied pairing metadata is byte-identical.
+    func test_authorizedOwnerFingerprint_doesNotMergeTokensWithSameClientDeviceID() throws {
         let (auth, repo, dir) = try makeAuth()
         defer { try? FileManager.default.removeItem(atPath: dir) }
         auth.onPairingRequest = { _ in }
@@ -94,16 +93,16 @@ final class LocalAuthAdapterOwnerFingerprintTests: XCTestCase {
         XCTAssertEqual(
             firstFP,
             LocalAuthAdapter.opaqueAuthorizedOwnerFingerprint(
-                stableIdentity: "device:\(first.0.id)"
+                stableIdentity: "token:\(first.0.tokenHash)"
             )
         )
         XCTAssertFalse(firstFP.contains(clientDeviceID))
         XCTAssertEqual(
             secondFP,
             LocalAuthAdapter.opaqueAuthorizedOwnerFingerprint(
-                stableIdentity: "device:\(second.0.id)"
+                stableIdentity: "token:\(second.0.tokenHash)"
             ),
-            "each approved row is its own security principal"
+            "each verified bearer is its own security principal"
         )
 
         // A different client device stays isolated even with a valid token.

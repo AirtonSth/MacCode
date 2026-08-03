@@ -151,10 +151,7 @@ final class SnapshotChunkTransferTests: XCTestCase {
         let retry = try cache.fetchChunk(
             transferId: first.transferId,
             chunkIndex: 0,
-            ownerFingerprint: "owner",
-            connectionId: "c",
-            hostId: "h",
-            bootEpoch: 1
+            ownerFingerprint: "owner"
         )
         XCTAssertEqual(retry.byteCount, min(frozen, frame.count))
 
@@ -189,7 +186,7 @@ final class SnapshotChunkTransferTests: XCTestCase {
     }
 
     func test_cache_rejectsWrongIdentityAndExpiresDeterministically() throws {
-        // WHY: a chunk HTTP request must never bypass ownership or serve after TTL.
+        // WHY: chunk auth is bearer owner + transfer id only; TTL still fail-closes.
         var now: UInt64 = 1_000
         let cache = SnapshotChunkTransferCache(
             clock: { now },
@@ -217,30 +214,7 @@ final class SnapshotChunkTransferTests: XCTestCase {
         XCTAssertThrowsError(try cache.fetchChunk(
             transferId: record.transferId,
             chunkIndex: 0,
-            ownerFingerprint: "owner-b",
-            connectionId: "conn-1",
-            hostId: "host-1",
-            bootEpoch: 7
-        )) { error in
-            XCTAssertEqual(error as? SnapshotChunkTransferFailure, .identityMismatch)
-        }
-        XCTAssertThrowsError(try cache.fetchChunk(
-            transferId: record.transferId,
-            chunkIndex: 0,
-            ownerFingerprint: "owner-a",
-            connectionId: "conn-2",
-            hostId: "host-1",
-            bootEpoch: 7
-        )) { error in
-            XCTAssertEqual(error as? SnapshotChunkTransferFailure, .identityMismatch)
-        }
-        XCTAssertThrowsError(try cache.fetchChunk(
-            transferId: record.transferId,
-            chunkIndex: 0,
-            ownerFingerprint: "owner-a",
-            connectionId: "conn-1",
-            hostId: "host-1",
-            bootEpoch: 8
+            ownerFingerprint: "owner-b"
         )) { error in
             XCTAssertEqual(error as? SnapshotChunkTransferFailure, .identityMismatch)
         }
@@ -248,10 +222,7 @@ final class SnapshotChunkTransferTests: XCTestCase {
         let ok = try cache.fetchChunk(
             transferId: record.transferId,
             chunkIndex: 0,
-            ownerFingerprint: "owner-a",
-            connectionId: "conn-1",
-            hostId: "host-1",
-            bootEpoch: 7
+            ownerFingerprint: "owner-a"
         )
         XCTAssertEqual(Data(base64Encoded: ok.payloadBase64), frame)
 
@@ -259,10 +230,7 @@ final class SnapshotChunkTransferTests: XCTestCase {
         XCTAssertThrowsError(try cache.fetchChunk(
             transferId: record.transferId,
             chunkIndex: 0,
-            ownerFingerprint: "owner-a",
-            connectionId: "conn-1",
-            hostId: "host-1",
-            bootEpoch: 7
+            ownerFingerprint: "owner-a"
         )) { error in
             XCTAssertEqual(error as? SnapshotChunkTransferFailure, .transferExpired)
         }
@@ -292,18 +260,12 @@ final class SnapshotChunkTransferTests: XCTestCase {
         let secondA = try cache.fetchChunk(
             transferId: record.transferId,
             chunkIndex: 1,
-            ownerFingerprint: "owner",
-            connectionId: "c",
-            hostId: "h",
-            bootEpoch: 1
+            ownerFingerprint: "owner"
         )
         let secondB = try cache.fetchChunk(
             transferId: record.transferId,
             chunkIndex: 1,
-            ownerFingerprint: "owner",
-            connectionId: "c",
-            hostId: "h",
-            bootEpoch: 1
+            ownerFingerprint: "owner"
         )
         XCTAssertEqual(secondA.payloadBase64, secondB.payloadBase64)
         XCTAssertNotEqual(first.payloadBase64, secondA.payloadBase64)
@@ -332,10 +294,7 @@ final class SnapshotChunkTransferTests: XCTestCase {
             transferId: record.transferId,
             snapshotId: "snap-commit",
             digest: String(repeating: "ab", count: 32),
-            ownerFingerprint: "owner",
-            connectionId: "c",
-            hostId: "h",
-            bootEpoch: 2
+            ownerFingerprint: "owner"
         )) { error in
             XCTAssertEqual(error as? SnapshotChunkTransferFailure, .commitMismatch)
         }
@@ -345,10 +304,7 @@ final class SnapshotChunkTransferTests: XCTestCase {
             transferId: record.transferId,
             snapshotId: "wrong-snap",
             digest: record.digest,
-            ownerFingerprint: "owner",
-            connectionId: "c",
-            hostId: "h",
-            bootEpoch: 2
+            ownerFingerprint: "owner"
         )) { error in
             XCTAssertEqual(error as? SnapshotChunkTransferFailure, .commitMismatch)
         }
@@ -358,10 +314,7 @@ final class SnapshotChunkTransferTests: XCTestCase {
             transferId: record.transferId,
             snapshotId: "snap-commit",
             digest: record.digest,
-            ownerFingerprint: "owner",
-            connectionId: "c",
-            hostId: "h",
-            bootEpoch: 2
+            ownerFingerprint: "owner"
         )
         XCTAssertEqual(taken.sequence, 42)
         XCTAssertEqual(cache.countForTests, 0)
@@ -371,10 +324,7 @@ final class SnapshotChunkTransferTests: XCTestCase {
             transferId: record.transferId,
             snapshotId: "snap-commit",
             digest: record.digest,
-            ownerFingerprint: "owner",
-            connectionId: "c",
-            hostId: "h",
-            bootEpoch: 2
+            ownerFingerprint: "owner"
         )) { error in
             XCTAssertEqual(error as? SnapshotChunkTransferFailure, .transferUnknown)
         }
@@ -408,10 +358,7 @@ final class SnapshotChunkTransferTests: XCTestCase {
             transferId: record.transferId,
             snapshotId: record.snapshotId,
             digest: record.digest,
-            ownerFingerprint: "owner",
-            connectionId: "c",
-            hostId: "h",
-            bootEpoch: 1
+            ownerFingerprint: "owner"
         )) { error in
             XCTAssertEqual(error as? SnapshotChunkTransferFailure, .transferExpired)
         }
@@ -549,7 +496,10 @@ final class SnapshotChunkTransferTests: XCTestCase {
         guard case .snapshot(let snapshot) = frame else {
             return XCTFail("assembled bytes must be a snapshot transport frame")
         }
-        XCTAssertEqual(snapshot.connectionId, connectionID)
+        // HTTP chunk path mints a non-empty connectionId for frame decoding only;
+        // it is not the live WS id and is not used for authorization.
+        XCTAssertFalse(snapshot.connectionId.isEmpty)
+        XCTAssertNotEqual(snapshot.connectionId, connectionID)
         XCTAssertEqual(snapshot.hostId, "chunk-host")
         XCTAssertEqual(snapshot.bootEpoch, 11)
         XCTAssertEqual(snapshot.stateVersion, 3)
@@ -576,8 +526,9 @@ final class SnapshotChunkTransferTests: XCTestCase {
     }
 
     @MainActor
-    func test_chunk_failClosed_wrongOwnerWrongHostAndUnknownTransfer() async throws {
-        // WHY: chunk HTTP must not bypass WS/HTTP auth or ownership gates.
+    func test_chunk_failClosed_wrongOwnerAndUnknownTransfer_legacyHostIgnored() async throws {
+        // WHY: wrong bearer owner and unknown transfer fail closed; legacy
+        // expectedHostId / connectionId / bootEpoch never authorize or block.
         let tokenA = "chunk-owner-a"
         let tokenB = "chunk-owner-b"
         let auth = ChunkSnapshotAuth(acceptedTokens: [tokenA, tokenB])
@@ -595,22 +546,19 @@ final class SnapshotChunkTransferTests: XCTestCase {
         defer { server.stop() }
         try await Task.sleep(nanoseconds: 80_000_000)
 
-        var request = URLRequest(url: URL(string: "ws://127.0.0.1:\(port)/v1/ws")!)
-        request.setValue("Bearer \(tokenA)", forHTTPHeaderField: "Authorization")
-        request.setValue("\(EventBus.shared.currentSeq)", forHTTPHeaderField: "x-rc2-since-seq")
-        let socket = URLSession.shared.webSocketTask(with: request)
-        socket.resume()
-        defer { socket.cancel(with: .normalClosure, reason: nil) }
-        let welcome = try await receiveObject(socket)
-        let connectionID = try XCTUnwrap(welcome["connectionId"] as? String)
-
         let begin = try await rpc(
             port: port,
             id: "begin-a",
             method: "sync.snapshot.begin",
-            params: baseParams(connectionID: connectionID),
+            params: [
+                "supportedStateVersion": 3,
+                "connectionId": "http-only-session",
+                "expectedHostId": "stale-client-host",
+                "expectedBootEpoch": 999,
+            ],
             bearerToken: tokenA
         )
+        XCTAssertNil(begin["error"], "begin must succeed without live WS and with stale host/boot: \(begin)")
         let transferId = try XCTUnwrap((begin["result"] as? [String: Any])?["transferId"] as? String)
 
         let wrongOwner = try await rpc(
@@ -620,28 +568,26 @@ final class SnapshotChunkTransferTests: XCTestCase {
             params: [
                 "transferId": transferId,
                 "chunkIndex": 0,
-                "connectionId": connectionID,
-                "expectedHostId": "chunk-host",
-                "expectedBootEpoch": 11,
             ],
             bearerToken: tokenB
         )
         XCTAssertEqual((wrongOwner["error"] as? [String: Any])?["code"] as? Int, -32602)
 
-        let wrongHost = try await rpc(
+        let legacyHostIgnored = try await rpc(
             port: port,
-            id: "chunk-host-mismatch",
+            id: "chunk-legacy-host",
             method: "sync.snapshot.chunk",
             params: [
                 "transferId": transferId,
                 "chunkIndex": 0,
-                "connectionId": connectionID,
+                "connectionId": "not-registered",
                 "expectedHostId": "other-host",
                 "expectedBootEpoch": 11,
             ],
             bearerToken: tokenA
         )
-        XCTAssertEqual((wrongHost["error"] as? [String: Any])?["code"] as? Int, -32602)
+        XCTAssertNil(legacyHostIgnored["error"],
+                     "legacy host/connection fields must not block owner-authorized chunk fetch: \(legacyHostIgnored)")
 
         let unknown = try await rpc(
             port: port,
@@ -650,9 +596,6 @@ final class SnapshotChunkTransferTests: XCTestCase {
             params: [
                 "transferId": UUID().uuidString,
                 "chunkIndex": 0,
-                "connectionId": connectionID,
-                "expectedHostId": "chunk-host",
-                "expectedBootEpoch": 11,
             ],
             bearerToken: tokenA
         )
@@ -660,9 +603,9 @@ final class SnapshotChunkTransferTests: XCTestCase {
     }
 
     @MainActor
-    func test_begin_rejectsMalformedPreferredChunkAndDoesNotAdoptUntilCommit() async throws {
-        // WHY: begin may only reserve; authority advances on commit after verified
-        // assembly. Proven via watermark single-flight fence + commit single-flight.
+    func test_begin_rejectsMalformedPreferredChunkAndCommitIsSingleFlight() async throws {
+        // WHY: malformed preferredChunkBytes fail closed before host read; commit
+        // is single-flight on transfer identity without WS watermark coupling.
         let router = ChunkSnapshotFakeRouter()
         let port = UInt16.random(in: 33_000...44_000)
         let server = DirectHTTPServer(
@@ -676,13 +619,7 @@ final class SnapshotChunkTransferTests: XCTestCase {
         defer { server.stop() }
         try await Task.sleep(nanoseconds: 80_000_000)
 
-        let socket = webSocketTask(port: port)
-        socket.resume()
-        defer { socket.cancel(with: .normalClosure, reason: nil) }
-        let welcome = try await receiveObject(socket)
-        let connectionID = try XCTUnwrap(welcome["connectionId"] as? String)
-
-        var bad = baseParams(connectionID: connectionID)
+        var bad = baseParams(connectionID: "http-session")
         bad["preferredChunkBytes"] = -1
         let invalid = try await rpc(
             port: port,
@@ -697,7 +634,7 @@ final class SnapshotChunkTransferTests: XCTestCase {
             port: port,
             id: "ok-begin",
             method: "sync.snapshot.begin",
-            params: baseParams(connectionID: connectionID)
+            params: baseParams(connectionID: "http-session")
         )
         XCTAssertNil(ok["error"], "\(ok)")
         let manifest = try XCTUnwrap(ok["result"] as? [String: Any])
@@ -708,21 +645,17 @@ final class SnapshotChunkTransferTests: XCTestCase {
         let snapshotId = try XCTUnwrap(manifest["snapshotId"] as? String)
         let digest = try XCTUnwrap(manifest["digest"] as? String)
 
-        // Reservation held: second begin must fail closed without advancing.
+        // Concurrent begins are independent HTTP transfers (no WS watermark fence).
         let secondBegin = try await rpc(
             port: port,
             id: "second-begin",
             method: "sync.snapshot.begin",
-            params: baseParams(connectionID: connectionID)
+            params: baseParams(connectionID: "http-session-2")
         )
-        let secondBeginError = try XCTUnwrap(secondBegin["error"] as? [String: Any])
-        XCTAssertEqual(secondBeginError["code"] as? Int, -32602)
-        let collisionData = try XCTUnwrap(secondBeginError["data"] as? [String: Any])
-        XCTAssertEqual(collisionData["reason"] as? String, "snapshot_reservation_held")
-        XCTAssertEqual(collisionData["retryable"] as? Bool, true)
-        XCTAssertEqual(router.snapshotReadCount, 1, "failed begin must not re-read host state")
+        XCTAssertNil(secondBegin["error"], "HTTP begin must not require WS watermark exclusive fence: \(secondBegin)")
+        XCTAssertEqual(router.snapshotReadCount, 2)
 
-        // Commit mismatch leaves reservation/transfer intact (no adopt).
+        // Commit mismatch leaves the original transfer intact.
         let badCommit = try await rpc(
             port: port,
             id: "bad-commit",
@@ -731,19 +664,9 @@ final class SnapshotChunkTransferTests: XCTestCase {
                 "transferId": transferId,
                 "snapshotId": snapshotId,
                 "digest": String(repeating: "00", count: 32),
-                "connectionId": connectionID,
-                "expectedHostId": "chunk-host",
-                "expectedBootEpoch": 11,
             ]
         )
         XCTAssertEqual((badCommit["error"] as? [String: Any])?["code"] as? Int, -32602)
-        let stillBlocked = try await rpc(
-            port: port,
-            id: "still-blocked",
-            method: "sync.snapshot.begin",
-            params: baseParams(connectionID: connectionID)
-        )
-        XCTAssertEqual((stillBlocked["error"] as? [String: Any])?["code"] as? Int, -32602)
 
         let commit = try await rpc(
             port: port,
@@ -753,15 +676,12 @@ final class SnapshotChunkTransferTests: XCTestCase {
                 "transferId": transferId,
                 "snapshotId": snapshotId,
                 "digest": digest,
-                "connectionId": connectionID,
-                "expectedHostId": "chunk-host",
-                "expectedBootEpoch": 11,
             ]
         )
         XCTAssertNil(commit["error"], "\(commit)")
         XCTAssertEqual((commit["result"] as? [String: Any])?["committed"] as? Bool, true)
 
-        // Single-flight: second commit cannot re-adopt (transfer gone).
+        // Single-flight: second commit cannot re-take the transfer.
         let doubleCommit = try await rpc(
             port: port,
             id: "double-commit",
@@ -770,22 +690,9 @@ final class SnapshotChunkTransferTests: XCTestCase {
                 "transferId": transferId,
                 "snapshotId": snapshotId,
                 "digest": digest,
-                "connectionId": connectionID,
-                "expectedHostId": "chunk-host",
-                "expectedBootEpoch": 11,
             ]
         )
         XCTAssertEqual((doubleCommit["error"] as? [String: Any])?["code"] as? Int, -32041)
-
-        // After successful commit the fence is released for a new begin.
-        let afterCommitBegin = try await rpc(
-            port: port,
-            id: "after-commit-begin",
-            method: "sync.snapshot.begin",
-            params: baseParams(connectionID: connectionID)
-        )
-        XCTAssertNil(afterCommitBegin["error"], "\(afterCommitBegin)")
-        XCTAssertEqual(router.snapshotReadCount, 2)
     }
 
     @MainActor

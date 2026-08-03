@@ -1,7 +1,7 @@
 import XCTest
 @testable import SocketServer
 
-/// Wave 4 pure helpers: incremental domain selection, JSON-RPC detection, C-25 thread policy.
+/// Wave 4 pure helpers: incremental domain selection and C-25 thread policy.
 final class Wave4ConnectionArchitectureTests: XCTestCase {
 
     func test_domainRevisions_domainsChanged_sinceKnown() {
@@ -68,29 +68,12 @@ final class Wave4ConnectionArchitectureTests: XCTestCase {
         XCTAssertGreaterThan(try frame.encoded().count, 0)
     }
 
-    func test_looksLikeJSONRPCRequest_detectsSingleAndBatch() throws {
-        let single = try JSONSerialization.data(withJSONObject: [
-            "jsonrpc": "2.0",
-            "id": "1",
-            "method": "system.ping",
-            "params": [:] as [String: Any],
-        ])
-        XCTAssertTrue(DirectHTTPServer.looksLikeJSONRPCRequest(single))
-
-        let batch = try JSONSerialization.data(withJSONObject: [[
-            "jsonrpc": "2.0",
-            "id": "1",
-            "method": "system.ping",
-            "params": [:] as [String: Any],
-        ]])
-        XCTAssertTrue(DirectHTTPServer.looksLikeJSONRPCRequest(batch))
-
-        let transport = try JSONSerialization.data(withJSONObject: [
-            "protocolVersion": 3,
-            "type": "welcome",
-            "connectionId": "c",
-        ])
-        XCTAssertFalse(DirectHTTPServer.looksLikeJSONRPCRequest(transport))
+    func test_welcomeDoesNotAdvertiseRPCOverEventWebSocket() {
+        // WHY: HTTP must remain the single request/response transport. If this
+        // capability returns, clients may silently couple mutations to WS state.
+        XCTAssertFalse(
+            DirectHTTPServer.welcomeCapabilities().contains("rpc.websocket")
+        )
     }
 
     func test_interestControl_parseAndApplyUpdatesCellularSafeOnly() throws {

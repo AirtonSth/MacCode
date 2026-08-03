@@ -3406,7 +3406,7 @@ final class DispatcherTests: XCTestCase {
     }
 
     @MainActor
-    func test_agentCheckpointList_v1RefusedOnUnixWebSocketAndBatch_legacyRetainsTransport() async throws {
+    func test_agentCheckpointList_v1RefusedOnUnixAndBatch_legacyRetainsUnixTransport() async throws {
         // WHY: explicit response_version 1 is HTTP-only / batch-forbidden before
         // work. Legacy (no response_version) must keep prior Unix/WS/batch paths
         // and full-array response shape — a regression here breaks base clients.
@@ -3441,29 +3441,19 @@ final class DispatcherTests: XCTestCase {
             ]
         )
 
-        // Explicit v1: refuse Unix / WS before repository work.
+        // Explicit v1: refuse Unix before repository work.
         let unixV1 = await d.dispatchUnixSocket(v1)
         XCTAssertEqual(unixV1.error?.code, -32600, "Unix must refuse explicit v1")
         XCTAssertEqual(
             unixV1.error?.data?.objectValue?["reason"],
             .string("checkpoint_list_http_only")
         )
-        let wsV1 = await d.dispatchWebSocket(v1, mutationContext: nil)
-        XCTAssertEqual(wsV1.error?.code, -32600, "WebSocket must refuse explicit v1")
-        XCTAssertEqual(
-            wsV1.error?.data?.objectValue?["reason"],
-            .string("checkpoint_list_http_only")
-        )
         XCTAssertEqual(router.checkpointPageCallCount, 0)
 
-        // Legacy: Unix / WS still succeed with prior full-array shape.
+        // Legacy: Unix still succeeds with the prior full-array shape.
         let unixLegacy = await d.dispatchUnixSocket(legacy)
         XCTAssertNil(unixLegacy.error, "legacy checkpoint.list must work on Unix")
         XCTAssertNotNil(unixLegacy.result?.arrayValue)
-        let wsLegacy = await d.dispatchWebSocket(legacy, mutationContext: nil)
-        XCTAssertNil(wsLegacy.error, "legacy checkpoint.list must work on WebSocket")
-        XCTAssertNotNil(wsLegacy.result?.arrayValue)
-
         // Explicit v1 in nested rpc.batch: reject before any sibling executes.
         let nestedV1 = await d.dispatchHTTP(
             JSONRPCRequest(

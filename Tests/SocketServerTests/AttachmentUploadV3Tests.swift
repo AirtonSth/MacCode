@@ -70,6 +70,40 @@ final class AttachmentUploadV3Tests: XCTestCase {
         func revokeDevice(_ id: String) { revoke() }
     }
 
+    /// Multi-token owner map for cross-owner prepare isolation tests.
+    private final class DualOwnerAuth:
+        DirectAuthProvider,
+        @unchecked Sendable
+    {
+        private let mappings: [String: String]
+
+        init(mappings: [String: String]) {
+            self.mappings = mappings
+        }
+
+        func verify(token: String) -> Bool {
+            mappings[token] != nil
+        }
+
+        func authorizedOwnerFingerprint(token: String) -> String? {
+            mappings[token]
+        }
+
+        func isAuthorizedOwnerFingerprintActive(
+            _ fingerprint: String
+        ) -> Bool {
+            mappings.values.contains(fingerprint)
+        }
+
+        func createPairingCode() -> String? { nil }
+        func redeemPairingCode(
+            _ code: String,
+            deviceName: String
+        ) -> (deviceId: String, token: String)? { nil }
+        func listDevices() -> [[String: Any]] { [] }
+        func revokeDevice(_ id: String) {}
+    }
+
     private struct Vector {
         let request: AttachmentUploadV3PrepareRequest
         let capability: Data
@@ -953,9 +987,31 @@ final class AttachmentUploadV3Tests: XCTestCase {
             ),
             forHTTPHeaderField: "Idempotency-Key"
         )
-        XCTAssertNil(
-            put.value(forHTTPHeaderField: "Authorization"),
-            "background PUT must not carry the bearer"
+        let missingAuthPut = put
+        let (_, missingAuthResponse) =
+            try await URLSession.shared.data(for: missingAuthPut)
+        XCTAssertEqual(
+            (missingAuthResponse as? HTTPURLResponse)?.statusCode,
+            401,
+            "every protected chunk must require the bearer"
+        )
+
+        var wrongAuthPut = put
+        wrongAuthPut.setValue(
+            "Bearer forged",
+            forHTTPHeaderField: "Authorization"
+        )
+        let (_, wrongAuthResponse) =
+            try await URLSession.shared.data(for: wrongAuthPut)
+        XCTAssertEqual(
+            (wrongAuthResponse as? HTTPURLResponse)?.statusCode,
+            401,
+            "a chunk capability must not bypass bearer ownership"
+        )
+
+        put.setValue(
+            "Bearer \(token)",
+            forHTTPHeaderField: "Authorization"
         )
         let (putData, putResponse) =
             try await URLSession.shared.data(for: put)
@@ -991,6 +1047,131 @@ final class AttachmentUploadV3Tests: XCTestCase {
         XCTAssertEqual(statusBody["received_bytes"] as? Int, plaintext.count)
     }
 
+    @MainActor
+    func test_httpPrepare_ignoresHostIdentityGatesAndStillRequiresBearerOwner() async throws {
+        // WHY: prepare.server_id is a client crypto label, not a Mac host gate;
+        // X-RC2-Expected-Host-ID must not authorize or block. Bearer + owner still fail closed.
+        let token = "valid-test-bearer"
+        let otherToken = "other-owner-bearer"
+        let otherOwner = String(repeating: "b", count: 64)
+        let auth = DualOwnerAuth(
+            mappings: [token: owner, otherToken: otherOwner]
+        )
+        let port = UInt16.random(in: 33_000...44_000)
+        let server = DirectHTTPServer(
+            port: port,
+            loopbackOnly: false,
+            dispatcher: JSONRPCDispatcher(
+                router: FakeRouter(),
+                agentAttachmentUploadCapability: .protectedV3
+            ),
+            auth: auth,
+            serverId: serverId,
+            bootEpoch: 1,
+            attachmentUploadV2Store: plaintextStore,
+            attachmentUploadV3Store: store
+        )
+        try server.start()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        let uploadId = UUID().uuidString.lowercased()
+        let vector = try makeVector(
+            uploadId: uploadId,
+            plaintext: Data("identity-gate".utf8),
+            requestServerId: "client-declared-crypto-label"
+        )
+        let prepareURL = URL(string: "http://127.0.0.1:\(port)")!
+            .appendingPathComponent("/v1/agent/attachment-uploads/v3/\(uploadId)/prepare")
+
+        func prepareRequest(
+            bearer: String?,
+            expectedHost: String?,
+            body: AttachmentUploadV3PrepareRequest
+        ) throws -> URLRequest {
+            var request = URLRequest(url: prepareURL)
+            request.httpMethod = "POST"
+            request.httpBody = try JSONEncoder().encode(body)
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue(uploadId, forHTTPHeaderField: "Idempotency-Key")
+            if let bearer {
+                request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
+            }
+            if let expectedHost {
+                request.setValue(expectedHost, forHTTPHeaderField: "X-RC2-Expected-Host-ID")
+            }
+            return request
+        }
+
+        // Missing / invalid bearer fail closed even with matching host header.
+        let (_, missingAuth) = try await URLSession.shared.data(
+            for: try prepareRequest(bearer: nil, expectedHost: serverId, body: vector.request)
+        )
+        XCTAssertEqual((missingAuth as? HTTPURLResponse)?.statusCode, 401)
+
+        let (_, badAuth) = try await URLSession.shared.data(
+            for: try prepareRequest(bearer: "forged", expectedHost: serverId, body: vector.request)
+        )
+        XCTAssertEqual((badAuth as? HTTPURLResponse)?.statusCode, 401)
+
+        // Wrong expected-host + client-declared server_id still prepares for owner.
+        let (prepareData, prepareResponse) = try await URLSession.shared.data(
+            for: try prepareRequest(
+                bearer: token,
+                expectedHost: "stale-other-host",
+                body: vector.request
+            )
+        )
+        XCTAssertEqual((prepareResponse as? HTTPURLResponse)?.statusCode, 200)
+        let prepareBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: prepareData) as? [String: Any]
+        )
+        XCTAssertEqual(prepareBody["prepared"] as? Bool, true)
+
+        // Missing expected-host still succeeds (idempotent prepare).
+        let (_, noHost) = try await URLSession.shared.data(
+            for: try prepareRequest(bearer: token, expectedHost: nil, body: vector.request)
+        )
+        XCTAssertEqual((noHost as? HTTPURLResponse)?.statusCode, 200)
+
+        // Different valid owner cannot take over the upload (owner mismatch).
+        let otherUploadId = UUID().uuidString.lowercased()
+        var foreign = try makeVector(
+            uploadId: otherUploadId,
+            plaintext: Data("foreign".utf8),
+            requestServerId: "client-declared-crypto-label"
+        ).request
+        // Force owner_fingerprint in body to match token owner while presenting
+        // a different bearer → store rejects owner mismatch.
+        foreign = AttachmentUploadV3PrepareRequest(
+            serverId: foreign.serverId,
+            ownerFingerprint: owner,
+            workspaceId: foreign.workspaceId,
+            filename: foreign.filename,
+            mimeType: foreign.mimeType,
+            totalPlaintextBytes: foreign.totalPlaintextBytes,
+            chunkCount: foreign.chunkCount,
+            fileSHA256: foreign.fileSHA256,
+            encryptionKeyBase64URL: foreign.encryptionKeyBase64URL,
+            chunks: foreign.chunks
+        )
+        let foreignURL = URL(string: "http://127.0.0.1:\(port)")!
+            .appendingPathComponent("/v1/agent/attachment-uploads/v3/\(otherUploadId)/prepare")
+        var foreignRequest = URLRequest(url: foreignURL)
+        foreignRequest.httpMethod = "POST"
+        foreignRequest.httpBody = try JSONEncoder().encode(foreign)
+        foreignRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        foreignRequest.setValue(otherUploadId, forHTTPHeaderField: "Idempotency-Key")
+        foreignRequest.setValue("Bearer \(otherToken)", forHTTPHeaderField: "Authorization")
+        let (foreignData, foreignResponse) = try await URLSession.shared.data(for: foreignRequest)
+        XCTAssertEqual((foreignResponse as? HTTPURLResponse)?.statusCode, 400)
+        let foreignBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: foreignData) as? [String: Any]
+        )
+        let foreignError = try XCTUnwrap(foreignBody["error"] as? [String: Any])
+        XCTAssertNotEqual(foreignError["code"] as? String, "host_identity_mismatch")
+    }
+
     func test_v3RouteParserRejectsTraversalAndAcceptsFrozenFamily() {
         let id = "11111111-1111-4111-8111-111111111111"
         XCTAssertEqual(
@@ -1022,14 +1203,16 @@ final class AttachmentUploadV3Tests: XCTestCase {
         plaintext: Data,
         masterKey: Data = Data(repeating: 0x11, count: 32),
         capability: Data = Data(repeating: 0x33, count: 32),
-        nonce: Data = Data(repeating: 0x22, count: 12)
+        nonce: Data = Data(repeating: 0x22, count: 12),
+        requestServerId: String? = nil
     ) throws -> Vector {
+        let declaredServerId = requestServerId ?? serverId
         let plaintextDigest = sha256Hex(plaintext)
         let capabilityDigest = sha256Hex(capability)
         let placeholder = String(repeating: "0", count: 64)
         func request(sealedDigest: String) -> AttachmentUploadV3PrepareRequest {
             AttachmentUploadV3PrepareRequest(
-                serverId: serverId,
+                serverId: declaredServerId,
                 ownerFingerprint: owner,
                 workspaceId: workspaceId,
                 filename: "vector.bin",
@@ -1062,7 +1245,7 @@ final class AttachmentUploadV3Tests: XCTestCase {
             plaintext,
             using: AttachmentUploadV3Store.derivedChunkKey(
                 masterKey: masterKey,
-                serverId: serverId,
+                serverId: declaredServerId,
                 uploadId: uploadId,
                 chunkIndex: 0
             ),

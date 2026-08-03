@@ -1067,17 +1067,6 @@ public final class JSONRPCDispatcher {
         }
     }
 
-    /// Production WebSocket JSON-RPC entry. Legacy checkpoint list retains
-    /// prior behavior; explicit response_version 1 is refused before work.
-    public func dispatchWebSocket(
-        _ req: JSONRPCRequest,
-        mutationContext: MutationRequestContext?
-    ) async -> JSONRPCResponse {
-        await Self.$rpcWireTransport.withValue(.webSocket) {
-            await dispatch(req, mutationContext: mutationContext)
-        }
-    }
-
     /// Production HTTP JSON-RPC entry (legacy + explicit v1 checkpoint list).
     public func dispatchHTTP(
         _ req: JSONRPCRequest,
@@ -1113,10 +1102,10 @@ public final class JSONRPCDispatcher {
         context: MutationRequestContext
     ) async -> JSONRPCResponse {
         let params = req.params ?? [:]
-        guard let identity = mutationIdentity(params: params, context: context) else {
+        guard let clientRequestId = mutationIdentity(params: params, context: context) else {
             return .init(id: req.id, error: JSONRPCError(
                 code: -32097,
-                message: "Connection is stale. Refresh the authoritative host state before mutating."
+                message: "Mutation requires a non-empty client_request_id."
             ))
         }
         let businessParams = HostMutationContract.businessParams(params)
@@ -1133,7 +1122,7 @@ public final class JSONRPCDispatcher {
         } catch {
             return .init(id: req.id, error: .invalidParams)
         }
-        let key = "\(req.method):\(identity.clientRequestId)"
+        let key = "\(req.method):\(clientRequestId)"
         if let unknown = volatileUnknownReceipts[key] {
             if unknown.ownerFingerprint != context.ownerFingerprint {
                 commandReceiptMetrics.recordClaim(.ownerMismatch, latencyMilliseconds: 0)
@@ -1142,7 +1131,7 @@ public final class JSONRPCDispatcher {
                     code: -32094,
                     reason: "idempotencyOwnerMismatch",
                     method: req.method,
-                    clientRequestId: identity.clientRequestId,
+                    clientRequestId: clientRequestId,
                     retryable: false,
                     requiresSnapshot: false
                 )
@@ -1154,7 +1143,7 @@ public final class JSONRPCDispatcher {
                     code: -32093,
                     reason: "idempotencyRequestMismatch",
                     method: req.method,
-                    clientRequestId: identity.clientRequestId,
+                    clientRequestId: clientRequestId,
                     retryable: false,
                     requiresSnapshot: false
                 )
@@ -1165,7 +1154,7 @@ public final class JSONRPCDispatcher {
                 code: -32095,
                 reason: "commandOutcomeUnknown",
                 method: req.method,
-                clientRequestId: identity.clientRequestId,
+                clientRequestId: clientRequestId,
                 retryable: false,
                 requiresSnapshot: true
             )
@@ -1176,7 +1165,7 @@ public final class JSONRPCDispatcher {
                 code: -32091,
                 reason: "commandReceiptUnavailable",
                 method: req.method,
-                clientRequestId: identity.clientRequestId,
+                clientRequestId: clientRequestId,
                 retryable: true,
                 requiresSnapshot: false
             )
@@ -1187,7 +1176,7 @@ public final class JSONRPCDispatcher {
         do {
             claim = try receiptRouter.claimCommandReceipt(
                 method: req.method,
-                clientRequestId: identity.clientRequestId,
+                clientRequestId: clientRequestId,
                 ownerFingerprint: context.ownerFingerprint,
                 paramsHash: paramsHash
             )
@@ -1204,7 +1193,7 @@ public final class JSONRPCDispatcher {
                 code: -32091,
                 reason: "commandReceiptUnavailable",
                 method: req.method,
-                clientRequestId: identity.clientRequestId,
+                clientRequestId: clientRequestId,
                 retryable: true,
                 requiresSnapshot: false
             )
@@ -1219,7 +1208,7 @@ public final class JSONRPCDispatcher {
                 code: -32096,
                 reason: "commandInProgress",
                 method: req.method,
-                clientRequestId: identity.clientRequestId,
+                clientRequestId: clientRequestId,
                 retryable: true,
                 requiresSnapshot: false
             )
@@ -1231,7 +1220,7 @@ public final class JSONRPCDispatcher {
                     code: -32092,
                     reason: "legacyReceiptUnverifiable",
                     method: req.method,
-                    clientRequestId: identity.clientRequestId,
+                    clientRequestId: clientRequestId,
                     retryable: false,
                     requiresSnapshot: true
                 )
@@ -1243,7 +1232,7 @@ public final class JSONRPCDispatcher {
                 code: -32095,
                 reason: "commandOutcomeUnknown",
                 method: req.method,
-                clientRequestId: identity.clientRequestId,
+                clientRequestId: clientRequestId,
                 retryable: false,
                 requiresSnapshot: true
             )
@@ -1253,7 +1242,7 @@ public final class JSONRPCDispatcher {
                 code: -32094,
                 reason: "idempotencyOwnerMismatch",
                 method: req.method,
-                clientRequestId: identity.clientRequestId,
+                clientRequestId: clientRequestId,
                 retryable: false,
                 requiresSnapshot: false
             )
@@ -1263,7 +1252,7 @@ public final class JSONRPCDispatcher {
                 code: -32093,
                 reason: "idempotencyRequestMismatch",
                 method: req.method,
-                clientRequestId: identity.clientRequestId,
+                clientRequestId: clientRequestId,
                 retryable: false,
                 requiresSnapshot: false
             )
@@ -1273,7 +1262,7 @@ public final class JSONRPCDispatcher {
                 code: -32092,
                 reason: "legacyReceiptUnverifiable",
                 method: req.method,
-                clientRequestId: identity.clientRequestId,
+                clientRequestId: clientRequestId,
                 retryable: false,
                 requiresSnapshot: true
             )
@@ -1319,7 +1308,7 @@ public final class JSONRPCDispatcher {
             commandReceiptMetrics.recordUnknownOutcome()
             try? receiptRouter.markCommandReceiptUnknown(
                 method: req.method,
-                clientRequestId: identity.clientRequestId,
+                clientRequestId: clientRequestId,
                 ownerFingerprint: context.ownerFingerprint,
                 paramsHash: paramsHash
             )
@@ -1328,7 +1317,7 @@ public final class JSONRPCDispatcher {
                 code: -32095,
                 reason: "commandOutcomeUnknown",
                 method: req.method,
-                clientRequestId: identity.clientRequestId,
+                clientRequestId: clientRequestId,
                 retryable: false,
                 requiresSnapshot: true
             )
@@ -1340,7 +1329,7 @@ public final class JSONRPCDispatcher {
                 _ = try EventBus.shared.commitPersistedEvents { minimumEventSequence in
                     try receiptRouter.finalizeCommandReceipt(
                         method: req.method,
-                        clientRequestId: identity.clientRequestId,
+                        clientRequestId: clientRequestId,
                         ownerFingerprint: context.ownerFingerprint,
                         paramsHash: paramsHash,
                         result: result,
@@ -1351,7 +1340,7 @@ public final class JSONRPCDispatcher {
             } else {
                 try receiptRouter.commitCommandReceipt(
                     method: req.method,
-                    clientRequestId: identity.clientRequestId,
+                    clientRequestId: clientRequestId,
                     ownerFingerprint: context.ownerFingerprint,
                     paramsHash: paramsHash,
                     result: result
@@ -1375,7 +1364,7 @@ public final class JSONRPCDispatcher {
             commandReceiptMetrics.recordUnknownOutcome()
             try? receiptRouter.markCommandReceiptUnknown(
                 method: req.method,
-                clientRequestId: identity.clientRequestId,
+                clientRequestId: clientRequestId,
                 ownerFingerprint: context.ownerFingerprint,
                 paramsHash: paramsHash
             )
@@ -1384,7 +1373,7 @@ public final class JSONRPCDispatcher {
                 code: -32095,
                 reason: "commandOutcomeUnknown",
                 method: req.method,
-                clientRequestId: identity.clientRequestId,
+                clientRequestId: clientRequestId,
                 retryable: false,
                 requiresSnapshot: true
             )
@@ -1401,7 +1390,7 @@ public final class JSONRPCDispatcher {
         context: MutationRequestContext
     ) -> JSONRPCResponse {
         let params = req.params ?? [:]
-        guard let identity = mutationIdentity(params: params, context: context),
+        guard let clientRequestId = mutationIdentity(params: params, context: context),
               let method = params["method"]?.stringValue,
               Self.hostMutationMethods.contains(method),
               let receiptRouter = router as? CommandReceiptStateRouting else {
@@ -1411,7 +1400,7 @@ public final class JSONRPCDispatcher {
         do {
             status = try receiptRouter.commandReceiptStatus(
                 method: method,
-                clientRequestId: identity.clientRequestId,
+                clientRequestId: clientRequestId,
                 ownerFingerprint: context.ownerFingerprint
             )
         } catch {
@@ -1420,7 +1409,7 @@ public final class JSONRPCDispatcher {
                 code: -32091,
                 reason: "commandReceiptUnavailable",
                 method: method,
-                clientRequestId: identity.clientRequestId,
+                clientRequestId: clientRequestId,
                 retryable: true,
                 requiresSnapshot: false
             )
@@ -1431,7 +1420,7 @@ public final class JSONRPCDispatcher {
                 code: -32094,
                 reason: "idempotencyOwnerMismatch",
                 method: method,
-                clientRequestId: identity.clientRequestId,
+                clientRequestId: clientRequestId,
                 retryable: false,
                 requiresSnapshot: false
             )
@@ -1448,31 +1437,28 @@ public final class JSONRPCDispatcher {
         return .init(id: req.id, result: .object([
             "status": .string(values.0),
             "method": .string(method),
-            "clientRequestId": .string(identity.clientRequestId),
+            "clientRequestId": .string(clientRequestId),
             "retryable": .bool(values.1),
             "requiresSnapshot": .bool(values.2),
         ]))
     }
 
+    /// HTTP-authoritative mutation identity.
+    ///
+    /// Requires a non-empty `client_request_id` only. Legacy transport fields
+    /// (`connection_id`, `expected_host_id`, `expected_boot_epoch`) are optional
+    /// and never authorize or block — WS registry, host/boot freshness, and
+    /// connection ownership are not HTTP preconditions.
     private func mutationIdentity(
         params: [String: JSONValue],
         context: MutationRequestContext
-    ) -> (clientRequestId: String, connectionId: String)? {
+    ) -> String? {
+        _ = context
         guard let clientRequestId = params["client_request_id"]?.stringValue,
-              !clientRequestId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              let connectionId = params["connection_id"]?.stringValue,
-              !connectionId.isEmpty,
-              params["expected_host_id"]?.stringValue == context.hostId,
-              case .number(let epoch)? = params["expected_boot_epoch"],
-              // `UInt64(_: Double)` traps on overflow (e.g. 2^64, which passes an
-              // unbounded `>= 0` guard). `UInt64(exactly:)` rejects non-finite,
-              // fractional, negative, and out-of-range doubles.
-              let epochValue = UInt64(exactly: epoch),
-              epochValue == context.bootEpoch,
-              context.ownsActiveConnection(connectionId) else {
+              !clientRequestId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return nil
         }
-        return (clientRequestId, connectionId)
+        return clientRequestId
     }
 
     private func receiptFailure(

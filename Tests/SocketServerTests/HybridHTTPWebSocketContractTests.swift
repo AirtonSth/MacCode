@@ -4,9 +4,10 @@ import XCTest
 import CoreModel
 import Persistence
 
-// Hybrid contract: one host/boot/sequence authority; HTTP remains usable when
-// WebSocket is absent; duplicate mutations return the original outcome across
-// transports. Idempotency storage stays bounded and never caches secrets.
+// HTTP independence contract: mutations/snapshots authorize by bearer owner
+// (and client_request_id / transfer ids) only. Live/absent/foreign WS must not
+// block HTTP. Idempotency storage stays bounded and never caches secrets.
+// WS remains optional realtime event delivery.
 
 @MainActor
 private final class HybridReceiptRouter: FakeRouter, CommandReceiptStateRouting, ConnectionSnapshotRouting {
@@ -171,46 +172,13 @@ final class HybridHTTPWebSocketContractTests: XCTestCase {
     private let ownerToken = "hybrid-owner-token"
     private let hostId = "hybrid-host"
 
-    func test_hybridConnectionAuthorized_liveWSPinsConnection_httpFallbackWhenNoLiveWS() {
-        // WHY: live connection_id is owner-pinned; wrong id while live fails closed;
-        // foreign owner cannot borrow a live connection; after WS is gone HTTP works.
-        XCTAssertTrue(DirectHTTPServer.hybridConnectionAuthorized(
-            connectionID: "conn-a",
-            ownerFingerprint: "owner-a",
-            registeredOwner: { "owner-a" },
-            ownerHasLiveConnection: { true }
-        ))
-        XCTAssertFalse(DirectHTTPServer.hybridConnectionAuthorized(
-            connectionID: "conn-b",
-            ownerFingerprint: "owner-a",
-            registeredOwner: { nil },
-            ownerHasLiveConnection: { true }
-        ), "wrong connection_id while live WS exists must reject")
-        XCTAssertFalse(DirectHTTPServer.hybridConnectionAuthorized(
-            connectionID: "conn-a",
-            ownerFingerprint: "owner-b",
-            registeredOwner: { "owner-a" },
-            ownerHasLiveConnection: { false }
-        ), "non-owner must not use another device's live connection_id")
-        XCTAssertTrue(DirectHTTPServer.hybridConnectionAuthorized(
-            connectionID: "conn-stale",
-            ownerFingerprint: "owner-a",
-            registeredOwner: { nil },
-            ownerHasLiveConnection: { false }
-        ), "HTTP hybrid path must authorize when owner has no live WebSocket")
-    }
-
     func test_activeWebSocketRegistry_sameOwnerReplaceKeepsPhysicalLivenessUntilRemoved() {
-        // WHY: same-owner reconnect must make the new id the only hybrid authority
-        // while the half-closed predecessor stays physically live. Removing the
-        // successor alone must not open WS-absent HTTP fallback (hasConnection
-        // false) because HTTPServer.hybridConnectionAuthorized allows unregistered
-        // ids only when the owner has no live WS.
+        // WHY: WS registry hybrid-authority supersede remains for WS resume/watermarks,
+        // but HTTP admission no longer consults this registry.
         let registry = ActiveWebSocketConnectionRegistry()
         let watermark = ConnectionSequenceWatermark(initialSequence: 1)
         let otherWatermark = ConnectionSequenceWatermark(initialSequence: 9)
 
-        // 1. Insert old same-owner WS, insert new same-owner WS.
         registry.insert("conn-old", ownerFingerprint: "owner-a", watermark: watermark)
         XCTAssertTrue(registry.hasConnection(ownedBy: "owner-a"))
         XCTAssertEqual(registry.ownerFingerprint(for: "conn-old"), "owner-a")
@@ -218,55 +186,14 @@ final class HybridHTTPWebSocketContractTests: XCTestCase {
         registry.insert("conn-other", ownerFingerprint: "owner-b", watermark: otherWatermark)
         registry.insert("conn-new", ownerFingerprint: "owner-a", watermark: watermark)
 
-        // 2. New is the only current hybrid authority; old is unauthorized.
         XCTAssertNil(
             registry.ownerFingerprint(for: "conn-old"),
             "predecessor must lose hybrid authority after same-owner replace"
         )
         XCTAssertEqual(registry.ownerFingerprint(for: "conn-new"), "owner-a")
         XCTAssertTrue(registry.hasConnection(ownedBy: "owner-a"))
-        XCTAssertTrue(
-            DirectHTTPServer.hybridConnectionAuthorized(
-                connectionID: "conn-new",
-                ownerFingerprint: "owner-a",
-                registeredOwner: { registry.ownerFingerprint(for: "conn-new") },
-                ownerHasLiveConnection: { registry.hasConnection(ownedBy: "owner-a") }
-            ),
-            "new live connection_id must authorize hybrid snapshot after supersede"
-        )
-        XCTAssertFalse(
-            DirectHTTPServer.hybridConnectionAuthorized(
-                connectionID: "conn-old",
-                ownerFingerprint: "owner-a",
-                registeredOwner: { registry.ownerFingerprint(for: "conn-old") },
-                ownerHasLiveConnection: { registry.hasConnection(ownedBy: "owner-a") }
-            ),
-            "demoted predecessor connection_id must not authorize hybrid HTTP"
-        )
-        XCTAssertFalse(
-            DirectHTTPServer.hybridConnectionAuthorized(
-                connectionID: "conn-stale",
-                ownerFingerprint: "owner-a",
-                registeredOwner: { registry.ownerFingerprint(for: "conn-stale") },
-                ownerHasLiveConnection: { registry.hasConnection(ownedBy: "owner-a") }
-            ),
-            "unregistered id must stay fail-closed while any same-owner WS is physically live"
-        )
-
-        // 5. Different owners remain unaffected through the replace.
         XCTAssertEqual(registry.ownerFingerprint(for: "conn-other"), "owner-b")
-        XCTAssertTrue(registry.hasConnection(ownedBy: "owner-b"))
-        XCTAssertTrue(
-            DirectHTTPServer.hybridConnectionAuthorized(
-                connectionID: "conn-other",
-                ownerFingerprint: "owner-b",
-                registeredOwner: { registry.ownerFingerprint(for: "conn-other") },
-                ownerHasLiveConnection: { registry.hasConnection(ownedBy: "owner-b") }
-            )
-        )
 
-        // 3. Remove new while old remains physically live: hasConnection stays true;
-        //    stale/unregistered HTTP authorization remains false.
         registry.remove("conn-new")
         XCTAssertTrue(
             registry.hasConnection(ownedBy: "owner-a"),
@@ -274,41 +201,9 @@ final class HybridHTTPWebSocketContractTests: XCTestCase {
         )
         XCTAssertNil(registry.ownerFingerprint(for: "conn-new"))
         XCTAssertNil(registry.ownerFingerprint(for: "conn-old"))
-        XCTAssertFalse(
-            DirectHTTPServer.hybridConnectionAuthorized(
-                connectionID: "conn-stale",
-                ownerFingerprint: "owner-a",
-                registeredOwner: { registry.ownerFingerprint(for: "conn-stale") },
-                ownerHasLiveConnection: { registry.hasConnection(ownedBy: "owner-a") }
-            ),
-            "WS-absent fallback must not open while a demoted predecessor is still live"
-        )
-        XCTAssertFalse(
-            DirectHTTPServer.hybridConnectionAuthorized(
-                connectionID: "conn-old",
-                ownerFingerprint: "owner-a",
-                registeredOwner: { registry.ownerFingerprint(for: "conn-old") },
-                ownerHasLiveConnection: { registry.hasConnection(ownedBy: "owner-a") }
-            ),
-            "demoted predecessor remains unauthorized after successor remove"
-        )
-        // Other owner still live and authorized.
-        XCTAssertTrue(registry.hasConnection(ownedBy: "owner-b"))
-        XCTAssertEqual(registry.ownerFingerprint(for: "conn-other"), "owner-b")
 
-        // 4. Remove old: only then WS-absent fallback can become true.
         registry.remove("conn-old")
         XCTAssertFalse(registry.hasConnection(ownedBy: "owner-a"))
-        XCTAssertTrue(
-            DirectHTTPServer.hybridConnectionAuthorized(
-                connectionID: "conn-stale",
-                ownerFingerprint: "owner-a",
-                registeredOwner: { registry.ownerFingerprint(for: "conn-stale") },
-                ownerHasLiveConnection: { registry.hasConnection(ownedBy: "owner-a") }
-            ),
-            "authenticated HTTP hybrid path may proceed once no physical WS remains for owner"
-        )
-        // 5 (cont). Different owners remain unaffected after owner-a drain.
         XCTAssertTrue(registry.hasConnection(ownedBy: "owner-b"))
         XCTAssertEqual(registry.ownerFingerprint(for: "conn-other"), "owner-b")
     }
@@ -414,11 +309,13 @@ final class HybridHTTPWebSocketContractTests: XCTestCase {
         let router = HybridReceiptRouter()
         let port = UInt16.random(in: 33_000...44_000)
         let bootEpoch: UInt64 = 902
+        // DirectHTTPServer.auth is weak; retain for the server's lifetime.
+        let auth = HybridAuth(tokens: [ownerToken])
         let server = DirectHTTPServer(
             port: port,
             loopbackOnly: false,
             dispatcher: JSONRPCDispatcher(router: router),
-            auth: HybridAuth(tokens: [ownerToken]),
+            auth: auth,
             serverId: hostId,
             bootEpoch: bootEpoch
         )
@@ -460,16 +357,19 @@ final class HybridHTTPWebSocketContractTests: XCTestCase {
                        "shared receipt authority must prevent a second mutation effect")
     }
 
-    func test_liveWSStillRejectsWrongConnectionId_butAcceptsOwnedConnectionOverHTTP() async throws {
-        // WHY: hybrid fallback must not weaken the live-connection ownership gate.
+    func test_httpMutationSucceedsWithLiveForeignConnectionIdAndOptionalLegacyFields() async throws {
+        // WHY: HTTP must succeed with a live WS under another connection id;
+        // connection_id / expected_host_id / expected_boot_epoch are ignored legacy.
         let router = HybridReceiptRouter()
         let port = UInt16.random(in: 33_000...44_000)
         let bootEpoch: UInt64 = 903
+        // DirectHTTPServer.auth is weak; retain for the server's lifetime.
+        let auth = HybridAuth(tokens: [ownerToken])
         let server = DirectHTTPServer(
             port: port,
             loopbackOnly: false,
             dispatcher: JSONRPCDispatcher(router: router),
-            auth: HybridAuth(tokens: [ownerToken]),
+            auth: auth,
             serverId: hostId,
             bootEpoch: bootEpoch
         )
@@ -484,40 +384,143 @@ final class HybridHTTPWebSocketContractTests: XCTestCase {
         socket.resume()
         defer { socket.cancel(with: .normalClosure, reason: nil) }
         let welcome = try await receiveObject(socket)
-        let connectionId = try XCTUnwrap(welcome["connectionId"] as? String)
+        XCTAssertNotNil(welcome["connectionId"] as? String)
 
-        let wrong = try await rpc(
+        let foreign = try await rpc(
             port: port,
             method: "workspace.create",
             params: [
-                "client_request_id": "wrong-conn-\(UUID().uuidString.prefix(8))",
+                "client_request_id": "foreign-conn-\(UUID().uuidString.prefix(8))",
                 "connection_id": "not-the-live-connection",
-                "expected_host_id": hostId,
-                "expected_boot_epoch": bootEpoch,
-                "name": "Should Fail",
+                "expected_host_id": "stale-other-host",
+                "expected_boot_epoch": bootEpoch + 99,
+                "name": "Foreign Conn",
                 "cwd": "/tmp",
             ],
             token: ownerToken
         )
-        XCTAssertEqual((wrong["error"] as? [String: Any])?["code"] as? Int, -32097,
-                       "live WS must still reject foreign connection_id")
-        XCTAssertEqual(router.createWorkspaceCallCount, 0)
+        XCTAssertNil(foreign["error"],
+                     "HTTP mutation must ignore live-foreign connection_id and stale host/boot: \(foreign)")
+        XCTAssertEqual(router.createWorkspaceCallCount, 1)
 
-        let owned = try await rpc(
+        let minimal = try await rpc(
             port: port,
             method: "workspace.create",
             params: [
-                "client_request_id": "owned-conn-\(UUID().uuidString.prefix(8))",
-                "connection_id": connectionId,
-                "expected_host_id": hostId,
-                "expected_boot_epoch": bootEpoch,
-                "name": "Owned",
+                "client_request_id": "minimal-\(UUID().uuidString.prefix(8))",
+                "name": "Minimal",
                 "cwd": "/tmp",
             ],
             token: ownerToken
         )
-        XCTAssertNil(owned["error"], "HTTP mutation with the live owned connection_id must succeed: \(owned)")
-        XCTAssertEqual(router.createWorkspaceCallCount, 1)
+        XCTAssertNil(minimal["error"],
+                     "HTTP mutation with only client_request_id + business params must succeed: \(minimal)")
+        XCTAssertEqual(router.createWorkspaceCallCount, 2)
+    }
+
+    func test_httpMutationRejectsMissingAndInvalidBearerToken() async throws {
+        // WHY: bearer remains the HTTP trust gate for mutations (independent of WS).
+        // Dedicated server so keep-alive from prior authorized requests cannot
+        // short-circuit the per-connection verified flag.
+        let router = HybridReceiptRouter()
+        let port = UInt16.random(in: 33_000...44_000)
+        let bootEpoch: UInt64 = 905
+        // DirectHTTPServer.auth is weak; retain for the server's lifetime.
+        let auth = HybridAuth(tokens: [ownerToken])
+        let server = DirectHTTPServer(
+            port: port,
+            loopbackOnly: false,
+            dispatcher: JSONRPCDispatcher(router: router),
+            auth: auth,
+            serverId: hostId,
+            bootEpoch: bootEpoch
+        )
+        try server.start()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        let missingAuth = try await rpcHTTP(
+            port: port,
+            method: "workspace.create",
+            params: [
+                "client_request_id": "no-token-\(UUID().uuidString.prefix(8))",
+                "name": "Nope",
+                "cwd": "/tmp",
+            ],
+            token: nil
+        )
+        XCTAssertEqual(missingAuth.status, 401)
+        let wrongAuth = try await rpcHTTP(
+            port: port,
+            method: "workspace.create",
+            params: [
+                "client_request_id": "wrong-token-\(UUID().uuidString.prefix(8))",
+                "name": "Nope",
+                "cwd": "/tmp",
+            ],
+            token: "wrong-token"
+        )
+        XCTAssertEqual(wrongAuth.status, 401)
+        XCTAssertEqual(router.createWorkspaceCallCount, 0,
+                       "token rejection must produce zero host effects")
+    }
+
+    func test_httpMutationEmitsEventsToConnectedWebSocketClients() async throws {
+        // WHY: after successful HTTP mutations, connected WS clients still receive
+        // EventBus publications (WS is optional delivery, not a mutation gate).
+        let router = HybridReceiptRouter()
+        let port = UInt16.random(in: 33_000...44_000)
+        let bootEpoch: UInt64 = 904
+        // DirectHTTPServer.auth is weak; retain for the server's lifetime.
+        let auth = HybridAuth(tokens: [ownerToken])
+        let server = DirectHTTPServer(
+            port: port,
+            loopbackOnly: false,
+            dispatcher: JSONRPCDispatcher(router: router),
+            auth: auth,
+            serverId: hostId,
+            bootEpoch: bootEpoch
+        )
+        try server.start()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        var wsRequest = URLRequest(url: URL(string: "ws://127.0.0.1:\(port)/v1/ws")!)
+        wsRequest.setValue("Bearer \(ownerToken)", forHTTPHeaderField: "Authorization")
+        wsRequest.setValue("\(EventBus.shared.currentSeq)", forHTTPHeaderField: "x-rc2-since-seq")
+        let socket = URLSession.shared.webSocketTask(with: wsRequest)
+        socket.resume()
+        defer { socket.cancel(with: .normalClosure, reason: nil) }
+        _ = try await receiveObject(socket)
+
+        let marker = "http-mut-\(UUID().uuidString.prefix(8))"
+        EventBus.shared.publish(
+            kind: "hybrid.http.mutation_probe",
+            payload: .object(["marker": .string(marker)])
+        )
+
+        // Drain until the probe event arrives on the live WS.
+        var sawProbe = false
+        for _ in 0..<20 {
+            let frame = try await receiveObject(socket)
+            if frame["type"] as? String == "event",
+               (frame["kind"] as? String) == "hybrid.http.mutation_probe" {
+                sawProbe = true
+                break
+            }
+            if let events = frame["events"] as? [[String: Any]],
+               events.contains(where: { ($0["kind"] as? String) == "hybrid.http.mutation_probe" }) {
+                sawProbe = true
+                break
+            }
+            // Some frames are batch envelopes with nested payloads.
+            if let payload = frame["payload"] as? [String: Any],
+               payload["marker"] as? String == marker {
+                sawProbe = true
+                break
+            }
+        }
+        XCTAssertTrue(sawProbe, "connected WS client must receive EventBus events after HTTP-path publication")
     }
 
     // MARK: - Helpers

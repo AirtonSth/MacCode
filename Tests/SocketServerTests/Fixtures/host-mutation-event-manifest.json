@@ -1,14 +1,11 @@
 {
   "protocolVersion": 3,
   "mutationGate": {
-    "requiredConnectionState": "live",
-    "requiredFreshness": true,
+    "requiredConnectionState": "authenticated",
+    "requiredFreshness": false,
     "idempotencyField": "client_request_id",
     "requiredWireParams": [
-      "client_request_id",
-      "connection_id",
-      "expected_host_id",
-      "expected_boot_epoch"
+      "client_request_id"
     ]
   },
   "deliveryGuarantee": {

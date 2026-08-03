@@ -939,8 +939,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// negotiated controls (e.g. `stream.interest.v1`) are appended only when
     /// the host actually implements them — see `welcomeCapabilities(streamInterestSupported:)`.
     public static let baselineWelcomeCapabilities: [String] = [
-        "events.replay", "jsonrpc.batch", "snapshot.v3",
-        "rpc.websocket", "snapshot.incremental", "resume.v1",
+        "events.replay", "snapshot.v3",
+        "snapshot.incremental", "resume.v1",
         SnapshotChunkCapability.wireName,
     ]
 
@@ -1946,12 +1946,32 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
             switch attachmentUploadV3Route {
             case .chunk(_, let index):
-                // These fields carry raw identity/key material in v2. Their
-                // presence on a redirect-following background request is a
-                // protocol violation even if a proxy would otherwise ignore
-                // them.
+                attachmentUploadV3OwnerFingerprint =
+                    Self.attachmentUploadV3OwnerFingerprint(
+                        token: presentedBearerToken,
+                        auth: auth
+                    )
+                guard let attachmentUploadV3OwnerFingerprint else {
+                    sendAttachmentUploadV3Error(
+                        fd: fd,
+                        status: 401,
+                        code: "unauthorized",
+                        message: "A valid bearer token is required.",
+                        retryable: false,
+                        uploadId: uploadId,
+                        additionalHeaders: [
+                            "WWW-Authenticate": wwwAuthenticateHeaderValue(
+                                scheme: "Bearer",
+                                realm: "RC2"
+                            )
+                        ]
+                    )
+                    return
+                }
+                // These fields carry raw host/key material in v2. Their
+                // presence on a background request is a protocol violation;
+                // bearer authorization remains mandatory for every chunk.
                 let forbidden = [
-                    "authorization",
                     "x-rc2-expected-host-id",
                     "x-rc2-workspace-id",
                     "x-rc2-filename-utf8-base64url",
@@ -2003,9 +2023,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         sealedSHA256: sealedSHA256,
                         sealedBytes: sealedBytes,
                         idempotencyKey: idempotencyKey,
-                        ownerIsActive: { [weak auth] owner in
-                            auth?.isAuthorizedOwnerFingerprintActive(owner)
-                                ?? false
+                        ownerIsActive: { owner in
+                            owner == attachmentUploadV3OwnerFingerprint
                         }
                     )
                 } catch {
@@ -2044,15 +2063,16 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     )
                     return
                 }
-                guard headers["x-rc2-expected-host-id"] == serverId,
-                      let idempotencyKey = headers["idempotency-key"],
+                // Bearer owner + matching Idempotency-Key only. Optional
+                // X-RC2-Expected-Host-ID is never an HTTP authorization gate.
+                guard let idempotencyKey = headers["idempotency-key"],
                       UUID(uuidString: idempotencyKey)
                         == UUID(uuidString: uploadId) else {
                     sendAttachmentUploadV3Error(
                         fd: fd,
                         status: 409,
-                        code: "protected_control_identity_mismatch",
-                        message: "Protected upload control identity is invalid.",
+                        code: "idempotency_key_mismatch",
+                        message: "Idempotency-Key must match the upload id.",
                         retryable: false,
                         uploadId: uploadId
                     )
@@ -2108,18 +2128,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 )
                 return
             }
-            guard headers["x-rc2-expected-host-id"] == serverId else {
-                sendAttachmentUploadV2Error(
-                    fd: fd,
-                    status: 409,
-                    code: "host_identity_mismatch",
-                    message: "The expected host identity does not match this server.",
-                    retryable: false,
-                    uploadId: uploadId,
-                    acceptEncoding: headers["accept-encoding"]
-                )
-                return
-            }
+            // Optional X-RC2-Expected-Host-ID is ignored: HTTP upload admission
+            // is bearer owner + workspace/idempotency/size/digest only.
             guard let idempotencyKey = headers["idempotency-key"],
                   UUID(uuidString: idempotencyKey) == UUID(uuidString: uploadId) else {
                 sendAttachmentUploadV2Error(
@@ -2392,8 +2402,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 snapshotTimeoutMs: snapshotTimeoutMs,
                 currentSequence: eventSnapshot.sequence,
                 oldestReplaySequence: eventSnapshot.oldestReplaySequence,
-                // Wave 4: rpc.websocket + snapshot.incremental advertised so
-                // clients can hydrate without new TCP and request domain deltas.
+                // Snapshot deltas and replay are advertised independently of
+                // the event-only WebSocket transport.
                 // stream.interest.v1 only when the host applies rc2.interest
                 // (see welcomeCapabilities); old peers ignore unknown caps.
                 capabilities: Self.welcomeCapabilities()
@@ -3304,18 +3314,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
         )
     }
 
-    /// WebSocket JSON-RPC entry: same framing as HTTP, but checkpoint list is forbidden.
-    public func dispatchRPCOverWebSocket(
-        bodyData: Data,
-        ownerFingerprint: String? = nil
-    ) async -> Data {
-        await dispatchRPC(
-            bodyData: bodyData,
-            ownerFingerprint: ownerFingerprint,
-            wireTransport: .webSocket
-        )
-    }
-
     private func dispatchRPC(
         bodyData: Data,
         ownerFingerprint: String?,
@@ -3378,8 +3376,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
         // C-24: `sync.snapshot` is the largest payload. Encode the full JSON-RPC
         // envelope once with the wire `id` included — no Data→Any→Data cycle.
-        // Chunk begin/chunk are also owned here so they share the same
-        // host/boot/owner/watermark gates as the legacy full path.
+        // Chunk begin/chunk share bearer-owner admission with the full path
+        // (no WS registry / host-boot / watermark prerequisites).
         if let object = root as? [String: Any],
            let method = object["method"] as? String {
             let phaseMetrics = wireTransport == .http ? requestPhaseMetrics : nil
@@ -3554,34 +3552,15 @@ public final class DirectHTTPServer: @unchecked Sendable {
             method: method,
             params: params
         )
+        // HTTP is independently authoritative: bearer owner only. Live/absent/
+        // foreign WS registry identity is never a mutation precondition.
         let mutationContext = MutationRequestContext(
             ownerFingerprint: ownerFingerprint,
             hostId: serverId,
-            bootEpoch: bootEpoch,
-            activeConnection: { [activeWebSocketConnections] connectionID, ownerFingerprint in
-                // One host/boot authority for HTTP and WebSocket. Live WS still
-                // pins mutations to the owned connection_id. When that socket is
-                // gone, authenticated HTTP remains usable so retries and
-                // idempotent commands do not depend on a second transport.
-                Self.hybridConnectionAuthorized(
-                    connectionID: connectionID,
-                    ownerFingerprint: ownerFingerprint,
-                    registeredOwner: {
-                        activeWebSocketConnections.ownerFingerprint(for: connectionID)
-                    },
-                    ownerHasLiveConnection: {
-                        activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
-                    }
-                )
-            }
+            bootEpoch: bootEpoch
         )
         let response: JSONRPCResponse
         switch wireTransport {
-        case .webSocket:
-            response = await dispatcher.dispatchWebSocket(
-                request,
-                mutationContext: mutationContext
-            )
         case .http:
             response = await dispatcher.dispatchHTTP(
                 request,
@@ -3654,107 +3633,31 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return rpcErrorObject(.internalError, id: wireID)
     }
 
-    /// Hybrid transport authority for mutations (and snapshot ownership checks).
-    ///
-    /// - If `connectionID` is live: only its registered owner may use it.
-    /// - If this owner has any other live WS: they must use that connection_id
-    ///   (wrong-connection stays fail-closed).
-    /// - If nothing is live for this owner and the id is unregistered: allow
-    ///   authenticated HTTP under the host/boot gate (WS-absent hybrid path).
-    nonisolated static func hybridConnectionAuthorized(
-        connectionID: String,
-        ownerFingerprint: String,
-        registeredOwner: () -> String?,
-        ownerHasLiveConnection: () -> Bool
-    ) -> Bool {
-        _ = connectionID
-        if let registered = registeredOwner() {
-            return registered == ownerFingerprint
-        }
-        // Unregistered connection_id: reject when the owner still holds a live WS.
-        if ownerHasLiveConnection() { return false }
-        return true
-    }
-
     private func encodeSyncSnapshotResponse(
         rawParams: [String: Any],
         wireID: Any,
         ownerFingerprint: String,
         phaseMetrics: HTTPRequestPhaseMetrics? = nil
     ) async -> Data {
-        // Wave 4: optional knownDomainRevisions enables partial/delta snapshots.
+        // HTTP snapshot admission: bearer owner (caller) + schema only.
+        // connectionId / expectedHostId / expectedBootEpoch may appear as
+        // ignored legacy noise of any JSON type — never parsed, validated,
+        // or used as WS-registry / host-boot / watermark preconditions.
+        _ = ownerFingerprint
         let allowedKeys: Set<String> = [
             "connectionId", "expectedHostId", "expectedBootEpoch", "supportedStateVersion",
             "knownDomainRevisions",
         ]
         guard Set(rawParams.keys).isSubset(of: allowedKeys),
-              rawParams.keys.contains("connectionId"),
-              rawParams.keys.contains("expectedHostId"),
-              rawParams.keys.contains("expectedBootEpoch"),
               rawParams.keys.contains("supportedStateVersion"),
-        let connectionID = rawParams["connectionId"] as? String,
-        !connectionID.isEmpty,
-        let expectedHostID = rawParams["expectedHostId"] as? String,
-        expectedHostID == serverId,
-        let expectedBootEpoch = Self.strictUInt64(rawParams["expectedBootEpoch"]),
-        expectedBootEpoch == bootEpoch,
-        let supportedStateVersion = Self.strictInt64(rawParams["supportedStateVersion"]),
-        supportedStateVersion == 3 else {
+              let supportedStateVersion = Self.strictInt64(rawParams["supportedStateVersion"]),
+              supportedStateVersion == 3 else {
             return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
-        }
-
-        // Hybrid ownership: live connection_id is owner-pinned; unregistered ids
-        // are only accepted when this owner has no live WebSocket (HTTP baseline).
-        let registeredOwner = activeWebSocketConnections.ownerFingerprint(for: connectionID)
-        let ownerHasLiveConnection = activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
-        guard Self.hybridConnectionAuthorized(
-            connectionID: connectionID,
-            ownerFingerprint: ownerFingerprint,
-            registeredOwner: {
-                registeredOwner
-            },
-            ownerHasLiveConnection: {
-                ownerHasLiveConnection
-            }
-        ) else {
-            if registeredOwner == nil, ownerHasLiveConnection {
-                return rpcJSONData(rpcErrorObject(
-                    JSONRPCError(
-                        code: JSONRPCError.invalidParams.code,
-                        message: JSONRPCError.invalidParams.message,
-                        data: .object([
-                            "reason": .string("snapshot_owner_conflict"),
-                            "retryable": .bool(true),
-                        ])
-                    ),
-                    id: wireID
-                ))
-            }
-            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
-        }
-        let watermark = activeWebSocketConnections.watermark(
-            for: connectionID,
-            ownerFingerprint: ownerFingerprint
-        )
-        if let watermark, !watermark.beginSnapshot() {
-            NSLog("[RC2.WS] snapshot_reservation_collision method=sync.snapshot")
-            return rpcJSONData(rpcErrorObject(
-                JSONRPCError(
-                    code: JSONRPCError.invalidParams.code,
-                    message: JSONRPCError.invalidParams.message,
-                    data: .object([
-                        "reason": .string("snapshot_reservation_held"),
-                        "retryable": .bool(true),
-                    ])
-                ),
-                id: wireID
-            ))
         }
 
         let knownRevisions: ConnectionDomainRevisions?
         if rawParams.keys.contains("knownDomainRevisions") {
             guard let parsed = ConnectionDomainRevisions.parse(rawParams["knownDomainRevisions"]) else {
-                if let watermark { watermark.cancelSnapshot() }
                 return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
             }
             knownRevisions = parsed
@@ -3762,24 +3665,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
             knownRevisions = nil
         }
 
-        var snapshotAdopted = false
-        defer {
-            if let watermark, !snapshotAdopted { watermark.cancelSnapshot() }
-        }
         do {
             let snapshot = try await dispatcher.readConnectionSnapshot(
                 timeoutNanoseconds: snapshotReadTimeoutNanosecondsForTesting
                     ?? JSONRPCDispatcher.connectionSnapshotTimeoutNanoseconds,
                 phaseMetrics: phaseMetrics
             )
-            if let watermark {
-                guard activeWebSocketConnections.watermark(
-                    for: connectionID,
-                    ownerFingerprint: ownerFingerprint
-                ) === watermark else {
-                    return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
-                }
-            }
             let hostRevisions = snapshot.metadata.domainRevisions
             let includeDomains: Set<String>?
             if let knownRevisions {
@@ -3793,10 +3684,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 domainRevisions: hostRevisions,
                 includeDomains: includeDomains
             )
+            // Server response metadata only (host/boot + non-empty connectionId
+            // required by transport frame decoding). HTTP does not bind to a
+            // live WS connection and never echoes client identity fields.
             let frame = ConnectionSnapshotFrame(
                 protocolVersion: ConnectionTransportFrame.protocolVersion,
                 type: "snapshot",
-                connectionId: connectionID,
+                connectionId: UUID().uuidString,
                 hostId: serverId,
                 bootEpoch: bootEpoch,
                 sequence: snapshot.metadata.sequence,
@@ -3805,24 +3699,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 stateVersion: 3,
                 state: state
             )
-            if let watermark {
-                switch watermark.adoptSnapshot(sequence: snapshot.metadata.sequence) {
-                case .adopted:
-                    snapshotAdopted = true
-                case .gap(let expected, let received):
-                    return rpcJSONData(rpcErrorObject(JSONRPCError(
-                        code: -32010,
-                        message: "Event sequence gap detected; reconnect and request a new baseline.",
-                        data: .object([
-                            "expectedSequence": .number(Double(expected)),
-                            "receivedSequence": .number(Double(received)),
-                        ])
-                    ), id: wireID))
-                }
-            } else {
-                // HTTP-only baseline: no WS gap watermark to adopt.
-                snapshotAdopted = true
-            }
             // C-24: one JSONEncoder pass for the full RPC response (id + result).
             // Avoids the prior Data → Any → Data cycle on multi-hundred-KB snapshots.
             let envelope = SnapshotRPCSuccessEnvelope(
@@ -3905,32 +3781,24 @@ public final class DirectHTTPServer: @unchecked Sendable {
         )
     }
 
-    /// Opt-in chunked baseline: same host/boot/owner gates as `sync.snapshot`,
-    /// but only *reserves* the watermark (`beginSnapshot`). Sequence authority
-    /// advances only in `sync.snapshot.commit` after the client has assembled
-    /// and digest-verified every chunk. Returns a secret-free manifest and
-    /// caches bounded frame bytes for granular resume via `sync.snapshot.chunk`.
+    /// Opt-in chunked baseline: bearer owner + schema only (no WS registry,
+    /// host/boot client tuple, snapshot-owner, or watermark preconditions).
+    /// Returns a secret-free manifest and caches bounded frame bytes for
+    /// granular resume via `sync.snapshot.chunk`.
     private func encodeSyncSnapshotBeginResponse(
         rawParams: [String: Any],
         wireID: Any,
         ownerFingerprint: String,
         phaseMetrics: HTTPRequestPhaseMetrics? = nil
     ) async -> Data {
+        // Legacy connectionId/expectedHostId/expectedBootEpoch may appear as
+        // ignored noise of any JSON type — never parsed for auth or storage.
         let allowedKeys: Set<String> = [
             "connectionId", "expectedHostId", "expectedBootEpoch", "supportedStateVersion",
             "knownDomainRevisions", "preferredChunkBytes",
         ]
         guard Set(rawParams.keys).isSubset(of: allowedKeys),
-              rawParams.keys.contains("connectionId"),
-              rawParams.keys.contains("expectedHostId"),
-              rawParams.keys.contains("expectedBootEpoch"),
               rawParams.keys.contains("supportedStateVersion"),
-              let connectionID = rawParams["connectionId"] as? String,
-              !connectionID.isEmpty,
-              let expectedHostID = rawParams["expectedHostId"] as? String,
-              expectedHostID == serverId,
-              let expectedBootEpoch = Self.strictUInt64(rawParams["expectedBootEpoch"]),
-              expectedBootEpoch == bootEpoch,
               let supportedStateVersion = Self.strictInt64(rawParams["supportedStateVersion"]),
               supportedStateVersion == 3 else {
             return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
@@ -3948,61 +3816,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
             preferredChunkBytes = nil
         }
 
-        let registeredOwner = activeWebSocketConnections.ownerFingerprint(for: connectionID)
-        let ownerHasLiveConnection = activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
-        guard Self.hybridConnectionAuthorized(
-            connectionID: connectionID,
-            ownerFingerprint: ownerFingerprint,
-            registeredOwner: {
-                registeredOwner
-            },
-            ownerHasLiveConnection: {
-                ownerHasLiveConnection
-            }
-        ) else {
-            if registeredOwner == nil, ownerHasLiveConnection {
-                return rpcJSONData(rpcErrorObject(
-                    JSONRPCError(
-                        code: JSONRPCError.invalidParams.code,
-                        message: JSONRPCError.invalidParams.message,
-                        data: .object([
-                            "reason": .string("snapshot_owner_conflict"),
-                            "retryable": .bool(true),
-                        ])
-                    ),
-                    id: wireID
-                ))
-            }
-            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
-        }
-        // Drop TTL-expired transfers first so a abandoned chunk reservation
-        // cannot permanently fence beginSnapshot.
-        releaseExpiredChunkTransferReservations()
-        let watermark = activeWebSocketConnections.watermark(
-            for: connectionID,
-            ownerFingerprint: ownerFingerprint
-        )
-        if let watermark, !watermark.beginSnapshot() {
-            // Single-flight collision: secret-free reason so clients wait out
-            // the transfer-cache lease instead of thrashing another begin.
-            NSLog("[RC2.WS] snapshot_reservation_collision method=sync.snapshot.begin")
-            return rpcJSONData(rpcErrorObject(
-                JSONRPCError(
-                    code: JSONRPCError.invalidParams.code,
-                    message: JSONRPCError.invalidParams.message,
-                    data: .object([
-                        "reason": .string("snapshot_reservation_held"),
-                        "retryable": .bool(true),
-                    ])
-                ),
-                id: wireID
-            ))
-        }
+        // Drop TTL-expired transfers so cache pressure stays deterministic.
+        _ = snapshotChunkTransfers.evictExpired()
 
         let knownRevisions: ConnectionDomainRevisions?
         if rawParams.keys.contains("knownDomainRevisions") {
             guard let parsed = ConnectionDomainRevisions.parse(rawParams["knownDomainRevisions"]) else {
-                if let watermark { watermark.cancelSnapshot() }
                 return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
             }
             knownRevisions = parsed
@@ -4010,26 +3829,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
             knownRevisions = nil
         }
 
-        // Reservation held only after cache insert succeeds. Unlike full
-        // `sync.snapshot`, begin must NOT adopt/advance the watermark.
-        var reservationHeld = false
-        defer {
-            if let watermark, !reservationHeld { watermark.cancelSnapshot() }
-        }
         do {
             let snapshot = try await dispatcher.readConnectionSnapshot(
                 timeoutNanoseconds: snapshotReadTimeoutNanosecondsForTesting
                     ?? JSONRPCDispatcher.connectionSnapshotTimeoutNanoseconds,
                 phaseMetrics: phaseMetrics
             )
-            if let watermark {
-                guard activeWebSocketConnections.watermark(
-                    for: connectionID,
-                    ownerFingerprint: ownerFingerprint
-                ) === watermark else {
-                    return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
-                }
-            }
             let hostRevisions = snapshot.metadata.domainRevisions
             let includeDomains: Set<String>?
             if let knownRevisions {
@@ -4042,10 +3847,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 domainRevisions: hostRevisions,
                 includeDomains: includeDomains
             )
+            // Server response metadata only; HTTP is not WS-connection-bound.
+            // Non-empty connectionId satisfies transport-frame decoding only.
+            let responseConnectionId = UUID().uuidString
             let frame = ConnectionSnapshotFrame(
                 protocolVersion: ConnectionTransportFrame.protocolVersion,
                 type: "snapshot",
-                connectionId: connectionID,
+                connectionId: responseConnectionId,
                 hostId: serverId,
                 bootEpoch: bootEpoch,
                 sequence: snapshot.metadata.sequence,
@@ -4067,7 +3875,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let inserted = try snapshotChunkTransfers.insert(
                 frameBytes: frameBytes,
                 ownerFingerprint: ownerFingerprint,
-                connectionId: connectionID,
+                connectionId: responseConnectionId,
                 hostId: serverId,
                 bootEpoch: bootEpoch,
                 snapshotId: frame.snapshotId,
@@ -4076,15 +3884,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 stateVersion: frame.stateVersion,
                 preferredChunkBytes: preferredChunkBytes
             )
-            // Pressure/TTL evictions release prior reservations without adopt.
-            for released in inserted.releasedReservations {
-                cancelChunkSnapshotReservation(
-                    connectionID: released.connectionId,
-                    ownerFingerprint: released.ownerFingerprint
-                )
-            }
-            // Keep watermark in-flight until commit (or cancel on expiry/failure).
-            reservationHeld = true
+            _ = inserted.releasedReservations
             return rpcJSONData([
                 "jsonrpc": "2.0",
                 "id": wireID,
@@ -4131,9 +3931,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
         )
     }
 
-    /// Finalize a chunked transfer: validate identity + digest, adopt sequence
-    /// exactly once, and release the transfer. Must not run before the client
-    /// has assembled/verified every chunk (client contracts enforce ordering).
+    /// Finalize a chunked transfer: bearer owner + transfer/request identifiers
+    /// (transferId, snapshotId, digest). No WS watermark adopt prerequisite.
     private func encodeSyncSnapshotCommitResponse(
         rawParams: [String: Any],
         wireID: Any,
@@ -4143,81 +3942,27 @@ public final class DirectHTTPServer: @unchecked Sendable {
             "transferId", "snapshotId", "digest",
             "connectionId", "expectedHostId", "expectedBootEpoch",
         ]
-        guard Set(rawParams.keys) == allowedKeys,
+        guard Set(rawParams.keys).isSubset(of: allowedKeys),
+              rawParams.keys.contains("transferId"),
+              rawParams.keys.contains("snapshotId"),
+              rawParams.keys.contains("digest"),
               let transferId = rawParams["transferId"] as? String,
               !transferId.isEmpty,
               let snapshotId = rawParams["snapshotId"] as? String,
               !snapshotId.isEmpty,
               let digest = rawParams["digest"] as? String,
               digest.count == 64,
-              digest.allSatisfy({ $0.isHexDigit }),
-              let connectionID = rawParams["connectionId"] as? String,
-              !connectionID.isEmpty,
-              let expectedHostID = rawParams["expectedHostId"] as? String,
-              expectedHostID == serverId,
-              let expectedBootEpoch = Self.strictUInt64(rawParams["expectedBootEpoch"]),
-              expectedBootEpoch == bootEpoch else {
+              digest.allSatisfy({ $0.isHexDigit }) else {
             return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
         }
-
-        let registeredOwner = activeWebSocketConnections.ownerFingerprint(for: connectionID)
-        let ownerHasLiveConnection = activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
-        guard Self.hybridConnectionAuthorized(
-            connectionID: connectionID,
-            ownerFingerprint: ownerFingerprint,
-            registeredOwner: {
-                registeredOwner
-            },
-            ownerHasLiveConnection: {
-                ownerHasLiveConnection
-            }
-        ) else {
-            if registeredOwner == nil, ownerHasLiveConnection {
-                return rpcJSONData(rpcErrorObject(
-                    JSONRPCError(
-                        code: JSONRPCError.invalidParams.code,
-                        message: JSONRPCError.invalidParams.message,
-                        data: .object([
-                            "reason": .string("snapshot_owner_conflict"),
-                            "retryable": .bool(true),
-                        ])
-                    ),
-                    id: wireID
-                ))
-            }
-            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
-        }
-
-        let watermark = activeWebSocketConnections.watermark(
-            for: connectionID,
-            ownerFingerprint: ownerFingerprint
-        )
 
         do {
             let record = try snapshotChunkTransfers.takeForCommit(
                 transferId: transferId,
                 snapshotId: snapshotId,
                 digest: digest,
-                ownerFingerprint: ownerFingerprint,
-                connectionId: connectionID,
-                hostId: serverId,
-                bootEpoch: bootEpoch
+                ownerFingerprint: ownerFingerprint
             )
-            if let watermark {
-                switch watermark.adoptSnapshot(sequence: record.sequence) {
-                case .adopted:
-                    break
-                case .gap(let expected, let received):
-                    return rpcJSONData(rpcErrorObject(JSONRPCError(
-                        code: -32010,
-                        message: "Event sequence gap detected; reconnect and request a new baseline.",
-                        data: .object([
-                            "expectedSequence": .number(Double(expected)),
-                            "receivedSequence": .number(Double(received)),
-                        ])
-                    ), id: wireID))
-                }
-            }
             return rpcJSONData([
                 "jsonrpc": "2.0",
                 "id": wireID,
@@ -4231,20 +3976,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
         } catch let failure as SnapshotChunkTransferFailure {
             switch failure {
             case .transferExpired:
-                // Reservation must not outlive the transfer cache entry.
-                cancelChunkSnapshotReservation(
-                    connectionID: connectionID,
-                    ownerFingerprint: ownerFingerprint
-                )
                 return rpcJSONData(rpcErrorObject(JSONRPCError(
                     code: -32041,
                     message: "Snapshot chunk transfer expired or unknown; request a new baseline.",
                     data: .object(["reason": .string("transfer_expired")])
                 ), id: wireID))
             case .transferUnknown:
-                // Already committed (single-flight) or never existed — do not
-                // cancel a live reservation that may belong to another transfer
-                // lifecycle. Double-commit is fail-closed and non-advancing.
+                // Already committed (single-flight) or never existed.
+                // Double-commit is fail-closed and non-advancing.
                 return rpcJSONData(rpcErrorObject(JSONRPCError(
                     code: -32041,
                     message: "Snapshot chunk transfer expired or unknown; request a new baseline.",
@@ -4260,8 +3999,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
         }
     }
 
-    /// Serve one cached chunk. Auth + identity gates match `sync.snapshot`;
-    /// never returns secrets from the original request.
+    /// Serve one cached chunk. Auth is bearer owner + transferId; legacy
+    /// connection/host/boot fields are optional and ignored. Never returns secrets.
     private func encodeSyncSnapshotChunkResponse(
         rawParams: [String: Any],
         wireID: Any,
@@ -4271,46 +4010,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
             "transferId", "chunkIndex",
             "connectionId", "expectedHostId", "expectedBootEpoch",
         ]
-        guard Set(rawParams.keys) == allowedKeys,
+        guard Set(rawParams.keys).isSubset(of: allowedKeys),
+              rawParams.keys.contains("transferId"),
+              rawParams.keys.contains("chunkIndex"),
               let transferId = rawParams["transferId"] as? String,
               !transferId.isEmpty,
               let chunkIndex = Self.strictInt64(rawParams["chunkIndex"]),
               chunkIndex >= 0,
-              chunkIndex <= Int64(SnapshotChunkSizePolicy.maximumChunkCount),
-              let connectionID = rawParams["connectionId"] as? String,
-              !connectionID.isEmpty,
-              let expectedHostID = rawParams["expectedHostId"] as? String,
-              expectedHostID == serverId,
-              let expectedBootEpoch = Self.strictUInt64(rawParams["expectedBootEpoch"]),
-              expectedBootEpoch == bootEpoch else {
-            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
-        }
-
-        let registeredOwner = activeWebSocketConnections.ownerFingerprint(for: connectionID)
-        let ownerHasLiveConnection = activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
-        guard Self.hybridConnectionAuthorized(
-            connectionID: connectionID,
-            ownerFingerprint: ownerFingerprint,
-            registeredOwner: {
-                registeredOwner
-            },
-            ownerHasLiveConnection: {
-                ownerHasLiveConnection
-            }
-        ) else {
-            if registeredOwner == nil, ownerHasLiveConnection {
-                return rpcJSONData(rpcErrorObject(
-                    JSONRPCError(
-                        code: JSONRPCError.invalidParams.code,
-                        message: JSONRPCError.invalidParams.message,
-                        data: .object([
-                            "reason": .string("snapshot_owner_conflict"),
-                            "retryable": .bool(true),
-                        ])
-                    ),
-                    id: wireID
-                ))
-            }
+              chunkIndex <= Int64(SnapshotChunkSizePolicy.maximumChunkCount) else {
             return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
         }
 
@@ -4318,10 +4025,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let chunk = try snapshotChunkTransfers.fetchChunk(
                 transferId: transferId,
                 chunkIndex: Int(chunkIndex),
-                ownerFingerprint: ownerFingerprint,
-                connectionId: connectionID,
-                hostId: serverId,
-                bootEpoch: bootEpoch
+                ownerFingerprint: ownerFingerprint
             )
             return rpcJSONData([
                 "jsonrpc": "2.0",
@@ -4331,10 +4035,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
         } catch let failure as SnapshotChunkTransferFailure {
             switch failure {
             case .transferExpired:
-                cancelChunkSnapshotReservation(
-                    connectionID: connectionID,
-                    ownerFingerprint: ownerFingerprint
-                )
                 return rpcJSONData(rpcErrorObject(JSONRPCError(
                     code: -32041,
                     message: "Snapshot chunk transfer expired or unknown; request a new baseline.",
@@ -4353,29 +4053,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
         } catch {
             return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
-        }
-    }
-
-    /// Drop an in-flight watermark reservation without advancing sequence.
-    private func cancelChunkSnapshotReservation(
-        connectionID: String,
-        ownerFingerprint: String
-    ) {
-        activeWebSocketConnections.watermark(
-            for: connectionID,
-            ownerFingerprint: ownerFingerprint
-        )?.cancelSnapshot()
-    }
-
-    /// Evict TTL-expired chunk transfers and cancel any watermark reservations
-    /// they still held (no cursor advance).
-    private func releaseExpiredChunkTransferReservations() {
-        let released = snapshotChunkTransfers.evictExpired()
-        for record in released {
-            cancelChunkSnapshotReservation(
-                connectionID: record.connectionId,
-                ownerFingerprint: record.ownerFingerprint
-            )
         }
     }
 
@@ -4401,28 +4078,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
         headers["authorization"]
             .flatMap { $0.split(separator: " ").last.map(String.init) }
             ?? headers["x-rc2-token"]
-    }
-
-    /// True when a WS text payload is a JSON-RPC 2.0 request (single or batch).
-    /// Wave 4 `rpc.websocket` — distinct from ConnectionTransportFrame envelopes.
-    static func looksLikeJSONRPCRequest(_ data: Data) -> Bool {
-        guard let root = try? JSONSerialization.jsonObject(with: data) else { return false }
-        if let object = root as? [String: Any] {
-            return object["jsonrpc"] as? String == "2.0"
-                && object["method"] is String
-                && object.keys.contains("id")
-        }
-        if let batch = root as? [Any], let first = batch.first as? [String: Any] {
-            return first["jsonrpc"] as? String == "2.0"
-                && first["method"] is String
-        }
-        return false
-    }
-
-    /// Swift Task priority for dispatching `bodyData` (pure; secret-free).
-    /// Convenience over `RPCDispatchSchedulerClass.taskPriority(for:)`.
-    nonisolated static func rpcDispatchTaskPriority(for bodyData: Data) -> TaskPriority {
-        RPCDispatchSchedulerClass.taskPriority(for: bodyData)
     }
 
     static func connectionOwnerFingerprint(token: String?) -> String {
@@ -4764,13 +4419,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 }
                 let prepare = try AttachmentUploadV3Store
                     .decodePrepareRequest(bodyData)
-                guard prepare.serverId == serverId else {
-                    throw AttachmentUploadV3HTTPError(
-                        status: 409,
-                        code: "host_identity_mismatch",
-                        message: "Prepare targets a different host."
-                    )
-                }
+                // prepare.serverId is a client-declared crypto binding label
+                // (AAD / HKDF salt), not a Mac host-identity gate.
                 _ = try store.prepare(
                     uploadId: uploadId,
                     authorizedOwnerFingerprint: ownerFingerprint,
@@ -5612,48 +5262,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     continue
                 case .text(let payload):
                     offset += consumed
-                    // Wave 4: JSON-RPC over the existing WebSocket (capability
-                    // `rpc.websocket`). Transport control frames remain rejected.
-                    if Self.looksLikeJSONRPCRequest(payload) {
-                        let body = payload
-                        let fingerprint = ownerFingerprint
-                        // Scheduler admission only: classify request body so
-                        // large snapshot/replay dispatch does not contend at
-                        // the same Swift Task priority as stop/input/control.
-                        let rpcTaskPriority = RPCDispatchSchedulerClass.taskPriority(for: body)
-                        Task(priority: rpcTaskPriority) { [weak self] in
-                            guard let self else { return }
-                            let response = await self.dispatchRPCOverWebSocket(
-                                bodyData: body,
-                                ownerFingerprint: fingerprint
-                            )
-                            // Stop/input and other interactive RPC replies stay
-                            // on the control lane so they drain ahead of events.
-                            // Large `sync.snapshot` success bodies are bulk under
-                            // the existing nested `result.type == "snapshot"`
-                            // shape: put them on the application bulk lane so an
-                            // accepted snapshot backlog cannot indefinitely
-                            // block control (pong / stop / input) traffic.
-                            if WebSocketOutboundQueue.applicationPriority(of: response) == .bulk {
-                                switch outbound.enqueueApplication(response) {
-                                case .accepted, .closed:
-                                    break
-                                case .queueFull:
-                                    _ = outbound.degrade()
-                                    _ = outbound.enqueueApplication(response)
-                                }
-                            } else {
-                                switch outbound.enqueueControl(opcode: 0x1, data: response) {
-                                case .accepted, .closed:
-                                    break
-                                case .queueFull:
-                                    _ = outbound.degrade()
-                                    _ = outbound.enqueueControl(opcode: 0x1, data: response)
-                                }
-                            }
-                        }
-                        continue
-                    }
                     // Mid-session interest: update cellular-safe admission without
                     // tearing down the socket. Unknown to older clients; ignored
                     // when filter is full (fail open).

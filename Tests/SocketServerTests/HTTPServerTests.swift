@@ -2403,7 +2403,7 @@ final class HTTPServerTests: XCTestCase {
         let crossPutError = try XCTUnwrap(crossPutBody["error"] as? [String: Any])
         XCTAssertEqual(crossPutError["code"] as? String, "upload_not_found")
 
-        // Invalid bearer still 401; host/workspace/idempotency gates stay intact.
+        // Invalid bearer still 401; owner/workspace/idempotency gates stay intact.
         let (unauthData, unauthResponse) = try await URLSession.shared.data(
             for: statusRequest(bearer: "forged-token")
         )
@@ -2414,10 +2414,146 @@ final class HTTPServerTests: XCTestCase {
         let unauthError = try XCTUnwrap(unauthBody["error"] as? [String: Any])
         XCTAssertEqual(unauthError["code"] as? String, "unauthorized")
 
+        // Wrong/missing X-RC2-Expected-Host-ID must not block bearer-authorized status.
         var badHost = statusRequest(bearer: tokenA2)
         badHost.setValue("other-host", forHTTPHeaderField: "X-RC2-Expected-Host-ID")
         let (_, badHostResponse) = try await URLSession.shared.data(for: badHost)
-        XCTAssertEqual((badHostResponse as? HTTPURLResponse)?.statusCode, 409)
+        XCTAssertEqual((badHostResponse as? HTTPURLResponse)?.statusCode, 200)
+
+        var noHost = statusRequest(bearer: tokenA2)
+        noHost.setValue(nil, forHTTPHeaderField: "X-RC2-Expected-Host-ID")
+        let (_, noHostResponse) = try await URLSession.shared.data(for: noHost)
+        XCTAssertEqual((noHostResponse as? HTTPURLResponse)?.statusCode, 200)
+    }
+
+    @MainActor
+    func test_attachmentUploadV2_ignoresHostIdentityHeaderAndStillGatesBearerOwner() async throws {
+        // WHY: HTTP upload admission is bearer owner + workspace/idempotency/
+        // sizes/digests only. X-RC2-Expected-Host-ID must never authorize or block.
+        let tokenA = "upload-v2-host-gate-a"
+        let tokenB = "upload-v2-host-gate-b"
+        let auth = StableOwnerAuth(tokenToStableOwner: [
+            tokenA: "device-row:host-gate-a",
+            tokenB: "device-row:host-gate-b",
+        ])
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "rc-http-upload-v2-host-gate-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uploadStore = AttachmentUploadV2Store(
+            root: root.appendingPathComponent("uploads", isDirectory: true),
+            attachmentStore: AgentAttachmentStore(
+                root: root.appendingPathComponent("attachments", isDirectory: true)
+            )
+        )
+        let port = UInt16.random(in: 33000...44000)
+        let hostId = "host-upload-v2-identity-ignored"
+        let server = DirectHTTPServer(
+            port: port,
+            loopbackOnly: false,
+            dispatcher: JSONRPCDispatcher(router: FakeRouter()),
+            auth: auth,
+            serverId: hostId,
+            bootEpoch: 1,
+            attachmentUploadV2Store: uploadStore
+        )
+        try server.start()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        let baseURL = URL(string: "http://127.0.0.1:\(port)")!
+        let workspaceId = "a1b2c3d4-e5f6-4789-a012-3456789abcde"
+        let uploadId = UUID().uuidString.lowercased()
+        let payload = Data("host-identity-ignored payload".utf8)
+        func digest(_ data: Data) -> String {
+            SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        }
+        func encodedFilename(_ value: String) -> String {
+            Data(value.utf8).base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+                .trimmingCharacters(in: CharacterSet(charactersIn: "="))
+        }
+        func putRequest(bearer: String?, expectedHost: String?) -> URLRequest {
+            var request = URLRequest(
+                url: baseURL.appendingPathComponent(
+                    "/v1/agent/attachment-uploads/v2/\(uploadId)/chunks/0"
+                )
+            )
+            request.httpMethod = "PUT"
+            request.httpBody = payload
+            if let bearer {
+                request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
+            }
+            request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+            request.setValue("identity", forHTTPHeaderField: "Content-Encoding")
+            request.setValue(uploadId, forHTTPHeaderField: "Idempotency-Key")
+            if let expectedHost {
+                request.setValue(expectedHost, forHTTPHeaderField: "X-RC2-Expected-Host-ID")
+            }
+            request.setValue(workspaceId, forHTTPHeaderField: "X-RC2-Workspace-ID")
+            request.setValue(
+                encodedFilename("stable.txt"),
+                forHTTPHeaderField: "X-RC2-Filename-UTF8-Base64URL"
+            )
+            request.setValue("text/plain", forHTTPHeaderField: "X-RC2-Mime-Type")
+            request.setValue(String(payload.count), forHTTPHeaderField: "X-RC2-Total-Bytes")
+            request.setValue(digest(payload), forHTTPHeaderField: "X-RC2-File-SHA256")
+            request.setValue(
+                String(AttachmentUploadV2Policy.rawChunkBytes),
+                forHTTPHeaderField: "X-RC2-Chunk-Bytes"
+            )
+            request.setValue("1", forHTTPHeaderField: "X-RC2-Chunk-Count")
+            request.setValue(
+                String(payload.count),
+                forHTTPHeaderField: "X-RC2-Raw-Chunk-Bytes"
+            )
+            request.setValue(digest(payload), forHTTPHeaderField: "X-RC2-Chunk-SHA256")
+            return request
+        }
+
+        // Missing bearer → 401 even with matching host header.
+        let (_, missingAuth) = try await URLSession.shared.data(
+            for: putRequest(bearer: nil, expectedHost: hostId)
+        )
+        XCTAssertEqual((missingAuth as? HTTPURLResponse)?.statusCode, 401)
+
+        // Invalid bearer → 401.
+        let (_, badAuth) = try await URLSession.shared.data(
+            for: putRequest(bearer: "forged", expectedHost: hostId)
+        )
+        XCTAssertEqual((badAuth as? HTTPURLResponse)?.statusCode, 401)
+
+        // Wrong host header still commits for the rightful owner.
+        let (commitData, commitResponse) = try await URLSession.shared.data(
+            for: putRequest(bearer: tokenA, expectedHost: "stale-other-host")
+        )
+        XCTAssertEqual((commitResponse as? HTTPURLResponse)?.statusCode, 201)
+        let commitBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: commitData) as? [String: Any]
+        )
+        XCTAssertEqual(commitBody["state"] as? String, "committed")
+
+        // No host header still resumes for same owner.
+        let (_, resumeNoHost) = try await URLSession.shared.data(
+            for: putRequest(bearer: tokenA, expectedHost: nil)
+        )
+        XCTAssertEqual((resumeNoHost as? HTTPURLResponse)?.statusCode, 200)
+
+        // Wrong owner remains privacy-preserving 404 (not host-identity mismatch).
+        let (crossData, crossResponse) = try await URLSession.shared.data(
+            for: putRequest(bearer: tokenB, expectedHost: hostId)
+        )
+        XCTAssertEqual((crossResponse as? HTTPURLResponse)?.statusCode, 404)
+        let crossBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: crossData) as? [String: Any]
+        )
+        XCTAssertEqual(
+            (crossBody["error"] as? [String: Any])?["code"] as? String,
+            "upload_not_found"
+        )
     }
 
     private func writeAll(fd: Int32, data: Data) throws {

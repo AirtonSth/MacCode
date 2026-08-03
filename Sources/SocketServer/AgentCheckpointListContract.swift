@@ -5,7 +5,7 @@ import CoreModel
 ///
 /// Explicit `response_version: 1` is HTTP JSON-RPC only and is forbidden in
 /// nested `rpc.batch` and top-level JSON-RPC array batches. Legacy calls
-/// (no `response_version`) retain prior Unix / WebSocket / batch behavior and
+/// (no `response_version`) retain prior Unix / batch behavior and
 /// the historical full-array response shape.
 public enum AgentCheckpointListContract: Sendable {
     public static let method = "agent.checkpoint.list"
@@ -50,7 +50,6 @@ public enum AgentCheckpointListContract: Sendable {
     public enum WireTransport: String, Sendable, Equatable {
         case http
         case unix
-        case webSocket
         /// Same-process unit tests / harnesses (not a production entry).
         case localTest
     }
@@ -67,7 +66,7 @@ public enum AgentCheckpointListContract: Sendable {
 
     /// Transport admission for **explicit v1 only**.
     /// Legacy `agent.checkpoint.list` (no `response_version`) is a no-op here so
-    /// Unix / WebSocket / batch retain prior host behavior.
+    /// Unix / batch retain prior host behavior.
     public static func preflightTransport(
         method: String,
         transport: WireTransport,
@@ -89,7 +88,7 @@ public enum AgentCheckpointListContract: Sendable {
         switch transport {
         case .http, .localTest:
             return
-        case .unix, .webSocket:
+        case .unix:
             throw JSONRPCError(
                 code: -32600,
                 message: "agent.checkpoint.list response_version 1 is HTTP JSON-RPC only.",

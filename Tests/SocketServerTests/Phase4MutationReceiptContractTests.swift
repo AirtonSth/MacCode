@@ -1224,14 +1224,14 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         XCTAssertEqual(router.receiptRecordCallCount, 0)
     }
 
-    func test_everyCanonicalMutationRejectsBeforeBusinessParsingWithoutPhase4WireGate() async throws {
+    func test_everyCanonicalMutationRejectsBeforeBusinessParsingWithoutClientRequestId() async throws {
+        // WHY: empty params lack client_request_id; business preflight must not run.
         let router = Phase4ReceiptFakeRouter()
         let dispatcher = JSONRPCDispatcher(router: router)
         let mutationContext = MutationRequestContext(
             ownerFingerprint: "phase4-owner",
             hostId: "phase4-host",
-            bootEpoch: 1,
-            activeConnection: { _, _ in false }
+            bootEpoch: 1
         )
 
         for method in try canonicalMutationMethods().sorted() {
@@ -1242,8 +1242,8 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
                 params: [:]
             ), mutationContext: mutationContext)
             XCTAssertEqual(response.error?.code, -32097,
-                           "\(method) must be rejected as stale before parsing business params")
-            XCTAssertNil(response.result, "\(method) must not mutate without the Phase 4 wire gate")
+                           "\(method) must be rejected without client_request_id before business params")
+            XCTAssertNil(response.result, "\(method) must not mutate without client_request_id")
         }
     }
 
@@ -1334,7 +1334,10 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         }
     }
 
-    func test_liveMutationRequiresEveryWireFieldCurrentIdentityAndOwningConnection() async throws {
+    func test_liveMutationRequiresClientRequestIdAndBearerOwnerOnly() async throws {
+        // WHY: HTTP mutations admit with bearer owner + client_request_id + valid
+        // method/params. connection_id / expected_host_id / expected_boot_epoch
+        // are optional ignored legacy fields — never -32097 blockers.
         let router = Phase4ReceiptFakeRouter()
         let thread = AgentThread(workspaceId: nil, title: "phase4-gate", provider: .codex, model: "gpt-5.5")
         router.threadStore = [thread]
@@ -1345,32 +1348,47 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         let validResponse = try await live.rpc(method: "agent.message.send", params: valid)
         XCTAssertNil(validResponse["error"])
 
-        let variants: [(String, [String: Any], String)] = [
+        let blocked: [(String, [String: Any], String)] = [
             ("missing request id", removing("client_request_id", from: valid), Phase4LiveServer.ownerToken),
             ("empty request id", replacing("client_request_id", with: "", in: valid), Phase4LiveServer.ownerToken),
-            ("missing connection", removing("connection_id", from: valid), Phase4LiveServer.ownerToken),
-            ("wrong connection", replacing("connection_id", with: "other-connection", in: valid), Phase4LiveServer.ownerToken),
-            ("missing host", removing("expected_host_id", from: valid), Phase4LiveServer.ownerToken),
-            ("wrong host", replacing("expected_host_id", with: "other-host", in: valid), Phase4LiveServer.ownerToken),
-            ("missing epoch", removing("expected_boot_epoch", from: valid), Phase4LiveServer.ownerToken),
-            ("wrong epoch", replacing("expected_boot_epoch", with: 411, in: valid), Phase4LiveServer.ownerToken),
-            ("non-owner", replacing("client_request_id", with: "gate-other-owner", in: valid), Phase4LiveServer.otherOwnerToken),
         ]
+        for (name, params, token) in blocked {
+            let response = try await live.rpc(
+                method: "agent.message.send",
+                params: params,
+                token: token
+            )
+            XCTAssertEqual(errorCode(response), -32097, name)
+        }
 
-        for (name, params, token) in variants {
+        let admitted: [(String, [String: Any])] = [
+            ("missing connection", removing("connection_id", from: valid)),
+            ("wrong connection", replacing("connection_id", with: "other-connection", in: valid)),
+            ("missing host", removing("expected_host_id", from: valid)),
+            ("wrong host", replacing("expected_host_id", with: "other-host", in: valid)),
+            ("missing epoch", removing("expected_boot_epoch", from: valid)),
+            ("wrong epoch", replacing("expected_boot_epoch", with: 411, in: valid)),
+            ("minimal transport", [
+                "client_request_id": "gate-minimal-transport",
+                "thread_id": thread.id.value.uuidString,
+                "text": "minimal",
+            ]),
+        ]
+        var effectCount = 1
+        for (name, params) in admitted {
             var uniqueParams = params
             if uniqueParams["client_request_id"] as? String == "gate-valid" {
                 uniqueParams["client_request_id"] = "gate-\(name)"
             }
             let response = try await live.rpc(
                 method: "agent.message.send",
-                params: uniqueParams,
-                token: token
+                params: uniqueParams
             )
-            XCTAssertEqual(errorCode(response), -32097, name)
+            XCTAssertNil(response["error"], "\(name): \(response)")
+            effectCount += 1
+            XCTAssertEqual(router.sendAgentMessageCallCount, effectCount, name)
         }
-        XCTAssertEqual(router.sendAgentMessageCallCount, 1,
-                       "failed identity/freshness guards must produce zero host effects")
+        XCTAssertEqual(router.sendAgentMessageCallCount, 1 + admitted.count)
     }
 
     func test_sameRequestConcurrentSequentialAndRestartHasOneEffectOneEventAndStableResult() async throws {

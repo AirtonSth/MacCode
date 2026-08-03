@@ -315,13 +315,12 @@ public final class SnapshotChunkTransferCache: @unchecked Sendable {
         return SnapshotChunkInsertResult(record: record, releasedReservations: released)
     }
 
+    /// Fetch one chunk. Authorization is bearer owner + transfer id only —
+    /// connection/host/boot tuples and live WS state are not consulted.
     func fetchChunk(
         transferId: String,
         chunkIndex: Int,
-        ownerFingerprint: String,
-        connectionId: String,
-        hostId: String,
-        bootEpoch: UInt64
+        ownerFingerprint: String
     ) throws -> SnapshotChunkResponse {
         lock.lock(); defer { lock.unlock() }
         let now = clock()
@@ -332,12 +331,8 @@ public final class SnapshotChunkTransferCache: @unchecked Sendable {
             throw SnapshotChunkTransferFailure.transferUnknown
         }
         if now >= record.expiresAtNanoseconds {
-            // Identity-check the expired record so only the rightful owner
-            // surfaces transferExpired (and cancels their watermark reservation).
+            // Only the rightful owner surfaces transferExpired.
             let matches = record.ownerFingerprint == ownerFingerprint
-                && record.connectionId == connectionId
-                && record.hostId == hostId
-                && record.bootEpoch == bootEpoch
             _ = removeLocked(transferId: transferId)
             _ = evictExpiredLocked(now: now)
             throw matches
@@ -345,10 +340,7 @@ public final class SnapshotChunkTransferCache: @unchecked Sendable {
                 : SnapshotChunkTransferFailure.identityMismatch
         }
         _ = evictExpiredLocked(now: now)
-        guard record.ownerFingerprint == ownerFingerprint,
-              record.connectionId == connectionId,
-              record.hostId == hostId,
-              record.bootEpoch == bootEpoch else {
+        guard record.ownerFingerprint == ownerFingerprint else {
             throw SnapshotChunkTransferFailure.identityMismatch
         }
         // Re-read after sweep in case concurrent cleanup removed it (single-threaded
@@ -360,16 +352,15 @@ public final class SnapshotChunkTransferCache: @unchecked Sendable {
     }
 
     /// Atomically validate + remove a transfer for `sync.snapshot.commit`.
-    /// On success the caller must adopt the returned sequence exactly once.
-    /// Mismatch leaves the transfer in place; expiry removes it.
+    /// Auth is owner + transfer/request identifiers (transferId, snapshotId, digest).
+    /// Connection/host/boot and WS watermarks are not preconditions.
+    /// On success the caller may publish sequence metadata; mismatch leaves the
+    /// transfer in place; expiry removes it.
     func takeForCommit(
         transferId: String,
         snapshotId: String,
         digest: String,
-        ownerFingerprint: String,
-        connectionId: String,
-        hostId: String,
-        bootEpoch: UInt64
+        ownerFingerprint: String
     ) throws -> SnapshotChunkTransferRecord {
         lock.lock(); defer { lock.unlock() }
         let now = clock()
@@ -379,19 +370,13 @@ public final class SnapshotChunkTransferCache: @unchecked Sendable {
         }
         if now >= record.expiresAtNanoseconds {
             let matches = record.ownerFingerprint == ownerFingerprint
-                && record.connectionId == connectionId
-                && record.hostId == hostId
-                && record.bootEpoch == bootEpoch
             _ = removeLocked(transferId: transferId)
             _ = evictExpiredLocked(now: now)
             throw matches
                 ? SnapshotChunkTransferFailure.transferExpired
                 : SnapshotChunkTransferFailure.identityMismatch
         }
-        guard record.ownerFingerprint == ownerFingerprint,
-              record.connectionId == connectionId,
-              record.hostId == hostId,
-              record.bootEpoch == bootEpoch else {
+        guard record.ownerFingerprint == ownerFingerprint else {
             throw SnapshotChunkTransferFailure.identityMismatch
         }
         let normalizedDigest = digest.lowercased()

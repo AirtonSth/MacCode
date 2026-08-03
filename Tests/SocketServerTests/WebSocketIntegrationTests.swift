@@ -434,6 +434,7 @@ final class WebSocketIntegrationTests: XCTestCase {
         for invalid in [
             "{not-json",
             #"{"protocolVersion":3,"type":"unknown","unexpected":true}"#,
+            #"{"jsonrpc":"2.0","id":"1","method":"system.ping","params":{}}"#,
         ] {
             let (server, port) = try startServer()
             let task = wsTask(port: port, sinceSeq: EventBus.shared.currentSeq)

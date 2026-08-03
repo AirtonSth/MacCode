@@ -140,7 +140,7 @@ final class RPCDispatchPriorityTests: XCTestCase {
     // MARK: - Priority mapping
 
     /// WHY: Admission only helps if bulk maps to a lower Task priority than
-    /// interactive. Pin the exact Swift priorities the HTTP/WS launch sites use.
+    /// interactive. Pin the exact Swift priorities the HTTP launch site uses.
     func test_taskPriority_bulkIsUtility_interactiveIsUserInitiated() {
         XCTAssertEqual(RPCDispatchSchedulerClass.bulk.taskPriority, .utility)
         XCTAssertEqual(RPCDispatchSchedulerClass.interactive.taskPriority, .userInitiated)
@@ -156,14 +156,6 @@ final class RPCDispatchPriorityTests: XCTestCase {
             RPCDispatchSchedulerClass.taskPriority(for: interactiveBody),
             .userInitiated,
             "stop body must launch at userInitiated"
-        )
-        XCTAssertEqual(
-            DirectHTTPServer.rpcDispatchTaskPriority(for: bulkBody),
-            .utility
-        )
-        XCTAssertEqual(
-            DirectHTTPServer.rpcDispatchTaskPriority(for: interactiveBody),
-            .userInitiated
         )
     }
 

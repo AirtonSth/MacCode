@@ -287,7 +287,10 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
     }
 
     @MainActor
-    func test_syncSnapshot_requiresSameAuthenticatedOwnerAsWebSocket() async throws {
+    func test_syncSnapshot_admitsAnyAuthenticatedBearerIndependentOfLiveWSOwner() async throws {
+        // WHY: HTTP snapshot is bearer-gated only. Live WS connection ownership
+        // must not block another authenticated bearer (or the same owner under a
+        // different connection id).
         let tokenA = "phase3-owner-token-a"
         let tokenB = "phase3-owner-token-b"
         let auth = Phase3SnapshotAuth(acceptedTokens: [tokenA, tokenB])
@@ -323,23 +326,42 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
             "supportedStateVersion": 3,
         ]
 
-        let wrongOwner = try await rpc(
+        let otherBearer = try await rpc(
             port: port,
-            id: "wrong-owner",
+            id: "other-bearer",
             params: params,
             bearerToken: tokenB
         )
-        XCTAssertEqual((wrongOwner["error"] as? [String: Any])?["code"] as? Int, -32602)
-        XCTAssertEqual(router.snapshotReadCount, 0)
+        XCTAssertNil(otherBearer["error"],
+                     "authenticated bearer B must snapshot while WS is owned by A: \(otherBearer)")
+        XCTAssertEqual(router.snapshotReadCount, 1)
 
-        let correctOwner = try await rpc(
+        let ownerA = try await rpc(
             port: port,
-            id: "correct-owner",
+            id: "owner-a",
             params: params,
             bearerToken: tokenA
         )
-        XCTAssertNil(correctOwner["error"])
-        XCTAssertEqual(router.snapshotReadCount, 1)
+        XCTAssertNil(ownerA["error"])
+        XCTAssertEqual(router.snapshotReadCount, 2)
+
+        // Unauthorized requests fail at the HTTP bearer gate (status 401), not
+        // via JSON-RPC connection ownership — verify status without assuming body shape.
+        for token in [Optional<String>.none, Optional("not-a-token")] {
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/rpc")!)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            if let token {
+                request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            }
+            request.httpBody = try JSONSerialization.data(withJSONObject: [
+                "jsonrpc": "2.0", "id": "auth-gate", "method": "sync.snapshot", "params": params,
+            ])
+            let (_, response) = try await URLSession.shared.data(for: request)
+            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 401)
+        }
+        XCTAssertEqual(router.snapshotReadCount, 2,
+                       "token rejection must not read host state")
         XCTAssertNotEqual(DirectHTTPServer.connectionOwnerFingerprint(token: tokenA), tokenA)
         XCTAssertNotEqual(
             DirectHTTPServer.connectionOwnerFingerprint(token: tokenA),
@@ -348,7 +370,7 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
     }
 
     @MainActor
-    func test_syncSnapshot_requiresActiveExactConnectionIdentityAndExactRequestKeys() async throws {
+    func test_syncSnapshot_acceptsLegacyIdentityFieldsAndRejectsSchemaOnly() async throws {
         let router = Phase3SnapshotFakeRouter()
         let port = UInt16.random(in: 33_000...44_000)
         let server = DirectHTTPServer(
@@ -380,25 +402,41 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
         XCTAssertEqual(router.snapshotReadCount, 1,
                        "one sync.snapshot request must perform one synchronous router read")
 
-        for invalid in [
+        // Stale/wrong-typed connection/host/boot are optional ignored legacy — never parsed.
+        for allowedLegacy in [
             validParams.merging(["connectionId": "not-active"]) { _, new in new },
             validParams.merging(["expectedHostId": "other-host"]) { _, new in new },
             validParams.merging(["expectedBootEpoch": 74]) { _, new in new },
+            // Non-string / non-int legacy values must still be ignored (not type-validated).
+            validParams.merging(["connectionId": 12345]) { _, new in new },
+            validParams.merging(["expectedHostId": false]) { _, new in new },
+            ["supportedStateVersion": 3] as [String: Any],
+        ] {
+            let response = try await rpc(port: port, id: "legacy-ok", params: allowedLegacy)
+            XCTAssertNil(response["error"], "legacy connection/host/boot must not block: \(response)")
+        }
+        XCTAssertEqual(router.snapshotReadCount, 7)
+
+        for invalid in [
             validParams.merging(["supportedStateVersion": 2]) { _, new in new },
             validParams.merging(["criticalFutureKey": true]) { _, new in new },
         ] {
             let response = try await rpc(port: port, id: "invalid", params: invalid)
             XCTAssertEqual((response["error"] as? [String: Any])?["code"] as? Int, -32602)
         }
-        for rawBody in [
-            #"{"jsonrpc":"2.0","id":"float-boot","method":"sync.snapshot","params":{"connectionId":"\#(connectionID)","expectedHostId":"phase3-host","expectedBootEpoch":73.0,"supportedStateVersion":3}}"#,
-            #"{"jsonrpc":"2.0","id":"float-version","method":"sync.snapshot","params":{"connectionId":"\#(connectionID)","expectedHostId":"phase3-host","expectedBootEpoch":73,"supportedStateVersion":3.0}}"#,
-        ] {
-            let response = try await rpc(port: port, rawBody: Data(rawBody.utf8))
-            XCTAssertEqual((response["error"] as? [String: Any])?["code"] as? Int, -32602)
-        }
-        XCTAssertEqual(router.snapshotReadCount, 1,
-                       "identity/schema rejection must occur before reading host state")
+        // Float supportedStateVersion still rejected; float boot is ignored legacy.
+        let floatBoot = try await rpc(
+            port: port,
+            rawBody: Data(#"{"jsonrpc":"2.0","id":"float-boot","method":"sync.snapshot","params":{"connectionId":"\#(connectionID)","expectedHostId":"phase3-host","expectedBootEpoch":73.0,"supportedStateVersion":3}}"#.utf8)
+        )
+        XCTAssertNil(floatBoot["error"], "float expectedBootEpoch is ignored legacy: \(floatBoot)")
+        let floatVersion = try await rpc(
+            port: port,
+            rawBody: Data(#"{"jsonrpc":"2.0","id":"float-version","method":"sync.snapshot","params":{"connectionId":"\#(connectionID)","expectedHostId":"phase3-host","expectedBootEpoch":73,"supportedStateVersion":3.0}}"#.utf8)
+        )
+        XCTAssertEqual((floatVersion["error"] as? [String: Any])?["code"] as? Int, -32602)
+        XCTAssertEqual(router.snapshotReadCount, 8,
+                       "only schema rejections must skip host state reads")
     }
 
     @MainActor
@@ -438,7 +476,11 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
         ])
         XCTAssertEqual(firstResult["type"] as? String, "snapshot")
         XCTAssertEqual(firstResult["stateVersion"] as? Int, 3)
-        XCTAssertEqual(firstResult["connectionId"] as? String, connectionID)
+        // HTTP snapshots mint non-empty connectionId for frame decoding only;
+        // it is not the live WS id and is not client-echoed identity.
+        let responseConnectionId = try XCTUnwrap(firstResult["connectionId"] as? String)
+        XCTAssertFalse(responseConnectionId.isEmpty)
+        XCTAssertNotEqual(responseConnectionId, connectionID)
         XCTAssertEqual(firstResult["hostId"] as? String, "phase3-host")
         XCTAssertEqual((firstResult["bootEpoch"] as? NSNumber)?.uint64Value, 73)
 

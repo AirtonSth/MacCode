@@ -518,26 +518,27 @@ public enum HostMutationContract {
     }
 }
 
+/// Bearer-owned mutation context for remote HTTP/WS command admission.
+///
+/// HTTP independence: `hostId` / `bootEpoch` are retained for diagnostics and
+/// legacy call sites only. They are never mutation preconditions. Connection
+/// registry callbacks are not consulted — authorization is bearer ownership +
+/// `client_request_id` + method/params validation.
 public struct MutationRequestContext: @unchecked Sendable {
     public let ownerFingerprint: String
     public let hostId: String
     public let bootEpoch: UInt64
-    private let activeConnection: @Sendable (String, String) -> Bool
 
     public init(
         ownerFingerprint: String,
         hostId: String,
         bootEpoch: UInt64,
-        activeConnection: @escaping @Sendable (String, String) -> Bool
+        activeConnection: (@Sendable (String, String) -> Bool)? = nil
     ) {
         self.ownerFingerprint = ownerFingerprint
         self.hostId = hostId
         self.bootEpoch = bootEpoch
-        self.activeConnection = activeConnection
-    }
-
-    public func ownsActiveConnection(_ connectionId: String) -> Bool {
-        activeConnection(connectionId, ownerFingerprint)
+        _ = activeConnection
     }
 }
 

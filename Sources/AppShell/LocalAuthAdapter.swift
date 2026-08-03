@@ -96,16 +96,13 @@ public final class LocalAuthAdapter: DirectAuthProvider {
         ((try? repo.verify(token: token)) ?? nil) != nil
     }
 
-    /// Stable durable owner for Attachment Upload v2 (and similar bindings).
-    ///
-    /// The trusted device row is the security principal. `clientDeviceID` is
-    /// client-supplied display/pairing metadata and must never merge two trust
-    /// rows into one upload owner. Only an opaque SHA-256 fingerprint is
-    /// returned — never the bearer or raw row id.
+    /// Token-only durable owner for protected HTTP uploads. The stored token
+    /// hash permits revocation checks without retaining or exposing the bearer;
+    /// Mac identity and client-supplied pairing metadata are not inputs.
     public func authorizedOwnerFingerprint(token: String) -> String? {
         guard let trust = (try? repo.verify(token: token)) ?? nil else { return nil }
         return Self.opaqueAuthorizedOwnerFingerprint(
-            stableIdentity: "device:\(trust.id)"
+            stableIdentity: "token:\(trust.tokenHash)"
         )
     }
 
@@ -116,7 +113,7 @@ public final class LocalAuthAdapter: DirectAuthProvider {
         return ((try? repo.list()) ?? []).contains { trust in
             trust.revokedAt == nil
                 && Self.opaqueAuthorizedOwnerFingerprint(
-                    stableIdentity: "device:\(trust.id)"
+                    stableIdentity: "token:\(trust.tokenHash)"
                 ) == fingerprint
         }
     }
