@@ -261,6 +261,108 @@ final class ConnectionSnapshotRouterPhase3Tests: XCTestCase {
         )
     }
 
+    func test_agentRefreshReadRPCsStayOffMainAndPreservePayloads() async throws {
+        let (context, router) = try make()
+        let workspace = try router.createWorkspace(name: "Agent reads", cwd: NSTemporaryDirectory())
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "Persisted thread",
+            provider: .codex,
+            model: "gpt-5",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .assistant,
+            content: "persisted response"
+        ))
+        _ = try context.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "queued prompt",
+            attachments: [],
+            interactionMode: .default
+        )
+        try context.providerPendingCallbackRepo.record(
+            threadId: thread.id,
+            request: AssistantPendingRequest(
+                id: "approval-1",
+                turnId: "turn-1",
+                kind: .commandExecution,
+                title: "Run command",
+                detail: "swift test",
+                createdAtMs: 1_000
+            )
+        )
+
+        AgentAppReadGateway.resetExecutionProbesForTesting()
+        AgentAppReadGateway.readDelayNanosecondsForTesting = 20_000_000
+        defer { AgentAppReadGateway.resetExecutionProbesForTesting() }
+
+        var heartbeats = 0
+        let heartbeat = Task { @MainActor in
+            while !Task.isCancelled {
+                heartbeats += 1
+                try? await Task.sleep(nanoseconds: 2_000_000)
+            }
+        }
+
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let threadResponse = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.thread.list",
+            params: ["workspace_id": .string(workspace.id.value.uuidString)]
+        ))
+        let messageResponse = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(2),
+            method: "agent.message.list",
+            params: ["thread_id": .string(thread.id.value.uuidString)]
+        ))
+        let queueResponse = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(3),
+            method: "agent.message.queue.list",
+            params: ["thread_id": .string(thread.id.value.uuidString)]
+        ))
+        let pendingResponse = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(4),
+            method: "agent.pending_callbacks.list",
+            params: ["thread_id": .string(thread.id.value.uuidString)]
+        ))
+
+        heartbeat.cancel()
+        _ = await heartbeat.result
+
+        guard case .array(let threads)? = threadResponse.result,
+              case .object(let threadPayload)? = threads.first,
+              case .array(let messages)? = messageResponse.result,
+              case .object(let messagePayload)? = messages.first,
+              case .array(let queued)? = queueResponse.result,
+              case .object(let queuedPayload)? = queued.first,
+              case .object(let pending)? = pendingResponse.result,
+              case .array(let requests)? = pending["requests"],
+              case .object(let requestPayload)? = requests.first else {
+            return XCTFail("Agent App refresh RPCs must retain their existing response shapes")
+        }
+        XCTAssertNil(threadResponse.error)
+        XCTAssertNil(messageResponse.error)
+        XCTAssertNil(queueResponse.error)
+        XCTAssertNil(pendingResponse.error)
+        XCTAssertEqual(threadPayload["title"], .string("Persisted thread"))
+        XCTAssertEqual(messagePayload["content"], .string("persisted response"))
+        XCTAssertEqual(queuedPayload["text"], .string("queued prompt"))
+        XCTAssertEqual(requestPayload["id"], .string("approval-1"))
+        XCTAssertEqual(AgentAppReadGateway.readCallCountForTesting, 5,
+                       "thread.list performs one thread read plus one locked-thread batch read")
+        XCTAssertEqual(AgentAppReadGateway.readOnMainActorCountForTesting, 0)
+        XCTAssertEqual(AgentAppReadGateway.readOffMainActorCountForTesting, 5)
+        XCTAssertGreaterThan(heartbeats, 20,
+                             "MainActor must keep pumping while all four RPC reads are delayed")
+    }
+
     func test_realRouterSnapshot_threadListCancellationDoesNotLeaveContinuationHanging() async throws {
         // WHY: a timed-out HTTP snapshot must release its caller immediately;
         // the queued SQLite read may finish later, but it must not resume a

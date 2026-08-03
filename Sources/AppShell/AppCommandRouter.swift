@@ -47,6 +47,158 @@ private struct ProviderProbeCapabilities: Sendable {
     var capturedAt: Date
 }
 
+/// Off-MainActor owner for Agent App refresh/read RPC persistence work.
+///
+/// The dispatcher and router are MainActor-isolated, but these RPCs can read
+/// large SQLite rows and decode provider JSON. Keep that work on one serial
+/// queue and return only immutable Sendable values to the actor boundary.
+public final class AgentAppReadGateway: @unchecked Sendable {
+    public static let queueLabel = "io.remotecode.agent-app-read"
+
+    // MARK: - Test probes (executor proof, not latency alone)
+
+    nonisolated(unsafe) public static var readWillRunForTesting: (() -> Void)?
+    nonisolated(unsafe) public static var readDelayNanosecondsForTesting: UInt64 = 0
+    nonisolated(unsafe) public static private(set) var readCallCountForTesting = 0
+    nonisolated(unsafe) public static private(set) var readOnMainActorCountForTesting = 0
+    nonisolated(unsafe) public static private(set) var readOffMainActorCountForTesting = 0
+
+    public static func resetExecutionProbesForTesting() {
+        readWillRunForTesting = nil
+        readDelayNanosecondsForTesting = 0
+        readCallCountForTesting = 0
+        readOnMainActorCountForTesting = 0
+        readOffMainActorCountForTesting = 0
+    }
+
+    private let db: SQLiteDB
+    private let queue: DispatchQueue
+
+    public init(db: SQLiteDB) {
+        self.db = db
+        self.queue = DispatchQueue(label: Self.queueLabel, qos: .userInitiated)
+    }
+
+    public func listThreads(workspaceId: WorkspaceID?) async throws -> [AgentThread] {
+        try await execute {
+            try AgentThreadRepository(db: self.db).list(workspaceId: workspaceId)
+        }
+    }
+
+    public func threadIdsWithMessages() async throws -> Set<AgentThreadID> {
+        try await execute {
+            try AgentMessageRepository(db: self.db).threadIdsWithMessages()
+        }
+    }
+
+    public func listMessages(threadId: AgentThreadID, limit: Int) async throws -> [AgentMessage] {
+        try await execute {
+            try AgentMessageRepository(db: self.db).listRecent(
+                threadId: threadId,
+                limit: max(0, min(limit, 500))
+            )
+        }
+    }
+
+    public func listMessagesPage(
+        threadId: AgentThreadID,
+        limit: Int,
+        before: AgentMessageCursor?,
+        after: AgentMessageCursor?
+    ) async throws -> AgentMessagePage {
+        try await execute {
+            try AgentMessageRepository(db: self.db).listPage(
+                threadId: threadId,
+                limit: max(0, min(limit, 500)),
+                before: before,
+                after: after
+            )
+        }
+    }
+
+    public func listMessagesWithinBodyBudget(
+        threadId: AgentThreadID,
+        limit: Int,
+        before: AgentMessageCursor?,
+        after: AgentMessageCursor?,
+        budget: Int,
+        contentLimit: Int
+    ) async throws -> AgentMessageBodyBudgetResult {
+        try await execute {
+            try AgentMessageRepository(db: self.db).listPageWithinBodyBudget(
+                threadId: threadId,
+                limit: max(1, min(limit, 500)),
+                before: before,
+                after: after,
+                budget: budget,
+                contentLimit: contentLimit,
+                appendEllipsisOnCap: false,
+                attachmentsByteLimit: AgentMessageTransport.attachmentJSONMaxBytes,
+                attachmentsCountLimit: AgentMessageTransport.attachmentCountLimit
+            )
+        }
+    }
+
+    public func listQueuedMessages(threadId: AgentThreadID) async throws -> [AgentQueuedMessage] {
+        try await execute {
+            try AgentQueuedMessageRepository(db: self.db).list(threadId: threadId)
+        }
+    }
+
+    public func listPendingCallbacks(threadId: AgentThreadID) async throws -> AssistantPendingCallbacksSnapshot {
+        try await execute {
+            let decoder = JSONDecoder()
+            var requests: [AssistantPendingRequest] = []
+            var userInputs: [AssistantUserInputRequest] = []
+            for callback in try ProviderPendingCallbackRepository(db: self.db).listVisible(threadId: threadId) {
+                guard let data = callback.payloadJSON.data(using: .utf8) else { continue }
+                switch callback.kind {
+                case .approval:
+                    guard var request = try? decoder.decode(AssistantPendingRequest.self, from: data) else { continue }
+                    request.state = callback.state
+                    request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
+                    if callback.state == .stale, let reason = callback.staleReason {
+                        request.detail = [request.detail, reason].compactMap { $0 }.joined(separator: "\n")
+                    }
+                    requests.append(request)
+                case .userInput:
+                    guard var input = try? decoder.decode(AssistantUserInputRequest.self, from: data) else { continue }
+                    input.state = callback.state
+                    input.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
+                    if callback.state == .stale, let reason = callback.staleReason, input.answer == nil {
+                        input.answer = reason
+                    }
+                    userInputs.append(input)
+                }
+            }
+            return AssistantPendingCallbacksSnapshot(requests: requests, userInputs: userInputs)
+        }
+    }
+
+    private func execute<T: Sendable>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                Self.readCallCountForTesting += 1
+                if Thread.isMainThread {
+                    Self.readOnMainActorCountForTesting += 1
+                } else {
+                    Self.readOffMainActorCountForTesting += 1
+                }
+                Self.readWillRunForTesting?()
+                let delay = Self.readDelayNanosecondsForTesting
+                if delay > 0 {
+                    Thread.sleep(forTimeInterval: TimeInterval(delay) / 1_000_000_000)
+                }
+                do {
+                    continuation.resume(returning: try work())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+}
+
 struct ClaudeProviderRuntimePresentation: Equatable {
     let advisory: String?
     let interactionModes: [AgentInteractionMode]?
@@ -106,6 +258,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
     private let sshPasswordStore: SSHPasswordStoring
     private let sshCommandRunner: SSHCommandRunner
+    private let agentAppReadGateway: AgentAppReadGateway
     private var providerProbeCache: [ProviderProbeCacheKey: ProviderProbeCapabilities] = [:]
     private var providerUpdateLocks = Set<ProviderProbeCacheKey>()
     private let providerProbeCacheTTL: TimeInterval = 30
@@ -130,6 +283,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         self.context = context
         self.sshPasswordStore = sshPasswordStore
         self.sshCommandRunner = sshCommandRunner
+        self.agentAppReadGateway = AgentAppReadGateway(db: context.db)
     }
 
     private func publishAgentThreadUpdated(_ thread: AgentThread) {
@@ -2095,6 +2249,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return try ctx.threadRepo.list(workspaceId: workspace)
     }
 
+    public func listAgentThreadsOffMain(workspace: WorkspaceID?) async throws -> [AgentThread] {
+        try await agentAppReadGateway.listThreads(workspaceId: workspace)
+    }
+
     /// Legacy Path B hooks (LaunchAgent foreign ownership). Schedules now run
     /// in-process through the normal Agent App coordinator, so stop/stream use
     /// the local session — leave these unset.
@@ -2635,14 +2793,31 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return try ctx.messageRepo.listRecent(threadId: thread, limit: max(0, min(limit, 500)))
     }
 
+    public func listAgentMessagesOffMain(thread: AgentThreadID, limit: Int) async throws -> [AgentMessage] {
+        try await agentAppReadGateway.listMessages(threadId: thread, limit: limit)
+    }
+
     public func threadIdsWithMessages() throws -> Set<AgentThreadID> {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         return try ctx.messageRepo.threadIdsWithMessages()
     }
 
+    public func threadIdsWithMessagesOffMain() async throws -> Set<AgentThreadID> {
+        try await agentAppReadGateway.threadIdsWithMessages()
+    }
+
     public func listAgentMessagesPage(thread: AgentThreadID, limit: Int, before: AgentMessageCursor?, after: AgentMessageCursor? = nil) throws -> AgentMessagePage {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         return try ctx.messageRepo.listPage(threadId: thread, limit: max(0, min(limit, 500)), before: before, after: after)
+    }
+
+    public func listAgentMessagesPageOffMain(thread: AgentThreadID, limit: Int, before: AgentMessageCursor?, after: AgentMessageCursor? = nil) async throws -> AgentMessagePage {
+        try await agentAppReadGateway.listMessagesPage(
+            threadId: thread,
+            limit: limit,
+            before: before,
+            after: after
+        )
     }
 
     public func listAgentMessagesWithinBodyBudget(
@@ -2666,6 +2841,24 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 AgentMessageTransport.attachmentJSONMaxBytes,
             attachmentsCountLimit:
                 AgentMessageTransport.attachmentCountLimit
+        )
+    }
+
+    public func listAgentMessagesWithinBodyBudgetOffMain(
+        thread: AgentThreadID,
+        limit: Int,
+        before: AgentMessageCursor?,
+        after: AgentMessageCursor?,
+        budget: Int,
+        contentLimit: Int
+    ) async throws -> AgentMessageBodyBudgetResult {
+        try await agentAppReadGateway.listMessagesWithinBodyBudget(
+            threadId: thread,
+            limit: limit,
+            before: before,
+            after: after,
+            budget: budget,
+            contentLimit: contentLimit
         )
     }
 
@@ -2694,6 +2887,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func listAgentQueuedMessages(thread: AgentThreadID) throws -> [AgentQueuedMessage] {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         return try ctx.queuedMessageRepo.list(threadId: thread)
+    }
+
+    public func listAgentQueuedMessagesOffMain(thread: AgentThreadID) async throws -> [AgentQueuedMessage] {
+        try await agentAppReadGateway.listQueuedMessages(threadId: thread)
     }
 
     public func updateAgentQueuedMessage(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) async throws -> AgentQueuedMessage {
@@ -4100,6 +4297,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
         }
         return AssistantPendingCallbacksSnapshot(requests: requests, userInputs: userInputs)
+    }
+
+    public func listAgentPendingCallbacksOffMain(thread: AgentThreadID) async throws -> AssistantPendingCallbacksSnapshot {
+        try await agentAppReadGateway.listPendingCallbacks(threadId: thread)
     }
 
     public func readAgentThreadEvents(thread: AgentThreadID) async throws -> [AssistantEvent] {

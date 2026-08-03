@@ -117,6 +117,7 @@ public protocol CommandRouting: AnyObject {
     // agent
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor
     func listAgentThreads(workspace: WorkspaceID?) throws -> [AgentThread]
+    func listAgentThreadsOffMain(workspace: WorkspaceID?) async throws -> [AgentThread]
     func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?) throws -> AgentThread
     func createAgentThreadRouting(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?, routing: AgentRoutingRequest?, nestedRunContext: AgentNestedRunContext?) async throws -> AgentThread
     func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?) throws -> AgentThread
@@ -128,7 +129,9 @@ public protocol CommandRouting: AnyObject {
     func importAgentAttachment(workspace: WorkspaceID, relativePath: String) throws -> AgentAttachmentUploadResult
     func selectAgentThread(thread: AgentThreadID, surfaceID: SurfaceID?) throws
     func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage]
+    func listAgentMessagesOffMain(thread: AgentThreadID, limit: Int) async throws -> [AgentMessage]
     func listAgentMessagesPage(thread: AgentThreadID, limit: Int, before: AgentMessageCursor?, after: AgentMessageCursor?) throws -> AgentMessagePage
+    func listAgentMessagesPageOffMain(thread: AgentThreadID, limit: Int, before: AgentMessageCursor?, after: AgentMessageCursor?) async throws -> AgentMessagePage
     /// Body-budgeted keyset page used by `agent.message.list` response_version=1.
     /// Hosts with SQLite should override to call `listPageWithinBodyBudget`; the
     /// protocol extension provides an in-memory default for test conformers.
@@ -140,10 +143,19 @@ public protocol CommandRouting: AnyObject {
         budget: Int,
         contentLimit: Int
     ) throws -> AgentMessageBodyBudgetResult
+    func listAgentMessagesWithinBodyBudgetOffMain(
+        thread: AgentThreadID,
+        limit: Int,
+        before: AgentMessageCursor?,
+        after: AgentMessageCursor?,
+        budget: Int,
+        contentLimit: Int
+    ) async throws -> AgentMessageBodyBudgetResult
     /// PERF-007: returns the set of thread IDs that have at least one message, via a
     /// single SQL query. Used by agent.thread.list to derive provider_locked for every
     /// thread without issuing one query per thread.
     func threadIdsWithMessages() throws -> Set<AgentThreadID>
+    func threadIdsWithMessagesOffMain() async throws -> Set<AgentThreadID>
     func getAgentMessage(id: AgentMessageID) throws -> AgentMessage?
     func getAgentMessageBodyChunk(
         id: AgentMessageID,
@@ -153,6 +165,7 @@ public protocol CommandRouting: AnyObject {
         expectedBodySHA256: String?
     ) throws -> AgentMessageBodyChunk?
     func listAgentQueuedMessages(thread: AgentThreadID) throws -> [AgentQueuedMessage]
+    func listAgentQueuedMessagesOffMain(thread: AgentThreadID) async throws -> [AgentQueuedMessage]
     func updateAgentQueuedMessage(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) async throws -> AgentQueuedMessage
     func cancelAgentQueuedMessage(id: AgentQueuedMessageID) throws -> AgentQueuedMessage
     func forceAgentQueuedMessageNow(id: AgentQueuedMessageID) async throws -> AgentMessageSendResult
@@ -172,6 +185,7 @@ public protocol CommandRouting: AnyObject {
     func respondAgentRequest(thread: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws
     func respondAgentUserInput(thread: AgentThreadID, requestId: String, text: String) async throws
     func listAgentPendingCallbacks(thread: AgentThreadID) throws -> AssistantPendingCallbacksSnapshot
+    func listAgentPendingCallbacksOffMain(thread: AgentThreadID) async throws -> AssistantPendingCallbacksSnapshot
     func readAgentThreadEvents(thread: AgentThreadID) async throws -> [AssistantEvent]
     /// Mirror recovery snapshot.
     /// - Legacy (`eventRowLimit`/`maxPayloadBytes` both nil): full unbounded decode.
@@ -2175,9 +2189,9 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: encode(s))
             case "agent.thread.list":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
-                let threads = try router.listAgentThreads(workspace: wid)
+                let threads = try await router.listAgentThreadsOffMain(workspace: wid)
                 // PERF-007: one batch query for all threads instead of N per-thread queries.
-                let lockedThreads = (try? router.threadIdsWithMessages()) ?? []
+                let lockedThreads = (try? await router.threadIdsWithMessagesOffMain()) ?? []
                 return .init(id: id, result: .array(threads.map { encodeThread($0, lockedThreads: lockedThreads) }))
             case "agent.thread.create":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
@@ -2323,7 +2337,7 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: result)
             case "agent.message.queue.list":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
-                return .init(id: id, result: .array(try router.listAgentQueuedMessages(thread: tid).map(queuedMessagePayload)))
+                return .init(id: id, result: .array(try await router.listAgentQueuedMessagesOffMain(thread: tid).map(queuedMessagePayload)))
             case "agent.message.queue.update":
                 guard let qid = params["queued_message_id"]?.stringValue.flatMap(UUID.init).map(AgentQueuedMessageID.init)
                         ?? params["id"]?.stringValue.flatMap(UUID.init).map(AgentQueuedMessageID.init),
@@ -2499,8 +2513,8 @@ public final class JSONRPCDispatcher {
                     }
                     let budgeted: AgentMessageBodyBudgetResult
                     do {
-                        budgeted = try router
-                            .listAgentMessagesWithinBodyBudget(
+                        budgeted = try await router
+                            .listAgentMessagesWithinBodyBudgetOffMain(
                                 thread: tid,
                                 limit: limit,
                                 before: before,
@@ -2552,7 +2566,7 @@ public final class JSONRPCDispatcher {
                     return .init(id: id, result: result)
                 }
                 if params["pagination"]?.boolValue == true || params["page"]?.boolValue == true {
-                    let page = try router.listAgentMessagesPage(
+                    let page = try await router.listAgentMessagesPageOffMain(
                         thread: tid,
                         limit: limit,
                         before: messageCursor(from: params["before"]),
@@ -2560,7 +2574,7 @@ public final class JSONRPCDispatcher {
                     )
                     return .init(id: id, result: messagePagePayload(page))
                 }
-                return .init(id: id, result: .array(try router.listAgentMessages(thread: tid, limit: limit).map(messagePayload)))
+                return .init(id: id, result: .array(try await router.listAgentMessagesOffMain(thread: tid, limit: limit).map(messagePayload)))
             case "agent.message.get":
                 guard let mid = params["message_id"]?.stringValue.flatMap(UUID.init).map(AgentMessageID.init) else { throw JSONRPCError.invalidParams }
                 if let responseVersion = params["response_version"] {
@@ -2708,7 +2722,7 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: result)
             case "agent.pending_callbacks.list":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
-                return .init(id: id, result: encode(try router.listAgentPendingCallbacks(thread: tid)))
+                return .init(id: id, result: encode(try await router.listAgentPendingCallbacksOffMain(thread: tid)))
             case "agent.thread.read":
                 // response_version absent → exact legacy shapes (array or watermark object).
                 // response_version present → integral 1 only; validate before repository work.

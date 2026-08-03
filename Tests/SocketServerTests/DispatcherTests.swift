@@ -153,6 +153,9 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
             return $0.updatedAt > $1.updatedAt
         }
     }
+    func listAgentThreadsOffMain(workspace: WorkspaceID?) async throws -> [AgentThread] {
+        try listAgentThreads(workspace: workspace)
+    }
     var lastCreateSurfaceID: SurfaceID?
     func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?) throws -> AgentThread {
         lastCreateSurfaceID = surfaceID
@@ -285,8 +288,14 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage] {
         Array(messageStore.filter { $0.threadId == thread }.suffix(max(0, limit)))
     }
+    func listAgentMessagesOffMain(thread: AgentThreadID, limit: Int) async throws -> [AgentMessage] {
+        try listAgentMessages(thread: thread, limit: limit)
+    }
     func threadIdsWithMessages() throws -> Set<AgentThreadID> {
         Set(messageStore.map(\.threadId))
+    }
+    func threadIdsWithMessagesOffMain() async throws -> Set<AgentThreadID> {
+        try threadIdsWithMessages()
     }
     func listAgentMessagesPage(thread: AgentThreadID, limit requestedLimit: Int, before beforeCursor: AgentMessageCursor?, after afterCursor: AgentMessageCursor?) throws -> AgentMessagePage {
         let limit = max(0, min(requestedLimit, 500))
@@ -325,6 +334,9 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
             nextAfter: after
         )
     }
+    func listAgentMessagesPageOffMain(thread: AgentThreadID, limit: Int, before: AgentMessageCursor?, after: AgentMessageCursor?) async throws -> AgentMessagePage {
+        try listAgentMessagesPage(thread: thread, limit: limit, before: before, after: after)
+    }
     func listAgentMessagesWithinBodyBudget(
         thread: AgentThreadID,
         limit: Int,
@@ -348,11 +360,31 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
             afterDirection: after != nil
         )
     }
+    func listAgentMessagesWithinBodyBudgetOffMain(
+        thread: AgentThreadID,
+        limit: Int,
+        before: AgentMessageCursor?,
+        after: AgentMessageCursor?,
+        budget: Int,
+        contentLimit: Int
+    ) async throws -> AgentMessageBodyBudgetResult {
+        try listAgentMessagesWithinBodyBudget(
+            thread: thread,
+            limit: limit,
+            before: before,
+            after: after,
+            budget: budget,
+            contentLimit: contentLimit
+        )
+    }
     func getAgentMessage(id: AgentMessageID) throws -> AgentMessage? {
         messageStore.first { $0.id == id }
     }
     func listAgentQueuedMessages(thread: AgentThreadID) throws -> [AgentQueuedMessage] {
         queuedMessageStore.filter { $0.threadId == thread }.sorted { $0.position < $1.position }
+    }
+    func listAgentQueuedMessagesOffMain(thread: AgentThreadID) async throws -> [AgentQueuedMessage] {
+        try listAgentQueuedMessages(thread: thread)
     }
     func updateAgentQueuedMessage(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) async throws -> AgentQueuedMessage {
         guard let idx = queuedMessageStore.firstIndex(where: { $0.id == id }) else { throw JSONRPCError.invalidParams }
@@ -497,6 +529,9 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     }
     func listAgentPendingCallbacks(thread: AgentThreadID) throws -> AssistantPendingCallbacksSnapshot {
         pendingCallbackSnapshot
+    }
+    func listAgentPendingCallbacksOffMain(thread: AgentThreadID) async throws -> AssistantPendingCallbacksSnapshot {
+        try listAgentPendingCallbacks(thread: thread)
     }
     func readAgentThreadEvents(thread: AgentThreadID) async throws -> [AssistantEvent] {
         readAgentEvents
