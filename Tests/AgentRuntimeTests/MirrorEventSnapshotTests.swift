@@ -112,6 +112,82 @@ final class MirrorEventSnapshotTests: XCTestCase {
                              "a transient SQLite failure must retain every event until a later snapshot barrier commits it")
     }
 
+    func testPersistenceFailureDiagnosticDoesNotHoldMirrorLockAgainstSnapshot() async throws {
+        let appSupport = NSTemporaryDirectory() + "rc2-mirror-diagnostic-lock-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: appSupport).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let activeThread = AgentThread(title: "active", provider: .codex, model: "fake-model")
+        let snapshotThread = AgentThread(title: "snapshot", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(activeThread)
+        try threadRepo.upsert(snapshotThread)
+        try db.execute("""
+            CREATE TRIGGER fail_mirror_stream_insert
+            BEFORE INSERT ON agent_stream_events
+            BEGIN
+                SELECT RAISE(ABORT, 'forced diagnostic lock failure');
+            END;
+            """)
+
+        let runner = ControlledMirrorRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: runner]
+        )
+        let diagnosticEntered = DispatchSemaphore(value: 0)
+        let releaseDiagnostic = DispatchSemaphore(value: 0)
+        let diagnosticGateLock = NSLock()
+        var hasBlockedDiagnostic = false
+        coordinator.onPersistenceIssue = { _, _, _ in
+            let shouldBlock = diagnosticGateLock.withLock {
+                guard !hasBlockedDiagnostic else { return false }
+                hasBlockedDiagnostic = true
+                return true
+            }
+            if shouldBlock {
+                diagnosticEntered.signal()
+                releaseDiagnostic.wait()
+            }
+        }
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: activeThread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: appSupport,
+            prompt: "exercise diagnostic lock release"
+        ))
+        runner.emit(.event(.turnStarted(turnId: "turn-diagnostic")))
+
+        let eventTask = Task.detached {
+            runner.emit(.finished(.completed, finalMessage: nil, providerThreadId: "provider-thread"))
+        }
+        XCTAssertEqual(
+            diagnosticEntered.wait(timeout: .now() + 2),
+            .success,
+            "the forced SQLite failure must reach the diagnostic callback"
+        )
+
+        let snapshotFinished = DispatchSemaphore(value: 0)
+        let snapshotTask = Task.detached {
+            _ = try? coordinator.withMirrorEventSnapshot(threadId: snapshotThread.id) { $0 }
+            snapshotFinished.signal()
+        }
+        let snapshotResult = snapshotFinished.wait(timeout: .now() + 1)
+        releaseDiagnostic.signal()
+        await eventTask.value
+        await snapshotTask.value
+
+        XCTAssertEqual(
+            snapshotResult,
+            .success,
+            "a persistence diagnostic must not keep mirrorEventLock held while host callbacks wait on main/UI work"
+        )
+    }
+
     func testTerminalFlushCannotCrossAnAtomicSnapshotLock() async throws {
         let appSupport = NSTemporaryDirectory() + "rc2-mirror-snapshot-lock-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: appSupport) }

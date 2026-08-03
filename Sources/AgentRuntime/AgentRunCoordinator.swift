@@ -1288,7 +1288,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let priorBufferedRunId = pendingStreamRunIds[request.threadId]
         lock.unlock()
         if let priorBufferedRunId, priorBufferedRunId != request.runId,
-           let error = flushPendingStreamWritesResult(runId: priorBufferedRunId, threadId: request.threadId) {
+           let error = flushPendingStreamWrites(runId: priorBufferedRunId, threadId: request.threadId) {
             throw error
         }
         let admittedDeadlineAt = routingSnapshot?.admissionSnapshot?.deadlineAt
@@ -3136,25 +3136,53 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     }
 
     /// Shared lock + flush so watermark capture cannot race a concurrent append.
+    /// Persistence diagnostics for a failed barrier flush fire only after the lock
+    /// is released (callback fan-out must not run under `mirrorEventLock`).
+    private enum MirrorEventLockOutcome<T> {
+        case value(T)
+        case failure(Error, deferred: DeferredPersistenceIssue?)
+    }
+
     private func withMirrorEventLock<T>(
         threadId: AgentThreadID,
         _ body: () throws -> T
     ) throws -> T {
-        mirrorEventLock.lock()
-        defer { mirrorEventLock.unlock() }
-        lock.lock()
-        let priorFailure = mirrorPersistenceFailures[threadId]
-        lock.unlock()
-        if let priorFailure { throw priorFailure }
-        lock.lock()
-        let bufferedRunId = pendingStreamRunIds[threadId]
-        lock.unlock()
-        if let runId = bufferedRunId ?? activeRunId(threadId: threadId) {
-            if let error = flushPendingStreamWritesResult(runId: runId, threadId: threadId) {
-                throw error
+        let outcome: MirrorEventLockOutcome<T> = {
+            mirrorEventLock.lock()
+            defer { mirrorEventLock.unlock() }
+            lock.lock()
+            let priorFailure = mirrorPersistenceFailures[threadId]
+            lock.unlock()
+            if let priorFailure { return .failure(priorFailure, deferred: nil) }
+            lock.lock()
+            let bufferedRunId = pendingStreamRunIds[threadId]
+            lock.unlock()
+            if let runId = bufferedRunId ?? activeRunId(threadId: threadId) {
+                let attempt = flushPendingStreamWritesResult(runId: runId, threadId: threadId)
+                if let error = attempt.error {
+                    return .failure(error, deferred: attempt.deferredIssue)
+                }
             }
+            do {
+                return .value(try body())
+            } catch {
+                return .failure(error, deferred: nil)
+            }
+        }()
+        switch outcome {
+        case .value(let value):
+            return value
+        case .failure(let error, let deferred):
+            if let deferred {
+                emitPersistenceIssue(
+                    deferred.operation,
+                    error: deferred.error,
+                    runId: deferred.runId,
+                    threadId: deferred.threadId
+                )
+            }
+            throw error
         }
-        return try body()
     }
 
     public func activeThreadIdsSnapshot() -> Set<AgentThreadID> {
@@ -3418,15 +3446,27 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return BatchFlush(items: batch.snapshot(), pruneDue: effectivePruneDue)
     }
 
+    /// Deferred host/observer diagnostic. Emitted only after `mirrorEventLock` is
+    /// released so snapshot capture cannot deadlock on main/UI fan-out.
+    private struct DeferredPersistenceIssue {
+        let operation: String
+        let error: Error
+        let runId: AgentRunID
+        let threadId: AgentThreadID
+    }
+
     /// Commits a batch atomically, then acknowledges the exact in-memory prefix.
     /// Repository writes are idempotent so a retry after an ambiguous boundary
     /// cannot duplicate a previously committed sequence.
+    ///
+    /// Never calls `emitPersistenceIssue` — callers must publish diagnostics after
+    /// releasing `mirrorEventLock` (this method often runs while that lock is held).
     @discardableResult
     private func flushStreamWrites(
         _ flush: BatchFlush,
         runId: AgentRunID,
         threadId: AgentThreadID
-    ) -> Error? {
+    ) -> DeferredPersistenceIssue? {
         do {
             try runRepo.persistStreamBatch(
                 runId: runId,
@@ -3454,8 +3494,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     userInfo: [NSLocalizedDescriptionKey: "Committed stream batch no longer matches its in-memory prefix."]
                 )
                 recordMirrorPersistenceFailure(error, threadId: threadId)
-                emitPersistenceIssue("run.stream_event.acknowledge", error: error, runId: runId, threadId: threadId)
-                return error
+                return DeferredPersistenceIssue(
+                    operation: "run.stream_event.acknowledge",
+                    error: error,
+                    runId: runId,
+                    threadId: threadId
+                )
             }
             pendingStreamWrites[threadId] = batch
             if flush.pruneDue { pendingStreamPrunes.remove(threadId) }
@@ -3468,23 +3512,46 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // The repository transaction rolled back the entire batch. Keep the
             // in-memory prefix and owner intact so snapshot/start/terminal barriers
             // can retry. This is a transient durability failure, not a known gap.
-            emitPersistenceIssue("run.stream_event.append", error: error, runId: runId, threadId: threadId)
-            return error
+            return DeferredPersistenceIssue(
+                operation: "run.stream_event.append",
+                error: error,
+                runId: runId,
+                threadId: threadId
+            )
         }
     }
 
     /// Drain and persist any buffered stream writes for a thread immediately. Used
     /// on terminal/stop paths so the tail of a fast stream is never stranded in the
     /// buffer once the run is no longer producing events.
+    /// Emits persistence diagnostics only when the caller is not already holding
+    /// `mirrorEventLock` (this entry point does not nest under that lock).
     @discardableResult
     private func flushPendingStreamWrites(runId: AgentRunID, threadId: AgentThreadID) -> Error? {
-        flushPendingStreamWritesResult(runId: runId, threadId: threadId)
+        let result = flushPendingStreamWritesResult(runId: runId, threadId: threadId)
+        if let deferred = result.deferredIssue {
+            emitPersistenceIssue(
+                deferred.operation,
+                error: deferred.error,
+                runId: deferred.runId,
+                threadId: deferred.threadId
+            )
+        }
+        return result.error
     }
 
+    private struct StreamFlushAttempt {
+        let error: Error?
+        /// Set only for SQLite/ack failures that previously emitted under the lock.
+        let deferredIssue: DeferredPersistenceIssue?
+    }
+
+    /// Serializes durability under `mirrorEventLock` but never fans out diagnostics
+    /// or host callbacks while that lock is held.
     private func flushPendingStreamWritesResult(
         runId: AgentRunID,
         threadId: AgentThreadID
-    ) -> Error? {
+    ) -> StreamFlushAttempt {
         mirrorEventLock.lock()
         defer { mirrorEventLock.unlock() }
         lock.lock()
@@ -3496,46 +3563,58 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 userInfo: [NSLocalizedDescriptionKey: "Buffered mirror events changed run ownership."]
             )
             recordMirrorPersistenceFailure(error, threadId: threadId)
-            return error
+            return StreamFlushAttempt(error: error, deferredIssue: nil)
         }
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         let flush = takeStreamFlushLocked(threadId: threadId, pruneDue: false, nowMs: nowMs)
         lock.unlock()
         if let flush, !flush.items.isEmpty {
-            return flushStreamWrites(flush, runId: runId, threadId: threadId)
+            if let deferred = flushStreamWrites(flush, runId: runId, threadId: threadId) {
+                return StreamFlushAttempt(error: deferred.error, deferredIssue: deferred)
+            }
         }
-        return nil
+        return StreamFlushAttempt(error: nil, deferredIssue: nil)
     }
 
+    /// Updates provider session runtime payload. Never emits diagnostics; callers
+    /// that hold `mirrorEventLock` must defer fan-out until after unlock.
+    @discardableResult
     private func updateProviderRuntimePayload(
         threadId: AgentThreadID,
         runId: AgentRunID,
         mutate: (inout ProviderSessionRuntimePayload) -> Void
-    ) {
+    ) -> DeferredPersistenceIssue? {
         do {
-            guard var session = try providerSessionRepo?.get(threadId: threadId) else { return }
+            guard var session = try providerSessionRepo?.get(threadId: threadId) else { return nil }
             var payload = ProviderSessionRuntimePayload.decode(session.runtimePayloadJSON)
             mutate(&payload)
             session.runtimePayloadJSON = payload.encoded()
             session.updatedAt = Date()
             try providerSessionRepo?.upsert(session)
+            return nil
         } catch {
-            emitPersistenceIssue("provider_session.runtime_payload.update", error: error, runId: runId, threadId: threadId)
+            return DeferredPersistenceIssue(
+                operation: "provider_session.runtime_payload.update",
+                error: error,
+                runId: runId,
+                threadId: threadId
+            )
         }
     }
 
+    @discardableResult
     private func updateProviderRuntimePayloadFromProviderEvent(
         _ event: ProviderRuntimeEvent,
         threadId: AgentThreadID,
         runId: AgentRunID
-    ) {
+    ) -> DeferredPersistenceIssue? {
         guard event.provider == .claude,
               event.method == "claude.session.snapshot",
               let data = event.payloadJSON.data(using: .utf8),
               let snapshot = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return
+            return nil
         }
-        updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+        return updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
             if let providerThreadId = snapshot["providerThreadId"] as? String ?? snapshot["resume"] as? String {
                 payload.providerThreadId = providerThreadId
             }
@@ -3565,10 +3644,25 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
     }
 
-    @discardableResult
-    private func persistAssistantIfMissing(_ text: String, threadId: AgentThreadID, runId: AgentRunID) -> AgentMessage? {
+    private struct PersistAssistantOutcome {
+        let message: AgentMessage?
+        let deferredIssue: DeferredPersistenceIssue?
+        /// Message that was newly appended and still needs host `onMessageAppended`
+        /// after any outer mirror lock is released.
+        let pendingMessageAppendNotification: AgentMessage?
+    }
+
+    /// Persists a final assistant message when missing. Never emits diagnostics or
+    /// host callbacks; callers defer those until after `mirrorEventLock` release.
+    private func persistAssistantIfMissing(
+        _ text: String,
+        threadId: AgentThreadID,
+        runId: AgentRunID
+    ) -> PersistAssistantOutcome {
         let text = AssistantTimelineState.cappedText(sanitizeFinalAssistantText(text))
-        guard !text.isEmpty else { return nil }
+        guard !text.isEmpty else {
+            return PersistAssistantOutcome(message: nil, deferredIssue: nil, pendingMessageAppendNotification: nil)
+        }
         // PERF-MAC_AGENT-006: the common duplicate is the same turn's final
         // message arriving via both `turnCompleted` and `finished`. Skip the
         // full-history load when the text matches the last one we persisted;
@@ -3577,13 +3671,23 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.lock()
         let cachedLast = lastPersistedAssistantContent[threadId]
         lock.unlock()
-        if cachedLast == text { return nil }
+        if cachedLast == text {
+            return PersistAssistantOutcome(message: nil, deferredIssue: nil, pendingMessageAppendNotification: nil)
+        }
         let existing: [AgentMessage]
         do {
             existing = try messageRepo.list(threadId: threadId)
         } catch {
-            emitPersistenceIssue("message.list", error: error, runId: runId, threadId: threadId)
-            return nil
+            return PersistAssistantOutcome(
+                message: nil,
+                deferredIssue: DeferredPersistenceIssue(
+                    operation: "message.list",
+                    error: error,
+                    runId: runId,
+                    threadId: threadId
+                ),
+                pendingMessageAppendNotification: nil
+            )
         }
         guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else {
             // Warm the cache on history-scan hit too, subject to the same size cap.
@@ -3591,14 +3695,22 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             if !Self.shouldEvictLastPersistedContent(threadClosed: false, entryByteCount: byteCountHit) {
                 lock.lock(); lastPersistedAssistantContent[threadId] = text; lock.unlock()
             }
-            return nil
+            return PersistAssistantOutcome(message: nil, deferredIssue: nil, pendingMessageAppendNotification: nil)
         }
         let message = AgentMessage(threadId: threadId, role: .assistant, content: text)
         do {
             try messageRepo.append(message)
         } catch {
-            emitPersistenceIssue("message.append.assistant", error: error, runId: runId, threadId: threadId)
-            return nil
+            return PersistAssistantOutcome(
+                message: nil,
+                deferredIssue: DeferredPersistenceIssue(
+                    operation: "message.append.assistant",
+                    error: error,
+                    runId: runId,
+                    threadId: threadId
+                ),
+                pendingMessageAppendNotification: nil
+            )
         }
         // PERF-MAC_AGENT-008: only cache if the entry is within the byte cap;
         // oversized entries skip the cache and rely on the full-history scan for
@@ -3607,8 +3719,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         if !Self.shouldEvictLastPersistedContent(threadClosed: false, entryByteCount: byteCount) {
             lock.lock(); lastPersistedAssistantContent[threadId] = text; lock.unlock()
         }
-        onMessageAppended?(message)
-        return message
+        return PersistAssistantOutcome(
+            message: message,
+            deferredIssue: nil,
+            pendingMessageAppendNotification: message
+        )
     }
 
     private func sanitizeFinalAssistantText(_ text: String) -> String {
@@ -3925,8 +4040,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // is held: host callbacks can block on main-queue work, and the HTTP
             // mirror snapshot path waits on this same lock on the main actor.
             enum MirrorEventPostAction {
-                case publish
-                case saturatedRetry(Error)
+                case publish(persistenceIssues: [DeferredPersistenceIssue], appendedMessages: [AgentMessage])
+                case saturatedRetry(Error, deferred: DeferredPersistenceIssue?)
                 case ownerConflict(Error)
                 case activePlanBudget(Error)
                 case resumeCursorFailure(Error)
@@ -3935,16 +4050,22 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 mirrorEventLock.lock()
                 defer { mirrorEventLock.unlock() }
 
+                var deferredPersistenceIssues: [DeferredPersistenceIssue] = []
+                var appendedMessages: [AgentMessage] = []
+
                 lock.lock()
                 let priorBufferedRunId = pendingStreamRunIds[threadId].flatMap { owner in
                     owner == runId ? nil : owner
                 }
                 lock.unlock()
                 if let priorBufferedRunId {
-                    _ = flushPendingStreamWritesResult(
+                    let priorAttempt = flushPendingStreamWritesResult(
                         runId: priorBufferedRunId,
                         threadId: threadId
                     )
+                    if let issue = priorAttempt.deferredIssue {
+                        deferredPersistenceIssues.append(issue)
+                    }
                 }
                 // A failed SQLite flush must not turn the retry prefix into an
                 // unbounded spool. Before accepting another provider event, retry a
@@ -3960,10 +4081,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     )
                 } ?? false
                 lock.unlock()
-                if saturatedRetry,
-                   let retryError = flushPendingStreamWritesResult(runId: runId, threadId: threadId) {
-                    recordMirrorPersistenceFailure(retryError, threadId: threadId)
-                    return .saturatedRetry(retryError)
+                if saturatedRetry {
+                    let retryAttempt = flushPendingStreamWritesResult(runId: runId, threadId: threadId)
+                    if let retryError = retryAttempt.error {
+                        recordMirrorPersistenceFailure(retryError, threadId: threadId)
+                        return .saturatedRetry(retryError, deferred: retryAttempt.deferredIssue)
+                    }
                 }
 
                 lock.lock()
@@ -4012,7 +4135,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     }
                     lock.unlock()
                     if let flushNow {
-                        flushStreamWrites(flushNow, runId: runId, threadId: threadId)
+                        if let issue = flushStreamWrites(flushNow, runId: runId, threadId: threadId) {
+                            deferredPersistenceIssues.append(issue)
+                        }
                     }
                 }
 
@@ -4039,56 +4164,68 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                         resumeCursorFailure = error
                     }
                 case .providerRuntime(let runtimeEvent):
-                    updateProviderRuntimePayloadFromProviderEvent(runtimeEvent, threadId: threadId, runId: runId)
+                    if let issue = updateProviderRuntimePayloadFromProviderEvent(runtimeEvent, threadId: threadId, runId: runId) {
+                        deferredPersistenceIssues.append(issue)
+                    }
                 case .turnStarted(let turnId):
                     lock.lock()
                     activeTurnIds[runId] = turnId
                     lock.unlock()
-                    updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                    let issue = updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
                         payload.activeTurnId = turnId
                         payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
                     }
+                    if let issue { deferredPersistenceIssues.append(issue) }
                 case .requestOpened(let request):
-                    updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                    let issue = updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
                         payload.pendingApprovalRequestIds = Self.boundedRuntimeIdentifiers(
                             existing: payload.pendingApprovalRequestIds,
                             adding: request.id
                         )
                         payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
                     }
+                    if let issue { deferredPersistenceIssues.append(issue) }
                 case .requestResolved(let requestId, _):
-                    updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                    let issue = updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
                         payload.pendingApprovalRequestIds.removeAll { $0 == requestId }
                         payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
                     }
+                    if let issue { deferredPersistenceIssues.append(issue) }
                 case .userInputRequested(let request):
-                    updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                    let issue = updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
                         payload.pendingUserInputRequestIds = Self.boundedRuntimeIdentifiers(
                             existing: payload.pendingUserInputRequestIds,
                             adding: request.id
                         )
                         payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
                     }
+                    if let issue { deferredPersistenceIssues.append(issue) }
                 case .userInputResolved(let requestId, _):
-                    updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                    let issue = updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
                         payload.pendingUserInputRequestIds.removeAll { $0 == requestId }
                         payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
                     }
+                    if let issue { deferredPersistenceIssues.append(issue) }
                 case .turnCompleted(let turnId, let finalMessage):
                     lock.lock()
                     activeTurnIds[runId] = turnId
                     lock.unlock()
-                    if let msg = finalMessage,
-                       let persisted = persistAssistantIfMissing(msg, threadId: threadId, runId: runId) {
-                        lock.lock()
-                        activeAssistantMessageIds[runId] = persisted.id
-                        lock.unlock()
+                    if let msg = finalMessage {
+                        let outcome = persistAssistantIfMissing(msg, threadId: threadId, runId: runId)
+                        if let issue = outcome.deferredIssue { deferredPersistenceIssues.append(issue) }
+                        if let message = outcome.pendingMessageAppendNotification { appendedMessages.append(message) }
+                        if let persisted = outcome.message {
+                            lock.lock()
+                            activeAssistantMessageIds[runId] = persisted.id
+                            lock.unlock()
+                        }
                     }
                     if finalMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
-                        updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                        let issue = updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
                             payload.activePlan = nil
                             payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
                         }
+                        if let issue { deferredPersistenceIssues.append(issue) }
                     }
                 case .activePlanUpdated(let plan):
                     guard Self.activePlanFitsCompactBudget(plan) else {
@@ -4098,10 +4235,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                             userInfo: [NSLocalizedDescriptionKey: "Active plan exceeds the compact recovery-state budget."]
                         ))
                     }
-                    updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                    let issue = updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
                         payload.activePlan = plan
                         payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
                     }
+                    if let issue { deferredPersistenceIssues.append(issue) }
                 case .error(let message, _):
                     // Same durable reason seam as AgentRunEvent.error — stream-level
                     // error rows must also fill agent_runs.error_message on terminal.
@@ -4115,11 +4253,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 if let resumeCursorFailure {
                     return .resumeCursorFailure(resumeCursorFailure)
                 }
-                return .publish
+                return .publish(persistenceIssues: deferredPersistenceIssues, appendedMessages: appendedMessages)
             }()
 
             switch postAction {
-            case .saturatedRetry(let error):
+            case .saturatedRetry(let error, let deferred):
+                if let deferred {
+                    emitPersistenceIssue(deferred.operation, error: deferred.error, runId: deferred.runId, threadId: deferred.threadId)
+                }
                 emitPersistenceIssue("run.stream_event.retry_saturated", error: error, runId: runId, threadId: threadId)
                 stopRun(runId)
                 return
@@ -4132,8 +4273,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 return
             case .resumeCursorFailure(let error):
                 emitPersistenceIssue("provider_session.resume_cursor.update", error: error, runId: runId, threadId: threadId)
-            case .publish:
-                break
+            case .publish(let persistenceIssues, let appendedMessages):
+                for issue in persistenceIssues {
+                    emitPersistenceIssue(issue.operation, error: issue.error, runId: issue.runId, threadId: issue.threadId)
+                }
+                for message in appendedMessages {
+                    onMessageAppended?(message)
+                }
             }
 
             for observer in observersSnapshot() {
