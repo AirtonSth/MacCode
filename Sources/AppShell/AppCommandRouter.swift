@@ -190,7 +190,12 @@ public final class AgentAppReadGateway: @unchecked Sendable {
                     Thread.sleep(forTimeInterval: TimeInterval(delay) / 1_000_000_000)
                 }
                 do {
-                    continuation.resume(returning: try work())
+                    // The queue keeps the work off MainActor; performSync also
+                    // takes SQLiteDB's operation gate for the complete
+                    // statement/decode sequence so this gateway cannot race
+                    // existing readers or writers on the shared handle.
+                    let result = try self.db.performSync { _ in try work() }
+                    continuation.resume(returning: result)
                 } catch {
                     continuation.resume(throwing: error)
                 }
