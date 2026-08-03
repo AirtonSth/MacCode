@@ -35,6 +35,11 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         let foreignUserUID: uid_t?
         let parser = ClaudeParser()
         let lineBuffer = LineBuffer()
+        // Serializes the stdout readabilityHandler against finishTerminated's
+        // EOF drain: nil-ing a readabilityHandler does not wait for a callback
+        // already running, and LineBuffer/ClaudeParser are not thread-safe.
+        // Taken BEFORE the fd read so byte order is preserved across readers.
+        let stdoutReadLock = NSLock()
         let writeQueue = DispatchQueue(label: "remotecode.claude-stream.write")
         var events: [AssistantEvent] = []
         var status: AgentRunStatus = .running
@@ -518,6 +523,8 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session.environment = request.environment
         stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self, weak session] handle in
             guard let self, let session else { return }
+            session.stdoutReadLock.lock()
+            defer { session.stdoutReadLock.unlock() }
             let data = handle.availableData
             guard !data.isEmpty else { return }
             for line in session.lineBuffer.take(data) {
@@ -954,10 +961,15 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     private func finishTerminated(_ session: Session) {
         session.stdoutPipe.fileHandleForReading.readabilityHandler = nil
         session.stderrPipe.fileHandleForReading.readabilityHandler = nil
+        // Drain under the lock: an in-flight readabilityHandler callback may
+        // still be reading/parsing — the lock keeps LineBuffer and ClaudeParser
+        // access and fd read order serialized so no final line is split or raced.
+        session.stdoutReadLock.lock()
         let tail = BoundedPipeDrain.readRemaining(from: session.stdoutPipe.fileHandleForReading)
         for line in session.lineBuffer.take(tail) + session.lineBuffer.flush() {
             handleLine(line, session: session)
         }
+        session.stdoutReadLock.unlock()
         for event in session.parser.finalize() {
             handleFinalizedEvent(event, session: session)
         }
