@@ -3614,16 +3614,31 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
         // Hybrid ownership: live connection_id is owner-pinned; unregistered ids
         // are only accepted when this owner has no live WebSocket (HTTP baseline).
+        let registeredOwner = activeWebSocketConnections.ownerFingerprint(for: connectionID)
+        let ownerHasLiveConnection = activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
         guard Self.hybridConnectionAuthorized(
             connectionID: connectionID,
             ownerFingerprint: ownerFingerprint,
             registeredOwner: {
-                activeWebSocketConnections.ownerFingerprint(for: connectionID)
+                registeredOwner
             },
             ownerHasLiveConnection: {
-                activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
+                ownerHasLiveConnection
             }
         ) else {
+            if registeredOwner == nil, ownerHasLiveConnection {
+                return rpcJSONData(rpcErrorObject(
+                    JSONRPCError(
+                        code: JSONRPCError.invalidParams.code,
+                        message: JSONRPCError.invalidParams.message,
+                        data: .object([
+                            "reason": .string("snapshot_owner_conflict"),
+                            "retryable": .bool(true),
+                        ])
+                    ),
+                    id: wireID
+                ))
+            }
             return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
         }
         let watermark = activeWebSocketConnections.watermark(
@@ -3830,16 +3845,31 @@ public final class DirectHTTPServer: @unchecked Sendable {
             preferredChunkBytes = nil
         }
 
+        let registeredOwner = activeWebSocketConnections.ownerFingerprint(for: connectionID)
+        let ownerHasLiveConnection = activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
         guard Self.hybridConnectionAuthorized(
             connectionID: connectionID,
             ownerFingerprint: ownerFingerprint,
             registeredOwner: {
-                activeWebSocketConnections.ownerFingerprint(for: connectionID)
+                registeredOwner
             },
             ownerHasLiveConnection: {
-                activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
+                ownerHasLiveConnection
             }
         ) else {
+            if registeredOwner == nil, ownerHasLiveConnection {
+                return rpcJSONData(rpcErrorObject(
+                    JSONRPCError(
+                        code: JSONRPCError.invalidParams.code,
+                        message: JSONRPCError.invalidParams.message,
+                        data: .object([
+                            "reason": .string("snapshot_owner_conflict"),
+                            "retryable": .bool(true),
+                        ])
+                    ),
+                    id: wireID
+                ))
+            }
             return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
         }
         // Drop TTL-expired transfers first so a abandoned chunk reservation
@@ -4018,16 +4048,31 @@ public final class DirectHTTPServer: @unchecked Sendable {
             return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
         }
 
+        let registeredOwner = activeWebSocketConnections.ownerFingerprint(for: connectionID)
+        let ownerHasLiveConnection = activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
         guard Self.hybridConnectionAuthorized(
             connectionID: connectionID,
             ownerFingerprint: ownerFingerprint,
             registeredOwner: {
-                activeWebSocketConnections.ownerFingerprint(for: connectionID)
+                registeredOwner
             },
             ownerHasLiveConnection: {
-                activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
+                ownerHasLiveConnection
             }
         ) else {
+            if registeredOwner == nil, ownerHasLiveConnection {
+                return rpcJSONData(rpcErrorObject(
+                    JSONRPCError(
+                        code: JSONRPCError.invalidParams.code,
+                        message: JSONRPCError.invalidParams.message,
+                        data: .object([
+                            "reason": .string("snapshot_owner_conflict"),
+                            "retryable": .bool(true),
+                        ])
+                    ),
+                    id: wireID
+                ))
+            }
             return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
         }
 
@@ -4129,16 +4174,31 @@ public final class DirectHTTPServer: @unchecked Sendable {
             return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
         }
 
+        let registeredOwner = activeWebSocketConnections.ownerFingerprint(for: connectionID)
+        let ownerHasLiveConnection = activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
         guard Self.hybridConnectionAuthorized(
             connectionID: connectionID,
             ownerFingerprint: ownerFingerprint,
             registeredOwner: {
-                activeWebSocketConnections.ownerFingerprint(for: connectionID)
+                registeredOwner
             },
             ownerHasLiveConnection: {
-                activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint)
+                ownerHasLiveConnection
             }
         ) else {
+            if registeredOwner == nil, ownerHasLiveConnection {
+                return rpcJSONData(rpcErrorObject(
+                    JSONRPCError(
+                        code: JSONRPCError.invalidParams.code,
+                        message: JSONRPCError.invalidParams.message,
+                        data: .object([
+                            "reason": .string("snapshot_owner_conflict"),
+                            "retryable": .bool(true),
+                        ])
+                    ),
+                    id: wireID
+                ))
+            }
             return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
         }
 
