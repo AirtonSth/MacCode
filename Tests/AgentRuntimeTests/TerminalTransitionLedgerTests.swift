@@ -1,6 +1,7 @@
 import XCTest
 @testable import AgentRuntime
 import CoreModel
+import Persistence
 
 /// plan-final W0/W1: terminal reason classes never masquerade as provider completed.
 final class TerminalTransitionLedgerTests: XCTestCase {
@@ -79,5 +80,82 @@ final class TerminalTransitionLedgerTests: XCTestCase {
         XCTAssertEqual(all[0].runId, "run-1")
         XCTAssertEqual(all[0].reason, .processDeath)
         XCTAssertEqual(try ledger.records(forRunId: "run-1").count, 1)
+    }
+
+    func test_terminalInitiator_userStop_processDeath_rpcTimeout() {
+        XCTAssertEqual(
+            AgentRunCoordinator.terminalInitiator(
+                status: .cancelled,
+                providerTerminalAcknowledged: false
+            ),
+            .userStop
+        )
+        XCTAssertEqual(
+            AgentRunCoordinator.terminalInitiator(
+                status: .failed,
+                providerTerminalAcknowledged: false
+            ),
+            .processDeath
+        )
+        XCTAssertEqual(
+            AgentRunCoordinator.terminalInitiator(
+                status: .failed,
+                providerTerminalAcknowledged: true,
+                errorMessage: "request timed out after 30s"
+            ),
+            .rpcTimeout
+        )
+        XCTAssertEqual(
+            AgentRunCoordinator.terminalInitiator(
+                status: .completed,
+                providerTerminalAcknowledged: true
+            ),
+            .providerTerminal
+        )
+        XCTAssertEqual(
+            AgentRunCoordinator.terminalInitiator(
+                status: .interrupted,
+                providerTerminalAcknowledged: false
+            ),
+            .relaunchReconcile
+        )
+    }
+
+    func test_recordTerminalTransition_usesPolicy_blocksFalseCompleted() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-term-policy-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let ledger = TerminalTransitionLedger(
+            directory: URL(fileURLWithPath: tmp).appendingPathComponent("diagnostics")
+        )
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: AgentThreadRepository(db: db),
+            providers: [:],
+            terminalTransitionLedger: ledger
+        )
+        // Local initiator claiming completed must not present as completed.
+        let presentation = coordinator.recordTerminalTransition(
+            runId: AgentRunID(),
+            threadId: AgentThreadID(),
+            requestedStatus: .completed,
+            initiator: .relaunchReconcile
+        )
+        XCTAssertEqual(presentation, .interrupted)
+        XCTAssertFalse(
+            TerminalTransitionPolicy.allowsCompletedPresentation(
+                TerminalTransitionRecord(
+                    runId: "x",
+                    threadId: "y",
+                    reason: .relaunchReconcile,
+                    initiator: .relaunchReconcile,
+                    requestedStatus: .completed
+                )
+            )
+        )
+        let rows = try ledger.allRecords()
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0].reason, .relaunchReconcile)
     }
 }

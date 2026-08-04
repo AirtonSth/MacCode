@@ -1074,7 +1074,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         _ = try runRepo.reconcileRunningOnLaunch(preservingThreadIDs: preservingThreadIDs)
         for run in preLaunchActive {
             if preservingThreadIDs.contains(run.threadId) { continue }
-            recordTerminalTransition(
+            _ = recordTerminalTransition(
                 runId: run.id,
                 threadId: run.threadId,
                 requestedStatus: .interrupted,
@@ -2285,7 +2285,30 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         try? providerSessionRepo?.markStopped(threadId: threadId, status: .completed)
     }
 
-    /// Write-before-UI terminal transition record. Never flips status by itself.
+    /// Classifies the local initiator for a terminal transition (plan-final T1–T3).
+    public static func terminalInitiator(
+        status: AgentRunStatus,
+        providerTerminalAcknowledged: Bool,
+        errorMessage: String? = nil
+    ) -> TerminalTransitionInitiator {
+        if status == .cancelled && !providerTerminalAcknowledged {
+            return .userStop
+        }
+        if status == .interrupted {
+            return .relaunchReconcile
+        }
+        let lower = (errorMessage ?? "").lowercased()
+        if lower.contains("timed out") || lower.contains("timeout") || lower.contains("requesttimedout") {
+            return .rpcTimeout
+        }
+        if status == .failed && !providerTerminalAcknowledged {
+            return .processDeath
+        }
+        return .providerTerminal
+    }
+
+    /// Write-before-UI terminal transition. Applies `TerminalTransitionPolicy` so
+    /// false `completed` cannot be presented. Returns the presentation status.
     @discardableResult
     public func recordTerminalTransition(
         runId: AgentRunID,
@@ -2295,12 +2318,29 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         providerPid: Int32? = nil,
         exitStatus: Int32? = nil,
         eventSequence: Int64? = nil
-    ) -> TerminalTransitionRecord? {
+    ) -> AgentRunStatus {
         let reason = TerminalTransitionReason.classify(
             requestedStatus: requestedStatus,
             initiator: initiator
         )
-        let record = TerminalTransitionRecord(
+        var presentation = TerminalTransitionPolicy.reconciledStatus(
+            requested: requestedStatus,
+            reason: reason
+        )
+        // Hard gate: completed presentation requires provider-completed reason.
+        if presentation == .completed {
+            let probe = TerminalTransitionRecord(
+                runId: runId.value.uuidString,
+                threadId: threadId.value.uuidString,
+                reason: reason,
+                initiator: initiator,
+                requestedStatus: .completed
+            )
+            if !TerminalTransitionPolicy.allowsCompletedPresentation(probe) {
+                presentation = reason.durableStatus
+            }
+        }
+        var record = TerminalTransitionRecord(
             runId: runId.value.uuidString,
             threadId: threadId.value.uuidString,
             reason: reason,
@@ -2311,8 +2351,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             eventSequence: eventSequence,
             bootId: TerminalTransitionLedger.currentBootId()
         )
-        guard let ledger = terminalTransitionLedger else { return record }
-        return try? ledger.append(record)
+        record.presentTime = Date()
+        if let ledger = terminalTransitionLedger {
+            _ = try? ledger.append(record)
+        }
+        return presentation
     }
 
     private func markStopRequested(threadId: AgentThreadID, runId: AgentRunID?) {
@@ -2385,6 +2428,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 errorMessage: nil
             )
             lock.unlock()
+            _ = recordTerminalTransition(
+                runId: runId,
+                threadId: threadId,
+                requestedStatus: .cancelled,
+                initiator: .userStop
+            )
             handle(
                 event: .finished(.cancelled, finalMessage: nil, providerThreadId: nil),
                 runId: runId,
@@ -3287,8 +3336,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     public func stopAllProviderSessionsForAppTermination() {
         lock.lock()
+        // activeThreads: threadId -> runId
+        let livePairs = Array(activeThreads)
         let adapters = Array(providers.values)
         lock.unlock()
+        for (threadId, runId) in livePairs {
+            _ = recordTerminalTransition(
+                runId: runId,
+                threadId: threadId,
+                requestedStatus: .interrupted,
+                initiator: .appTermination
+            )
+        }
         adapters.forEach { $0.stopAllForAppTermination() }
     }
 
@@ -4312,7 +4371,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 // Lock saturation must not terminate a live turn (plan-final W1 T-path).
                 // Keep the run alive with a deferred-persistence issue; retry later.
                 emitPersistenceIssue("run.stream_event.retry_saturated", error: error, runId: runId, threadId: threadId)
-                recordTerminalTransition(
+                _ = recordTerminalTransition(
                     runId: runId,
                     threadId: threadId,
                     requestedStatus: .failed,
@@ -4529,7 +4588,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 return
             }
             // Use the resolved terminal (may reclassify empty "completed" → failed).
-            let status = pendingTerminal.status
+            // Write-before-UI ledger + policy: never present false completed.
+            let initiator = Self.terminalInitiator(
+                status: pendingTerminal.status,
+                providerTerminalAcknowledged: pendingTerminal.providerTerminalAcknowledged,
+                errorMessage: pendingTerminal.errorMessage
+            )
+            let status = recordTerminalTransition(
+                runId: runId,
+                threadId: threadId,
+                requestedStatus: pendingTerminal.status,
+                initiator: initiator
+            )
             // PERF-MAC_AGENT-007: drain any buffered stream writes before the run
             // tears down, so the tail of a fast stream is durably persisted (and
             // visible to latestStreamEvents/reload) once the run finishes.
