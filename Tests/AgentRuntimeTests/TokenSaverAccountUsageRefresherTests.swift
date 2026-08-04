@@ -1,5 +1,6 @@
 import XCTest
 import CoreModel
+import Darwin
 @testable import AgentRuntime
 
 final class TokenSaverAccountUsageRefresherTests: XCTestCase {
@@ -186,6 +187,72 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
         XCTAssertEqual(usage?.provider, .claude)
         XCTAssertEqual(usage?.weeklyUsedPercent, 58)
         XCTAssertEqual(usage?.weeklyWindowDurationMinutes, 10_080)
+    }
+
+    /// WHY: the normal Claude text probe can fail even though the interactive
+    /// usage screen is available. The fallback must then launch the prepared
+    /// executable/environment through the PTY, parse that screen, and reap its
+    /// owned child before returning so no `<defunct>` Claude process remains.
+    func test_claudeUsageRefresh_fallsBackToPTYScreenAndReapsChild() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-claude-usage-pty-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let script = dir.appendingPathComponent("fake-claude")
+        let headlessMarker = dir.appendingPathComponent("headless-ran")
+        let ptyPIDFile = dir.appendingPathComponent("pty-pid")
+        try #"""
+        #!/bin/sh
+        if [ "$1" = "-p" ]; then
+          : > "$RC2_CLAUDE_HEADLESS_MARKER"
+          printf 'headless usage unavailable\n'
+          exit 1
+        fi
+        printf '%s\n' "$$" > "$RC2_CLAUDE_PTY_PID_FILE"
+        printf '❯'
+        while IFS= read -r line; do
+          case "$line" in
+            */usage*)
+              printf '\nCurrent week (all models)\n████████████████████████████ 56%% used\n'
+              ;;
+            */exit*) exit 0 ;;
+          esac
+        done
+        """#.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let usages = await TokenSaverAccountUsageRefresher(timeoutSeconds: 3)
+            .refreshAccountUsage(TokenSaverAccountUsageRefreshRequest(
+                codexBinary: dir.appendingPathComponent("missing-codex").path,
+                claudeBinary: script.path,
+                grokBillingLogURL: dir.appendingPathComponent("missing-grok-billing-log"),
+                cwd: dir.path,
+                environment: [
+                    "RC2_CLAUDE_HEADLESS_MARKER": headlessMarker.path,
+                    "RC2_CLAUDE_PTY_PID_FILE": ptyPIDFile.path
+                ]
+            ))
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: headlessMarker.path),
+                      "fixture must fail the headless probe before exercising the interactive PTY fallback")
+        XCTAssertEqual(usages.first(where: { $0.provider == .claude })?.weeklyUsedPercent, 56,
+                       "interactive /usage output must be parsed after the headless probe fails")
+
+        let ptyPID = try XCTUnwrap(Int32(try String(contentsOf: ptyPIDFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)))
+        let killResult = kill(ptyPID, 0)
+        let killError = errno
+        XCTAssertEqual(killResult, -1,
+                       "fallback child must be terminated before refresh returns")
+        XCTAssertEqual(killError, ESRCH)
+        var status: Int32 = 0
+        let waitResult = waitpid(ptyPID, &status, WNOHANG)
+        let waitError = errno
+        XCTAssertEqual(waitResult, -1,
+                       "the refresher must retain final waitpid ownership for its PTY child")
+        XCTAssertEqual(waitError, ECHILD,
+                       "the fallback child must be reaped rather than left as a zombie")
     }
 
     func test_liveAccountUsageRefresh_whenExplicitlyEnabled() async throws {

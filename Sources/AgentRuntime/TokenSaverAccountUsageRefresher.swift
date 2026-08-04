@@ -453,28 +453,32 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
         environment["LANG"] = environment["LANG"] ?? "C.UTF-8"
         environment["LC_ALL"] = environment["LC_ALL"] ?? "C.UTF-8"
         environment.removeValue(forKey: "NO_COLOR")
-        let environmentPairs = environment.map { ($0.key, $0.value) }
+        var argv: [UnsafeMutablePointer<CChar>?] = [strdup(path), nil]
+        var envp = environment.sorted { $0.key < $1.key }
+            .map { strdup("\($0.key)=\($0.value)") }
+        envp.append(nil)
+        defer {
+            argv.compactMap { $0 }.forEach { free($0) }
+            envp.compactMap { $0 }.forEach { free($0) }
+        }
 
         var masterFD: Int32 = -1
-        let pid = rc2_forkpty(&masterFD)
-        if pid < 0 { return nil }
-        if pid == 0 {
-            _ = chdir(request.cwd)
-            for (key, value) in environmentPairs {
-                key.withCString { keyPtr in
-                    value.withCString { valuePtr in
-                        _ = setenv(keyPtr, valuePtr, 1)
+        let pid = request.cwd.withCString { cwdPointer in
+            path.withCString { executablePointer in
+                argv.withUnsafeMutableBufferPointer { argvPointer in
+                    envp.withUnsafeMutableBufferPointer { envpPointer in
+                        rc2_spawnpty_exec(
+                            &masterFD,
+                            cwdPointer,
+                            executablePointer,
+                            argvPointer.baseAddress,
+                            envpPointer.baseAddress
+                        )
                     }
                 }
             }
-            path.withCString { executablePath in
-                let argv: [UnsafeMutablePointer<CChar>?] = [strdup(executablePath), nil]
-                argv.withUnsafeBufferPointer { pointer in
-                    _ = execv(executablePath, pointer.baseAddress)
-                }
-            }
-            _exit(127)
         }
+        guard pid > 0 else { return nil }
 
         defer { close(masterFD) }
         _ = rc2_set_winsize(masterFD, 40, 120)
