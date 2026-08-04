@@ -220,7 +220,7 @@ public final class TerminalTransitionLedger: @unchecked Sendable {
     @discardableResult
     public func append(_ record: TerminalTransitionRecord) throws -> TerminalTransitionRecord {
         var committed = record
-        committed.commitTime = Date()
+        committed.commitTime = committed.commitTime ?? Date()
         try queue.sync {
             try appendLocked(committed)
             // Prune only when over soft budget — avoid O(n) rewrite every terminal.

@@ -248,6 +248,139 @@ final class TerminalTransitionLedgerTests: XCTestCase {
         XCTAssertEqual(try runRepo.get(id: runId)?.status, .completed)
         XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .completed)
     }
+
+    func test_terminalGraphRetry_recordsOneTransitionOnlyAfterDurabilityAndBeforePresentation() async throws {
+        // WHY: the terminal claim survives 100 ms durability retries. The forensic
+        // row must describe its one successful graph commit, rather than every
+        // failed attempt or an already-presented result.
+        let tmp = NSTemporaryDirectory() + "rc2-terminal-ledger-retry-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "terminal retry", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let ledger = TerminalTransitionLedger(
+            directory: URL(fileURLWithPath: tmp).appendingPathComponent("diagnostics")
+        )
+        let runner = SaturatingStreamRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providers: [.codex: runner],
+            terminalTransitionLedger: ledger
+        )
+        let runId = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "exercise terminal graph retry"
+        ))
+        let finished = expectation(description: "terminal graph recovery presents once")
+        coordinator.onRunFinished = { _, finishedRunId, status in
+            if finishedRunId == runId, status == .completed {
+                finished.fulfill()
+            }
+        }
+
+        try db.execute("""
+            CREATE TRIGGER fail_terminal_graph_retry
+            BEFORE UPDATE ON agent_runs
+            WHEN NEW.status = 'completed'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced terminal graph failure');
+            END;
+            """)
+        runner.finishCompleted()
+        try await Task.sleep(nanoseconds: 350_000_000)
+
+        XCTAssertTrue(
+            try ledger.records(forRunId: runId.value.uuidString).isEmpty,
+            "failed terminal graph retries must not write premature forensic rows"
+        )
+        XCTAssertNil(try runRepo.get(id: runId)?.finishedAt)
+
+        try db.execute("DROP TRIGGER fail_terminal_graph_retry;")
+        await fulfillment(of: [finished], timeout: 2)
+
+        let records = try ledger.records(forRunId: runId.value.uuidString)
+        XCTAssertEqual(records.count, 1)
+        let record = try XCTUnwrap(records.first)
+        let commitTime = try XCTUnwrap(record.commitTime)
+        let presentTime = try XCTUnwrap(record.presentTime)
+        XCTAssertEqual(record.reason, .providerCompleted)
+        XCTAssertLessThanOrEqual(record.eventTime, commitTime)
+        XCTAssertLessThanOrEqual(commitTime, presentTime)
+        XCTAssertEqual(try runRepo.get(id: runId)?.status, .completed)
+    }
+
+    func test_userStopRetry_recordsOneTransitionOnlyAfterDurabilityAndBeforePresentation() async throws {
+        // WHY: Stop owns the same terminal claim as provider completion. Its
+        // immediate claim and each retry must not append separate ledger rows.
+        let tmp = NSTemporaryDirectory() + "rc2-terminal-ledger-stop-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "stop retry", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let ledger = TerminalTransitionLedger(
+            directory: URL(fileURLWithPath: tmp).appendingPathComponent("diagnostics")
+        )
+        let runner = SaturatingStreamRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providers: [.codex: runner],
+            terminalTransitionLedger: ledger
+        )
+        let runId = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "exercise user stop retry"
+        ))
+        let finished = expectation(description: "user stop recovery presents once")
+        coordinator.onRunFinished = { _, finishedRunId, status in
+            if finishedRunId == runId, status == .cancelled {
+                finished.fulfill()
+            }
+        }
+
+        try db.execute("""
+            CREATE TRIGGER fail_terminal_stop_retry
+            BEFORE UPDATE ON agent_runs
+            WHEN NEW.status = 'cancelled'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced terminal stop failure');
+            END;
+            """)
+        coordinator.stopRun(threadId: thread.id)
+        try await Task.sleep(nanoseconds: 350_000_000)
+
+        XCTAssertTrue(
+            try ledger.records(forRunId: runId.value.uuidString).isEmpty,
+            "a Stop claim and its failed retries must not append premature ledger rows"
+        )
+        XCTAssertNil(try runRepo.get(id: runId)?.finishedAt)
+
+        try db.execute("DROP TRIGGER fail_terminal_stop_retry;")
+        await fulfillment(of: [finished], timeout: 2)
+
+        let records = try ledger.records(forRunId: runId.value.uuidString)
+        XCTAssertEqual(records.count, 1)
+        let record = try XCTUnwrap(records.first)
+        let commitTime = try XCTUnwrap(record.commitTime)
+        let presentTime = try XCTUnwrap(record.presentTime)
+        XCTAssertEqual(record.reason, .userStop)
+        XCTAssertLessThanOrEqual(record.eventTime, commitTime)
+        XCTAssertLessThanOrEqual(commitTime, presentTime)
+        XCTAssertEqual(try runRepo.get(id: runId)?.status, .cancelled)
+    }
 }
 
 private final class SaturatingStreamRunner: AgentProviderRunner, @unchecked Sendable {

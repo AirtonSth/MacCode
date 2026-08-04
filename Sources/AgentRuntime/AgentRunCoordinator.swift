@@ -2355,6 +2355,34 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         exitStatus: Int32? = nil,
         eventSequence: Int64? = nil
     ) -> AgentRunStatus {
+        let eventTime = Date()
+        return recordTerminalTransition(
+            runId: runId,
+            threadId: threadId,
+            requestedStatus: requestedStatus,
+            initiator: initiator,
+            providerPid: providerPid,
+            exitStatus: exitStatus,
+            eventSequence: eventSequence,
+            eventTime: eventTime,
+            commitTime: Date(),
+            presentTime: Date()
+        )
+    }
+
+    @discardableResult
+    private func recordTerminalTransition(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        requestedStatus: AgentRunStatus,
+        initiator: TerminalTransitionInitiator,
+        providerPid: Int32?,
+        exitStatus: Int32?,
+        eventSequence: Int64?,
+        eventTime: Date,
+        commitTime: Date,
+        presentTime: Date
+    ) -> AgentRunStatus {
         let reason = TerminalTransitionReason.classify(
             requestedStatus: requestedStatus,
             initiator: initiator
@@ -2376,7 +2404,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 presentation = reason.durableStatus
             }
         }
-        var record = TerminalTransitionRecord(
+        let record = TerminalTransitionRecord(
             runId: runId.value.uuidString,
             threadId: threadId.value.uuidString,
             reason: reason,
@@ -2385,9 +2413,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             providerPid: providerPid,
             exitStatus: exitStatus,
             eventSequence: eventSequence,
-            bootId: TerminalTransitionLedger.currentBootId()
+            bootId: TerminalTransitionLedger.currentBootId(),
+            eventTime: eventTime,
+            commitTime: commitTime,
+            presentTime: presentTime
         )
-        record.presentTime = Date()
         if let ledger = terminalTransitionLedger {
             _ = try? ledger.append(record)
         }
@@ -2464,12 +2494,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 errorMessage: nil
             )
             lock.unlock()
-            _ = recordTerminalTransition(
-                runId: runId,
-                threadId: threadId,
-                requestedStatus: .cancelled,
-                initiator: .userStop
-            )
             handle(
                 event: .finished(.cancelled, finalMessage: nil, providerThreadId: nil),
                 runId: runId,
@@ -4627,12 +4651,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             )
             let status = durable.status
             let initiator = durable.initiator
-            _ = recordTerminalTransition(
-                runId: runId,
-                threadId: threadId,
-                requestedStatus: requestedStatus,
-                initiator: initiator
-            )
             if status != pendingTerminal.status || durable.errorMessage != pendingTerminal.errorMessage {
                 pendingTerminal.status = status
                 if let msg = durable.errorMessage {
@@ -4671,6 +4689,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 scheduleTerminalDurabilityRetry(runId: runId, threadId: threadId)
                 return
             }
+            let terminalGraphCommitTime = Date()
             lock.lock()
             // Prefer the current value — this captures out-of-band usage (e.g.
             // Codex delivers usage as an independent notification that can arrive
@@ -4696,6 +4715,21 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             let completedTurnId = terminalPersistence.completedTurnId
             let assistantMessageId = terminalPersistence.assistantMessageId
             let resumeCursor = terminalPersistence.resumeCursor
+            // The record is only written after the terminal graph has committed and
+            // immediately before the first host presentation callback. The retained
+            // pending event supplies one stable event time across durability retries.
+            _ = recordTerminalTransition(
+                runId: runId,
+                threadId: threadId,
+                requestedStatus: requestedStatus,
+                initiator: initiator,
+                providerPid: nil,
+                exitStatus: nil,
+                eventSequence: nil,
+                eventTime: pendingTerminal.finishedAt,
+                commitTime: terminalGraphCommitTime,
+                presentTime: Date()
+            )
             if terminalPersistence.insertedAssistantMessage,
                let assistantMessage = pendingTerminal.assistantMessage {
                 onMessageAppended?(assistantMessage)
