@@ -25,6 +25,17 @@ final class TerminalTransitionLedgerTests: XCTestCase {
         XCTAssertFalse(reason.mayRenderAsProviderCompleted)
     }
 
+    func test_classify_providerStartFailureIsFailedWithTruthfulMessage() {
+        let reason = TerminalTransitionReason.classify(
+            requestedStatus: .failed,
+            initiator: .providerStartFailure
+        )
+        XCTAssertEqual(reason, .providerStartFailure)
+        XCTAssertEqual(reason.durableStatus, .failed)
+        XCTAssertEqual(reason.durableErrorMessage, "Provider start did not complete durably.")
+        XCTAssertFalse(reason.mayRenderAsProviderCompleted)
+    }
+
     func test_classify_rpcTimeoutNotCompleted() {
         let reason = TerminalTransitionReason.classify(
             requestedStatus: .failed,

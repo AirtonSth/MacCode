@@ -474,7 +474,7 @@ final class StreamBatchAtomicPersistenceTests: XCTestCase {
         XCTAssertEqual(finishBox.statuses, [.completed])
     }
 
-    func test_startFailureGraphFailureAtEveryWriteRollsBackAndRetriesBeforePublication() async throws {
+    func test_startFailureGraphFailureAtEveryWriteRetriesBeforeOneLedgeredPresentation() async throws {
         let faultStages: [(name: String, operation: String, table: String, condition: String)] = [
             ("run", "UPDATE", "agent_runs", "NEW.status = 'failed'"),
             ("thread", "UPDATE", "agent_threads", "NEW.status = 'failed'"),
@@ -495,18 +495,29 @@ final class StreamBatchAtomicPersistenceTests: XCTestCase {
             let sessionRepo = ProviderSessionRuntimeRepository(db: db)
             let thread = AgentThread(title: "start failure graph", provider: .codex, model: "fake-model")
             try threadRepo.upsert(thread)
+            let ledger = TerminalTransitionLedger(
+                directory: root.appendingPathComponent("diagnostics")
+            )
             let runner = FailingStreamBatchStartRunner()
             let coordinator = AgentRunCoordinator(
                 runRepo: runRepo,
                 messageRepo: messageRepo,
                 threadRepo: threadRepo,
                 providerSessionRepo: sessionRepo,
-                providers: [.codex: runner]
+                providers: [.codex: runner],
+                terminalTransitionLedger: ledger
             )
             let finishBox = TerminalFinishBox()
             let eventBox = AssistantEventBox()
-            coordinator.onRunFinished = { _, _, status in finishBox.record(status) }
-            coordinator.onAssistantEvent = { event, _, _ in eventBox.record(event) }
+            let presentationBox = StartFailurePresentationBox()
+            coordinator.onRunFinished = { _, _, status in
+                presentationBox.record("finish", ledgerRecordCount: (try? ledger.allRecords().count) ?? -1)
+                finishBox.record(status)
+            }
+            coordinator.onAssistantEvent = { event, _, _ in
+                presentationBox.record("event", ledgerRecordCount: (try? ledger.allRecords().count) ?? -1)
+                eventBox.record(event)
+            }
             let runId = AgentRunID()
 
             try db.execute("""
@@ -531,7 +542,8 @@ final class StreamBatchAtomicPersistenceTests: XCTestCase {
             } catch {
                 // Expected provider rejection. The durable transition retries below.
             }
-            try await Task.sleep(nanoseconds: 150_000_000)
+            // The trigger remains active across three 100 ms retry slots.
+            try await Task.sleep(nanoseconds: 350_000_000)
 
             XCTAssertEqual(finishBox.count, 0,
                            "\(stage.name): failed start must not drain/fan out before commit")
@@ -542,6 +554,10 @@ final class StreamBatchAtomicPersistenceTests: XCTestCase {
             XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .pending)
             XCTAssertEqual(try sessionRepo.get(threadId: thread.id)?.status, .pending)
             XCTAssertEqual(try runRepo.countStreamEvents(threadId: thread.id), 0)
+            XCTAssertTrue(
+                try ledger.records(forRunId: runId.value.uuidString).isEmpty,
+                "\(stage.name): failed start retries must not append a ledger row before the graph commits"
+            )
             do {
                 _ = try await coordinator.startRun(AgentRunRequest(
                     threadId: thread.id,
@@ -566,10 +582,30 @@ final class StreamBatchAtomicPersistenceTests: XCTestCase {
             XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .failed)
             XCTAssertEqual(try sessionRepo.get(threadId: thread.id)?.status, .failed)
             XCTAssertEqual(try runRepo.countStreamEvents(threadId: thread.id), 1)
+            let records = try ledger.records(forRunId: runId.value.uuidString)
+            XCTAssertEqual(records.count, 1)
+            let record = try XCTUnwrap(records.first)
+            let commitTime = try XCTUnwrap(record.commitTime)
+            let presentTime = try XCTUnwrap(record.presentTime)
+            XCTAssertEqual(record.reason, .providerStartFailure)
+            XCTAssertEqual(record.initiator, .providerStartFailure)
+            XCTAssertEqual(record.requestedStatus, AgentRunStatus.failed.rawValue)
+            XCTAssertLessThanOrEqual(record.eventTime, commitTime)
+            XCTAssertLessThanOrEqual(commitTime, presentTime)
+            XCTAssertEqual(
+                presentationBox.observations,
+                [
+                    StartFailurePresentationBox.Observation(phase: "event", ledgerRecordCount: 1),
+                    StartFailurePresentationBox.Observation(phase: "finish", ledgerRecordCount: 1)
+                ],
+                "\(stage.name): the committed ledger row must exist before each first presentation callback"
+            )
             try await Task.sleep(nanoseconds: 250_000_000)
             XCTAssertEqual(finishBox.count, 1,
                            "\(stage.name): a committed start failure must not fan out twice")
             XCTAssertEqual(eventBox.errorCount, 1)
+            XCTAssertEqual(try ledger.records(forRunId: runId.value.uuidString).count, 1,
+                           "\(stage.name): later retry turns must not append a duplicate ledger row")
         }
     }
 
@@ -703,6 +739,22 @@ private final class AssistantEventBox: @unchecked Sendable {
         lock.withLock { values.filter { if case .error = $0 { return true }; return false }.count }
     }
     func record(_ event: AssistantEvent) { lock.withLock { values.append(event) } }
+}
+
+private final class StartFailurePresentationBox: @unchecked Sendable {
+    struct Observation: Equatable {
+        let phase: String
+        let ledgerRecordCount: Int
+    }
+
+    private let lock = NSLock()
+    private var values: [Observation] = []
+
+    var observations: [Observation] { lock.withLock { values } }
+
+    func record(_ phase: String, ledgerRecordCount: Int) {
+        lock.withLock { values.append(Observation(phase: phase, ledgerRecordCount: ledgerRecordCount)) }
+    }
 }
 
 private struct Fixture {

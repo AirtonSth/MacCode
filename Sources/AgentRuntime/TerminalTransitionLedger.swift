@@ -7,6 +7,7 @@ import CoreModel
 public enum TerminalTransitionReason: String, Sendable, Codable, Equatable, CaseIterable {
     case providerCompleted
     case providerFailed
+    case providerStartFailure
     case providerCancelled
     case userStop
     case processDeath
@@ -21,7 +22,7 @@ public enum TerminalTransitionReason: String, Sendable, Codable, Equatable, Case
         switch self {
         case .providerCompleted:
             return .completed
-        case .providerFailed, .lockSaturation, .rpcTimeout, .processDeath:
+        case .providerFailed, .providerStartFailure, .lockSaturation, .rpcTimeout, .processDeath:
             return .failed
         case .providerCancelled, .userStop:
             return .cancelled
@@ -39,6 +40,8 @@ public enum TerminalTransitionReason: String, Sendable, Codable, Equatable, Case
             return nil
         case .providerFailed:
             return "Provider reported failure."
+        case .providerStartFailure:
+            return "Provider start did not complete durably."
         case .processDeath:
             return "Provider process exited without an authoritative completion event."
         case .relaunchReconcile:
@@ -73,6 +76,8 @@ public enum TerminalTransitionReason: String, Sendable, Codable, Equatable, Case
             case .interrupted: return .processDeath
             default: return .unknown
             }
+        case .providerStartFailure:
+            return .providerStartFailure
         case .userStop:
             return .userStop
         case .processDeath:
@@ -93,6 +98,7 @@ public enum TerminalTransitionReason: String, Sendable, Codable, Equatable, Case
 
 public enum TerminalTransitionInitiator: String, Sendable, Codable, Equatable {
     case providerTerminal
+    case providerStartFailure
     case userStop
     case processDeath
     case relaunchReconcile

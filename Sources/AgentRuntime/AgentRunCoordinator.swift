@@ -5056,6 +5056,21 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 providerSession: providerSession,
                 streamEvent: pending.streamEvent
             )
+            // A provider-start failure is terminal only after its run/thread/session
+            // graph commits. Write the forensic row before any status or error callback;
+            // failed durability attempts return above and therefore cannot append rows.
+            _ = recordTerminalTransition(
+                runId: runId,
+                threadId: pending.request.threadId,
+                requestedStatus: .failed,
+                initiator: .providerStartFailure,
+                providerPid: nil,
+                exitStatus: nil,
+                eventSequence: nil,
+                eventTime: pending.finishedAt,
+                commitTime: Date(),
+                presentTime: Date()
+            )
             lock.lock()
             receiptUsageFinalizationInFlight.insert(runId)
             let usage = latestTokenUsage.removeValue(forKey: runId)
