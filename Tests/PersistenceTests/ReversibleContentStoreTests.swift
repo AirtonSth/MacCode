@@ -65,18 +65,21 @@ final class ReversibleContentStoreTests: XCTestCase {
         XCTAssertEqual(try store.retrieveText(marker), original)
     }
 
-    func test_pruneUnreferencedRespectsRefCountAndAge() throws {
+    func test_pruneUnreferencedRespectsProtectedHandlesAndAge() throws {
         let store = ReversibleContentStore(db: try makeDB())
         let t0 = Date(timeIntervalSince1970: 1_000_000)
         let stale = try store.store("stale unreferenced", at: t0)
         let pinned = try store.store("stale but referenced", at: t0)
-        try store.retain(pinned)
 
         let cutoff = Int64(t0.addingTimeInterval(60).timeIntervalSince1970 * 1000)
-        let removed = try store.pruneUnreferenced(olderThanMs: cutoff)
-        XCTAssertEqual(removed, 1, "only the unreferenced stale block is pruned")
+        // plan-final W3: protection is by durable handle set, not ref_count.
+        let removed = try store.pruneUnreferenced(
+            olderThanMs: cutoff,
+            protectedHandles: [pinned]
+        )
+        XCTAssertEqual(removed, 1, "only the unprotected stale block is pruned")
         XCTAssertNil(try store.retrieve(stale))
-        XCTAssertNotNil(try store.retrieve(pinned), "referenced block survives (P4 cross-thread retention)")
+        XCTAssertNotNil(try store.retrieve(pinned), "protected handle survives")
     }
 
     func test_migrationIsIdempotentAndAdditive() throws {

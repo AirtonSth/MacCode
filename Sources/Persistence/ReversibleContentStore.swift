@@ -122,26 +122,44 @@ public final class ReversibleContentStore: @unchecked Sendable {
         }
     }
 
-    /// Prune only unreferenced blocks last accessed before `cutoffMs`. Referenced
-    /// blocks (ref_count > 0) are never evicted — they outlive the union of the
-    /// threads holding them (P4). Returns the number of rows removed.
+    /// Prune only unreferenced blocks last accessed before `cutoffMs`.
+    ///
+    /// **Unsafe by default (plan-final W3):** `ref_count` is never incremented in
+    /// production (`retain` is test-only), so every row has ref_count=0 including
+    /// originals still referenced by `[[rc:…]]` markers. Callers must pass
+    /// `protectedHandles` from `durableReferencedHandles` (or equivalent). When
+    /// `protectedHandles` is nil, this method is a no-op and returns 0.
     @discardableResult
-    public func pruneUnreferenced(olderThanMs cutoffMs: Int64) throws -> Int {
-        try db.performSync { database in
-            let count = try database.prepare(
-                "SELECT COUNT(*) FROM rc_reversible_content WHERE ref_count <= 0 AND last_access_ms < ?;"
+    public func pruneUnreferenced(
+        olderThanMs cutoffMs: Int64,
+        protectedHandles: Set<String>? = nil
+    ) throws -> Int {
+        guard let protectedHandles else {
+            // Fail closed: never delete by ref_count alone.
+            return 0
+        }
+        return try db.performSync { database in
+            // Load candidates then filter in process so we never DELETE a protected handle.
+            let select = try database.prepare(
+                "SELECT handle FROM rc_reversible_content WHERE last_access_ms < ?;"
             )
-            defer { count.reset() }
-            try count.bind(1, cutoffMs)
-            let removed = (try count.step()) ? Int(count.columnInt64(0)) : 0
-
-            let del = try database.prepare(
-                "DELETE FROM rc_reversible_content WHERE ref_count <= 0 AND last_access_ms < ?;"
-            )
-            defer { del.reset() }
-            try del.bind(1, cutoffMs)
-            _ = try del.step()
-            return removed
+            defer { select.reset() }
+            try select.bind(1, cutoffMs)
+            var victims: [String] = []
+            while try select.step() {
+                guard let handle = select.columnText(0), !handle.isEmpty else { continue }
+                if !protectedHandles.contains(handle) {
+                    victims.append(handle)
+                }
+            }
+            guard !victims.isEmpty else { return 0 }
+            let del = try database.prepare("DELETE FROM rc_reversible_content WHERE handle = ?;")
+            for handle in victims {
+                del.reset()
+                try del.bind(1, handle)
+                _ = try del.step()
+            }
+            return victims.count
         }
     }
 
@@ -193,8 +211,21 @@ public struct CCRRetentionJob {
     ///   - cutoffMs: Rows last accessed before this ms timestamp are candidates.
     ///               Derive it with `olderThanMs(now:retentionDays:)`.
     /// - Returns: Number of rows removed.
+    /// Legacy entry — no-op fail-closed. Prefer `LocalStorageBudgetManager.cleanupExpired`.
     @discardableResult
     public static func runRetention(store: ReversibleContentStore, now: Date, cutoffMs: Int64) throws -> Int {
-        try store.pruneUnreferenced(olderThanMs: cutoffMs)
+        // plan-final W3: never prune by ref_count; require protected handle set.
+        try store.pruneUnreferenced(olderThanMs: cutoffMs, protectedHandles: nil)
+    }
+
+    /// Safe retention when the caller supplies marker-reachable handles.
+    @discardableResult
+    public static func runRetention(
+        store: ReversibleContentStore,
+        now: Date,
+        cutoffMs: Int64,
+        protectedHandles: Set<String>
+    ) throws -> Int {
+        try store.pruneUnreferenced(olderThanMs: cutoffMs, protectedHandles: protectedHandles)
     }
 }
