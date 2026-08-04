@@ -1,4 +1,5 @@
 import Darwin
+import AgentRuntime
 import DistillCore
 import Foundation
 
@@ -63,13 +64,14 @@ enum CommandWrapRunner {
 
         switch action {
         case .passthrough:
-            FileHandle.standardOutput.write(captured.stdout)
+            // POSIX write — FileHandle.write raises uncatchable ObjC on closed pipe.
+            _ = GuardedStdoutWrite.writeAll(captured.stdout)
             return (captured.exitCode, nil)
         case .compress:
             let query = CommandWrapPolicy.extractionQuery(forCommand: command)
             let (bytes, deferred) = await compressedOrRaw(captured.stdout, query: query, compress: compress)
             // Write stdout first; caller awaits deferred only after this returns.
-            FileHandle.standardOutput.write(bytes)
+            _ = GuardedStdoutWrite.writeAll(bytes)
             return (captured.exitCode, deferred)
         }
     }
@@ -180,13 +182,13 @@ enum CommandWrapRunner {
             let chunk = handle.readData(ofLength: readChunk)
             if chunk.isEmpty { break }
             if overflowed {
-                FileHandle.standardOutput.write(chunk)
+                _ = GuardedStdoutWrite.writeAll(chunk)
                 continue
             }
             buffer.append(chunk)
             if buffer.count > captureCapBytes {
                 overflowed = true
-                FileHandle.standardOutput.write(buffer)
+                _ = GuardedStdoutWrite.writeAll(buffer)
                 buffer.removeAll(keepingCapacity: false)
             }
         }

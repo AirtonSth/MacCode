@@ -588,11 +588,9 @@ public final class CodexAppServerClient: @unchecked Sendable {
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + requestTimeout) { [weak self] in
                 guard let self else { return }
                 let error = CodexAppServerError.requestTimedOut(method: method, timeout: self.requestTimeout)
-                if self.completePending(id: id, result: .failure(error)) {
-                    // A timed-out JSON-RPC connection has unknown protocol state.
-                    // Stop the peer so later calls cannot be written to a desynchronized session.
-                    self.stop()
-                }
+                // Fail only this request. Peer stop requires proven protocol desync
+                // (unknown id / out-of-order), not wall-clock alone (plan-final W1).
+                _ = self.completePending(id: id, result: .failure(error))
             }
         }
     }
