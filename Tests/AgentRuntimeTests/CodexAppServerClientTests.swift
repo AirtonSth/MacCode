@@ -94,7 +94,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                       "the provider-visible census proves no turn/start bytes were written")
     }
 
-    func test_rpcDeadlineFailsAndStopsSilentAppServer() async throws {
+    func test_rpcDeadlineFailsWithoutStoppingSilentAppServer() async throws {
         let script = try makeSilentAppServerPeer()
         let client = try CodexAppServerClient(
             binary: script,
@@ -116,12 +116,46 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             XCTAssertEqual(method, "test/neverRespond")
             XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1,
                               "all app-server RPCs must have a real bounded deadline")
-            XCTAssertTrue(waitForProcessDeath(pid),
-                          "a timed-out RPC must kill the desynchronized app-server peer")
+            XCTAssertTrue(isProcessAlive(pid),
+                          "a timed-out RPC must leave a peer available for later requests")
         }
     }
 
-    func test_everyProductionRPCUsesTheDeadlineAndKillsItsSilentPeer() async throws {
+    func test_timedOutRequestDiscardsLateResponseAndPreservesPeerForLaterRPC() async throws {
+        let script = try makeLateResponseAppServerPeer()
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path,
+            requestTimeout: 0.03
+        )
+        defer { client.stop() }
+        let pid = try silentPeerPID(for: script)
+        let startedAt = Date()
+
+        do {
+            let _: [String: Any] = try await client.requestJSONObject(method: "test/lateResponse")
+            XCTFail("the deliberately delayed RPC must still honor its deadline")
+        } catch let error as CodexAppServerError {
+            guard case .requestTimedOut(let method, _) = error else {
+                return XCTFail("expected requestTimedOut, got \(error)")
+            }
+            XCTAssertEqual(method, "test/lateResponse")
+            XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1,
+                              "the first RPC must retain its bounded deadline")
+        }
+
+        XCTAssertTrue(waitForFile(script + ".late"),
+                      "the fake peer must emit the first response after the local deadline")
+        XCTAssertTrue(isProcessAlive(pid),
+                      "a late response is not protocol desynchronization and must not kill the peer")
+
+        let followUp: [String: Any] = try await client.requestJSONObject(method: "test/afterLateResponse")
+        XCTAssertEqual(followUp["response"] as? String, "follow-up",
+                       "the late response id must be discarded instead of resolving the later RPC")
+    }
+
+    func test_everyProductionRPCUsesTheDeadlineAndKeepsItsSilentPeerRunning() async throws {
         let cwd = FileManager.default.temporaryDirectory.path
         let startRequest = AgentRunRequest(
             threadId: AgentThreadID(),
@@ -171,8 +205,8 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                 }
                 XCTAssertEqual(method, operation.method)
                 XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1)
-                XCTAssertTrue(waitForProcessDeath(pid),
-                              "\(operation.method) timeout must kill its app-server peer")
+                XCTAssertTrue(isProcessAlive(pid),
+                              "\(operation.method) timeout must leave its app-server peer available")
             }
             client.stop()
         }
@@ -296,7 +330,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             CodexAppServerClient.requiresFreshClientAfterThreadResumeFailure(
                 CodexAppServerError.requestTimedOut(method: "thread/resume", timeout: 30)
             ),
-            "the client deadline intentionally stops a silent resume peer, so only a new client may safely retry resume"
+            "a timed-out resume has uncertain thread-open state, so recovery retries it with a new client"
         )
         XCTAssertFalse(
             CodexAppServerClient.requiresFreshClientAfterThreadResumeFailure(
@@ -1199,6 +1233,31 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         return script.path
     }
 
+    private func makeLateResponseAppServerPeer() throws -> String {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remotecode-codex-app-server-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let script = dir.appendingPathComponent("late-response-codex-app-server.py")
+        let source = """
+        #!/usr/bin/env python3
+        import json, os, pathlib, sys, time
+
+        pathlib.Path(__file__ + '.pid').write_text(str(os.getpid()))
+
+        first = json.loads(sys.stdin.readline())
+        time.sleep(0.08)
+        print(json.dumps({"id": first["id"], "result": {"response": "late"}}), flush=True)
+        pathlib.Path(__file__ + '.late').write_text('sent')
+
+        for line in sys.stdin:
+            request = json.loads(line)
+            print(json.dumps({"id": request["id"], "result": {"response": "follow-up"}}), flush=True)
+        """
+        try source.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        return script.path
+    }
+
     private func silentPeerPID(for script: String) throws -> pid_t {
         let pidFile = script + ".pid"
         let deadline = Date().addingTimeInterval(1)
@@ -1214,13 +1273,17 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         ])
     }
 
-    private func waitForProcessDeath(_ pid: pid_t) -> Bool {
+    private func waitForFile(_ path: String) -> Bool {
         let deadline = Date().addingTimeInterval(1)
         while Date() < deadline {
-            if Darwin.kill(pid, 0) != 0, errno == ESRCH { return true }
+            if FileManager.default.fileExists(atPath: path) { return true }
             Thread.sleep(forTimeInterval: 0.005)
         }
-        return Darwin.kill(pid, 0) != 0 && errno == ESRCH
+        return FileManager.default.fileExists(atPath: path)
+    }
+
+    private func isProcessAlive(_ pid: pid_t) -> Bool {
+        Darwin.kill(pid, 0) == 0 || errno == EPERM
     }
 }
 

@@ -4407,12 +4407,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 // Lock saturation must not terminate a live turn (plan-final W1 T-path).
                 // Keep the run alive with a deferred-persistence issue; retry later.
                 emitPersistenceIssue("run.stream_event.retry_saturated", error: error, runId: runId, threadId: threadId)
-                _ = recordTerminalTransition(
-                    runId: runId,
-                    threadId: threadId,
-                    requestedStatus: .failed,
-                    initiator: .lockSaturation
-                )
                 return
             case .ownerConflict(let error):
                 emitPersistenceIssue("run.stream_event.owner", error: error, runId: runId, threadId: threadId)

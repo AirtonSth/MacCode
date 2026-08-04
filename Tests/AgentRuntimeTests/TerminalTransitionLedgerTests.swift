@@ -184,4 +184,106 @@ final class TerminalTransitionLedgerTests: XCTestCase {
         XCTAssertEqual(rows.count, 1)
         XCTAssertEqual(rows[0].reason, .relaunchReconcile)
     }
+
+    func test_lockSaturation_doesNotAppendTerminalLedgerUntilProviderTerminal() async throws {
+        // WHY: a saturated stream retry is recoverable persistence telemetry, not a
+        // provider terminal. Recording it as .failed made recovery diagnostics lie
+        // about a still-running turn before the provider actually finished.
+        let tmp = NSTemporaryDirectory() + "rc2-lock-saturation-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "lock saturation", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let ledger = TerminalTransitionLedger(
+            directory: URL(fileURLWithPath: tmp).appendingPathComponent("diagnostics")
+        )
+        let runner = SaturatingStreamRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providers: [.codex: runner],
+            terminalTransitionLedger: ledger
+        )
+        let runId = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "exercise saturated stream retry"
+        ))
+        let finished = expectation(description: "provider terminal commits")
+        coordinator.onRunFinished = { _, finishedRunId, status in
+            if finishedRunId == runId, status == .completed {
+                finished.fulfill()
+            }
+        }
+
+        try db.execute("""
+            CREATE TRIGGER fail_saturated_stream_flush
+            BEFORE INSERT ON agent_stream_events
+            BEGIN
+                SELECT RAISE(ABORT, 'forced saturated stream flush');
+            END;
+            """)
+        runner.emitItemStarts(count: 16)
+        runner.emitItemStarts(count: 1)
+
+        XCTAssertTrue(
+            try ledger.allRecords().isEmpty,
+            "retry saturation must remain nonterminal telemetry until a provider terminal event arrives"
+        )
+        XCTAssertEqual(try runRepo.get(id: runId)?.status, .running)
+        XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .running)
+
+        try db.execute("DROP TRIGGER fail_saturated_stream_flush;")
+        runner.finishCompleted()
+        await fulfillment(of: [finished], timeout: 2)
+
+        let records = try ledger.allRecords()
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(records[0].reason, .providerCompleted)
+        XCTAssertEqual(try runRepo.get(id: runId)?.status, .completed)
+        XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .completed)
+    }
+}
+
+private final class SaturatingStreamRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .codex
+    private let lock = NSLock()
+    private var callback: (@Sendable (AgentRunEvent) -> Void)?
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        lock.withLock { callback = onEvent }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+
+    func emitItemStarts(count: Int) {
+        let callback = lock.withLock { self.callback }
+        for index in 1...count {
+            callback?(.event(.itemStarted(item: AssistantItem(
+                id: "item-\(index)",
+                turnId: "turn-1",
+                type: .assistantMessage,
+                state: .streaming,
+                body: "",
+                startedAtMs: Int64(index)
+            ))))
+        }
+    }
+
+    func finishCompleted() {
+        lock.withLock { self.callback }?(.finished(
+            .completed,
+            finalMessage: "done",
+            providerThreadId: "provider-thread"
+        ))
+    }
 }
