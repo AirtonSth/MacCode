@@ -99,6 +99,7 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
 
     override func selectWorkspace(_ id: WorkspaceID) throws {
         synchronousBatchEffectCallCount += 1
+        window.selectedWorkspaceID = id
     }
 
     override func closeWorkspace(_ id: WorkspaceID, publishEvent: Bool = true) throws {
@@ -1603,6 +1604,10 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         for (index, testCase) in cases.enumerated() {
             let expectedKinds = Set(testCase.eventKinds)
             let router = Phase4ReceiptFakeRouter()
+            if testCase.method == "workspace.select",
+               let uuid = UUID(uuidString: workspaceID) {
+                seedPhase4Workspace(router: router, id: WorkspaceID(uuid))
+            }
             let live = try await Phase4LiveServer.start(router: router, bootEpoch: UInt64(900 + index))
             let recorder = Phase4EventRecorder()
             let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
@@ -1633,6 +1638,10 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
             }
 
             let faultRouter = Phase4ReceiptFakeRouter()
+            if testCase.method == "workspace.select",
+               let uuid = UUID(uuidString: workspaceID) {
+                seedPhase4Workspace(router: faultRouter, id: WorkspaceID(uuid))
+            }
             faultRouter.finalizationPersistenceUnavailable = true
             let faultLive = try await Phase4LiveServer.start(
                 router: faultRouter,
@@ -1666,6 +1675,155 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
                 XCTAssertTrue(faultRecorder.events.isEmpty, testCase.method)
             }
         }
+    }
+
+    /// WHY: a syntactically valid UUID that is absent on the host used to claim
+    /// a durable receipt, fail before mutation, then permanent -32095. Preflight
+    /// must reject with a domain error and leave receipt status absent.
+    func test_workspaceSelectAbsentIdIsDomainRejectionWithoutUnknownReceipt() async throws {
+        let router = Phase4ReceiptFakeRouter()
+        let existing = WorkspaceID()
+        seedPhase4Workspace(router: router, id: existing)
+        router.window.selectedWorkspaceID = existing
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 2_010)
+        defer { live.stop() }
+        let recorder = Phase4EventRecorder()
+        let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            if event.kind == "workspace.selected" { recorder.append(event) }
+        }
+        defer { EventBus.shared.unsubscribe(subscription) }
+
+        let absentID = UUID().uuidString
+        var params = live.mutationParams(
+            requestId: "select-absent",
+            threadId: AgentThreadID(),
+            text: "unused"
+        )
+        params.removeValue(forKey: "thread_id")
+        params.removeValue(forKey: "text")
+        params["id"] = absentID
+
+        let first = try await live.rpc(method: "workspace.select", params: params)
+        let retry = try await live.rpc(method: "workspace.select", params: params)
+        let status = try await live.rpc(method: "command.receipt.status", params: statusParams(
+            live: live,
+            method: "workspace.select",
+            requestId: "select-absent"
+        ))
+
+        XCTAssertNotEqual(errorCode(first), commandOutcomeUnknown)
+        XCTAssertNotEqual(errorCode(retry), commandOutcomeUnknown)
+        XCTAssertNotNil(first["error"])
+        XCTAssertNotNil(retry["error"])
+        XCTAssertEqual(errorCode(first), errorCode(retry))
+        XCTAssertEqual(router.phase4ClaimCallCount, 0)
+        XCTAssertEqual(router.synchronousBatchEffectCallCount, 0)
+        XCTAssertEqual(router.finalizationCallCount, 0)
+        XCTAssertEqual(router.window.selectedWorkspaceID, existing)
+        XCTAssertTrue(recorder.events.isEmpty)
+        try assertStatusResult(
+            status,
+            status: "absent",
+            method: "workspace.select",
+            requestId: "select-absent"
+        )
+        XCTAssertNotEqual(statusResultStatus(status), "unknown")
+    }
+
+    /// WHY: successful select must claim once, finalize once, publish exactly one
+    /// event, and replay without a second effect when the response is lost.
+    func test_workspaceSelectExistingIdSucceedsExactlyOnceWithReplaySafety() async throws {
+        let router = Phase4ReceiptFakeRouter()
+        let target = WorkspaceID()
+        let other = WorkspaceID()
+        seedPhase4Workspace(router: router, id: other)
+        seedPhase4Workspace(router: router, id: target)
+        router.window.selectedWorkspaceID = other
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 2_011)
+        defer { live.stop() }
+        let recorder = Phase4EventRecorder()
+        let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            if event.kind == "workspace.selected" { recorder.append(event) }
+        }
+        defer { EventBus.shared.unsubscribe(subscription) }
+
+        var params = live.mutationParams(
+            requestId: "select-success",
+            threadId: AgentThreadID(),
+            text: "unused"
+        )
+        params.removeValue(forKey: "thread_id")
+        params.removeValue(forKey: "text")
+        params["id"] = target.value.uuidString
+
+        let first = try await live.rpc(method: "workspace.select", params: params)
+        let retry = try await live.rpc(method: "workspace.select", params: params)
+        let status = try await live.rpc(method: "command.receipt.status", params: statusParams(
+            live: live,
+            method: "workspace.select",
+            requestId: "select-success"
+        ))
+
+        XCTAssertNil(first["error"])
+        XCTAssertNil(retry["error"])
+        XCTAssertEqual(first["result"] as? Bool, true)
+        XCTAssertEqual(retry["result"] as? Bool, true)
+        XCTAssertEqual(router.phase4ClaimCallCount, 2)
+        XCTAssertEqual(router.synchronousBatchEffectCallCount, 1)
+        XCTAssertEqual(router.finalizationCallCount, 1)
+        XCTAssertEqual(router.window.selectedWorkspaceID, target)
+        XCTAssertEqual(recorder.events.map(\.kind), ["workspace.selected"])
+        try assertStatusResult(
+            status,
+            status: "committed",
+            method: "workspace.select",
+            requestId: "select-success"
+        )
+    }
+
+    /// WHY: true post-effect finalization uncertainty must stay commandOutcomeUnknown
+    /// with no mutation replay on retry.
+    func test_workspaceSelectFinalizationFailureRemainsUnknownWithoutReplay() async throws {
+        let router = Phase4ReceiptFakeRouter()
+        let target = WorkspaceID()
+        seedPhase4Workspace(router: router, id: target)
+        router.finalizationPersistenceUnavailable = true
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 2_012)
+        defer { live.stop() }
+        let recorder = Phase4EventRecorder()
+        let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            if event.kind == "workspace.selected" { recorder.append(event) }
+        }
+        defer { EventBus.shared.unsubscribe(subscription) }
+
+        var params = live.mutationParams(
+            requestId: "select-finalize-fault",
+            threadId: AgentThreadID(),
+            text: "unused"
+        )
+        params.removeValue(forKey: "thread_id")
+        params.removeValue(forKey: "text")
+        params["id"] = target.value.uuidString
+
+        let first = try await live.rpc(method: "workspace.select", params: params)
+        let retry = try await live.rpc(method: "workspace.select", params: params)
+        let status = try await live.rpc(method: "command.receipt.status", params: statusParams(
+            live: live,
+            method: "workspace.select",
+            requestId: "select-finalize-fault"
+        ))
+
+        XCTAssertEqual(errorCode(first), commandOutcomeUnknown)
+        XCTAssertEqual(errorCode(retry), commandOutcomeUnknown)
+        XCTAssertEqual(router.synchronousBatchEffectCallCount, 1)
+        XCTAssertEqual(router.finalizationCallCount, 0)
+        XCTAssertTrue(recorder.events.isEmpty)
+        try assertStatusResult(
+            status,
+            status: "unknown",
+            method: "workspace.select",
+            requestId: "select-finalize-fault"
+        )
     }
 
     func test_windowPaneSurfaceBatchHasOneEffectFinalizeExactEventsAndNoRetryReplay() async throws {
@@ -2286,6 +2444,23 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         XCTAssertEqual(turnIDs, ["turn-a", "turn-b"])
     }
 
+    private func seedPhase4Workspace(router: Phase4ReceiptFakeRouter, id: WorkspaceID) {
+        let pane = PaneNode(surfaces: [])
+        let workspace = Workspace(
+            id: id,
+            name: "phase4-workspace",
+            cwd: FileManager.default.currentDirectoryPath,
+            layout: .pane(pane),
+            focusedPaneID: pane.id
+        )
+        if !router.workspaces.contains(where: { $0.id == id }) {
+            router.workspaces.append(workspace)
+        }
+        if !router.window.workspaces.contains(id) {
+            router.window.workspaces.append(id)
+        }
+    }
+
     private func seedPhase4GitSurface(
         router: Phase4ReceiptFakeRouter,
         workspaceID: WorkspaceID
@@ -2527,14 +2702,36 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         file: StaticString = #filePath,
         line: UInt = #line
     ) throws {
+        try assertStatusResult(
+            response,
+            status: status,
+            method: "agent.message.send",
+            requestId: requestId,
+            file: file,
+            line: line
+        )
+    }
+
+    private func assertStatusResult(
+        _ response: [String: Any],
+        status: String,
+        method: String,
+        requestId: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
         let result = try XCTUnwrap(response["result"] as? [String: Any], file: file, line: line)
         XCTAssertEqual(Set(result.keys), [
             "status", "method", "clientRequestId", "retryable", "requiresSnapshot",
         ], file: file, line: line)
         XCTAssertEqual(result["status"] as? String, status, file: file, line: line)
-        XCTAssertEqual(result["method"] as? String, "agent.message.send", file: file, line: line)
+        XCTAssertEqual(result["method"] as? String, method, file: file, line: line)
         XCTAssertEqual(result["clientRequestId"] as? String, requestId, file: file, line: line)
         XCTAssertNotNil(result["retryable"] as? Bool, file: file, line: line)
         XCTAssertNotNil(result["requiresSnapshot"] as? Bool, file: file, line: line)
+    }
+
+    private func statusResultStatus(_ response: [String: Any]) -> String? {
+        (response["result"] as? [String: Any])?["status"] as? String
     }
 }

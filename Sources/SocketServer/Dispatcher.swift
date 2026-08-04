@@ -1159,6 +1159,20 @@ public final class JSONRPCDispatcher {
                 requiresSnapshot: true
             )
         }
+        // workspace.select: reject a syntactically valid but absent workspace
+        // before the durable claim so the failure is a stable domain error and
+        // never becomes permanent commandOutcomeUnknown. Skip when a prior
+        // receipt already exists so committed/unknown/in-progress replay paths
+        // remain unchanged.
+        if req.method == "workspace.select",
+           let domainRejection = workspaceSelectAbsenceRejectionBeforeClaim(
+            id: req.id,
+            businessParams: businessParams,
+            clientRequestId: clientRequestId,
+            ownerFingerprint: context.ownerFingerprint
+           ) {
+            return domainRejection
+        }
         guard let receiptRouter = router as? CommandReceiptStateRouting else {
             return receiptFailure(
                 id: req.id,
@@ -1383,6 +1397,47 @@ public final class JSONRPCDispatcher {
     private nonisolated static func elapsedMilliseconds(since start: UInt64) -> Double {
         let end = DispatchTime.now().uptimeNanoseconds
         return Double(end >= start ? end - start : 0) / 1_000_000
+    }
+
+    /// Read-only existence preflight for `workspace.select` only.
+    ///
+    /// Returns a domain rejection when the UUID is valid but absent from host
+    /// workspace state, and only when no durable receipt already exists for
+    /// this request identity. Does not claim, mutate selection, or record
+    /// unknown receipts.
+    private func workspaceSelectAbsenceRejectionBeforeClaim(
+        id: JSONRPCID?,
+        businessParams: [String: JSONValue],
+        clientRequestId: String,
+        ownerFingerprint: String
+    ) -> JSONRPCResponse? {
+        if let receiptRouter = router as? CommandReceiptStateRouting,
+           let status = try? receiptRouter.commandReceiptStatus(
+            method: "workspace.select",
+            clientRequestId: clientRequestId,
+            ownerFingerprint: ownerFingerprint
+           ),
+           status != .absent {
+            return nil
+        }
+        guard let wid = businessParams["id"]?.stringValue
+            .flatMap(UUID.init)
+            .map(WorkspaceID.init) else {
+            return .init(id: id, error: .invalidParams)
+        }
+        let exists: Bool
+        do {
+            exists = try router.listWorkspaces().contains { $0.id == wid }
+        } catch {
+            return .init(id: id, error: Self.mapDomainError(error, method: "workspace.select"))
+        }
+        guard exists else {
+            return .init(
+                id: id,
+                error: Self.mapDomainError(LayoutError.workspaceNotFound, method: "workspace.select")
+            )
+        }
+        return nil
     }
 
     private func commandReceiptStatus(
