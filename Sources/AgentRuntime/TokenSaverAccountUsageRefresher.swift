@@ -409,9 +409,8 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
     }
 
     private func fetchClaudeUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
-        if let usage = await runClaudeUsageScreen(request) {
-            return usage
-        }
+        // Prefer the Process path (waitUntilExit) first — it never leaves PTY zombies.
+        // Screen-capture PTY is fallback only when text /usage fails (plan-final W1).
         if let result = run(
             binary: request.claudeBinary,
             arguments: [
@@ -425,6 +424,9 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
             environment: request.environment
         ), result.status == 0,
            let usage = AssistantAccountUsageParser.claudeUsageText(result.stdout) {
+            return usage
+        }
+        if let usage = await runClaudeUsageScreen(request) {
             return usage
         }
         return nil
@@ -451,28 +453,32 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
         environment["LANG"] = environment["LANG"] ?? "C.UTF-8"
         environment["LC_ALL"] = environment["LC_ALL"] ?? "C.UTF-8"
         environment.removeValue(forKey: "NO_COLOR")
-        let environmentPairs = environment.map { ($0.key, $0.value) }
+        var argv: [UnsafeMutablePointer<CChar>?] = [strdup(path), nil]
+        var envp = environment.sorted { $0.key < $1.key }
+            .map { strdup("\($0.key)=\($0.value)") }
+        envp.append(nil)
+        defer {
+            argv.compactMap { $0 }.forEach { free($0) }
+            envp.compactMap { $0 }.forEach { free($0) }
+        }
 
         var masterFD: Int32 = -1
-        let pid = rc2_forkpty(&masterFD)
-        if pid < 0 { return nil }
-        if pid == 0 {
-            _ = chdir(request.cwd)
-            for (key, value) in environmentPairs {
-                key.withCString { keyPtr in
-                    value.withCString { valuePtr in
-                        _ = setenv(keyPtr, valuePtr, 1)
+        let pid = request.cwd.withCString { cwdPointer in
+            path.withCString { executablePointer in
+                argv.withUnsafeMutableBufferPointer { argvPointer in
+                    envp.withUnsafeMutableBufferPointer { envpPointer in
+                        rc2_spawnpty_exec(
+                            &masterFD,
+                            cwdPointer,
+                            executablePointer,
+                            argvPointer.baseAddress,
+                            envpPointer.baseAddress
+                        )
                     }
                 }
             }
-            path.withCString { executablePath in
-                let argv: [UnsafeMutablePointer<CChar>?] = [strdup(executablePath), nil]
-                argv.withUnsafeBufferPointer { pointer in
-                    _ = execv(executablePath, pointer.baseAddress)
-                }
-            }
-            _exit(127)
         }
+        guard pid > 0 else { return nil }
 
         defer { close(masterFD) }
         _ = rc2_set_winsize(masterFD, 40, 120)
@@ -553,25 +559,13 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
     }
 
     private func isChildRunning(_ pid: Int32) -> Bool {
-        var status: Int32 = 0
-        let result = waitpid(pid, &status, WNOHANG)
-        return result == 0
+        OwnedChildReaper.poll(pid: pid) == nil
     }
 
     private func terminatePTYChild(_ pid: Int32) {
-        if !isChildRunning(pid) { return }
-        Darwin.kill(pid, SIGTERM)
-        let limit = Date().addingTimeInterval(0.8)
-        while Date() < limit {
-            if !isChildRunning(pid) { return }
-            Thread.sleep(forTimeInterval: 0.05)
-        }
-        Darwin.kill(pid, SIGKILL)
-        let killLimit = Date().addingTimeInterval(0.4)
-        while Date() < killLimit {
-            if !isChildRunning(pid) { return }
-            Thread.sleep(forTimeInterval: 0.05)
-        }
+        // Always terminate with a final waitpid so the child cannot remain <defunct>
+        // (plan-final W1: 0.4s WNOHANG-only window left permanent zombies).
+        _ = OwnedChildReaper.terminateAndReap(pid: pid)
     }
 
     private func terminateScriptProcess(_ proc: Process) {

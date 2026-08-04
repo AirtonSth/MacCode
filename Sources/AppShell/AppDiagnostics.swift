@@ -47,7 +47,9 @@ public struct ManagedProcessMemoryProfile: Sendable, Equatable {
             providerRootCap: nil,
             sidecarMaxConcurrentRequests: 4,
             sidecarMaxQueueDepth: 32,
-            idleReleaseAge: 6 * 60 * 60,
+            // Minutes-scale idle release (plan-final W2). 6h retained too many
+            // completed provider trees (~10 GiB). Resume-preserving release only.
+            idleReleaseAge: 30 * 60,
             warningFraction: 0.70,
             criticalFraction: 0.85,
             hostProcessCeilingKB: nil,

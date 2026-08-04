@@ -989,6 +989,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// Not fired when translation is a no-op (finalResponseTranslator absent or text unchanged).
     public var onSR1TranslatedMessageId: (@Sendable (AgentMessageID) -> Void)?
 
+    /// Optional durable terminal-transition ledger (write-before-UI). Forensic only.
+    public var terminalTransitionLedger: TerminalTransitionLedger?
+
     public init(
         runRepo: AgentRunRepository,
         messageRepo: AgentMessageRepository,
@@ -997,7 +1000,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         checkpointRepo: AgentTurnCheckpointRepository? = nil,
         orchestrationRuntime: AgentOrchestrationRuntime? = nil,
         providerSnapshotSupplier: (@Sendable () async throws -> [AgentProviderSnapshot])? = nil,
-        providers: [AgentProvider: AgentProviderRunner]
+        providers: [AgentProvider: AgentProviderRunner],
+        terminalTransitionLedger: TerminalTransitionLedger? = nil
     ) {
         self.runRepo = runRepo
         self.messageRepo = messageRepo
@@ -1007,6 +1011,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         self.orchestrationRuntime = orchestrationRuntime
         self.providerSnapshotSupplier = providerSnapshotSupplier
         self.providers = providers.mapValues { OneShotProviderAdapter(runner: $0) }
+        self.terminalTransitionLedger = terminalTransitionLedger
     }
 
     public convenience init(
@@ -1064,7 +1069,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// - Parameter preservingThreadIDs: threads owned by another process
     ///   (e.g. scheduled-task LaunchAgent) that must stay durable-running.
     public func reconcileOnLaunch(preservingThreadIDs: Set<AgentThreadID> = []) throws {
+        // Snapshot active runs before reconcile so we can stamp ledger rows.
+        let preLaunchActive = (try? runRepo.listActive()) ?? []
         _ = try runRepo.reconcileRunningOnLaunch(preservingThreadIDs: preservingThreadIDs)
+        for run in preLaunchActive {
+            if preservingThreadIDs.contains(run.threadId) { continue }
+            _ = recordTerminalTransition(
+                runId: run.id,
+                threadId: run.threadId,
+                requestedStatus: .interrupted,
+                initiator: .relaunchReconcile
+            )
+        }
         try orchestrationRuntime?.reconcileReceipts(
             statusForRun: { [runRepo] runId in
                 try runRepo.get(id: runId)?.status
@@ -2264,7 +2280,148 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.lock()
         providerTurnScopes.removeValue(forKey: threadId)
         lock.unlock()
-        try? providerSessionRepo?.markStopped(threadId: threadId)
+        // Preserve resume eligibility: default `.cancelled` removes Continue (plan-final W2).
+        // Completed is the honest session status when the turn already finished.
+        try? providerSessionRepo?.markStopped(threadId: threadId, status: .completed)
+    }
+
+    /// Classifies the local initiator for a terminal transition (plan-final T1–T3).
+    public static func terminalInitiator(
+        status: AgentRunStatus,
+        providerTerminalAcknowledged: Bool,
+        errorMessage: String? = nil
+    ) -> TerminalTransitionInitiator {
+        if status == .cancelled && !providerTerminalAcknowledged {
+            return .userStop
+        }
+        if status == .interrupted {
+            return .relaunchReconcile
+        }
+        let lower = (errorMessage ?? "").lowercased()
+        if lower.contains("timed out") || lower.contains("timeout") || lower.contains("requesttimedout") {
+            return .rpcTimeout
+        }
+        // completed without authoritative provider terminal is never provider_completed
+        if status == .completed && !providerTerminalAcknowledged {
+            return .processDeath
+        }
+        if status == .failed && !providerTerminalAcknowledged {
+            return .processDeath
+        }
+        return .providerTerminal
+    }
+
+    /// Pure: durable/UI status after TerminalTransitionPolicy (must match persist rows).
+    public static func durableTerminalStatus(
+        requested: AgentRunStatus,
+        providerTerminalAcknowledged: Bool,
+        errorMessage: String? = nil
+    ) -> (status: AgentRunStatus, initiator: TerminalTransitionInitiator, errorMessage: String?) {
+        let initiator = terminalInitiator(
+            status: requested,
+            providerTerminalAcknowledged: providerTerminalAcknowledged,
+            errorMessage: errorMessage
+        )
+        let reason = TerminalTransitionReason.classify(
+            requestedStatus: requested,
+            initiator: initiator
+        )
+        var status = TerminalTransitionPolicy.reconciledStatus(requested: requested, reason: reason)
+        if status == .completed {
+            let probe = TerminalTransitionRecord(
+                runId: "",
+                threadId: "",
+                reason: reason,
+                initiator: initiator,
+                requestedStatus: .completed
+            )
+            if !TerminalTransitionPolicy.allowsCompletedPresentation(probe) {
+                status = reason.durableStatus
+            }
+        }
+        let msg = errorMessage ?? (status == requested ? nil : reason.durableErrorMessage)
+        return (status, initiator, msg)
+    }
+
+    /// Write-before-UI terminal transition. Applies `TerminalTransitionPolicy` so
+    /// false `completed` cannot be presented. Returns the presentation status.
+    @discardableResult
+    public func recordTerminalTransition(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        requestedStatus: AgentRunStatus,
+        initiator: TerminalTransitionInitiator,
+        providerPid: Int32? = nil,
+        exitStatus: Int32? = nil,
+        eventSequence: Int64? = nil
+    ) -> AgentRunStatus {
+        let eventTime = Date()
+        return recordTerminalTransition(
+            runId: runId,
+            threadId: threadId,
+            requestedStatus: requestedStatus,
+            initiator: initiator,
+            providerPid: providerPid,
+            exitStatus: exitStatus,
+            eventSequence: eventSequence,
+            eventTime: eventTime,
+            commitTime: Date(),
+            presentTime: Date()
+        )
+    }
+
+    @discardableResult
+    private func recordTerminalTransition(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        requestedStatus: AgentRunStatus,
+        initiator: TerminalTransitionInitiator,
+        providerPid: Int32?,
+        exitStatus: Int32?,
+        eventSequence: Int64?,
+        eventTime: Date,
+        commitTime: Date,
+        presentTime: Date
+    ) -> AgentRunStatus {
+        let reason = TerminalTransitionReason.classify(
+            requestedStatus: requestedStatus,
+            initiator: initiator
+        )
+        var presentation = TerminalTransitionPolicy.reconciledStatus(
+            requested: requestedStatus,
+            reason: reason
+        )
+        // Hard gate: completed presentation requires provider-completed reason.
+        if presentation == .completed {
+            let probe = TerminalTransitionRecord(
+                runId: runId.value.uuidString,
+                threadId: threadId.value.uuidString,
+                reason: reason,
+                initiator: initiator,
+                requestedStatus: .completed
+            )
+            if !TerminalTransitionPolicy.allowsCompletedPresentation(probe) {
+                presentation = reason.durableStatus
+            }
+        }
+        let record = TerminalTransitionRecord(
+            runId: runId.value.uuidString,
+            threadId: threadId.value.uuidString,
+            reason: reason,
+            initiator: initiator,
+            requestedStatus: requestedStatus,
+            providerPid: providerPid,
+            exitStatus: exitStatus,
+            eventSequence: eventSequence,
+            bootId: TerminalTransitionLedger.currentBootId(),
+            eventTime: eventTime,
+            commitTime: commitTime,
+            presentTime: presentTime
+        )
+        if let ledger = terminalTransitionLedger {
+            _ = try? ledger.append(record)
+        }
+        return presentation
     }
 
     private func markStopRequested(threadId: AgentThreadID, runId: AgentRunID?) {
@@ -3239,8 +3396,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     public func stopAllProviderSessionsForAppTermination() {
         lock.lock()
+        // activeThreads: threadId -> runId
+        let livePairs = Array(activeThreads)
         let adapters = Array(providers.values)
         lock.unlock()
+        for (threadId, runId) in livePairs {
+            _ = recordTerminalTransition(
+                runId: runId,
+                threadId: threadId,
+                requestedStatus: .interrupted,
+                initiator: .appTermination
+            )
+        }
         adapters.forEach { $0.stopAllForAppTermination() }
     }
 
@@ -4261,15 +4428,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 if let deferred {
                     emitPersistenceIssue(deferred.operation, error: deferred.error, runId: deferred.runId, threadId: deferred.threadId)
                 }
+                // Lock saturation must not terminate a live turn (plan-final W1 T-path).
+                // Keep the run alive with a deferred-persistence issue; retry later.
                 emitPersistenceIssue("run.stream_event.retry_saturated", error: error, runId: runId, threadId: threadId)
-                stopRun(runId)
                 return
             case .ownerConflict(let error):
                 emitPersistenceIssue("run.stream_event.owner", error: error, runId: runId, threadId: threadId)
                 return
             case .activePlanBudget(let error):
+                // Budget overflow is a persistence degradation, not a user-visible cancel.
                 emitPersistenceIssue("provider_session.active_plan.budget", error: error, runId: runId, threadId: threadId)
-                stopRun(runId)
                 return
             case .resumeCursorFailure(let error):
                 emitPersistenceIssue("provider_session.resume_cursor.update", error: error, runId: runId, threadId: threadId)
@@ -4469,12 +4637,30 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lock.lock()
             let pendingTerminal = pendingTerminalEvents[runId]
             lock.unlock()
-            guard let pendingTerminal else {
+            guard var pendingTerminal else {
                 // Slot vanished (ownership released elsewhere); nothing to commit.
                 return
             }
-            // Use the resolved terminal (may reclassify empty "completed" → failed).
-            let status = pendingTerminal.status
+            // Policy BEFORE durable persist: run/thread/session rows must match
+            // presentation status (never durable completed while UI says interrupted).
+            let requestedStatus = pendingTerminal.status
+            let durable = Self.durableTerminalStatus(
+                requested: requestedStatus,
+                providerTerminalAcknowledged: pendingTerminal.providerTerminalAcknowledged,
+                errorMessage: pendingTerminal.errorMessage
+            )
+            let status = durable.status
+            let initiator = durable.initiator
+            if status != pendingTerminal.status || durable.errorMessage != pendingTerminal.errorMessage {
+                pendingTerminal.status = status
+                if let msg = durable.errorMessage {
+                    pendingTerminal.errorMessage = msg
+                }
+                // Keep retry map consistent if durability flushes later.
+                lock.lock()
+                pendingTerminalEvents[runId] = pendingTerminal
+                lock.unlock()
+            }
             // PERF-MAC_AGENT-007: drain any buffered stream writes before the run
             // tears down, so the tail of a fast stream is durably persisted (and
             // visible to latestStreamEvents/reload) once the run finishes.
@@ -4492,6 +4678,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
             let terminalPersistence: TerminalPersistenceContext
             do {
+                // pendingTerminal.status is already policy-reconciled.
                 terminalPersistence = try persistTerminalGraph(
                     pendingTerminal,
                     runId: runId,
@@ -4502,6 +4689,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 scheduleTerminalDurabilityRetry(runId: runId, threadId: threadId)
                 return
             }
+            let terminalGraphCommitTime = Date()
             lock.lock()
             // Prefer the current value — this captures out-of-band usage (e.g.
             // Codex delivers usage as an independent notification that can arrive
@@ -4527,6 +4715,21 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             let completedTurnId = terminalPersistence.completedTurnId
             let assistantMessageId = terminalPersistence.assistantMessageId
             let resumeCursor = terminalPersistence.resumeCursor
+            // The record is only written after the terminal graph has committed and
+            // immediately before the first host presentation callback. The retained
+            // pending event supplies one stable event time across durability retries.
+            _ = recordTerminalTransition(
+                runId: runId,
+                threadId: threadId,
+                requestedStatus: requestedStatus,
+                initiator: initiator,
+                providerPid: nil,
+                exitStatus: nil,
+                eventSequence: nil,
+                eventTime: pendingTerminal.finishedAt,
+                commitTime: terminalGraphCommitTime,
+                presentTime: Date()
+            )
             if terminalPersistence.insertedAssistantMessage,
                let assistantMessage = pendingTerminal.assistantMessage {
                 onMessageAppended?(assistantMessage)
@@ -4852,6 +5055,21 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 thread: terminalThread,
                 providerSession: providerSession,
                 streamEvent: pending.streamEvent
+            )
+            // A provider-start failure is terminal only after its run/thread/session
+            // graph commits. Write the forensic row before any status or error callback;
+            // failed durability attempts return above and therefore cannot append rows.
+            _ = recordTerminalTransition(
+                runId: runId,
+                threadId: pending.request.threadId,
+                requestedStatus: .failed,
+                initiator: .providerStartFailure,
+                providerPid: nil,
+                exitStatus: nil,
+                eventSequence: nil,
+                eventTime: pending.finishedAt,
+                commitTime: Date(),
+                presentTime: Date()
             )
             lock.lock()
             receiptUsageFinalizationInFlight.insert(runId)

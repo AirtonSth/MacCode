@@ -97,7 +97,10 @@ final class CCRRetentionJobTests: XCTestCase {
         try store.store(fresh, at: now)      // recent -> kept
 
         let cutoffMs = CCRRetentionJob.olderThanMs(now: now, retentionDays: 1)
-        try CCRRetentionJob.runRetention(store: store, now: now, cutoffMs: cutoffMs)
+        // Safe path requires protectedHandles (plan-final W3). Empty set = none protected.
+        try CCRRetentionJob.runRetention(
+            store: store, now: now, cutoffMs: cutoffMs, protectedHandles: []
+        )
 
         let remaining = try store.storeSizeBytes()
         let expectedRemaining = Int64(Data(fresh.utf8).count)
@@ -107,94 +110,104 @@ final class CCRRetentionJobTests: XCTestCase {
 
     // MARK: - runRetention
 
+    func test_runRetention_withoutProtectedHandles_isNoOp() throws {
+        // WHY: production must fail closed when no durable handle set is supplied.
+        let store = try makeStore()
+        let epoch = Date(timeIntervalSince1970: 1_000_000)
+        let staleDate = epoch.addingTimeInterval(-31 * 86_400)
+        try store.store("stale", at: staleDate)
+        let cutoffMs = CCRRetentionJob.olderThanMs(now: epoch, retentionDays: 30)
+        let removed = try CCRRetentionJob.runRetention(store: store, now: epoch, cutoffMs: cutoffMs)
+        XCTAssertEqual(removed, 0)
+        XCTAssertEqual(try store.count(), 1)
+    }
+
     func test_runRetention_prunesOldUnreferenced_keepsRecent() throws {
-        // WHY: the core contract — rows older than cutoff with ref_count<=0 are removed;
+        // WHY: rows older than cutoff and not in protectedHandles are removed;
         // rows newer than cutoff survive, maintaining a usable recovery window.
         let store = try makeStore()
         let epoch = Date(timeIntervalSince1970: 1_000_000)
 
-        // Stored 31 days ago (before cutoff)
         let staleDate = epoch.addingTimeInterval(-31 * 86_400)
         try store.store("stale block A", at: staleDate)
         try store.store("stale block B", at: staleDate)
 
-        // Stored 1 day ago (after cutoff)
         let recentDate = epoch.addingTimeInterval(-1 * 86_400)
         try store.store("fresh block C", at: recentDate)
 
         let cutoffMs = CCRRetentionJob.olderThanMs(now: epoch, retentionDays: 30)
-        let removed = try CCRRetentionJob.runRetention(store: store, now: epoch, cutoffMs: cutoffMs)
+        let removed = try CCRRetentionJob.runRetention(
+            store: store, now: epoch, cutoffMs: cutoffMs, protectedHandles: []
+        )
 
-        XCTAssertEqual(removed, 2, "two stale unreferenced blocks must be pruned")
+        XCTAssertEqual(removed, 2, "two stale unprotected blocks must be pruned")
         XCTAssertEqual(try store.count(), 1, "one recent block must remain after retention")
     }
 
-    func test_runRetention_neverPrunesReferencedRows_regardlessOfAge() throws {
-        // WHY: ref_count > 0 means a live transcript holds this block; evicting it
-        // would corrupt the transcript's recovery path. Age must not override ref_count.
+    func test_runRetention_neverPrunesProtectedRows_regardlessOfAge() throws {
+        // WHY: protectedHandles models marker-reachable originals; age must not override.
         let store = try makeStore()
-        let ancient = Date(timeIntervalSince1970: 0)  // year 1970 — far older than any cutoff
+        let ancient = Date(timeIntervalSince1970: 0)
         let now = Date(timeIntervalSince1970: 1_000_000)
 
         let handle = try store.store("ancient but live block", at: ancient)
-        try store.retain(handle)
 
         let cutoffMs = CCRRetentionJob.olderThanMs(now: now, retentionDays: 30)
-        let removed = try CCRRetentionJob.runRetention(store: store, now: now, cutoffMs: cutoffMs)
+        let removed = try CCRRetentionJob.runRetention(
+            store: store, now: now, cutoffMs: cutoffMs, protectedHandles: [handle]
+        )
 
-        XCTAssertEqual(removed, 0, "referenced blocks must never be pruned regardless of age")
-        XCTAssertNotNil(try store.retrieve(handle), "referenced block must still be recoverable after retention")
+        XCTAssertEqual(removed, 0, "protected blocks must never be pruned regardless of age")
+        XCTAssertNotNil(try store.retrieve(handle), "protected block must still be recoverable after retention")
     }
 
     func test_runRetention_emptyStoreIsNoop() throws {
-        // WHY: running retention on an empty store must not throw or return a negative
-        // count; the daily job must be safe to fire unconditionally.
         let store = try makeStore()
         let now = Date(timeIntervalSince1970: 1_000_000)
         let cutoffMs = CCRRetentionJob.olderThanMs(now: now, retentionDays: 30)
-        let removed = try CCRRetentionJob.runRetention(store: store, now: now, cutoffMs: cutoffMs)
+        let removed = try CCRRetentionJob.runRetention(
+            store: store, now: now, cutoffMs: cutoffMs, protectedHandles: []
+        )
         XCTAssertEqual(removed, 0, "retention on empty store must be a no-op (removed=0)")
     }
 
     func test_runRetention_allRecentIsNoop() throws {
-        // WHY: if every row is newer than the cutoff, nothing should be removed;
-        // a bug in the cutoff comparison could silently wipe recent data.
         let store = try makeStore()
         let now = Date(timeIntervalSince1970: 1_000_000)
-        let recentDate = now.addingTimeInterval(-1 * 86_400) // 1 day ago, within 30-day window
+        let recentDate = now.addingTimeInterval(-1 * 86_400)
 
         try store.store("block 1", at: recentDate)
         try store.store("block 2", at: recentDate)
 
         let cutoffMs = CCRRetentionJob.olderThanMs(now: now, retentionDays: 30)
-        let removed = try CCRRetentionJob.runRetention(store: store, now: now, cutoffMs: cutoffMs)
+        let removed = try CCRRetentionJob.runRetention(
+            store: store, now: now, cutoffMs: cutoffMs, protectedHandles: []
+        )
 
-        XCTAssertEqual(removed, 0, "recent unreferenced blocks must not be pruned before the cutoff")
+        XCTAssertEqual(removed, 0, "recent blocks must not be pruned before the cutoff")
         XCTAssertEqual(try store.count(), 2, "all rows must survive when all are within the retention window")
     }
 
-    func test_runRetention_mixedReferencedAndStale() throws {
-        // WHY: validates the intersection of two independent criteria (age AND ref_count).
-        // Stale+unreferenced -> pruned. Stale+referenced -> kept. Recent+unreferenced -> kept.
-        // A bug that ignores either dimension silently deletes the wrong rows.
+    func test_runRetention_mixedProtectedAndStale() throws {
+        // Stale+unprotected -> pruned. Stale+protected -> kept. Recent -> kept.
         let store = try makeStore()
         let now = Date(timeIntervalSince1970: 2_000_000)
-        let staleDate = now.addingTimeInterval(-60 * 86_400) // 60 days ago
-        let recentDate = now.addingTimeInterval(-1 * 86_400) // 1 day ago
+        let staleDate = now.addingTimeInterval(-60 * 86_400)
+        let recentDate = now.addingTimeInterval(-1 * 86_400)
 
         let staleUnref  = try store.store("stale unreferenced",  at: staleDate)
         let staleRef    = try store.store("stale but referenced", at: staleDate)
         let recentUnref = try store.store("recent unreferenced", at: recentDate)
 
-        try store.retain(staleRef)
-
         let cutoffMs = CCRRetentionJob.olderThanMs(now: now, retentionDays: 30)
-        let removed = try CCRRetentionJob.runRetention(store: store, now: now, cutoffMs: cutoffMs)
+        let removed = try CCRRetentionJob.runRetention(
+            store: store, now: now, cutoffMs: cutoffMs, protectedHandles: [staleRef]
+        )
 
-        XCTAssertEqual(removed, 1, "only stale+unreferenced must be pruned")
-        XCTAssertNil(try store.retrieve(staleUnref),   "stale unreferenced block must be gone")
-        XCTAssertNotNil(try store.retrieve(staleRef),  "stale referenced block must survive")
-        XCTAssertNotNil(try store.retrieve(recentUnref), "recent unreferenced block must survive")
+        XCTAssertEqual(removed, 1, "only stale+unprotected must be pruned")
+        XCTAssertNil(try store.retrieve(staleUnref),   "stale unprotected block must be gone")
+        XCTAssertNotNil(try store.retrieve(staleRef),  "stale protected block must survive")
+        XCTAssertNotNil(try store.retrieve(recentUnref), "recent block must survive")
     }
 
     // MARK: - Wiring contract: retention actually bounds the store
@@ -225,10 +238,12 @@ final class CCRRetentionJobTests: XCTestCase {
         XCTAssertEqual(try store.count(), 7, "precondition: 7 rows before retention")
 
         let cutoffMs = CCRRetentionJob.olderThanMs(now: now, retentionDays: 30)
-        let removed = try CCRRetentionJob.runRetention(store: store, now: now, cutoffMs: cutoffMs)
+        let removed = try CCRRetentionJob.runRetention(
+            store: store, now: now, cutoffMs: cutoffMs, protectedHandles: []
+        )
 
         XCTAssertEqual(removed, 5,
-            "all 5 stale unreferenced rows must be pruned -- store is bounded after retention runs")
+            "all 5 stale unprotected rows must be pruned -- store is bounded after retention runs")
         XCTAssertEqual(try store.count(), 2,
             "only the 2 recent rows must remain -- unbounded growth is prevented")
         for h in staleHandles {

@@ -588,11 +588,10 @@ public final class CodexAppServerClient: @unchecked Sendable {
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + requestTimeout) { [weak self] in
                 guard let self else { return }
                 let error = CodexAppServerError.requestTimedOut(method: method, timeout: self.requestTimeout)
-                if self.completePending(id: id, result: .failure(error)) {
-                    // A timed-out JSON-RPC connection has unknown protocol state.
-                    // Stop the peer so later calls cannot be written to a desynchronized session.
-                    self.stop()
-                }
+                // Fail only this request. A late response for this now-unreserved id
+                // is harmless; a wall-clock deadline alone is not a reason to stop
+                // a peer that may still serve later RPCs.
+                _ = self.completePending(id: id, result: .failure(error))
             }
         }
     }
@@ -769,10 +768,10 @@ public final class CodexAppServerClient: @unchecked Sendable {
         ].contains { message.contains($0) }
     }
 
-    /// A timed-out request stops this client because its JSON-RPC stream may be
-    /// desynchronized. The adapter recovers a timed-out `thread/resume` by
-    /// creating a new client and retrying resume (bounded), then falling back
-    /// to `thread/start` only after those retries are exhausted.
+    /// A timed-out `thread/resume` leaves that thread-open attempt uncertain.
+    /// The adapter recovers it with a new client and a bounded retry, then falls
+    /// back to `thread/start` only after those retries are exhausted. This
+    /// higher-level recovery does not stop the still-live request peer.
     public static func requiresFreshClientAfterThreadResumeFailure(_ error: Error) -> Bool {
         guard let appServerError = error as? CodexAppServerError,
               case .requestTimedOut(let method, _) = appServerError else {

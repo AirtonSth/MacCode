@@ -107,6 +107,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private var diagnosticsHeartbeatTimer: Timer?
     private var tokenSaverAccountUsageRefreshTimer: Timer?
     private var lifecycleRecorder: AppLifecycleRecorder?
+    /// Forensic-only hang detector (plan-final W0). Never mutates run status.
+    private var hangWatchdog: HangWatchdog?
+    /// Sleep-aware awake state for HangWatchdog (updated from NSWorkspace sleep/wake).
+    private let hangWatchdogAwakeState = HangWatchdogAwakeBox(initial: .unknown)
     /// Distributed-notification observer: schedule store commits → rail reload.
     private var scheduledTaskStoreObserver: NSObjectProtocol?
     private var scheduledTaskScheduler: ScheduledTaskScheduler?
@@ -674,6 +678,36 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         recorder.installSignalHandlers()
         recorder.installExitHandler()
         lifecycleRecorder = recorder
+        startHangWatchdog(recorder: recorder)
+    }
+
+    private func startHangWatchdog(recorder: AppLifecycleRecorder) {
+        hangWatchdog?.stop()
+        hangWatchdogAwakeState.value = .awake
+        let bootId = HostBootIdentity.currentBootId()
+        let awakeBox = hangWatchdogAwakeState
+        let watchdog = HangWatchdog(
+            pingInterval: 1.0,
+            hangThreshold: 2.0,
+            awakeProvider: { awakeBox.value },
+            sideContextProvider: { [weak self] in
+                HangWatchdogSideContext(
+                    providerProcessCount: self?.context?.coordinator.activeThreadIdsSnapshot().count ?? 0,
+                    recoveryInFlight: false,
+                    bootId: bootId,
+                    // Spindump capture is residual; do not claim samples were taken.
+                    sampleCountRequested: 0
+                )
+            },
+            onBreach: { [weak recorder] breach in
+                // Forensic only — never flip run/thread status.
+                recorder?.record(
+                    "\(breach.sideContext.lifecycleLine) gapSec=\(Int(breach.gapSeconds)) kind=\(breach.kind.rawValue) awake=\(breach.awake.rawValue)"
+                )
+            }
+        )
+        hangWatchdog = watchdog
+        watchdog.start()
     }
 
     /// F9-adjacent: orphan reaping used Thread.sleep grace windows on MainActor
@@ -805,23 +839,24 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
     }
 
-    /// Run CCR retention off the main thread. Dispatched to backgroundWriterQueue so
-    /// the SQLite DELETE never blocks the main actor. Cadence: once on launch +
-    /// every 24 hours via ccrRetentionTimer. No-op when context is nil (before init).
+    /// Safe storage cleanup off the main thread (plan-final W3).
+    /// Uses LocalStorageBudgetManager.cleanupExpired (marker-reachable handles),
+    /// never prune-by-ref_count. Cadence: launch + every 24h via ccrRetentionTimer.
     private func runCCRRetention() {
         guard let ctx = context else { return }
-        let store = ReversibleContentStore(db: ctx.db)
+        let db = ctx.db
         let queue = ctx.backgroundWriterQueue
         queue.async {
-            let now = Date()
-            let cutoffMs = CCRRetentionJob.olderThanMs(now: now)
             do {
-                let removed = try CCRRetentionJob.runRetention(store: store, now: now, cutoffMs: cutoffMs)
-                if removed > 0 {
-                    NSLog("CCR retention pruned \(removed) stale reversible-content row(s).")
+                let manager = LocalStorageBudgetManager(db: db)
+                // compact: false on periodic path — vacuum only when idle + headroom.
+                let result = try manager.cleanupExpired(compact: false)
+                let total = result.removedRows.values.reduce(0, +)
+                if total > 0 {
+                    NSLog("Local storage cleanup removed \(total) expired row(s) (handle-safe).")
                 }
             } catch {
-                NSLog("CCR retention failed: \(error)")
+                NSLog("Local storage cleanup failed: \(error)")
             }
         }
     }
@@ -839,10 +874,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     @objc private func workspaceWillSleep() {
+        hangWatchdogAwakeState.value = .displaySleep
+        lifecycleRecorder?.record("hang_watchdog_awake state=displaySleep")
         directAccessSupervisor?.suspend()
     }
 
     @objc private func workspaceDidWake() {
+        hangWatchdogAwakeState.value = .awake
+        lifecycleRecorder?.record("hang_watchdog_awake state=awake")
         guard let context else { return }
         let remoteEnabled = ((try? context.settingsRepo.get("remote_access_enabled")) ?? "0") == "1"
         do {

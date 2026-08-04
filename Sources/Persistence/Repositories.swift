@@ -2690,11 +2690,45 @@ public final class AgentRunRepository: @unchecked Sendable {
         )
     }
 
+    /// All pending/running runs (for launch reconcile ledger stamping).
+    public func listActive() throws -> [AgentRun] {
+        let st = try db.prepare("""
+            SELECT id, thread_id, provider, provider_instance_id, model, status, started_at, finished_at, error_message
+            FROM agent_runs
+            WHERE status IN ('pending', 'running')
+            ORDER BY started_at DESC;
+            """)
+        var rows: [AgentRun] = []
+        while try st.step() {
+            rows.append(AgentRun(
+                id: AgentRunID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID()),
+                threadId: AgentThreadID(UUID(uuidString: st.columnText(1) ?? "") ?? UUID()),
+                provider: AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex,
+                providerInstanceId: st.columnText(3) ?? (AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex).rawValue,
+                model: st.columnText(4) ?? "",
+                status: AgentRunStatus(rawValue: st.columnText(5) ?? "") ?? .pending,
+                startedAt: parseDate(st.columnText(6)),
+                finishedAt: st.columnText(7).map(parseDate),
+                errorMessage: st.columnText(8)
+            ))
+        }
+        return rows
+    }
+
     public func reconcileRunningOnLaunch(preservingThreadIDs: Set<AgentThreadID> = []) throws -> Int {
         let countBefore = try countRunning()
+        // Always stamp a durable reason so relaunch is never an unexplained terminal
+        // (plan-final W1: process_death/relaunch_reconcile ≠ provider_completed).
+        let reason = "Interrupted by app restart."
         if preservingThreadIDs.isEmpty {
-            let st = try db.prepare("UPDATE agent_runs SET status='interrupted', finished_at=? WHERE status='running';")
+            let st = try db.prepare("""
+                UPDATE agent_runs
+                SET status='interrupted', finished_at=?,
+                    error_message=COALESCE(error_message, ?)
+                WHERE status IN ('pending', 'running');
+                """)
             try st.bind(1, iso.string(from: Date()))
+            try st.bind(2, reason)
             _ = try st.step()
             return countBefore
         }
@@ -2702,12 +2736,15 @@ public final class AgentRunRepository: @unchecked Sendable {
         // false-interrupt a still-live provider session in the other process.
         let placeholders = preservingThreadIDs.map { _ in "?" }.joined(separator: ",")
         let st = try db.prepare("""
-            UPDATE agent_runs SET status='interrupted', finished_at=?
-            WHERE status='running' AND thread_id NOT IN (\(placeholders));
+            UPDATE agent_runs
+            SET status='interrupted', finished_at=?,
+                error_message=COALESCE(error_message, ?)
+            WHERE status IN ('pending', 'running') AND thread_id NOT IN (\(placeholders));
             """)
         try st.bind(1, iso.string(from: Date()))
+        try st.bind(2, reason)
         for (offset, threadID) in preservingThreadIDs.enumerated() {
-            try st.bind(Int32(offset + 2), threadID.value.uuidString)
+            try st.bind(Int32(offset + 3), threadID.value.uuidString)
         }
         _ = try st.step()
         return countBefore
