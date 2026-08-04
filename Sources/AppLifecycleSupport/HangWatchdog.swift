@@ -107,6 +107,17 @@ public struct HangWatchdogBreach: Sendable, Equatable {
     }
 }
 
+/// Thread-safe box for awake state (shared between NSWorkspace observers and watchdog).
+public final class HangWatchdogAwakeBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value: HangWatchdogAwakeState
+    public init(initial: HangWatchdogAwakeState) { _value = initial }
+    public var value: HangWatchdogAwakeState {
+        get { lock.lock(); defer { lock.unlock() }; return _value }
+        set { lock.lock(); _value = newValue; lock.unlock() }
+    }
+}
+
 /// Off-main hang watchdog. Forensic only — callbacks must not flip run status.
 public final class HangWatchdog: @unchecked Sendable {
     public typealias MainPinger = (@escaping @Sendable () -> Void) -> Void
@@ -124,6 +135,7 @@ public final class HangWatchdog: @unchecked Sendable {
 
     private var timer: DispatchSourceTimer?
     private var lastAck = Date()
+    private var lastAckUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
     private var lastBreachAt: Date?
     private let breachCooldown: TimeInterval
     private var started = false
@@ -174,9 +186,14 @@ public final class HangWatchdog: @unchecked Sendable {
     }
 
     /// Test seam: force a tick evaluation with a synthetic last-ack age.
-    public func evaluateForTests(now: Date, lastAck: Date) -> HangWatchdogBreach? {
+    public func evaluateForTests(
+        now: Date,
+        lastAck: Date,
+        wallGap: TimeInterval? = nil,
+        uptimeGap: TimeInterval? = nil
+    ) -> HangWatchdogBreach? {
         self.lastAck = lastAck
-        return evaluate(now: now)
+        return evaluate(now: now, wallGapOverride: wallGap, uptimeGapOverride: uptimeGap)
     }
 
     private func tick() {
@@ -189,25 +206,38 @@ public final class HangWatchdog: @unchecked Sendable {
             guard let self else { return }
             self.queue.async {
                 self.lastAck = Date()
+                self.lastAckUptime = ProcessInfo.processInfo.systemUptime
             }
         }
     }
 
-    private func evaluate(now: Date) -> HangWatchdogBreach? {
-        let gap = now.timeIntervalSince(lastAck)
-        let awake = awakeProvider()
+    private func evaluate(
+        now: Date,
+        wallGapOverride: TimeInterval? = nil,
+        uptimeGapOverride: TimeInterval? = nil
+    ) -> HangWatchdogBreach? {
+        let wallGap = wallGapOverride ?? now.timeIntervalSince(lastAck)
+        let uptimeGap = uptimeGapOverride ?? max(0, ProcessInfo.processInfo.systemUptime - lastAckUptime)
+        // Wall clock advances during sleep; uptime does not. Large wall≫uptime ⇒ sleep.
+        var awake = awakeProvider()
+        if wallGap >= hangThreshold, wallGap > uptimeGap + max(1.0, hangThreshold) {
+            awake = .displaySleep
+        }
         let kind = HangWatchdogClassifier.classifyGap(
-            gapSeconds: gap,
+            gapSeconds: wallGap,
             hangThresholdSeconds: hangThreshold,
             awake: awake
         )
-        guard kind == .hangLikely else { return nil }
-        if let lastBreachAt, now.timeIntervalSince(lastBreachAt) < breachCooldown {
-            return nil
+        // Record sleep gaps too (distinct kind) so the sleep branch leaves evidence.
+        guard kind == .hangLikely || kind == .suspendedOrSleep else { return nil }
+        if kind == .hangLikely {
+            if let lastBreachAt, now.timeIntervalSince(lastBreachAt) < breachCooldown {
+                return nil
+            }
+            lastBreachAt = now
         }
-        lastBreachAt = now
         return HangWatchdogBreach(
-            gapSeconds: gap,
+            gapSeconds: wallGap,
             kind: kind,
             awake: awake,
             sideContext: sideContextProvider(),

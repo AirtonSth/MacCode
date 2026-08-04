@@ -109,6 +109,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private var lifecycleRecorder: AppLifecycleRecorder?
     /// Forensic-only hang detector (plan-final W0). Never mutates run status.
     private var hangWatchdog: HangWatchdog?
+    /// Sleep-aware awake state for HangWatchdog (updated from NSWorkspace sleep/wake).
+    private let hangWatchdogAwakeState = HangWatchdogAwakeBox(initial: .unknown)
     /// Distributed-notification observer: schedule store commits → rail reload.
     private var scheduledTaskStoreObserver: NSObjectProtocol?
     private var scheduledTaskScheduler: ScheduledTaskScheduler?
@@ -681,22 +683,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     private func startHangWatchdog(recorder: AppLifecycleRecorder) {
         hangWatchdog?.stop()
+        hangWatchdogAwakeState.value = .awake
         let bootId = HostBootIdentity.currentBootId()
+        let awakeBox = hangWatchdogAwakeState
         let watchdog = HangWatchdog(
             pingInterval: 1.0,
             hangThreshold: 2.0,
-            awakeProvider: {
-                // Best-effort: App Nap / display sleep are observed via
-                // processActivity later; default awake so real stalls are not
-                // silently reclassified. Sleep-aware upgrades land with W0 samples.
-                .awake
-            },
+            awakeProvider: { awakeBox.value },
             sideContextProvider: { [weak self] in
                 HangWatchdogSideContext(
                     providerProcessCount: self?.context?.coordinator.activeThreadIdsSnapshot().count ?? 0,
                     recoveryInFlight: false,
                     bootId: bootId,
-                    sampleCountRequested: 3
+                    // Spindump capture is residual; do not claim samples were taken.
+                    sampleCountRequested: 0
                 )
             },
             onBreach: { [weak recorder] breach in
@@ -874,10 +874,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     @objc private func workspaceWillSleep() {
+        hangWatchdogAwakeState.value = .displaySleep
+        lifecycleRecorder?.record("hang_watchdog_awake state=displaySleep")
         directAccessSupervisor?.suspend()
     }
 
     @objc private func workspaceDidWake() {
+        hangWatchdogAwakeState.value = .awake
+        lifecycleRecorder?.record("hang_watchdog_awake state=awake")
         guard let context else { return }
         let remoteEnabled = ((try? context.settingsRepo.get("remote_access_enabled")) ?? "0") == "1"
         do {

@@ -223,9 +223,19 @@ public final class TerminalTransitionLedger: @unchecked Sendable {
         committed.commitTime = Date()
         try queue.sync {
             try appendLocked(committed)
-            try pruneLocked(now: committed.commitTime ?? Date())
+            // Prune only when over soft budget — avoid O(n) rewrite every terminal.
+            let count = try rowCountLocked()
+            if count > maxRows {
+                try pruneLocked(now: committed.commitTime ?? Date())
+            }
         }
         return committed
+    }
+
+    private func rowCountLocked() throws -> Int {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return 0 }
+        let text = try String(contentsOf: fileURL, encoding: .utf8)
+        return text.split(separator: "\n", omittingEmptySubsequences: true).count
     }
 
     public func allRecords() throws -> [TerminalTransitionRecord] {

@@ -1069,7 +1069,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// - Parameter preservingThreadIDs: threads owned by another process
     ///   (e.g. scheduled-task LaunchAgent) that must stay durable-running.
     public func reconcileOnLaunch(preservingThreadIDs: Set<AgentThreadID> = []) throws {
+        // Snapshot active runs before reconcile so we can stamp ledger rows.
+        let preLaunchActive = (try? runRepo.listActive()) ?? []
         _ = try runRepo.reconcileRunningOnLaunch(preservingThreadIDs: preservingThreadIDs)
+        for run in preLaunchActive {
+            if preservingThreadIDs.contains(run.threadId) { continue }
+            recordTerminalTransition(
+                runId: run.id,
+                threadId: run.threadId,
+                requestedStatus: .interrupted,
+                initiator: .relaunchReconcile
+            )
+        }
         try orchestrationRuntime?.reconcileReceipts(
             statusForRun: { [runRepo] runId in
                 try runRepo.get(id: runId)?.status

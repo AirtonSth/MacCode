@@ -626,6 +626,9 @@ public final class AppContext {
             },
             providerAdapters: [.codex: codex, .claude: claude, .grok: grok]
         )
+        // plan-final W0: durable terminal ledger write-before-UI (diagnostics dir).
+        let diagnosticsDir = self.appSupportDirectory.appendingPathComponent("diagnostics", isDirectory: true)
+        self.coordinator.terminalTransitionLedger = TerminalTransitionLedger(directory: diagnosticsDir)
         contextReference.value = self
         let liveActivitySyncCoordinator = self.liveActivitySyncCoordinator
         coordinator.onActiveRunProjectionChanged = { projection, cause in

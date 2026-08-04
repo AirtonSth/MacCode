@@ -69,8 +69,36 @@ final class HangWatchdogTests: XCTestCase {
             onBreach: { _ in }
         )
         let now = Date()
-        let breach = watchdog.evaluateForTests(now: now, lastAck: now.addingTimeInterval(-3))
+        // Equal wall/uptime gaps → hang, not sleep.
+        let breach = watchdog.evaluateForTests(
+            now: now,
+            lastAck: now.addingTimeInterval(-3),
+            wallGap: 3,
+            uptimeGap: 3
+        )
         XCTAssertNotNil(breach)
         XCTAssertEqual(breach?.kind, .hangLikely)
+    }
+
+    func test_evaluateForTests_wallAheadOfUptime_isSleepNotHang() {
+        let watchdog = HangWatchdog(
+            pingInterval: 0.2,
+            hangThreshold: 2.0,
+            breachCooldown: 0,
+            mainPinger: { _ in },
+            awakeProvider: { .awake }, // even if stale awake flag…
+            sideContextProvider: { HangWatchdogSideContext(bootId: "t") },
+            onBreach: { _ in }
+        )
+        let now = Date()
+        let breach = watchdog.evaluateForTests(
+            now: now,
+            lastAck: now.addingTimeInterval(-509),
+            wallGap: 509,
+            uptimeGap: 0.1
+        )
+        XCTAssertNotNil(breach)
+        XCTAssertEqual(breach?.kind, .suspendedOrSleep)
+        XCTAssertEqual(breach?.awake, .displaySleep)
     }
 }

@@ -2690,6 +2690,31 @@ public final class AgentRunRepository: @unchecked Sendable {
         )
     }
 
+    /// All pending/running runs (for launch reconcile ledger stamping).
+    public func listActive() throws -> [AgentRun] {
+        let st = try db.prepare("""
+            SELECT id, thread_id, provider, provider_instance_id, model, status, started_at, finished_at, error_message
+            FROM agent_runs
+            WHERE status IN ('pending', 'running')
+            ORDER BY started_at DESC;
+            """)
+        var rows: [AgentRun] = []
+        while try st.step() {
+            rows.append(AgentRun(
+                id: AgentRunID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID()),
+                threadId: AgentThreadID(UUID(uuidString: st.columnText(1) ?? "") ?? UUID()),
+                provider: AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex,
+                providerInstanceId: st.columnText(3) ?? (AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex).rawValue,
+                model: st.columnText(4) ?? "",
+                status: AgentRunStatus(rawValue: st.columnText(5) ?? "") ?? .pending,
+                startedAt: parseDate(st.columnText(6)),
+                finishedAt: st.columnText(7).map(parseDate),
+                errorMessage: st.columnText(8)
+            ))
+        }
+        return rows
+    }
+
     public func reconcileRunningOnLaunch(preservingThreadIDs: Set<AgentThreadID> = []) throws -> Int {
         let countBefore = try countRunning()
         // Always stamp a durable reason so relaunch is never an unexplained terminal
