@@ -989,6 +989,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// Not fired when translation is a no-op (finalResponseTranslator absent or text unchanged).
     public var onSR1TranslatedMessageId: (@Sendable (AgentMessageID) -> Void)?
 
+    /// Optional durable terminal-transition ledger (write-before-UI). Forensic only.
+    public var terminalTransitionLedger: TerminalTransitionLedger?
+
     public init(
         runRepo: AgentRunRepository,
         messageRepo: AgentMessageRepository,
@@ -997,7 +1000,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         checkpointRepo: AgentTurnCheckpointRepository? = nil,
         orchestrationRuntime: AgentOrchestrationRuntime? = nil,
         providerSnapshotSupplier: (@Sendable () async throws -> [AgentProviderSnapshot])? = nil,
-        providers: [AgentProvider: AgentProviderRunner]
+        providers: [AgentProvider: AgentProviderRunner],
+        terminalTransitionLedger: TerminalTransitionLedger? = nil
     ) {
         self.runRepo = runRepo
         self.messageRepo = messageRepo
@@ -1007,6 +1011,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         self.orchestrationRuntime = orchestrationRuntime
         self.providerSnapshotSupplier = providerSnapshotSupplier
         self.providers = providers.mapValues { OneShotProviderAdapter(runner: $0) }
+        self.terminalTransitionLedger = terminalTransitionLedger
     }
 
     public convenience init(
@@ -2264,7 +2269,39 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.lock()
         providerTurnScopes.removeValue(forKey: threadId)
         lock.unlock()
-        try? providerSessionRepo?.markStopped(threadId: threadId)
+        // Preserve resume eligibility: default `.cancelled` removes Continue (plan-final W2).
+        // Completed is the honest session status when the turn already finished.
+        try? providerSessionRepo?.markStopped(threadId: threadId, status: .completed)
+    }
+
+    /// Write-before-UI terminal transition record. Never flips status by itself.
+    @discardableResult
+    public func recordTerminalTransition(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        requestedStatus: AgentRunStatus,
+        initiator: TerminalTransitionInitiator,
+        providerPid: Int32? = nil,
+        exitStatus: Int32? = nil,
+        eventSequence: Int64? = nil
+    ) -> TerminalTransitionRecord? {
+        let reason = TerminalTransitionReason.classify(
+            requestedStatus: requestedStatus,
+            initiator: initiator
+        )
+        let record = TerminalTransitionRecord(
+            runId: runId.value.uuidString,
+            threadId: threadId.value.uuidString,
+            reason: reason,
+            initiator: initiator,
+            requestedStatus: requestedStatus,
+            providerPid: providerPid,
+            exitStatus: exitStatus,
+            eventSequence: eventSequence,
+            bootId: TerminalTransitionLedger.currentBootId()
+        )
+        guard let ledger = terminalTransitionLedger else { return record }
+        return try? ledger.append(record)
     }
 
     private func markStopRequested(threadId: AgentThreadID, runId: AgentRunID?) {
@@ -4261,15 +4298,22 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 if let deferred {
                     emitPersistenceIssue(deferred.operation, error: deferred.error, runId: deferred.runId, threadId: deferred.threadId)
                 }
+                // Lock saturation must not terminate a live turn (plan-final W1 T-path).
+                // Keep the run alive with a deferred-persistence issue; retry later.
                 emitPersistenceIssue("run.stream_event.retry_saturated", error: error, runId: runId, threadId: threadId)
-                stopRun(runId)
+                recordTerminalTransition(
+                    runId: runId,
+                    threadId: threadId,
+                    requestedStatus: .failed,
+                    initiator: .lockSaturation
+                )
                 return
             case .ownerConflict(let error):
                 emitPersistenceIssue("run.stream_event.owner", error: error, runId: runId, threadId: threadId)
                 return
             case .activePlanBudget(let error):
+                // Budget overflow is a persistence degradation, not a user-visible cancel.
                 emitPersistenceIssue("provider_session.active_plan.budget", error: error, runId: runId, threadId: threadId)
-                stopRun(runId)
                 return
             case .resumeCursorFailure(let error):
                 emitPersistenceIssue("provider_session.resume_cursor.update", error: error, runId: runId, threadId: threadId)
