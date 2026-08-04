@@ -121,6 +121,32 @@ final class TerminalTransitionLedgerTests: XCTestCase {
         )
     }
 
+    func test_durableTerminalStatus_falseCompleted_notPersistedAsCompleted() {
+        // WHY: durable run/thread rows must match presentation — never store completed
+        // when provider terminal was not acknowledged (skeptic: persist used pending.status).
+        let durable = AgentRunCoordinator.durableTerminalStatus(
+            requested: .completed,
+            providerTerminalAcknowledged: false
+        )
+        XCTAssertNotEqual(durable.status, .completed)
+        XCTAssertEqual(durable.initiator, .processDeath)
+        XCTAssertEqual(durable.status, .failed)
+
+        let ok = AgentRunCoordinator.durableTerminalStatus(
+            requested: .completed,
+            providerTerminalAcknowledged: true
+        )
+        XCTAssertEqual(ok.status, .completed)
+        XCTAssertEqual(ok.initiator, .providerTerminal)
+
+        let relaunch = AgentRunCoordinator.durableTerminalStatus(
+            requested: .interrupted,
+            providerTerminalAcknowledged: false
+        )
+        XCTAssertEqual(relaunch.status, .interrupted)
+        XCTAssertEqual(relaunch.initiator, .relaunchReconcile)
+    }
+
     func test_recordTerminalTransition_usesPolicy_blocksFalseCompleted() throws {
         let tmp = NSTemporaryDirectory() + "rc2-term-policy-\(UUID().uuidString)"
         defer { try? FileManager.default.removeItem(atPath: tmp) }

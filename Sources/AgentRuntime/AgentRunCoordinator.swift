@@ -2301,10 +2301,46 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         if lower.contains("timed out") || lower.contains("timeout") || lower.contains("requesttimedout") {
             return .rpcTimeout
         }
+        // completed without authoritative provider terminal is never provider_completed
+        if status == .completed && !providerTerminalAcknowledged {
+            return .processDeath
+        }
         if status == .failed && !providerTerminalAcknowledged {
             return .processDeath
         }
         return .providerTerminal
+    }
+
+    /// Pure: durable/UI status after TerminalTransitionPolicy (must match persist rows).
+    public static func durableTerminalStatus(
+        requested: AgentRunStatus,
+        providerTerminalAcknowledged: Bool,
+        errorMessage: String? = nil
+    ) -> (status: AgentRunStatus, initiator: TerminalTransitionInitiator, errorMessage: String?) {
+        let initiator = terminalInitiator(
+            status: requested,
+            providerTerminalAcknowledged: providerTerminalAcknowledged,
+            errorMessage: errorMessage
+        )
+        let reason = TerminalTransitionReason.classify(
+            requestedStatus: requested,
+            initiator: initiator
+        )
+        var status = TerminalTransitionPolicy.reconciledStatus(requested: requested, reason: reason)
+        if status == .completed {
+            let probe = TerminalTransitionRecord(
+                runId: "",
+                threadId: "",
+                reason: reason,
+                initiator: initiator,
+                requestedStatus: .completed
+            )
+            if !TerminalTransitionPolicy.allowsCompletedPresentation(probe) {
+                status = reason.durableStatus
+            }
+        }
+        let msg = errorMessage ?? (status == requested ? nil : reason.durableErrorMessage)
+        return (status, initiator, msg)
     }
 
     /// Write-before-UI terminal transition. Applies `TerminalTransitionPolicy` so
@@ -4583,23 +4619,36 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lock.lock()
             let pendingTerminal = pendingTerminalEvents[runId]
             lock.unlock()
-            guard let pendingTerminal else {
+            guard var pendingTerminal else {
                 // Slot vanished (ownership released elsewhere); nothing to commit.
                 return
             }
-            // Use the resolved terminal (may reclassify empty "completed" → failed).
-            // Write-before-UI ledger + policy: never present false completed.
-            let initiator = Self.terminalInitiator(
-                status: pendingTerminal.status,
+            // Policy BEFORE durable persist: run/thread/session rows must match
+            // presentation status (never durable completed while UI says interrupted).
+            let requestedStatus = pendingTerminal.status
+            let durable = Self.durableTerminalStatus(
+                requested: requestedStatus,
                 providerTerminalAcknowledged: pendingTerminal.providerTerminalAcknowledged,
                 errorMessage: pendingTerminal.errorMessage
             )
-            let status = recordTerminalTransition(
+            let status = durable.status
+            let initiator = durable.initiator
+            _ = recordTerminalTransition(
                 runId: runId,
                 threadId: threadId,
-                requestedStatus: pendingTerminal.status,
+                requestedStatus: requestedStatus,
                 initiator: initiator
             )
+            if status != pendingTerminal.status || durable.errorMessage != pendingTerminal.errorMessage {
+                pendingTerminal.status = status
+                if let msg = durable.errorMessage {
+                    pendingTerminal.errorMessage = msg
+                }
+                // Keep retry map consistent if durability flushes later.
+                lock.lock()
+                pendingTerminalEvents[runId] = pendingTerminal
+                lock.unlock()
+            }
             // PERF-MAC_AGENT-007: drain any buffered stream writes before the run
             // tears down, so the tail of a fast stream is durably persisted (and
             // visible to latestStreamEvents/reload) once the run finishes.
@@ -4617,6 +4666,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
             let terminalPersistence: TerminalPersistenceContext
             do {
+                // pendingTerminal.status is already policy-reconciled.
                 terminalPersistence = try persistTerminalGraph(
                     pendingTerminal,
                     runId: runId,
