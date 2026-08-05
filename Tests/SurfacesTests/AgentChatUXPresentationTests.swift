@@ -415,6 +415,62 @@ final class AgentChatUXPresentationTests: XCTestCase {
         XCTAssertTrue(model?.lines.contains(where: { $0.kind == .addition && $0.text.contains("let x = 2") }) == true)
     }
 
+    func test_appendFriendlyCompletedWorkBlocks_refreshesPayloadWhenIdsUnchanged() {
+        // WHY: token deltas keep item ids; returning previous blocks froze body mid-stream.
+        var first = AssistantItem(
+            id: "r1", turnId: "t", type: .reasoning, state: .streaming,
+            body: "thin", startedAtMs: 1
+        )
+        let firstBlocks = AgentAppView.turnRenderBlocks([first])
+        first.body = "thinking out loud fully"
+        let refreshed = AgentAppView.appendFriendlyCompletedWorkBlocks(
+            previousItems: [
+                AssistantItem(
+                    id: "r1", turnId: "t", type: .reasoning, state: .streaming,
+                    body: "thin", startedAtMs: 1
+                )
+            ],
+            previousBlocks: firstBlocks,
+            nextItems: [first]
+        )
+        XCTAssertEqual(refreshed.count, 1)
+        if case .item(let item) = refreshed[0] {
+            XCTAssertEqual(item.body, "thinking out loud fully")
+        } else {
+            XCTFail("expected single item block")
+        }
+    }
+
+    func test_eagerAnchorTurnId_rejectsStaleLiveNearTop() {
+        // WHY: stale unfinished at index 0 must not force whole paint eager.
+        let stuck = AssistantTurnSnapshot(
+            turnId: "stuck",
+            items: [AssistantItem(id: "s", turnId: "stuck", type: .tool, state: .streaming, startedAtMs: 1)],
+            finished: false
+        )
+        var entries: [AgentAppView.TranscriptEntry] = [.turn(stuck)]
+        for i in 0..<25 {
+            entries.append(.turn(AssistantTurnSnapshot(
+                turnId: "f\(i)",
+                items: [AssistantItem(id: "x\(i)", turnId: "f\(i)", type: .tool, state: .completed, startedAtMs: Int64(i + 2), finishedAtMs: Int64(i + 3))],
+                finished: true
+            )))
+        }
+        XCTAssertNil(
+            AgentAppView.eagerAnchorTurnId(entries, latestLiveTurnId: "stuck", maxEagerTail: 20)
+        )
+        let live = AssistantTurnSnapshot(
+            turnId: "now",
+            items: [AssistantItem(id: "n", turnId: "now", type: .tool, state: .streaming, startedAtMs: 100)],
+            finished: false
+        )
+        entries.append(.turn(live))
+        XCTAssertEqual(
+            AgentAppView.eagerAnchorTurnId(entries, latestLiveTurnId: "now", maxEagerTail: 20),
+            "now"
+        )
+    }
+
     func test_appendFriendlyCompletedWorkBlocks_appendsNewSettledTool() {
         func item(_ id: String) -> AssistantItem {
             AssistantItem(

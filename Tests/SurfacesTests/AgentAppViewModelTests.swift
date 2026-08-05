@@ -3269,6 +3269,26 @@ final class AgentAppViewModelTests: XCTestCase {
                        "completed head-cap must not keep the tail window used only while streaming")
     }
 
+    func test_streamingToolBodyAndOutputLiveCapKeepsTailNotHead() {
+        // WHY: head-capping tool body/output froze mid-run Work so far streams.
+        let head = String(repeating: "A", count: 80)
+        let bodyTail = "LATEST-BODY-TOKEN"
+        let outTail = "LATEST-OUT-TOKEN"
+        let bodyPad = String(repeating: "b", count: AgentAppView.liveTurnBodyCharacterLimit)
+        let outPad = String(repeating: "o", count: AgentAppView.liveTurnOutputCharacterLimit)
+        let item = AssistantItem(
+            id: "cmd", turnId: "t1", type: .commandExecution, state: .streaming,
+            body: head + bodyPad + bodyTail,
+            output: head + outPad + outTail,
+            startedAtMs: 1
+        )
+        let visible = AgentAppView.visibleLiveTurnItems([item], running: true)
+        XCTAssertTrue(visible[0].body.contains(bodyTail))
+        XCTAssertFalse(visible[0].body.hasPrefix(head))
+        XCTAssertTrue(visible[0].output?.contains(outTail) == true)
+        XCTAssertFalse(visible[0].output?.hasPrefix(head) == true)
+    }
+
     func test_toolCommandPreviewCapsLongCommandsForCollapsedRows() {
         let command = "gh api graphql " + String(repeating: "x", count: AgentAppView.commandPreviewCharacterLimit + 200)
         let body = #"{"command":"\#(command)"}"#

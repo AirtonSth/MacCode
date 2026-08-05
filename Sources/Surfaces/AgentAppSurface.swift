@@ -8299,6 +8299,23 @@ public struct AgentAppView: View {
         return blocks
     }
 
+    /// Keep block structure/ids; replace embedded AssistantItem payloads from `items`.
+    nonisolated static func rematerializeWorkBlocks(
+        _ blocks: [TurnRenderBlock],
+        items: [AssistantItem]
+    ) -> [TurnRenderBlock] {
+        var byId = [String: AssistantItem](minimumCapacity: items.count)
+        for item in items { byId[item.id] = item }
+        return blocks.map { block in
+            switch block {
+            case .item(let old):
+                return .item(byId[old.id] ?? old)
+            case .toolGroup(let id, let oldItems):
+                return .toolGroup(id: id, items: oldItems.map { byId[$0.id] ?? $0 })
+            }
+        }
+    }
+
     /// Prefer append / sealed-prefix reuse when expanded live work only grew a tail.
     /// WHY: full `turnRenderBlocks(settled)` on every stream tick rematerializes O(N) rows.
     static func appendFriendlyCompletedWorkBlocks(
@@ -8316,10 +8333,13 @@ public struct AgentAppView: View {
             return turnRenderBlocks(nextItems, groupThreshold: groupThreshold)
         }
         if nextIds.count == previousIds.count {
-            if !previousBlocks.isEmpty || nextItems.isEmpty {
-                return previousBlocks
+            // Same id sequence: keep block shells, refresh item payloads.
+            // Returning previousBlocks verbatim froze body/output for the whole
+            // stream (token deltas never change id count).
+            guard !previousBlocks.isEmpty, !nextItems.isEmpty else {
+                return turnRenderBlocks(nextItems, groupThreshold: groupThreshold)
             }
-            return turnRenderBlocks(nextItems, groupThreshold: groupThreshold)
+            return rematerializeWorkBlocks(previousBlocks, items: nextItems)
         }
         // Fast path: pure tool runs collapse to one group/item list — append items only.
         if !nextItems.isEmpty,
@@ -8351,7 +8371,11 @@ public struct AgentAppView: View {
         if sealedBlockCount == 0 {
             sealedBlocks = []
         } else if sealedBlockCount <= previousBlocks.count {
-            sealedBlocks = Array(previousBlocks.prefix(sealedBlockCount))
+            // Refresh payloads on sealed shells too (state/output may settle).
+            sealedBlocks = rematerializeWorkBlocks(
+                Array(previousBlocks.prefix(sealedBlockCount)),
+                items: nextItems
+            )
         } else {
             return turnRenderBlocks(nextItems, groupThreshold: groupThreshold)
         }
@@ -8713,15 +8737,18 @@ public struct AgentAppView: View {
     static func liveRenderableCopy(_ item: AssistantItem) -> AssistantItem {
         var copy = item
         copy.summary = cappedOptionalVisibleText(copy.summary, limit: liveTurnSummaryCharacterLimit)
-        // Streaming Thought: keep the *tail* (latest tokens) like the Grok TUI.
-        // Head-capping freezes early chain-of-thought while later tokens rewrite
-        // "on top" of the answer without the user seeing them.
-        if item.type == .reasoning, item.state == .streaming {
+        // Streaming: keep the *tail* (latest tokens). Head-capping freezes early
+        // text while later tokens rewrite "on top" without the user seeing them
+        // (reasoning, assistantMessage, tool body/output).
+        if item.state == .streaming {
             copy.body = cappedVisibleTextTail(copy.body, limit: liveTurnBodyCharacterLimit)
+            if let output = copy.output {
+                copy.output = cappedVisibleTextTail(output, limit: liveTurnOutputCharacterLimit)
+            }
         } else {
             copy.body = cappedVisibleText(copy.body, limit: liveTurnBodyCharacterLimit)
+            copy.output = cappedOptionalVisibleText(copy.output, limit: liveTurnOutputCharacterLimit)
         }
-        copy.output = cappedOptionalVisibleText(copy.output, limit: liveTurnOutputCharacterLimit)
         return copy
     }
 
@@ -8828,19 +8855,36 @@ public struct AgentAppView: View {
         )
     }
 
+    /// Only honor `latestLiveTurnId` when it sits in the recent eager tail.
+    /// A stale unfinished near the top of a long paint set must not force the
+    /// entire Lazy history into the eager path.
+    nonisolated static func eagerAnchorTurnId(
+        _ entries: [TranscriptEntry],
+        latestLiveTurnId: String?,
+        maxEagerTail: Int = idleTranscriptWindowCount
+    ) -> String? {
+        guard let lid = latestLiveTurnId,
+              let idx = entries.firstIndex(where: {
+                  if case .turn(let turn) = $0 { return turn.turnId == lid && !turn.finished }
+                  return false
+              }),
+              entries.count - idx <= max(1, maxEagerTail)
+        else { return nil }
+        return lid
+    }
+
     /// Eager suffix for the **current** streaming turn only.
     ///
-    /// - Prefer `latestLiveTurnId` when present and unfinished: everything from
-    ///   that row to the end is eager (streaming row never inside Lazy).
-    /// - Else peel only **trailing** unfinished turns (never the first unfinished
-    ///   in the whole list — a stale interrupted turn near the top would force
-    ///   the entire paint window eager and defeat virtualization).
+    /// - Prefer a *recent-tail* `latestLiveTurnId` when unfinished: everything
+    ///   from that row to the end is eager (streaming row never inside Lazy).
+    /// - Else peel only **trailing** unfinished turns.
     /// history + liveTail == original sequence.
     nonisolated static func splitTrailingLiveTurns(
         _ entries: [TranscriptEntry],
         latestLiveTurnId: String? = nil
     ) -> (history: [TranscriptEntry], liveTail: [TranscriptEntry]) {
-        if let lid = latestLiveTurnId,
+        let anchor = eagerAnchorTurnId(entries, latestLiveTurnId: latestLiveTurnId)
+        if let lid = anchor,
            let idx = entries.firstIndex(where: {
                if case .turn(let turn) = $0 { return turn.turnId == lid && !turn.finished }
                return false
