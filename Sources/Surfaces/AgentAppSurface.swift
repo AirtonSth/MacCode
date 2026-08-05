@@ -1062,7 +1062,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let selectedThread: AgentThread
         do {
             guard let persistedThread = try threadRepo.get(id: id) else {
-                statusMessage = "Could not open thread: The thread is no longer available."
+                if statusMessage.isEmpty {
+                    statusMessage = "Could not open thread: The thread is no longer available."
+                }
                 return
             }
             selectedThread = persistedThread
@@ -1072,7 +1074,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         guard let selectedWorkspaceID = selectedThread.workspaceId,
               selectedWorkspaceID == workspaceID else {
-            statusMessage = "Could not open thread: The thread belongs to another workspace."
+            if statusMessage.isEmpty {
+                statusMessage = "Could not open thread: The thread belongs to another workspace."
+            }
             return
         }
         threadWorkspaceCache[id] = selectedWorkspaceID

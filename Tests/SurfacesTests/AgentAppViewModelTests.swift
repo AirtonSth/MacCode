@@ -7214,13 +7214,14 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.setReloadThreadListForTesting(nil)
         XCTAssertTrue(vm.threads.contains(where: { $0.id == deleted.id }),
                       "precondition: the failed cross-process reconciliation leaves a stale rail snapshot")
+        let reloadFailureStatus = vm.statusMessage
 
         vm.selectThread(deleted.id, markRead: false)
 
         XCTAssertNil(vm.selectedThreadId,
                      "repository absence must win over stale in-memory rail membership")
-        XCTAssertTrue(vm.statusMessage.contains("Could not open thread"),
-                      "a missing stale rail row must fail loud")
+        XCTAssertEqual(vm.statusMessage, reloadFailureStatus,
+                       "a missing stale row must not overwrite the more relevant reload failure")
     }
 
     func test_selectThread_repositoryFallbackCachesLocalOwnershipAndRejectsForeignRow() throws {
