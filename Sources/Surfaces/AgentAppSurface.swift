@@ -4158,7 +4158,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if let retireDeletedThreadRuntime {
             retireDeletedThreadRuntime(ids, coordinatorAlreadyRetired)
         } else if !coordinatorAlreadyRetired {
-            coordinator.retireDeletedThreads(ids)
+            // Direct/test surfaces have no AppContext retry owner. Delegate to
+            // the coordinator's single fallback driver so retryRequired is kept.
+            coordinator.retireDeletedThreads(ids, scheduleRetries: true)
         }
     }
 

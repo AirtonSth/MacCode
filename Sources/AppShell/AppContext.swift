@@ -6,6 +6,9 @@ import AgentRuntime
 import SocketServer
 import Surfaces
 import DistillCore
+import os
+
+private let appContextRuntimeLog = Logger(subsystem: "io.remotecode.agent", category: "app-context")
 
 // MARK: - Token Saver per-lane kill switch + governance snapshot
 
@@ -418,12 +421,12 @@ public final class AppContext {
     /// stop provider/queue ownership. Retain the exact deleted candidate until
     /// a later read proves it absent (retire) or present (drop the candidate).
     private struct PendingDeletedThreadRetirement {
-        var timedRetryAttempts = 0
+        var retryLogged = false
     }
     private var pendingDeletedThreadRetirements: [AgentThreadID: PendingDeletedThreadRetirement] = [:]
     private var deletedThreadRetirementRetryTask: Task<Void, Never>?
-    private static let deletedThreadRetirementTimedRetryLimit = 2
     private static let deletedThreadRetirementRetryBaseDelayNanoseconds: UInt64 = 50_000_000
+    private static let deletedThreadRetirementRetryMaximumDelayNanoseconds: UInt64 = 2_000_000_000
     private var isTerminating = false
     private struct TokenSaverAccountIdentity: Equatable {
         let userID: String?
@@ -503,16 +506,12 @@ public final class AppContext {
             .filter { seen.insert($0).inserted }
             .sorted { $0.value.uuidString < $1.value.uuidString }
         for threadId in ordered {
-            if var pending = pendingDeletedThreadRetirements[threadId] {
-                // A fresh lifecycle call gets a fresh bounded timer budget. The
-                // identifier itself remains pending after any budget expires.
-                pending.timedRetryAttempts = 0
-                pendingDeletedThreadRetirements[threadId] = pending
-            } else {
+            if pendingDeletedThreadRetirements[threadId] == nil {
                 pendingDeletedThreadRetirements[threadId] = PendingDeletedThreadRetirement()
             }
         }
         drainPendingDeletedThreadRetirements()
+        schedulePendingDeletedThreadRetirementRetry()
     }
 
     /// Drain in a stable order so concurrent cap/fork lifecycle paths cannot
@@ -522,11 +521,12 @@ public final class AppContext {
         let ordered = pendingDeletedThreadRetirements.keys.sorted {
             $0.value.uuidString < $1.value.uuidString
         }
-        var needsTimedRetry = false
-
         for threadId in ordered {
             guard var pending = pendingDeletedThreadRetirements[threadId] else { continue }
-            let outcome = coordinator.retireDeletedThreads([threadId])[threadId] ?? .retryRequired
+            let outcome = coordinator.retireDeletedThreads(
+                [threadId],
+                scheduleRetries: false
+            )[threadId] ?? .retryRequired
             switch outcome {
             case .retired:
                 pendingDeletedThreadRetirements.removeValue(forKey: threadId)
@@ -534,48 +534,60 @@ public final class AppContext {
                 queueDrainSuppressionLeases.removeValue(forKey: threadId)
                 queueDispatchAcceptancePermits.removeValue(forKey: threadId)?.invalidate()
                 deferredQueuePromotions.removeValue(forKey: threadId)
+                appContextRuntimeLog.info(
+                    "thread.retirement.outcome thread=\(threadId.value.uuidString, privacy: .public) outcome=retired"
+                )
             case .confirmedPresent:
                 // A restored row owns its queue/session state; only the stale
                 // retirement candidate is terminally resolved.
                 pendingDeletedThreadRetirements.removeValue(forKey: threadId)
+                appContextRuntimeLog.info(
+                    "thread.retirement.outcome thread=\(threadId.value.uuidString, privacy: .public) outcome=present"
+                )
             case .retryRequired:
-                if pending.timedRetryAttempts < Self.deletedThreadRetirementTimedRetryLimit {
-                    pending.timedRetryAttempts += 1
-                    needsTimedRetry = true
+                if pending.retryLogged == false {
+                    pending.retryLogged = true
+                    pendingDeletedThreadRetirements[threadId] = pending
+                    appContextRuntimeLog.info(
+                        "thread.retirement.retry_pending thread=\(threadId.value.uuidString, privacy: .public)"
+                    )
                 }
-                // Timer budget exhaustion stops only timer work, never this ID.
-                // A subsequent lifecycle drain will verify it again.
-                pendingDeletedThreadRetirements[threadId] = pending
             }
-        }
-
-        if needsTimedRetry {
-            schedulePendingDeletedThreadRetirementRetry()
         }
     }
 
     private func schedulePendingDeletedThreadRetirementRetry() {
-        guard deletedThreadRetirementRetryTask == nil else { return }
-        let nextAttempt = pendingDeletedThreadRetirements.values
-            .map(\.timedRetryAttempts)
-            .filter { $0 > 0 && $0 <= Self.deletedThreadRetirementTimedRetryLimit }
-            .min() ?? 1
-        let baseDelay: UInt64
+        guard deletedThreadRetirementRetryTask == nil,
+              !pendingDeletedThreadRetirements.isEmpty else { return }
+        deletedThreadRetirementRetryTask = Task { @MainActor [weak self] in
+            var attempt = 0
+            while !Task.isCancelled {
+                guard let delay = self?.deletedThreadRetirementRetryDelay(attempt: attempt) else {
+                    return
+                }
+                try? await Task.sleep(nanoseconds: delay)
+                guard let self, !Task.isCancelled else { return }
+                self.drainPendingDeletedThreadRetirements()
+                guard !self.pendingDeletedThreadRetirements.isEmpty else {
+                    self.deletedThreadRetirementRetryTask = nil
+                    return
+                }
+                attempt = min(attempt + 1, 5)
+            }
+        }
+    }
+
+    private func deletedThreadRetirementRetryDelay(attempt: Int) -> UInt64 {
         #if DEBUG
-        baseDelay = deletedThreadRetirementRetryDelayNanosecondsForTesting
+        let baseDelay = deletedThreadRetirementRetryDelayNanosecondsForTesting
             ?? Self.deletedThreadRetirementRetryBaseDelayNanoseconds
         #else
-        baseDelay = Self.deletedThreadRetirementRetryBaseDelayNanoseconds
+        let baseDelay = Self.deletedThreadRetirementRetryBaseDelayNanoseconds
         #endif
-        let multiplier = UInt64(1 << min(nextAttempt - 1, 3))
-        let delay = min(baseDelay * multiplier, 2_000_000_000)
-        deletedThreadRetirementRetryTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: delay)
-            guard let self else { return }
-            self.deletedThreadRetirementRetryTask = nil
-            guard !Task.isCancelled else { return }
-            self.drainPendingDeletedThreadRetirements()
-        }
+        return min(
+            baseDelay * UInt64(1 << min(attempt, 5)),
+            Self.deletedThreadRetirementRetryMaximumDelayNanoseconds
+        )
     }
 
     func enqueueRecoveredForkPrunedThreadIDs(_ ids: [AgentThreadID]) {
@@ -1383,6 +1395,7 @@ public final class AppContext {
     }
 
     deinit {
+        deletedThreadRetirementRetryTask?.cancel()
         tokenSaverEntitlementReconcileTask?.cancel()
         if let tokenSaverAccountObserver {
             NotificationCenter.default.removeObserver(tokenSaverAccountObserver)
