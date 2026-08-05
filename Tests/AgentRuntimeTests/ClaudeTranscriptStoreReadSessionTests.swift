@@ -178,6 +178,87 @@ final class ClaudeTranscriptStoreReadSessionTests: XCTestCase {
                        "a tool_use-only line must not reset the turn's final assistant message to nil")
     }
 
+    // MARK: - user tool_result pairing (real Claude JSONL)
+
+    // WHY: Claude 2.1.x session files put tool_result on type=user lines keyed
+    // by tool_use_id (string content, no block id), after ordinary user text
+    // echoes. Skipping all non-assistant lines made the store's tool_result
+    // mapper unreachable on resume — tool cards rehydrated without output —
+    // while user text must never become assistant prose.
+    func test_readSession_userToolResult_pairsByToolUseId_keepsOutputAndSkipsUserEcho() throws {
+        let base = try makeTempDir()
+        defer { try? fm.removeItem(at: base) }
+        let configRoot = base.appendingPathComponent("config/projects", isDirectory: true)
+        try fm.createDirectory(at: configRoot, withIntermediateDirectories: true)
+        let threadId = "thread-user-tool-result"
+        let toolUseId = "toolu_01HDNTestPairingId0001"
+
+        func jsonLine(_ obj: [String: Any]) throws -> String {
+            String(data: try JSONSerialization.data(withJSONObject: obj), encoding: .utf8)!
+        }
+        let lines = [
+            try jsonLine([
+                "type": "assistant",
+                "uuid": "asst-tool-use",
+                "message": [
+                    "id": "msg-tool-turn",
+                    "role": "assistant",
+                    "content": [[
+                        "type": "tool_use",
+                        "id": toolUseId,
+                        "name": "Bash",
+                        "input": ["command": "ls"]
+                    ]]
+                ]
+            ]),
+            try jsonLine([
+                "type": "user",
+                "uuid": "user-echo-text",
+                "message": [
+                    "role": "user",
+                    "content": [["type": "text", "text": "USER_ECHO_MUST_NOT_BE_ASSISTANT"]]
+                ]
+            ]),
+            try jsonLine([
+                "type": "user",
+                "uuid": "user-tool-result",
+                "message": [
+                    "role": "user",
+                    "content": [[
+                        "type": "tool_result",
+                        "tool_use_id": toolUseId,
+                        "content": "TOOL_OUTPUT_MARKER_ok"
+                    ]]
+                ]
+            ])
+        ]
+        try lines.joined(separator: "\n").data(using: .utf8)!
+            .write(to: configRoot.appendingPathComponent(threadId + ".jsonl"))
+
+        let store = ClaudeTranscriptStore(fileManager: fm)
+        let events = store.readSession(
+            providerThreadId: threadId,
+            environment: ["CLAUDE_CONFIG_DIR": base.appendingPathComponent("config").path]
+        )
+
+        var state = AssistantTimelineState()
+        for event in events { state.apply(event) }
+
+        let toolItems = state.turns.flatMap(\.items).filter { $0.type == .tool }
+        XCTAssertEqual(toolItems.count, 1,
+                       "tool_use + user tool_result must pair into exactly one tool item (no orphan result item)")
+        XCTAssertEqual(toolItems.first?.id, toolUseId,
+                       "pairing must key the result onto the tool_use id")
+        XCTAssertEqual(toolItems.first?.output, "TOOL_OUTPUT_MARKER_ok",
+                       "user-line tool_result content must survive rehydration as tool output")
+
+        let assistantBodies = state.turns.flatMap(\.items)
+            .filter { $0.type == .assistantMessage }
+            .map(\.body)
+        XCTAssertFalse(assistantBodies.contains(where: { $0.contains("USER_ECHO_MUST_NOT_BE_ASSISTANT") }),
+                       "ordinary user text echo must not render as assistant prose")
+    }
+
     // MARK: - emptyThreadId returns empty
 
     func test_readSession_emptyThreadId_returnsEmpty() {

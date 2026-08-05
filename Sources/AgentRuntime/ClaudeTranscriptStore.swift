@@ -184,16 +184,36 @@ public final class ClaudeTranscriptStore: @unchecked Sendable {
 
         for line in candidateLines {
             guard let object = Self.jsonObject(from: line),
-                  (object["type"] as? String) == "assistant",
+                  let lineType = object["type"] as? String,
                   let message = object["message"] as? [String: Any] else {
                 continue
             }
             let messageId = Self.string(object["uuid"]) ?? Self.string(message["id"]) ?? Self.string(object["requestId"]) ?? UUID().uuidString
             guard emittedMessageIds.insert(messageId).inserted else { continue }
 
-            let turnId = Self.string(message["id"]) ?? messageId
             let timestampMs = Self.timestampMs(object["timestamp"] as? String) ?? Int64(Date().timeIntervalSince1970 * 1000)
             let blocks = message["content"] as? [[String: Any]] ?? []
+
+            // Real Claude session JSONL puts tool_result on type=user lines keyed
+            // by tool_use_id (string content, often no block id). Accept those
+            // lines only for tool_result and pair onto the existing tool item —
+            // never start a user turn or render user text/thinking as assistant.
+            if lineType == "user" {
+                for (index, block) in blocks.enumerated() {
+                    guard (Self.string(block["type"]) ?? "") == "tool_result" else { continue }
+                    let toolUseId = Self.string(block["tool_use_id"])
+                        ?? Self.string(block["id"])
+                        ?? "\(messageId)-\(index)"
+                    let output = Self.string(block["content"]) ?? Self.jsonString(block["content"]) ?? ""
+                    events.append(.itemDelta(itemId: toolUseId, bodyAppend: nil, outputAppend: output, summary: nil))
+                    events.append(.itemCompleted(itemId: toolUseId, finalState: .completed))
+                }
+                continue
+            }
+
+            guard lineType == "assistant" else { continue }
+
+            let turnId = Self.string(message["id"]) ?? messageId
             let mapped = Self.events(for: blocks, turnId: turnId, lineId: messageId, timestampMs: timestampMs)
             guard !mapped.events.isEmpty else { continue }
             if let final = mapped.finalMessage {
@@ -239,9 +259,11 @@ public final class ClaudeTranscriptStore: @unchecked Sendable {
                 events.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .tool, state: .streaming, summary: name, body: input ?? "", startedAtMs: timestampMs)))
                 events.append(.itemCompleted(itemId: itemId, finalState: .completed))
             case "tool_result":
+                // Prefer tool_use_id so a result block merges onto the tool_use item.
+                let toolUseId = string(block["tool_use_id"]) ?? itemId
                 let output = string(block["content"]) ?? jsonString(block["content"]) ?? ""
-                events.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .tool, state: .completed, summary: "result", output: output, startedAtMs: timestampMs, finishedAtMs: timestampMs)))
-                events.append(.itemCompleted(itemId: itemId, finalState: .completed))
+                events.append(.itemStarted(item: AssistantItem(id: toolUseId, turnId: turnId, type: .tool, state: .completed, summary: "result", output: output, startedAtMs: timestampMs, finishedAtMs: timestampMs)))
+                events.append(.itemCompleted(itemId: toolUseId, finalState: .completed))
             default:
                 continue
             }
