@@ -261,6 +261,26 @@ public final class AgentThreadRepository {
         }
     }
 
+    /// Persists a thread and applies the workspace retention cap as one write.
+    /// Any victim-delete failure rolls the upsert back with the transaction.
+    @discardableResult
+    public func upsertEnforcingWorkspaceThreadLimit(
+        _ thread: AgentThread,
+        limit: Int = AgentThreadRepository.maxThreadsPerWorkspace
+    ) throws -> [AgentThreadID] {
+        try db.performSync { database in
+            try database.transaction {
+                try upsert(thread)
+                guard let workspaceID = thread.workspaceId else { return [] }
+                let victims = try workspaceThreadLimitVictims(workspaceId: workspaceID, limit: limit)
+                for id in victims {
+                    try delete(id: id)
+                }
+                return victims
+            }
+        }
+    }
+
     public func list(workspaceId: WorkspaceID? = nil) throws -> [AgentThread] {
         // Rail order is pure last activity: most recently updated/completed
         // threads float to the top. Pin is a visual/retention marker only —
@@ -409,6 +429,16 @@ public final class AgentThreadRepository {
         workspaceId: WorkspaceID,
         limit: Int = AgentThreadRepository.maxThreadsPerWorkspace
     ) throws -> [AgentThreadID] {
+        let victims = try workspaceThreadLimitVictims(workspaceId: workspaceId, limit: limit)
+        guard !victims.isEmpty else { return [] }
+        try delete(ids: victims)
+        return victims
+    }
+
+    private func workspaceThreadLimitVictims(
+        workspaceId: WorkspaceID,
+        limit: Int
+    ) throws -> [AgentThreadID] {
         let cap = max(1, limit)
         let total = try count(workspaceId: workspaceId)
         guard total > cap else { return [] }
@@ -429,8 +459,6 @@ public final class AgentThreadRepository {
                 victims.append(AgentThreadID(uuid))
             }
         }
-        guard !victims.isEmpty else { return [] }
-        try delete(ids: victims)
         return victims
     }
 

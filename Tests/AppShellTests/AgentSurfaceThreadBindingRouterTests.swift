@@ -36,6 +36,38 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         return (ctx, router)
     }
 
+    private func fillWorkspaceToThreadCap(
+        _ workspaceID: WorkspaceID,
+        context: AppContext
+    ) throws -> Set<AgentThreadID> {
+        var ids: Set<AgentThreadID> = []
+        for index in 0..<AgentThreadRepository.maxThreadsPerWorkspace {
+            var thread = AgentThread(
+                workspaceId: workspaceID,
+                title: "existing \(index)",
+                provider: .codex,
+                model: "fake-model"
+            )
+            thread.status = .completed
+            try context.threadRepo.upsert(thread)
+            ids.insert(thread.id)
+        }
+        return ids
+    }
+
+    private func installThreadCapDeleteAbortTrigger(
+        _ context: AppContext,
+        named name: String
+    ) throws {
+        try context.db.execute("""
+            CREATE TRIGGER \(name)
+            BEFORE DELETE ON agent_threads
+            BEGIN
+                SELECT RAISE(ABORT, 'forced cap victim delete failure');
+            END;
+            """)
+    }
+
     // MARK: Bug A — new tab does not adopt the workspace's existing thread
 
     func test_newAgentTab_doesNotAdoptExistingWorkspaceThread() throws {
@@ -434,6 +466,256 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         XCTAssertNotNil(try ctx.threadRepo.get(id: created.id))
         XCTAssertEqual(victimEvents.count, 1,
                        "the routed producer must publish its authoritative victim")
+    }
+
+    func test_routerCreateAtCap_deleteFailureRollsBackCreationAndPublishesNothing() throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-AtomicRouterCap-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "ATOMIC-ROUTER-CAP", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        let existingIDs = try fillWorkspaceToThreadCap(workspace.id, context: ctx)
+        let triggerName = "fail_router_cap_delete"
+        try installThreadCapDeleteAbortTrigger(ctx, named: triggerName)
+        defer { try? ctx.db.execute("DROP TRIGGER \(triggerName);") }
+        var lifecycleEvents: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "agent.thread.created"
+                    || event.kind == "agent.thread.deleted"
+                    || event.kind == "agent.thread.deleted_many" else { return }
+            lifecycleEvents.append(event)
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        XCTAssertThrowsError(try router.createAgentThread(
+            workspace: workspace.id,
+            title: "must roll back",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium,
+            routingConfiguration: nil,
+            quiet: true
+        ))
+
+        XCTAssertEqual(try ctx.threadRepo.count(workspaceId: workspace.id),
+                       AgentThreadRepository.maxThreadsPerWorkspace)
+        XCTAssertEqual(Set(try ctx.threadRepo.list(workspaceId: workspace.id).map(\.id)), existingIDs,
+                       "cap failure must restore the exact pre-create thread set")
+        XCTAssertTrue(lifecycleEvents.isEmpty,
+                      "a rolled-back router create must publish no create or delete lifecycle")
+    }
+
+    func test_routedCreateAtCap_deleteFailureRollsBackCreationAndPublishesNothing() async throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-AtomicRoutedCap-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "ATOMIC-ROUTED-CAP", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        let existingIDs = try fillWorkspaceToThreadCap(workspace.id, context: ctx)
+        let triggerName = "fail_routed_cap_delete"
+        try installThreadCapDeleteAbortTrigger(ctx, named: triggerName)
+        defer { try? ctx.db.execute("DROP TRIGGER \(triggerName);") }
+        var lifecycleEvents: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "agent.thread.created"
+                    || event.kind == "agent.thread.deleted"
+                    || event.kind == "agent.thread.deleted_many" else { return }
+            lifecycleEvents.append(event)
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+        let selection = AgentModelSelection(
+            provider: .codex,
+            modelId: "gpt-5.6",
+            reasoningEffort: .medium,
+            serviceTier: .auto
+        )
+
+        do {
+            _ = try await router.createAgentThreadRouting(
+                workspace: workspace.id,
+                title: "must roll back routed",
+                provider: .codex,
+                model: "gpt-5.6",
+                permissionMode: .supervised,
+                reasoningEffort: .medium,
+                serviceTier: .auto,
+                modelSelection: selection,
+                providerInstanceId: nil,
+                runAsUser: nil,
+                surfaceID: nil,
+                routing: AgentRoutingRequest(
+                    mode: .manual,
+                    expectedRevision: 0,
+                    manualSelection: selection
+                )
+            )
+            XCTFail("routed cap failure must throw")
+        } catch {}
+
+        XCTAssertEqual(try ctx.threadRepo.count(workspaceId: workspace.id),
+                       AgentThreadRepository.maxThreadsPerWorkspace)
+        XCTAssertEqual(Set(try ctx.threadRepo.list(workspaceId: workspace.id).map(\.id)), existingIDs,
+                       "routed cap failure must restore the exact pre-create thread set")
+        XCTAssertTrue(lifecycleEvents.isEmpty,
+                      "a rolled-back routed create must publish no create or delete lifecycle")
+    }
+
+    func test_localCreateAtCap_deleteFailureRollsBackCreationAndFailsLoudly() throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-AtomicLocalCap-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "ATOMIC-LOCAL-CAP", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        let surface = try XCTUnwrap(agentSurfaces(in: workspace.id).first)
+        let existingIDs = try fillWorkspaceToThreadCap(workspace.id, context: ctx)
+        surface.viewModel.reloadThreads()
+        let triggerName = "fail_local_cap_delete"
+        try installThreadCapDeleteAbortTrigger(ctx, named: triggerName)
+        defer { try? ctx.db.execute("DROP TRIGGER \(triggerName);") }
+        var lifecycleEvents: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "agent.thread.created"
+                    || event.kind == "agent.thread.deleted"
+                    || event.kind == "agent.thread.deleted_many" else { return }
+            lifecycleEvents.append(event)
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        surface.viewModel.createThread(title: "must roll back local")
+
+        XCTAssertEqual(try ctx.threadRepo.count(workspaceId: workspace.id),
+                       AgentThreadRepository.maxThreadsPerWorkspace)
+        XCTAssertEqual(Set(try ctx.threadRepo.list(workspaceId: workspace.id).map(\.id)), existingIDs,
+                       "local cap failure must restore the exact pre-create thread set")
+        XCTAssertTrue(surface.viewModel.statusMessage.contains("Could not create thread"),
+                      "the local surface must fail loud when atomic creation rolls back")
+        XCTAssertTrue(lifecycleEvents.isEmpty,
+                      "a rolled-back local create must publish no create or delete lifecycle")
+    }
+
+    func test_deletionBridges_applyAuthoritativeIDsBeforeFailedSurfaceReload() async throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-DeletionBridges-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "DELETION-BRIDGES", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        let producer = try XCTUnwrap(agentSurfaces(in: workspace.id).first)
+        let receiverDescriptor = try router.createSurface(
+            workspace: workspace.id,
+            type: .agentApp,
+            paneID: nil,
+            title: "Deletion receiver"
+        )
+        let receiver = try XCTUnwrap(
+            SurfaceRegistry.shared.surface(receiverDescriptor.id) as? AgentAppSurface
+        )
+
+        let rawSingle = AgentThread(workspaceId: workspace.id, title: "raw single", provider: .codex, model: "m")
+        let rawMany = [
+            AgentThread(workspaceId: workspace.id, title: "raw many 1", provider: .codex, model: "m"),
+            AgentThread(workspaceId: workspace.id, title: "raw many 2", provider: .codex, model: "m")
+        ]
+        let localMany = [
+            AgentThread(workspaceId: workspace.id, title: "local many 1", provider: .codex, model: "m"),
+            AgentThread(workspaceId: workspace.id, title: "local many 2", provider: .codex, model: "m")
+        ]
+        for thread in [rawSingle] + rawMany + localMany {
+            try ctx.threadRepo.upsert(thread)
+        }
+        producer.viewModel.reloadThreads()
+        receiver.viewModel.reloadThreads()
+
+        receiver.viewModel.selectThread(rawSingle.id)
+        receiver.viewModel.prompt = "raw single draft"
+        receiver.viewModel.seedAdditionalThreadCachesForTesting(rawSingle.id)
+        receiver.viewModel.seedRunThreadProjectionForTesting(rawSingle.id)
+        ctx.coordinator.seedAutoContinuationStateForTesting(rawSingle.id)
+        try ctx.threadRepo.delete(id: rawSingle.id)
+        receiver.viewModel.setReloadThreadListForTesting {
+            throw NSError(domain: "AgentSurfaceThreadBindingRouterTests.rawSingle", code: 1)
+        }
+
+        EventBus.shared.publish(kind: "agent.thread.deleted", payload: .object([
+            "thread_id": .string(rawSingle.id.value.uuidString)
+        ]))
+
+        for _ in 0..<100 where receiver.viewModel.threadCacheResidueForTesting.contains(rawSingle.id)
+            || !receiver.viewModel.statusMessage.contains("Could not reload threads") {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        receiver.viewModel.setReloadThreadListForTesting(nil)
+        XCTAssertFalse(receiver.viewModel.threads.contains(where: { $0.id == rawSingle.id }))
+        XCTAssertFalse(receiver.viewModel.threadCacheResidueForTesting.contains(rawSingle.id))
+        XCTAssertFalse(ctx.coordinator.autoContinuationThreadIdsForTesting.contains(rawSingle.id))
+        XCTAssertNil(receiver.viewModel.selectedThreadId)
+        XCTAssertEqual(receiver.viewModel.prompt, "raw single draft",
+                       "raw delete recovery must preserve the selected unsent draft")
+
+        receiver.viewModel.dismissStatusMessage()
+        receiver.viewModel.reloadThreads()
+        let rawManyIDs = Set(rawMany.map(\.id))
+        for thread in rawMany {
+            receiver.viewModel.selectThread(thread.id)
+            receiver.viewModel.seedAdditionalThreadCachesForTesting(thread.id)
+            receiver.viewModel.seedRunThreadProjectionForTesting(thread.id)
+            ctx.coordinator.seedAutoContinuationStateForTesting(thread.id)
+        }
+        try ctx.threadRepo.delete(ids: Array(rawManyIDs))
+        receiver.viewModel.setReloadThreadListForTesting {
+            throw NSError(domain: "AgentSurfaceThreadBindingRouterTests.rawMany", code: 2)
+        }
+
+        EventBus.shared.publish(kind: "agent.thread.deleted_many", payload: .object([
+            "thread_ids": .array(rawMany.reversed().map { .string($0.id.value.uuidString) })
+        ]))
+
+        for _ in 0..<100 where !receiver.viewModel.threadCacheResidueForTesting.isDisjoint(with: rawManyIDs)
+            || !receiver.viewModel.statusMessage.contains("Could not reload threads") {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        receiver.viewModel.setReloadThreadListForTesting(nil)
+        XCTAssertTrue(receiver.viewModel.threadCacheResidueForTesting.isDisjoint(with: rawManyIDs))
+        XCTAssertTrue(ctx.coordinator.autoContinuationThreadIdsForTesting.isDisjoint(with: rawManyIDs))
+        XCTAssertTrue(receiver.viewModel.threads.allSatisfy { !rawManyIDs.contains($0.id) })
+        XCTAssertNil(receiver.viewModel.selectedThreadId)
+
+        receiver.viewModel.dismissStatusMessage()
+        receiver.viewModel.reloadThreads()
+        let localManyIDs = Set(localMany.map(\.id))
+        for thread in localMany {
+            receiver.viewModel.selectThread(thread.id)
+            receiver.viewModel.seedAdditionalThreadCachesForTesting(thread.id)
+            receiver.viewModel.seedRunThreadProjectionForTesting(thread.id)
+            ctx.coordinator.seedAutoContinuationStateForTesting(thread.id)
+        }
+        receiver.viewModel.setReloadThreadListForTesting {
+            throw NSError(domain: "AgentSurfaceThreadBindingRouterTests.localMany", code: 3)
+        }
+        var deletedManyEvents: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "agent.thread.deleted_many" else { return }
+            deletedManyEvents.append(event)
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        let didDeleteLocalMany = await producer.viewModel.deleteThreads(localManyIDs)
+        XCTAssertTrue(didDeleteLocalMany)
+
+        for _ in 0..<100 where !receiver.viewModel.threadCacheResidueForTesting.isDisjoint(with: localManyIDs)
+            || !receiver.viewModel.statusMessage.contains("Could not reload threads") {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        receiver.viewModel.setReloadThreadListForTesting(nil)
+        XCTAssertEqual(deletedManyEvents.count, 1)
+        let deletedManyEvent = try XCTUnwrap(deletedManyEvents.first)
+        let payload = try XCTUnwrap(deletedManyEvent.payload.objectValue)
+        XCTAssertEqual(Set(payload.keys), Set(["thread_ids"]))
+        XCTAssertEqual(
+            payload["thread_ids"]?.arrayValue?.compactMap { $0.stringValue },
+            localMany.map { $0.id.value.uuidString }.sorted(),
+            "local bulk delete must publish exactly the two sorted durable IDs"
+        )
+        XCTAssertTrue(receiver.viewModel.threadCacheResidueForTesting.isDisjoint(with: localManyIDs))
+        XCTAssertTrue(ctx.coordinator.autoContinuationThreadIdsForTesting.isDisjoint(with: localManyIDs))
+        XCTAssertTrue(receiver.viewModel.threads.allSatisfy { !localManyIDs.contains($0.id) })
+        XCTAssertNil(receiver.viewModel.selectedThreadId)
     }
 
     // MARK: selectAgentThread targets exactly one surface when given a surfaceID

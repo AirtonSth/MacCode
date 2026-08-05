@@ -3745,9 +3745,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                             runAsUser: runAsUser, routingConfiguration: routingConfiguration)
         let prunedThreadIDs: [AgentThreadID]
         do {
-            try threadRepo.upsert(t)
-            // Drop oldest history when this create pushes past the workspace cap.
-            prunedThreadIDs = try threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspaceID)
+            prunedThreadIDs = try threadRepo.upsertEnforcingWorkspaceThreadLimit(t)
         } catch {
             statusMessage = "Could not create thread: \(error)"
             return
@@ -4051,7 +4049,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         resetTimelineUpdateTick()
         }
         reloadThreads()
-        onThreadLifecycle?(.deleted(Array(ids)))
+        onThreadLifecycle?(.deleted(orderedIDs))
         // Reselect a remaining thread when the open one was deleted (delete UX);
         // never auto-bind a surface that was on the fresh-composer state.
         if wasSelected, selectedThreadId == nil, let next = threads.first {

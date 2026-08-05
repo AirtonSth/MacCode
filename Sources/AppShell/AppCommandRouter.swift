@@ -2432,13 +2432,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             modelSelection: modelSelection ?? AgentModelSelection(provider: provider, modelId: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier),
                             runAsUser: resolvedRunAs,
                             routingConfiguration: routingConfiguration)
-        try ctx.threadRepo.upsert(t)
-        let prunedThreadIDs: [AgentThreadID]
-        if let resolvedWorkspace {
-            prunedThreadIDs = (try? ctx.threadRepo.enforceWorkspaceThreadLimit(workspaceId: resolvedWorkspace)) ?? []
-        } else {
-            prunedThreadIDs = []
-        }
+        let prunedThreadIDs = try ctx.threadRepo.upsertEnforcingWorkspaceThreadLimit(t)
         // Apply/publish victims before any fallible surface reload or selection.
         if !prunedThreadIDs.isEmpty {
             publishAgentThreadLifecycle(.deleted(prunedThreadIDs))
@@ -2529,13 +2523,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             runAsUser: resolvedRunAs,
             routingConfiguration: resolvedRouting
         )
-        try ctx.threadRepo.upsert(thread)
-        let prunedThreadIDs: [AgentThreadID]
-        if let resolvedWorkspace {
-            prunedThreadIDs = try ctx.threadRepo.enforceWorkspaceThreadLimit(workspaceId: resolvedWorkspace)
-        } else {
-            prunedThreadIDs = []
-        }
+        let prunedThreadIDs = try ctx.threadRepo.upsertEnforcingWorkspaceThreadLimit(thread)
         if !prunedThreadIDs.isEmpty {
             publishAgentThreadLifecycle(.deleted(prunedThreadIDs))
         }
