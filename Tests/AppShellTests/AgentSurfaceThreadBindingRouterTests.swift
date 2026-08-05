@@ -233,17 +233,19 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         firstSurface.viewModel.selectThread(victim.id)
         firstSurface.viewModel.prompt = "first surface victim draft"
         firstSurface.viewModel.seedAdditionalThreadCachesForTesting(victim.id)
-        firstSurface.viewModel.seedRunThreadProjectionForTesting(victim.id)
         secondSurface.viewModel.selectThread(victim.id)
         secondSurface.viewModel.prompt = "second surface victim draft"
         secondSurface.viewModel.seedAdditionalThreadCachesForTesting(victim.id)
         secondSurface.viewModel.selectThread(secondSelection)
         ctx.coordinator.seedAutoContinuationStateForTesting(victim.id)
+        firstSurface.viewModel.seedRunThreadProjectionForTesting(victim.id)
 
         XCTAssertTrue(firstSurface.viewModel.threadCacheResidueForTesting.contains(victim.id),
                       "precondition: first surface caches the future victim")
         XCTAssertTrue(secondSurface.viewModel.threadCacheResidueForTesting.contains(victim.id),
                       "precondition: second surface caches the future victim")
+        XCTAssertEqual(firstSurface.viewModel.activeThreadCount, 1,
+                       "precondition: the first surface projects the future victim run")
         XCTAssertTrue(ctx.coordinator.autoContinuationThreadIdsForTesting.contains(victim.id),
                       "precondition: the shared coordinator caches the future victim")
         XCTAssertEqual(firstSurface.viewModel.selectedThreadId, victim.id)
@@ -277,6 +279,20 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             routingConfiguration: nil,
             quiet: true
         )
+
+        // publishAgentThreadLifecycle synchronously applies authoritative IDs to
+        // every registered surface before it emits the asynchronous EventBus
+        // notification. These assertions deliberately run before any yield.
+        XCTAssertFalse(firstSurface.viewModel.threadCacheResidueForTesting.contains(victim.id))
+        XCTAssertFalse(secondSurface.viewModel.threadCacheResidueForTesting.contains(victim.id))
+        XCTAssertFalse(firstSurface.viewModel.threads.contains(where: { $0.id == victim.id }))
+        XCTAssertFalse(secondSurface.viewModel.threads.contains(where: { $0.id == victim.id }))
+        XCTAssertEqual(firstSurface.viewModel.activeThreadCount, 0,
+                       "synchronous deletion must remove the victim run projection")
+        XCTAssertFalse(ctx.coordinator.autoContinuationThreadIdsForTesting.contains(victim.id))
+        XCTAssertNil(firstSurface.viewModel.selectedThreadId)
+        XCTAssertEqual(firstSurface.viewModel.prompt, "first surface victim draft",
+                       "synchronous selected-victim recovery must preserve the unsent draft")
 
         for _ in 0..<100 where firstSurface.viewModel.threadCacheResidueForTesting.contains(victim.id)
             || secondSurface.viewModel.threadCacheResidueForTesting.contains(victim.id)
@@ -1021,7 +1037,7 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
 
     // MARK: Per-surface binding persists across restart
 
-    func test_perSurfaceThreadBinding_persistsAcrossRestart() throws {
+    func test_perSurfaceThreadBinding_persistsAcrossRestart() async throws {
         let dir = NSTemporaryDirectory() + "RC2Bind-Restore-" + UUID().uuidString
         var threadId: AgentThreadID!
         var workspaceId: WorkspaceID!
@@ -1044,7 +1060,7 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         }
 
         // Fresh process.
-        let (_, router2) = try makeRouter(dir)
+        let (ctx2, router2) = try makeRouter(dir)
         defer { closeAndUnregisterAgentSurfaces(workspace: workspaceId) }
         router2.reinstantiateRestoredSurfaces()
 
@@ -1052,6 +1068,41 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         XCTAssertEqual(restored.count, 1, "the default agent tab restores (no phantom duplicate)")
         XCTAssertEqual(restored.first?.viewModel.selectedThreadId, threadId,
             "each agent tab must reopen its OWN bound thread after restart, not threads.first.")
+        let restoredSurface = try XCTUnwrap(restored.first)
+
+        restoredSurface.viewModel.prompt = "restored unsent draft"
+        restoredSurface.viewModel.seedAdditionalThreadCachesForTesting(threadId)
+        restoredSurface.viewModel.seedRunThreadProjectionForTesting(threadId)
+        ctx2.coordinator.seedAutoContinuationStateForTesting(threadId)
+        XCTAssertTrue(restoredSurface.viewModel.threadCacheResidueForTesting.contains(threadId))
+        XCTAssertEqual(restoredSurface.viewModel.activeThreadCount, 1,
+                       "precondition: the restored surface projects a victim run")
+        XCTAssertTrue(ctx2.coordinator.autoContinuationThreadIdsForTesting.contains(threadId))
+
+        try ctx2.threadRepo.delete(id: threadId)
+        restoredSurface.viewModel.setReloadThreadListForTesting {
+            throw NSError(domain: "AgentSurfaceThreadBindingRouterTests.restoredDelete", code: 1)
+        }
+        EventBus.shared.publish(kind: "agent.thread.deleted", payload: .object([
+            "thread_id": .string(threadId.value.uuidString)
+        ]))
+
+        // Yield only until the restored subscription's main-queue callback has
+        // attempted its injected-failure reload; do not manually reload/reconcile.
+        for _ in 0..<100 where !restoredSurface.viewModel.statusMessage.contains("Could not reload threads") {
+            await Task.yield()
+        }
+        restoredSurface.viewModel.setReloadThreadListForTesting(nil)
+
+        XCTAssertTrue(restoredSurface.viewModel.statusMessage.contains("Could not reload threads"))
+        XCTAssertFalse(restoredSurface.viewModel.threads.contains(where: { $0.id == threadId }))
+        XCTAssertFalse(restoredSurface.viewModel.threadCacheResidueForTesting.contains(threadId))
+        XCTAssertEqual(restoredSurface.viewModel.activeThreadCount, 0,
+                       "the restored subscription must remove the victim run projection")
+        XCTAssertFalse(ctx2.coordinator.autoContinuationThreadIdsForTesting.contains(threadId))
+        XCTAssertNil(restoredSurface.viewModel.selectedThreadId)
+        XCTAssertEqual(restoredSurface.viewModel.prompt, "restored unsent draft",
+                       "restored subscription recovery must preserve the unsent draft")
     }
 
     // MARK: Plan-note realtime mirror wiring
