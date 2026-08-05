@@ -83,6 +83,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         /// previous one (or the user started a follow-up).
         var promptGeneration: UInt64 = 0
         var turnWatchdog: DispatchWorkItem?
+        /// Wall-clock when the turn inactivity watchdog was first armed for the
+        /// current prompt generation. Absolute max is measured from this and is
+        /// **not** reset by later stream events (those only refresh inactivity).
+        var turnWatchdogArmedAt: Date?
         var promptWritePermit = AgentRunAcceptancePermit()
         var onEvent: (@Sendable (AgentRunEvent) -> Void)?
         var history: [AssistantEvent] = []
@@ -127,6 +131,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     /// stick forever (field: 70m Grok zombie with full **COMPLETE** final).
     /// Matches Claude's deferred-finish inactivity default (900s).
     private let turnInactivityTimeout: TimeInterval
+    /// Hard wall-clock cap from first arm of the turn watchdog — **not** reset
+    /// by later stream events. Stops heartbeats from postponing terminal forever
+    /// (same class of hang as Claude deferred-finish absolute max).
+    private let turnInactivityAbsoluteMaxTimeout: TimeInterval
     private let discoveryCwd: String
     private let discoveryEnvironment: [String: String]
     private let modelCacheTTL: TimeInterval
@@ -146,6 +154,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         binaryNameOverride: String? = nil,
         cancellationGracePeriod: TimeInterval = 2,
         turnInactivityTimeout: TimeInterval = 900,
+        turnInactivityAbsoluteMaxTimeout: TimeInterval = 900,
         discoveryCwd: String = FileManager.default.temporaryDirectory.path,
         discoveryEnvironment: [String: String] = [:],
         modelCacheTTL: TimeInterval = 300
@@ -153,6 +162,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         self.binaryNameOverride = binaryNameOverride
         self.cancellationGracePeriod = max(0.01, cancellationGracePeriod)
         self.turnInactivityTimeout = max(0.01, turnInactivityTimeout)
+        self.turnInactivityAbsoluteMaxTimeout = max(0.01, turnInactivityAbsoluteMaxTimeout)
         self.discoveryCwd = discoveryCwd
         self.discoveryEnvironment = discoveryEnvironment
         self.modelCacheTTL = max(0, modelCacheTTL)
@@ -924,8 +934,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     }
 
     /// (Re)arm the in-flight turn inactivity bound. No-op when the turn is no
-    /// longer open. Every stream/event emission extends the deadline so long
-    /// tools stay live; only true post-stream silence can synthesize a terminal.
+    /// longer open. Stream events extend the *inactivity* deadline so long tools
+    /// stay live; absolute max from first arm is never extended by heartbeats.
     private func refreshTurnWatchdog(session: Session, generation: UInt64) {
         lock.lock()
         guard sessions[session.threadId] === session,
@@ -937,13 +947,26 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             lock.unlock()
             return
         }
+        if session.turnWatchdogArmedAt == nil {
+            session.turnWatchdogArmedAt = Date()
+        }
+        let armedAt = session.turnWatchdogArmedAt ?? Date()
+        let elapsed = Date().timeIntervalSince(armedAt)
+        let absoluteRemaining = turnInactivityAbsoluteMaxTimeout - elapsed
+        if absoluteRemaining <= 0 {
+            session.turnWatchdog?.cancel()
+            session.turnWatchdog = nil
+            lock.unlock()
+            fireTurnInactivityWatchdog(session: session, generation: generation)
+            return
+        }
         session.turnWatchdog?.cancel()
+        let delay = min(turnInactivityTimeout, absoluteRemaining)
         let item = DispatchWorkItem { [weak self, weak session] in
             guard let self, let session else { return }
             self.fireTurnInactivityWatchdog(session: session, generation: generation)
         }
         session.turnWatchdog = item
-        let delay = turnInactivityTimeout
         lock.unlock()
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: item)
     }
@@ -951,6 +974,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     private func cancelTurnWatchdogLocked(session: Session) {
         session.turnWatchdog?.cancel()
         session.turnWatchdog = nil
+        session.turnWatchdogArmedAt = nil
     }
 
     /// When `session/prompt` never returns after the model finished streaming,
