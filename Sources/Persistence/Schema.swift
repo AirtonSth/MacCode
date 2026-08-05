@@ -21,9 +21,10 @@ public enum Schema {
     public static let checkpointListSchemaVersion: Int =
         sharedIntegrationBaseVersion + 2
 
-    /// Must equal the highest SchemaStep version (checkpoint list at 58, then
-    /// Token Saver per-thread attribution at 59).
-    public static let currentVersion: Int = 59
+    /// Must equal the highest SchemaStep version (checkpoint list at 58, Token
+    /// Saver per-thread attribution at 59, fork lifecycle support at 61, and
+    /// bounded historical-maintenance lookup support at 62).
+    public static let currentVersion: Int = 62
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1094,6 +1095,37 @@ public enum Schema {
             runs INTEGER NOT NULL,
             updated_at TEXT NOT NULL
         );
+        """),
+        // v60 never shipped. Historical payload maintenance cannot run as a
+        // schema step because that would make launch one corpus-sized write.
+        // Keep the version slot monotonic while the bounded resumable worker
+        // owns cleanup after bootstrap.
+        SchemaStep(60, """
+        SELECT 1;
+        """),
+        // Some pre-release databases already recorded v60. Install lifecycle
+        // evidence and child-delete behavior forward-only so those databases
+        // recover through the same bounded maintenance predicates.
+        SchemaStep(61, """
+        ALTER TABLE agent_thread_fork_intents
+        ADD COLUMN provider_creation_attempted INTEGER NOT NULL DEFAULT 1;
+        CREATE TRIGGER IF NOT EXISTS trg_agent_thread_fork_intent_delete_local_committed_child
+        AFTER DELETE ON agent_threads
+        BEGIN
+            DELETE FROM agent_thread_fork_intents
+            WHERE child_thread_id = OLD.id
+              AND state = 'local_committed';
+        END;
+        """),
+        SchemaStep(62, """
+        CREATE INDEX IF NOT EXISTS idx_agent_thread_fork_intents_maintenance
+            ON agent_thread_fork_intents(
+                updated_at,
+                child_thread_id
+            )
+            WHERE state = 'local_committed'
+               OR state = 'compensated'
+               OR state = 'abandoned';
         """),
     ]
 

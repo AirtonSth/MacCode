@@ -2,6 +2,104 @@ import XCTest
 @testable import Persistence
 import CoreModel
 
+private final class ForkIntentMaintenanceProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let firstBatchGate: DispatchSemaphore?
+    private let drainedExpectation: XCTestExpectation
+    private let errorExpectation: XCTestExpectation?
+    private var didBlockFirstBatch = false
+    private var didObserveDrain = false
+    private var didObserveError = false
+    private var storedReceipts: [ForkIntentMaintenanceReceipt] = []
+    private var storedReceiptTimes: [UInt64] = []
+
+    init(
+        firstBatchGate: DispatchSemaphore? = nil,
+        drainedExpectation: XCTestExpectation,
+        errorExpectation: XCTestExpectation? = nil
+    ) {
+        self.firstBatchGate = firstBatchGate
+        self.drainedExpectation = drainedExpectation
+        self.errorExpectation = errorExpectation
+    }
+
+    func beforeBatch() {
+        lock.lock()
+        let shouldBlock = !didBlockFirstBatch && firstBatchGate != nil
+        if shouldBlock { didBlockFirstBatch = true }
+        lock.unlock()
+        if shouldBlock { firstBatchGate?.wait() }
+    }
+
+    func record(_ receipt: ForkIntentMaintenanceReceipt) {
+        lock.lock()
+        storedReceipts.append(receipt)
+        storedReceiptTimes.append(DispatchTime.now().uptimeNanoseconds)
+        let shouldFulfillError = receipt.errorKind != nil && !didObserveError
+        if shouldFulfillError { didObserveError = true }
+        let shouldFulfillDrain = receipt.errorKind == nil
+            && !receipt.hasMore
+            && !didObserveDrain
+        if shouldFulfillDrain { didObserveDrain = true }
+        lock.unlock()
+        if shouldFulfillError { errorExpectation?.fulfill() }
+        if shouldFulfillDrain { drainedExpectation.fulfill() }
+    }
+
+    var receipts: [ForkIntentMaintenanceReceipt] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedReceipts
+    }
+
+    var receiptTimes: [UInt64] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedReceiptTimes
+    }
+}
+
+private final class ForkIntentFairnessProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let firstReceiptExpectation: XCTestExpectation
+    private let secondReceiptExpectation: XCTestExpectation
+    private var storedReceipts: [ForkIntentMaintenanceReceipt] = []
+    private var receiptTimes: [UInt64] = []
+
+    init(
+        firstReceiptExpectation: XCTestExpectation,
+        secondReceiptExpectation: XCTestExpectation
+    ) {
+        self.firstReceiptExpectation = firstReceiptExpectation
+        self.secondReceiptExpectation = secondReceiptExpectation
+    }
+
+    func record(_ receipt: ForkIntentMaintenanceReceipt) {
+        guard receipt.errorKind == nil else { return }
+        lock.lock()
+        storedReceipts.append(receipt)
+        receiptTimes.append(DispatchTime.now().uptimeNanoseconds)
+        let count = storedReceipts.count
+        lock.unlock()
+        if count == 1 { firstReceiptExpectation.fulfill() }
+        if count == 2 { secondReceiptExpectation.fulfill() }
+    }
+
+    var snapshot: (receipts: [ForkIntentMaintenanceReceipt], times: [UInt64]) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (storedReceipts, receiptTimes)
+    }
+}
+
+private final class NoopSQLiteMaintenance: SQLiteDBOwnedMaintenance {
+    func cancel() {}
+}
+
+private final class WeakSQLiteDBBox {
+    weak var value: SQLiteDB?
+}
+
 /// P1 — Migration-path matrix: historical -> head.
 ///
 /// WHY: `SchemaMigrationTransactionTests` covers transaction semantics (rollback,
@@ -337,15 +435,19 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             Schema.sharedIntegrationBaseVersion,
             "named step must sit after the shared integration base"
         )
-        // The composed head has Message identity, named checkpoint list, then
-        // Token Saver per-thread totals (59). This catches duplicate/reordered slots.
+        // The composed head has Message identity, named checkpoint list,
+        // Token Saver per-thread totals (59), reserved no-op (60), lifecycle
+        // support (61), then bounded maintenance lookup support (62).
         let postBase = Schema.steps.filter {
             $0.version > Schema.sharedIntegrationBaseVersion
         }
         XCTAssertEqual(postBase.map(\.version), [
             Schema.sharedIntegrationBaseVersion + 1,
             Schema.checkpointListSchemaVersion,
-            Schema.currentVersion,
+            59,
+            60,
+            61,
+            Schema.currentVersion
         ])
     }
 
@@ -502,6 +604,468 @@ final class SchemaMigrationMatrixTests: XCTestCase {
                          "a crash here would break every launch after the first")
         XCTAssertEqual(try maxVersion(db), Schema.currentVersion,
                        "re-running must not alter the recorded version")
+    }
+
+    func test_v59ToHeadDoesNotScrubTheCorpusInsideMigration() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 59 })
+        let payload = "[\"\(String(repeating: "x", count: 128 * 1024))\"]"
+        let states = [
+            "prepared", "provider_created", "compensating",
+            "local_committed", "compensated", "abandoned"
+        ]
+        for state in states {
+            let insert = try db.prepare("""
+                INSERT INTO agent_thread_fork_intents(
+                    child_thread_id, source_thread_id, provider, idempotency_key,
+                    state, child_thread_json, source_messages_json,
+                    provider_child_thread_id, last_error, created_at, updated_at
+                ) VALUES(?, ?, 'codex', ?, ?, '{}', ?, NULL, NULL, 'created', 'updated');
+            """)
+            try insert.bind(1, "child-\(state)")
+            try insert.bind(2, "source-\(state)")
+            try insert.bind(3, "key-\(state)")
+            try insert.bind(4, state)
+            try insert.bind(5, payload)
+            _ = try insert.step()
+        }
+
+        var migrationSQL: [String] = []
+        db.beforeExecuteForTesting = { migrationSQL.append($0) }
+        try Schema.migrate(db)
+        db.beforeExecuteForTesting = nil
+
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
+        XCTAssertFalse(migrationSQL.contains {
+            $0.uppercased().contains("UPDATE AGENT_THREAD_FORK_INTENTS")
+        }, "v59 -> head must never turn schema migration into a corpus-sized transcript write")
+        let preserved = try db.prepare("""
+            SELECT COUNT(*) FROM agent_thread_fork_intents
+            WHERE source_messages_json = ?;
+        """)
+        try preserved.bind(1, payload)
+        XCTAssertTrue(try preserved.step())
+        XCTAssertEqual(preserved.columnInt64(0), Int64(states.count),
+                       "schema-only migration must leave every payload byte untouched")
+    }
+
+    func test_v59LargeCorpusBootstrapReturnsThenBoundedWorkerEventuallyDrains() throws {
+        let root = NSTemporaryDirectory() + "rc2-fork-intent-maintenance-benchmark-" + UUID().uuidString
+        let dbPath = root + "/remotecode.sqlite"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let terminalPayload = "[\"" + String(repeating: "x", count: 256 * 1024) + "\"]"
+        let terminalRows = 1_000
+        let preservedPayloads = [
+            "prepared": "[\"recoverable-prepared\"]",
+            "provider_created": "[\"recoverable-provider-created\"]",
+            "compensating": "[\"recoverable-compensating\"]",
+            "abandoned": "[\"ambiguous-abandoned\"]"
+        ]
+
+        do {
+            let seed = try SQLiteDB(path: dbPath)
+            try Schema.migrateSteps(seed, Schema.steps.filter { $0.version <= 59 })
+            try seed.transaction {
+                let insert = try seed.prepare("""
+                    INSERT INTO agent_thread_fork_intents(
+                        child_thread_id, source_thread_id, provider, idempotency_key,
+                        state, child_thread_json, source_messages_json,
+                        provider_child_thread_id, last_error, created_at, updated_at
+                    ) VALUES(?, ?, 'codex', ?, ?, '{}', ?, NULL, NULL, 'created', ?);
+                """)
+                for index in 0..<terminalRows {
+                    insert.reset()
+                    try insert.bind(1, String(format: "terminal-%04d", index))
+                    try insert.bind(2, "source-\(index)")
+                    try insert.bind(3, "key-\(index)")
+                    try insert.bind(4, index.isMultiple(of: 2) ? "local_committed" : "compensated")
+                    try insert.bind(5, terminalPayload)
+                    try insert.bind(6, String(format: "%04d", index))
+                    _ = try insert.step()
+                }
+                for (state, payload) in preservedPayloads {
+                    insert.reset()
+                    try insert.bind(1, "preserved-\(state)")
+                    try insert.bind(2, "source-\(state)")
+                    try insert.bind(3, "key-\(state)")
+                    try insert.bind(4, state)
+                    try insert.bind(5, payload)
+                    try insert.bind(6, "preserved-\(state)")
+                    _ = try insert.step()
+                }
+            }
+            try seed.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        }
+
+        func fileBytes(_ path: String) -> Int64 {
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+                  let size = attributes[.size] as? NSNumber else { return 0 }
+            return size.int64Value
+        }
+        func storageBytes() -> Int64 {
+            fileBytes(dbPath) + fileBytes(dbPath + "-wal")
+        }
+
+        let beforeBytes = storageBytes()
+        let sampleLock = NSLock()
+        var peakBytes = beforeBytes
+        let sampleQueue = DispatchQueue(label: "rc2-fork-intent-maintenance-storage-sampler")
+        let sampler = DispatchSource.makeTimerSource(queue: sampleQueue)
+        sampler.schedule(deadline: .now(), repeating: .milliseconds(1))
+        sampler.setEventHandler {
+            let bytes = storageBytes()
+            sampleLock.lock()
+            peakBytes = max(peakBytes, bytes)
+            sampleLock.unlock()
+        }
+        sampler.resume()
+
+        let gate = DispatchSemaphore(value: 0)
+        let drained = expectation(description: "bounded maintenance drains historical terminal rows")
+        let probe = ForkIntentMaintenanceProbe(firstBatchGate: gate, drainedExpectation: drained)
+        let bootstrap = Bootstrap(channel: .debug, dbPathOverride: dbPath, appSupportOverride: root)
+        bootstrap.beforeForkIntentMaintenanceBatchForTesting = { probe.beforeBatch() }
+        bootstrap.forkIntentMaintenanceReceiptForTesting = { probe.record($0) }
+
+        let startupBegan = Date()
+        let (_, db) = try bootstrap.run()
+        let startupWallSeconds = Date().timeIntervalSince(startupBegan)
+        let remainingAtReturn = try AgentThreadRepository(db: db)
+            .historicalForkIntentMaintenanceCandidateCount()
+        sampleLock.lock()
+        let startupPeakBytes = peakBytes
+        sampleLock.unlock()
+
+        XCTAssertEqual(remainingAtReturn, terminalRows,
+                       "bootstrap must return while the corpus remains queued for background maintenance")
+        XCTAssertEqual(db.maintenanceInstallCountForTesting, 1)
+        XCTAssertFalse(db.installOwnedMaintenance(NoopSQLiteMaintenance()),
+                       "one database connection must retain at most one maintenance loop")
+
+        gate.signal()
+        wait(for: [drained], timeout: 60)
+        sampler.cancel()
+        sampleQueue.sync {}
+        sampleLock.lock()
+        peakBytes = max(peakBytes, storageBytes())
+        let eventualPeakBytes = peakBytes
+        sampleLock.unlock()
+        let afterBytes = storageBytes()
+
+        let repository = AgentThreadRepository(db: db)
+        XCTAssertEqual(try repository.historicalForkIntentMaintenanceCandidateCount(), 0)
+        let successfulReceipts = probe.receipts.filter { $0.errorKind == nil }
+        XCTAssertFalse(successfulReceipts.isEmpty)
+        XCTAssertTrue(successfulReceipts.allSatisfy {
+            $0.batchCount > 0
+                && $0.batchCount <= AgentThreadRepository.terminalForkIntentCleanupBatchSize
+        }, "every transaction must process between 1 and 16 rows")
+        let receiptTimes = probe.receiptTimes
+        XCTAssertGreaterThanOrEqual(receiptTimes.count, 2)
+        let minimumDefaultInterBatchMilliseconds = zip(receiptTimes, receiptTimes.dropFirst())
+            .map { previous, next in Double(next - previous) / 1_000_000 }
+            .min() ?? 0
+        XCTAssertGreaterThanOrEqual(
+            minimumDefaultInterBatchMilliseconds,
+            5,
+            "the production 10ms success delay must pace every maintenance batch"
+        )
+        for (state, payload) in preservedPayloads {
+            let row = try db.prepare("""
+                SELECT source_messages_json, provider_creation_attempted
+                FROM agent_thread_fork_intents WHERE child_thread_id = ?;
+            """)
+            try row.bind(1, "preserved-\(state)")
+            XCTAssertTrue(try row.step())
+            XCTAssertEqual(row.columnText(0), payload,
+                           "recoverable and ambiguous payloads must remain byte-identical")
+            XCTAssertEqual(row.columnInt64(1), 1)
+        }
+
+        print("FORK_INTENT_MAINTENANCE_LOCAL startup_wall_seconds=\(String(format: "%.3f", startupWallSeconds)) before_db_wal_bytes=\(beforeBytes) startup_peak_db_wal_bytes=\(startupPeakBytes) eventual_peak_db_wal_bytes=\(eventualPeakBytes) after_db_wal_bytes=\(afterBytes) terminal_rows=\(terminalRows) batch_limit=\(AgentThreadRepository.terminalForkIntentCleanupBatchSize) batches=\(successfulReceipts.count) minimum_default_inter_batch_ms=\(String(format: "%.3f", minimumDefaultInterBatchMilliseconds))")
+    }
+
+    func test_largeMaintenanceBacklogPacesBatchesSoForegroundDatabaseWorkProgresses() throws {
+        let root = NSTemporaryDirectory() + "rc2-fork-intent-maintenance-fairness-" + UUID().uuidString
+        let dbPath = root + "/remotecode.sqlite"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+
+        do {
+            let seed = try SQLiteDB(path: dbPath)
+            try Schema.migrate(seed)
+            try seed.transaction {
+                let insert = try seed.prepare("""
+                    INSERT INTO agent_thread_fork_intents(
+                        child_thread_id, source_thread_id, provider, idempotency_key,
+                        state, child_thread_json, source_messages_json,
+                        provider_child_thread_id, last_error, created_at, updated_at,
+                        provider_creation_attempted
+                    ) VALUES(?, ?, 'codex', ?, 'compensated', '{}', '[]',
+                             'provider-child', NULL, 'created', ?, 1);
+                """)
+                for index in 0..<1_000 {
+                    insert.reset()
+                    try insert.bind(1, String(format: "fairness-child-%04d", index))
+                    try insert.bind(2, "fairness-source-\(index)")
+                    try insert.bind(3, "fairness-key-\(index)")
+                    try insert.bind(4, String(format: "%04d", index))
+                    _ = try insert.step()
+                }
+            }
+        }
+
+        let firstReceipt = expectation(description: "first bounded batch completes")
+        let secondReceipt = expectation(description: "second bounded batch completes after pacing")
+        let probe = ForkIntentFairnessProbe(
+            firstReceiptExpectation: firstReceipt,
+            secondReceiptExpectation: secondReceipt
+        )
+        let bootstrap = Bootstrap(channel: .debug, dbPathOverride: dbPath, appSupportOverride: root)
+        bootstrap.forkIntentMaintenanceSuccessDelayNanosecondsForTesting = 250_000_000
+        bootstrap.forkIntentMaintenanceReceiptForTesting = { probe.record($0) }
+        let (_, db) = try bootstrap.run()
+
+        wait(for: [firstReceipt], timeout: 5)
+        let foregroundStarted = DispatchTime.now().uptimeNanoseconds
+        let foreground = try db.prepare("SELECT COUNT(*) FROM schema_meta;")
+        XCTAssertTrue(try foreground.step())
+        XCTAssertGreaterThan(foreground.columnInt64(0), 0)
+        let foregroundMilliseconds = Double(
+            DispatchTime.now().uptimeNanoseconds - foregroundStarted
+        ) / 1_000_000
+        XCTAssertLessThan(foregroundMilliseconds, 100,
+                          "foreground DB work must acquire operationLock during the success pacing window")
+        XCTAssertEqual(probe.snapshot.receipts.count, 1,
+                       "foreground DB work must finish before the next maintenance batch starts")
+
+        wait(for: [secondReceipt], timeout: 5)
+        let snapshot = probe.snapshot
+        XCTAssertGreaterThanOrEqual(snapshot.receipts.count, 2)
+        XCTAssertTrue(snapshot.receipts.prefix(2).allSatisfy {
+            $0.batchCount > 0
+                && $0.batchCount <= AgentThreadRepository.terminalForkIntentCleanupBatchSize
+                && $0.hasMore
+        }, "a 1000-row backlog must mutate at most 16 rows per transaction")
+        let interBatchMilliseconds = Double(snapshot.times[1] - snapshot.times[0]) / 1_000_000
+        XCTAssertGreaterThanOrEqual(interBatchMilliseconds, 200,
+                                    "successful batches must not spin in a tight loop")
+        print("FORK_INTENT_MAINTENANCE_FAIRNESS foreground_ms=\(String(format: "%.3f", foregroundMilliseconds)) inter_batch_ms=\(String(format: "%.3f", interBatchMilliseconds)) backlog_rows=1000 batch_limit=\(AgentThreadRepository.terminalForkIntentCleanupBatchSize)")
+    }
+
+    func test_v62MaintenanceQueryPlanUsesPartialUpdatedAtIndex() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let plan = try db.prepare("""
+            EXPLAIN QUERY PLAN
+            SELECT child_thread_id
+            FROM agent_thread_fork_intents AS intent
+                 INDEXED BY idx_agent_thread_fork_intents_maintenance
+            WHERE (intent.state = 'local_committed'
+                   OR intent.state = 'compensated'
+                   OR intent.state = 'abandoned')
+              AND ((intent.state = 'local_committed'
+                    AND (intent.source_messages_json != '[]'
+                         OR NOT EXISTS (
+                             SELECT 1 FROM agent_threads AS child
+                             WHERE child.id = intent.child_thread_id
+                         )))
+                   OR intent.state = 'compensated'
+                   OR (intent.state = 'abandoned'
+                       AND intent.provider_creation_attempted = 0))
+            ORDER BY intent.updated_at ASC, intent.child_thread_id ASC
+            LIMIT 17;
+        """)
+        var details: [String] = []
+        while try plan.step() {
+            if let detail = plan.columnText(3) { details.append(detail) }
+        }
+        XCTAssertTrue(details.contains {
+            $0.contains("USING INDEX idx_agent_thread_fork_intents_maintenance")
+        }, "v62 must serve ordered maintenance candidates from its partial index: \(details)")
+        XCTAssertFalse(details.contains {
+            $0.contains("USE TEMP B-TREE")
+        }, "v62 must satisfy maintenance ordering without a temporary B-tree: \(details)")
+    }
+
+    func test_oldV61MaintenanceRollsBackFailedBatchAndRetriesToDrain() throws {
+        let root = NSTemporaryDirectory() + "rc2-fork-intent-v61-recovery-" + UUID().uuidString
+        let dbPath = root + "/remotecode.sqlite"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let batchSize = AgentThreadRepository.terminalForkIntentCleanupBatchSize
+        let candidateCount = batchSize + 2
+
+        func scalar(_ db: SQLiteDB, _ sql: String) throws -> Int {
+            let statement = try db.prepare(sql)
+            defer { statement.reset() }
+            guard try statement.step() else { return 0 }
+            return Int(statement.columnInt64(0))
+        }
+
+        do {
+            let legacy = try SQLiteDB(path: dbPath)
+            try Schema.migrateSteps(legacy, Schema.steps.filter { $0.version <= 61 })
+            let insert = try legacy.prepare("""
+                INSERT INTO agent_thread_fork_intents(
+                    child_thread_id, source_thread_id, provider, idempotency_key,
+                    state, child_thread_json, source_messages_json,
+                    provider_child_thread_id, last_error, created_at, updated_at
+                ) VALUES(?, ?, 'codex', ?, ?, '{}', ?, 'provider-child', NULL, 'created', 'updated');
+            """)
+            for index in 0..<candidateCount {
+                insert.reset()
+                try insert.bind(1, String(format: "candidate-%04d", index))
+                try insert.bind(2, "source-\(index)")
+                try insert.bind(3, "key-\(index)")
+                try insert.bind(4, index.isMultiple(of: 2) ? "compensated" : "local_committed")
+                try insert.bind(5, "[\"historical terminal payload\"]")
+                _ = try insert.step()
+            }
+            insert.reset()
+            try insert.bind(1, "recoverable-prepared")
+            try insert.bind(2, "source-recoverable")
+            try insert.bind(3, "key-recoverable")
+            try insert.bind(4, "prepared")
+            try insert.bind(5, "[\"recoverable transcript\"]")
+            _ = try insert.step()
+            insert.reset()
+            try insert.bind(1, "legacy-abandoned")
+            try insert.bind(2, "source-abandoned")
+            try insert.bind(3, "key-abandoned")
+            try insert.bind(4, "abandoned")
+            try insert.bind(5, "[]")
+            _ = try insert.step()
+            try legacy.execute("""
+                INSERT INTO agent_threads(id, title, provider, model, status, created_at, updated_at)
+                VALUES('candidate-\(String(format: "%04d", 1))', 'live child', 'codex', 'm', 'completed', 'created', 'updated');
+            """)
+            try legacy.execute("""
+                CREATE TRIGGER fail_causal_fork_cleanup
+                BEFORE DELETE ON agent_thread_fork_intents
+                WHEN OLD.child_thread_id = 'candidate-\(String(format: "%04d", 2))'
+                BEGIN SELECT RAISE(ABORT, 'injected causal cleanup failure'); END;
+            """)
+        }
+
+        let failed = expectation(description: "one bounded batch reports failure")
+        let drained = expectation(description: "retry drains after injected failure is removed")
+        let probe = ForkIntentMaintenanceProbe(
+            drainedExpectation: drained,
+            errorExpectation: failed
+        )
+        let bootstrap = Bootstrap(channel: .debug, dbPathOverride: dbPath, appSupportOverride: root)
+        bootstrap.forkIntentMaintenanceReceiptForTesting = { probe.record($0) }
+        bootstrap.forkIntentMaintenanceRetryDelayNanosecondsForTesting = 500_000_000
+        let (_, afterFailure) = try bootstrap.run()
+        wait(for: [failed], timeout: 10)
+        XCTAssertEqual(try scalar(afterFailure, "SELECT MAX(version) FROM schema_meta;"), Schema.currentVersion,
+                       "an old v61 database must advance through v62 before maintenance")
+        XCTAssertEqual(try scalar(afterFailure, """
+            SELECT COUNT(*) FROM agent_thread_fork_intents
+            WHERE state = 'compensated'
+               OR (state = 'local_committed' AND child_thread_id != 'candidate-0001');
+        """), candidateCount - 1,
+                       "a failed batch must roll back every tentative terminal deletion")
+        XCTAssertEqual(try scalar(afterFailure, """
+            SELECT provider_creation_attempted FROM agent_thread_fork_intents
+            WHERE child_thread_id = 'recoverable-prepared';
+        """), 1,
+                       "legacy recoverable rows default to ambiguous rather than becoming deletable")
+        XCTAssertEqual(try scalar(afterFailure, """
+            SELECT COUNT(*) FROM agent_thread_fork_intents
+            WHERE child_thread_id = 'candidate-0001'
+              AND source_messages_json = '[\"historical terminal payload\"]';
+        """), 1, "the failed batch must also roll back a preceding live-child scrub")
+        try afterFailure.execute("DROP TRIGGER fail_causal_fork_cleanup;")
+
+        wait(for: [drained], timeout: 10)
+        let firstDB = afterFailure
+        XCTAssertEqual(try scalar(firstDB, """
+            SELECT COUNT(*) FROM agent_thread_fork_intents
+            WHERE state = 'compensated'
+               OR (state = 'local_committed' AND child_thread_id != 'candidate-0001');
+        """), 0)
+        XCTAssertEqual(try scalar(firstDB, """
+            SELECT COUNT(*) FROM agent_thread_fork_intents
+            WHERE child_thread_id = 'recoverable-prepared'
+              AND source_messages_json = '["recoverable transcript"]';
+        """), 1,
+                       "recoverable transcript payloads must survive every maintenance retry exactly")
+        XCTAssertEqual(try scalar(firstDB, """
+            SELECT COUNT(*) FROM agent_thread_fork_intents
+            WHERE child_thread_id IN ('candidate-0001', 'legacy-abandoned');
+        """), 2,
+                       "a live local child and an unproven legacy abandonment are not cleanup candidates")
+        XCTAssertEqual(try scalar(firstDB, """
+            SELECT COUNT(*) FROM agent_thread_fork_intents
+            WHERE child_thread_id = 'candidate-0001'
+              AND source_messages_json = '[]';
+        """), 1, "a live-child tombstone is scrubbed but never deleted")
+
+        XCTAssertEqual(afterFailure.maintenanceInstallCountForTesting, 1)
+        XCTAssertEqual(probe.receipts.filter { $0.errorKind != nil }.count, 1)
+        XCTAssertTrue(probe.receipts.filter { $0.errorKind == nil }.allSatisfy {
+            $0.batchCount <= batchSize
+        })
+        let secondDB = afterFailure
+        XCTAssertEqual(try scalar(secondDB, """
+            SELECT COUNT(*) FROM agent_thread_fork_intents
+            WHERE state = 'compensated'
+               OR (state = 'local_committed' AND child_thread_id != 'candidate-0001');
+        """), 0,
+                       "the next startup resumes from the remaining causal candidates without a cursor replay")
+    }
+
+    func test_maintenanceKeepsDatabaseAliveOnlyUntilInFlightBatchReturns() throws {
+        let root = NSTemporaryDirectory() + "rc2-fork-intent-maintenance-lifetime-" + UUID().uuidString
+        let dbPath = root + "/remotecode.sqlite"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+
+        do {
+            let seed = try SQLiteDB(path: dbPath)
+            try Schema.migrate(seed)
+            try seed.execute("""
+                INSERT INTO agent_thread_fork_intents(
+                    child_thread_id, source_thread_id, provider, idempotency_key,
+                    state, child_thread_json, source_messages_json,
+                    provider_child_thread_id, last_error, created_at, updated_at,
+                    provider_creation_attempted
+                ) VALUES('lifetime-child', 'lifetime-source', 'codex', 'lifetime-key',
+                         'compensated', '{}', '[]', 'provider-child', NULL,
+                         'created', 'updated', 1);
+            """)
+        }
+
+        let beforeBatchGate = DispatchSemaphore(value: 0)
+        let batchEntered = DispatchSemaphore(value: 0)
+        let batchRelease = DispatchSemaphore(value: 0)
+        let didDrain = expectation(description: "in-flight batch drains its final candidate")
+        let didDeinitialize = expectation(description: "database deinitializes after in-flight batch")
+        let probe = ForkIntentMaintenanceProbe(drainedExpectation: didDrain)
+        let bootstrap = Bootstrap(channel: .debug, dbPathOverride: dbPath, appSupportOverride: root)
+        bootstrap.beforeForkIntentMaintenanceBatchForTesting = { beforeBatchGate.wait() }
+        bootstrap.forkIntentMaintenanceReceiptForTesting = { probe.record($0) }
+        let weakDatabase = WeakSQLiteDBBox()
+        try autoreleasepool {
+            var database: SQLiteDB? = try bootstrap.run().1
+            weakDatabase.value = database
+            database?.onDeinitForTesting = { didDeinitialize.fulfill() }
+            database?.beforeStatementStepForTesting = { sql in
+                guard sql.contains("SELECT child_thread_id") else { return }
+                weakDatabase.value?.beforeStatementStepForTesting = nil
+                batchEntered.signal()
+                batchRelease.wait()
+            }
+
+            beforeBatchGate.signal()
+            XCTAssertEqual(batchEntered.wait(timeout: .now() + 5), .success)
+            database = nil
+        }
+        XCTAssertNotNil(weakDatabase.value,
+                        "the synchronous batch scope must prevent SQLite close while a statement is active")
+        batchRelease.signal()
+        wait(for: [didDrain, didDeinitialize], timeout: 5)
+        XCTAssertNil(weakDatabase.value,
+                     "no SQLiteDB reference may cross the worker's next await or keep its owner cycle alive")
     }
 
     // MARK: - Monotonically-increasing version numbers

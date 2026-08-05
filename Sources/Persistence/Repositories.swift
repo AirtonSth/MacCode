@@ -190,19 +190,86 @@ public struct AgentThreadForkIntent: Codable, Sendable, Equatable {
     public let provider: AgentProvider
     public let idempotencyKey: String
     public let state: AgentThreadForkIntentState
+    /// `prepared` alone is not proof that an adapter was never called: a crash
+    /// can land after a provider accepts the stable key but before its child id
+    /// is durably recorded. New intents start false and flip before that call;
+    /// legacy rows migrate as true so they remain ambiguity-safe.
+    public let providerCreationAttempted: Bool
     public let providerChildThreadId: String?
     public let lastError: String?
     public let createdAt: Date
     public let updatedAt: Date
 }
 
+public struct AgentThreadCapacityDiagnostics: Equatable, Sendable {
+    public let protectedCounts: [String: Int]
+
+    public init(protectedCounts: [String: Int] = [:]) {
+        self.protectedCounts = protectedCounts.filter { $0.value > 0 }
+    }
+
+}
+
+public enum AgentThreadCapacityError: Error, Equatable, CustomStringConvertible, LocalizedError {
+    case workspaceLimitExceeded(
+        workspaceId: WorkspaceID,
+        limit: Int,
+        actualCount: Int,
+        diagnostics: AgentThreadCapacityDiagnostics = AgentThreadCapacityDiagnostics()
+    )
+
+    public var description: String {
+        switch self {
+        case .workspaceLimitExceeded(_, let limit, let actualCount, let diagnostics):
+            let categories = diagnostics.protectedCounts
+                .sorted { $0.key < $1.key }
+                .map { "\($0.key)=\($0.value)" }
+                .joined(separator: ", ")
+            let detail = categories.isEmpty ? "" : " Protected: \(categories)."
+            return "Agent thread capacity reached: \(actualCount) threads for a hard limit of \(limit). No reclaimable terminal thread is safe to remove (running, pinned, draft, worktree, or bound). Close or unpin a thread, then retry.\(detail)"
+        }
+    }
+
+    public var errorDescription: String? { description }
+}
+
 public final class AgentThreadRepository {
-    /// Soft product cap: keep each workspace's thread table bounded so scheduled
-    /// runs and long sessions cannot grow SQLite without limit.
-    public static let maxThreadsPerWorkspace = 100
+    /// Best-effort retention cap: keep each workspace's disposable empty shells
+    /// bounded without deleting user-owned or operational state.
+    /// Hard product ceiling: at most 5 threads per workspace (storage pressure).
+    public static let maxThreadsPerWorkspace = 5
+    /// Each maintenance transaction processes at most this many historical
+    /// terminal rows. This bounds work, not eligibility: recoverable rows are
+    /// never candidates regardless of age or count.
+    public static let terminalForkIntentCleanupBatchSize = 16
+
+    public struct ForkIntentMaintenanceBatch: Equatable, Sendable {
+        public let scrubbedCount: Int
+        public let deletedCount: Int
+        public let hasMore: Bool
+
+        public var processedCount: Int { scrubbedCount + deletedCount }
+    }
 
     let db: SQLiteDB
     public init(db: SQLiteDB) { self.db = db }
+
+    /// Live Agent App bindings are process state, not a new persistence model.
+    /// Binding updates take this same lock before changing visible selection;
+    /// cap victim selection holds it through the guarded DELETE transaction.
+    public func setLiveSurfaceBinding(surfaceID: SurfaceID, threadID: AgentThreadID?) {
+        db.setLiveAgentThreadBinding(surfaceID: surfaceID, threadID: threadID)
+    }
+
+    public var liveSurfaceBoundThreadIDsForTesting: Set<AgentThreadID> {
+        db.withLiveAgentThreadBindings { $0 }
+    }
+
+    private func withLiveSurfaceBindingsLocked<T>(
+        _ body: (Set<AgentThreadID>) throws -> T
+    ) rethrows -> T {
+        try db.withLiveAgentThreadBindings(body)
+    }
 
     public func upsert(_ t: AgentThread) throws {
         let st = try db.prepare("""
@@ -258,6 +325,268 @@ public final class AgentThreadRepository {
             let routing = try db.prepare("DELETE FROM agent_thread_routing WHERE thread_id = ?;")
             try routing.bind(1, t.id.value.uuidString)
             _ = try routing.step()
+        }
+    }
+
+    /// Hard workspace cap: reclaim oldest *terminal* threads (including those with
+    /// history) when over the limit. Protected and never auto-deleted:
+    /// running/pending, pinned, durable drafts, worktrees, recoverable fork
+    /// intents, and live surface bindings (excluded via the live-binding set).
+    /// Keep this predicate shared by preflight, selection, and the guarded DELETE.
+    private func workspaceThreadLimitEligibilityPredicate(candidateAlias: String) -> String {
+        """
+        -- Everything except an active run is reclaimable under the hard 5-thread
+        -- ceiling (includes pending shells and completed history with messages).
+        AND \(candidateAlias).status NOT IN ('running')
+        AND \(candidateAlias).pinned = 0
+        AND NULLIF(TRIM(COALESCE(\(candidateAlias).worktree_path, '')), '') IS NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM agent_thread_drafts AS draft
+            WHERE draft.thread_id = \(candidateAlias).id
+              AND (
+                  LENGTH(TRIM(COALESCE(draft.text, ''))) > 0
+                  OR CASE
+                      WHEN json_valid(COALESCE(draft.attachments_json, '')) = 1
+                      THEN CASE
+                          WHEN json_type(draft.attachments_json) = 'array'
+                          THEN json_array_length(draft.attachments_json) > 0
+                          ELSE 1
+                      END
+                      ELSE LENGTH(TRIM(COALESCE(draft.attachments_json, ''))) > 0
+                  END
+              )
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM agent_thread_fork_intents AS intent
+            WHERE intent.state IN ('prepared', 'provider_created', 'compensating')
+              AND (intent.source_thread_id = \(candidateAlias).id
+                   OR intent.child_thread_id = \(candidateAlias).id)
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM session_snapshots AS snapshot, json_tree(snapshot.payload_json) AS value
+            WHERE snapshot.id = (SELECT MAX(id) FROM session_snapshots)
+              AND json_valid(snapshot.payload_json) = 1
+              AND value.type = 'text'
+              AND value.atom = \(candidateAlias).id
+        )
+        """
+    }
+
+    private func workspaceThreadCapacityDiagnostics(
+        workspaceId: WorkspaceID,
+        liveSurfaceBindings: Set<AgentThreadID>
+    ) throws -> AgentThreadCapacityDiagnostics {
+        func count(_ predicate: String) throws -> Int {
+            let statement = try db.prepare("""
+                SELECT COUNT(*) FROM agent_threads AS candidate
+                WHERE candidate.workspace_id = ? AND (\(predicate));
+            """)
+            try statement.bind(1, workspaceId.value.uuidString)
+            return try statement.step() ? Int(statement.columnInt64(0)) : 0
+        }
+
+        var counts: [String: Int] = [:]
+        counts["active"] = try count("candidate.status IN ('running', 'pending')")
+        counts["pinned"] = try count("candidate.pinned != 0")
+        counts["history"] = try count("EXISTS (SELECT 1 FROM agent_messages AS message WHERE message.thread_id = candidate.id)")
+        counts["draft_or_worktree"] = try count("""
+            NULLIF(TRIM(COALESCE(candidate.worktree_path, '')), '') IS NOT NULL
+            OR EXISTS (
+                SELECT 1 FROM agent_thread_drafts AS draft
+                WHERE draft.thread_id = candidate.id
+                  AND (LENGTH(TRIM(COALESCE(draft.text, ''))) > 0
+                       OR LENGTH(TRIM(COALESCE(draft.attachments_json, '[]'))) > 2)
+            )
+        """)
+        counts["fork_recovery"] = try count("""
+            EXISTS (
+                SELECT 1 FROM agent_thread_fork_intents AS intent
+                WHERE intent.source_thread_id = candidate.id
+                   OR intent.child_thread_id = candidate.id
+            )
+        """)
+        counts["runtime_or_queue"] = try count("""
+            EXISTS (SELECT 1 FROM agent_runs AS run WHERE run.thread_id = candidate.id)
+            OR EXISTS (SELECT 1 FROM provider_session_runtime AS session WHERE session.thread_id = candidate.id)
+            OR EXISTS (SELECT 1 FROM provider_pending_callbacks AS callback WHERE callback.thread_id = candidate.id)
+            OR EXISTS (SELECT 1 FROM agent_queued_messages AS queued WHERE queued.thread_id = candidate.id)
+        """)
+        counts["plan_or_checkpoint"] = try count("""
+            EXISTS (SELECT 1 FROM agent_proposed_plans AS plan WHERE plan.thread_id = candidate.id OR plan.implementation_thread_id = candidate.id)
+            OR EXISTS (SELECT 1 FROM agent_turn_checkpoints AS checkpoint WHERE checkpoint.thread_id = candidate.id)
+            OR EXISTS (SELECT 1 FROM agent_turn_checkpoint_catalog_meta AS catalog WHERE catalog.thread_id = candidate.id)
+        """)
+
+        var boundIDs = liveSurfaceBindings
+        let persisted = try db.prepare("""
+            SELECT DISTINCT candidate.id
+            FROM agent_threads AS candidate,
+                 session_snapshots AS snapshot,
+                 json_tree(snapshot.payload_json) AS value
+            WHERE candidate.workspace_id = ?
+              AND snapshot.id = (SELECT MAX(id) FROM session_snapshots)
+              AND json_valid(snapshot.payload_json) = 1
+              AND value.type = 'text'
+              AND value.atom = candidate.id;
+        """)
+        try persisted.bind(1, workspaceId.value.uuidString)
+        while try persisted.step() {
+            if let uuid = persisted.columnText(0).flatMap(UUID.init(uuidString:)) {
+                boundIDs.insert(AgentThreadID(uuid))
+            }
+        }
+        let workspaceThreadIDs = Set(try list(workspaceId: workspaceId).map(\.id))
+        counts["surface_bound"] = boundIDs.intersection(workspaceThreadIDs).count
+        return AgentThreadCapacityDiagnostics(protectedCounts: counts)
+    }
+
+    private func workspaceThreadCapacityError(
+        workspaceId: WorkspaceID,
+        limit: Int,
+        actualCount: Int,
+        liveSurfaceBindings: Set<AgentThreadID>
+    ) throws -> AgentThreadCapacityError {
+        .workspaceLimitExceeded(
+            workspaceId: workspaceId,
+            limit: limit,
+            actualCount: actualCount,
+            diagnostics: try workspaceThreadCapacityDiagnostics(
+                workspaceId: workspaceId,
+                liveSurfaceBindings: liveSurfaceBindings
+            )
+        )
+    }
+
+    /// Cheap fail-fast check before a producer performs irreversible or
+    /// expensive work. The capped transaction remains authoritative for races.
+    public func preflightWorkspaceThreadInsertion(
+        workspaceId: WorkspaceID,
+        prospectiveThreadId: AgentThreadID? = nil,
+        excludedVictimIDs: Set<AgentThreadID> = [],
+        limit: Int = AgentThreadRepository.maxThreadsPerWorkspace
+    ) throws {
+        let cap = max(1, limit)
+        try withLiveSurfaceBindingsLocked { liveBindings in
+            try db.performSync { _ in
+                let total = try count(workspaceId: workspaceId)
+                let prospectiveExists: Bool
+                if let prospectiveThreadId {
+                    prospectiveExists = try get(id: prospectiveThreadId)?.workspaceId == workspaceId
+                } else {
+                    prospectiveExists = false
+                }
+                let projectedCount = total + (prospectiveExists ? 0 : 1)
+                let requiredVictims = max(0, projectedCount - cap)
+                guard requiredVictims > 0 else { return }
+
+                var excludedIDs = excludedVictimIDs.union(liveBindings)
+                if let prospectiveThreadId { excludedIDs.insert(prospectiveThreadId) }
+                let excludedRawIDs = excludedIDs.map { $0.value.uuidString }.sorted()
+                let exclusion = excludedRawIDs.isEmpty
+                    ? ""
+                    : "AND candidate.id NOT IN (\(Array(repeating: "?", count: excludedRawIDs.count).joined(separator: ", ")))"
+                let statement = try db.prepare("""
+                    SELECT COUNT(*) FROM agent_threads AS candidate
+                    WHERE candidate.workspace_id = ?
+                      \(workspaceThreadLimitEligibilityPredicate(candidateAlias: "candidate"))
+                      \(exclusion);
+                """)
+                try statement.bind(1, workspaceId.value.uuidString)
+                for (index, id) in excludedRawIDs.enumerated() {
+                    try statement.bind(Int32(index + 2), id)
+                }
+                let eligibleCount = try statement.step() ? Int(statement.columnInt64(0)) : 0
+                guard eligibleCount >= requiredVictims else {
+                    throw try workspaceThreadCapacityError(
+                        workspaceId: workspaceId,
+                        limit: cap,
+                        actualCount: projectedCount,
+                        liveSurfaceBindings: liveBindings
+                    )
+                }
+            }
+        }
+    }
+
+    /// Persists a thread and applies the workspace retention cap as one write.
+    /// Any victim-delete failure rolls the upsert back with the transaction.
+    @discardableResult
+    public func upsertEnforcingWorkspaceThreadLimit(
+        _ thread: AgentThread,
+        limit: Int = AgentThreadRepository.maxThreadsPerWorkspace
+    ) throws -> [AgentThreadID] {
+        try transactionallyUpsertEnforcingWorkspaceThreadLimit(thread, limit: limit) {}
+    }
+
+    /// Persists a capped thread and its dependent graph writes atomically.
+    /// Callers publish returned victim ids only after this method commits.
+    @discardableResult
+    public func transactionallyUpsertEnforcingWorkspaceThreadLimit(
+        _ thread: AgentThread,
+        limit: Int = AgentThreadRepository.maxThreadsPerWorkspace,
+        excludedVictimIDs: Set<AgentThreadID> = [],
+        additionalWrites: () throws -> Void
+    ) throws -> [AgentThreadID] {
+        return try db.performSync { database in
+            try database.transaction {
+                let victims = try upsertEnforcingWorkspaceThreadLimitInCurrentTransaction(
+                    thread,
+                    limit: limit,
+                    excludedVictimIDs: excludedVictimIDs
+                )
+                try additionalWrites()
+                return victims
+            }
+        }
+    }
+
+    private func upsertEnforcingWorkspaceThreadLimitInCurrentTransaction(
+        _ thread: AgentThread,
+        limit: Int,
+        excludedVictimIDs: Set<AgentThreadID> = []
+    ) throws -> [AgentThreadID] {
+        try upsert(thread)
+        guard let workspaceID = thread.workspaceId else { return [] }
+        return try enforceWorkspaceThreadLimitInCurrentTransaction(
+            workspaceId: workspaceID,
+            limit: limit,
+            excluding: excludedVictimIDs.union([thread.id])
+        )
+    }
+
+    func enforceWorkspaceThreadLimitInCurrentTransaction(
+        workspaceId: WorkspaceID,
+        limit: Int,
+        excluding excludedThreadIDs: Set<AgentThreadID>
+    ) throws -> [AgentThreadID] {
+        try withLiveSurfaceBindingsLocked { liveBindings in
+            let cap = max(1, limit)
+            let victims = try workspaceThreadLimitVictims(
+                workspaceId: workspaceId,
+                limit: cap,
+                excluding: excludedThreadIDs.union(liveBindings)
+            )
+            for id in victims {
+                guard try deleteWorkspaceThreadLimitVictimIfStillEligible(id) else {
+                    throw try workspaceThreadCapacityError(
+                        workspaceId: workspaceId,
+                        limit: cap,
+                        actualCount: try count(workspaceId: workspaceId),
+                        liveSurfaceBindings: liveBindings
+                    )
+                }
+            }
+            let actualCount = try count(workspaceId: workspaceId)
+            guard actualCount <= cap else {
+                throw try workspaceThreadCapacityError(
+                    workspaceId: workspaceId,
+                    limit: cap,
+                    actualCount: actualCount,
+                    liveSurfaceBindings: liveBindings
+                )
+            }
+            return victims
         }
     }
 
@@ -409,29 +738,66 @@ public final class AgentThreadRepository {
         workspaceId: WorkspaceID,
         limit: Int = AgentThreadRepository.maxThreadsPerWorkspace
     ) throws -> [AgentThreadID] {
+        try db.performSync { database in
+            try database.transaction {
+                try enforceWorkspaceThreadLimitInCurrentTransaction(
+                    workspaceId: workspaceId,
+                    limit: limit,
+                    excluding: []
+                )
+            }
+        }
+    }
+
+    private func workspaceThreadLimitVictims(
+        workspaceId: WorkspaceID,
+        limit: Int,
+        excluding excludedThreadIDs: Set<AgentThreadID> = []
+    ) throws -> [AgentThreadID] {
         let cap = max(1, limit)
         let total = try count(workspaceId: workspaceId)
         guard total > cap else { return [] }
         let excess = total - cap
         // Prefer pruning idle unpinned history; never touch active runs.
+        let excludedRawIDs = excludedThreadIDs.map { $0.value.uuidString }.sorted()
+        let exclusion = excludedRawIDs.isEmpty
+            ? ""
+            : "AND candidate.id NOT IN (\(Array(repeating: "?", count: excludedRawIDs.count).joined(separator: ", ")))"
         let st = try db.prepare("""
-            SELECT id FROM agent_threads
-            WHERE workspace_id = ?
-              AND status NOT IN ('running', 'pending')
-            ORDER BY pinned ASC, updated_at ASC, id ASC
+            SELECT candidate.id FROM agent_threads AS candidate
+            WHERE candidate.workspace_id = ?
+              \(workspaceThreadLimitEligibilityPredicate(candidateAlias: "candidate"))
+              \(exclusion)
+            ORDER BY candidate.updated_at ASC, candidate.id ASC
             LIMIT ?;
-            """)
+        """)
         try st.bind(1, workspaceId.value.uuidString)
-        try st.bind(2, Int64(excess))
+        for (index, id) in excludedRawIDs.enumerated() {
+            try st.bind(Int32(index + 2), id)
+        }
+        try st.bind(Int32(excludedRawIDs.count + 2), Int64(excess))
         var victims: [AgentThreadID] = []
         while try st.step() {
             if let uuid = st.columnText(0).flatMap(UUID.init(uuidString:)) {
                 victims.append(AgentThreadID(uuid))
             }
         }
-        guard !victims.isEmpty else { return [] }
-        try delete(ids: victims)
         return victims
+    }
+
+    /// Victim selection is only advisory until this guarded DELETE executes.
+    /// Recheck active status and recoverable fork participation so any change
+    /// after selection aborts and rolls back the entire cap transaction.
+    private func deleteWorkspaceThreadLimitVictimIfStillEligible(_ id: AgentThreadID) throws -> Bool {
+        let deletion = try db.prepare("""
+            DELETE FROM agent_threads
+            WHERE id = ?
+              \(workspaceThreadLimitEligibilityPredicate(candidateAlias: "agent_threads"));
+        """)
+        try deletion.bind(1, id.value.uuidString)
+        _ = try deletion.step()
+        let changes = try db.prepare("SELECT changes();")
+        return try changes.step() && changes.columnInt64(0) == 1
     }
 
     /// Persists the complete local half of a provider-native fork as one graph.
@@ -443,6 +809,22 @@ public final class AgentThreadRepository {
         providerSession: ProviderSessionRuntime?,
         forkIntentChildThreadId: AgentThreadID? = nil
     ) throws {
+        _ = try persistForkedChildGraphReturningPrunedThreadIDs(
+            sourceThreadId: sourceThreadId,
+            childThread: childThread,
+            providerSession: providerSession,
+            forkIntentChildThreadId: forkIntentChildThreadId
+        )
+    }
+
+    /// Result-returning fork commit used by surfaces that must apply and publish
+    /// retention victims before selecting the newly committed child.
+    public func persistForkedChildGraphReturningPrunedThreadIDs(
+        sourceThreadId: AgentThreadID,
+        childThread: AgentThread,
+        providerSession: ProviderSessionRuntime?,
+        forkIntentChildThreadId: AgentThreadID? = nil
+    ) throws -> [AgentThreadID] {
         try db.performSync { database in
             try database.transaction {
                 guard try get(id: sourceThreadId) != nil else {
@@ -462,7 +844,7 @@ public final class AgentThreadRepository {
                               existing.providerThreadId == childThread.providerThreadId else {
                             throw AgentThreadForkPersistenceError.childThreadConflict
                         }
-                        return
+                        return []
                     }
                     guard intent.state == .providerCreated else {
                         throw AgentThreadForkPersistenceError.invalidIntentState(intent.state)
@@ -478,7 +860,11 @@ public final class AgentThreadRepository {
                     throw AgentThreadForkPersistenceError.childThreadConflict
                 }
                 let messageRepo = AgentMessageRepository(db: database)
-                try upsert(childThread)
+                let prunedThreadIDs = try upsertEnforcingWorkspaceThreadLimitInCurrentTransaction(
+                    childThread,
+                    limit: AgentThreadRepository.maxThreadsPerWorkspace,
+                    excludedVictimIDs: [sourceThreadId]
+                )
 
                 let copyBaseDate = Date()
                 for (index, message) in sourceMessages.enumerated() {
@@ -496,13 +882,15 @@ public final class AgentThreadRepository {
                 if let forkIntentChildThreadId {
                     let update = try database.prepare("""
                         UPDATE agent_thread_fork_intents
-                        SET state = 'local_committed', last_error = NULL, updated_at = ?
+                        SET state = 'local_committed', source_messages_json = '[]',
+                            last_error = NULL, updated_at = ?
                         WHERE child_thread_id = ? AND state = 'provider_created';
                     """)
                     try update.bind(1, iso.string(from: Date()))
                     try update.bind(2, forkIntentChildThreadId.value.uuidString)
                     _ = try update.step()
                 }
+                return prunedThreadIDs
             }
         }
     }
@@ -523,19 +911,56 @@ public final class AgentThreadRepository {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let childJSON = String(decoding: try encoder.encode(childThread), as: UTF8.self)
-        try db.performSync { database in
+        return try db.performSync { database in
             try database.transaction {
                 guard try get(id: sourceThreadId) != nil else {
                     throw AgentThreadForkPersistenceError.sourceThreadNotFound
                 }
+
+                // Same durable child/key is a retry, not a second snapshot. Any
+                // mismatch is a conflict rather than an unsafe best-effort merge.
+                if let existing = try getForkIntent(childThreadId: childThread.id) {
+                    guard existing.sourceThreadId == sourceThreadId,
+                          existing.provider == childThread.provider,
+                          existing.idempotencyKey == idempotencyKey,
+                          existing.childThread == childThread else {
+                        throw AgentThreadForkPersistenceError.intentConflict
+                    }
+                    return existing
+                }
+
+                let keyCollision = try database.prepare("""
+                    SELECT 1 FROM agent_thread_fork_intents
+                    WHERE idempotency_key = ?
+                    LIMIT 1;
+                """)
+                try keyCollision.bind(1, idempotencyKey)
+                guard try keyCollision.step() == false else {
+                    throw AgentThreadForkPersistenceError.intentConflict
+                }
+
+                // BEGIN IMMEDIATE serializes this admission across processes.
+                // Check before reading/encoding the transcript so a distinct
+                // child cannot inflate either retained payload or provider work.
+                let recoverableSourceIntent = try database.prepare("""
+                    SELECT 1 FROM agent_thread_fork_intents
+                    WHERE source_thread_id = ?
+                      AND state IN ('prepared', 'provider_created', 'compensating')
+                    LIMIT 1;
+                """)
+                try recoverableSourceIntent.bind(1, sourceThreadId.value.uuidString)
+                guard try recoverableSourceIntent.step() == false else {
+                    throw AgentThreadForkPersistenceError.recoverableIntentExists
+                }
+
                 let sourceMessages = try AgentMessageRepository(db: database).list(threadId: sourceThreadId)
                 let sourceMessagesJSON = String(decoding: try encoder.encode(sourceMessages), as: UTF8.self)
                 let insert = try database.prepare("""
-                    INSERT OR IGNORE INTO agent_thread_fork_intents(
+                    INSERT INTO agent_thread_fork_intents(
                         child_thread_id, source_thread_id, provider, idempotency_key,
                         state, child_thread_json, source_messages_json, provider_child_thread_id,
-                        last_error, created_at, updated_at
-                    ) VALUES(?, ?, ?, ?, 'prepared', ?, ?, NULL, NULL, ?, ?);
+                        last_error, created_at, updated_at, provider_creation_attempted
+                    ) VALUES(?, ?, ?, ?, 'prepared', ?, ?, NULL, NULL, ?, ?, 0);
                 """)
                 try insert.bind(1, childThread.id.value.uuidString)
                 try insert.bind(2, sourceThreadId.value.uuidString)
@@ -546,22 +971,19 @@ public final class AgentThreadRepository {
                 try insert.bind(7, iso.string(from: date))
                 try insert.bind(8, iso.string(from: date))
                 _ = try insert.step()
+                guard let intent = try getForkIntent(childThreadId: childThread.id) else {
+                    throw AgentThreadForkPersistenceError.intentConflict
+                }
+                return intent
             }
         }
-        guard let intent = try getForkIntent(childThreadId: childThread.id),
-              intent.sourceThreadId == sourceThreadId,
-              intent.provider == childThread.provider,
-              intent.idempotencyKey == idempotencyKey else {
-            throw AgentThreadForkPersistenceError.intentConflict
-        }
-        return intent
     }
 
     public func getForkIntent(childThreadId: AgentThreadID) throws -> AgentThreadForkIntent? {
         let statement = try db.prepare("""
             SELECT source_thread_id, provider, idempotency_key, state,
                    child_thread_json, source_messages_json, provider_child_thread_id, last_error,
-                   created_at, updated_at
+                   created_at, updated_at, provider_creation_attempted
             FROM agent_thread_fork_intents WHERE child_thread_id = ?;
         """)
         try statement.bind(1, childThreadId.value.uuidString)
@@ -582,6 +1004,7 @@ public final class AgentThreadRepository {
             provider: provider,
             idempotencyKey: statement.columnText(2) ?? "",
             state: state,
+            providerCreationAttempted: statement.columnInt64(10) != 0,
             providerChildThreadId: statement.columnText(6),
             lastError: statement.columnText(7),
             createdAt: parseDate(statement.columnText(8)),
@@ -617,6 +1040,32 @@ public final class AgentThreadRepository {
         return try statement.step()
     }
 
+    /// Records the point after which `prepared` must be treated as provider-call
+    /// ambiguous. The call is idempotent so a relaunch can retry the keyed
+    /// adapter request without losing its exact transcript snapshot.
+    @discardableResult
+    public func markForkProviderCreationAttempted(
+        childThreadId: AgentThreadID,
+        at date: Date = Date()
+    ) throws -> AgentThreadForkIntent {
+        let update = try db.prepare("""
+            UPDATE agent_thread_fork_intents
+            SET provider_creation_attempted = 1, updated_at = ?
+            WHERE child_thread_id = ?
+              AND state = 'prepared'
+              AND provider_creation_attempted = 0;
+        """)
+        try update.bind(1, iso.string(from: date))
+        try update.bind(2, childThreadId.value.uuidString)
+        _ = try update.step()
+        guard let intent = try getForkIntent(childThreadId: childThreadId),
+              intent.state == .prepared,
+              intent.providerCreationAttempted else {
+            throw AgentThreadForkPersistenceError.intentConflict
+        }
+        return intent
+    }
+
     @discardableResult
     public func recordForkProviderCreated(
         childThreadId: AgentThreadID,
@@ -626,7 +1075,7 @@ public final class AgentThreadRepository {
         let update = try db.prepare("""
             UPDATE agent_thread_fork_intents
             SET state = 'provider_created', provider_child_thread_id = ?,
-                last_error = NULL, updated_at = ?
+                provider_creation_attempted = 1, last_error = NULL, updated_at = ?
             WHERE child_thread_id = ? AND state = 'prepared';
         """)
         try update.bind(1, providerChildThreadId)
@@ -663,39 +1112,169 @@ public final class AgentThreadRepository {
         return intent
     }
 
-    public func markForkCompensated(childThreadId: AgentThreadID, at date: Date = Date()) throws {
-        let update = try db.prepare("""
-            UPDATE agent_thread_fork_intents
-            SET state = 'compensated', last_error = NULL, updated_at = ?
-            WHERE child_thread_id = ? AND state = 'compensating';
+    public func markForkCompensated(childThreadId: AgentThreadID, at _: Date = Date()) throws {
+        let delete = try db.prepare("""
+            DELETE FROM agent_thread_fork_intents
+            WHERE child_thread_id = ?
+              AND state = 'compensating'
+              AND provider_child_thread_id IS NOT NULL;
         """)
-        try update.bind(1, iso.string(from: date))
-        try update.bind(2, childThreadId.value.uuidString)
-        _ = try update.step()
-        guard try getForkIntent(childThreadId: childThreadId)?.state == .compensated else {
+        try delete.bind(1, childThreadId.value.uuidString)
+        _ = try delete.step()
+        let changes = try db.prepare("SELECT changes();")
+        guard try changes.step(), changes.columnInt64(0) == 1,
+              try getForkIntent(childThreadId: childThreadId) == nil else {
             throw AgentThreadForkPersistenceError.intentConflict
         }
     }
 
-    public func markPreparedForkAbandoned(childThreadId: AgentThreadID, error: String, at date: Date = Date()) throws {
-        let update = try db.prepare("""
-            UPDATE agent_thread_fork_intents
-            SET state = 'abandoned', last_error = ?, updated_at = ?
-            WHERE child_thread_id = ? AND state = 'prepared' AND provider_child_thread_id IS NULL;
+    /// A missing source is safe to retire only before the durable intent records
+    /// that a provider call could have begun. The delete itself is the terminal
+    /// outcome: retaining an `abandoned` tombstone would reintroduce row growth.
+    public func markPreparedForkAbandoned(childThreadId: AgentThreadID, error _: String, at _: Date = Date()) throws {
+        let delete = try db.prepare("""
+            DELETE FROM agent_thread_fork_intents
+            WHERE child_thread_id = ?
+              AND state = 'prepared'
+              AND provider_child_thread_id IS NULL
+              AND provider_creation_attempted = 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM agent_threads AS source
+                  WHERE source.id = agent_thread_fork_intents.source_thread_id
+              );
         """)
-        try update.bind(1, error)
-        try update.bind(2, iso.string(from: date))
-        try update.bind(3, childThreadId.value.uuidString)
-        _ = try update.step()
-        guard try getForkIntent(childThreadId: childThreadId)?.state == .abandoned else {
+        try delete.bind(1, childThreadId.value.uuidString)
+        _ = try delete.step()
+        let changes = try db.prepare("SELECT changes();")
+        guard try changes.step(), changes.columnInt64(0) == 1,
+              try getForkIntent(childThreadId: childThreadId) == nil else {
             throw AgentThreadForkPersistenceError.intentConflict
+        }
+    }
+
+    /// Scrubs or removes one bounded batch of historical terminal fork intents.
+    /// A live locally-committed child keeps its tombstone but no longer needs a
+    /// duplicated source transcript. Rows are deleted only when their terminal
+    /// outcome is causally known. Recoverable and ambiguous rows are never
+    /// selected, and a failed write rolls back this batch only.
+    @discardableResult
+    public func maintainHistoricalForkIntents(
+        limit: Int = AgentThreadRepository.terminalForkIntentCleanupBatchSize
+    ) throws -> ForkIntentMaintenanceBatch {
+        let batchSize = min(
+            AgentThreadRepository.terminalForkIntentCleanupBatchSize,
+            max(0, limit)
+        )
+        let result = try db.performSync { database in
+            try database.transaction {
+                let candidates = try database.prepare("""
+                    SELECT child_thread_id,
+                           CASE WHEN state = 'local_committed' AND EXISTS (
+                               SELECT 1 FROM agent_threads AS child
+                               WHERE child.id = intent.child_thread_id
+                           ) THEN 1 ELSE 0 END AS scrub_only
+                    FROM agent_thread_fork_intents AS intent
+                         INDEXED BY idx_agent_thread_fork_intents_maintenance
+                    WHERE (intent.state = 'local_committed'
+                           OR intent.state = 'compensated'
+                           OR intent.state = 'abandoned')
+                      AND ((intent.state = 'local_committed'
+                            AND (intent.source_messages_json != '[]'
+                                 OR NOT EXISTS (
+                                     SELECT 1 FROM agent_threads AS child
+                                     WHERE child.id = intent.child_thread_id
+                                 )))
+                           OR intent.state = 'compensated'
+                           OR (intent.state = 'abandoned'
+                               AND intent.provider_creation_attempted = 0))
+                    ORDER BY intent.updated_at ASC, intent.child_thread_id ASC
+                    LIMIT ?;
+                """)
+                try candidates.bind(1, batchSize + 1)
+                var selected: [(childID: String, scrubOnly: Bool)] = []
+                while try candidates.step() {
+                    guard let childID = candidates.columnText(0) else {
+                        throw AgentThreadForkPersistenceError.corruptIntent
+                    }
+                    selected.append((childID, candidates.columnInt64(1) != 0))
+                }
+                let hasMore = selected.count > batchSize
+
+                let scrub = try database.prepare("""
+                    UPDATE agent_thread_fork_intents
+                    SET source_messages_json = '[]'
+                    WHERE child_thread_id = ?
+                      AND state = 'local_committed'
+                      AND source_messages_json != '[]'
+                      AND EXISTS (
+                          SELECT 1 FROM agent_threads AS child
+                          WHERE child.id = agent_thread_fork_intents.child_thread_id
+                      );
+                """)
+                let delete = try database.prepare("""
+                    DELETE FROM agent_thread_fork_intents
+                    WHERE child_thread_id = ?
+                      AND (
+                          state = 'compensated'
+                          OR (state = 'abandoned' AND provider_creation_attempted = 0)
+                          OR (state = 'local_committed' AND NOT EXISTS (
+                              SELECT 1 FROM agent_threads AS child
+                              WHERE child.id = agent_thread_fork_intents.child_thread_id
+                          ))
+                      );
+                """)
+                var scrubbed = 0
+                var deleted = 0
+                for candidate in selected.prefix(batchSize) {
+                    let mutation = candidate.scrubOnly ? scrub : delete
+                    mutation.reset()
+                    try mutation.bind(1, candidate.childID)
+                    _ = try mutation.step()
+                    let changes = try database.prepare("SELECT changes();")
+                    guard try changes.step() else {
+                        throw AgentThreadForkPersistenceError.intentConflict
+                    }
+                    if candidate.scrubOnly {
+                        scrubbed += Int(changes.columnInt64(0))
+                    } else {
+                        deleted += Int(changes.columnInt64(0))
+                    }
+                }
+                return (scrubbed, deleted, hasMore)
+            }
+        }
+        return ForkIntentMaintenanceBatch(
+            scrubbedCount: result.0,
+            deletedCount: result.1,
+            hasMore: result.2
+        )
+    }
+
+    public func historicalForkIntentMaintenanceCandidateCount() throws -> Int {
+        try db.performSync { database in
+            let count = try database.prepare("""
+                SELECT COUNT(*)
+                FROM agent_thread_fork_intents AS intent
+                WHERE (intent.state = 'local_committed'
+                       AND (intent.source_messages_json != '[]'
+                            OR NOT EXISTS (
+                                SELECT 1 FROM agent_threads AS child
+                                WHERE child.id = intent.child_thread_id
+                            )))
+                   OR intent.state = 'compensated'
+                   OR (intent.state = 'abandoned'
+                       AND intent.provider_creation_attempted = 0);
+            """)
+            guard try count.step() else { return 0 }
+            return Int(count.columnInt64(0))
         }
     }
 
     public func recordForkIntentError(childThreadId: AgentThreadID, error: String, at date: Date = Date()) throws {
         let update = try db.prepare("""
             UPDATE agent_thread_fork_intents SET last_error = ?, updated_at = ?
-            WHERE child_thread_id = ? AND state != 'local_committed' AND state != 'compensated';
+            WHERE child_thread_id = ?
+              AND state IN ('prepared', 'provider_created', 'compensating');
         """)
         try update.bind(1, error)
         try update.bind(2, iso.string(from: date))
@@ -778,6 +1357,7 @@ public final class AgentThreadRepository {
 public enum AgentThreadForkPersistenceError: Error, Equatable {
     case sourceThreadNotFound
     case intentConflict
+    case recoverableIntentExists
     case providerIdentityConflict
     case childThreadConflict
     case invalidIntentState(AgentThreadForkIntentState)
@@ -903,6 +1483,10 @@ public final class AgentMessageRepository: @unchecked Sendable {
     private let decoder = JSONDecoder()
     public init(db: SQLiteDB) { self.db = db }
 
+    /// Durable transcript retention: keep only the newest N messages per thread
+    /// so long-running agent sessions cannot grow `agent_messages` without bound.
+    public static let maxMessagesPerThread = 100
+
     public func append(_ m: AgentMessage) throws {
         let bodyBytes = m.content.utf8.count
         let bodySHA256 = Self.bodySHA256Hex(m.content)
@@ -933,6 +1517,32 @@ public final class AgentMessageRepository: @unchecked Sendable {
         try st.bind(6, try attachmentsJSON(m.attachments))
         try st.bind(7, bodySHA256)
         try st.bind(8, bodyBytes)
+        _ = try st.step()
+        try pruneMessagesKeepingLatest(threadId: m.threadId, limit: Self.maxMessagesPerThread)
+    }
+
+    /// Deletes oldest durable messages so only the newest `limit` remain.
+    public func pruneMessagesKeepingLatest(
+        threadId: AgentThreadID,
+        limit: Int = AgentMessageRepository.maxMessagesPerThread
+    ) throws {
+        let keep = max(1, limit)
+        // Nested SELECT required: SQLite rejects LIMIT directly inside DELETE … NOT IN.
+        let st = try db.prepare("""
+            DELETE FROM agent_messages
+            WHERE thread_id = ?
+              AND rowid NOT IN (
+                SELECT rowid FROM (
+                    SELECT rowid FROM agent_messages
+                    WHERE thread_id = ?
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?
+                )
+              );
+            """)
+        try st.bind(1, threadId.value.uuidString)
+        try st.bind(2, threadId.value.uuidString)
+        try st.bind(3, Int64(keep))
         _ = try st.step()
     }
 
@@ -3056,7 +3666,10 @@ public final class AgentRunRepository: @unchecked Sendable {
         return events
     }
 
-    public func pruneProviderEventLogs(threadId: AgentThreadID, keepLatest limit: Int = 10_000) throws {
+    public func pruneProviderEventLogs(
+        threadId: AgentThreadID,
+        keepLatest limit: Int = AgentEventRetentionPolicy.production.providerLogCountPerThread
+    ) throws {
         try pruneProviderEventLogs(
             threadId: threadId,
             keepLatest: limit,
@@ -3110,7 +3723,10 @@ public final class AgentRunRepository: @unchecked Sendable {
         return try changedRowCount(db) > 0
     }
 
-    public func pruneStreamEvents(threadId: AgentThreadID, keepLatest limit: Int = 5_000) throws {
+    public func pruneStreamEvents(
+        threadId: AgentThreadID,
+        keepLatest limit: Int = AgentEventRetentionPolicy.production.streamEventCountPerThread
+    ) throws {
         try pruneStreamEvents(
             threadId: threadId,
             keepLatest: limit,

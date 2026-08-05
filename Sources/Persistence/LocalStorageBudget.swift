@@ -33,14 +33,15 @@ public struct AgentEventRetentionPolicy: Sendable, Equatable {
     public var pruneQuantumBytes: Int64
 
     public init(
-        streamEventCountPerThread: Int = 16_384,
-        streamEventBytesPerThread: Int64 = 256 * 1_024 * 1_024,
-        providerLogCountPerThread: Int = 16_384,
-        providerLogBytesPerThread: Int64 = 256 * 1_024 * 1_024,
-        streamEventBytesGlobal: Int64 = 1_024 * 1_024 * 1_024,
-        providerLogBytesGlobal: Int64 = 1_024 * 1_024 * 1_024,
-        pruneQuantumRows: Int = 1_024,
-        pruneQuantumBytes: Int64 = 32 * 1_024 * 1_024
+        // Keep only recent "movements" per thread (aligned with message retention).
+        streamEventCountPerThread: Int = 100,
+        streamEventBytesPerThread: Int64 = 8 * 1_024 * 1_024,
+        providerLogCountPerThread: Int = 100,
+        providerLogBytesPerThread: Int64 = 8 * 1_024 * 1_024,
+        streamEventBytesGlobal: Int64 = 64 * 1_024 * 1_024,
+        providerLogBytesGlobal: Int64 = 64 * 1_024 * 1_024,
+        pruneQuantumRows: Int = 64,
+        pruneQuantumBytes: Int64 = 2 * 1_024 * 1_024
     ) {
         self.streamEventCountPerThread = max(1, streamEventCountPerThread)
         self.streamEventBytesPerThread = max(1, streamEventBytesPerThread)

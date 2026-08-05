@@ -156,6 +156,49 @@ final class Phase4CommandReceiptRepositoryTests: XCTestCase {
         XCTAssertEqual(fullFsync.columnInt64(0), 1)
     }
 
+    func test_bootstrapEnablesFullDurabilityBeforeSchemaTransaction() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("phase4-full-before-migrate-\(UUID().uuidString)", isDirectory: true)
+        let databasePath = root.appendingPathComponent("remotecode.sqlite").path
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        do {
+            let oldDatabase = try SQLiteDB(path: databasePath)
+            try Schema.migrateSteps(oldDatabase, Schema.steps.filter { $0.version <= 59 })
+        }
+
+        var durabilityAtFirstSchemaBegin: (synchronous: Int64, fullFsync: Int64)?
+        let bootstrap = Bootstrap(
+            channel: .debug,
+            dbPathOverride: databasePath,
+            appSupportOverride: root.path
+        )
+        bootstrap.beforeSchemaMigrationForTesting = { database in
+            database.beforeExecuteForTesting = { sql in
+                guard sql == "BEGIN IMMEDIATE;", durabilityAtFirstSchemaBegin == nil else { return }
+                do {
+                    let synchronous = try database.prepare("PRAGMA synchronous;")
+                    let fullFsync = try database.prepare("PRAGMA fullfsync;")
+                    XCTAssertTrue(try synchronous.step())
+                    XCTAssertTrue(try fullFsync.step())
+                    durabilityAtFirstSchemaBegin = (
+                        synchronous.columnInt64(0),
+                        fullFsync.columnInt64(0)
+                    )
+                } catch {
+                    XCTFail("failed to inspect migration durability: \(error)")
+                }
+            }
+        }
+
+        _ = try bootstrap.run()
+        XCTAssertEqual(durabilityAtFirstSchemaBegin?.synchronous, 2,
+                       "the migration BEGIN must inherit synchronous=FULL")
+        XCTAssertEqual(durabilityAtFirstSchemaBegin?.fullFsync, 1,
+                       "the migration BEGIN must inherit fullfsync=ON")
+    }
+
     func test_finalizeAtomicallyPersistsOrderedEventsOutcomeAndReceiptRange() throws {
         let db = try SQLiteDB(path: ":memory:")
         try Schema.migrate(db)

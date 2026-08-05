@@ -255,6 +255,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     var terminalRestartRuntimePreparerForTesting: ((WorkspaceID, String, SurfaceID) -> TerminalPreparedPTYRuntime?)?
     var terminalRestartPreparedDiscardAdditionalBarrierForTesting: (() -> SurfaceTerminationBarrier?)?
     var queueDispatchBeforeProviderStartForTesting: (() async -> Void)?
+    var beforePullRequestThreadCommitForTesting: (() throws -> Void)?
     var codexForkProtocolSupportProbe: (String, [String: String]) -> Bool = { binary, environment in
         CodexForkProtocolSupport.probe(binary: binary, environment: environment).isSupported
     }
@@ -376,6 +377,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 "order": .array(order.map { .string($0.value.uuidString) })
             ]))
         case .deleted(let ids):
+            let rawIDs = ids.map { $0.value.uuidString }
+            let kind = ids.count > 1 ? "agent.thread.deleted_many" : "agent.thread.deleted"
+            for surface in SurfaceRegistry.shared.all() {
+                guard let agent = surface as? AgentAppSurface else { continue }
+                agent.viewModel.handleThreadLifecycleEvent(
+                    kind: kind,
+                    threadId: rawIDs.count == 1 ? rawIDs[0] : nil,
+                    threadIds: rawIDs.count > 1 ? rawIDs : nil
+                )
+            }
             if ids.count > 1 {
                 EventBus.shared.publish(kind: "agent.thread.deleted_many", payload: .object([
                     "thread_ids": .array(ids.map { .string($0.value.uuidString) })
@@ -386,6 +397,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 ]))
             }
         }
+    }
+
+    func publishAgentThreadDeletions(_ ids: [AgentThreadID]) {
+        guard !ids.isEmpty else { return }
+        publishAgentThreadLifecycle(.deleted(ids))
     }
 
     private func publishQueuedMessage(kind: String, _ message: AgentQueuedMessage) {
@@ -451,14 +467,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         } else {
             resolvedWorkspace = nil
         }
+        var workspacesNeedingRailReload = Set<WorkspaceID>()
         for s in SurfaceRegistry.shared.all() {
             guard let agent = s as? AgentAppSurface,
                   resolvedWorkspace == nil || agent.viewModel.workspaceID == resolvedWorkspace! else { continue }
-            agent.viewModel.reloadThreads()
-            agent.viewModel.reloadQueuedMessages()
+            workspacesNeedingRailReload.insert(agent.viewModel.workspaceID)
             if reloadTranscriptIfSelected, agent.viewModel.selectedThreadId == thread {
                 agent.viewModel.selectThread(thread, markRead: false)
             }
+        }
+        for workspaceID in workspacesNeedingRailReload {
+            AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(workspaceID: workspaceID)
+            AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedQueueReload(workspaceID: workspaceID)
         }
         windowController?.refreshFromState()
     }
@@ -525,20 +545,39 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             guard let self, let agent else { return }
                             self.persistAgentSelectedThread(surfaceID: agent.descriptor.id, threadID: threadID)
                         }
+                        // Restore-time select does not re-fire onSelectedThreadChanged;
+                        // still arm live retention protection for the restored thread.
+                        ctx.threadRepo.setLiveSurfaceBinding(
+                            surfaceID: agent.descriptor.id,
+                            threadID: agent.viewModel.selectedThreadId
+                        )
                         agent.viewModel.markThreadRead = { [weak self] threadID in
                             guard let self else { throw LayoutError.workspaceNotFound }
                             try self.markAgentThreadRead(thread: threadID)
                         }
-                        let queueSubscriptionToken = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
-                            guard ev.kind.hasPrefix("agent.thread.") || ev.kind.hasPrefix("agent.message.queue") || ev.kind == "agent.message.queued" else { return }
+                        let queueSubscriptionToken = EventBus.shared.subscribe(
+                            since: nil,
+                            filter: .agentThreadAndQueue
+                        ) { [weak agent] ev in
                             DispatchQueue.main.async {
-                                agent?.viewModel.handleQueueLifecycleEvent(
+                                guard let agent else { return }
+                                agent.viewModel.handleThreadLifecycleEvent(
+                                    kind: ev.kind,
+                                    threadId: ev.payload.objectValue?["thread_id"]?.stringValue,
+                                    threadIds: ev.payload.objectValue?["thread_ids"]?.arrayValue?.compactMap(\.stringValue)
+                                )
+                                agent.viewModel.handleQueueLifecycleEvent(
                                     kind: ev.kind,
                                     threadId: ev.payload.objectValue?["thread_id"]?.stringValue,
                                     message: ev.payload.objectValue?["message"]?.stringValue
                                 )
-                                agent?.viewModel.reloadThreads()
-                                agent?.viewModel.reloadQueuedMessages()
+                                // Coalesce N open Agent tabs → one cap+list + queue reload per workspace.
+                                AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(
+                                    workspaceID: agent.viewModel.workspaceID
+                                )
+                                AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedQueueReload(
+                                    workspaceID: agent.viewModel.workspaceID
+                                )
                             }
                         }
                         agent.subscriptionToken = AnyHashable(queueSubscriptionToken)
@@ -598,6 +637,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         }
                         agent.viewModel.onThreadLifecycle = { [weak self] event in
                             self?.publishAgentThreadLifecycle(event)
+                        }
+                        agent.viewModel.retireDeletedThreadRuntime = { [weak ctx] ids, coordinatorAlreadyRetired in
+                            ctx?.retireDeletedAgentThreads(
+                                ids,
+                                coordinatorAlreadyRetired: coordinatorAlreadyRetired
+                            )
                         }
                         Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
                         wireQueueDrainControl(on: agent.viewModel, context: ctx)
@@ -1506,6 +1551,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             SurfaceRegistry.shared.surface(surfaceID)?.close()
             try? context?.terminalOutputRepo.delete(surfaceID: surfaceID.value.uuidString)
         }
+        // Drop process-only retention protection once the surface is gone.
+        context?.threadRepo.setLiveSurfaceBinding(surfaceID: surfaceID, threadID: nil)
         SurfaceRegistry.shared.unregister(surfaceID)
         SurfaceOutputBus.shared.remove(surfaceId: surfaceID)
     }
@@ -2417,9 +2464,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             modelSelection: modelSelection ?? AgentModelSelection(provider: provider, modelId: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier),
                             runAsUser: resolvedRunAs,
                             routingConfiguration: routingConfiguration)
-        try ctx.threadRepo.upsert(t)
-        if let resolvedWorkspace {
-            _ = try? ctx.threadRepo.enforceWorkspaceThreadLimit(workspaceId: resolvedWorkspace)
+        let prunedThreadIDs = try ctx.threadRepo.upsertEnforcingWorkspaceThreadLimit(t)
+        // Apply/publish victims before any fallible surface reload or selection.
+        ctx.retireDeletedAgentThreads(prunedThreadIDs)
+        if !prunedThreadIDs.isEmpty {
+            publishAgentThreadLifecycle(.deleted(prunedThreadIDs))
         }
         if !quiet {
             // Only bind/select the new thread on the requesting surface (if any).
@@ -2507,7 +2556,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             runAsUser: resolvedRunAs,
             routingConfiguration: resolvedRouting
         )
-        try ctx.threadRepo.upsert(thread)
+        let prunedThreadIDs = try ctx.threadRepo.upsertEnforcingWorkspaceThreadLimit(thread)
+        ctx.retireDeletedAgentThreads(prunedThreadIDs)
+        if !prunedThreadIDs.isEmpty {
+            publishAgentThreadLifecycle(.deleted(prunedThreadIDs))
+        }
         if parentThread == nil {
             try selectAgentThread(thread: thread.id, surfaceID: surfaceID)
         } else {
@@ -2651,7 +2704,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 if let serviceTier { agent.viewModel.serviceTier = serviceTier }
                 if let runAsUser = t.runAsUser { agent.viewModel.runAsUser = runAsUser }
             }
-            agent.viewModel.reloadThreads()
+        }
+        if let wid = t.workspaceId {
+            AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(workspaceID: wid)
         }
         windowController?.refreshFromState()
         return t
@@ -2727,9 +2782,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         t.executionMode = executionMode
         t.updatedAt = Date()
         try ctx.threadRepo.upsert(t)
-        for s in SurfaceRegistry.shared.all() {
-            guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId else { continue }
-            agent.viewModel.reloadThreads()
+        if let wid = t.workspaceId {
+            AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(workspaceID: wid)
         }
         windowController?.refreshFromState()
         return t
@@ -2737,6 +2791,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func prepareAgentThreadForPullRequest(workspace: WorkspaceID, url: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        try ctx.threadRepo.preflightWorkspaceThreadInsertion(workspaceId: workspace)
         let cwd = try workspaceCwd(workspace)
         let prep = GitDiff.preparePullRequestWorktree(in: cwd, urlString: url)
         guard prep.result.ok else {
@@ -2757,7 +2812,22 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             modelSelection: modelSelection ?? AgentModelSelection(provider: provider, modelId: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier)
         )
         thread.updatedAt = Date()
-        try ctx.threadRepo.upsert(thread)
+        let prunedThreadIDs: [AgentThreadID]
+        do {
+            try beforePullRequestThreadCommitForTesting?()
+            prunedThreadIDs = try ctx.threadRepo.upsertEnforcingWorkspaceThreadLimit(thread)
+        } catch {
+            let cleanup = GitDiff.removeRegisteredWorktree(in: cwd, worktreePath: prep.worktreePath)
+            if !cleanup.ok {
+                throw JSONRPCError(
+                    code: -32051,
+                    message: "PR thread commit failed: \(error.localizedDescription) Worktree cleanup also failed: \(cleanup.message)"
+                )
+            }
+            throw error
+        }
+        ctx.retireDeletedAgentThreads(prunedThreadIDs)
+        publishAgentThreadDeletions(prunedThreadIDs)
         // Rail refresh only across surfaces; the initiating macOS surface (if
         // local) selects the PR thread through its own view-model path.
         try selectAgentThread(thread: thread.id)
@@ -2783,9 +2853,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     ) throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard let t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
+        if let wid = t.workspaceId {
+            AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(workspaceID: wid)
+        }
         for s in SurfaceRegistry.shared.all() {
             guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId else { continue }
-            agent.viewModel.reloadThreads()
             if let surfaceID, agent.descriptor.id == surfaceID {
                 agent.viewModel.selectThread(thread, markRead: markReadOnSelection)
             }
@@ -4476,9 +4548,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         try ctx.threadRepo.setPinned(id: thread, pinned: pinned)
         guard let t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
-        for s in SurfaceRegistry.shared.all() {
-            guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId else { continue }
-            agent.viewModel.reloadThreads()
+        if let wid = t.workspaceId {
+            AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(workspaceID: wid)
         }
         windowController?.refreshFromState()
         return t
@@ -4490,9 +4561,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         t.color = color.isEmpty ? nil : color
         t.updatedAt = Date()
         try ctx.threadRepo.upsert(t)
-        for s in SurfaceRegistry.shared.all() {
-            guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId else { continue }
-            agent.viewModel.reloadThreads()
+        if let wid = t.workspaceId {
+            AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(workspaceID: wid)
         }
         windowController?.refreshFromState()
         return t
@@ -4503,10 +4573,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         try ctx.threadRepo.reorder(id: thread, position: position)
         guard let t = try ctx.threadRepo.get(id: thread), let wid = t.workspaceId else { throw LayoutError.workspaceNotFound }
         let list = try ctx.threadRepo.list(workspaceId: wid)
-        for s in SurfaceRegistry.shared.all() {
-            guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == wid else { continue }
-            agent.viewModel.reloadThreads()
-        }
+        AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(workspaceID: wid)
         windowController?.refreshFromState()
         return list
     }
@@ -4524,9 +4591,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // auto-marks it read) force-switched every macOS agent tab to that
         // thread (the "iOS bugs macOS" report). Just refresh the rails so the
         // unread badge clears everywhere; selection stays per-surface.
-        for s in SurfaceRegistry.shared.all() {
-            guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId else { continue }
-            agent.viewModel.reloadThreads()
+        if let wid = t.workspaceId {
+            AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(workspaceID: wid)
         }
         if didMarkRead {
             publishAgentThreadRead(thread)
@@ -5534,6 +5600,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// instead of every tab converging on threads.first.
     func persistAgentSelectedThread(surfaceID: SurfaceID, threadID: AgentThreadID?) {
         guard let ctx = context else { return }
+        // Process-only retention authority: cap victim selection must not delete
+        // a thread currently bound in an open Agent App surface.
+        ctx.threadRepo.setLiveSurfaceBinding(surfaceID: surfaceID, threadID: threadID)
         for (wid, var ws) in ctx.state.workspaces {
             let result = updateSurface(in: ws.layout, surfaceID: surfaceID) { descriptor in
                 if let threadID {
@@ -6028,22 +6097,39 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     guard let self, let agent else { return }
                     self.persistAgentSelectedThread(surfaceID: agent.descriptor.id, threadID: threadID)
                 }
+                // Initial restore/create select may not re-fire onSelectedThreadChanged.
+                ctx.threadRepo.setLiveSurfaceBinding(
+                    surfaceID: agent.descriptor.id,
+                    threadID: agent.viewModel.selectedThreadId
+                )
                 agent.viewModel.markThreadRead = { [weak self] threadID in
                     guard let self else { throw LayoutError.workspaceNotFound }
                     try self.markAgentThreadRead(thread: threadID)
                 }
                 // Socket-driven thread mutations (create/rename/delete/read)
                 // refresh this already-open surface — fixes the stale-VM gap.
-                let queueSubscriptionToken = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
-                    guard ev.kind.hasPrefix("agent.thread.") || ev.kind.hasPrefix("agent.message.queue") || ev.kind == "agent.message.queued" else { return }
+                let queueSubscriptionToken = EventBus.shared.subscribe(
+                    since: nil,
+                    filter: .agentThreadAndQueue
+                ) { [weak agent] ev in
                     DispatchQueue.main.async {
-                        agent?.viewModel.handleQueueLifecycleEvent(
+                        guard let agent else { return }
+                        agent.viewModel.handleThreadLifecycleEvent(
+                            kind: ev.kind,
+                            threadId: ev.payload.objectValue?["thread_id"]?.stringValue,
+                            threadIds: ev.payload.objectValue?["thread_ids"]?.arrayValue?.compactMap(\.stringValue)
+                        )
+                        agent.viewModel.handleQueueLifecycleEvent(
                             kind: ev.kind,
                             threadId: ev.payload.objectValue?["thread_id"]?.stringValue,
                             message: ev.payload.objectValue?["message"]?.stringValue
                         )
-                        agent?.viewModel.reloadThreads()
-                        agent?.viewModel.reloadQueuedMessages()
+                        AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(
+                            workspaceID: agent.viewModel.workspaceID
+                        )
+                        AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedQueueReload(
+                            workspaceID: agent.viewModel.workspaceID
+                        )
                     }
                 }
                 agent.subscriptionToken = AnyHashable(queueSubscriptionToken)
@@ -6101,6 +6187,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 }
                 agent.viewModel.onThreadLifecycle = { [weak self] event in
                     self?.publishAgentThreadLifecycle(event)
+                }
+                agent.viewModel.retireDeletedThreadRuntime = { [weak ctx] ids, coordinatorAlreadyRetired in
+                    ctx?.retireDeletedAgentThreads(
+                        ids,
+                        coordinatorAlreadyRetired: coordinatorAlreadyRetired
+                    )
                 }
                 Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
                 wireQueueDrainControl(on: agent.viewModel, context: ctx)

@@ -1724,6 +1724,684 @@ final class FakeRunnerTests: XCTestCase {
               let data = json.data(using: .utf8) else { return nil }
         return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     }
+
+    /// WHY: a committed cap delete cascades SQLite rows but does not release a
+    /// completed resident provider process or retry buffers held by this process.
+    /// Retirement must clear those without inventing a cancelled lifecycle.
+    func test_retireDeletedThreads_releasesTerminalResidentSessionAndBufferedFailureState() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-retire-deleted-thread-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let thread = AgentThread(title: "retire", provider: .codex, model: "m")
+        try threadRepo.upsert(thread)
+        let adapter = SpyProviderAdapter(provider: .codex)
+        adapter.sessionSummaries = [
+            AgentProviderSessionSummary(
+                threadId: thread.id,
+                provider: .codex,
+                status: .completed,
+                providerThreadId: "resident-idle"
+            )
+        ]
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providerAdapters: [.codex: adapter]
+        )
+        coordinator.seedDeletedThreadRuntimeStateForTesting(thread.id)
+        XCTAssertTrue(coordinator.deletedThreadRuntimeResidueForTesting.contains(thread.id))
+        var lifecycleEvents = 0
+        coordinator.onRunFinished = { _, _, _ in lifecycleEvents += 1 }
+
+        try threadRepo.delete(id: thread.id)
+        XCTAssertEqual(coordinator.retireDeletedThreads([thread.id])[thread.id], .retired)
+        XCTAssertEqual(coordinator.retireDeletedThreads([thread.id])[thread.id], .retired)
+
+        XCTAssertEqual(adapter.stopSessionCallCount, 1,
+                       "an idle resident session must be released exactly once after its row commits deleted")
+        XCTAssertFalse(coordinator.deletedThreadRuntimeResidueForTesting.contains(thread.id),
+                       "deleted threads must not retain stream buffers, retry failures, or per-thread caches")
+        XCTAssertEqual(lifecycleEvents, 0,
+                       "retiring an already-terminal session must not emit a synthetic run lifecycle")
+    }
+
+    /// WHY: a provider stop failure leaves process ownership uncertain. Runtime
+    /// state must survive for an explicit retry rather than being purged after a
+    /// partially completed retirement attempt.
+    func test_retireDeletedThreads_stopFailureRequiresRetryBeforePurge() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-retire-stop-retry-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let thread = AgentThread(title: "stop retry", provider: .codex, model: "m")
+        try threadRepo.upsert(thread)
+        let adapter = SpyProviderAdapter(provider: .codex)
+        adapter.sessionSummaries = [AgentProviderSessionSummary(
+            threadId: thread.id,
+            provider: .codex,
+            status: .completed,
+            providerThreadId: "resident-stop-retry"
+        )]
+        adapter.stopSessionError = NSError(domain: "FakeRunnerTests.stopSession", code: 1)
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providerAdapters: [.codex: adapter]
+        )
+        coordinator.seedDeletedThreadRuntimeStateForTesting(thread.id)
+        try threadRepo.delete(id: thread.id)
+
+        XCTAssertEqual(
+            coordinator.retireDeletedThreads([thread.id], scheduleRetries: false)[thread.id],
+            .retryRequired
+        )
+        XCTAssertTrue(coordinator.deletedThreadRuntimeResidueForTesting.contains(thread.id),
+                      "failed provider stop must preserve all purgeable runtime state")
+
+        adapter.stopSessionError = nil
+        XCTAssertEqual(
+            coordinator.retireDeletedThreads([thread.id], scheduleRetries: false)[thread.id],
+            .retired
+        )
+        XCTAssertFalse(coordinator.deletedThreadRuntimeResidueForTesting.contains(thread.id))
+        XCTAssertEqual(adapter.stopSessionCallCount, 2,
+                       "the later explicit retry must repeat and complete the failed stop")
+    }
+
+    /// WHY: direct/test Agent App surfaces do not always have an AppContext
+    /// callback. Their fallback call must retain `.retryRequired` and finish once
+    /// the provider stop becomes available, without another surface lifecycle.
+    func test_retireDeletedThreads_directFallbackRetriesAutonomously() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-retire-direct-retry-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let thread = AgentThread(title: "direct retry", provider: .codex, model: "m")
+        try threadRepo.upsert(thread)
+        let adapter = SpyProviderAdapter(provider: .codex)
+        adapter.sessionSummaries = [AgentProviderSessionSummary(
+            threadId: thread.id,
+            provider: .codex,
+            status: .completed,
+            providerThreadId: "resident-direct-retry"
+        )]
+        adapter.stopSessionError = NSError(domain: "FakeRunnerTests.directRetry", code: 1)
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providerAdapters: [.codex: adapter]
+        )
+        coordinator.deletedThreadRetirementRetryDelayNanosecondsForTesting = 1_000_000
+        coordinator.seedDeletedThreadRuntimeStateForTesting(thread.id)
+        try threadRepo.delete(id: thread.id)
+
+        XCTAssertEqual(coordinator.retireDeletedThreads([thread.id])[thread.id], .retryRequired)
+        XCTAssertTrue(coordinator.deletedThreadRuntimeResidueForTesting.contains(thread.id))
+        let outageDeadline = Date().addingTimeInterval(3)
+        while Date() < outageDeadline && adapter.stopSessionCallCount < 4 {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertGreaterThanOrEqual(adapter.stopSessionCallCount, 4,
+                                    "the single fallback driver must outlive the old retry budget")
+
+        adapter.stopSessionError = nil
+        let recoveryDeadline = Date().addingTimeInterval(3)
+        while Date() < recoveryDeadline
+                && coordinator.deletedThreadRuntimeResidueForTesting.contains(thread.id) {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertFalse(coordinator.deletedThreadRuntimeResidueForTesting.contains(thread.id))
+    }
+
+    /// WHY: a late cumulative usage receipt can arrive after normal terminal
+    /// cleanup has already removed active/pending state. Its run-to-thread
+    /// ownership must survive long enough for a cap delete to purge both an
+    /// enrichment error retry and a false/not-enriched residue, without touching
+    /// a different thread's late receipt state.
+    func test_retireDeletedThreads_purgesLateReceiptResidueAfterNormalTerminalCleanup() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-retire-late-receipt-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let victim = AgentThread(title: "late receipt victim", provider: .codex, model: "m")
+        let foreign = AgentThread(title: "late receipt foreign", provider: .codex, model: "m")
+        try threadRepo.upsert(victim)
+        try threadRepo.upsert(foreign)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(scenario: .simpleAssistant(reply: "done"))]
+        )
+        let victimRun = try await coordinator.startRun(AgentRunRequest(
+            threadId: victim.id,
+            provider: .codex,
+            model: "m",
+            cwd: tmp,
+            prompt: "finish before late usage"
+        ))
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if (try? runRepo.get(id: victimRun))?.finishedAt != nil,
+               coordinator.runThreadOwnershipForTesting[victimRun] == nil {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertNotNil((try? runRepo.get(id: victimRun))?.finishedAt,
+                        "precondition: the victim run must finish normally")
+        XCTAssertNil(coordinator.runThreadOwnershipForTesting[victimRun],
+                     "normal terminal cleanup must release ownership before a late receipt re-establishes it")
+        // This test isolates retry-residue ownership. Provider stop failure has
+        // its own fail-closed test above, so remove the completed one-shot session.
+        coordinator.replaceProviderAdapter(.codex, adapter: SpyProviderAdapter(provider: .codex))
+
+        let foreignRun = AgentRunID()
+        try runRepo.upsert(AgentRun(
+            id: foreignRun,
+            threadId: foreign.id,
+            provider: .codex,
+            model: "m",
+            status: .completed,
+            finishedAt: Date()
+        ))
+        coordinator.receiptUsageEnrichmentOverrideForTesting = { runId, _ in
+            if runId == victimRun {
+                throw NSError(domain: "FakeRunnerTests.lateReceipt", code: 1)
+            }
+            return false
+        }
+        coordinator.recordLateCumulativeUsageForTesting(
+            runId: victimRun,
+            threadId: victim.id,
+            totalTokens: 13
+        )
+        coordinator.recordLateCumulativeUsageForTesting(
+            runId: foreignRun,
+            threadId: foreign.id,
+            totalTokens: 17
+        )
+
+        XCTAssertEqual(coordinator.runThreadOwnershipForTesting[victimRun], victim.id)
+        XCTAssertEqual(coordinator.runThreadOwnershipForTesting[foreignRun], foreign.id)
+        XCTAssertTrue(coordinator.lateReceiptRunResidueForTesting.contains(victimRun),
+                      "an enrichment error must retain the late usage retry until deletion or success")
+        XCTAssertTrue(coordinator.lateReceiptRunResidueForTesting.contains(foreignRun),
+                      "a false enrichment result must retain its late usage for a future correction")
+
+        try threadRepo.delete(id: victim.id)
+        XCTAssertEqual(coordinator.retireDeletedThreads([victim.id])[victim.id], .retired)
+        XCTAssertEqual(coordinator.retireDeletedThreads([victim.id])[victim.id], .retired)
+
+        XCTAssertFalse(coordinator.lateReceiptRunResidueForTesting.contains(victimRun),
+                       "deleted-thread retirement must purge late usage, reconciliation, and retry state")
+        XCTAssertNil(coordinator.runThreadOwnershipForTesting[victimRun],
+                     "the deleted run's ownership index must not outlive the purge")
+        XCTAssertTrue(coordinator.lateReceiptRunResidueForTesting.contains(foreignRun),
+                      "retiring one thread must not clear another thread's late receipt state")
+        XCTAssertEqual(coordinator.runThreadOwnershipForTesting[foreignRun], foreign.id,
+                       "foreign late receipt ownership must remain intact")
+    }
+
+    /// WHY: callbacks arriving after a committed delete and completed retirement
+    /// must not recreate usage or central provider-event ownership for that thread.
+    func test_retiredDeletedThread_rejectsLateUsageAndProviderRuntimeEvent() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-retire-late-callback-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "late callback", provider: .codex, model: "m")
+        let runId = AgentRunID()
+        try threadRepo.upsert(thread)
+        try runRepo.upsert(AgentRun(
+            id: runId,
+            threadId: thread.id,
+            provider: .codex,
+            model: "m",
+            status: .completed,
+            finishedAt: Date()
+        ))
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(scenario: .simpleAssistant(reply: "unused"))]
+        )
+        try threadRepo.delete(id: thread.id)
+        XCTAssertEqual(coordinator.retireDeletedThreads([thread.id])[thread.id], .retired)
+
+        coordinator.recordLateCumulativeUsageForTesting(runId: runId, threadId: thread.id, totalTokens: 21)
+        coordinator.handleRunEventForTesting(
+            .event(.providerRuntime(ProviderRuntimeEvent(
+                provider: .codex,
+                source: "test.late",
+                method: "late.callback",
+                payloadJSON: "{}",
+                receivedAtMs: 1
+            ))),
+            runId: runId,
+            threadId: thread.id
+        )
+
+        XCTAssertNil(try threadRepo.get(id: thread.id))
+        XCTAssertNil(try runRepo.get(id: runId))
+        XCTAssertNil(coordinator.runThreadOwnershipForTesting[runId])
+        XCTAssertFalse(coordinator.lateReceiptRunResidueForTesting.contains(runId))
+        XCTAssertFalse(coordinator.deletedThreadRuntimeResidueForTesting.contains(thread.id))
+    }
+
+    /// WHY: a durable read can become stale before its result claims ownership.
+    /// Retirement during that gap must invalidate the callback so it cannot
+    /// recreate usage or stream state after the committed delete.
+    func test_lateUsageReadPresent_deletedBeforeResolutionRejectsStaleAdmission() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-late-admission-race-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "late admission race", provider: .codex, model: "m")
+        let runId = AgentRunID()
+        try threadRepo.upsert(thread)
+        try runRepo.upsert(AgentRun(
+            id: runId,
+            threadId: thread.id,
+            provider: .codex,
+            model: "m",
+            status: .completed,
+            finishedAt: Date()
+        ))
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(scenario: .simpleAssistant(reply: "unused"))]
+        )
+        let readPresent = DispatchSemaphore(value: 0)
+        let resumeResolution = DispatchSemaphore(value: 0)
+        let callbackFinished = DispatchSemaphore(value: 0)
+        coordinator.lateRunAdmissionDidReadPresentForTesting = { id, candidateThreadId in
+            guard id == runId, candidateThreadId == thread.id else { return }
+            readPresent.signal()
+            resumeResolution.wait()
+        }
+
+        DispatchQueue.global().async {
+            coordinator.recordLateCumulativeUsageForTesting(
+                runId: runId,
+                threadId: thread.id,
+                totalTokens: 21
+            )
+            callbackFinished.signal()
+        }
+        XCTAssertEqual(readPresent.wait(timeout: .now() + 3), .success)
+
+        try threadRepo.delete(id: thread.id)
+        XCTAssertEqual(coordinator.retireDeletedThreads([thread.id])[thread.id], .retired)
+        resumeResolution.signal()
+        XCTAssertEqual(callbackFinished.wait(timeout: .now() + 3), .success)
+
+        XCTAssertNil(coordinator.runThreadOwnershipForTesting[runId])
+        XCTAssertFalse(coordinator.lateReceiptRunResidueForTesting.contains(runId))
+        XCTAssertFalse(coordinator.deletedThreadRuntimeResidueForTesting.contains(thread.id))
+        XCTAssertFalse(coordinator.pendingLateRunValidationIDsForTesting.contains(runId))
+    }
+
+    /// WHY: a durable-present read is only admission, not mutation authority.
+    /// Deletion after admission must invalidate the exact lease before late usage
+    /// can recreate accounting residue.
+    func test_lateUsageAdmitted_deletedBeforeMutationRejectsExpiredLease() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-late-usage-lease-race-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "usage lease race", provider: .codex, model: "m")
+        let runId = AgentRunID()
+        try threadRepo.upsert(thread)
+        try runRepo.upsert(AgentRun(
+            id: runId,
+            threadId: thread.id,
+            provider: .codex,
+            model: "m",
+            status: .completed,
+            finishedAt: Date()
+        ))
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(scenario: .simpleAssistant(reply: "unused"))]
+        )
+        let admitted = DispatchSemaphore(value: 0)
+        let resumeMutation = DispatchSemaphore(value: 0)
+        let callbackFinished = DispatchSemaphore(value: 0)
+        coordinator.runCallbackDidAdmitBeforeMutationForTesting = { id, _ in
+            guard id == runId else { return }
+            admitted.signal()
+            resumeMutation.wait()
+        }
+
+        DispatchQueue.global().async {
+            coordinator.recordLateCumulativeUsageForTesting(
+                runId: runId,
+                threadId: thread.id,
+                totalTokens: 23
+            )
+            callbackFinished.signal()
+        }
+        XCTAssertEqual(admitted.wait(timeout: .now() + 3), .success)
+        try threadRepo.delete(id: thread.id)
+        XCTAssertEqual(coordinator.retireDeletedThreads([thread.id])[thread.id], .retired)
+        resumeMutation.signal()
+        XCTAssertEqual(callbackFinished.wait(timeout: .now() + 3), .success)
+
+        XCTAssertNil(coordinator.runThreadOwnershipForTesting[runId])
+        XCTAssertFalse(coordinator.lateReceiptRunResidueForTesting.contains(runId))
+        XCTAssertFalse(coordinator.deletedThreadRuntimeResidueForTesting.contains(thread.id))
+    }
+
+    /// WHY: central provider events use the same admission boundary as usage.
+    /// An admitted-but-paused event must not publish or buffer after retirement.
+    func test_providerEventAdmitted_deletedBeforeMutationRejectsExpiredLease() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-late-event-lease-race-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "event lease race", provider: .codex, model: "m")
+        let runId = AgentRunID()
+        try threadRepo.upsert(thread)
+        try runRepo.upsert(AgentRun(
+            id: runId,
+            threadId: thread.id,
+            provider: .codex,
+            model: "m",
+            status: .completed,
+            finishedAt: Date()
+        ))
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(scenario: .simpleAssistant(reply: "unused"))]
+        )
+        let admitted = DispatchSemaphore(value: 0)
+        let resumeMutation = DispatchSemaphore(value: 0)
+        let callbackFinished = DispatchSemaphore(value: 0)
+        var publishedEvents = 0
+        coordinator.onAssistantEvent = { _, _, _ in publishedEvents += 1 }
+        coordinator.runCallbackDidAdmitBeforeMutationForTesting = { id, _ in
+            guard id == runId else { return }
+            admitted.signal()
+            resumeMutation.wait()
+        }
+        let event = AgentRunEvent.event(.providerRuntime(ProviderRuntimeEvent(
+            provider: .codex,
+            source: "test.lease",
+            method: "late.callback",
+            payloadJSON: "{}",
+            receivedAtMs: 1
+        )))
+
+        DispatchQueue.global().async {
+            coordinator.handleRunEventForTesting(event, runId: runId, threadId: thread.id)
+            callbackFinished.signal()
+        }
+        XCTAssertEqual(admitted.wait(timeout: .now() + 3), .success)
+        try threadRepo.delete(id: thread.id)
+        XCTAssertEqual(coordinator.retireDeletedThreads([thread.id])[thread.id], .retired)
+        resumeMutation.signal()
+        XCTAssertEqual(callbackFinished.wait(timeout: .now() + 3), .success)
+
+        XCTAssertEqual(publishedEvents, 0)
+        XCTAssertNil(coordinator.runThreadOwnershipForTesting[runId])
+        XCTAssertFalse(coordinator.deletedThreadRuntimeResidueForTesting.contains(thread.id))
+    }
+
+    /// WHY: the first callback may fail open for a transient durable read, but a
+    /// later validation proving the graph present must clear only the marker and
+    /// preserve the admitted usage state without another read on its fast path.
+    func test_lateUsageReadError_validationPresentClearsMarkerAndPreservesState() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-late-validation-present-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "validation present", provider: .codex, model: "m")
+        let runId = AgentRunID()
+        try threadRepo.upsert(thread)
+        try runRepo.upsert(AgentRun(id: runId, threadId: thread.id, provider: .codex, model: "m", status: .completed))
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(scenario: .simpleAssistant(reply: "unused"))]
+        )
+        var reads = 0
+        coordinator.lateRunAdmissionPresenceOverrideForTesting = { _, _ in
+            reads += 1
+            if reads == 1 { throw NSError(domain: "FakeRunnerTests.lateValidation", code: 1) }
+            return true
+        }
+        coordinator.recordLateCumulativeUsageForTesting(runId: runId, threadId: thread.id, totalTokens: 5)
+        XCTAssertTrue(coordinator.pendingLateRunValidationIDsForTesting.contains(runId))
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline && coordinator.pendingLateRunValidationIDsForTesting.contains(runId) {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertFalse(coordinator.pendingLateRunValidationIDsForTesting.contains(runId))
+        XCTAssertTrue(coordinator.lateReceiptRunResidueForTesting.contains(runId))
+        let readsAfterValidation = reads
+        coordinator.recordLateCumulativeUsageForTesting(runId: runId, threadId: thread.id, totalTokens: 7)
+        XCTAssertEqual(reads, readsAfterValidation,
+                       "owned follow-up usage must not perform a durable graph read")
+    }
+
+    /// WHY: when validation after an admitted read error proves the durable graph
+    /// absent, it must purge that exact callback residue and ownership.
+    func test_lateUsageReadError_validationAbsentPurgesAdmittedState() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-late-validation-absent-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let thread = AgentThread(title: "validation absent", provider: .codex, model: "m")
+        let runId = AgentRunID()
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(scenario: .simpleAssistant(reply: "unused"))]
+        )
+        var reads = 0
+        coordinator.lateRunAdmissionPresenceOverrideForTesting = { _, _ in
+            reads += 1
+            if reads == 1 { throw NSError(domain: "FakeRunnerTests.lateValidation", code: 2) }
+            return false
+        }
+        coordinator.recordLateCumulativeUsageForTesting(runId: runId, threadId: thread.id, totalTokens: 5)
+        XCTAssertTrue(coordinator.lateReceiptRunResidueForTesting.contains(runId),
+                      "the exact first callback is admitted while validation is pending")
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline && coordinator.pendingLateRunValidationIDsForTesting.contains(runId) {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertFalse(coordinator.pendingLateRunValidationIDsForTesting.contains(runId))
+        XCTAssertFalse(coordinator.lateReceiptRunResidueForTesting.contains(runId))
+        XCTAssertNil(coordinator.runThreadOwnershipForTesting[runId])
+    }
+
+    /// WHY: a persistent read failure may admit only the exact first callback.
+    /// Its validation marker must remain observable and bounded; capacity
+    /// exhaustion rejects new unknown callbacks instead of evicting evidence.
+    func test_lateCallbackPersistentReadError_admitsOnceAndFailsClosedAtCapacity() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-late-validation-capacity-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let thread = AgentThread(title: "validation capacity", provider: .codex, model: "m")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(scenario: .simpleAssistant(reply: "unused"))]
+        )
+        coordinator.lateRunAdmissionPresenceOverrideForTesting = { _, _ in
+            throw NSError(domain: "FakeRunnerTests.lateValidation", code: 3)
+        }
+        let firstRun = AgentRunID()
+        var publishedEvents = 0
+        coordinator.onAssistantEvent = { _, _, _ in publishedEvents += 1 }
+        let event = AgentRunEvent.event(.providerRuntime(ProviderRuntimeEvent(
+            provider: .codex,
+            source: "test.persistent",
+            method: "persistent.callback",
+            payloadJSON: "{}",
+            receivedAtMs: 1
+        )))
+
+        coordinator.handleRunEventForTesting(event, runId: firstRun, threadId: thread.id)
+        coordinator.handleRunEventForTesting(event, runId: firstRun, threadId: thread.id)
+        XCTAssertEqual(publishedEvents, 1,
+                       "the unresolved callback identity may be admitted exactly once")
+        XCTAssertTrue(coordinator.pendingLateRunValidationIDsForTesting.contains(firstRun))
+
+        for _ in 1..<64 {
+            coordinator.recordLateCumulativeUsageForTesting(
+                runId: AgentRunID(),
+                threadId: thread.id,
+                totalTokens: 1
+            )
+        }
+        let overflowRun = AgentRunID()
+        coordinator.recordLateCumulativeUsageForTesting(
+            runId: overflowRun,
+            threadId: thread.id,
+            totalTokens: 1
+        )
+        XCTAssertEqual(coordinator.pendingLateRunValidationIDsForTesting.count, 64)
+        XCTAssertNil(coordinator.runThreadOwnershipForTesting[overflowRun],
+                     "capacity exhaustion must reject rather than admit untracked state")
+        XCTAssertFalse(coordinator.lateReceiptRunResidueForTesting.contains(overflowRun))
+    }
+
+    /// WHY: a SQLite outage may last beyond the old two-timer budget. One sweep
+    /// must keep retrying all bounded claims, release capacity after recovery,
+    /// purge stale-absent residue, and admit a new callback without a manual drain.
+    func test_lateValidationSweep_recoversCapacityAndPurgesStaleAbsentClaim() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-late-validation-sweep-recovery-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let thread = AgentThread(title: "validation sweep recovery", provider: .codex, model: "m")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(scenario: .simpleAssistant(reply: "unused"))]
+        )
+        coordinator.lateRunValidationRetryDelayNanosecondsForTesting = 1_000_000
+        let stateLock = NSLock()
+        var recovering = false
+        var reads = 0
+        let staleRun = AgentRunID()
+        coordinator.lateRunAdmissionPresenceOverrideForTesting = { runId, _ in
+            try stateLock.withLock {
+                reads += 1
+                guard recovering else {
+                    throw NSError(domain: "FakeRunnerTests.lateValidationSweep", code: 1)
+                }
+                return runId != staleRun
+            }
+        }
+
+        coordinator.recordLateCumulativeUsageForTesting(
+            runId: staleRun,
+            threadId: thread.id,
+            totalTokens: 1
+        )
+        for _ in 1..<64 {
+            coordinator.recordLateCumulativeUsageForTesting(
+                runId: AgentRunID(),
+                threadId: thread.id,
+                totalTokens: 1
+            )
+        }
+        XCTAssertEqual(coordinator.pendingLateRunValidationIDsForTesting.count, 64)
+        XCTAssertEqual(coordinator.lateRunValidationSweepStartsForTesting, 1,
+                       "all claims must share one coordinator sweep task")
+
+        let outageDeadline = Date().addingTimeInterval(3)
+        while Date() < outageDeadline && stateLock.withLock({ reads < 192 }) {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertGreaterThanOrEqual(stateLock.withLock { reads }, 192,
+                                    "the sweep must continue beyond the former two retry rounds")
+        stateLock.withLock { recovering = true }
+
+        let recoveryDeadline = Date().addingTimeInterval(3)
+        while Date() < recoveryDeadline && !coordinator.pendingLateRunValidationIDsForTesting.isEmpty {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertTrue(coordinator.pendingLateRunValidationIDsForTesting.isEmpty)
+        XCTAssertNil(coordinator.runThreadOwnershipForTesting[staleRun])
+        XCTAssertFalse(coordinator.lateReceiptRunResidueForTesting.contains(staleRun),
+                       "an absent durable run must lose the state admitted during the outage")
+
+        let newRun = AgentRunID()
+        coordinator.recordLateCumulativeUsageForTesting(
+            runId: newRun,
+            threadId: thread.id,
+            totalTokens: 9
+        )
+        XCTAssertEqual(coordinator.runThreadOwnershipForTesting[newRun], thread.id,
+                       "recovered capacity must admit a new durable-present callback")
+    }
+
+    /// WHY: deletion evidence alone cannot authorize tearing down a running or
+    /// provider-mismatched session. Those may be foreign work whose identity is
+    /// unavailable after the durable row has gone away.
+    func test_retireDeletedThreads_preservesActiveAndForeignProviderSessions() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-retire-preserve-provider-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let active = AgentThread(title: "active", provider: .codex, model: "m")
+        let foreign = AgentThread(title: "foreign", provider: .codex, model: "m")
+        try threadRepo.upsert(active)
+        try threadRepo.upsert(foreign)
+        let adapter = SpyProviderAdapter(provider: .codex)
+        adapter.sessionSummaries = [
+            AgentProviderSessionSummary(
+                threadId: active.id,
+                provider: .codex,
+                status: .running,
+                providerThreadId: "active-session"
+            ),
+            AgentProviderSessionSummary(
+                threadId: foreign.id,
+                provider: .claude,
+                status: .completed,
+                providerThreadId: "foreign-session"
+            )
+        ]
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providerAdapters: [.codex: adapter]
+        )
+
+        try threadRepo.delete(id: active.id)
+        try threadRepo.delete(id: foreign.id)
+        let outcomes = coordinator.retireDeletedThreads([active.id, foreign.id])
+
+        XCTAssertEqual(outcomes[active.id], .retryRequired)
+        XCTAssertEqual(outcomes[foreign.id], .retryRequired)
+        XCTAssertEqual(adapter.stopSessionCallCount, 0,
+                       "active or provider-mismatched sessions must remain untouched by post-delete retirement")
+        XCTAssertEqual(adapter.sessionSummaries.count, 2,
+                       "conservative retirement must preserve the adapter's foreign/active ownership")
+    }
 }
 
 private extension AssistantEvent {
@@ -1808,6 +2486,7 @@ private final class SpyProviderAdapter: AgentProviderAdapter, @unchecked Sendabl
     private var _lastRecoveredExtraArgs: [String] = []
     var readEvents: [AssistantEvent] = []
     var sessionSummaries: [AgentProviderSessionSummary] = []
+    var stopSessionError: Error?
     private var _stopSessionCallCount = 0
     private var _lastRollback: (AgentThreadID, String)?
 
@@ -1924,8 +2603,12 @@ private final class SpyProviderAdapter: AgentProviderAdapter, @unchecked Sendabl
     func stopSession(threadId: AgentThreadID) throws {
         lock.lock()
         _stopSessionCallCount += 1
-        sessionSummaries.removeAll { $0.threadId == threadId }
+        let error = stopSessionError
+        if error == nil {
+            sessionSummaries.removeAll { $0.threadId == threadId }
+        }
         lock.unlock()
+        if let error { throw error }
     }
     func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {
         lock.lock()

@@ -382,6 +382,168 @@ final class AgentThreadDeletionUndoTests: XCTestCase {
                       "the rejected restore must fail loud in the visible status channel")
     }
 
+    // WHY: another producer can refill the workspace during the Undo window.
+    // Restoring the deleted graph must enforce the cap atomically and announce
+    // the committed victim before the restored row, never a post-reload ghost.
+    func test_undoThreadDeletion_afterConcurrentCreatePrunesEligibleVictimBeforeCreatedEvent() async throws {
+        let vm = try makeVM()
+        var restored = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "restore me",
+            provider: .codex,
+            model: "m",
+            status: .completed
+        )
+        restored.updatedAt = Date(timeIntervalSince1970: 10)
+        var victim = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "eligible victim",
+            provider: .codex,
+            model: "m",
+            status: .completed
+        )
+        victim.updatedAt = Date(timeIntervalSince1970: 1)
+        try vm.threadRepo.upsert(restored)
+        try vm.threadRepo.upsert(victim)
+        try vm.messageRepo.append(AgentMessage(
+            threadId: restored.id,
+            role: .user,
+            content: "restored readback"
+        ))
+        let cap = AgentThreadRepository.maxThreadsPerWorkspace
+        // restored + victim already present; fill remaining slots with protected rows.
+        let protectedCount = max(0, cap - 2)
+        for index in 0..<protectedCount {
+            var protected = AgentThread(
+                workspaceId: vm.workspaceID,
+                title: "protected \(index)",
+                provider: .codex,
+                model: "m"
+            )
+            protected.status = index.isMultiple(of: 2) ? .running : .pending
+            protected.updatedAt = Date(timeIntervalSince1970: TimeInterval(20 + index))
+            try vm.threadRepo.upsert(protected)
+        }
+        XCTAssertEqual(try vm.threadRepo.count(workspaceId: vm.workspaceID), cap)
+        vm.reloadThreads()
+        vm.selectThread(restored.id)
+        let deleted = await vm.deleteThread(restored.id)
+        XCTAssertTrue(deleted)
+
+        var concurrent = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "concurrent create",
+            provider: .codex,
+            model: "m",
+            status: .completed
+        )
+        concurrent.updatedAt = Date(timeIntervalSince1970: 1_000)
+        XCTAssertTrue(try vm.threadRepo.upsertEnforcingWorkspaceThreadLimit(concurrent).isEmpty)
+        XCTAssertEqual(try vm.threadRepo.count(workspaceId: vm.workspaceID), cap,
+                       "precondition: another producer refills the slot before Undo")
+
+        var eventOrder: [String] = []
+        var createdRowsExisted = true
+        vm.onThreadLifecycle = { event in
+            switch event {
+            case .deleted(let ids):
+                eventOrder.append("deleted:\(ids.map { $0.value.uuidString }.joined(separator: ","))")
+            case .created(let thread):
+                createdRowsExisted = createdRowsExisted && ((try? vm.threadRepo.get(id: thread.id)) != nil)
+                eventOrder.append("created:\(thread.id.value.uuidString)")
+            case .updated, .reordered:
+                break
+            }
+        }
+        vm.setReloadThreadListForTesting {
+            throw NSError(domain: "AgentThreadDeletionUndoTests.forcedReloadFailure", code: 1)
+        }
+        defer { vm.setReloadThreadListForTesting(nil) }
+
+        XCTAssertTrue(vm.undoLastThreadDeletion())
+
+        XCTAssertEqual(try vm.threadRepo.count(workspaceId: vm.workspaceID), cap)
+        XCTAssertNotNil(try vm.threadRepo.get(id: restored.id))
+        XCTAssertNil(try vm.threadRepo.get(id: victim.id))
+        XCTAssertNotNil(try vm.threadRepo.get(id: concurrent.id))
+        XCTAssertEqual(eventOrder, [
+            "deleted:\(victim.id.value.uuidString)",
+            "created:\(restored.id.value.uuidString)"
+        ], "the authoritative cap victim must be published before the restored row")
+        XCTAssertTrue(createdRowsExisted,
+                      "Undo must never publish a created event for a row absent from the repository")
+        XCTAssertTrue(vm.threads.contains(where: { $0.id == restored.id }))
+        XCTAssertFalse(vm.threads.contains(where: { $0.id == victim.id }))
+        XCTAssertEqual(vm.selectedThreadId, restored.id,
+                       "the committed restore must rebind selection before the fallible reload")
+        for _ in 0..<100 where vm.messages.map(\.content) != ["restored readback"] {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(vm.messages.map(\.content), ["restored readback"],
+                       "selection must read back the committed relational graph before reload")
+        XCTAssertTrue(vm.statusMessage.contains("Could not reload threads"),
+                      "the later list failure must remain visible without hiding the restored row")
+    }
+
+    // WHY: restored IDs are protected from retention. If every remaining row is
+    // active/protected, Undo must roll back the entire graph and keep its retry
+    // snapshot instead of exceeding the hard cap.
+    func test_undoThreadDeletion_atProtectedCapacityRollsBackAndPreservesUndo() async throws {
+        let vm = try makeVM()
+        let restored = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "restore me",
+            provider: .codex,
+            model: "m",
+            status: .completed
+        )
+        try vm.threadRepo.upsert(restored)
+        let cap = AgentThreadRepository.maxThreadsPerWorkspace
+        for index in 0..<(cap - 1) {
+            var protected = AgentThread(
+                workspaceId: vm.workspaceID,
+                title: "protected \(index)",
+                provider: .codex,
+                model: "m"
+            )
+            protected.status = index.isMultiple(of: 2) ? .running : .pending
+            try vm.threadRepo.upsert(protected)
+        }
+        vm.reloadThreads()
+        vm.selectThread(restored.id)
+        let deleted = await vm.deleteThread(restored.id)
+        XCTAssertTrue(deleted)
+
+        var concurrent = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "protected concurrent create",
+            provider: .codex,
+            model: "m"
+        )
+        concurrent.status = .running
+        XCTAssertTrue(try vm.threadRepo.upsertEnforcingWorkspaceThreadLimit(concurrent).isEmpty)
+        let undoPinBeforeFailure = vm.pendingThreadDeletionUndo?.attachmentGCPinID
+        let undoThreadIDsBeforeFailure = vm.pendingThreadDeletionUndo?.snapshots.map(\.thread.id)
+        var lifecycleEventCount = 0
+        vm.onThreadLifecycle = { _ in lifecycleEventCount += 1 }
+
+        XCTAssertFalse(vm.undoLastThreadDeletion())
+
+        XCTAssertEqual(try vm.threadRepo.count(workspaceId: vm.workspaceID), cap)
+        XCTAssertNil(try vm.threadRepo.get(id: restored.id),
+                     "the restored parent and every dependent row must roll back together")
+        XCTAssertNotNil(try vm.threadRepo.get(id: concurrent.id))
+        XCTAssertEqual(vm.pendingThreadDeletionUndo?.attachmentGCPinID, undoPinBeforeFailure,
+                       "a capacity failure must preserve the valid Undo snapshot for retry")
+        XCTAssertEqual(vm.pendingThreadDeletionUndo?.snapshots.map(\.thread.id), undoThreadIDsBeforeFailure)
+        XCTAssertEqual(lifecycleEventCount, 0,
+                       "rolled-back restore and victim deletes must publish no lifecycle events")
+        XCTAssertTrue(
+            vm.statusMessage.contains("Agent thread capacity exceeded")
+                || vm.statusMessage.contains("Agent thread capacity reached")
+        )
+    }
+
     // WHY: delete owns a provider teardown barrier. Cascading the thread row while
     // cancel is still pending loses the only durable handle to that provider work.
     func test_deleteRunningThread_removesDataOnlyAfterTerminationConfirmation() async throws {

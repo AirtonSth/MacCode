@@ -1,5 +1,10 @@
 import Foundation
+import CoreModel
 import SQLite3
+
+protocol SQLiteDBOwnedMaintenance: AnyObject {
+    func cancel()
+}
 
 public enum SQLiteError: Error, CustomStringConvertible {
     case open(String)
@@ -56,6 +61,13 @@ public final class SQLiteDB {
     // step, preventing a bare repository writer from entering a maintenance
     // transaction between its durable-reference scan and reversible-row delete.
     private let operationLock = NSRecursiveLock()
+    // Process-only Agent App selections belong to this database connection so
+    // distinct repository instances share one retention authority. The same
+    // operation lock makes selection changes atomic with capped transactions.
+    private var liveAgentThreadBySurface: [SurfaceID: AgentThreadID] = [:]
+    private var ownedMaintenance: SQLiteDBOwnedMaintenance?
+    private(set) var maintenanceInstallCountForTesting = 0
+    var onDeinitForTesting: (() -> Void)?
     // Marks `queue` so cachedStatement() can detect when it is running inside a
     // `performSync` block (and may therefore safely reuse a shared cached stmt).
     private static let queueKey = DispatchSpecificKey<UInt8>()
@@ -117,6 +129,24 @@ public final class SQLiteDB {
         operationLock.lock()
         defer { operationLock.unlock() }
         return try block()
+    }
+
+    func setLiveAgentThreadBinding(surfaceID: SurfaceID, threadID: AgentThreadID?) {
+        withSerializedOperation {
+            if let threadID {
+                liveAgentThreadBySurface[surfaceID] = threadID
+            } else {
+                liveAgentThreadBySurface.removeValue(forKey: surfaceID)
+            }
+        }
+    }
+
+    func withLiveAgentThreadBindings<T>(
+        _ body: (Set<AgentThreadID>) throws -> T
+    ) rethrows -> T {
+        try withSerializedOperation {
+            try body(Set(liveAgentThreadBySurface.values))
+        }
     }
 
     fileprivate func takeInjectedResultCodeForTesting() -> Int32? {
@@ -257,11 +287,13 @@ public final class SQLiteDB {
     }
 
     deinit {
+        ownedMaintenance?.cancel()
         // Finalise every cached statement before closing the connection.
         // sqlite3_close returns SQLITE_BUSY if any statement is still alive.
         for stmt in stmtCache.values { sqlite3_finalize(stmt) }
         stmtCache.removeAll()
         if let handle { sqlite3_close(handle) }
+        onDeinitForTesting?()
     }
 
     public func execute(_ sql: String) throws {
@@ -311,6 +343,25 @@ public final class SQLiteDB {
     public func enableFullDurability() throws {
         try execute("PRAGMA synchronous=FULL;")
         try execute("PRAGMA fullfsync=ON;")
+    }
+
+    /// Retains one database-scoped background worker for exactly this
+    /// connection's lifetime. Repeated installation attempts are harmless.
+    @discardableResult
+    func installOwnedMaintenance(_ maintenance: SQLiteDBOwnedMaintenance) -> Bool {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        guard ownedMaintenance == nil else { return false }
+        ownedMaintenance = maintenance
+        maintenanceInstallCountForTesting += 1
+        return true
+    }
+
+    func releaseOwnedMaintenance(_ maintenance: SQLiteDBOwnedMaintenance) {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        guard ownedMaintenance === maintenance else { return }
+        ownedMaintenance = nil
     }
 
     public func performSync<T>(_ block: (SQLiteDB) throws -> T) rethrows -> T {

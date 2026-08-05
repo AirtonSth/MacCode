@@ -1,5 +1,145 @@
 import Foundation
 import CoreModel
+import os
+
+private let forkIntentMaintenanceLog = Logger(
+    subsystem: "io.remotecode.persistence",
+    category: "fork-intent-maintenance"
+)
+
+struct ForkIntentMaintenanceReceipt: Equatable, Sendable {
+    let batchCount: Int
+    let hasMore: Bool
+    let durationMilliseconds: Int
+    let errorKind: String?
+}
+
+private final class ForkIntentMaintenanceLoop: SQLiteDBOwnedMaintenance, @unchecked Sendable {
+    private weak var db: SQLiteDB?
+    private let beforeBatch: (@Sendable () -> Void)?
+    private let receiptHandler: (@Sendable (ForkIntentMaintenanceReceipt) -> Void)?
+    private let retryDelayOverrideNanoseconds: UInt64?
+    private let successDelayOverrideNanoseconds: UInt64?
+    private let lock = NSLock()
+    private var task: Task<Void, Never>?
+
+    init(
+        db: SQLiteDB,
+        beforeBatch: (@Sendable () -> Void)?,
+        receiptHandler: (@Sendable (ForkIntentMaintenanceReceipt) -> Void)?,
+        retryDelayOverrideNanoseconds: UInt64?,
+        successDelayOverrideNanoseconds: UInt64?
+    ) {
+        self.db = db
+        self.beforeBatch = beforeBatch
+        self.receiptHandler = receiptHandler
+        self.retryDelayOverrideNanoseconds = retryDelayOverrideNanoseconds
+        self.successDelayOverrideNanoseconds = successDelayOverrideNanoseconds
+    }
+
+    func start() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard task == nil else { return }
+        task = Task.detached(priority: .utility) { [weak self] in
+            await self?.run()
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        let task = task
+        self.task = nil
+        lock.unlock()
+        task?.cancel()
+    }
+
+    private func run() async {
+        defer { clearTask() }
+        var retryDelayNanoseconds: UInt64 = 10_000_000
+        var recoveringFromError = false
+        forkIntentMaintenanceLog.info("transition=start")
+        while !Task.isCancelled {
+            beforeBatch?()
+            guard !Task.isCancelled, let receipt = performBatch() else { return }
+            emit(receipt)
+            if receipt.errorKind == nil {
+                retryDelayNanoseconds = 10_000_000
+                if recoveringFromError {
+                    forkIntentMaintenanceLog.info("transition=recovered")
+                    recoveringFromError = false
+                }
+                guard receipt.hasMore else {
+                    forkIntentMaintenanceLog.info("transition=drained")
+                    return
+                }
+                let delay = successDelayOverrideNanoseconds ?? 10_000_000
+                do {
+                    try await Task.sleep(nanoseconds: delay)
+                } catch {
+                    return
+                }
+            } else {
+                if !recoveringFromError, let errorKind = receipt.errorKind {
+                    forkIntentMaintenanceLog.error(
+                        "transition=error error_kind=\(errorKind, privacy: .public)"
+                    )
+                    recoveringFromError = true
+                }
+                let delay = retryDelayOverrideNanoseconds ?? retryDelayNanoseconds
+                do {
+                    try await Task.sleep(nanoseconds: delay)
+                } catch {
+                    return
+                }
+                retryDelayNanoseconds = min(retryDelayNanoseconds * 2, 1_000_000_000)
+            }
+        }
+    }
+
+    private func clearTask() {
+        lock.lock()
+        task = nil
+        lock.unlock()
+    }
+
+    /// The only scope that promotes the weak connection to a strong reference.
+    /// It is synchronous, so SQLiteDB cannot deinitialize during a batch and no
+    /// connection reference can cross the loop's yield or retry sleep.
+    private func performBatch() -> ForkIntentMaintenanceReceipt? {
+        guard let db else { return nil }
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        do {
+            let batch = try AgentThreadRepository(db: db).maintainHistoricalForkIntents()
+            let receipt = ForkIntentMaintenanceReceipt(
+                batchCount: batch.processedCount,
+                hasMore: batch.hasMore,
+                durationMilliseconds: Self.elapsedMilliseconds(since: startedAt),
+                errorKind: nil
+            )
+            if !batch.hasMore {
+                db.releaseOwnedMaintenance(self)
+            }
+            return receipt
+        } catch {
+            return ForkIntentMaintenanceReceipt(
+                batchCount: 0,
+                hasMore: true,
+                durationMilliseconds: Self.elapsedMilliseconds(since: startedAt),
+                errorKind: String(describing: type(of: error))
+            )
+        }
+    }
+
+    private func emit(_ receipt: ForkIntentMaintenanceReceipt) {
+        receiptHandler?(receipt)
+    }
+
+    private static func elapsedMilliseconds(since start: UInt64) -> Int {
+        let elapsed = DispatchTime.now().uptimeNanoseconds - start
+        return Int(elapsed / 1_000_000)
+    }
+}
 
 public struct BootstrapReport: Equatable {
     public let createdAppSupport: Bool
@@ -33,6 +173,11 @@ public final class Bootstrap {
     public let channel: ReleaseChannel
     public let dbPathOverride: String?
     public let appSupportOverride: String?
+    var beforeSchemaMigrationForTesting: ((SQLiteDB) throws -> Void)?
+    var beforeForkIntentMaintenanceBatchForTesting: (@Sendable () -> Void)?
+    var forkIntentMaintenanceReceiptForTesting: (@Sendable (ForkIntentMaintenanceReceipt) -> Void)?
+    var forkIntentMaintenanceRetryDelayNanosecondsForTesting: UInt64?
+    var forkIntentMaintenanceSuccessDelayNanosecondsForTesting: UInt64?
 
     public init(channel: ReleaseChannel, dbPathOverride: String? = nil, appSupportOverride: String? = nil) {
         self.channel = channel
@@ -94,10 +239,21 @@ public final class Bootstrap {
 
     private func openAndMigrate(dbPath: String) throws -> SQLiteDB {
         let db = try SQLiteDB(path: dbPath)
-        try Schema.migrate(db)
         try db.enableFullDurability()
+        try beforeSchemaMigrationForTesting?(db)
+        try Schema.migrate(db)
         try CommandReceiptRepository(db: db).recoverInterruptedClaims()
         try initDefaults(db: db)
+        let maintenance = ForkIntentMaintenanceLoop(
+            db: db,
+            beforeBatch: beforeForkIntentMaintenanceBatchForTesting,
+            receiptHandler: forkIntentMaintenanceReceiptForTesting,
+            retryDelayOverrideNanoseconds: forkIntentMaintenanceRetryDelayNanosecondsForTesting,
+            successDelayOverrideNanoseconds: forkIntentMaintenanceSuccessDelayNanosecondsForTesting
+        )
+        if db.installOwnedMaintenance(maintenance) {
+            maintenance.start()
+        }
         return db
     }
 

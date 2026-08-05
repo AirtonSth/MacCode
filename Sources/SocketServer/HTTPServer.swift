@@ -1029,7 +1029,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
         switch filter {
         case .cellularSafe:
             return wsHeartbeatProfileCellular
-        case .full:
+        case .full, .kindPrefixes:
+            // Local kind-prefix filters are host-only and use the Wi-Fi heartbeat budget.
             return wsHeartbeatProfileWiFi
         }
     }

@@ -6,6 +6,9 @@ import AgentRuntime
 import SocketServer
 import Surfaces
 import DistillCore
+import os
+
+private let appContextRuntimeLog = Logger(subsystem: "io.remotecode.agent", category: "app-context")
 
 // MARK: - Token Saver per-lane kill switch + governance snapshot
 
@@ -339,7 +342,10 @@ public final class AppContext {
     public var state = LayoutState()
 
     public let coordinator: AgentRunCoordinator
-    public var router: AppCommandRouter!
+    public var router: AppCommandRouter! {
+        didSet { drainRecoveredForkPrunedThreadIDsIfPossible() }
+    }
+    private var pendingRecoveredForkPrunedThreadIDs: Set<AgentThreadID> = []
     public var socketServer: UnixSocketServer?
     private let tokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefreshing
     private var tokenSaverAccountUsageRefreshTask: Task<Void, Never>?
@@ -411,6 +417,16 @@ public final class AppContext {
         let targetId: AgentQueuedMessageID
     }
     private var deferredQueuePromotions: [AgentThreadID: DeferredQueuePromotion] = [:]
+    /// A transient thread readback failure cannot safely decide whether it may
+    /// stop provider/queue ownership. Retain the exact deleted candidate until
+    /// a later read proves it absent (retire) or present (drop the candidate).
+    private struct PendingDeletedThreadRetirement {
+        var retryLogged = false
+    }
+    private var pendingDeletedThreadRetirements: [AgentThreadID: PendingDeletedThreadRetirement] = [:]
+    private var deletedThreadRetirementRetryTask: Task<Void, Never>?
+    private static let deletedThreadRetirementRetryBaseDelayNanoseconds: UInt64 = 50_000_000
+    private static let deletedThreadRetirementRetryMaximumDelayNanoseconds: UInt64 = 2_000_000_000
     private var isTerminating = false
     private struct TokenSaverAccountIdentity: Equatable {
         let userID: String?
@@ -425,6 +441,34 @@ public final class AppContext {
     var tokenSaverEntitlementModelValidationOverrideForTesting: TokenSaverModelValidation?
     var queueDrainWaiterCountForTesting: Int { queueDrainWaiters.count }
     var queueDrainSuppressedThreadCountForTesting: Int { queueDrainSuppressionLeases.count }
+    #if DEBUG
+    var deletedThreadRetirementRetryDelayNanosecondsForTesting: UInt64?
+    var pendingDeletedThreadRetirementIDsForTesting: Set<AgentThreadID> {
+        Set(pendingDeletedThreadRetirements.keys)
+    }
+
+    var deletedThreadQueueRuntimeResidueForTesting: Set<AgentThreadID> {
+        Set(queueDrainWaiters.keys)
+            .union(queueDrainSuppressionLeases.keys)
+            .union(queueDispatchAcceptancePermits.keys)
+            .union(deferredQueuePromotions.keys)
+    }
+
+    func seedDeletedThreadQueueRuntimeStateForTesting(_ threadId: AgentThreadID) {
+        queueDrainWaiters[threadId] = QueueDrainWaiter(
+            token: UUID(),
+            task: Task<Void, Never> {
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+            }
+        )
+        queueDrainSuppressionLeases[threadId] = [UUID()]
+        queueDispatchAcceptancePermits[threadId] = AgentRunAcceptancePermit()
+        deferredQueuePromotions[threadId] = DeferredQueuePromotion(
+            ownerId: AgentQueuedMessageID(),
+            targetId: AgentQueuedMessageID()
+        )
+    }
+    #endif
     /// Test seam: sandbox the SessionLearn target instruction files so tests never write
     /// into the developer's real ~/.claude/CLAUDE.md or ~/.codex/AGENTS.md.
     var sessionLearnInstructionFilesOverrideForTesting: [URL]?
@@ -448,6 +492,121 @@ public final class AppContext {
     private static var didLogEmptyTokenSaverLaneState = false
     /// Debounce window for coalescing per-token usage writes into one disk write.
     private static let tokenSaverUsageDebounceInterval: TimeInterval = 0.75
+
+    /// Releases host-owned state after a cap transaction has committed its
+    /// deletes. This deliberately has no EventBus/UI side effect: callers retain
+    /// the existing delete-before-create publication order. A failed read or a
+    /// restored row is not permission to cancel queue/provider ownership.
+    func retireDeletedAgentThreads(
+        _ ids: [AgentThreadID],
+        coordinatorAlreadyRetired _: Bool = false
+    ) {
+        var seen: Set<AgentThreadID> = []
+        let ordered = ids
+            .filter { seen.insert($0).inserted }
+            .sorted { $0.value.uuidString < $1.value.uuidString }
+        for threadId in ordered {
+            if pendingDeletedThreadRetirements[threadId] == nil {
+                pendingDeletedThreadRetirements[threadId] = PendingDeletedThreadRetirement()
+            }
+        }
+        drainPendingDeletedThreadRetirements()
+        schedulePendingDeletedThreadRetirementRetry()
+    }
+
+    /// Drain in a stable order so concurrent cap/fork lifecycle paths cannot
+    /// produce nondeterministic teardown. The coordinator is the sole durable
+    /// verifier; AppContext clears queue ownership only after terminal retirement.
+    private func drainPendingDeletedThreadRetirements() {
+        let ordered = pendingDeletedThreadRetirements.keys.sorted {
+            $0.value.uuidString < $1.value.uuidString
+        }
+        for threadId in ordered {
+            guard var pending = pendingDeletedThreadRetirements[threadId] else { continue }
+            let outcome = coordinator.retireDeletedThreads(
+                [threadId],
+                scheduleRetries: false
+            )[threadId] ?? .retryRequired
+            switch outcome {
+            case .retired:
+                pendingDeletedThreadRetirements.removeValue(forKey: threadId)
+                queueDrainWaiters.removeValue(forKey: threadId)?.task.cancel()
+                queueDrainSuppressionLeases.removeValue(forKey: threadId)
+                queueDispatchAcceptancePermits.removeValue(forKey: threadId)?.invalidate()
+                deferredQueuePromotions.removeValue(forKey: threadId)
+                appContextRuntimeLog.info(
+                    "thread.retirement.outcome thread=\(threadId.value.uuidString, privacy: .public) outcome=retired"
+                )
+            case .confirmedPresent:
+                // A restored row owns its queue/session state; only the stale
+                // retirement candidate is terminally resolved.
+                pendingDeletedThreadRetirements.removeValue(forKey: threadId)
+                appContextRuntimeLog.info(
+                    "thread.retirement.outcome thread=\(threadId.value.uuidString, privacy: .public) outcome=present"
+                )
+            case .retryRequired:
+                if pending.retryLogged == false {
+                    pending.retryLogged = true
+                    pendingDeletedThreadRetirements[threadId] = pending
+                    appContextRuntimeLog.info(
+                        "thread.retirement.retry_pending thread=\(threadId.value.uuidString, privacy: .public)"
+                    )
+                }
+            }
+        }
+    }
+
+    private func schedulePendingDeletedThreadRetirementRetry() {
+        guard deletedThreadRetirementRetryTask == nil,
+              !pendingDeletedThreadRetirements.isEmpty else { return }
+        deletedThreadRetirementRetryTask = Task { @MainActor [weak self] in
+            var attempt = 0
+            while !Task.isCancelled {
+                guard let delay = self?.deletedThreadRetirementRetryDelay(attempt: attempt) else {
+                    return
+                }
+                try? await Task.sleep(nanoseconds: delay)
+                guard let self, !Task.isCancelled else { return }
+                self.drainPendingDeletedThreadRetirements()
+                guard !self.pendingDeletedThreadRetirements.isEmpty else {
+                    self.deletedThreadRetirementRetryTask = nil
+                    return
+                }
+                attempt = min(attempt + 1, 5)
+            }
+        }
+    }
+
+    private func deletedThreadRetirementRetryDelay(attempt: Int) -> UInt64 {
+        #if DEBUG
+        let baseDelay = deletedThreadRetirementRetryDelayNanosecondsForTesting
+            ?? Self.deletedThreadRetirementRetryBaseDelayNanoseconds
+        #else
+        let baseDelay = Self.deletedThreadRetirementRetryBaseDelayNanoseconds
+        #endif
+        return min(
+            baseDelay * UInt64(1 << min(attempt, 5)),
+            Self.deletedThreadRetirementRetryMaximumDelayNanoseconds
+        )
+    }
+
+    func enqueueRecoveredForkPrunedThreadIDs(_ ids: [AgentThreadID]) {
+        // reconcileForkIntent already retired coordinator state immediately after
+        // its local graph commit. Do the host queue portion even before a router
+        // or Agent App surface exists; lifecycle publication remains deferred.
+        retireDeletedAgentThreads(ids, coordinatorAlreadyRetired: true)
+        pendingRecoveredForkPrunedThreadIDs.formUnion(ids)
+        drainRecoveredForkPrunedThreadIDsIfPossible()
+    }
+
+    private func drainRecoveredForkPrunedThreadIDsIfPossible() {
+        guard let router, !pendingRecoveredForkPrunedThreadIDs.isEmpty else { return }
+        let ids = pendingRecoveredForkPrunedThreadIDs.sorted {
+            $0.value.uuidString < $1.value.uuidString
+        }
+        pendingRecoveredForkPrunedThreadIDs.removeAll()
+        router.publishAgentThreadDeletions(ids)
+    }
 
     /// Accumulates streaming tool body/output so Codex/Grok `itemDelta` paths still
     /// detect `graphify query|path|explain` (not only one-shot `itemStarted`).
@@ -626,6 +785,11 @@ public final class AppContext {
             },
             providerAdapters: [.codex: codex, .claude: claude, .grok: grok]
         )
+        self.coordinator.onRecoveredForkPrunedThreadIDs = { [weak contextReference] ids in
+            await MainActor.run {
+                contextReference?.value?.enqueueRecoveredForkPrunedThreadIDs(ids)
+            }
+        }
         // plan-final W0: durable terminal ledger write-before-UI (diagnostics dir).
         let diagnosticsDir = self.appSupportDirectory.appendingPathComponent("diagnostics", isDirectory: true)
         self.coordinator.terminalTransitionLedger = TerminalTransitionLedger(directory: diagnosticsDir)
@@ -1231,6 +1395,7 @@ public final class AppContext {
     }
 
     deinit {
+        deletedThreadRetirementRetryTask?.cancel()
         tokenSaverEntitlementReconcileTask?.cancel()
         if let tokenSaverAccountObserver {
             NotificationCenter.default.removeObserver(tokenSaverAccountObserver)
@@ -3156,7 +3321,7 @@ public final class AppContext {
     ) throws -> AgentThread {
         guard let parent = try threadRepo.get(id: parentThreadID),
               let projectID = parent.projectId?.value.uuidString,
-              parent.workspaceId != nil else {
+              let workspaceID = parent.workspaceId else {
             throw TokenSaverRolloverError.missingProjectScope
         }
         guard parent.status != .pending, parent.status != .running else {
@@ -3167,6 +3332,10 @@ public final class AppContext {
         guard admission.allowed else {
             throw TokenSaverRolloverError.laneUnavailable(admission.reason)
         }
+        try threadRepo.preflightWorkspaceThreadInsertion(
+            workspaceId: workspaceID,
+            excludedVictimIDs: [parentThreadID]
+        )
         _ = try tokenSaverProjectDataRepo.performLifecycleSweep()
         let child = AgentThread(
             projectId: parent.projectId,
@@ -3204,17 +3373,23 @@ public final class AppContext {
                   try messageRepo.list(threadId: parentThreadID) == parentMessages else {
                 throw TokenSaverRolloverError.parentChanged
             }
-            try threadRepo.upsert(child)
-            try messageRepo.append(.init(threadId: child.id, role: .system, content: capsule.text))
-            try tokenSaverRolloverRepo.save(.init(
-                id: UUID().uuidString,
-                parentThreadID: parentThreadID.value.uuidString,
-                childThreadID: child.id.value.uuidString,
-                scopeTransitionJSON: nil,
-                capsuleSHA256: AgentSkillInstaller.sha256Hex(Data(capsule.text.utf8)),
-                capsuleText: capsule.text
-            ))
             _ = try tokenSaverProjectDataRepo.performLifecycleSweep()
+            let prunedThreadIDs = try threadRepo.transactionallyUpsertEnforcingWorkspaceThreadLimit(
+                child,
+                excludedVictimIDs: [parentThreadID]
+            ) {
+                try messageRepo.append(.init(threadId: child.id, role: .system, content: capsule.text))
+                try tokenSaverRolloverRepo.save(.init(
+                    id: UUID().uuidString,
+                    parentThreadID: parentThreadID.value.uuidString,
+                    childThreadID: child.id.value.uuidString,
+                    scopeTransitionJSON: nil,
+                    capsuleSHA256: AgentSkillInstaller.sha256Hex(Data(capsule.text.utf8)),
+                    capsuleText: capsule.text
+                ))
+            }
+            retireDeletedAgentThreads(prunedThreadIDs)
+            router?.publishAgentThreadDeletions(prunedThreadIDs)
             return child
         } catch {
             try? tokenSaverRolloverRepo.delete(childThreadID: child.id.value.uuidString)

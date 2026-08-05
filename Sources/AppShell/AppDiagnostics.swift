@@ -33,7 +33,8 @@ public struct ManagedProcessMemoryProfile: Sendable, Equatable {
                 providerRootCap: nil,
                 sidecarMaxConcurrentRequests: 1,
                 sidecarMaxQueueDepth: 4,
-                idleReleaseAge: 30 * 60,
+                // Early release of completed provider trees (claude/codex/grok).
+                idleReleaseAge: 60,
                 warningFraction: 0.60,
                 criticalFraction: 0.75,
                 // Observation/pressure only — never admission-blocking.
@@ -47,9 +48,9 @@ public struct ManagedProcessMemoryProfile: Sendable, Equatable {
             providerRootCap: nil,
             sidecarMaxConcurrentRequests: 4,
             sidecarMaxQueueDepth: 32,
-            // Minutes-scale idle release (plan-final W2). 6h retained too many
-            // completed provider trees (~10 GiB). Resume-preserving release only.
-            idleReleaseAge: 30 * 60,
+            // Early idle release: completed provider processes (claude/codex/grok)
+            // were retaining hundreds of MB for 30 minutes. Resume-preserving.
+            idleReleaseAge: 2 * 60,
             warningFraction: 0.70,
             criticalFraction: 0.85,
             hostProcessCeilingKB: nil,
