@@ -414,6 +414,17 @@ public final class AppContext {
         let targetId: AgentQueuedMessageID
     }
     private var deferredQueuePromotions: [AgentThreadID: DeferredQueuePromotion] = [:]
+    /// A transient thread readback failure cannot safely decide whether it may
+    /// stop provider/queue ownership. Retain the exact deleted candidate until
+    /// a later read proves it absent (retire) or present (drop the candidate).
+    private struct PendingDeletedThreadRetirement {
+        var coordinatorAlreadyRetired: Bool
+        var timedRetryAttempts = 0
+    }
+    private var pendingDeletedThreadRetirements: [AgentThreadID: PendingDeletedThreadRetirement] = [:]
+    private var deletedThreadRetirementRetryTask: Task<Void, Never>?
+    private static let deletedThreadRetirementTimedRetryLimit = 2
+    private static let deletedThreadRetirementRetryBaseDelayNanoseconds: UInt64 = 50_000_000
     private var isTerminating = false
     private struct TokenSaverAccountIdentity: Equatable {
         let userID: String?
@@ -429,6 +440,13 @@ public final class AppContext {
     var queueDrainWaiterCountForTesting: Int { queueDrainWaiters.count }
     var queueDrainSuppressedThreadCountForTesting: Int { queueDrainSuppressionLeases.count }
     #if DEBUG
+    /// Test-only readback seam. Production always queries the durable thread row.
+    var deletedThreadRetirementVerificationForTesting: ((AgentThreadID) throws -> Bool)?
+    var deletedThreadRetirementRetryDelayNanosecondsForTesting: UInt64?
+    var pendingDeletedThreadRetirementIDsForTesting: Set<AgentThreadID> {
+        Set(pendingDeletedThreadRetirements.keys)
+    }
+
     var deletedThreadQueueRuntimeResidueForTesting: Set<AgentThreadID> {
         Set(queueDrainWaiters.keys)
             .union(queueDrainSuppressionLeases.keys)
@@ -487,23 +505,95 @@ public final class AppContext {
         let ordered = ids
             .filter { seen.insert($0).inserted }
             .sorted { $0.value.uuidString < $1.value.uuidString }
-        let committed = ordered.filter { id in
-            do {
-                return try threadRepo.get(id: id) == nil
-            } catch {
-                return false
+        for threadId in ordered {
+            if var pending = pendingDeletedThreadRetirements[threadId] {
+                // Once a caller needs coordinator cleanup, a later recovery path
+                // that already performed its own portion cannot weaken that need.
+                pending.coordinatorAlreadyRetired = pending.coordinatorAlreadyRetired
+                    && coordinatorAlreadyRetired
+                // A fresh lifecycle call gets a fresh bounded timer budget. The
+                // identifier itself remains pending after any budget expires.
+                pending.timedRetryAttempts = 0
+                pendingDeletedThreadRetirements[threadId] = pending
+            } else {
+                pendingDeletedThreadRetirements[threadId] = PendingDeletedThreadRetirement(
+                    coordinatorAlreadyRetired: coordinatorAlreadyRetired
+                )
             }
         }
-        guard !committed.isEmpty else { return }
+        drainPendingDeletedThreadRetirements()
+    }
 
-        for threadId in committed {
-            queueDrainWaiters.removeValue(forKey: threadId)?.task.cancel()
-            queueDrainSuppressionLeases.removeValue(forKey: threadId)
-            queueDispatchAcceptancePermits.removeValue(forKey: threadId)?.invalidate()
-            deferredQueuePromotions.removeValue(forKey: threadId)
+    /// Drain in a stable order so concurrent cap/fork lifecycle paths cannot
+    /// produce nondeterministic teardown. A read error retains the exact ID;
+    /// only a later read proving absence can retire its runtime state.
+    private func drainPendingDeletedThreadRetirements() {
+        let ordered = pendingDeletedThreadRetirements.keys.sorted {
+            $0.value.uuidString < $1.value.uuidString
         }
-        if !coordinatorAlreadyRetired {
-            coordinator.retireDeletedThreads(committed)
+        var needsTimedRetry = false
+
+        for threadId in ordered {
+            guard var pending = pendingDeletedThreadRetirements[threadId] else { continue }
+            do {
+                let isDeleted = try isThreadDurablyDeletedForRetirement(threadId)
+                pendingDeletedThreadRetirements.removeValue(forKey: threadId)
+                // A restored or still-present row owns its session. Never stop it.
+                guard isDeleted else { continue }
+
+                queueDrainWaiters.removeValue(forKey: threadId)?.task.cancel()
+                queueDrainSuppressionLeases.removeValue(forKey: threadId)
+                queueDispatchAcceptancePermits.removeValue(forKey: threadId)?.invalidate()
+                deferredQueuePromotions.removeValue(forKey: threadId)
+                if !pending.coordinatorAlreadyRetired {
+                    coordinator.retireDeletedThreads([threadId])
+                }
+            } catch {
+                if pending.timedRetryAttempts < Self.deletedThreadRetirementTimedRetryLimit {
+                    pending.timedRetryAttempts += 1
+                    needsTimedRetry = true
+                }
+                // Timer budget exhaustion stops only timer work, never this ID.
+                // A subsequent lifecycle drain will verify it again.
+                pendingDeletedThreadRetirements[threadId] = pending
+            }
+        }
+
+        if needsTimedRetry {
+            schedulePendingDeletedThreadRetirementRetry()
+        }
+    }
+
+    private func isThreadDurablyDeletedForRetirement(_ threadId: AgentThreadID) throws -> Bool {
+        #if DEBUG
+        if let verification = deletedThreadRetirementVerificationForTesting {
+            return try verification(threadId)
+        }
+        #endif
+        return try threadRepo.get(id: threadId) == nil
+    }
+
+    private func schedulePendingDeletedThreadRetirementRetry() {
+        guard deletedThreadRetirementRetryTask == nil else { return }
+        let nextAttempt = pendingDeletedThreadRetirements.values
+            .map(\.timedRetryAttempts)
+            .filter { $0 > 0 && $0 <= Self.deletedThreadRetirementTimedRetryLimit }
+            .min() ?? 1
+        let baseDelay: UInt64
+        #if DEBUG
+        baseDelay = deletedThreadRetirementRetryDelayNanosecondsForTesting
+            ?? Self.deletedThreadRetirementRetryBaseDelayNanoseconds
+        #else
+        baseDelay = Self.deletedThreadRetirementRetryBaseDelayNanoseconds
+        #endif
+        let multiplier = UInt64(1 << min(nextAttempt - 1, 3))
+        let delay = min(baseDelay * multiplier, 2_000_000_000)
+        deletedThreadRetirementRetryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: delay)
+            guard let self else { return }
+            self.deletedThreadRetirementRetryTask = nil
+            guard !Task.isCancelled else { return }
+            self.drainPendingDeletedThreadRetirements()
         }
     }
 

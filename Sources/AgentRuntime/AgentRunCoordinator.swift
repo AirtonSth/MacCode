@@ -812,6 +812,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private var providers: [AgentProvider: AgentProviderAdapter]
     private var active: [AgentRunID: AgentRunHandle] = [:]
     private var activeThreads: [AgentThreadID: AgentRunID] = [:]
+    /// Every run-scoped in-memory residue must retain this association while it
+    /// exists. Durable rows can cascade away before a late cumulative usage
+    /// snapshot or receipt retry is cleared, so those maps cannot reconstruct a
+    /// deleted thread safely on their own.
+    private var runThreadOwnership: [AgentRunID: AgentThreadID] = [:]
     private typealias RunMetadata = (provider: AgentProvider, providerInstanceId: String?, model: String, cwd: String, serviceTier: AgentServiceTier, runtimeMode: AgentPermissionMode, interactionMode: AgentInteractionMode, adapterKey: String, binaryIdentity: String?)
     private var activeRunMetadata: [AgentRunID: RunMetadata] = [:]
     /// Process environments are immutable after launch. Resident provider adapters
@@ -826,6 +831,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// for a post-finalization enrichment pass.
     private var receiptUsageFinalizationInFlight: Set<AgentRunID> = []
     private var receiptUsageEnrichmentRetryScheduled: Set<AgentRunID> = []
+#if DEBUG
+    /// Test-only failure/false seam for a late cumulative usage correction.
+    /// Production always calls the durable orchestration runtime directly.
+    var receiptUsageEnrichmentOverrideForTesting: ((AgentRunID, AssistantTokenUsage) throws -> Bool)?
+#endif
     private var pendingReceiptFinalizations: [AgentRunID: PendingOrchestrationReceiptFinalization] = [:]
     private var receiptFinalizationRetryScheduled: Set<AgentRunID> = []
     /// Last provider `.error` (or stderr-derived) detail for the live run. Used when
@@ -1267,6 +1277,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let registeredPendingStart: Bool
         if pendingProviderStarts[request.threadId] == nil {
             pendingProviderStarts[request.threadId] = pendingProviderStart
+            rememberRunThreadOwnershipLocked(runId: runId, threadId: request.threadId)
             registeredPendingStart = true
         } else {
             registeredPendingStart = false
@@ -1282,6 +1293,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             if pendingProviderStarts[request.threadId] === pendingProviderStart {
                 pendingProviderStarts.removeValue(forKey: request.threadId)
             }
+            discardRunThreadOwnershipIfReleasedLocked(runId)
             lock.unlock()
             pendingProviderStart.complete()
         }
@@ -1677,8 +1689,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 self.active[runId] != nil || self.activeRunMetadata[runId] != nil
             }
             guard isActive, let runtime = self.orchestrationRuntime else {
-                _ = self.lock.withLock {
+                self.lock.withLock {
                     self.externalReceiptLeaseWorkItems.removeValue(forKey: runId)
+                    self.discardRunThreadOwnershipIfReleasedLocked(runId)
                 }
                 return
             }
@@ -1706,6 +1719,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
         }
         lock.withLock {
+            rememberRunThreadOwnershipLocked(runId: runId, threadId: threadId)
             externalReceiptLeaseWorkItems.removeValue(forKey: runId)?.cancel()
             externalReceiptLeaseWorkItems[runId] = workItem
         }
@@ -2370,6 +2384,61 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             || pendingProviderStarts[threadId] != nil
             || pendingThreadStops.contains(threadId)
             || exclusiveThreadMutations.contains(threadId)
+            || runThreadOwnership.contains {
+                $0.value == threadId && active[$0.key] != nil
+            }
+    }
+
+    /// Must be called with `lock` held. The index is deliberately independent
+    /// from durable `agent_runs`: cap deletes cascade those rows before late
+    /// provider usage or receipt retries have necessarily drained.
+    private func rememberRunThreadOwnershipLocked(
+        runId: AgentRunID,
+        threadId: AgentThreadID
+    ) {
+        runThreadOwnership[runId] = threadId
+    }
+
+    /// Every map here is keyed by a run id or contains one as a value. Keep the
+    /// ownership index only while at least one such residue remains. A future
+    /// late usage event carries its thread id and will re-establish ownership.
+    private func hasRunScopedResidueLocked(_ runId: AgentRunID) -> Bool {
+        active[runId] != nil
+            || activeThreads.values.contains(runId)
+            || activeRunMetadata[runId] != nil
+            || activeTurnIds[runId] != nil
+            || latestTokenUsage[runId] != nil
+            || reconciledTokenUsage[runId] != nil
+            || receiptUsageFinalizationInFlight.contains(runId)
+            || receiptUsageEnrichmentRetryScheduled.contains(runId)
+            || pendingReceiptFinalizations[runId] != nil
+            || receiptFinalizationRetryScheduled.contains(runId)
+            || latestRunErrorMessages[runId] != nil
+            || orchestrationDeadlineWorkItems[runId] != nil
+            || externalReceiptLeaseWorkItems[runId] != nil
+            || activeAssistantMessageIds[runId] != nil
+            || activeProviderTextItemTypes[runId] != nil
+            || bufferedProviderTextItems[runId] != nil
+            || providerTextTranslationsInFlight[runId] != nil
+            || deferredProviderTerminalEvents[runId] != nil
+            || activeDistillOutputRuns.contains(runId)
+            || finishingRuns.contains(runId)
+            || pendingTerminalEvents[runId] != nil
+            || terminalRetryScheduled.contains(runId)
+            || pendingStartFailures[runId] != nil
+            || startFailureRetryScheduled.contains(runId)
+            || pendingProviderStarts.values.contains { $0.runId == runId }
+            || awaitingTerminationRuns.contains(runId)
+            || providerTerminatedRuns.contains(runId)
+            || pendingGracefulStopFallbacks.contains(runId)
+            || seq[runId] != nil
+            || pendingStreamRunIds.values.contains(runId)
+    }
+
+    /// Must be called with `lock` held after removing run-scoped state.
+    private func discardRunThreadOwnershipIfReleasedLocked(_ runId: AgentRunID) {
+        guard !hasRunScopedResidueLocked(runId) else { return }
+        runThreadOwnership.removeValue(forKey: runId)
     }
 
     /// Returns nil when any adapter state could be active or belongs to a
@@ -2405,19 +2474,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     /// Must be called with mirrorEventLock and lock held, in that order.
     private func purgeDeletedThreadRuntimeLocked(_ threadId: AgentThreadID) {
-        var runIds: Set<AgentRunID> = []
-        if let runId = pendingStreamRunIds[threadId] {
-            runIds.insert(runId)
-        }
-        for (runId, pending) in pendingStartFailures where pending.request.threadId == threadId {
-            runIds.insert(runId)
-        }
-        for (runId, pending) in pendingReceiptFinalizations where pending.threadId == threadId {
-            runIds.insert(runId)
-        }
-        for (runId, pending) in deferredProviderTerminalEvents where pending.threadId == threadId {
-            runIds.insert(runId)
-        }
+        let runIds = runThreadOwnership
+            .compactMap { $0.value == threadId ? $0.key : nil }
+            .sorted { $0.value.uuidString < $1.value.uuidString }
 
         providerTurnScopes.removeValue(forKey: threadId)
         streamEventsSincePrune.removeValue(forKey: threadId)
@@ -2461,6 +2520,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             providerTerminatedRuns.remove(runId)
             pendingGracefulStopFallbacks.remove(runId)
             seq.removeValue(forKey: runId)
+            runThreadOwnership.removeValue(forKey: runId)
         }
     }
 
@@ -2723,6 +2783,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 clearStreamSequenceIfReleasedLocked(runId: runId, threadId: threadId)
             }
             pendingThreadStops.remove(threadId)
+            discardRunThreadOwnershipIfReleasedLocked(runId)
         }
         if streamFlushError == nil {
             streamEventsSincePrune.removeValue(forKey: threadId)
@@ -2730,6 +2791,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             pendingStreamRunIds.removeValue(forKey: threadId)
             pendingStreamPrunes.remove(threadId)
             lastStreamFlushMs.removeValue(forKey: threadId)
+            if let runId {
+                discardRunThreadOwnershipIfReleasedLocked(runId)
+            }
         }
         // PERF-MAC_AGENT-008: thread closed -> evict the dedup cache entry so
         // cancelled threads do not retain their final-answer text indefinitely.
@@ -2838,6 +2902,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         orchestrationDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
         externalReceiptLeaseWorkItems.removeValue(forKey: runId)?.cancel()
         seq.removeValue(forKey: runId)
+        discardRunThreadOwnershipIfReleasedLocked(runId)
         lastPersistedAssistantContent.removeValue(forKey: threadId)
         autoContinuationCounts.removeValue(forKey: threadId)
         autoContinuationTokens[threadId] = (autoContinuationTokens[threadId] ?? 0) + 1
@@ -2909,6 +2974,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         autoContinuationCounts[threadId] = 1
         autoContinuationTokens[threadId] = 1
         lastPersistedAssistantContent[threadId] = "retained assistant text"
+        rememberRunThreadOwnershipLocked(runId: runId, threadId: threadId)
         pendingReceiptFinalizations[runId] = PendingOrchestrationReceiptFinalization(
             runId: runId,
             threadId: threadId,
@@ -2970,7 +3036,35 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         ids.formUnion(pendingStartFailures.values.map { $0.request.threadId })
         ids.formUnion(pendingReceiptFinalizations.values.map(\.threadId))
         ids.formUnion(deferredProviderTerminalEvents.values.map(\.threadId))
+        ids.formUnion(runThreadOwnership.values)
         return ids
+    }
+
+    func recordLateCumulativeUsageForTesting(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        totalTokens: Int
+    ) {
+        recordReconciledTokenUsage(
+            AssistantTokenUsage(totalTokens: totalTokens, semantics: .cumulative),
+            runId: runId,
+            threadId: threadId
+        )
+    }
+
+    var runThreadOwnershipForTesting: [AgentRunID: AgentThreadID] {
+        lock.withLock { runThreadOwnership }
+    }
+
+    var lateReceiptRunResidueForTesting: Set<AgentRunID> {
+        lock.withLock {
+            Set(latestTokenUsage.keys)
+                .union(reconciledTokenUsage.keys)
+                .union(receiptUsageFinalizationInFlight)
+                .union(receiptUsageEnrichmentRetryScheduled)
+                .union(pendingReceiptFinalizations.keys)
+                .union(receiptFinalizationRetryScheduled)
+        }
     }
     #endif
 
@@ -3118,6 +3212,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
 
         lock.lock()
+        rememberRunThreadOwnershipLocked(runId: runId, threadId: request.threadId)
         let eventSequence = allocateStreamSequenceLocked(runId: runId, threadId: request.threadId)
         pendingStartFailures[runId] = PendingStartFailure(
             request: request,
@@ -3990,6 +4085,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             if flush.pruneDue { pendingStreamPrunes.remove(threadId) }
             if batch.isEmpty {
                 pendingStreamRunIds.removeValue(forKey: threadId)
+                discardRunThreadOwnershipIfReleasedLocked(runId)
             }
             lock.unlock()
             return nil
@@ -4244,6 +4340,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         threadId: AgentThreadID
     ) {
         lock.lock()
+        rememberRunThreadOwnershipLocked(runId: runId, threadId: threadId)
         var accumulator = reconciledTokenUsage[runId] ?? ReconciledTokenUsageAccumulator()
         accumulator.record(usage)
         let effective = accumulator.effective
@@ -4274,13 +4371,29 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lock.unlock()
             return
         }
+#if DEBUG
+        let enrichmentOverride = receiptUsageEnrichmentOverrideForTesting
+#endif
         lock.unlock()
 
         do {
-            if try orchestrationRuntime?.enrichFinalizedReceiptUsage(
+            let enriched: Bool?
+#if DEBUG
+            if let enrichmentOverride {
+                enriched = try enrichmentOverride(runId, usage)
+            } else {
+                enriched = try orchestrationRuntime?.enrichFinalizedReceiptUsage(
+                    runId: runId,
+                    usage: usage
+                )
+            }
+#else
+            enriched = try orchestrationRuntime?.enrichFinalizedReceiptUsage(
                 runId: runId,
                 usage: usage
-            ) == true {
+            )
+#endif
+            if enriched == true {
                 lock.lock()
                 let current = latestTokenUsage[runId]
                 let isCovered = current.map {
@@ -4291,6 +4404,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     reconciledTokenUsage.removeValue(forKey: runId)
                     latestTokenUsage.removeValue(forKey: runId)
                     receiptUsageEnrichmentRetryScheduled.remove(runId)
+                    discardRunThreadOwnershipIfReleasedLocked(runId)
                 }
                 lock.unlock()
                 if !isCovered {
@@ -4325,7 +4439,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             guard let self else { return }
             let stillPending = self.lock.withLock {
                 self.receiptUsageEnrichmentRetryScheduled.remove(runId)
-                return self.latestTokenUsage[runId] != nil
+                let pending = self.latestTokenUsage[runId] != nil
+                self.discardRunThreadOwnershipIfReleasedLocked(runId)
+                return pending
             }
             if stillPending {
                 self.attemptFinalizedReceiptUsageEnrichment(
@@ -4340,6 +4456,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private func finalizeOrRetryReceipt(
         _ pending: PendingOrchestrationReceiptFinalization
     ) -> Bool {
+        lock.withLock {
+            rememberRunThreadOwnershipLocked(
+                runId: pending.runId,
+                threadId: pending.threadId
+            )
+        }
         do {
             try orchestrationRuntime?.finalizeReceipt(
                 runId: pending.runId,
@@ -4351,6 +4473,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 pendingReceiptFinalizations.removeValue(forKey: pending.runId)
                 receiptFinalizationRetryScheduled.remove(pending.runId)
                 receiptUsageFinalizationInFlight.remove(pending.runId)
+                discardRunThreadOwnershipIfReleasedLocked(pending.runId)
                 return (
                     latestTokenUsage[pending.runId] != nil,
                     externalReceiptLeaseWorkItems.removeValue(forKey: pending.runId)
@@ -4366,6 +4489,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return true
         } catch {
             lock.withLock {
+                rememberRunThreadOwnershipLocked(
+                    runId: pending.runId,
+                    threadId: pending.threadId
+                )
                 pendingReceiptFinalizations[pending.runId] = pending
                 receiptUsageFinalizationInFlight.insert(pending.runId)
             }
@@ -4392,7 +4519,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             guard let self else { return }
             let pending = self.lock.withLock { () -> PendingOrchestrationReceiptFinalization? in
                 self.receiptFinalizationRetryScheduled.remove(runId)
-                return self.pendingReceiptFinalizations[runId]
+                let pending = self.pendingReceiptFinalizations[runId]
+                self.discardRunThreadOwnershipIfReleasedLocked(runId)
+                return pending
             }
             if let pending {
                 self.finalizeOrRetryReceipt(pending)
@@ -4407,6 +4536,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         allowFinalResponseTranslation: Bool = true,
         providerTerminalAcknowledged: Bool = true
     ) {
+        lock.lock()
+        rememberRunThreadOwnershipLocked(runId: runId, threadId: threadId)
+        lock.unlock()
         switch event {
         case .event(let rawEvent):
             let ev = sanitizeFinalAssistantEvent(rawEvent)
@@ -5095,6 +5227,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // PERF-MAC_AGENT-008: thread closed -> evict the dedup cache entry so
             // finished threads do not retain their final-answer text indefinitely.
             lastPersistedAssistantContent.removeValue(forKey: threadId)
+            discardRunThreadOwnershipIfReleasedLocked(runId)
             let activeProjection = activeRunProjectionLocked()
             lock.unlock()
             // Durable terminal is committed and in-memory ownership released.
@@ -5418,6 +5551,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         pendingStartFailures.removeValue(forKey: runId)
         startFailureRetryScheduled.remove(runId)
         clearStreamSequenceIfReleasedLocked(runId: runId, threadId: pending.request.threadId)
+        discardRunThreadOwnershipIfReleasedLocked(runId)
         lock.unlock()
 
         if !pending.otherRunActive {
@@ -5459,6 +5593,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             self.lock.lock()
             self.startFailureRetryScheduled.remove(runId)
             let stillPending = self.pendingStartFailures[runId] != nil
+            self.discardRunThreadOwnershipIfReleasedLocked(runId)
             self.lock.unlock()
             if stillPending {
                 self.retryStartFailureCommit(runId: runId)
@@ -5578,7 +5713,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         terminalRetryScheduled.remove(runId)
-        return pendingTerminalEvents[runId]
+        let pending = pendingTerminalEvents[runId]
+        discardRunThreadOwnershipIfReleasedLocked(runId)
+        return pending
     }
 
     private func shouldTranslateFinalResponse(_ text: String) -> Bool {
@@ -5594,7 +5731,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return nil
         }
         providerTextTranslationsInFlight.removeValue(forKey: runId)
-        return deferredProviderTerminalEvents.removeValue(forKey: runId)
+        let deferred = deferredProviderTerminalEvents.removeValue(forKey: runId)
+        discardRunThreadOwnershipIfReleasedLocked(runId)
+        return deferred
     }
 
     private enum ProviderTextTarget {
@@ -5760,6 +5899,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private func clearDistillOutputMode(_ runId: AgentRunID) {
         lock.lock()
         activeDistillOutputRuns.remove(runId)
+        discardRunThreadOwnershipIfReleasedLocked(runId)
         lock.unlock()
     }
 
@@ -6042,6 +6182,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return
         }
         seq.removeValue(forKey: runId)
+        discardRunThreadOwnershipIfReleasedLocked(runId)
     }
 
     // PERF-MAC_AGENT-008: the lastPersistedAssistantContent dedup cache stores one

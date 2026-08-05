@@ -1766,6 +1766,87 @@ final class FakeRunnerTests: XCTestCase {
                        "retiring an already-terminal session must not emit a synthetic run lifecycle")
     }
 
+    /// WHY: a late cumulative usage receipt can arrive after normal terminal
+    /// cleanup has already removed active/pending state. Its run-to-thread
+    /// ownership must survive long enough for a cap delete to purge both an
+    /// enrichment error retry and a false/not-enriched residue, without touching
+    /// a different thread's late receipt state.
+    func test_retireDeletedThreads_purgesLateReceiptResidueAfterNormalTerminalCleanup() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-retire-late-receipt-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let victim = AgentThread(title: "late receipt victim", provider: .codex, model: "m")
+        let foreign = AgentThread(title: "late receipt foreign", provider: .codex, model: "m")
+        try threadRepo.upsert(victim)
+        try threadRepo.upsert(foreign)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(scenario: .simpleAssistant(reply: "done"))]
+        )
+        let victimRun = try await coordinator.startRun(AgentRunRequest(
+            threadId: victim.id,
+            provider: .codex,
+            model: "m",
+            cwd: tmp,
+            prompt: "finish before late usage"
+        ))
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if (try? runRepo.get(id: victimRun))?.finishedAt != nil,
+               coordinator.runThreadOwnershipForTesting[victimRun] == nil {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertNotNil((try? runRepo.get(id: victimRun))?.finishedAt,
+                        "precondition: the victim run must finish normally")
+        XCTAssertNil(coordinator.runThreadOwnershipForTesting[victimRun],
+                     "normal terminal cleanup must release ownership before a late receipt re-establishes it")
+
+        let foreignRun = AgentRunID()
+        coordinator.receiptUsageEnrichmentOverrideForTesting = { runId, _ in
+            if runId == victimRun {
+                throw NSError(domain: "FakeRunnerTests.lateReceipt", code: 1)
+            }
+            return false
+        }
+        coordinator.recordLateCumulativeUsageForTesting(
+            runId: victimRun,
+            threadId: victim.id,
+            totalTokens: 13
+        )
+        coordinator.recordLateCumulativeUsageForTesting(
+            runId: foreignRun,
+            threadId: foreign.id,
+            totalTokens: 17
+        )
+
+        XCTAssertEqual(coordinator.runThreadOwnershipForTesting[victimRun], victim.id)
+        XCTAssertEqual(coordinator.runThreadOwnershipForTesting[foreignRun], foreign.id)
+        XCTAssertTrue(coordinator.lateReceiptRunResidueForTesting.contains(victimRun),
+                      "an enrichment error must retain the late usage retry until deletion or success")
+        XCTAssertTrue(coordinator.lateReceiptRunResidueForTesting.contains(foreignRun),
+                      "a false enrichment result must retain its late usage for a future correction")
+
+        try threadRepo.delete(id: victim.id)
+        coordinator.retireDeletedThreads([victim.id])
+        coordinator.retireDeletedThreads([victim.id])
+
+        XCTAssertFalse(coordinator.lateReceiptRunResidueForTesting.contains(victimRun),
+                       "deleted-thread retirement must purge late usage, reconciliation, and retry state")
+        XCTAssertNil(coordinator.runThreadOwnershipForTesting[victimRun],
+                     "the deleted run's ownership index must not outlive the purge")
+        XCTAssertTrue(coordinator.lateReceiptRunResidueForTesting.contains(foreignRun),
+                      "retiring one thread must not clear another thread's late receipt state")
+        XCTAssertEqual(coordinator.runThreadOwnershipForTesting[foreignRun], foreign.id,
+                       "foreign late receipt ownership must remain intact")
+    }
+
     /// WHY: deletion evidence alone cannot authorize tearing down a running or
     /// provider-mismatched session. Those may be foreign work whose identity is
     /// unavailable after the durable row has gone away.

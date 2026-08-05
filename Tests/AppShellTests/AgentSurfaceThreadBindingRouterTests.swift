@@ -587,6 +587,102 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
                        "headless cap eviction must clear queue waiters, permits, leases, and promotions")
     }
 
+    /// WHY: an intermittent durable-thread read must defer retirement rather
+    /// than treating an unknown row as deleted. The retry may later clear the
+    /// exact committed victim, but cannot stop its terminal session prematurely.
+    func test_headlessCreateAtCap_retriesTransientRetirementReadWithoutPrematureSessionStop() async throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-HeadlessRetryRetire-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "HEADLESS-RETRY", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        closeAndUnregisterAgentSurfaces(workspace: workspace.id)
+        XCTAssertTrue(agentSurfaces(in: workspace.id).isEmpty,
+                      "precondition: this producer must run without an Agent App surface")
+
+        let oldest = Date(timeIntervalSince1970: 1_700_000_000)
+        var victim = AgentThread(workspaceId: workspace.id, title: "retry victim", provider: .codex, model: "m")
+        victim.status = .completed
+        victim.updatedAt = oldest
+        try ctx.threadRepo.upsert(victim)
+        for index in 0..<(AgentThreadRepository.maxThreadsPerWorkspace - 1) {
+            var survivor = AgentThread(workspaceId: workspace.id, title: "survivor \(index)", provider: .codex, model: "m")
+            survivor.status = .completed
+            survivor.updatedAt = oldest.addingTimeInterval(TimeInterval(index + 1))
+            try ctx.threadRepo.upsert(survivor)
+        }
+
+        let adapter = IdleSessionRetirementAdapter(provider: .codex)
+        adapter.seedTerminalSession(threadId: victim.id)
+        ctx.coordinator.replaceProviderAdapter(.codex, adapter: adapter)
+        ctx.coordinator.seedDeletedThreadRuntimeStateForTesting(victim.id)
+        ctx.seedDeletedThreadQueueRuntimeStateForTesting(victim.id)
+        var verificationAttempts = 0
+        ctx.deletedThreadRetirementVerificationForTesting = { id in
+            guard id == victim.id else {
+                return try ctx.threadRepo.get(id: id) == nil
+            }
+            verificationAttempts += 1
+            if verificationAttempts <= 3 {
+                throw NSError(domain: "AgentSurfaceThreadBindingRouterTests.retirement", code: 1)
+            }
+            return try ctx.threadRepo.get(id: id) == nil
+        }
+        ctx.deletedThreadRetirementRetryDelayNanosecondsForTesting = 1_000_000
+        defer {
+            ctx.deletedThreadRetirementVerificationForTesting = nil
+            ctx.deletedThreadRetirementRetryDelayNanosecondsForTesting = nil
+        }
+        var runLifecycleEvents = 0
+        ctx.coordinator.onRunFinished = { _, _, _ in runLifecycleEvents += 1 }
+
+        _ = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "scheduled create after transient read failure",
+            provider: .codex,
+            model: "m",
+            permissionMode: .supervised,
+            reasoningEffort: .medium,
+            routingConfiguration: nil,
+            quiet: true
+        )
+
+        XCTAssertNil(try ctx.threadRepo.get(id: victim.id),
+                     "the cap transaction must still commit its victim delete")
+        XCTAssertEqual(adapter.stopSessionCallCount, 0,
+                       "an unreadable verification result must not stop a session before deletion is confirmed")
+        XCTAssertTrue(ctx.pendingDeletedThreadRetirementIDsForTesting.contains(victim.id),
+                      "the exact unverified victim must remain pending for retry")
+        XCTAssertTrue(ctx.coordinator.deletedThreadRuntimeResidueForTesting.contains(victim.id),
+                      "coordinator state must remain intact until the retry confirms deletion")
+        XCTAssertTrue(ctx.deletedThreadQueueRuntimeResidueForTesting.contains(victim.id),
+                      "queue state must remain intact until the retry confirms deletion")
+
+        let retryDeadline = Date().addingTimeInterval(3)
+        while Date() < retryDeadline && verificationAttempts < 3 {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(verificationAttempts, 3,
+                       "the bounded timer budget must make its configured retry attempts")
+        XCTAssertEqual(adapter.stopSessionCallCount, 0,
+                       "timer-budget exhaustion must retain—not prematurely retire—the unknown victim")
+        XCTAssertTrue(ctx.pendingDeletedThreadRetirementIDsForTesting.contains(victim.id),
+                      "the candidate must survive exhausted timers for a future lifecycle drain")
+
+        // The next lifecycle drain retries the retained exact ID and may now
+        // safely retire it because the durable read succeeds.
+        ctx.retireDeletedAgentThreads([victim.id])
+
+        XCTAssertEqual(verificationAttempts, 4,
+                       "the next lifecycle drain must re-read the retained victim id")
+        XCTAssertEqual(adapter.stopSessionCallCount, 1,
+                       "a confirmed deletion must retire the terminal resident session exactly once")
+        XCTAssertFalse(ctx.pendingDeletedThreadRetirementIDsForTesting.contains(victim.id))
+        XCTAssertFalse(ctx.coordinator.deletedThreadRuntimeResidueForTesting.contains(victim.id))
+        XCTAssertFalse(ctx.deletedThreadQueueRuntimeResidueForTesting.contains(victim.id))
+        XCTAssertEqual(runLifecycleEvents, 0,
+                       "retry retirement must not manufacture a run lifecycle event")
+    }
+
     /// WHY: the Agent App producer must use the same post-commit path as the
     /// headless producer, before it fans out the deleted lifecycle event.
     func test_surfaceCreateAtCap_retiresGlobalRuntimeBeforeLifecycleFanout() throws {
