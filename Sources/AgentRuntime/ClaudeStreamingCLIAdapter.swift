@@ -20,6 +20,11 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         let finalMessage: String?
         let providerThreadId: String?
         let runId: AgentRunID?
+        /// Wall-clock when the finish was first withheld. Absolute max is measured
+        /// from this instant and is **not** reset by later stream lines (those only
+        /// refresh the inactivity timer). Prevents "Working forever" when the CLI
+        /// keeps heartbeating while pending tasks never clear.
+        let deferredAt: Date
     }
 
     private final class Session: @unchecked Sendable {
@@ -128,18 +133,34 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     // Cleared when sendTurn begins a new session for that thread. Guarded by `lock`.
     private var interruptedThreadIds: Set<AgentThreadID> = []
 
-    /// CLAUDE-BG-LIFECYCLE: liveness bound for a withheld finish, reset by any
-    /// stream line. Generous by default (a quiet background job emits nothing
-    /// until it ends); on expiry the run still reaches a terminal state instead of
-    /// hanging non-terminal forever. Injectable so tests can drive it in ms.
+    /// CLAUDE-BG-LIFECYCLE: inactivity bound for a withheld finish, reset by stream
+    /// lines. Quiet background jobs emit nothing until they end; on expiry the run
+    /// still reaches a terminal state. Injectable so tests can drive it in ms.
     private let deferredFinishInactivityTimeout: TimeInterval
+    /// Hard wall-clock cap from `DeferredFinish.deferredAt` — **not** reset by
+    /// stream lines. Stops runs from hanging for hours when the CLI keeps
+    /// emitting heartbeats (or noise) while `pendingBackgroundTaskIds` never empties.
+    private let deferredFinishAbsoluteMaxTimeout: TimeInterval
+    /// After the CLI reports idle pending tasks, wait briefly for a resume `result`
+    /// (happy path). If none arrives, flush the withheld finish so Working ends.
+    private let deferredFinishPostIdleTimeout: TimeInterval
 
-    public init(binaryNameOverride: String? = nil, maxReadableEvents: Int = 5_000, transcriptStore: ClaudeTranscriptStore = ClaudeTranscriptStore(), interruptGracePeriod: TimeInterval = 2, deferredFinishInactivityTimeout: TimeInterval = 900) {
+    public init(
+        binaryNameOverride: String? = nil,
+        maxReadableEvents: Int = 5_000,
+        transcriptStore: ClaudeTranscriptStore = ClaudeTranscriptStore(),
+        interruptGracePeriod: TimeInterval = 2,
+        deferredFinishInactivityTimeout: TimeInterval = 900,
+        deferredFinishAbsoluteMaxTimeout: TimeInterval = 900,
+        deferredFinishPostIdleTimeout: TimeInterval = 45
+    ) {
         self.binaryNameOverride = binaryNameOverride
         self.maxReadableEvents = max(1, maxReadableEvents)
         self.transcriptStore = transcriptStore
         self.interruptGracePeriod = max(0, interruptGracePeriod)
         self.deferredFinishInactivityTimeout = max(0.01, deferredFinishInactivityTimeout)
+        self.deferredFinishAbsoluteMaxTimeout = max(0.01, deferredFinishAbsoluteMaxTimeout)
+        self.deferredFinishPostIdleTimeout = max(0.01, deferredFinishPostIdleTimeout)
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
@@ -631,15 +652,18 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             session.lastAssistantUuid = assistantUuid
             lock.unlock()
         }
+        var armedPostIdleFlush = false
         if let rawObject {
             // CLAUDE-BG-LIFECYCLE: keep the pending-background-work view current
             // BEFORE the parser's turn events are processed below, so a `result`
             // in this same batch is judged against the up-to-date set.
-            trackBackgroundWork(in: rawObject, session: session)
+            armedPostIdleFlush = trackBackgroundWork(in: rawObject, session: session)
         }
-        // Any stream line is liveness: a deferral must not time out while the CLI
-        // is still talking to us.
-        refreshDeferralWatchdog(session: session)
+        // Any stream line is liveness — but do not clobber a post-idle short flush
+        // that trackBackgroundWork just armed when pending became empty.
+        if !armedPostIdleFlush {
+            refreshDeferralWatchdog(session: session)
+        }
         if let rawObject,
            let runtimeEvent = ProviderRuntimeEvent.fromJSONObject(rawObject, provider: .claude, source: "claude.stream-json") {
             emit(.event(.providerRuntime(runtimeEvent)), session: session)
@@ -765,11 +789,14 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         let runId = session.inFlightRunId
         let shouldDefer = allowDeferral && status == .completed && !pending.isEmpty
         if shouldDefer {
+            // Keep the earliest deferredAt if we re-arm on a later premature result.
+            let deferredAt = session.deferredFinish?.deferredAt ?? Date()
             session.deferredFinish = DeferredFinish(
                 status: status,
                 finalMessage: finalMessage,
                 providerThreadId: providerThreadId,
-                runId: runId
+                runId: runId,
+                deferredAt: deferredAt
             )
         } else {
             session.deferredFinish = nil
@@ -835,19 +862,44 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     }
 
     /// (Re)arms the deferral liveness bound. No-op unless a finish is withheld.
-    private func refreshDeferralWatchdog(session: Session) {
+    /// Stream lines refresh the *inactivity* timer only; the absolute max from
+    /// `deferredAt` is always respected so heartbeats cannot postpone terminal forever.
+    private func refreshDeferralWatchdog(
+        session: Session,
+        inactivityOverride: TimeInterval? = nil
+    ) {
         lock.lock()
-        guard session.deferredFinish != nil else {
+        guard let deferred = session.deferredFinish else {
             lock.unlock()
             return
         }
+        let elapsed = Date().timeIntervalSince(deferred.deferredAt)
+        let absoluteRemaining = deferredFinishAbsoluteMaxTimeout - elapsed
+        if absoluteRemaining <= 0 {
+            session.deferralWatchdog?.cancel()
+            session.deferralWatchdog = nil
+            lock.unlock()
+            flushDeferredFinish(session: session, reason: "watchdog_absolute_max")
+            return
+        }
         session.deferralWatchdog?.cancel()
+        let inactivity = inactivityOverride ?? deferredFinishInactivityTimeout
+        let delay = min(max(0.01, inactivity), absoluteRemaining)
         let item = DispatchWorkItem { [weak self, weak session] in
             guard let self, let session else { return }
-            self.flushDeferredFinish(session: session, reason: "watchdog_inactivity")
+            // Re-check absolute max at fire time (clock can advance past inactivity).
+            self.lock.lock()
+            let stillDeferred = session.deferredFinish
+            let elapsedNow = stillDeferred.map { Date().timeIntervalSince($0.deferredAt) } ?? 0
+            let hitAbsolute = stillDeferred != nil
+                && elapsedNow >= self.deferredFinishAbsoluteMaxTimeout
+            self.lock.unlock()
+            self.flushDeferredFinish(
+                session: session,
+                reason: hitAbsolute ? "watchdog_absolute_max" : "watchdog_inactivity"
+            )
         }
         session.deferralWatchdog = item
-        let delay = deferredFinishInactivityTimeout
         lock.unlock()
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: item)
     }
@@ -858,32 +910,54 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     /// REPLACES the set (never merges). `task_started` seeds the set defensively
     /// for the ordering race where a `result` could precede the first snapshot,
     /// and a `task_updated` patch carrying a terminal status removes that id.
-    private func trackBackgroundWork(in obj: [String: Any], session: Session) {
+    /// When the set becomes empty while a finish is withheld, arm a short
+    /// post-idle wait for a resume `result` (then flush if none arrives).
+    /// Returns true when that short flush was armed (caller must not overwrite).
+    @discardableResult
+    private func trackBackgroundWork(in obj: [String: Any], session: Session) -> Bool {
         guard (obj["type"] as? String) == "system",
-              let subtype = obj["subtype"] as? String else { return }
+              let subtype = obj["subtype"] as? String else { return false }
+        var becameIdleWithDeferred = false
         switch subtype {
         case "background_tasks_changed":
             let ids = (obj["tasks"] as? [[String: Any]])?
                 .compactMap { $0["task_id"] as? String } ?? []
             lock.lock()
             session.pendingBackgroundTaskIds = Set(ids)
+            becameIdleWithDeferred = session.pendingBackgroundTaskIds.isEmpty
+                && session.deferredFinish != nil
             lock.unlock()
         case "task_started":
-            guard let id = obj["task_id"] as? String else { return }
+            guard let id = obj["task_id"] as? String else { return false }
             lock.lock()
             session.pendingBackgroundTaskIds.insert(id)
             lock.unlock()
         case "task_updated", "task_notification":
-            guard let id = obj["task_id"] as? String else { return }
+            guard let id = obj["task_id"] as? String else { return false }
             let status = (obj["patch"] as? [String: Any])?["status"] as? String
                 ?? obj["status"] as? String
-            guard let status, ["completed", "failed", "killed", "cancelled"].contains(status) else { return }
+            guard let status, ["completed", "failed", "killed", "cancelled"].contains(status) else {
+                return false
+            }
             lock.lock()
             session.pendingBackgroundTaskIds.remove(id)
+            becameIdleWithDeferred = session.pendingBackgroundTaskIds.isEmpty
+                && session.deferredFinish != nil
             lock.unlock()
         default:
-            return
+            return false
         }
+        if becameIdleWithDeferred {
+            // Happy path: CLI often emits a resume turn next. If not, flush soon
+            // so "Working" does not stick after background work is already idle.
+            claudeStreamLog.info("claude.turn.deferred.pending_idle arming_post_idle_flush")
+            refreshDeferralWatchdog(
+                session: session,
+                inactivityOverride: deferredFinishPostIdleTimeout
+            )
+            return true
+        }
+        return false
     }
 
     /// Observes raw `assistant` lines for foreground Bash tool_use commands that

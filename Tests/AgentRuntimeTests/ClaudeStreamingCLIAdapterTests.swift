@@ -2213,6 +2213,122 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                        "with no resumed turn to supersede it, the withheld finish is what settles the run")
     }
 
+    func test_deferredFinishAbsoluteMaxIgnoresStreamHeartbeats() async throws {
+        // WHY: every stream line used to reset only the inactivity timer. A CLI
+        // that heartbeats forever with sticky pending tasks kept Working for hours
+        // (incident: final answer painted, Working for 97m). Absolute max from
+        // deferredAt must flush regardless of later lines.
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-absmax-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let script = tmp.appendingPathComponent("fake-claude")
+        try """
+        #!/usr/bin/env python3
+        import json, sys, time
+        S = "claude-absmax-session"
+        def e(o):
+            print(json.dumps(o), flush=True)
+        e({"type":"system","subtype":"init","session_id":S})
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            e({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"T1","task_type":"local_bash"}],"session_id":S})
+            e({"type":"assistant","message":{"content":[{"type":"text","text":"DONE_PREMATURE"}]},"session_id":S})
+            e({"type":"result","subtype":"success","is_error":False,"result":"DONE_PREMATURE","session_id":S})
+            # Heartbeats that used to postpone inactivity forever:
+            for _ in range(40):
+                time.sleep(0.05)
+                e({"type":"system","subtype":"status","session_id":S,"message":"heartbeat"})
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let adapter = ClaudeStreamingCLIAdapter(
+            binaryNameOverride: script.path,
+            deferredFinishInactivityTimeout: 30, // would never fire under heartbeats
+            deferredFinishAbsoluteMaxTimeout: 0.35,
+            deferredFinishPostIdleTimeout: 30
+        )
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "bg hang"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            let finished = await sink.snapshot().contains { if case .finished = $0 { return true }; return false }
+            if finished { break }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+        let finishes = Self.finishedPairs(await sink.snapshot())
+        XCTAssertEqual(finishes.count, 1,
+                       "absolute max must force terminal even while stream heartbeats keep firing")
+        XCTAssertEqual(finishes.first?.1, "DONE_PREMATURE")
+        try? adapter.stopSession(threadId: threadId)
+    }
+
+    func test_deferredFinishFlushesSoonAfterPendingBecomesIdleWithoutResumeResult() async throws {
+        // WHY: CLI sometimes clears background_tasks without a follow-up result.
+        // Post-idle short timeout must end Working instead of waiting full 900s.
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-postidle-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let script = tmp.appendingPathComponent("fake-claude")
+        try """
+        #!/usr/bin/env python3
+        import json, sys, time
+        S = "claude-postidle-session"
+        def e(o):
+            print(json.dumps(o), flush=True)
+        e({"type":"system","subtype":"init","session_id":S})
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            e({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"T1","task_type":"local_bash"}],"session_id":S})
+            e({"type":"assistant","message":{"content":[{"type":"text","text":"STANDING_BY"}]},"session_id":S})
+            e({"type":"result","subtype":"success","is_error":False,"result":"STANDING_BY","session_id":S})
+            time.sleep(0.1)
+            e({"type":"system","subtype":"background_tasks_changed","tasks":[],"session_id":S})
+            # No second result — post-idle flush must settle the run.
+            time.sleep(2)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let adapter = ClaudeStreamingCLIAdapter(
+            binaryNameOverride: script.path,
+            deferredFinishInactivityTimeout: 30,
+            deferredFinishAbsoluteMaxTimeout: 30,
+            deferredFinishPostIdleTimeout: 0.25
+        )
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "bg then idle"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            let finished = await sink.snapshot().contains { if case .finished = $0 { return true }; return false }
+            if finished { break }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+        let finishes = Self.finishedPairs(await sink.snapshot())
+        XCTAssertEqual(finishes.count, 1,
+                       "empty pending without resume result must flush deferred finish quickly")
+        XCTAssertEqual(finishes.first?.1, "STANDING_BY")
+        try? adapter.stopSession(threadId: threadId)
+    }
+
     func test_turnWithoutBackgroundWorkFinishesImmediately() async throws {
         // Regression guard for the deferral gate: an ordinary turn (no background
         // task ever reported) must still finish on its first `result` — the fix
