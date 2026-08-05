@@ -472,13 +472,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             guard let agent = s as? AgentAppSurface,
                   resolvedWorkspace == nil || agent.viewModel.workspaceID == resolvedWorkspace! else { continue }
             workspacesNeedingRailReload.insert(agent.viewModel.workspaceID)
-            agent.viewModel.reloadQueuedMessages()
             if reloadTranscriptIfSelected, agent.viewModel.selectedThreadId == thread {
                 agent.viewModel.selectThread(thread, markRead: false)
             }
         }
         for workspaceID in workspacesNeedingRailReload {
             AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(workspaceID: workspaceID)
+            AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedQueueReload(workspaceID: workspaceID)
         }
         windowController?.refreshFromState()
     }
@@ -555,8 +555,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             guard let self else { throw LayoutError.workspaceNotFound }
                             try self.markAgentThreadRead(thread: threadID)
                         }
-                        let queueSubscriptionToken = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
-                            guard ev.kind.hasPrefix("agent.thread.") || ev.kind.hasPrefix("agent.message.queue") || ev.kind == "agent.message.queued" else { return }
+                        let queueSubscriptionToken = EventBus.shared.subscribe(
+                            since: nil,
+                            filter: .agentThreadAndQueue
+                        ) { [weak agent] ev in
                             DispatchQueue.main.async {
                                 guard let agent else { return }
                                 agent.viewModel.handleThreadLifecycleEvent(
@@ -569,11 +571,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                                     threadId: ev.payload.objectValue?["thread_id"]?.stringValue,
                                     message: ev.payload.objectValue?["message"]?.stringValue
                                 )
-                                // Coalesce N open Agent tabs → one cap+list per workspace.
+                                // Coalesce N open Agent tabs → one cap+list + queue reload per workspace.
                                 AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(
                                     workspaceID: agent.viewModel.workspaceID
                                 )
-                                agent.viewModel.reloadQueuedMessages()
+                                AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedQueueReload(
+                                    workspaceID: agent.viewModel.workspaceID
+                                )
                             }
                         }
                         agent.subscriptionToken = AnyHashable(queueSubscriptionToken)
@@ -6104,8 +6108,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 }
                 // Socket-driven thread mutations (create/rename/delete/read)
                 // refresh this already-open surface — fixes the stale-VM gap.
-                let queueSubscriptionToken = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
-                    guard ev.kind.hasPrefix("agent.thread.") || ev.kind.hasPrefix("agent.message.queue") || ev.kind == "agent.message.queued" else { return }
+                let queueSubscriptionToken = EventBus.shared.subscribe(
+                    since: nil,
+                    filter: .agentThreadAndQueue
+                ) { [weak agent] ev in
                     DispatchQueue.main.async {
                         guard let agent else { return }
                         agent.viewModel.handleThreadLifecycleEvent(
@@ -6121,7 +6127,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(
                             workspaceID: agent.viewModel.workspaceID
                         )
-                        agent.viewModel.reloadQueuedMessages()
+                        AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedQueueReload(
+                            workspaceID: agent.viewModel.workspaceID
+                        )
                     }
                 }
                 agent.subscriptionToken = AnyHashable(queueSubscriptionToken)

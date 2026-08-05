@@ -605,6 +605,9 @@ public enum EventStreamFilter: Sendable, Equatable {
     /// Cellular volume filter. Optional interest thread ids drop high-volume
     /// agent deltas for other threads (fail open when interest is empty).
     case cellularSafe(interestThreadIds: Set<String> = [])
+    /// Local in-process subscribers that only care about specific kind prefixes
+    /// (e.g. Agent App surfaces: `agent.thread.` / `agent.message.queue`).
+    case kindPrefixes([String])
 
     /// True for any cellular-safe filter regardless of interest set.
     /// Prefer this over `== .cellularSafe` (associated value breaks equality).
@@ -612,6 +615,13 @@ public enum EventStreamFilter: Sendable, Equatable {
         if case .cellularSafe = self { return true }
         return false
     }
+
+    /// Agent App surface subscription: thread lifecycle + queue only.
+    public static let agentThreadAndQueue = EventStreamFilter.kindPrefixes([
+        "agent.thread.",
+        "agent.message.queue",
+        "agent.message.queued"
+    ])
 
     public static func parse(_ raw: String?) -> EventStreamFilter {
         parse(filterHeader: raw, interestThreadHeader: nil)
@@ -664,6 +674,8 @@ public enum EventStreamFilter: Sendable, Equatable {
             return .full
         case .cellularSafe:
             return .cellularSafe(interestThreadIds: ids)
+        case .kindPrefixes(let prefixes):
+            return .kindPrefixes(prefixes)
         }
     }
 
@@ -697,6 +709,13 @@ public enum EventStreamFilter: Sendable, Equatable {
         switch self {
         case .full:
             return event
+        case .kindPrefixes(let prefixes):
+            for prefix in prefixes {
+                if event.kind == prefix || event.kind.hasPrefix(prefix) {
+                    return event
+                }
+            }
+            return nil
         case .cellularSafe(let interestThreadIds):
             // `reducerRequired` means the *content* is required on the client,
             // not that every micro-token must be its own WS frame (C-16).

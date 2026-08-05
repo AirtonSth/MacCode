@@ -3,15 +3,16 @@ import CoreModel
 import Persistence
 import AgentRuntime
 
-/// Coalesces multi-surface Agent App rail reloads for one workspace.
+/// Coalesces multi-surface Agent App work for one workspace.
 ///
 /// Without this, N open Agent tabs each subscribe to EventBus and each call
-/// `reloadThreads()` (cap enforce + list) on every `agent.thread.*` event.
-/// One create/delete therefore became N SQLite cap transactions.
+/// `reloadThreads()` / `reloadQueuedMessages()` / subagent poll on their own.
+/// One create/delete therefore became N SQLite cap transactions and N queue reads.
 ///
 /// Contract:
 /// - At most one cap+list per workspace per debounce window.
-/// - All live surfaces for that workspace apply the same snapshot.
+/// - At most one queue reload apply pass per workspace per debounce window.
+/// - At most one subagent activity poll tick per workspace (not per surface).
 /// - Cap/list run off the MainActor; apply stays on MainActor.
 @MainActor
 public final class AgentWorkspaceRailReloadCoordinator {
@@ -41,9 +42,13 @@ public final class AgentWorkspaceRailReloadCoordinator {
     }
 
     private var members: [WorkspaceID: [ObjectIdentifier: WeakBox]] = [:]
-    private var debounceTasks: [WorkspaceID: Task<Void, Never>] = [:]
+    private var railDebounceTasks: [WorkspaceID: Task<Void, Never>] = [:]
+    private var queueDebounceTasks: [WorkspaceID: Task<Void, Never>] = [:]
+    private var subagentPollTasks: [WorkspaceID: Task<Void, Never>] = [:]
     /// Debounce window for EventBus fan-out storms.
     public var debounceNanoseconds: UInt64 = 50_000_000
+    /// Shared subagent badge poll interval (was 2s per open surface).
+    public var subagentPollNanoseconds: UInt64 = 2_000_000_000
 
     private init() {}
 
@@ -52,38 +57,81 @@ public final class AgentWorkspaceRailReloadCoordinator {
         var bucket = members[viewModel.workspaceID] ?? [:]
         bucket[key] = WeakBox(viewModel: viewModel)
         members[viewModel.workspaceID] = bucket
+        ensureSubagentPoll(for: viewModel.workspaceID)
     }
 
     public func unregister(_ viewModel: AgentAppViewModel) {
         let key = ObjectIdentifier(viewModel)
-        guard var bucket = members[viewModel.workspaceID] else { return }
+        let workspaceID = viewModel.workspaceID
+        guard var bucket = members[workspaceID] else { return }
         bucket.removeValue(forKey: key)
         if bucket.isEmpty {
-            members.removeValue(forKey: viewModel.workspaceID)
-            debounceTasks[viewModel.workspaceID]?.cancel()
-            debounceTasks.removeValue(forKey: viewModel.workspaceID)
+            members.removeValue(forKey: workspaceID)
+            railDebounceTasks[workspaceID]?.cancel()
+            railDebounceTasks.removeValue(forKey: workspaceID)
+            queueDebounceTasks[workspaceID]?.cancel()
+            queueDebounceTasks.removeValue(forKey: workspaceID)
+            subagentPollTasks[workspaceID]?.cancel()
+            subagentPollTasks.removeValue(forKey: workspaceID)
         } else {
-            members[viewModel.workspaceID] = bucket
+            members[workspaceID] = bucket
         }
     }
 
     /// EventBus / external path: coalesce N surface notifications into one rail load.
     public func requestCoalescedReload(workspaceID: WorkspaceID) {
-        debounceTasks[workspaceID]?.cancel()
-        debounceTasks[workspaceID] = Task { @MainActor [weak self] in
+        railDebounceTasks[workspaceID]?.cancel()
+        railDebounceTasks[workspaceID] = Task { @MainActor [weak self] in
             let delay = self?.debounceNanoseconds ?? 50_000_000
             try? await Task.sleep(nanoseconds: delay)
             guard !Task.isCancelled else { return }
-            await self?.flush(workspaceID)
+            await self?.flushRail(workspaceID)
         }
     }
 
-    private func flush(_ workspaceID: WorkspaceID) async {
+    /// Coalesce queue reloads so N tabs do not each hit SQLite on the same event.
+    public func requestCoalescedQueueReload(workspaceID: WorkspaceID) {
+        queueDebounceTasks[workspaceID]?.cancel()
+        queueDebounceTasks[workspaceID] = Task { @MainActor [weak self] in
+            let delay = self?.debounceNanoseconds ?? 50_000_000
+            try? await Task.sleep(nanoseconds: delay)
+            guard !Task.isCancelled else { return }
+            self?.flushQueue(workspaceID)
+        }
+    }
+
+    private func ensureSubagentPoll(for workspaceID: WorkspaceID) {
+        guard subagentPollTasks[workspaceID] == nil else { return }
+        subagentPollTasks[workspaceID] = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                let interval = self?.subagentPollNanoseconds ?? 2_000_000_000
+                try? await Task.sleep(nanoseconds: interval)
+                guard !Task.isCancelled else { return }
+                self?.flushSubagent(workspaceID)
+            }
+        }
+    }
+
+    private func flushRail(_ workspaceID: WorkspaceID) async {
         let live = liveViewModels(for: workspaceID)
         guard let lead = live.first else { return }
         let snapshot = await lead.loadRailSnapshotOffMainActor()
         for viewModel in live {
             viewModel.applyRailSnapshot(snapshot)
+        }
+    }
+
+    private func flushQueue(_ workspaceID: WorkspaceID) {
+        for viewModel in liveViewModels(for: workspaceID) {
+            viewModel.reloadQueuedMessages()
+        }
+    }
+
+    private func flushSubagent(_ workspaceID: WorkspaceID) {
+        // One tick per workspace: only surfaces with a selected thread (badge context)
+        // refresh; others stay empty without extra SQLite work.
+        for viewModel in liveViewModels(for: workspaceID) where viewModel.selectedThreadId != nil {
+            viewModel.refreshSubagentActivity()
         }
     }
 
@@ -102,7 +150,6 @@ public final class AgentWorkspaceRailReloadCoordinator {
         } else {
             members[workspaceID] = bucket
         }
-        // Stable order so the same lead tends to own cap work.
         return live.sorted { ObjectIdentifier($0).debugDescription < ObjectIdentifier($1).debugDescription }
     }
 }
