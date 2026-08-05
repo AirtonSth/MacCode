@@ -7149,6 +7149,44 @@ final class AgentAppViewModelTests: XCTestCase {
                       "the partial list failure must still fail loud")
     }
 
+    /// Deleted-many is the existing EventBus contract for multiple victims. It
+    /// must apply every authoritative ID before any subscriber reload can fail.
+    func test_deletedManyLifecycleEvent_evictsEveryVictim() throws {
+        let (vm, threadRepo) = try makeVM()
+        let first = AgentThread(workspaceId: vm.workspaceID, title: "first victim", provider: .claude, model: "m")
+        let second = AgentThread(workspaceId: vm.workspaceID, title: "second victim", provider: .claude, model: "m")
+        try threadRepo.upsert(first)
+        try threadRepo.upsert(second)
+        vm.reloadThreads()
+
+        for thread in [first, second] {
+            vm.selectThread(thread.id)
+            vm.prompt = "draft for \(thread.title)"
+            vm.seedAdditionalThreadCachesForTesting(thread.id)
+            vm.seedRunThreadProjectionForTesting(thread.id)
+            vm.coordinator.seedAutoContinuationStateForTesting(thread.id)
+        }
+        let victimIDs = Set([first.id, second.id])
+        XCTAssertEqual(vm.threadCacheResidueForTesting.intersection(victimIDs), victimIDs)
+
+        vm.handleThreadLifecycleEvent(
+            kind: "agent.thread.deleted_many",
+            threadId: nil,
+            threadIds: victimIDs.map { $0.value.uuidString }
+        )
+
+        XCTAssertTrue(vm.threadCacheResidueForTesting.isDisjoint(with: victimIDs),
+                      "every deleted-many victim must leave all ViewModel caches and run projections")
+        XCTAssertTrue(vm.coordinator.autoContinuationThreadIdsForTesting.isDisjoint(with: victimIDs),
+                      "every deleted-many victim must leave shared coordinator state")
+        XCTAssertTrue(vm.threads.allSatisfy { !victimIDs.contains($0.id) },
+                      "every deleted-many victim must leave the rail synchronously")
+        XCTAssertNil(vm.selectedThreadId,
+                     "a selected deleted-many victim must recover to the fresh composer")
+        XCTAssertEqual(vm.prompt, "draft for second victim",
+                       "selected unsent input remains preserved during deleted-many recovery")
+    }
+
     /// PERF-MAC_AGENT-013: a create/RPC producer can enforce the cap before an
     /// open surface reloads, discarding the victim IDs. The next scheduled reload
     /// must reconcile its known thread/cache IDs against SQLite, including a

@@ -149,7 +149,7 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
     /// publishes `agent.thread.created`. Every open surface in the workspace
     /// must evict the pre-pruned victim from its local caches when the real
     /// EventBus notification arrives, even if the first rail list fails.
-    func test_quietRouterCreateAtCap_evictsPrePrunedVictimFromEveryOpenSurface() async throws {
+    func test_routerAndUICreateAtCap_publishVictimsBeforeCreatedAndEvictFailedReloadSurfaces() async throws {
         let dir = NSTemporaryDirectory() + "RC2Bind-Cap-" + UUID().uuidString
         let (ctx, router) = try makeRouter(dir)
         let workspace = try router.createWorkspace(name: "CAP", cwd: NSTemporaryDirectory())
@@ -223,8 +223,7 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             if event.kind == "agent.thread.created",
                event.payload.objectValue?["workspace_id"]?.stringValue == workspace.id.value.uuidString {
                 createdEvents.append(event)
-            } else if event.kind == "agent.thread.deleted",
-                      event.payload.objectValue?["thread_id"]?.stringValue == victim.id.value.uuidString {
+            } else if event.kind == "agent.thread.deleted" {
                 deletedEvents.append(event)
             }
         }
@@ -258,6 +257,11 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
                        "quiet router creation must publish one real-time thread-created event")
         XCTAssertEqual(deletedEvents.count, 1,
                        "cap pruning must publish the authoritative victim before the created event")
+        XCTAssertEqual(deletedEvents.first?.payload.objectValue?["thread_id"]?.stringValue,
+                       victim.id.value.uuidString)
+        XCTAssertLessThan(try XCTUnwrap(deletedEvents.first?.seq),
+                          try XCTUnwrap(createdEvents.first?.seq),
+                          "subscribers must receive the victim before the created event triggers a fallible reload")
         XCTAssertEqual(try ctx.threadRepo.count(workspaceId: workspace.id),
                        AgentThreadRepository.maxThreadsPerWorkspace)
         XCTAssertNil(try ctx.threadRepo.get(id: victim.id),
@@ -278,6 +282,46 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         XCTAssertEqual(secondSurface.viewModel.selectedThreadId, secondSelection,
                        "quiet creation must not yank the second open Agent App tab")
         XCTAssertTrue(firstSurface.viewModel.statusMessage.contains("Could not reload threads"))
+        XCTAssertTrue(secondSurface.viewModel.statusMessage.contains("Could not reload threads"))
+
+        // Repeat through the local UI producer. Its onThreadLifecycle callback is
+        // wired to the same EventBus, so another open surface must receive the
+        // victim before its injected reload failure.
+        let uiVictim = survivors[0]
+        secondSurface.viewModel.selectThread(uiVictim.id)
+        secondSurface.viewModel.prompt = "second surface local-create victim draft"
+        secondSurface.viewModel.seedAdditionalThreadCachesForTesting(uiVictim.id)
+        secondSurface.viewModel.selectThread(secondSelection)
+        ctx.coordinator.seedAutoContinuationStateForTesting(uiVictim.id)
+        XCTAssertTrue(secondSurface.viewModel.threadCacheResidueForTesting.contains(uiVictim.id))
+        createdEvents.removeAll()
+        deletedEvents.removeAll()
+        secondSurface.viewModel.setReloadThreadListForTesting {
+            throw NSError(domain: "AgentSurfaceThreadBindingRouterTests.localReload", code: 3)
+        }
+
+        firstSurface.viewModel.createThread(title: "local UI create")
+
+        for _ in 0..<100 where secondSurface.viewModel.threadCacheResidueForTesting.contains(uiVictim.id) {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        secondSurface.viewModel.setReloadThreadListForTesting(nil)
+
+        XCTAssertEqual(deletedEvents.count, 1,
+                       "UI creation must publish its authoritative cap victim")
+        XCTAssertEqual(createdEvents.count, 1,
+                       "UI creation must publish its created thread")
+        XCTAssertEqual(deletedEvents.first?.payload.objectValue?["thread_id"]?.stringValue,
+                       uiVictim.id.value.uuidString)
+        XCTAssertLessThan(try XCTUnwrap(deletedEvents.first?.seq),
+                          try XCTUnwrap(createdEvents.first?.seq),
+                          "the UI producer must publish delete before create")
+        XCTAssertNil(try ctx.threadRepo.get(id: uiVictim.id))
+        XCTAssertFalse(secondSurface.viewModel.threadCacheResidueForTesting.contains(uiVictim.id),
+                       "the subscribed surface must evict the UI producer's victim before list failure")
+        XCTAssertFalse(ctx.coordinator.autoContinuationThreadIdsForTesting.contains(uiVictim.id))
+        XCTAssertEqual(secondSurface.viewModel.selectedThreadId, secondSelection,
+                       "UI creation must preserve the unrelated surface selection")
         XCTAssertTrue(secondSurface.viewModel.statusMessage.contains("Could not reload threads"))
     }
 
