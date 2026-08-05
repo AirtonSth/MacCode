@@ -132,7 +132,8 @@ final class ThreadReorderTransactionTests: XCTestCase {
     }
 
     /// WHY: each workspace keeps at most 100 threads so scheduled runs cannot
-    /// grow SQLite without bound. Oldest non-active, unpinned threads go first.
+    /// grow SQLite without bound. Only empty terminal shells are eligible; among
+    /// those, the oldest updated_at go first. Active runs never qualify.
     func test_enforceWorkspaceThreadLimit_prunesOldestBeyond100() throws {
         let db = try makeDB()
         let repo = AgentThreadRepository(db: db)
@@ -153,12 +154,67 @@ final class ThreadReorderTransactionTests: XCTestCase {
 
         let deleted = try repo.enforceWorkspaceThreadLimit(workspaceId: wid, limit: limit)
         XCTAssertEqual(try repo.count(workspaceId: wid), limit)
-        XCTAssertEqual(deleted.count, 4, "9 rows → keep 5, delete 4 oldest eligible")
+        XCTAssertEqual(deleted.count, 4, "9 rows → keep 5, delete 4 oldest eligible empty shells")
         let remaining = try repo.list(workspaceId: wid)
         XCTAssertTrue(remaining.contains(where: { $0.title == "running" }),
                       "running threads must never be auto-pruned")
         XCTAssertFalse(remaining.contains(where: { $0.title == "t1" }),
-                       "oldest idle history must be pruned first")
+                       "oldest empty shells must be pruned first")
+    }
+
+    /// WHY: automatic retention must never delete a conversation with messages.
+    /// Empty shells remain reclaimable so the cap can still free room.
+    func test_workspaceThreadLimitProtectsTranscriptHistoryAndLiveSurfaceBinding() throws {
+        let db = try makeDB()
+        let repo = AgentThreadRepository(db: db)
+        let messages = AgentMessageRepository(db: db)
+        let wid = try makeWorkspace(db: db)
+
+        var withHistory = AgentThread(workspaceId: wid, title: "has history", provider: .codex, model: "m")
+        withHistory.status = .completed
+        withHistory.updatedAt = Date(timeIntervalSince1970: 1)
+        var liveBound = AgentThread(workspaceId: wid, title: "live bound empty shell", provider: .codex, model: "m")
+        liveBound.status = .completed
+        liveBound.updatedAt = Date(timeIntervalSince1970: 2)
+        var disposable = AgentThread(workspaceId: wid, title: "empty shell", provider: .codex, model: "m")
+        disposable.status = .completed
+        disposable.updatedAt = Date(timeIntervalSince1970: 3)
+        for thread in [withHistory, liveBound, disposable] {
+            try repo.upsert(thread)
+        }
+        try messages.append(AgentMessage(threadId: withHistory.id, role: .user, content: "keep me"))
+        let surfaceID = SurfaceID()
+        repo.setLiveSurfaceBinding(surfaceID: surfaceID, threadID: liveBound.id)
+        XCTAssertEqual(repo.liveSurfaceBoundThreadIDsForTesting, [liveBound.id])
+
+        let created = AgentThread(workspaceId: wid, title: "new thread", provider: .codex, model: "m")
+        let pruned = try repo.upsertEnforcingWorkspaceThreadLimit(created, limit: 3)
+
+        XCTAssertEqual(pruned, [disposable.id],
+                       "only an unbound empty shell may be reclaimed under the product policy")
+        XCTAssertNotNil(try repo.get(id: withHistory.id))
+        XCTAssertNotNil(try repo.get(id: liveBound.id))
+        XCTAssertNotNil(try repo.get(id: created.id))
+        XCTAssertNil(try repo.get(id: disposable.id))
+
+        // With only protected rows left, capacity fails with actionable diagnostics.
+        let blocked = AgentThread(workspaceId: wid, title: "blocked", provider: .codex, model: "m")
+        XCTAssertThrowsError(try repo.upsertEnforcingWorkspaceThreadLimit(blocked, limit: 3)) { error in
+            guard case let .workspaceLimitExceeded(_, _, _, diagnostics)? =
+                    error as? AgentThreadCapacityError else {
+                return XCTFail("expected capacity error with diagnostics")
+            }
+            XCTAssertGreaterThan(diagnostics.protectedCounts["history"] ?? 0, 0)
+            XCTAssertGreaterThan(diagnostics.protectedCounts["surface_bound"] ?? 0, 0)
+            XCTAssertTrue(
+                (error as? AgentThreadCapacityError)?.description.contains("No disposable empty thread") == true
+            )
+        }
+        XCTAssertNil(try repo.get(id: blocked.id))
+
+        // Closing the surface clears process-only protection.
+        repo.setLiveSurfaceBinding(surfaceID: surfaceID, threadID: nil)
+        XCTAssertTrue(repo.liveSurfaceBoundThreadIDsForTesting.isEmpty)
     }
 
     /// WHY: the automatic cap is allowed to reclaim cached history, never an

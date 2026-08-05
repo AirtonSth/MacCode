@@ -902,14 +902,17 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             routingConfiguration: nil,
             quiet: true
         )) { error in
-            XCTAssertEqual(
-                error as? AgentThreadCapacityError,
-                .workspaceLimitExceeded(
-                    workspaceId: workspace.id,
-                    limit: AgentThreadRepository.maxThreadsPerWorkspace,
-                    actualCount: AgentThreadRepository.maxThreadsPerWorkspace + 1
-                )
-            )
+            guard case let .workspaceLimitExceeded(workspaceId, limit, actualCount, diagnostics)? =
+                    error as? AgentThreadCapacityError else {
+                return XCTFail("normal router must throw AgentThreadCapacityError")
+            }
+            XCTAssertEqual(workspaceId, workspace.id)
+            XCTAssertEqual(limit, AgentThreadRepository.maxThreadsPerWorkspace)
+            XCTAssertEqual(actualCount, AgentThreadRepository.maxThreadsPerWorkspace + 1)
+            XCTAssertGreaterThan(diagnostics.protectedCounts["active"] ?? 0, 0,
+                                 "diagnostics must explain that active rows block disposal")
+            XCTAssertTrue(error.localizedDescription.contains("No disposable empty thread"),
+                          "capacity error must be actionable for operators")
         }
         try assertOriginalState("normal router")
 
@@ -940,14 +943,14 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             )
             XCTFail("routed create must reject a workspace containing only protected rows")
         } catch {
-            XCTAssertEqual(
-                error as? AgentThreadCapacityError,
-                .workspaceLimitExceeded(
-                    workspaceId: workspace.id,
-                    limit: AgentThreadRepository.maxThreadsPerWorkspace,
-                    actualCount: AgentThreadRepository.maxThreadsPerWorkspace + 1
-                )
-            )
+            guard case let .workspaceLimitExceeded(workspaceId, limit, actualCount, diagnostics)? =
+                    error as? AgentThreadCapacityError else {
+                return XCTFail("routed router must throw AgentThreadCapacityError")
+            }
+            XCTAssertEqual(workspaceId, workspace.id)
+            XCTAssertEqual(limit, AgentThreadRepository.maxThreadsPerWorkspace)
+            XCTAssertEqual(actualCount, AgentThreadRepository.maxThreadsPerWorkspace + 1)
+            XCTAssertGreaterThan(diagnostics.protectedCounts["active"] ?? 0, 0)
         }
         try assertOriginalState("routed router")
 
@@ -970,8 +973,11 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         surface.viewModel.createThread(title: "rejected local UI")
         XCTAssertTrue(surface.viewModel.statusMessage.contains("Could not create thread"),
                       "local create must fail loud at protected capacity")
-        XCTAssertTrue(surface.viewModel.statusMessage.contains("Agent thread capacity exceeded"),
-                      "local create must explain why the protected workspace cannot accept another thread")
+        XCTAssertTrue(
+            surface.viewModel.statusMessage.contains("Agent thread capacity reached")
+                || surface.viewModel.statusMessage.contains("Agent thread capacity exceeded"),
+            "local create must explain why the protected workspace cannot accept another thread"
+        )
         try assertOriginalState("local UI")
     }
 

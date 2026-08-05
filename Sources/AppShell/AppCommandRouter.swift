@@ -541,6 +541,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             guard let self, let agent else { return }
                             self.persistAgentSelectedThread(surfaceID: agent.descriptor.id, threadID: threadID)
                         }
+                        // Restore-time select does not re-fire onSelectedThreadChanged;
+                        // still arm live retention protection for the restored thread.
+                        ctx.threadRepo.setLiveSurfaceBinding(
+                            surfaceID: agent.descriptor.id,
+                            threadID: agent.viewModel.selectedThreadId
+                        )
                         agent.viewModel.markThreadRead = { [weak self] threadID in
                             guard let self else { throw LayoutError.workspaceNotFound }
                             try self.markAgentThreadRead(thread: threadID)
@@ -1533,6 +1539,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             SurfaceRegistry.shared.surface(surfaceID)?.close()
             try? context?.terminalOutputRepo.delete(surfaceID: surfaceID.value.uuidString)
         }
+        // Drop process-only retention protection once the surface is gone.
+        context?.threadRepo.setLiveSurfaceBinding(surfaceID: surfaceID, threadID: nil)
         SurfaceRegistry.shared.unregister(surfaceID)
         SurfaceOutputBus.shared.remove(surfaceId: surfaceID)
     }
@@ -5583,6 +5591,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// instead of every tab converging on threads.first.
     func persistAgentSelectedThread(surfaceID: SurfaceID, threadID: AgentThreadID?) {
         guard let ctx = context else { return }
+        // Process-only retention authority: cap victim selection must not delete
+        // a thread currently bound in an open Agent App surface.
+        ctx.threadRepo.setLiveSurfaceBinding(surfaceID: surfaceID, threadID: threadID)
         for (wid, var ws) in ctx.state.workspaces {
             let result = updateSurface(in: ws.layout, surfaceID: surfaceID) { descriptor in
                 if let threadID {
@@ -6077,6 +6088,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     guard let self, let agent else { return }
                     self.persistAgentSelectedThread(surfaceID: agent.descriptor.id, threadID: threadID)
                 }
+                // Initial restore/create select may not re-fire onSelectedThreadChanged.
+                ctx.threadRepo.setLiveSurfaceBinding(
+                    surfaceID: agent.descriptor.id,
+                    threadID: agent.viewModel.selectedThreadId
+                )
                 agent.viewModel.markThreadRead = { [weak self] threadID in
                     guard let self else { throw LayoutError.workspaceNotFound }
                     try self.markAgentThreadRead(thread: threadID)

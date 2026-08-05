@@ -201,13 +201,32 @@ public struct AgentThreadForkIntent: Codable, Sendable, Equatable {
     public let updatedAt: Date
 }
 
+public struct AgentThreadCapacityDiagnostics: Equatable, Sendable {
+    public let protectedCounts: [String: Int]
+
+    public init(protectedCounts: [String: Int] = [:]) {
+        self.protectedCounts = protectedCounts.filter { $0.value > 0 }
+    }
+
+}
+
 public enum AgentThreadCapacityError: Error, Equatable, CustomStringConvertible, LocalizedError {
-    case workspaceLimitExceeded(workspaceId: WorkspaceID, limit: Int, actualCount: Int)
+    case workspaceLimitExceeded(
+        workspaceId: WorkspaceID,
+        limit: Int,
+        actualCount: Int,
+        diagnostics: AgentThreadCapacityDiagnostics = AgentThreadCapacityDiagnostics()
+    )
 
     public var description: String {
         switch self {
-        case .workspaceLimitExceeded(_, let limit, let actualCount):
-            return "Agent thread capacity exceeded: \(actualCount) threads remain for limit \(limit)."
+        case .workspaceLimitExceeded(_, let limit, let actualCount, let diagnostics):
+            let categories = diagnostics.protectedCounts
+                .sorted { $0.key < $1.key }
+                .map { "\($0.key)=\($0.value)" }
+                .joined(separator: ", ")
+            let detail = categories.isEmpty ? "" : " Protected: \(categories)."
+            return "Agent thread capacity reached: \(actualCount) threads for a best-effort limit of \(limit). No disposable empty thread is safe to remove. Close a bound thread or delete history you no longer need, then retry.\(detail)"
         }
     }
 
@@ -215,8 +234,8 @@ public enum AgentThreadCapacityError: Error, Equatable, CustomStringConvertible,
 }
 
 public final class AgentThreadRepository {
-    /// Soft product cap: keep each workspace's thread table bounded so scheduled
-    /// runs and long sessions cannot grow SQLite without limit.
+    /// Best-effort retention cap: keep each workspace's disposable empty shells
+    /// bounded without deleting user-owned or operational state.
     public static let maxThreadsPerWorkspace = 100
     /// Each maintenance transaction processes at most this many historical
     /// terminal rows. This bounds work, not eligibility: recoverable rows are
@@ -233,6 +252,23 @@ public final class AgentThreadRepository {
 
     let db: SQLiteDB
     public init(db: SQLiteDB) { self.db = db }
+
+    /// Live Agent App bindings are process state, not a new persistence model.
+    /// Binding updates take this same lock before changing visible selection;
+    /// cap victim selection holds it through the guarded DELETE transaction.
+    public func setLiveSurfaceBinding(surfaceID: SurfaceID, threadID: AgentThreadID?) {
+        db.setLiveAgentThreadBinding(surfaceID: surfaceID, threadID: threadID)
+    }
+
+    public var liveSurfaceBoundThreadIDsForTesting: Set<AgentThreadID> {
+        db.withLiveAgentThreadBindings { $0 }
+    }
+
+    private func withLiveSurfaceBindingsLocked<T>(
+        _ body: (Set<AgentThreadID>) throws -> T
+    ) rethrows -> T {
+        try db.withLiveAgentThreadBindings(body)
+    }
 
     public func upsert(_ t: AgentThread) throws {
         let st = try db.prepare("""
@@ -291,15 +327,53 @@ public final class AgentThreadRepository {
         }
     }
 
-    /// Retention may reclaim only disposable history. A durable composer draft
-    /// belongs to the user even when its thread is idle, and a materialized
-    /// worktree owns a filesystem resource that this cap does not clean up.
+    /// Retention may reclaim only a terminal, unpinned, truly empty shell.
+    /// Any transcript, provider identity, run/session/callback/plan/checkpoint,
+    /// queue, Token Saver record, draft, worktree, custom color, fork role, or
+    /// persisted surface binding makes the shell ineligible. Its title and
+    /// routing/model configuration are shell metadata reclaimed with the shell.
     /// Keep this predicate shared by preflight, selection, and the guarded
     /// DELETE so a concurrent draft/worktree change rolls the whole transaction
     /// back instead of losing it after an initially safe selection.
     private func workspaceThreadLimitEligibilityPredicate(candidateAlias: String) -> String {
         """
+        AND \(candidateAlias).status IN ('completed', 'failed', 'cancelled', 'interrupted')
+        AND \(candidateAlias).pinned = 0
+        AND NULLIF(TRIM(COALESCE(\(candidateAlias).provider_thread_id, '')), '') IS NULL
+        AND \(candidateAlias).diff_additions = 0
+        AND \(candidateAlias).diff_deletions = 0
+        AND \(candidateAlias).has_unread = 0
+        AND NULLIF(TRIM(COALESCE(\(candidateAlias).color, '')), '') IS NULL
         AND NULLIF(TRIM(COALESCE(\(candidateAlias).worktree_path, '')), '') IS NULL
+        AND NOT EXISTS (SELECT 1 FROM agent_messages AS row WHERE row.thread_id = \(candidateAlias).id)
+        AND NOT EXISTS (SELECT 1 FROM agent_runs AS row WHERE row.thread_id = \(candidateAlias).id)
+        AND NOT EXISTS (SELECT 1 FROM agent_turn_snapshots AS row WHERE row.thread_id = \(candidateAlias).id)
+        AND NOT EXISTS (SELECT 1 FROM provider_session_runtime AS row WHERE row.thread_id = \(candidateAlias).id)
+        AND NOT EXISTS (SELECT 1 FROM provider_pending_callbacks AS row WHERE row.thread_id = \(candidateAlias).id)
+        AND NOT EXISTS (
+            SELECT 1 FROM agent_proposed_plans AS row
+            WHERE row.thread_id = \(candidateAlias).id
+               OR row.implementation_thread_id = \(candidateAlias).id
+        )
+        AND NOT EXISTS (SELECT 1 FROM agent_turn_checkpoints AS row WHERE row.thread_id = \(candidateAlias).id)
+        AND NOT EXISTS (SELECT 1 FROM agent_turn_checkpoint_catalog_meta AS row WHERE row.thread_id = \(candidateAlias).id)
+        AND NOT EXISTS (SELECT 1 FROM agent_provider_event_logs AS row WHERE row.thread_id = \(candidateAlias).id)
+        AND NOT EXISTS (SELECT 1 FROM agent_queued_messages AS row WHERE row.thread_id = \(candidateAlias).id)
+        AND NOT EXISTS (SELECT 1 FROM scheduled_task_runs AS row WHERE row.thread_id = \(candidateAlias).id)
+        AND NOT EXISTS (SELECT 1 FROM token_saver_savings AS row WHERE row.thread_id = \(candidateAlias).id)
+        AND NOT EXISTS (SELECT 1 FROM token_saver_thread_totals AS row WHERE row.thread_id = \(candidateAlias).id)
+        AND NOT EXISTS (SELECT 1 FROM token_saver_recovery_objects AS row WHERE row.thread_id = \(candidateAlias).id)
+        AND NOT EXISTS (SELECT 1 FROM token_saver_session_learn_records AS row WHERE row.thread_id = \(candidateAlias).id)
+        AND NOT EXISTS (
+            SELECT 1 FROM token_saver_rollover_capsules AS row
+            WHERE row.parent_thread_id = \(candidateAlias).id
+               OR row.child_thread_id = \(candidateAlias).id
+        )
+        AND NOT EXISTS (SELECT 1 FROM token_saver_audit_events AS row WHERE row.thread_id = \(candidateAlias).id)
+        AND NOT EXISTS (
+            SELECT 1 FROM settings AS row
+            WHERE row.key = 'agent.plan_notes.' || \(candidateAlias).id
+        )
         AND NOT EXISTS (
             SELECT 1 FROM agent_thread_drafts AS draft
             WHERE draft.thread_id = \(candidateAlias).id
@@ -316,7 +390,105 @@ public final class AgentThreadRepository {
                   END
               )
         )
+        AND NOT EXISTS (
+            SELECT 1 FROM agent_thread_fork_intents AS intent
+            WHERE intent.source_thread_id = \(candidateAlias).id
+               OR intent.child_thread_id = \(candidateAlias).id
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM session_snapshots AS snapshot, json_tree(snapshot.payload_json) AS value
+            WHERE snapshot.id = (SELECT MAX(id) FROM session_snapshots)
+              AND json_valid(snapshot.payload_json) = 1
+              AND value.type = 'text'
+              AND value.atom = \(candidateAlias).id
+        )
         """
+    }
+
+    private func workspaceThreadCapacityDiagnostics(
+        workspaceId: WorkspaceID,
+        liveSurfaceBindings: Set<AgentThreadID>
+    ) throws -> AgentThreadCapacityDiagnostics {
+        func count(_ predicate: String) throws -> Int {
+            let statement = try db.prepare("""
+                SELECT COUNT(*) FROM agent_threads AS candidate
+                WHERE candidate.workspace_id = ? AND (\(predicate));
+            """)
+            try statement.bind(1, workspaceId.value.uuidString)
+            return try statement.step() ? Int(statement.columnInt64(0)) : 0
+        }
+
+        var counts: [String: Int] = [:]
+        counts["active"] = try count("candidate.status IN ('running', 'pending')")
+        counts["pinned"] = try count("candidate.pinned != 0")
+        counts["history"] = try count("EXISTS (SELECT 1 FROM agent_messages AS message WHERE message.thread_id = candidate.id)")
+        counts["draft_or_worktree"] = try count("""
+            NULLIF(TRIM(COALESCE(candidate.worktree_path, '')), '') IS NOT NULL
+            OR EXISTS (
+                SELECT 1 FROM agent_thread_drafts AS draft
+                WHERE draft.thread_id = candidate.id
+                  AND (LENGTH(TRIM(COALESCE(draft.text, ''))) > 0
+                       OR LENGTH(TRIM(COALESCE(draft.attachments_json, '[]'))) > 2)
+            )
+        """)
+        counts["fork_recovery"] = try count("""
+            EXISTS (
+                SELECT 1 FROM agent_thread_fork_intents AS intent
+                WHERE intent.source_thread_id = candidate.id
+                   OR intent.child_thread_id = candidate.id
+            )
+        """)
+        counts["runtime_or_queue"] = try count("""
+            EXISTS (SELECT 1 FROM agent_runs AS run WHERE run.thread_id = candidate.id)
+            OR EXISTS (SELECT 1 FROM provider_session_runtime AS session WHERE session.thread_id = candidate.id)
+            OR EXISTS (SELECT 1 FROM provider_pending_callbacks AS callback WHERE callback.thread_id = candidate.id)
+            OR EXISTS (SELECT 1 FROM agent_queued_messages AS queued WHERE queued.thread_id = candidate.id)
+        """)
+        counts["plan_or_checkpoint"] = try count("""
+            EXISTS (SELECT 1 FROM agent_proposed_plans AS plan WHERE plan.thread_id = candidate.id OR plan.implementation_thread_id = candidate.id)
+            OR EXISTS (SELECT 1 FROM agent_turn_checkpoints AS checkpoint WHERE checkpoint.thread_id = candidate.id)
+            OR EXISTS (SELECT 1 FROM agent_turn_checkpoint_catalog_meta AS catalog WHERE catalog.thread_id = candidate.id)
+        """)
+
+        var boundIDs = liveSurfaceBindings
+        let persisted = try db.prepare("""
+            SELECT DISTINCT candidate.id
+            FROM agent_threads AS candidate,
+                 session_snapshots AS snapshot,
+                 json_tree(snapshot.payload_json) AS value
+            WHERE candidate.workspace_id = ?
+              AND snapshot.id = (SELECT MAX(id) FROM session_snapshots)
+              AND json_valid(snapshot.payload_json) = 1
+              AND value.type = 'text'
+              AND value.atom = candidate.id;
+        """)
+        try persisted.bind(1, workspaceId.value.uuidString)
+        while try persisted.step() {
+            if let uuid = persisted.columnText(0).flatMap(UUID.init(uuidString:)) {
+                boundIDs.insert(AgentThreadID(uuid))
+            }
+        }
+        let workspaceThreadIDs = Set(try list(workspaceId: workspaceId).map(\.id))
+        counts["surface_bound"] = boundIDs.intersection(workspaceThreadIDs).count
+        return AgentThreadCapacityDiagnostics(protectedCounts: counts)
+    }
+
+    private func workspaceThreadCapacityError(
+        workspaceId: WorkspaceID,
+        limit: Int,
+        actualCount: Int,
+        liveSurfaceBindings: Set<AgentThreadID>
+    ) throws -> AgentThreadCapacityError {
+        .workspaceLimitExceeded(
+            workspaceId: workspaceId,
+            limit: limit,
+            actualCount: actualCount,
+            diagnostics: try workspaceThreadCapacityDiagnostics(
+                workspaceId: workspaceId,
+                liveSurfaceBindings: liveSurfaceBindings
+            )
+        )
     }
 
     /// Cheap fail-fast check before a producer performs irreversible or
@@ -328,48 +500,44 @@ public final class AgentThreadRepository {
         limit: Int = AgentThreadRepository.maxThreadsPerWorkspace
     ) throws {
         let cap = max(1, limit)
-        try db.performSync { _ in
-            let total = try count(workspaceId: workspaceId)
-            let prospectiveExists: Bool
-            if let prospectiveThreadId {
-                prospectiveExists = try get(id: prospectiveThreadId)?.workspaceId == workspaceId
-            } else {
-                prospectiveExists = false
-            }
-            let projectedCount = total + (prospectiveExists ? 0 : 1)
-            let requiredVictims = max(0, projectedCount - cap)
-            guard requiredVictims > 0 else { return }
+        try withLiveSurfaceBindingsLocked { liveBindings in
+            try db.performSync { _ in
+                let total = try count(workspaceId: workspaceId)
+                let prospectiveExists: Bool
+                if let prospectiveThreadId {
+                    prospectiveExists = try get(id: prospectiveThreadId)?.workspaceId == workspaceId
+                } else {
+                    prospectiveExists = false
+                }
+                let projectedCount = total + (prospectiveExists ? 0 : 1)
+                let requiredVictims = max(0, projectedCount - cap)
+                guard requiredVictims > 0 else { return }
 
-            var excludedIDs = excludedVictimIDs
-            if let prospectiveThreadId { excludedIDs.insert(prospectiveThreadId) }
-            let excludedRawIDs = excludedIDs.map { $0.value.uuidString }.sorted()
-            let exclusion = excludedRawIDs.isEmpty
-                ? ""
-                : "AND candidate.id NOT IN (\(Array(repeating: "?", count: excludedRawIDs.count).joined(separator: ", ")))"
-            let statement = try db.prepare("""
-                SELECT COUNT(*) FROM agent_threads AS candidate
-                WHERE candidate.workspace_id = ?
-                  AND candidate.status NOT IN ('running', 'pending')
-                  AND NOT EXISTS (
-                      SELECT 1 FROM agent_thread_fork_intents AS intent
-                      WHERE intent.state IN ('prepared', 'provider_created', 'compensating')
-                        AND (intent.source_thread_id = candidate.id
-                             OR intent.child_thread_id = candidate.id)
-                  )
-                  \(workspaceThreadLimitEligibilityPredicate(candidateAlias: "candidate"))
-                  \(exclusion);
-            """)
-            try statement.bind(1, workspaceId.value.uuidString)
-            for (index, id) in excludedRawIDs.enumerated() {
-                try statement.bind(Int32(index + 2), id)
-            }
-            let eligibleCount = try statement.step() ? Int(statement.columnInt64(0)) : 0
-            guard eligibleCount >= requiredVictims else {
-                throw AgentThreadCapacityError.workspaceLimitExceeded(
-                    workspaceId: workspaceId,
-                    limit: cap,
-                    actualCount: projectedCount
-                )
+                var excludedIDs = excludedVictimIDs.union(liveBindings)
+                if let prospectiveThreadId { excludedIDs.insert(prospectiveThreadId) }
+                let excludedRawIDs = excludedIDs.map { $0.value.uuidString }.sorted()
+                let exclusion = excludedRawIDs.isEmpty
+                    ? ""
+                    : "AND candidate.id NOT IN (\(Array(repeating: "?", count: excludedRawIDs.count).joined(separator: ", ")))"
+                let statement = try db.prepare("""
+                    SELECT COUNT(*) FROM agent_threads AS candidate
+                    WHERE candidate.workspace_id = ?
+                      \(workspaceThreadLimitEligibilityPredicate(candidateAlias: "candidate"))
+                      \(exclusion);
+                """)
+                try statement.bind(1, workspaceId.value.uuidString)
+                for (index, id) in excludedRawIDs.enumerated() {
+                    try statement.bind(Int32(index + 2), id)
+                }
+                let eligibleCount = try statement.step() ? Int(statement.columnInt64(0)) : 0
+                guard eligibleCount >= requiredVictims else {
+                    throw try workspaceThreadCapacityError(
+                        workspaceId: workspaceId,
+                        limit: cap,
+                        actualCount: projectedCount,
+                        liveSurfaceBindings: liveBindings
+                    )
+                }
             }
         }
     }
@@ -425,30 +593,34 @@ public final class AgentThreadRepository {
         limit: Int,
         excluding excludedThreadIDs: Set<AgentThreadID>
     ) throws -> [AgentThreadID] {
-        let cap = max(1, limit)
-        let victims = try workspaceThreadLimitVictims(
-            workspaceId: workspaceId,
-            limit: cap,
-            excluding: excludedThreadIDs
-        )
-        for id in victims {
-            guard try deleteWorkspaceThreadLimitVictimIfStillEligible(id) else {
-                throw AgentThreadCapacityError.workspaceLimitExceeded(
-                    workspaceId: workspaceId,
-                    limit: cap,
-                    actualCount: try count(workspaceId: workspaceId)
-                )
-            }
-        }
-        let actualCount = try count(workspaceId: workspaceId)
-        guard actualCount <= cap else {
-            throw AgentThreadCapacityError.workspaceLimitExceeded(
+        try withLiveSurfaceBindingsLocked { liveBindings in
+            let cap = max(1, limit)
+            let victims = try workspaceThreadLimitVictims(
                 workspaceId: workspaceId,
                 limit: cap,
-                actualCount: actualCount
+                excluding: excludedThreadIDs.union(liveBindings)
             )
+            for id in victims {
+                guard try deleteWorkspaceThreadLimitVictimIfStillEligible(id) else {
+                    throw try workspaceThreadCapacityError(
+                        workspaceId: workspaceId,
+                        limit: cap,
+                        actualCount: try count(workspaceId: workspaceId),
+                        liveSurfaceBindings: liveBindings
+                    )
+                }
+            }
+            let actualCount = try count(workspaceId: workspaceId)
+            guard actualCount <= cap else {
+                throw try workspaceThreadCapacityError(
+                    workspaceId: workspaceId,
+                    limit: cap,
+                    actualCount: actualCount,
+                    liveSurfaceBindings: liveBindings
+                )
+            }
+            return victims
         }
-        return victims
     }
 
     public func list(workspaceId: WorkspaceID? = nil) throws -> [AgentThread] {
@@ -627,16 +799,9 @@ public final class AgentThreadRepository {
         let st = try db.prepare("""
             SELECT candidate.id FROM agent_threads AS candidate
             WHERE candidate.workspace_id = ?
-              AND candidate.status NOT IN ('running', 'pending')
-              AND NOT EXISTS (
-                  SELECT 1 FROM agent_thread_fork_intents AS intent
-                  WHERE intent.state IN ('prepared', 'provider_created', 'compensating')
-                    AND (intent.source_thread_id = candidate.id
-                         OR intent.child_thread_id = candidate.id)
-              )
               \(workspaceThreadLimitEligibilityPredicate(candidateAlias: "candidate"))
               \(exclusion)
-            ORDER BY candidate.pinned ASC, candidate.updated_at ASC, candidate.id ASC
+            ORDER BY candidate.updated_at ASC, candidate.id ASC
             LIMIT ?;
         """)
         try st.bind(1, workspaceId.value.uuidString)
@@ -660,13 +825,6 @@ public final class AgentThreadRepository {
         let deletion = try db.prepare("""
             DELETE FROM agent_threads
             WHERE id = ?
-              AND status NOT IN ('running', 'pending')
-              AND NOT EXISTS (
-                  SELECT 1 FROM agent_thread_fork_intents AS intent
-                  WHERE intent.state IN ('prepared', 'provider_created', 'compensating')
-                    AND (intent.source_thread_id = agent_threads.id
-                         OR intent.child_thread_id = agent_threads.id)
-              )
               \(workspaceThreadLimitEligibilityPredicate(candidateAlias: "agent_threads"));
         """)
         try deletion.bind(1, id.value.uuidString)

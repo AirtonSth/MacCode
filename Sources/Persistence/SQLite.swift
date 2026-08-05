@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 import SQLite3
 
 protocol SQLiteDBOwnedMaintenance: AnyObject {
@@ -60,6 +61,10 @@ public final class SQLiteDB {
     // step, preventing a bare repository writer from entering a maintenance
     // transaction between its durable-reference scan and reversible-row delete.
     private let operationLock = NSRecursiveLock()
+    // Process-only Agent App selections belong to this database connection so
+    // distinct repository instances share one retention authority. The same
+    // operation lock makes selection changes atomic with capped transactions.
+    private var liveAgentThreadBySurface: [SurfaceID: AgentThreadID] = [:]
     private var ownedMaintenance: SQLiteDBOwnedMaintenance?
     private(set) var maintenanceInstallCountForTesting = 0
     var onDeinitForTesting: (() -> Void)?
@@ -124,6 +129,24 @@ public final class SQLiteDB {
         operationLock.lock()
         defer { operationLock.unlock() }
         return try block()
+    }
+
+    func setLiveAgentThreadBinding(surfaceID: SurfaceID, threadID: AgentThreadID?) {
+        withSerializedOperation {
+            if let threadID {
+                liveAgentThreadBySurface[surfaceID] = threadID
+            } else {
+                liveAgentThreadBySurface.removeValue(forKey: surfaceID)
+            }
+        }
+    }
+
+    func withLiveAgentThreadBindings<T>(
+        _ body: (Set<AgentThreadID>) throws -> T
+    ) rethrows -> T {
+        try withSerializedOperation {
+            try body(Set(liveAgentThreadBySurface.values))
+        }
     }
 
     fileprivate func takeInjectedResultCodeForTesting() -> Int32? {
