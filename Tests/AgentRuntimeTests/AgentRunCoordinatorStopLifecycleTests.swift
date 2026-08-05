@@ -700,6 +700,89 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
         }
     }
 
+    /// WHY: provider-completed `.finished` used to wait unbounded on
+    /// providerTextTranslationsInFlight (SR1/distill). A hung translator left
+    /// durable agent_runs running and Working latched for all providers.
+    /// Token Saver must fail open: deadline drains the deferred terminal with
+    /// the original provider payload.
+    func test_providerCompletedFinished_drainsWhenTranslatorNeverReturns() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("defer-deadline")
+        final class StreamThenHoldRunner: AgentProviderRunner, @unchecked Sendable {
+            let provider: AgentProvider = .claude
+            private let lock = NSLock()
+            private var onEvent: (@Sendable (AgentRunEvent) -> Void)?
+            func listModels() async -> [AgentModelDescriptor] { [] }
+            func startRun(
+                _ request: AgentRunRequest,
+                onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+            ) async throws -> AgentRunHandle {
+                lock.lock(); self.onEvent = onEvent; lock.unlock()
+                onEvent(.status(.running))
+                let itemId = "sr1-item"
+                onEvent(.event(.itemStarted(item: AssistantItem(
+                    id: itemId,
+                    turnId: "t1",
+                    type: .assistantMessage,
+                    state: .streaming,
+                    body: "",
+                    startedAtMs: 1
+                ))))
+                onEvent(.event(.itemDelta(
+                    itemId: itemId,
+                    bodyAppend: "S: build pass. P: unit tests green.",
+                    outputAppend: nil,
+                    summary: nil
+                )))
+                onEvent(.event(.itemCompleted(itemId: itemId, finalState: .completed)))
+                // Provider terminal while humanize is still in flight.
+                onEvent(.finished(.completed, finalMessage: "S: done. P: shipped.", providerThreadId: "pt-1"))
+                return AgentRunHandle(runId: request.runId, process: nil) {}
+            }
+        }
+        let thread = AgentThread(title: "defer deadline", provider: .claude, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let runner = StreamThenHoldRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.claude: runner]
+        )
+        // Short deadline so the test proves fail-open without a long sleep.
+        coordinator.providerTerminalTranslationDeadline = 0.2
+        let hangGate = DispatchSemaphore(value: 0)
+        coordinator.finalResponseTranslator = { response, _, _, _ in
+            hangGate.wait()
+            return "Humanized: \(response)"
+        }
+        let recorder = LifecycleRecorder()
+        coordinator.addObserver(recorder)
+        coordinator.onRunFinished = { tid, _, status in
+            recorder.recordRunFinished(threadId: tid, status: status)
+        }
+
+        let runId = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .claude,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "do work"
+        ))
+        await waitUntil(3) {
+            recorder.runFinishedCallbacks.contains { $0.0 == thread.id && $0.1 == .completed }
+        }
+        hangGate.signal()
+
+        XCTAssertNil(coordinator.activeRunId(threadId: thread.id),
+                     "translation deadline must release active ownership without waiting for distill")
+        XCTAssertEqual(try runRepo.get(id: runId)?.status, .completed)
+        XCTAssertNotNil(try runRepo.get(id: runId)?.finishedAt)
+        XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .completed)
+        XCTAssertEqual(recorder.runFinishedCallbacks.filter { $0.0 == thread.id }.count, 1,
+                       "exactly one terminal lifecycle callback after deadline drain")
+    }
+
     /// WHY: Stop used to set isStopping=true then no-op while
     /// providerTextTranslationsInFlight > 0 (SR1 humanize via distill). The
     /// finished(.cancelled) path deferred forever, so Working/Stopping stuck and

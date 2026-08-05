@@ -908,6 +908,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// cleanup must wait until every in-flight translation finishes.
     private var providerTextTranslationsInFlight: [AgentRunID: Int] = [:]
     private var deferredProviderTerminalEvents: [AgentRunID: DeferredProviderTerminalEvent] = [:]
+    /// Bound on how long a provider-completed `.finished` may wait for SR1/distill
+    /// humanize. Token Saver must fail open: a hung translator cannot leave
+    /// Working latched forever. Default sits above distill startup polls (~60s)
+    /// + request timeout (8s). Tests inject a short value.
+    var providerTerminalTranslationDeadline: TimeInterval = 90
+    private var deferredProviderTerminalDeadlineWorkItems: [AgentRunID: DispatchWorkItem] = [:]
     private var activeDistillOutputRuns: Set<AgentRunID> = []
     private var finishingRuns: Set<AgentRunID> = []
     /// Provider terminal payloads wait here until the final stream batch crosses
@@ -2702,6 +2708,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         bufferedProviderTextItems.removeValue(forKey: runId)
         providerTextTranslationsInFlight.removeValue(forKey: runId)
         deferredProviderTerminalEvents.removeValue(forKey: runId)
+        deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
         activeDistillOutputRuns.remove(runId)
         finishingRuns.remove(runId)
         pendingTerminalEvents.removeValue(forKey: runId)
@@ -3199,6 +3206,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // supersedes it when the durability slot is still free. If a terminal
             // is already claimed below, the deferred entry is obsolete either way.
             deferredProviderTerminalEvents.removeValue(forKey: runId)
+            deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
 
             if pendingTerminalEvents[runId] != nil {
                 // Provider (or a prior Stop) already owns the durability slot.
@@ -3387,6 +3395,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         pendingTerminalEvents.removeValue(forKey: runId)
         terminalRetryScheduled.remove(runId)
         deferredProviderTerminalEvents.removeValue(forKey: runId)
+        deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
         providerTextTranslationsInFlight.removeValue(forKey: runId)
         pendingGracefulStopFallbacks.remove(runId)
         awaitingTerminationRuns.remove(runId)
@@ -5504,6 +5513,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     deferredProviderTerminalEvents.removeValue(forKey: runId)
                     // Fall through and finish as cancelled immediately.
                 } else {
+                    let firstDeferral = deferredProviderTerminalEvents[runId] == nil
                     if var deferred = deferredProviderTerminalEvents[runId] {
                         deferred.providerTerminalAcknowledged = deferred.providerTerminalAcknowledged
                             || providerTerminalAcknowledged
@@ -5517,6 +5527,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                             allowFinalResponseTranslation: allowFinalResponseTranslation,
                             providerTerminalAcknowledged: providerTerminalAcknowledged
                         )
+                    }
+                    if firstDeferral {
+                        scheduleDeferredProviderTerminalDeadline(runId: runId, threadId: threadId)
                     }
                     lock.unlock()
                     return
@@ -5788,6 +5801,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             finishingRuns.remove(runId)
             pendingTerminalEvents.removeValue(forKey: runId)
             terminalRetryScheduled.remove(runId)
+            deferredProviderTerminalEvents.removeValue(forKey: runId)
+            deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
+            providerTextTranslationsInFlight.removeValue(forKey: runId)
             pendingThreadStops.remove(threadId)
             // PERF-MAC_AGENT-005: flush a final prune at run end so events queued
             // since the last cadence-prune don't linger unbounded.
@@ -6312,8 +6328,51 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         providerTextTranslationsInFlight.removeValue(forKey: runId)
         let deferred = deferredProviderTerminalEvents.removeValue(forKey: runId)
+        deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
         discardRunThreadOwnershipIfReleasedLocked(runId)
         return deferred
+    }
+
+    /// Fail open when SR1/distill humanize never drains after a provider terminal.
+    /// Arms once per deferred terminal; cancel paths and successful translation
+    /// drain clear the work item.
+    private func scheduleDeferredProviderTerminalDeadline(runId: AgentRunID, threadId: AgentThreadID) {
+        // Caller holds `lock`.
+        deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
+        let delay = max(0.05, providerTerminalTranslationDeadline)
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.forceDrainDeferredProviderTerminal(runId: runId, threadId: threadId)
+        }
+        deferredProviderTerminalDeadlineWorkItems[runId] = item
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    private func forceDrainDeferredProviderTerminal(runId: AgentRunID, threadId: AgentThreadID) {
+        lock.lock()
+        deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)
+        guard let deferred = deferredProviderTerminalEvents.removeValue(forKey: runId) else {
+            lock.unlock()
+            return
+        }
+        // Drop the translation hold so later completeProviderTextTranslation
+        // calls are no-ops rather than re-arming a second terminal.
+        providerTextTranslationsInFlight.removeValue(forKey: runId)
+        lock.unlock()
+        agentRunLog.info(
+            "run.deferred_terminal.translation_deadline thread=\(threadId.value.uuidString, privacy: .public) run=\(runId.value.uuidString, privacy: .public) status=\(deferred.status.rawValue, privacy: .public)"
+        )
+        handle(
+            event: .finished(
+                deferred.status,
+                finalMessage: deferred.finalMessage,
+                providerThreadId: deferred.providerThreadId
+            ),
+            runId: runId,
+            threadId: deferred.threadId,
+            allowFinalResponseTranslation: false,
+            providerTerminalAcknowledged: deferred.providerTerminalAcknowledged
+        )
     }
 
     private enum ProviderTextTarget {
@@ -6532,7 +6591,22 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             if let activeProvider { return activeProvider }
             return (try? threadRepo.get(id: threadId)?.provider) ?? .codex
         }()
-        let translated = await finalResponseTranslator(response, provider, threadId, runId)
+        // Fail open on hung distill: never let SR1 humanize block the turn
+        // longer than the provider-terminal translation deadline. The translator
+        // Task may still complete later; its result is ignored after the race.
+        let deadlineNs = UInt64(max(0.05, providerTerminalTranslationDeadline) * 1_000_000_000)
+        let translated: String = await withTaskGroup(of: String.self) { group in
+            group.addTask {
+                await finalResponseTranslator(response, provider, threadId, runId)
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: deadlineNs)
+                return response
+            }
+            let first = await group.next() ?? response
+            group.cancelAll()
+            return first
+        }
         let trimmed = sanitizeFinalAssistantText(translated).trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? response : trimmed
     }

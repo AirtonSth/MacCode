@@ -26,6 +26,34 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(finished.finalMessage, "done")
     }
 
+    /// WHY: field 2026-08-05 — Grok streamed a full **COMPLETE** final then
+    /// never resolved session/prompt (timeout: nil). Working latched 70m+ with
+    /// Stop while durable agent_runs stayed running. The inactivity watchdog
+    /// must synthesize exactly one terminal so coordinator ownership releases.
+    func test_turnInactivityWatchdogSynthesizesTerminalWhenPromptNeverReturns() async throws {
+        let peer = try FakeGrokACPPeer(mode: .hangAfterFinal)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(
+            binaryNameOverride: peer.path,
+            cancellationGracePeriod: 0.05,
+            turnInactivityTimeout: 0.25
+        )
+        let request = makeRequest()
+        let box = GrokACPEventBox()
+        _ = try await adapter.startSession(request) { box.append($0) }
+
+        let finished = try await box.waitFinished(timeout: 4)
+        XCTAssertEqual(finished.status, .completed,
+                       "watchdog must prefer completed when speakable final text already streamed")
+        XCTAssertEqual(finished.finalMessage, "**COMPLETE** residual note")
+        XCTAssertTrue(box.hasWatchdogSynthesizedMarker,
+                      "inferred terminals must carry a distinct runtime marker for forensics")
+        // Late real prompt results must not double-emit (generation + turnTerminalEmitted).
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(box.finishedCount, 1,
+                       "exactly one .finished — late prompt result must not double-terminate")
+    }
+
     func test_foreignRunAsDoesNotRecordTokenSaverCensus() async throws {
         let peer = try FakeGrokACPPeer(mode: .permission)
         defer { peer.remove() }
@@ -930,6 +958,16 @@ private final class GrokACPEventBox: @unchecked Sendable {
             }.count
         }
     }
+    var hasWatchdogSynthesizedMarker: Bool {
+        lock.withLock {
+            events.contains {
+                if case .event(.providerRuntime(let runtime)) = $0 {
+                    return runtime.method == "grok.turn.watchdog.synthesized"
+                }
+                return false
+            }
+        }
+    }
     var lifecycleLabels: [String] {
         lock.withLock {
             events.compactMap { event in
@@ -975,6 +1013,10 @@ private final class FakeGrokACPPeer {
     enum Mode: String {
         case permission, cancel, ignoreCancel, crash, load, loadThenPrompt, discovery, plan
         case auth, rateLimit, network, invalidResume, invalidJSON, immediateResponse, promptWriteFailure
+        /// Streams a complete assistant final then never resolves session/prompt —
+        /// field shape of the 70m Grok Working zombie. The turn-inactivity
+        /// watchdog must synthesize a single terminal.
+        case hangAfterFinal
     }
     let root: URL
     let path: String
@@ -1070,6 +1112,15 @@ private final class FakeGrokACPPeer {
               if [ "$mode" = immediateResponse ]; then
                 printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"immediate"}}}}\n'
                 printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+                continue
+              fi
+              if [ "$mode" = hangAfterFinal ]; then
+                # Stream the full final answer (and a late available_commands_update)
+                # then deliberately never return session/prompt — the host must
+                # release Working via the turn-inactivity watchdog.
+                printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"**COMPLETE** residual note"}}}}\n'
+                printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"available_commands_update","availableCommands":[]}}}\n'
+                prompt_id="$id"
                 continue
               fi
               if [ "$mode" = plan ] && [ "$current_mode" = plan ]; then

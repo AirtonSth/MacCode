@@ -1,5 +1,8 @@
 import Foundation
 import CoreModel
+import os
+
+private let grokAcpLog = Logger(subsystem: "io.remotecode.agent", category: "grok.acp")
 
 public struct GrokACPDiscoveryResult: Sendable, Equatable {
     public let models: [AgentModelDescriptor]
@@ -75,6 +78,11 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         var cancelRequested = false
         var forcedKillByUs = false
         var turnTerminalEmitted = false
+        /// Bumped on every `session/prompt` start so a late RPC result cannot
+        /// finish a newer turn after the inactivity watchdog already closed the
+        /// previous one (or the user started a follow-up).
+        var promptGeneration: UInt64 = 0
+        var turnWatchdog: DispatchWorkItem?
         var promptWritePermit = AgentRunAcceptancePermit()
         var onEvent: (@Sendable (AgentRunEvent) -> Void)?
         var history: [AssistantEvent] = []
@@ -113,6 +121,12 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     public let provider: AgentProvider = .grok
     private let binaryNameOverride: String?
     private let cancellationGracePeriod: TimeInterval
+    /// Inactivity bound while a prompt is in flight. Re-armed on every emitted
+    /// turn event. When `session/prompt` never returns after the model has
+    /// finished streaming, this synthesizes the terminal so Working cannot
+    /// stick forever (field: 70m Grok zombie with full **COMPLETE** final).
+    /// Matches Claude's deferred-finish inactivity default (900s).
+    private let turnInactivityTimeout: TimeInterval
     private let discoveryCwd: String
     private let discoveryEnvironment: [String: String]
     private let modelCacheTTL: TimeInterval
@@ -131,12 +145,14 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     public init(
         binaryNameOverride: String? = nil,
         cancellationGracePeriod: TimeInterval = 2,
+        turnInactivityTimeout: TimeInterval = 900,
         discoveryCwd: String = FileManager.default.temporaryDirectory.path,
         discoveryEnvironment: [String: String] = [:],
         modelCacheTTL: TimeInterval = 300
     ) {
         self.binaryNameOverride = binaryNameOverride
         self.cancellationGracePeriod = max(0.01, cancellationGracePeriod)
+        self.turnInactivityTimeout = max(0.01, turnInactivityTimeout)
         self.discoveryCwd = discoveryCwd
         self.discoveryEnvironment = discoveryEnvironment
         self.modelCacheTTL = max(0, modelCacheTTL)
@@ -612,7 +628,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         session: Session,
         onEvent: @escaping @Sendable (AgentRunEvent) -> Void
     ) async throws {
-        try synchronized {
+        let promptGeneration: UInt64 = try synchronized {
             guard sessions[request.threadId] === session, session.isLive else {
                 throw AgentProviderAdapterError.sessionNotFound(request.threadId)
             }
@@ -625,7 +641,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             session.cancelRequested = false
             session.forcedKillByUs = false
             session.turnTerminalEmitted = false
+            session.promptGeneration &+= 1
             session.onEvent = onEvent
+            cancelTurnWatchdogLocked(session: session)
+            return session.promptGeneration
         }
 
         do {
@@ -694,10 +713,11 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                                     self.emit(event, session: session)
                                 }
                                 onEvent(.status(.running))
+                                self.refreshTurnWatchdog(session: session, generation: promptGeneration)
                                 acceptance.settle(.success(()))
                             }
                         )
-                        self.handlePromptResponse(response, session: session)
+                        self.handlePromptResponse(response, session: session, generation: promptGeneration)
                     } catch {
                         acceptance.settle(.failure(error))
                         self.finishTransportFailure(session: session, error: error, forced: false)
@@ -706,7 +726,12 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             }
             afterPromptWriteForTesting?()
         } catch {
-            synchronized { session.inFlight = false }
+            synchronized {
+                if session.promptGeneration == promptGeneration {
+                    session.inFlight = false
+                    cancelTurnWatchdogLocked(session: session)
+                }
+            }
             if error is AgentProviderAdapterError { throw error }
             throw GrokACPFailureTaxonomy.normalize(error, context: .turn)
         }
@@ -794,7 +819,22 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         }
     }
 
-    private func handlePromptResponse(_ response: [String: Any], session: Session) {
+    private func handlePromptResponse(
+        _ response: [String: Any],
+        session: Session,
+        generation: UInt64
+    ) {
+        // Drop a stale result for a previous prompt after the inactivity
+        // watchdog already released the turn (or a follow-up started).
+        let stillCurrent = synchronized {
+            session.promptGeneration == generation && !session.turnTerminalEmitted
+        }
+        guard stillCurrent else {
+            grokAcpLog.info(
+                "grok.turn.prompt_result.stale thread=\(session.threadId.value.uuidString, privacy: .public) generation=\(generation, privacy: .public)"
+            )
+            return
+        }
         let stopReason = response["stopReason"] as? String ?? "failed"
         let metadata = response["_meta"] as? [String: Any]
         let usage = metadata?["usage"] as? [String: Any]
@@ -869,6 +909,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         session.turnTerminalEmitted = true
         session.inFlight = false
         session.status = status
+        cancelTurnWatchdogLocked(session: session)
         let callback = session.onEvent
         let final = session.mapper.finalAssistantMessage
         let providerThreadId = session.providerThreadId
@@ -882,6 +923,83 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         callback?(.finished(status, finalMessage: final, providerThreadId: providerThreadId))
     }
 
+    /// (Re)arm the in-flight turn inactivity bound. No-op when the turn is no
+    /// longer open. Every stream/event emission extends the deadline so long
+    /// tools stay live; only true post-stream silence can synthesize a terminal.
+    private func refreshTurnWatchdog(session: Session, generation: UInt64) {
+        lock.lock()
+        guard sessions[session.threadId] === session,
+              session.isLive,
+              session.inFlight,
+              session.promptAccepted,
+              !session.turnTerminalEmitted,
+              session.promptGeneration == generation else {
+            lock.unlock()
+            return
+        }
+        session.turnWatchdog?.cancel()
+        let item = DispatchWorkItem { [weak self, weak session] in
+            guard let self, let session else { return }
+            self.fireTurnInactivityWatchdog(session: session, generation: generation)
+        }
+        session.turnWatchdog = item
+        let delay = turnInactivityTimeout
+        lock.unlock()
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    private func cancelTurnWatchdogLocked(session: Session) {
+        session.turnWatchdog?.cancel()
+        session.turnWatchdog = nil
+    }
+
+    /// When `session/prompt` never returns after the model finished streaming,
+    /// synthesize a terminal so coordinator ownership / Working release.
+    /// Prefer `.completed` when the mapper already has speakable final text.
+    private func fireTurnInactivityWatchdog(session: Session, generation: UInt64) {
+        lock.lock()
+        guard sessions[session.threadId] === session,
+              session.isLive,
+              session.inFlight,
+              session.promptAccepted,
+              !session.turnTerminalEmitted,
+              session.promptGeneration == generation else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+        let hasFinal = session.mapper.hasSpeakableFinalContent
+        let status: AgentRunStatus = hasFinal ? .completed : .failed
+        let stopReason = hasFinal ? "end_turn" : "failed"
+        grokAcpLog.info(
+            "grok.turn.watchdog.synthesized thread=\(session.threadId.value.uuidString, privacy: .public) status=\(status.rawValue, privacy: .public) generation=\(generation, privacy: .public)"
+        )
+        // Distinct runtime marker so field forensics can separate inferred
+        // terminals from real session/prompt stopReason frames.
+        emit(
+            Self.runtimeEvent(
+                method: "grok.turn.watchdog.synthesized",
+                payload: [
+                    "sessionId": session.providerThreadId,
+                    "status": status.rawValue,
+                    "stopReason": stopReason,
+                    "hasSpeakableFinalContent": hasFinal
+                ]
+            ),
+            session: session
+        )
+        for event in session.mapper.finishTurn(stopReason: stopReason, usage: nil) {
+            emit(event, session: session)
+        }
+        if status == .failed {
+            session.onEvent?(.error(GrokACPFailureTaxonomy.normalize(
+                diagnostic: "Grok ACP turn inactivity watchdog synthesized terminal (session/prompt never returned)",
+                context: .turn
+            ).message))
+        }
+        finishTurn(session: session, status: status)
+    }
+
     private func emit(_ event: AssistantEvent, session: Session) {
         lock.lock()
         // Drop late ACP noise after the turn terminal was published. Post-finish
@@ -892,9 +1010,14 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             return
         }
         session.history.append(event)
+        let generation = session.promptGeneration
+        let shouldArmWatchdog = session.inFlight && session.promptAccepted
         let callback = session.onEvent
         lock.unlock()
         callback?(.event(event))
+        if shouldArmWatchdog {
+            refreshTurnWatchdog(session: session, generation: generation)
+        }
     }
 
     private func handle(for runId: AgentRunID, session: Session) -> AgentRunHandle {

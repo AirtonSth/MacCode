@@ -45,6 +45,24 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         planReviewModeId = modeId
     }
 
+    /// True when the open turn has already produced speakable assistant text.
+    /// Used by the turn-inactivity watchdog to prefer `.completed` over `.failed`
+    /// when synthesizing a terminal after `session/prompt` never returns.
+    public var hasSpeakableFinalContent: Bool {
+        lock.lock(); defer { lock.unlock() }
+        if let final = finalAssistantMessage?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !final.isEmpty {
+            return true
+        }
+        if !currentAssistantPhase.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return true
+        }
+        if !lastNonEmptyAssistantPhase.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return true
+        }
+        return false
+    }
+
     public func beginTurn() -> [AssistantEvent] {
         lock.lock(); defer { lock.unlock() }
         var events: [AssistantEvent] = []
