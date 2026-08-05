@@ -398,6 +398,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
+    func publishAgentThreadDeletions(_ ids: [AgentThreadID]) {
+        guard !ids.isEmpty else { return }
+        publishAgentThreadLifecycle(.deleted(ids))
+    }
+
     private func publishQueuedMessage(kind: String, _ message: AgentQueuedMessage) {
         var payload: [String: JSONValue] = [
             "id": .string(message.id.value.uuidString),
@@ -2756,6 +2761,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func prepareAgentThreadForPullRequest(workspace: WorkspaceID, url: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        try ctx.threadRepo.preflightWorkspaceThreadInsertion(workspaceId: workspace)
         let cwd = try workspaceCwd(workspace)
         let prep = GitDiff.preparePullRequestWorktree(in: cwd, urlString: url)
         guard prep.result.ok else {
@@ -2776,7 +2782,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             modelSelection: modelSelection ?? AgentModelSelection(provider: provider, modelId: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier)
         )
         thread.updatedAt = Date()
-        try ctx.threadRepo.upsert(thread)
+        let prunedThreadIDs = try ctx.threadRepo.upsertEnforcingWorkspaceThreadLimit(thread)
+        publishAgentThreadDeletions(prunedThreadIDs)
         // Rail refresh only across surfaces; the initiating macOS surface (if
         // local) selects the PR thread through its own view-model path.
         try selectAgentThread(thread: thread.id)

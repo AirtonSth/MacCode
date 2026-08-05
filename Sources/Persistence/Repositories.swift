@@ -196,6 +196,19 @@ public struct AgentThreadForkIntent: Codable, Sendable, Equatable {
     public let updatedAt: Date
 }
 
+public enum AgentThreadCapacityError: Error, Equatable, CustomStringConvertible, LocalizedError {
+    case workspaceLimitExceeded(workspaceId: WorkspaceID, limit: Int, actualCount: Int)
+
+    public var description: String {
+        switch self {
+        case .workspaceLimitExceeded(_, let limit, let actualCount):
+            return "Agent thread capacity exceeded: \(actualCount) threads remain for limit \(limit)."
+        }
+    }
+
+    public var errorDescription: String? { description }
+}
+
 public final class AgentThreadRepository {
     /// Soft product cap: keep each workspace's thread table bounded so scheduled
     /// runs and long sessions cannot grow SQLite without limit.
@@ -261,6 +274,54 @@ public final class AgentThreadRepository {
         }
     }
 
+    /// Cheap fail-fast check before a producer performs irreversible or
+    /// expensive work. The capped transaction remains authoritative for races.
+    public func preflightWorkspaceThreadInsertion(
+        workspaceId: WorkspaceID,
+        prospectiveThreadId: AgentThreadID? = nil,
+        excludedVictimIDs: Set<AgentThreadID> = [],
+        limit: Int = AgentThreadRepository.maxThreadsPerWorkspace
+    ) throws {
+        let cap = max(1, limit)
+        try db.performSync { _ in
+            let total = try count(workspaceId: workspaceId)
+            let prospectiveExists: Bool
+            if let prospectiveThreadId {
+                prospectiveExists = try get(id: prospectiveThreadId)?.workspaceId == workspaceId
+            } else {
+                prospectiveExists = false
+            }
+            let projectedCount = total + (prospectiveExists ? 0 : 1)
+            let requiredVictims = max(0, projectedCount - cap)
+            guard requiredVictims > 0 else { return }
+
+            var excludedIDs = excludedVictimIDs
+            if let prospectiveThreadId { excludedIDs.insert(prospectiveThreadId) }
+            let excludedRawIDs = excludedIDs.map { $0.value.uuidString }.sorted()
+            let exclusion = excludedRawIDs.isEmpty
+                ? ""
+                : "AND id NOT IN (\(Array(repeating: "?", count: excludedRawIDs.count).joined(separator: ", ")))"
+            let statement = try db.prepare("""
+                SELECT COUNT(*) FROM agent_threads
+                WHERE workspace_id = ?
+                  AND status NOT IN ('running', 'pending')
+                  \(exclusion);
+            """)
+            try statement.bind(1, workspaceId.value.uuidString)
+            for (index, id) in excludedRawIDs.enumerated() {
+                try statement.bind(Int32(index + 2), id)
+            }
+            let eligibleCount = try statement.step() ? Int(statement.columnInt64(0)) : 0
+            guard eligibleCount >= requiredVictims else {
+                throw AgentThreadCapacityError.workspaceLimitExceeded(
+                    workspaceId: workspaceId,
+                    limit: cap,
+                    actualCount: projectedCount
+                )
+            }
+        }
+    }
+
     /// Persists a thread and applies the workspace retention cap as one write.
     /// Any victim-delete failure rolls the upsert back with the transaction.
     @discardableResult
@@ -268,17 +329,56 @@ public final class AgentThreadRepository {
         _ thread: AgentThread,
         limit: Int = AgentThreadRepository.maxThreadsPerWorkspace
     ) throws -> [AgentThreadID] {
-        try db.performSync { database in
+        try transactionallyUpsertEnforcingWorkspaceThreadLimit(thread, limit: limit) {}
+    }
+
+    /// Persists a capped thread and its dependent graph writes atomically.
+    /// Callers publish returned victim ids only after this method commits.
+    @discardableResult
+    public func transactionallyUpsertEnforcingWorkspaceThreadLimit(
+        _ thread: AgentThread,
+        limit: Int = AgentThreadRepository.maxThreadsPerWorkspace,
+        excludedVictimIDs: Set<AgentThreadID> = [],
+        additionalWrites: () throws -> Void
+    ) throws -> [AgentThreadID] {
+        return try db.performSync { database in
             try database.transaction {
-                try upsert(thread)
-                guard let workspaceID = thread.workspaceId else { return [] }
-                let victims = try workspaceThreadLimitVictims(workspaceId: workspaceID, limit: limit)
-                for id in victims {
-                    try delete(id: id)
-                }
+                let victims = try upsertEnforcingWorkspaceThreadLimitInCurrentTransaction(
+                    thread,
+                    limit: limit,
+                    excludedVictimIDs: excludedVictimIDs
+                )
+                try additionalWrites()
                 return victims
             }
         }
+    }
+
+    private func upsertEnforcingWorkspaceThreadLimitInCurrentTransaction(
+        _ thread: AgentThread,
+        limit: Int,
+        excludedVictimIDs: Set<AgentThreadID> = []
+    ) throws -> [AgentThreadID] {
+        let cap = max(1, limit)
+        try upsert(thread)
+        guard let workspaceID = thread.workspaceId else { return [] }
+        let victims = try workspaceThreadLimitVictims(
+            workspaceId: workspaceID,
+            limit: cap,
+            excluding: excludedVictimIDs.union([thread.id])
+        )
+        for id in victims {
+            try delete(id: id)
+        }
+        let actualCount = try count(workspaceId: workspaceID)
+        guard actualCount <= cap else {
+            throw AgentThreadCapacityError.workspaceLimitExceeded(
+                workspaceId: workspaceID,
+                limit: cap,
+                actualCount: actualCount
+            )
+        }
+        return victims
     }
 
     public func list(workspaceId: WorkspaceID? = nil) throws -> [AgentThread] {
@@ -437,22 +537,31 @@ public final class AgentThreadRepository {
 
     private func workspaceThreadLimitVictims(
         workspaceId: WorkspaceID,
-        limit: Int
+        limit: Int,
+        excluding excludedThreadIDs: Set<AgentThreadID> = []
     ) throws -> [AgentThreadID] {
         let cap = max(1, limit)
         let total = try count(workspaceId: workspaceId)
         guard total > cap else { return [] }
         let excess = total - cap
         // Prefer pruning idle unpinned history; never touch active runs.
+        let excludedRawIDs = excludedThreadIDs.map { $0.value.uuidString }.sorted()
+        let exclusion = excludedRawIDs.isEmpty
+            ? ""
+            : "AND id NOT IN (\(Array(repeating: "?", count: excludedRawIDs.count).joined(separator: ", ")))"
         let st = try db.prepare("""
             SELECT id FROM agent_threads
             WHERE workspace_id = ?
               AND status NOT IN ('running', 'pending')
+              \(exclusion)
             ORDER BY pinned ASC, updated_at ASC, id ASC
             LIMIT ?;
-            """)
+        """)
         try st.bind(1, workspaceId.value.uuidString)
-        try st.bind(2, Int64(excess))
+        for (index, id) in excludedRawIDs.enumerated() {
+            try st.bind(Int32(index + 2), id)
+        }
+        try st.bind(Int32(excludedRawIDs.count + 2), Int64(excess))
         var victims: [AgentThreadID] = []
         while try st.step() {
             if let uuid = st.columnText(0).flatMap(UUID.init(uuidString:)) {
@@ -471,6 +580,22 @@ public final class AgentThreadRepository {
         providerSession: ProviderSessionRuntime?,
         forkIntentChildThreadId: AgentThreadID? = nil
     ) throws {
+        _ = try persistForkedChildGraphReturningPrunedThreadIDs(
+            sourceThreadId: sourceThreadId,
+            childThread: childThread,
+            providerSession: providerSession,
+            forkIntentChildThreadId: forkIntentChildThreadId
+        )
+    }
+
+    /// Result-returning fork commit used by surfaces that must apply and publish
+    /// retention victims before selecting the newly committed child.
+    public func persistForkedChildGraphReturningPrunedThreadIDs(
+        sourceThreadId: AgentThreadID,
+        childThread: AgentThread,
+        providerSession: ProviderSessionRuntime?,
+        forkIntentChildThreadId: AgentThreadID? = nil
+    ) throws -> [AgentThreadID] {
         try db.performSync { database in
             try database.transaction {
                 guard try get(id: sourceThreadId) != nil else {
@@ -490,7 +615,7 @@ public final class AgentThreadRepository {
                               existing.providerThreadId == childThread.providerThreadId else {
                             throw AgentThreadForkPersistenceError.childThreadConflict
                         }
-                        return
+                        return []
                     }
                     guard intent.state == .providerCreated else {
                         throw AgentThreadForkPersistenceError.invalidIntentState(intent.state)
@@ -506,7 +631,11 @@ public final class AgentThreadRepository {
                     throw AgentThreadForkPersistenceError.childThreadConflict
                 }
                 let messageRepo = AgentMessageRepository(db: database)
-                try upsert(childThread)
+                let prunedThreadIDs = try upsertEnforcingWorkspaceThreadLimitInCurrentTransaction(
+                    childThread,
+                    limit: AgentThreadRepository.maxThreadsPerWorkspace,
+                    excludedVictimIDs: [sourceThreadId]
+                )
 
                 let copyBaseDate = Date()
                 for (index, message) in sourceMessages.enumerated() {
@@ -531,6 +660,7 @@ public final class AgentThreadRepository {
                     try update.bind(2, forkIntentChildThreadId.value.uuidString)
                     _ = try update.step()
                 }
+                return prunedThreadIDs
             }
         }
     }

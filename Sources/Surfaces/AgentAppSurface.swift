@@ -4465,9 +4465,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             interactionMode: src.effectiveInteractionMode
         )
         do {
-            let forked = try await coordinator.forkThread(sourceThreadId: tid, childThread: child)
+            let result = try await coordinator.forkThreadReturningPrunedThreadIDs(
+                sourceThreadId: tid,
+                childThread: child
+            )
+            if !result.prunedThreadIDs.isEmpty {
+                applyAuthoritativeThreadDeletions(Set(result.prunedThreadIDs))
+                onThreadLifecycle?(.deleted(result.prunedThreadIDs))
+            }
             reloadThreads()
-            selectThread(forked.id)
+            selectThread(result.thread.id)
         } catch {
             statusMessage = "Could not fork thread: \(error)"
         }

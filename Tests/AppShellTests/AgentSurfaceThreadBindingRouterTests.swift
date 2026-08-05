@@ -38,8 +38,10 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
 
     private func fillWorkspaceToThreadCap(
         _ workspaceID: WorkspaceID,
-        context: AppContext
+        context: AppContext,
+        statuses: [AgentRunStatus] = [.completed]
     ) throws -> Set<AgentThreadID> {
+        precondition(!statuses.isEmpty)
         var ids: Set<AgentThreadID> = []
         for index in 0..<AgentThreadRepository.maxThreadsPerWorkspace {
             var thread = AgentThread(
@@ -48,7 +50,7 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
                 provider: .codex,
                 model: "fake-model"
             )
-            thread.status = .completed
+            thread.status = statuses[index % statuses.count]
             try context.threadRepo.upsert(thread)
             ids.insert(thread.id)
         }
@@ -605,6 +607,120 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
                       "the local surface must fail loud when atomic creation rolls back")
         XCTAssertTrue(lifecycleEvents.isEmpty,
                       "a rolled-back local create must publish no create or delete lifecycle")
+    }
+
+    func test_createAtCapWithOnlyProtectedRows_rejectsEveryProducerWithoutEvents() async throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-ProtectedCap-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "PROTECTED-CAP", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        let surface = try XCTUnwrap(agentSurfaces(in: workspace.id).first)
+        let existingIDs = try fillWorkspaceToThreadCap(
+            workspace.id,
+            context: ctx,
+            statuses: [.running, .pending]
+        )
+        surface.viewModel.reloadThreads()
+        var lifecycleEvents: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "agent.thread.created"
+                    || event.kind == "agent.thread.deleted"
+                    || event.kind == "agent.thread.deleted_many" else { return }
+            lifecycleEvents.append(event)
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        func assertOriginalState(_ producer: String) throws {
+            XCTAssertEqual(try ctx.threadRepo.count(workspaceId: workspace.id),
+                           AgentThreadRepository.maxThreadsPerWorkspace,
+                           "\(producer) must leave the protected workspace at its cap")
+            XCTAssertEqual(Set(try ctx.threadRepo.list(workspaceId: workspace.id).map(\.id)), existingIDs,
+                           "\(producer) must roll back its new row")
+            XCTAssertTrue(lifecycleEvents.isEmpty,
+                          "\(producer) must publish no lifecycle for a rejected create")
+        }
+
+        XCTAssertThrowsError(try router.createAgentThread(
+            workspace: workspace.id,
+            title: "rejected normal router",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium,
+            routingConfiguration: nil,
+            quiet: true
+        )) { error in
+            XCTAssertEqual(
+                error as? AgentThreadCapacityError,
+                .workspaceLimitExceeded(
+                    workspaceId: workspace.id,
+                    limit: AgentThreadRepository.maxThreadsPerWorkspace,
+                    actualCount: AgentThreadRepository.maxThreadsPerWorkspace + 1
+                )
+            )
+        }
+        try assertOriginalState("normal router")
+
+        let selection = AgentModelSelection(
+            provider: .codex,
+            modelId: "gpt-5.6",
+            reasoningEffort: .medium,
+            serviceTier: .auto
+        )
+        do {
+            _ = try await router.createAgentThreadRouting(
+                workspace: workspace.id,
+                title: "rejected routed router",
+                provider: .codex,
+                model: "gpt-5.6",
+                permissionMode: .supervised,
+                reasoningEffort: .medium,
+                serviceTier: .auto,
+                modelSelection: selection,
+                providerInstanceId: nil,
+                runAsUser: nil,
+                surfaceID: nil,
+                routing: AgentRoutingRequest(
+                    mode: .manual,
+                    expectedRevision: 0,
+                    manualSelection: selection
+                )
+            )
+            XCTFail("routed create must reject a workspace containing only protected rows")
+        } catch {
+            XCTAssertEqual(
+                error as? AgentThreadCapacityError,
+                .workspaceLimitExceeded(
+                    workspaceId: workspace.id,
+                    limit: AgentThreadRepository.maxThreadsPerWorkspace,
+                    actualCount: AgentThreadRepository.maxThreadsPerWorkspace + 1
+                )
+            )
+        }
+        try assertOriginalState("routed router")
+
+        XCTAssertThrowsError(try router.prepareAgentThreadForPullRequest(
+            workspace: workspace.id,
+            url: "not-a-pull-request",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium,
+            serviceTier: .auto,
+            modelSelection: nil,
+            providerInstanceId: nil
+        )) { error in
+            XCTAssertTrue(error is AgentThreadCapacityError,
+                          "capacity preflight must reject before pull-request worktree preparation")
+        }
+        try assertOriginalState("pull-request router")
+
+        surface.viewModel.createThread(title: "rejected local UI")
+        XCTAssertTrue(surface.viewModel.statusMessage.contains("Could not create thread"),
+                      "local create must fail loud at protected capacity")
+        XCTAssertTrue(surface.viewModel.statusMessage.contains("Agent thread capacity exceeded"),
+                      "local create must explain why the protected workspace cannot accept another thread")
+        try assertOriginalState("local UI")
     }
 
     func test_deletionBridges_applyAuthoritativeIDsBeforeFailedSurfaceReload() async throws {

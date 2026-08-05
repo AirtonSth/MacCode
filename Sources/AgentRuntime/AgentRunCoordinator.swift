@@ -759,6 +759,16 @@ public protocol AgentRunObserver: AnyObject {
     func runCoordinator(_ c: AgentRunCoordinator, didChangeStatus status: AgentRunStatus, runId: AgentRunID, threadId: AgentThreadID)
 }
 
+public struct AgentThreadForkResult: Sendable, Equatable {
+    public let thread: AgentThread
+    public let prunedThreadIDs: [AgentThreadID]
+
+    public init(thread: AgentThread, prunedThreadIDs: [AgentThreadID]) {
+        self.thread = thread
+        self.prunedThreadIDs = prunedThreadIDs
+    }
+}
+
 public final class AgentRunCoordinator: @unchecked Sendable {
     private struct ProviderTurnScope: Equatable {
         let tokenSaverEnabled: Bool
@@ -2947,6 +2957,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         sourceThreadId: AgentThreadID,
         childThread: AgentThread
     ) async throws -> AgentThread {
+        try await forkThreadReturningPrunedThreadIDs(
+            sourceThreadId: sourceThreadId,
+            childThread: childThread
+        ).thread
+    }
+
+    public func forkThreadReturningPrunedThreadIDs(
+        sourceThreadId: AgentThreadID,
+        childThread: AgentThread
+    ) async throws -> AgentThreadForkResult {
         guard sourceThreadId != childThread.id else {
             throw AgentProviderAdapterError.unsupported("fork child must have a distinct local thread identity")
         }
@@ -2959,11 +2979,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         guard childThread.providerThreadId == nil else {
             throw AgentProviderAdapterError.unsupported("fork child provider identity must be assigned by the durable fork operation")
         }
-
         let adapter = try adapterForThread(sourceThreadId)
         guard adapter.forkSafety(threadId: sourceThreadId).supportsDurableFork else {
             throw AgentProviderAdapterError.unsupported(
                 "provider fork is not crash-safe: keyed idempotency and idempotent compensation are required"
+            )
+        }
+        if let workspaceId = childThread.workspaceId {
+            try threadRepo.preflightWorkspaceThreadInsertion(
+                workspaceId: workspaceId,
+                prospectiveThreadId: childThread.id,
+                excludedVictimIDs: [sourceThreadId]
             )
         }
         try beginExclusiveThreadMutation(sourceThreadId, operation: "provider fork", requiresIdleThread: true)
@@ -3072,7 +3098,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private func reconcileForkIntent(
         _ initialIntent: AgentThreadForkIntent,
         adapter: AgentProviderAdapter
-    ) async throws -> AgentThread {
+    ) async throws -> AgentThreadForkResult {
         var intent = try threadRepo.getForkIntent(childThreadId: initialIntent.childThread.id) ?? initialIntent
         let request = AgentProviderForkRequest(
             sourceThreadId: intent.sourceThreadId,
@@ -3087,7 +3113,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                   child.providerThreadId == intent.providerChildThreadId else {
                 throw AgentThreadForkPersistenceError.childThreadConflict
             }
-            return child
+            return AgentThreadForkResult(thread: child, prunedThreadIDs: [])
         }
         if intent.state == .compensated {
             throw AgentProviderAdapterError.unsupported("provider fork was compensated after local commit became impossible")
@@ -3161,23 +3187,31 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             )
         }
         do {
-            try threadRepo.persistForkedChildGraph(
+            let prunedThreadIDs = try threadRepo.persistForkedChildGraphReturningPrunedThreadIDs(
                 sourceThreadId: intent.sourceThreadId,
                 childThread: persistedChild,
                 providerSession: childRuntime,
                 forkIntentChildThreadId: intent.childThread.id
             )
-            return persistedChild
-        } catch let error as AgentThreadForkPersistenceError
-            where error == .sourceThreadNotFound || error == .childThreadConflict || error == .intentConflict {
-            _ = try threadRepo.markForkCompensating(
-                childThreadId: intent.childThread.id,
-                error: String(describing: error)
-            )
-            try await adapter.compensateFork(request, providerChildThreadId: providerChildThreadId)
-            try threadRepo.markForkCompensated(childThreadId: intent.childThread.id)
-            throw error
+            return AgentThreadForkResult(thread: persistedChild, prunedThreadIDs: prunedThreadIDs)
         } catch {
+            let forkPersistenceRequiresCompensation: Bool
+            if let forkError = error as? AgentThreadForkPersistenceError {
+                forkPersistenceRequiresCompensation = forkError == .sourceThreadNotFound
+                    || forkError == .childThreadConflict
+                    || forkError == .intentConflict
+            } else {
+                forkPersistenceRequiresCompensation = false
+            }
+            if forkPersistenceRequiresCompensation || error is AgentThreadCapacityError {
+                _ = try threadRepo.markForkCompensating(
+                    childThreadId: intent.childThread.id,
+                    error: String(describing: error)
+                )
+                try await adapter.compensateFork(request, providerChildThreadId: providerChildThreadId)
+                try threadRepo.markForkCompensated(childThreadId: intent.childThread.id)
+                throw error
+            }
             try? threadRepo.recordForkIntentError(
                 childThreadId: intent.childThread.id,
                 error: String(describing: error)

@@ -37,6 +37,7 @@ final class AsyncAdapterProtocolTests: XCTestCase {
         // Forwarding-test fixtures.
         var readThreadResult: [AssistantEvent] = []
         var forkThreadResult = "provider-child"
+        var beforeForkReturn: (() throws -> Void)?
         var rollbackError: Error?
         var respondError: Error?
 
@@ -90,10 +91,13 @@ final class AsyncAdapterProtocolTests: XCTestCase {
 
         func forkThread(_ request: AgentProviderForkRequest) async throws -> String {
             log("forkThread")
+            try beforeForkReturn?()
             return forkThreadResult
         }
 
-        func compensateFork(_ request: AgentProviderForkRequest, providerChildThreadId: String) async throws {}
+        func compensateFork(_ request: AgentProviderForkRequest, providerChildThreadId: String) async throws {
+            log("compensateFork")
+        }
 
         func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
             log("respondToRequest")
@@ -310,6 +314,126 @@ final class AsyncAdapterProtocolTests: XCTestCase {
                      "any child graph write failure must leave no child provider-session row")
         XCTAssertEqual(try threadRepo.get(id: parent.id)?.providerThreadId, "provider-parent",
                        "local rollback must not mutate the parent graph")
+    }
+
+    func test_forkThread_protectedCapacityRejectsBeforeProviderMutation() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-native-fork-protected-cap-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let workspaceID = WorkspaceID()
+        var parent = AgentThread(
+            workspaceId: workspaceID,
+            title: "protected parent",
+            provider: .codex,
+            model: "fake-model",
+            providerThreadId: "provider-parent"
+        )
+        parent.status = .running
+        try threadRepo.upsert(parent)
+        var originalIDs: Set<AgentThreadID> = [parent.id]
+        for index in 0..<(AgentThreadRepository.maxThreadsPerWorkspace - 1) {
+            var thread = AgentThread(
+                workspaceId: workspaceID,
+                title: "protected \(index)",
+                provider: .codex,
+                model: "fake-model"
+            )
+            thread.status = index.isMultiple(of: 2) ? .running : .pending
+            try threadRepo.upsert(thread)
+            originalIDs.insert(thread.id)
+        }
+        let child = AgentThread(
+            workspaceId: workspaceID,
+            title: "rejected child",
+            provider: .codex,
+            model: "fake-model"
+        )
+        let adapter = FakeAdapter()
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providerAdapters: [.codex: adapter]
+        )
+
+        do {
+            _ = try await coordinator.forkThread(sourceThreadId: parent.id, childThread: child)
+            XCTFail("protected capacity must reject the fork")
+        } catch {
+            XCTAssertTrue(error is AgentThreadCapacityError)
+        }
+
+        XCTAssertTrue(adapter.calls.isEmpty,
+                      "capacity preflight must reject before provider mutation or compensation")
+        XCTAssertEqual(Set(try threadRepo.list(workspaceId: workspaceID).map(\.id)), originalIDs)
+        XCTAssertNil(try threadRepo.getForkIntent(childThreadId: child.id))
+    }
+
+    func test_forkThread_capacityRaceRollsBackAndCompensatesProviderChild() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-native-fork-cap-race-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let workspaceID = WorkspaceID()
+        var parent = AgentThread(
+            workspaceId: workspaceID,
+            title: "last eligible parent",
+            provider: .codex,
+            model: "fake-model",
+            providerThreadId: "provider-parent"
+        )
+        parent.status = .completed
+        try threadRepo.upsert(parent)
+        var racingVictim = AgentThread(
+            workspaceId: workspaceID,
+            title: "last eligible victim",
+            provider: .codex,
+            model: "fake-model",
+            status: .completed
+        )
+        racingVictim.updatedAt = Date(timeIntervalSince1970: 1)
+        try threadRepo.upsert(racingVictim)
+        var originalIDs: Set<AgentThreadID> = [parent.id, racingVictim.id]
+        for index in 0..<(AgentThreadRepository.maxThreadsPerWorkspace - 2) {
+            var thread = AgentThread(
+                workspaceId: workspaceID,
+                title: "protected \(index)",
+                provider: .codex,
+                model: "fake-model"
+            )
+            thread.status = index.isMultiple(of: 2) ? .running : .pending
+            try threadRepo.upsert(thread)
+            originalIDs.insert(thread.id)
+        }
+        let child = AgentThread(
+            workspaceId: workspaceID,
+            title: "racing child",
+            provider: .codex,
+            model: "fake-model"
+        )
+        let adapter = FakeAdapter()
+        adapter.beforeForkReturn = {
+            racingVictim.status = .running
+            racingVictim.updatedAt = Date()
+            try threadRepo.upsert(racingVictim)
+        }
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providerAdapters: [.codex: adapter]
+        )
+
+        do {
+            _ = try await coordinator.forkThread(sourceThreadId: parent.id, childThread: child)
+            XCTFail("the final atomic capacity check must reject the raced fork")
+        } catch {
+            XCTAssertTrue(error is AgentThreadCapacityError)
+        }
+
+        XCTAssertEqual(adapter.calls, ["forkThread", "compensateFork"])
+        XCTAssertEqual(Set(try threadRepo.list(workspaceId: workspaceID).map(\.id)), originalIDs)
+        XCTAssertNil(try threadRepo.get(id: child.id))
+        XCTAssertEqual(try threadRepo.getForkIntent(childThreadId: child.id)?.state, .compensated)
     }
 
     func test_respondToRequest_propagatesAdapterError() async throws {

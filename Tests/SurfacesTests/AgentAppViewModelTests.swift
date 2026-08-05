@@ -4152,6 +4152,64 @@ final class AgentAppViewModelTests: XCTestCase {
         }, "later parent work must remain on the original provider session")
     }
 
+    func test_forkCurrentThread_atCapAppliesAndPublishesCommittedVictimBeforeSelectingChild() async throws {
+        let adapter = CapturingProviderAdapter(
+            provider: .codex,
+            forkThreadResult: "provider-child",
+            forkSafety: .keyedIdempotent(compensationSupported: true)
+        )
+        let (vm, threadRepo) = try makeVM(adapter: adapter)
+        vm.providerSnapshots = [crashSafeForkSnapshot()]
+        vm.createThread(title: "source")
+        let parentID = try XCTUnwrap(vm.selectedThreadId)
+        var parent = try XCTUnwrap(try threadRepo.get(id: parentID))
+        parent.providerThreadId = "provider-parent"
+        parent.status = .completed
+        parent.updatedAt = Date()
+        try threadRepo.upsert(parent)
+        var victim = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "old victim",
+            provider: .codex,
+            model: "fake-model",
+            status: .completed
+        )
+        victim.updatedAt = Date(timeIntervalSince1970: 1)
+        try threadRepo.upsert(victim)
+        var originalIDs: Set<AgentThreadID> = [parentID, victim.id]
+        for index in 0..<(AgentThreadRepository.maxThreadsPerWorkspace - 2) {
+            var thread = AgentThread(
+                workspaceId: vm.workspaceID,
+                title: "protected \(index)",
+                provider: .codex,
+                model: "fake-model"
+            )
+            thread.status = index.isMultiple(of: 2) ? .running : .pending
+            try threadRepo.upsert(thread)
+            originalIDs.insert(thread.id)
+        }
+        try vm.messageRepo.append(AgentMessage(threadId: parentID, role: .user, content: "copy me"))
+        vm.reloadThreads()
+        vm.selectThread(parentID)
+        var lifecycleEvents: [AgentThreadLifecycleEvent] = []
+        vm.onThreadLifecycle = { lifecycleEvents.append($0) }
+
+        await vm.forkCurrentThread()
+
+        let childID = try XCTUnwrap(vm.selectedThreadId)
+        XCTAssertNotEqual(childID, parentID)
+        XCTAssertEqual(
+            Set(try threadRepo.list(workspaceId: vm.workspaceID).map(\.id)),
+            originalIDs.subtracting([victim.id]).union([childID])
+        )
+        XCTAssertFalse(vm.threads.contains(where: { $0.id == victim.id }))
+        XCTAssertEqual(lifecycleEvents.count, 1)
+        guard case .deleted(let deletedIDs)? = lifecycleEvents.first else {
+            return XCTFail("the surface must publish the committed retention victim before selection")
+        }
+        XCTAssertEqual(deletedIDs, [victim.id])
+    }
+
     func test_forkCurrentThread_transcriptWriteFailureLeavesNoChildAndKeepsParentSelected() async throws {
         let adapter = CapturingProviderAdapter(
             provider: .codex,

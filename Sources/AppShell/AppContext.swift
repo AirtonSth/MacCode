@@ -3156,7 +3156,7 @@ public final class AppContext {
     ) throws -> AgentThread {
         guard let parent = try threadRepo.get(id: parentThreadID),
               let projectID = parent.projectId?.value.uuidString,
-              parent.workspaceId != nil else {
+              let workspaceID = parent.workspaceId else {
             throw TokenSaverRolloverError.missingProjectScope
         }
         guard parent.status != .pending, parent.status != .running else {
@@ -3167,6 +3167,10 @@ public final class AppContext {
         guard admission.allowed else {
             throw TokenSaverRolloverError.laneUnavailable(admission.reason)
         }
+        try threadRepo.preflightWorkspaceThreadInsertion(
+            workspaceId: workspaceID,
+            excludedVictimIDs: [parentThreadID]
+        )
         _ = try tokenSaverProjectDataRepo.performLifecycleSweep()
         let child = AgentThread(
             projectId: parent.projectId,
@@ -3204,17 +3208,22 @@ public final class AppContext {
                   try messageRepo.list(threadId: parentThreadID) == parentMessages else {
                 throw TokenSaverRolloverError.parentChanged
             }
-            try threadRepo.upsert(child)
-            try messageRepo.append(.init(threadId: child.id, role: .system, content: capsule.text))
-            try tokenSaverRolloverRepo.save(.init(
-                id: UUID().uuidString,
-                parentThreadID: parentThreadID.value.uuidString,
-                childThreadID: child.id.value.uuidString,
-                scopeTransitionJSON: nil,
-                capsuleSHA256: AgentSkillInstaller.sha256Hex(Data(capsule.text.utf8)),
-                capsuleText: capsule.text
-            ))
             _ = try tokenSaverProjectDataRepo.performLifecycleSweep()
+            let prunedThreadIDs = try threadRepo.transactionallyUpsertEnforcingWorkspaceThreadLimit(
+                child,
+                excludedVictimIDs: [parentThreadID]
+            ) {
+                try messageRepo.append(.init(threadId: child.id, role: .system, content: capsule.text))
+                try tokenSaverRolloverRepo.save(.init(
+                    id: UUID().uuidString,
+                    parentThreadID: parentThreadID.value.uuidString,
+                    childThreadID: child.id.value.uuidString,
+                    scopeTransitionJSON: nil,
+                    capsuleSHA256: AgentSkillInstaller.sha256Hex(Data(capsule.text.utf8)),
+                    capsuleText: capsule.text
+                ))
+            }
+            router?.publishAgentThreadDeletions(prunedThreadIDs)
             return child
         } catch {
             try? tokenSaverRolloverRepo.delete(childThreadID: child.id.value.uuidString)
