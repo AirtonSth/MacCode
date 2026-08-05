@@ -709,7 +709,8 @@ public final class AgentThreadRepository {
                 if let forkIntentChildThreadId {
                     let update = try database.prepare("""
                         UPDATE agent_thread_fork_intents
-                        SET state = 'local_committed', last_error = NULL, updated_at = ?
+                        SET state = 'local_committed', source_messages_json = '[]',
+                            last_error = NULL, updated_at = ?
                         WHERE child_thread_id = ? AND state = 'provider_created';
                     """)
                     try update.bind(1, iso.string(from: Date()))
@@ -880,7 +881,8 @@ public final class AgentThreadRepository {
     public func markForkCompensated(childThreadId: AgentThreadID, at date: Date = Date()) throws {
         let update = try db.prepare("""
             UPDATE agent_thread_fork_intents
-            SET state = 'compensated', last_error = NULL, updated_at = ?
+            SET state = 'compensated', source_messages_json = '[]',
+                last_error = NULL, updated_at = ?
             WHERE child_thread_id = ? AND state = 'compensating';
         """)
         try update.bind(1, iso.string(from: date))
@@ -894,7 +896,8 @@ public final class AgentThreadRepository {
     public func markPreparedForkAbandoned(childThreadId: AgentThreadID, error: String, at date: Date = Date()) throws {
         let update = try db.prepare("""
             UPDATE agent_thread_fork_intents
-            SET state = 'abandoned', last_error = ?, updated_at = ?
+            SET state = 'abandoned', source_messages_json = '[]',
+                last_error = ?, updated_at = ?
             WHERE child_thread_id = ? AND state = 'prepared' AND provider_child_thread_id IS NULL;
         """)
         try update.bind(1, error)

@@ -21,9 +21,9 @@ public enum Schema {
     public static let checkpointListSchemaVersion: Int =
         sharedIntegrationBaseVersion + 2
 
-    /// Must equal the highest SchemaStep version (checkpoint list at 58, then
-    /// Token Saver per-thread attribution at 59).
-    public static let currentVersion: Int = 59
+    /// Must equal the highest SchemaStep version (checkpoint list at 58, Token
+    /// Saver per-thread attribution at 59, fork transcript scrubbing at 60).
+    public static let currentVersion: Int = 60
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1094,6 +1094,15 @@ public enum Schema {
             runs INTEGER NOT NULL,
             updated_at TEXT NOT NULL
         );
+        """),
+        // Terminal fork intents remain as small idempotency tombstones. Freed
+        // SQLite pages become reusable; this does not VACUUM and makes no
+        // database-file shrink or process-RSS claim.
+        SchemaStep(60, """
+        UPDATE agent_thread_fork_intents
+        SET source_messages_json = '[]'
+        WHERE state IN ('local_committed', 'compensated', 'abandoned')
+          AND source_messages_json != '[]';
         """),
     ]
 

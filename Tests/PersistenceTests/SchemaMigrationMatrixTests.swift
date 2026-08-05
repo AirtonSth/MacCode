@@ -337,14 +337,16 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             Schema.sharedIntegrationBaseVersion,
             "named step must sit after the shared integration base"
         )
-        // The composed head has Message identity, named checkpoint list, then
-        // Token Saver per-thread totals (59). This catches duplicate/reordered slots.
+        // The composed head has Message identity, named checkpoint list,
+        // Token Saver per-thread totals (59), then terminal fork transcript
+        // scrubbing (60). This catches duplicate/reordered slots.
         let postBase = Schema.steps.filter {
             $0.version > Schema.sharedIntegrationBaseVersion
         }
         XCTAssertEqual(postBase.map(\.version), [
             Schema.sharedIntegrationBaseVersion + 1,
             Schema.checkpointListSchemaVersion,
+            59,
             Schema.currentVersion,
         ])
     }
@@ -502,6 +504,97 @@ final class SchemaMigrationMatrixTests: XCTestCase {
                          "a crash here would break every launch after the first")
         XCTAssertEqual(try maxVersion(db), Schema.currentVersion,
                        "re-running must not alter the recorded version")
+    }
+
+    func test_v59ForkIntentTranscriptScrubIsAtomicSelectiveAndIdempotent() throws {
+        XCTAssertEqual(Schema.currentVersion, 60)
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 59 })
+        let largePayload = "[\"\(String(repeating: "x", count: 128 * 1024))\"]"
+        let states = [
+            "prepared", "provider_created", "compensating",
+            "local_committed", "compensated", "abandoned"
+        ]
+        for state in states {
+            let statement = try db.prepare("""
+                INSERT INTO agent_thread_fork_intents(
+                    child_thread_id, source_thread_id, provider, idempotency_key,
+                    state, child_thread_json, source_messages_json,
+                    provider_child_thread_id, last_error, created_at, updated_at
+                ) VALUES(?, ?, 'codex', ?, ?, ?, ?, ?, ?, 'created', 'updated');
+            """)
+            try statement.bind(1, "child-\(state)")
+            try statement.bind(2, "source-\(state)")
+            try statement.bind(3, "key-\(state)")
+            try statement.bind(4, state)
+            try statement.bind(5, "{\"identity\":\"child-\(state)\"}")
+            try statement.bind(6, largePayload)
+            try statement.bind(7, "provider-child-\(state)")
+            try statement.bind(8, "error-\(state)")
+            _ = try statement.step()
+        }
+
+        try db.execute("""
+            CREATE TRIGGER fail_terminal_fork_scrub
+            BEFORE UPDATE OF source_messages_json ON agent_thread_fork_intents
+            WHEN NEW.child_thread_id = 'child-compensated'
+                 AND NEW.source_messages_json = '[]'
+            BEGIN SELECT RAISE(ABORT, 'injected terminal scrub failure'); END;
+        """)
+        XCTAssertThrowsError(try Schema.migrateSteps(db, Schema.steps))
+        XCTAssertEqual(try maxVersion(db), 59,
+                       "the scrub and schema version must roll back as one migration step")
+        let afterRollback = try db.prepare("""
+            SELECT COUNT(*) FROM agent_thread_fork_intents
+            WHERE source_messages_json = ?;
+        """)
+        try afterRollback.bind(1, largePayload)
+        XCTAssertTrue(try afterRollback.step())
+        XCTAssertEqual(afterRollback.columnInt64(0), 6,
+                       "one failed terminal update must roll every earlier scrub back")
+
+        try db.execute("DROP TRIGGER fail_terminal_fork_scrub;")
+        try Schema.migrateSteps(db, Schema.steps)
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
+
+        let rows = try db.prepare("""
+            SELECT child_thread_id, source_thread_id, provider, idempotency_key,
+                   state, child_thread_json, source_messages_json,
+                   provider_child_thread_id, last_error
+            FROM agent_thread_fork_intents ORDER BY state ASC;
+        """)
+        var observed: [String: [String]] = [:]
+        while try rows.step() {
+            let state = rows.columnText(4) ?? ""
+            observed[state] = (0..<9).map { rows.columnText(Int32($0)) ?? "" }
+        }
+        XCTAssertEqual(Set(observed.keys), Set(states), "terminal intents remain as tombstones")
+        for state in states {
+            let row = try XCTUnwrap(observed[state])
+            XCTAssertEqual(row[0], "child-\(state)")
+            XCTAssertEqual(row[1], "source-\(state)")
+            XCTAssertEqual(row[2], "codex")
+            XCTAssertEqual(row[3], "key-\(state)")
+            XCTAssertEqual(row[4], state)
+            XCTAssertEqual(row[5], "{\"identity\":\"child-\(state)\"}")
+            XCTAssertEqual(row[7], "provider-child-\(state)")
+            XCTAssertEqual(row[8], "error-\(state)")
+            let terminal = ["local_committed", "compensated", "abandoned"].contains(state)
+            XCTAssertEqual(row[6], terminal ? "[]" : largePayload,
+                           "only terminal transcript payloads may be scrubbed")
+        }
+
+        XCTAssertNoThrow(try Schema.migrate(db))
+        let afterRerun = try db.prepare("""
+            SELECT state, length(CAST(source_messages_json AS BLOB))
+            FROM agent_thread_fork_intents ORDER BY state ASC;
+        """)
+        while try afterRerun.step() {
+            let state = afterRerun.columnText(0) ?? ""
+            let terminal = ["local_committed", "compensated", "abandoned"].contains(state)
+            XCTAssertEqual(Int(afterRerun.columnInt64(1)), terminal ? 2 : largePayload.utf8.count,
+                           "re-running head migration must be an idempotent no-op")
+        }
     }
 
     // MARK: - Monotonically-increasing version numbers
