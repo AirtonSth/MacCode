@@ -71,6 +71,16 @@ public final class AgentComposerState: ObservableObject {
     @Published public var prompt: String = ""
 }
 
+/// Stream/transcript paint state on its OWN ObservableObject so token/tool storms
+/// re-render the conversation column without republishing chrome, rail, or composer
+/// fields on the parent `AgentAppViewModel`.
+@MainActor
+public final class AgentTranscriptState: ObservableObject {
+    @Published public var messages: [AgentMessage] = []
+    @Published public var timeline = AssistantTimelineState()
+    @Published public var timelineUpdateTick: Int = 0
+}
+
 /// F1: scopes @ObservedObject observation to the composer subtree. A change to the
 /// composer text re-renders only this wrapper (and the `composer` it rebuilds),
 /// WITHOUT invalidating the enclosing AgentAppView body that owns the transcript.
@@ -78,6 +88,14 @@ public final class AgentComposerState: ObservableObject {
 /// this wrapper (with a fresh `content`) whenever the view model publishes.
 private struct ComposerReactiveScope<Content: View>: View {
     @ObservedObject var composerState: AgentComposerState
+    @ViewBuilder var content: () -> Content
+    var body: some View { content() }
+}
+
+/// Isolates stream/transcript invalidation to the conversation column so status
+/// chrome and the thread rail do not rebuild on every token tick.
+private struct TranscriptReactiveScope<Content: View>: View {
+    @ObservedObject var transcriptState: AgentTranscriptState
     @ViewBuilder var content: () -> Content
     var body: some View { content() }
 }
@@ -150,9 +168,22 @@ public struct AgentModelPopoverPresentation: Equatable {
 public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var threads: [AgentThread] = []
     @Published public var selectedThreadId: AgentThreadID?
-    @Published public var messages: [AgentMessage] = []
-    @Published public var timeline = AssistantTimelineState()
-    @Published public var timelineUpdateTick: Int = 0
+    /// Transcript paint lives on `transcriptState` so stream ticks do not
+    /// republish chrome/rail fields on this object. Proxies keep `vm.messages` /
+    /// `vm.timeline` call sites (tests + host) working unchanged.
+    public let transcriptState = AgentTranscriptState()
+    public var messages: [AgentMessage] {
+        get { transcriptState.messages }
+        set { transcriptState.messages = newValue }
+    }
+    public var timeline: AssistantTimelineState {
+        get { transcriptState.timeline }
+        set { transcriptState.timeline = newValue }
+    }
+    public var timelineUpdateTick: Int {
+        get { transcriptState.timelineUpdateTick }
+        set { transcriptState.timelineUpdateTick = newValue }
+    }
     @Published public var userInputSelections: [String: Set<String>] = [:]
     @Published public var userInputDrafts: [String: String] = [:]
     @Published public var focusTick: Int = 0
@@ -454,6 +485,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // lock for nonisolated callers) and drain the whole buffer in one hop when
     // the first event of each tick schedules the flush Task.
     private let streamEventBatch = StreamEventBatch()
+    /// Serializes off-MainActor stream apply so concurrent flushes cannot reorder.
+    private var streamApplyInFlight = false
+    /// Set when append tried to flush while an apply was already running.
+    private var streamFlushNeeded = false
+    /// Bumped on dispose / thread switch so stale detached applies drop their commit.
+    private var streamApplyGeneration: UInt64 = 0
     /// True when the hot UI event queue refused at least one already-durable
     /// stream event. Cleared after a durable replay rebuilds the live timeline.
     private var streamUIBackpressured = false
@@ -700,6 +737,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         tokenSaverSavingsRepo = nil
         tokenSaverFooterEligibleCheck = nil
         tokenSaverGraphifyActiveCheck = nil
+        streamApplyGeneration &+= 1
+        streamApplyInFlight = false
+        streamFlushNeeded = false
         _ = streamEventBatch.drain()
         streamUIBackpressured = false
         publishInterestedThreadId(nil)
@@ -725,8 +765,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         #endif
         return await Task.detached(priority: .userInitiated) {
             _ = coordinator.reconcileStaleActiveOwnershipWithDurableState()
+            // Cheap COUNT first: skip the prune transaction when under cap.
+            // When over cap, enforce BEFORE list so a fallible list cannot leave
+            // committed victims alive without the rail learning their IDs.
+            var pruned: [AgentThreadID] = []
             do {
-                let pruned = try repo.enforceWorkspaceThreadLimit(workspaceId: workspaceID)
+                let count = try repo.count(workspaceId: workspaceID)
+                if count > AgentThreadRepository.maxThreadsPerWorkspace {
+                    pruned = try repo.enforceWorkspaceThreadLimit(workspaceId: workspaceID)
+                }
                 let listed: [AgentThread]
                 #if DEBUG
                 if let listOverride {
@@ -746,7 +793,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 return AgentWorkspaceRailReloadCoordinator.RailSnapshot(
                     workspaceID: workspaceID,
                     threads: [],
-                    prunedThreadIDs: [],
+                    prunedThreadIDs: pruned,
                     errorDescription: String(describing: error)
                 )
             }
@@ -756,12 +803,32 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Applies a coalesced rail snapshot produced once per workspace debounce window.
     func applyRailSnapshot(_ snapshot: AgentWorkspaceRailReloadCoordinator.RailSnapshot) {
         guard !isDisposed, snapshot.workspaceID == workspaceID else { return }
+        // Committed cap victims always leave the rail — even when the subsequent
+        // list fails (partial-failure contract).
+        if !snapshot.prunedThreadIDs.isEmpty {
+            retireCommittedThreadPrunes(snapshot.prunedThreadIDs)
+            applyAuthoritativeThreadDeletions(Set(snapshot.prunedThreadIDs))
+            onThreadLifecycle?(.deleted(snapshot.prunedThreadIDs))
+        }
         if let errorDescription = snapshot.errorDescription {
             let reloadFailure = "Could not reload threads: \(errorDescription)"
             if statusMessage.contains(Self.deletedThreadDraftRecoveryMessage) {
                 statusMessage = "\(Self.deletedThreadDraftRecoveryMessage) \(reloadFailure)"
             } else {
                 statusMessage = reloadFailure
+            }
+            if !snapshot.prunedThreadIDs.isEmpty {
+                let knownLocalThreadIDs = Set(threads.map(\.id)).union(
+                    threadWorkspaceCache.compactMap { id, workspace in
+                        workspace == workspaceID ? id : nil
+                    }
+                )
+                let missing = knownLocalThreadIDs.intersection(snapshot.prunedThreadIDs)
+                evictThreadCaches(missing)
+                threads.removeAll { snapshot.prunedThreadIDs.contains($0.id) }
+                recoverDeletedSelectionIfNeeded(missing)
+                pruneStaleRunThreadProjections()
+                refreshSubagentActivity()
             }
             return
         }
@@ -770,11 +837,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 workspace == workspaceID ? id : nil
             }
         )
-        retireCommittedThreadPrunes(snapshot.prunedThreadIDs)
-        applyAuthoritativeThreadDeletions(Set(snapshot.prunedThreadIDs))
-        if !snapshot.prunedThreadIDs.isEmpty {
-            onThreadLifecycle?(.deleted(snapshot.prunedThreadIDs))
-        }
         let missingKnownThreadIDs = knownLocalThreadIDs.subtracting(snapshot.threads.map(\.id))
         evictThreadCaches(missingKnownThreadIDs)
         threads = snapshot.threads
@@ -823,8 +885,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 workspace == workspaceID ? id : nil
             }
         )
+        var prunedThreadIDs: [AgentThreadID] = []
         do {
-            let prunedThreadIDs = try threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspaceID)
+            // Same under-cap short-circuit as production off-main rail loads:
+            // COUNT → optional enforce → list (enforce before fallible list).
+            let count = try threadRepo.count(workspaceId: workspaceID)
+            if count > AgentThreadRepository.maxThreadsPerWorkspace {
+                prunedThreadIDs = try threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspaceID)
+            }
             let reloadedThreads: [AgentThread]
             #if DEBUG
             if let reloadThreadListForTesting {
@@ -835,24 +903,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             #else
             reloadedThreads = try threadRepo.list(workspaceId: workspaceID)
             #endif
-            // Preserve pre-reload known set for eviction of missing IDs.
             let snapshot = AgentWorkspaceRailReloadCoordinator.RailSnapshot(
                 workspaceID: workspaceID,
                 threads: reloadedThreads,
                 prunedThreadIDs: prunedThreadIDs
             )
-            // Temporarily re-seed known locals for apply by setting threads first
-            // is unnecessary; applyRailSnapshot computes missing from current
-            // threads, so inject known set via the existing path:
             applyRailSnapshotPreservingKnownLocals(snapshot, knownLocalThreadIDs: knownLocalThreadIDs)
         } catch {
-            applyRailSnapshot(
+            applyRailSnapshotPreservingKnownLocals(
                 AgentWorkspaceRailReloadCoordinator.RailSnapshot(
                     workspaceID: workspaceID,
                     threads: [],
-                    prunedThreadIDs: [],
+                    prunedThreadIDs: prunedThreadIDs,
                     errorDescription: String(describing: error)
-                )
+                ),
+                knownLocalThreadIDs: knownLocalThreadIDs
             )
         }
     }
@@ -862,6 +927,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         knownLocalThreadIDs: Set<AgentThreadID>
     ) {
         guard !isDisposed, snapshot.workspaceID == workspaceID else { return }
+        if !snapshot.prunedThreadIDs.isEmpty {
+            retireCommittedThreadPrunes(snapshot.prunedThreadIDs)
+            applyAuthoritativeThreadDeletions(Set(snapshot.prunedThreadIDs))
+            onThreadLifecycle?(.deleted(snapshot.prunedThreadIDs))
+        }
         if let errorDescription = snapshot.errorDescription {
             let reloadFailure = "Could not reload threads: \(errorDescription)"
             if statusMessage.contains(Self.deletedThreadDraftRecoveryMessage) {
@@ -869,12 +939,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             } else {
                 statusMessage = reloadFailure
             }
+            if !snapshot.prunedThreadIDs.isEmpty {
+                let missing = knownLocalThreadIDs.intersection(snapshot.prunedThreadIDs)
+                evictThreadCaches(missing)
+                threads.removeAll { snapshot.prunedThreadIDs.contains($0.id) }
+                recoverDeletedSelectionIfNeeded(missing)
+                pruneStaleRunThreadProjections()
+                refreshSubagentActivity()
+            }
             return
-        }
-        retireCommittedThreadPrunes(snapshot.prunedThreadIDs)
-        applyAuthoritativeThreadDeletions(Set(snapshot.prunedThreadIDs))
-        if !snapshot.prunedThreadIDs.isEmpty {
-            onThreadLifecycle?(.deleted(snapshot.prunedThreadIDs))
         }
         let missingKnownThreadIDs = knownLocalThreadIDs.subtracting(snapshot.threads.map(\.id))
         evictThreadCaches(missingKnownThreadIDs)
@@ -1314,6 +1387,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         loadAllMessages(id)
         timeline = AssistantTimelineState()
+        streamApplyGeneration &+= 1
+        streamApplyInFlight = false
+        streamFlushNeeded = false
         streamUIBackpressured = false
         _ = streamEventBatch.drain()
         let persistedEvents = coordinator.latestStreamEvents(threadId: id)
@@ -1902,10 +1978,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// (Was 96 MB — too large for huge threads; older rows load via keyset pages.)
     /// First-paint / hot UI body budget. Lower than durable retention so opening
     /// a fat thread does not re-render multi-MiB of markdown on MainActor.
-    nonisolated static let fullLoadBodyBudgetBytes = 768 * 1024
+    nonisolated static let fullLoadBodyBudgetBytes = 400 * 1024
     /// Hot message page (newest first). Older durable rows remain outside the
     /// hot UI window (`messageHistoryIsPartial`) and load on demand via scroll.
-    nonisolated static let messageHistoryPageLimit = 40
+    nonisolated static let messageHistoryPageLimit = 25
 
     private func loadAllMessages(_ id: AgentThreadID) {
         // SQLite access remains on the app's established DB actor, but the query is
@@ -5927,132 +6003,203 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return false
     }
 
-    // PERF-MAC_AGENT-010: accumulate streaming events and flush all of them in
-    // a single main-actor hop. A fast token stream emits thousands of events/sec;
-    // the old code allocated one Task per event. Now the first event schedules
-    // ONE flush Task; subsequent events in the same tick just append to the buffer
-    // and the flush Task drains everything atomically. Event order is preserved.
+    // PERF-MAC_AGENT-010: accumulate streaming events, reduce each quantum off
+    // MainActor (pure timeline.apply), then commit with a single MainActor hop.
+    // A fast token stream emits thousands of events/sec; the old code allocated
+    // one Task per event and applied on MainActor. Order is preserved by a
+    // serial in-flight latch + generation token.
     private func flushStreamEvents() {
         guard !isDisposed else {
             _ = streamEventBatch.drain()
+            streamApplyInFlight = false
+            streamFlushNeeded = false
+            return
+        }
+        if streamApplyInFlight {
+            streamFlushNeeded = true
             return
         }
         let quantum = streamEventBatch.drainQuantum()
         let pending = quantum.entries
         if pending.isEmpty {
+            streamFlushNeeded = false
             if streamUIBackpressured, let tid = selectedThreadId {
                 rehydrateTimelineAfterStreamBackpressure(threadId: tid)
             }
             return
         }
-        if quantum.hasMore {
+
+        // Capture MainActor-only gates once; pure reduce never touches SQLite.
+        let selected = selectedThreadId
+        var allowedActiveRuns = Set<AgentRunID>()
+        for (_, run, threadId) in pending where threadId == selected {
+            if streamEventMayMarkRunActive(run, threadId: threadId) {
+                allowedActiveRuns.insert(run)
+            }
+        }
+        let input = StreamQuantumReduceInput(
+            selectedThreadId: selected,
+            timeline: timeline,
+            suppressStaleActivePlanUpdates: suppressStaleActivePlanUpdates,
+            newestUserMessageAt: messages.last(where: { $0.role == .user })?.createdAt,
+            runStartedAt: runStartedAt,
+            hasQueuedFollowUp: hasQueuedFollowUpOnSelectedThread(),
+            currentRunId: currentRunId,
+            status: status,
+            lastErrorRecoverable: lastErrorRecoverable,
+            liveBackgroundShellCount: liveBackgroundShellCount,
+            runsAllowedToMarkActive: allowedActiveRuns,
+            entries: pending.map { StreamQuantumEntry(event: $0.0, run: $0.1, threadId: $0.2) }
+        )
+        let generation = streamApplyGeneration
+        let hasMore = quantum.hasMore
+        streamApplyInFlight = true
+
+        // XCTest: same-stack reduce so a single Task.yield settles the batch
+        // (matches rail reloadImmediate). Production: pure apply off MainActor.
+        if Self.isRunningUnitTests {
+            let reduced = Self.reduceStreamQuantum(input)
+            finishStreamQuantumApply(
+                reduced: reduced,
+                generation: generation,
+                hasMore: hasMore
+            )
+            return
+        }
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let reduced = AgentAppViewModel.reduceStreamQuantum(input)
+            await MainActor.run { [weak self] in
+                self?.finishStreamQuantumApply(
+                    reduced: reduced,
+                    generation: generation,
+                    hasMore: hasMore
+                )
+            }
+        }
+    }
+
+    private func finishStreamQuantumApply(
+        reduced: StreamQuantumReduceResult,
+        generation: UInt64,
+        hasMore: Bool
+    ) {
+        streamApplyInFlight = false
+        guard !isDisposed, streamApplyGeneration == generation else {
+            streamFlushNeeded = false
+            return
+        }
+        commitStreamQuantum(reduced)
+        let needsAnother = hasMore
+            || streamFlushNeeded
+            || !streamEventBatch.isEmpty
+        streamFlushNeeded = false
+        if needsAnother {
             // Small gap so input/scroll can interleave between paint quanta.
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .milliseconds(4))
                 self?.flushStreamEvents()
             }
+        } else if streamUIBackpressured, let tid = selectedThreadId {
+            rehydrateTimelineAfterStreamBackpressure(threadId: tid)
         }
-        var nextTimeline = timeline
-        var nextCurrentRunId = currentRunId
-        var nextStatus = status
-        var nextLastErrorRecoverable = lastErrorRecoverable
+    }
+
+    /// Pure stream quantum reduce (off-MainActor). Durable run gates are pre-resolved
+    /// into `runsAllowedToMarkActive` so this never touches SQLite or the coordinator.
+    nonisolated static func reduceStreamQuantum(_ input: StreamQuantumReduceInput) -> StreamQuantumReduceResult {
+        var nextTimeline = input.timeline
+        var nextCurrentRunId = input.currentRunId
+        var nextStatus = input.status
+        var nextLastErrorRecoverable = input.lastErrorRecoverable
+        var nextBackgroundShellCount = input.liveBackgroundShellCount
+        var suppress = input.suppressStaleActivePlanUpdates
         var appliedEvent = false
-        var nextBackgroundShellCount = liveBackgroundShellCount
+        var seedRunStartedAt = false
+        var runThreadBindings: [AgentRunID: AgentThreadID] = [:]
+        var hasProposedPlan = false
         var appliedEvents: [AssistantEvent] = []
-        appliedEvents.reserveCapacity(pending.count)
-        for (event, run, threadId) in pending {
-            guard threadId == self.selectedThreadId else { continue }
-            // User already sent a follow-up: drop *stale* plan progress from the
-            // prior turn so the checklist cannot reappear under the new user bubble.
-            // While a follow-up is only queued (not yet a transcript bubble), the
-            // newest user message still belongs to the *prior* turn — so timestamp
-            // freshness alone would wrongly accept live plan updates from that run.
-            // Accept only a plan whose updatedAtMs is at/after the follow-up anchor
-            // once the new turn owns the transcript, then lift suppress for this run.
-            if suppressStaleActivePlanUpdates, case .activePlanUpdated(let plan) = event {
-                let newestUserAt = self.messages.last(where: { $0.role == .user })?.createdAt
+        appliedEvents.reserveCapacity(input.entries.count)
+
+        for entry in input.entries {
+            guard entry.threadId == input.selectedThreadId else { continue }
+            if suppress, case .activePlanUpdated(let plan) = entry.event {
                 if AgentAppView.shouldAcceptActivePlanForFollowUp(
                     plan: plan,
-                    newestUserMessageAt: newestUserAt,
-                    runStartedAt: self.runStartedAt,
-                    hasQueuedFollowUp: self.hasQueuedFollowUpOnSelectedThread()
+                    newestUserMessageAt: input.newestUserMessageAt,
+                    runStartedAt: input.runStartedAt,
+                    hasQueuedFollowUp: input.hasQueuedFollowUp
                 ) {
-                    self.suppressStaleActivePlanUpdates = false
+                    suppress = false
                 } else {
                     continue
                 }
             }
             appliedEvent = true
-            appliedEvents.append(event)
-            // CLAUDE-BG-LIFECYCLE: the provider's pending background-work set
-            // rides the session snapshot; pick off the count for the "N shells"
-            // chip. Cheap: only claude.session.snapshot events are decoded, and
-            // the adapter already coalesces snapshots whose state did not change.
-            if let count = Self.backgroundShellCount(fromRuntimeEvent: event) {
+            appliedEvents.append(entry.event)
+            if let count = backgroundShellCount(fromRuntimeEvent: entry.event) {
                 nextBackgroundShellCount = count
             }
-            if self.streamEventMayMarkRunActive(run, threadId: threadId) {
-                nextCurrentRunId = run
-                self.runThreads[run] = threadId
+            if input.runsAllowedToMarkActive.contains(entry.run) {
+                nextCurrentRunId = entry.run
+                runThreadBindings[entry.run] = entry.threadId
                 if nextStatus != .running { nextStatus = .running }
-                // Stream events can mark the run running before startProviderRun
-                // assigns runStartedAt. Seed it so the live window does not fall
-                // through to a full-history paint on the first deltas.
-                if self.runStartedAt == nil {
-                    self.runStartedAt = Date()
+                if input.runStartedAt == nil {
+                    seedRunStartedAt = true
                 }
             }
-            nextTimeline.apply(event)
-            // UX-MAC_AGENT-009: track recoverability of the latest error so the
-            // transcript can offer Retry. F26: only an .error event may change the
-            // flag — producers emit trailing runtime items right after a recoverable
-            // error (auth_status, resume fallback), and timeline.error (the banner)
-            // persists across non-error events, so clearing on any other event made
-            // the Retry affordance unreachable. The flag resets where the displayed
-            // error itself is cleared (clearVisibleErrorForNewUserMessage /
-            // startProviderRun / selectThread's timeline rebuild).
-            if case let .error(_, recoverable) = event {
+            nextTimeline.apply(entry.event)
+            if case let .error(_, recoverable) = entry.event {
                 nextLastErrorRecoverable = recoverable
+            }
+            if case .proposedPlan = entry.event {
+                hasProposedPlan = true
             }
         }
         nextTimeline.enforceAggregateHotTextBudget()
-        guard appliedEvent else {
-            if !quantum.hasMore, streamUIBackpressured, let tid = selectedThreadId {
-                rehydrateTimelineAfterStreamBackpressure(threadId: tid)
-            }
-            return
-        }
-        // UX: transient durability banners (sqlite "database is locked", etc.)
-        // stick only while the stream is still failing. Once a later event proves
-        // the run continued, drop the banner so it does not outlive the outage.
-        if Self.shouldAutoClearTransientTimelineError(
+        if shouldAutoClearTransientTimelineError(
             errorAfterBatch: nextTimeline.error,
             appliedEvents: appliedEvents
         ) {
             nextTimeline.clearError()
             nextLastErrorRecoverable = false
         }
-        if self.currentRunId != nextCurrentRunId { self.currentRunId = nextCurrentRunId }
-        if self.status != nextStatus { self.status = nextStatus }
-        if self.lastErrorRecoverable != nextLastErrorRecoverable {
-            self.lastErrorRecoverable = nextLastErrorRecoverable
+        return StreamQuantumReduceResult(
+            appliedEvent: appliedEvent,
+            timeline: nextTimeline,
+            currentRunId: nextCurrentRunId,
+            status: nextStatus,
+            lastErrorRecoverable: nextLastErrorRecoverable,
+            liveBackgroundShellCount: nextBackgroundShellCount,
+            suppressStaleActivePlanUpdates: suppress,
+            seedRunStartedAt: seedRunStartedAt,
+            runThreadBindings: runThreadBindings,
+            hasProposedPlan: hasProposedPlan
+        )
+    }
+
+    private func commitStreamQuantum(_ reduced: StreamQuantumReduceResult) {
+        guard reduced.appliedEvent else { return }
+        suppressStaleActivePlanUpdates = reduced.suppressStaleActivePlanUpdates
+        for (run, threadId) in reduced.runThreadBindings {
+            runThreads[run] = threadId
         }
-        if self.liveBackgroundShellCount != nextBackgroundShellCount {
-            self.liveBackgroundShellCount = nextBackgroundShellCount
+        if reduced.seedRunStartedAt, runStartedAt == nil {
+            runStartedAt = Date()
         }
-        self.timeline = nextTimeline
-        self.refreshSR1TranslationStateFromTimeline()
-        self.scheduleTimelineUpdateTick()
-        // Full access auto-approves plans: if a proposed plan arrived mid-stream,
-        // queue/start implementation without surfacing Approve/Reject.
-        if appliedEvents.contains(where: { if case .proposedPlan = $0 { return true }; return false }) {
+        if currentRunId != reduced.currentRunId { currentRunId = reduced.currentRunId }
+        if status != reduced.status { status = reduced.status }
+        if lastErrorRecoverable != reduced.lastErrorRecoverable {
+            lastErrorRecoverable = reduced.lastErrorRecoverable
+        }
+        if liveBackgroundShellCount != reduced.liveBackgroundShellCount {
+            liveBackgroundShellCount = reduced.liveBackgroundShellCount
+        }
+        timeline = reduced.timeline
+        refreshSR1TranslationStateFromTimeline()
+        scheduleTimelineUpdateTick()
+        if reduced.hasProposedPlan {
             scheduleFullAccessPlanAutoImplementIfNeeded()
-        }
-        // After the hot queue drains, rebuild from durable stream events so any
-        // paints skipped while the MainActor was behind are restored without
-        // forcing the user to Continue / reopen the thread.
-        if !quantum.hasMore, streamUIBackpressured, let tid = selectedThreadId {
-            rehydrateTimelineAfterStreamBackpressure(threadId: tid)
         }
     }
 
@@ -6613,19 +6760,55 @@ final class InterestedThreadBox: @unchecked Sendable {
     }
 }
 
+/// One stream event entry for pure off-MainActor quantum reduce.
+struct StreamQuantumEntry: Sendable {
+    let event: AssistantEvent
+    let run: AgentRunID
+    let threadId: AgentThreadID
+}
+
+/// MainActor-captured inputs for pure stream quantum reduce.
+struct StreamQuantumReduceInput: Sendable {
+    let selectedThreadId: AgentThreadID?
+    let timeline: AssistantTimelineState
+    let suppressStaleActivePlanUpdates: Bool
+    let newestUserMessageAt: Date?
+    let runStartedAt: Date?
+    let hasQueuedFollowUp: Bool
+    let currentRunId: AgentRunID?
+    let status: AgentRunStatus
+    let lastErrorRecoverable: Bool
+    let liveBackgroundShellCount: Int
+    let runsAllowedToMarkActive: Set<AgentRunID>
+    let entries: [StreamQuantumEntry]
+}
+
+/// Pure reduce output committed on MainActor in one hop.
+struct StreamQuantumReduceResult: Sendable {
+    let appliedEvent: Bool
+    let timeline: AssistantTimelineState
+    let currentRunId: AgentRunID?
+    let status: AgentRunStatus
+    let lastErrorRecoverable: Bool
+    let liveBackgroundShellCount: Int
+    let suppressStaleActivePlanUpdates: Bool
+    let seedRunStartedAt: Bool
+    let runThreadBindings: [AgentRunID: AgentThreadID]
+    let hasProposedPlan: Bool
+}
+
 // PERF-MAC_AGENT-010: lock-protected buffer used by runCoordinator(_:didReceive:)
 // to coalesce streaming events. Safe to access from both the coordinator's
 // background thread (append) and the main actor (drain).
 final class StreamEventBatch: @unchecked Sendable {
     struct Limits: Equatable {
         /// Hot UI queue only — durable stream history is bounded separately.
-        /// Hot UI queue only — durable stream history is bounded separately.
         /// Smaller quanta keep each MainActor hop short so scrolling/composer
         /// stay responsive during tool storms (rehydrate fills gaps after).
         var maxBufferedCount: Int = 8_192
         var maxBufferedBytes: Int = 32 * 1_024 * 1_024
-        var drainCount: Int = 64
-        var drainBytes: Int = 1 * 1_024 * 1_024
+        var drainCount: Int = 48
+        var drainBytes: Int = 512 * 1_024
     }
 
     enum AppendOutcome: Equatable {
@@ -8416,7 +8599,7 @@ public struct AgentAppView: View {
     // one-shot completion tick) — pathologically slow on huge threads. Bound the
     // idle render to a recent tail, mirroring the running-state window; the older
     // slice stays one tap away via the existing "earlier transcript items" reveal.
-    nonisolated static let idleTranscriptWindowCount = 30
+    nonisolated static let idleTranscriptWindowCount = 20
     nonisolated static let hiddenTranscriptRevealPageCount = 50
     /// Entries kept *before* the newest user message during a follow-up.
     /// 0 = start clean at the user's bubble (prior history via reveal row).
@@ -9380,13 +9563,19 @@ public struct AgentAppView: View {
             if let crToast = vm.pendingCheckpointRevertUndo {
                 checkpointRevertUndoBanner(crToast)
             }
-            if !vm.timeline.workActivities.isEmpty {
-                workLogRow
-                    .padding(.horizontal, 22)
-                    .padding(.vertical, DS.Space.md)
-                    .background(DS.Palette.bg)
+            // Stream paint: observe transcriptState only so token/tool ticks do
+            // not rebuild chrome, rail, or composer through the parent VM.
+            TranscriptReactiveScope(transcriptState: vm.transcriptState) {
+                Group {
+                    if !vm.timeline.workActivities.isEmpty {
+                        workLogRow
+                            .padding(.horizontal, 22)
+                            .padding(.vertical, DS.Space.md)
+                            .background(DS.Palette.bg)
+                    }
+                    timeline
+                }
             }
-            timeline
             backgroundAwaitBanner
             pendingCallbackRows
             // Unified system strip: severity-ordered, capped (replaces stacked banners).
@@ -9861,19 +10050,21 @@ public struct AgentAppView: View {
                 collapseTranscriptForNewTurn()
                 scheduleTimelineScrollToBottom(proxy, force: true)
             }
-            // Prefer coalesced paint tick + last-message identity over raw counts
-            // so every token/turn delta does not schedule redundant scroll work.
+            // Prefer coalesced paint tick over raw message/turn counts so every
+            // token delta does not schedule redundant scroll work.
             .onChange(of: vm.timelineUpdateTick) { _ in
                 scheduleTimelineScrollToBottom(proxy)
             }
             .onChange(of: vm.messages.last?.id) { _ in
-                scheduleTimelineScrollToBottom(proxy)
+                // New user/assistant bubble identity — force pin without waiting
+                // for the next tick window.
+                scheduleTimelineScrollToBottom(proxy, force: true)
             }
             .onChange(of: vm.timeline.turns.count) { _ in
                 // PERF-MAC_AGENT-012: drop expansion ids for items that no longer
                 // exist (turns are memory-capped at AssistantTimelineState.liveTurnLimit)
                 // so the sets don't leak over a long session. Runs only on a turn
-                // add/remove, not per text delta.
+                // add/remove, not per text delta. No scroll here — tick handles paint.
                 DispatchQueue.main.async {
                     pruneExpandedItemIds()
                 }

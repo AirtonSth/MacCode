@@ -177,7 +177,7 @@ final class AgentAppRenderCacheFixesTests: XCTestCase {
     }
 
     func test_idlePaintWindow_boundsLargeThread() {
-        XCTAssertEqual(AgentAppView.idleTranscriptWindowCount, 30)
+        XCTAssertEqual(AgentAppView.idleTranscriptWindowCount, 20)
         let entries: [AgentAppView.TranscriptEntry] = (0..<100).map { i in
             .message(msg(TimeInterval(i), content: "m\(i)"))
         }
@@ -187,7 +187,12 @@ final class AgentAppRenderCacheFixesTests: XCTestCase {
             runStartedAt: nil
         )
         XCTAssertEqual(visible.count, AgentAppView.idleTranscriptWindowCount)
-        XCTAssertEqual(visible.map(\.id), Array(entries.suffix(30)).map(\.id))
+        XCTAssertEqual(visible.map(\.id), Array(entries.suffix(20)).map(\.id))
+    }
+
+    func test_hotMessageFirstPaint_isAggressiveForFluidOpen() {
+        XCTAssertLessThanOrEqual(AgentAppViewModel.messageHistoryPageLimit, 30)
+        XCTAssertLessThanOrEqual(AgentAppViewModel.fullLoadBodyBudgetBytes, 400 * 1024)
     }
 
     /// WHY: older durable rows must prepend into the hot window without

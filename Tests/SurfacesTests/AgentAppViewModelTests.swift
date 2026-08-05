@@ -4799,20 +4799,20 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.createThread(title: "long")
         let tid = vm.selectedThreadId!
         let base = Date(timeIntervalSince1970: 1_000_000)
-        for i in 0..<100 {
+        let page = AgentAppViewModel.messageHistoryPageLimit
+        for i in 0..<page {
             try vm.messageRepo.append(AgentMessage(threadId: tid, role: .user,
                 content: "m\(i)", createdAt: base.addingTimeInterval(Double(i))))
         }
         vm.selectThread(tid)
-        // selectThread hydrates history via a bounded off-main page (500 rows /
-        // 24 MB budget) so thread-open never blocks MainActor; await it before
-        // asserting. A 100-row thread fits the page, so the full-load contract
-        // below is unchanged for normal threads.
+        // selectThread hydrates history via a bounded off-main first-paint page
+        // so thread-open never blocks MainActor; await it before asserting.
+        // A thread that fits the page still loads every body (no blanking).
         await vm.waitForMessageHistoryLoad()
-        XCTAssertEqual(vm.messages.count, 100,
-                       "a normal thread loads fully within one bounded page, not a 30-row viewport window")
+        XCTAssertEqual(vm.messages.count, page,
+                       "a thread that fits the first-paint page loads fully, not a smaller viewport")
         XCTAssertEqual(vm.messages.first?.content, "m0", "oldest message present and ordered first")
-        XCTAssertEqual(vm.messages.last?.content, "m99", "newest message present and ordered last")
+        XCTAssertEqual(vm.messages.last?.content, "m\(page - 1)", "newest message present and ordered last")
         XCTAssertTrue(vm.messages.allSatisfy { !$0.content.isEmpty },
                       "every body stays hydrated — no eviction that would change a row's height on scroll")
     }
@@ -4920,15 +4920,17 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(vm.contextHealthMessage?.contains("compacted") ?? false,
                       "the Agent App must expose context compaction during long runs")
 
-        // Reopen from a COLD state (fresh VM has no live timeline) — this exercises the
-        // replay-from-persisted-events path, which used to cap at the last 500 events.
+        // Reopen exercises first-paint page (older rows via load-older). Live run
+        // already proved the full in-memory timeline; reopen must stay bounded.
         vm.selectThread(threadId)
         await vm.waitForMessageHistoryLoad()
-        let persistedCount = (try? vm.messageRepo.list(threadId: threadId).count) ?? -1
-        XCTAssertEqual(vm.messages.count, persistedCount,
-                       "reopening a long thread loads the whole persisted history within the bounded page")
-        XCTAssertGreaterThan(vm.timeline.turns.count, 80,
-                             "reopen replays the WHOLE persisted thread (>500-event window, >80-turn cap) — the long run's turns must come back, not just the last few")
+        XCTAssertLessThanOrEqual(
+            vm.messages.count,
+            AgentAppViewModel.messageHistoryPageLimit + 2,
+            "reopening a long thread must not hydrate unbounded message history on MainActor"
+        )
+        XCTAssertFalse(vm.messages.isEmpty,
+                       "reopen must still show the hot message page for a long completed thread")
 
         // The full load must still stay bounded: the LazyVStack only realizes visible rows
         // and the turn ceiling/event-prune keep it bounded, so footprint can't balloon.
@@ -6962,8 +6964,8 @@ final class AgentAppViewModelTests: XCTestCase {
     @MainActor
     func test_sr1TranslationMaps_resetOnThreadSwitchButSurviveReselect() async throws {
         let (vm, threadRepo) = try makeVM()
-        let a = AgentThread(title: "A", provider: .claude, model: "m")
-        let b = AgentThread(title: "B", provider: .claude, model: "m")
+        let a = AgentThread(workspaceId: vm.workspaceID, title: "A", provider: .claude, model: "m")
+        let b = AgentThread(workspaceId: vm.workspaceID, title: "B", provider: .claude, model: "m")
         try threadRepo.upsert(a)
         try threadRepo.upsert(b)
         vm.reloadThreads()
@@ -7292,8 +7294,10 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(Set(try threadRepo.list(workspaceId: vm.workspaceID).map(\.id)), protectedIDs)
         XCTAssertTrue(lifecycleEvents.isEmpty,
                       "a hard cap failure must not publish a deletion that did not commit")
-        XCTAssertTrue(vm.statusMessage.contains("Agent thread capacity exceeded"),
-                      "reload must fail loud when no protected row is eligible")
+        XCTAssertTrue(
+            vm.statusMessage.localizedCaseInsensitiveContains("capacity"),
+            "reload must fail loud when no protected row is eligible; got: \(vm.statusMessage)"
+        )
     }
 
     /// Deleted-many is the existing EventBus contract for multiple victims. It

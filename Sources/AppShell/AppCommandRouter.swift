@@ -47,6 +47,46 @@ private struct ProviderProbeCapabilities: Sendable {
     var capturedAt: Date
 }
 
+/// Off-MainActor serial owner for durable command-receipt SQLite.
+///
+/// `AppCommandRouter` is `@MainActor`; running receipt get/claim/finalize on the
+/// main run loop competed with Agent App paint. This gateway keeps SQLite on a
+/// dedicated queue. Callers that need a return value still wait (sync RPC
+/// contract), but the MainActor stack is no longer inside sqlite step.
+/// Fire-and-forget `record` never blocks the UI at all.
+public final class CommandReceiptPersistenceGateway: @unchecked Sendable {
+    public static let shared = CommandReceiptPersistenceGateway()
+    public static let queueLabel = "io.remotecode.command-receipt"
+
+    private let queue: DispatchQueue
+    private let queueKey = DispatchSpecificKey<UInt8>()
+    private let queueToken: UInt8 = 1
+
+    public init() {
+        let queue = DispatchQueue(label: Self.queueLabel, qos: .userInitiated)
+        self.queue = queue
+        queue.setSpecific(key: queueKey, value: queueToken)
+    }
+
+    public func async(_ work: @escaping @Sendable () -> Void) {
+        queue.async(execute: work)
+    }
+
+    public func sync<T>(_ work: @escaping () -> T) -> T {
+        if DispatchQueue.getSpecific(key: queueKey) == queueToken {
+            return work()
+        }
+        return queue.sync(execute: work)
+    }
+
+    public func syncThrowing<T>(_ work: @escaping () throws -> T) throws -> T {
+        if DispatchQueue.getSpecific(key: queueKey) == queueToken {
+            return try work()
+        }
+        return try queue.sync(execute: work)
+    }
+}
+
 /// Off-MainActor owner for Agent App refresh/read RPC persistence work.
 ///
 /// The dispatcher and router are MainActor-isolated, but these RPCs can read
@@ -4153,17 +4193,32 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func commandReceipt(method: String, clientRequestId: String) -> JSONValue? {
-        guard let ctx = context,
-              let json = try? ctx.commandReceiptRepo.get(method: method, clientRequestId: clientRequestId),
-              let data = json.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(JSONValue.self, from: data)
+        guard let ctx = context else { return nil }
+        // Durable get off MainActor: Dispatcher already has a volatile cache for
+        // the hot retry path; this is the SQLite fallback and must not beachball.
+        let repo = ctx.commandReceiptRepo
+        let methodCopy = method
+        let clientRequestIdCopy = clientRequestId
+        return CommandReceiptPersistenceGateway.shared.sync {
+            guard let json = try? repo.get(method: methodCopy, clientRequestId: clientRequestIdCopy),
+                  let data = json.data(using: .utf8) else { return nil as JSONValue? }
+            return try? JSONDecoder().decode(JSONValue.self, from: data)
+        }
     }
 
     public func recordCommandReceipt(method: String, clientRequestId: String, result: JSONValue) {
         guard let ctx = context,
               let data = try? JSONEncoder().encode(result),
               let json = String(data: data, encoding: .utf8) else { return }
-        try? ctx.commandReceiptRepo.record(method: method, clientRequestId: clientRequestId, resultJSON: json)
+        // Fire-and-forget durable write: Dispatcher already mirrors into volatile
+        // cache before this call, so the RPC response path does not wait on SQLite.
+        let repo = ctx.commandReceiptRepo
+        let methodCopy = method
+        let clientRequestIdCopy = clientRequestId
+        let jsonCopy = json
+        CommandReceiptPersistenceGateway.shared.async {
+            try? repo.record(method: methodCopy, clientRequestId: clientRequestIdCopy, resultJSON: jsonCopy)
+        }
     }
 
     public func claimCommandReceipt(
@@ -4173,12 +4228,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         paramsHash: String
     ) throws -> CommandReceiptClaimResult {
         guard let context else { throw LayoutError.workspaceNotFound }
-        return try context.commandReceiptRepo.claim(
-            method: method,
-            clientRequestId: clientRequestId,
-            ownerFingerprint: ownerFingerprint,
-            paramsHash: paramsHash
-        )
+        let repo = context.commandReceiptRepo
+        return try CommandReceiptPersistenceGateway.shared.syncThrowing {
+            try repo.claim(
+                method: method,
+                clientRequestId: clientRequestId,
+                ownerFingerprint: ownerFingerprint,
+                paramsHash: paramsHash
+            )
+        }
     }
 
     public func commitCommandReceipt(
@@ -4195,13 +4253,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let json = String(data: data, encoding: .utf8) else {
             throw JSONRPCError.internalError
         }
-        try context.commandReceiptRepo.commit(
-            method: method,
-            clientRequestId: clientRequestId,
-            ownerFingerprint: ownerFingerprint,
-            paramsHash: paramsHash,
-            resultJSON: json
-        )
+        let repo = context.commandReceiptRepo
+        try CommandReceiptPersistenceGateway.shared.syncThrowing {
+            try repo.commit(
+                method: method,
+                clientRequestId: clientRequestId,
+                ownerFingerprint: ownerFingerprint,
+                paramsHash: paramsHash,
+                resultJSON: json
+            )
+        }
     }
 
     public func finalizeCommandReceipt(
@@ -4231,15 +4292,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 createdAt: event.createdAt
             )
         }
-        let persisted = try context.commandReceiptRepo.finalize(
-            method: method,
-            clientRequestId: clientRequestId,
-            ownerFingerprint: ownerFingerprint,
-            paramsHash: paramsHash,
-            resultJSON: resultJSON,
-            events: intents,
-            minimumEventSequence: minimumEventSequence
-        )
+        let repo = context.commandReceiptRepo
+        let persisted = try CommandReceiptPersistenceGateway.shared.syncThrowing {
+            try repo.finalize(
+                method: method,
+                clientRequestId: clientRequestId,
+                ownerFingerprint: ownerFingerprint,
+                paramsHash: paramsHash,
+                resultJSON: resultJSON,
+                events: intents,
+                minimumEventSequence: minimumEventSequence
+            )
+        }
         return try persisted.map { event in
             guard let payloadData = event.payloadJSON.data(using: .utf8) else {
                 throw JSONRPCError.internalError
@@ -4260,12 +4324,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         paramsHash: String
     ) throws {
         guard let context else { throw LayoutError.workspaceNotFound }
-        try context.commandReceiptRepo.markUnknown(
-            method: method,
-            clientRequestId: clientRequestId,
-            ownerFingerprint: ownerFingerprint,
-            paramsHash: paramsHash
-        )
+        let repo = context.commandReceiptRepo
+        try CommandReceiptPersistenceGateway.shared.syncThrowing {
+            try repo.markUnknown(
+                method: method,
+                clientRequestId: clientRequestId,
+                ownerFingerprint: ownerFingerprint,
+                paramsHash: paramsHash
+            )
+        }
     }
 
     public func commandReceiptStatus(
@@ -4274,11 +4341,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         ownerFingerprint: String
     ) throws -> CommandReceiptStatusResult {
         guard let context else { throw LayoutError.workspaceNotFound }
-        return try context.commandReceiptRepo.status(
-            method: method,
-            clientRequestId: clientRequestId,
-            ownerFingerprint: ownerFingerprint
-        )
+        let repo = context.commandReceiptRepo
+        return try CommandReceiptPersistenceGateway.shared.syncThrowing {
+            try repo.status(
+                method: method,
+                clientRequestId: clientRequestId,
+                ownerFingerprint: ownerFingerprint
+            )
+        }
     }
 
     public func respondAgentRequest(thread: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
