@@ -7012,6 +7012,137 @@ final class AgentAppViewModelTests: XCTestCase {
                       "reloading A must not forget B's shared coordinator state")
     }
 
+    /// PERF-MAC_AGENT-013: a same-workspace coordinator event can arrive before
+    /// the surface has loaded that thread into its rail. If another producer
+    /// prunes the row before the debounced reload, workspace membership — not
+    /// rail membership alone — must still identify the local cache as evictable.
+    func test_reloadThreads_evictsLocalWorkspaceCacheLearnedBeforeRail() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-pre-rail-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(provider: .codex)]
+        )
+        let localWorkspace = WorkspaceID()
+        let foreignWorkspace = WorkspaceID()
+        let vm = AgentAppViewModel(
+            workspaceID: localWorkspace,
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            draftRepo: AgentThreadDraftRepository(db: db),
+            attachmentStore: AgentAttachmentStore(root: URL(fileURLWithPath: tmp).appendingPathComponent("attachments")),
+            promptHistoryStore: PromptHistoryStore(db: db)
+        )
+        installRunnableProviderFixtures(on: vm)
+        wireCanonicalThreadRead(vm, repo: threadRepo)
+
+        var localVictim = AgentThread(workspaceId: localWorkspace, title: "local victim", provider: .codex, model: "m")
+        localVictim.status = .completed
+        localVictim.updatedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        var localSurvivor = AgentThread(workspaceId: localWorkspace, title: "local survivor", provider: .codex, model: "m")
+        localSurvivor.status = .completed
+        localSurvivor.updatedAt = localVictim.updatedAt.addingTimeInterval(1)
+        let foreign = AgentThread(workspaceId: foreignWorkspace, title: "foreign", provider: .codex, model: "m")
+        try threadRepo.upsert(localVictim)
+        try threadRepo.upsert(localSurvivor)
+        try threadRepo.upsert(foreign)
+        XCTAssertTrue(vm.threads.isEmpty,
+                      "precondition: neither post-init local row has entered this surface's rail")
+
+        coordinator.seedAutoContinuationStateForTesting(localVictim.id)
+        coordinator.seedAutoContinuationStateForTesting(foreign.id)
+        // Hold the debounce open so the status callbacks can populate ownership
+        // before this test performs the external prune deterministically.
+        vm.scheduleReloadThreads(delayMilliseconds: 1_000)
+        vm.runCoordinator(coordinator, didChangeStatus: .running, runId: AgentRunID(), threadId: localVictim.id)
+        vm.runCoordinator(coordinator, didChangeStatus: .running, runId: AgentRunID(), threadId: foreign.id)
+        await waitAsync("coordinator status caches local and foreign workspace membership") {
+            vm.threadCacheResidueForTesting.contains(localVictim.id)
+                && vm.threadCacheResidueForTesting.contains(foreign.id)
+        }
+
+        let pruned = try threadRepo.enforceWorkspaceThreadLimit(workspaceId: localWorkspace, limit: 1)
+        XCTAssertEqual(pruned, [localVictim.id],
+                       "precondition: another producer prunes the locally cached row before the rail reload")
+        vm.reloadThreads()
+
+        XCTAssertFalse(vm.threadCacheResidueForTesting.contains(localVictim.id),
+                       "reload must evict a locally owned cache learned before rail insertion")
+        XCTAssertFalse(coordinator.autoContinuationThreadIdsForTesting.contains(localVictim.id),
+                       "reload must forget coordinator state for that pre-rail local victim")
+        XCTAssertTrue(vm.threadCacheResidueForTesting.contains(foreign.id),
+                      "workspace-scoped reconciliation must preserve the foreign membership cache")
+        XCTAssertTrue(coordinator.autoContinuationThreadIdsForTesting.contains(foreign.id),
+                      "workspace-scoped reconciliation must preserve foreign coordinator state")
+        vm.dispose()
+    }
+
+    /// PERF-MAC_AGENT-013: once cap enforcement commits its delete, a later
+    /// thread-list failure must not keep the returned victims alive in memory.
+    func test_reloadThreads_evictsCapVictimsBeforeSubsequentListFailure() async throws {
+        let (vm, threadRepo) = try makeVM()
+        var victim = AgentThread(workspaceId: vm.workspaceID, title: "old victim", provider: .claude, model: "m")
+        victim.status = .completed
+        victim.updatedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        try threadRepo.upsert(victim)
+        vm.reloadThreads()
+        vm.selectThread(victim.id)
+        vm.prompt = "preserve this unsent draft"
+        let attachmentURL = URL(fileURLWithPath: vm.cwd).appendingPathComponent("preserve.txt")
+        try Data("preserve attachment".utf8).write(to: attachmentURL)
+        let preservedAttachments = [AgentAttachment(path: attachmentURL.path, kind: .file)]
+        vm.attachments = preservedAttachments
+        vm.seedAdditionalThreadCachesForTesting(victim.id)
+        vm.seedSelectedThreadChromeForTesting(victim.id)
+        vm.coordinator.seedAutoContinuationStateForTesting(victim.id)
+
+        for index in 0..<AgentThreadRepository.maxThreadsPerWorkspace {
+            var thread = AgentThread(workspaceId: vm.workspaceID,
+                                     title: "newer \(index)",
+                                     provider: .claude,
+                                     model: "m")
+            thread.status = .completed
+            thread.updatedAt = victim.updatedAt.addingTimeInterval(TimeInterval(index + 1))
+            try threadRepo.upsert(thread)
+        }
+        XCTAssertEqual(try threadRepo.count(workspaceId: vm.workspaceID),
+                       AgentThreadRepository.maxThreadsPerWorkspace + 1,
+                       "precondition: the next reload must prune the selected cached victim")
+
+        vm.setReloadThreadListForTesting {
+            throw NSError(domain: "AgentAppViewModelTests.reload", code: 1)
+        }
+        vm.reloadThreads()
+        vm.setReloadThreadListForTesting(nil)
+
+        XCTAssertNil(try threadRepo.get(id: victim.id),
+                     "cap enforcement must have committed the victim delete before list failed")
+        XCTAssertFalse(vm.threadCacheResidueForTesting.contains(victim.id),
+                       "a post-cap list failure must not retain any victim VM cache")
+        XCTAssertFalse(vm.coordinator.autoContinuationThreadIdsForTesting.contains(victim.id),
+                       "a post-cap list failure must not retain coordinator state")
+        XCTAssertNil(vm.selectedThreadId,
+                     "a selected cap victim must become unbound even when the rail list fails")
+        XCTAssertEqual(vm.prompt, "preserve this unsent draft",
+                      "selection recovery must keep unsent user input in the fresh composer")
+        XCTAssertEqual(vm.attachments, preservedAttachments,
+                       "selection recovery must keep unsent attachments in the fresh composer")
+        XCTAssertEqual(vm.subagentActivity, .empty,
+                       "partial-failure recovery must synchronously clear deleted-thread Subagents chrome")
+        XCTAssertEqual(vm.tokenSaverThreadSavedTokens, 0,
+                       "partial-failure recovery must synchronously clear deleted-thread Token Saver display")
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 0,
+                       "partial-failure recovery must synchronously clear deleted-thread Token Saver ledger total")
+        XCTAssertTrue(vm.statusMessage.contains("Could not reload threads"),
+                      "the partial list failure must still fail loud")
+    }
+
     /// PERF-MAC_AGENT-013: a create/RPC producer can enforce the cap before an
     /// open surface reloads, discarding the victim IDs. The next scheduled reload
     /// must reconcile its known thread/cache IDs against SQLite, including a
@@ -7037,8 +7168,11 @@ final class AgentAppViewModelTests: XCTestCase {
                       "automatic cap pruning must release the large unique drafts retained only by pruned IDs")
         XCTAssertTrue(measured.allSatisfy(\.selectedThreadRecovered),
                       "a selected victim must recover the surface to its fresh, unbound state")
-        XCTAssertTrue(measured.allSatisfy { $0.selectedPromptAfterEvictionUTF8Bytes == 0 },
-                      "recovering a selected victim must release its visible composer draft")
+        XCTAssertTrue(measured.allSatisfy {
+            $0.selectedPromptAfterEvictionUTF8Bytes == $0.selectedPromptBeforeEvictionUTF8Bytes
+        }, "recovering a selected victim must preserve its unsent draft in the fresh composer")
+        XCTAssertTrue(measured.allSatisfy(\.draftRecoveryNoticeShown),
+                      "successful recovery must explain that the unsent draft was preserved")
         XCTAssertTrue(measured.allSatisfy(\.selectedThreadBoundStateReleased),
                       "recovering a selected victim must clear its transcript, queue, and provider snapshot state")
         XCTAssertTrue(measured.allSatisfy { !$0.automaticPruneCreatedUndo },
@@ -7052,6 +7186,7 @@ final class AgentAppViewModelTests: XCTestCase {
         let cachedDraftUTF8Bytes: Int
         let selectedPromptBeforeEvictionUTF8Bytes: Int
         let selectedPromptAfterEvictionUTF8Bytes: Int
+        let draftRecoveryNoticeShown: Bool
         let selectedThreadBoundStateReleased: Bool
         let selectedThreadRecovered: Bool
         let automaticPruneCreatedUndo: Bool
@@ -7115,6 +7250,7 @@ final class AgentAppViewModelTests: XCTestCase {
             vm.messages.contains { $0.threadId == selectedVictim.id }
         }
         vm.timeline.apply(.turnStarted(turnId: "selected-victim-turn"))
+        vm.seedSelectedThreadChromeForTesting(selectedVictim.id)
         XCTAssertEqual(vm.queueStatusMessage, "test queue status",
                        "precondition: the selected victim owns the seeded queue status")
         XCTAssertNotNil(vm.providerThreadSnapshotLastConfirmedAt,
@@ -7159,10 +7295,14 @@ final class AgentAppViewModelTests: XCTestCase {
             cachedDraftUTF8Bytes: vm.cachedComposerDraftUTF8BytesForTesting,
             selectedPromptBeforeEvictionUTF8Bytes: selectedPromptBeforeEvictionUTF8Bytes,
             selectedPromptAfterEvictionUTF8Bytes: vm.prompt.utf8.count,
+            draftRecoveryNoticeShown: vm.statusMessage.contains("unsent draft was kept"),
             selectedThreadBoundStateReleased: vm.messages.isEmpty
                 && vm.timeline.turns.isEmpty
                 && vm.queueStatusMessage == nil
-                && vm.providerThreadSnapshotLastConfirmedAt == nil,
+                && vm.providerThreadSnapshotLastConfirmedAt == nil
+                && vm.subagentActivity == .empty
+                && vm.tokenSaverThreadSavedTokens == 0
+                && vm.tokenSaverThreadMeasuredTokens == 0,
             selectedThreadRecovered: vm.selectedThreadId == nil && recoveredSelection == nil,
             automaticPruneCreatedUndo: vm.pendingThreadDeletionUndo != nil,
             footprintBeforeReloadKB: footprintBeforeReloadKB,

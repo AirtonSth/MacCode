@@ -436,6 +436,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // coordinator's multi-workspace broadcast but are filtered out cheaply here.
     private var threadWorkspaceCache: [AgentThreadID: WorkspaceID] = [:]
 
+    #if DEBUG
+    /// Test seam for the partial-failure boundary after cap enforcement.
+    private var reloadThreadListForTesting: (() throws -> [AgentThread])?
+    #endif
+
     // PERF-MAC_AGENT-010: batch streaming events into one main-actor hop per
     // tick. Fast token streams produce thousands of events/sec; without batching
     // every event allocates an independent Task, each of which pays the Swift
@@ -689,15 +694,37 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // Ghost Working: durable finishedAt must free coordinator ownership before
         // the rail counts active threads (missed/filtered didFinish left spinners).
         _ = coordinator.reconcileStaleActiveOwnershipWithDurableState()
-        let knownThreadIDs = Set(threads.map(\.id))
+        // The rail is workspace-scoped, but a coordinator status can teach this
+        // surface about a local thread before the debounced rail reload runs.
+        // Include only cache entries whose workspace ownership is known locally;
+        // foreign cache keys must never drive shared-coordinator eviction.
+        let knownLocalThreadIDs = Set(threads.map(\.id)).union(
+            threadWorkspaceCache.compactMap { id, workspace in
+                workspace == workspaceID ? id : nil
+            }
+        )
         do {
             // Cap first so oversized workspaces (scheduled runs, long sessions)
             // shrink before the rail reads. CASCADE removes messages.
-            let prunedThreadIDs = try threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspaceID)
-            let reloadedThreads = try threadRepo.list(workspaceId: workspaceID)
-            let missingKnownThreadIDs = knownThreadIDs.subtracting(reloadedThreads.map(\.id))
-            evictThreadCaches(Set(prunedThreadIDs).union(missingKnownThreadIDs))
+            let prunedThreadIDs = Set(try threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspaceID))
+            // Cap succeeded: release its returned victims before the next DB read,
+            // so a transient list failure cannot retain state for already-deleted rows.
+            evictThreadCaches(prunedThreadIDs)
+            recoverDeletedSelectionIfNeeded(prunedThreadIDs)
+            let reloadedThreads: [AgentThread]
+            #if DEBUG
+            if let reloadThreadListForTesting {
+                reloadedThreads = try reloadThreadListForTesting()
+            } else {
+                reloadedThreads = try threadRepo.list(workspaceId: workspaceID)
+            }
+            #else
+            reloadedThreads = try threadRepo.list(workspaceId: workspaceID)
+            #endif
+            let missingKnownThreadIDs = knownLocalThreadIDs.subtracting(reloadedThreads.map(\.id))
+            evictThreadCaches(missingKnownThreadIDs)
             threads = reloadedThreads
+            recoverDeletedSelectionIfNeeded(missingKnownThreadIDs)
             pruneStaleRunThreadProjections()
             // Clear Stopping… once a LaunchAgent-owned run is no longer active.
             if isStopping,
@@ -723,12 +750,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // of auto-adopting threads.first (the new-tab-clone bug). The only
         // selection mutation here is the safe deletion-recovery below.
         if let sel = selectedThreadId, !threads.contains(where: { $0.id == sel }) {
-            // The bound thread was deleted (e.g. from another client). Fall back
-            // to the fresh-composer state rather than render a dangling selection.
-            selectedThreadId = nil
-            publishInterestedThreadId(nil)
-            resetDeletedSelectionToFreshComposer()
-            onSelectedThreadChanged?(nil)
+            recoverDeletedSelectionIfNeeded([sel])
         }
         // Refresh after selection recovery so a deleted thread cannot leave a
         // stale Subagents snapshot until the 2s poll.
@@ -4020,11 +4042,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Clears visible state owned by a selected thread that disappeared outside the
     /// explicit-delete flow. The selection is already nil when this runs, so the
     /// existing reload helpers reset queue/checkpoint projections to fresh-composer
-    /// state without persisting a change for the deleted thread.
+    /// state without persisting a change for the deleted thread. The unsent composer
+    /// itself is deliberately preserved as the new unbound draft; pruning history
+    /// must not destroy user input.
     private func resetDeletedSelectionToFreshComposer() {
-        prompt = ""
         composerCursorOffset = nil
-        attachments = []
         attachmentInputError = nil
         lastSentAttachmentCount = 0
         pendingAttachmentRetryConfirmation = nil
@@ -4050,8 +4072,25 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         userInputDrafts = [:]
         transcriptHistoryRevealCount = 0
         planNotes = ""
+        subagentActivity = .empty
+        tokenSaverFooterReloadTask?.cancel()
+        tokenSaverFooterReloadTask = nil
+        tokenSaverThreadSavedTokens = 0
+        tokenSaverThreadMeasuredTokens = 0
         reloadQueuedMessages()
         reloadCheckpoints()
+    }
+
+    private func recoverDeletedSelectionIfNeeded(_ removedThreadIDs: Set<AgentThreadID>) {
+        guard let selectedThreadId, removedThreadIDs.contains(selectedThreadId) else { return }
+        let preservedUnsentDraft = !prompt.isEmpty || !attachments.isEmpty
+        self.selectedThreadId = nil
+        publishInterestedThreadId(nil)
+        resetDeletedSelectionToFreshComposer()
+        if preservedUnsentDraft {
+            statusMessage = "Thread removed; your unsent draft was kept in a fresh composer."
+        }
+        onSelectedThreadChanged?(nil)
     }
 
     private func evictThreadCaches(_ ids: some Sequence<AgentThreadID>) {
@@ -4068,6 +4107,34 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     #if DEBUG
+    func setReloadThreadListForTesting(_ loader: (() throws -> [AgentThread])?) {
+        reloadThreadListForTesting = loader
+    }
+
+    func seedSelectedThreadChromeForTesting(_ threadId: AgentThreadID) {
+        let now = Date(timeIntervalSince1970: 0)
+        subagentActivity = SubagentActivitySnapshot(active: [
+            SubagentActivityItem(
+                id: UUID(),
+                runId: nil,
+                threadId: threadId,
+                nodeId: "test-node",
+                displayName: "test worker",
+                provider: .codex,
+                model: nil,
+                phase: .working,
+                lifecycleStatus: .accepted,
+                finalRunStatus: nil,
+                admittedAt: now,
+                finalizedAt: nil,
+                lifecycleUpdatedAt: now,
+                isActive: true
+            )
+        ], done: [])
+        tokenSaverThreadSavedTokens = 321
+        tokenSaverThreadMeasuredTokens = 123
+    }
+
     /// Test-only: the set of thread ids still present in ANY per-thread VM cache,
     /// so a test can prove `evictThreadCaches` leaves no residue after a delete.
     var threadCacheResidueForTesting: Set<AgentThreadID> {
