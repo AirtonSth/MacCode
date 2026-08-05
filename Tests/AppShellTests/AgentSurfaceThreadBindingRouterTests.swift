@@ -148,8 +148,7 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
     /// PERF-MAC_AGENT-013: scheduled/RPC creation enforces the cap before it
     /// publishes `agent.thread.created`. Every open surface in the workspace
     /// must evict the pre-pruned victim from its local caches when the real
-    /// EventBus notification asks it to reload, without changing either tab's
-    /// selected thread.
+    /// EventBus notification arrives, even if the first rail list fails.
     func test_quietRouterCreateAtCap_evictsPrePrunedVictimFromEveryOpenSurface() async throws {
         let dir = NSTemporaryDirectory() + "RC2Bind-Cap-" + UUID().uuidString
         let (ctx, router) = try makeRouter(dir)
@@ -198,12 +197,11 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         firstSurface.viewModel.reloadThreads()
         secondSurface.viewModel.reloadThreads()
 
-        let firstSelection = survivors[0].id
         let secondSelection = survivors[1].id
         firstSurface.viewModel.selectThread(victim.id)
         firstSurface.viewModel.prompt = "first surface victim draft"
         firstSurface.viewModel.seedAdditionalThreadCachesForTesting(victim.id)
-        firstSurface.viewModel.selectThread(firstSelection)
+        firstSurface.viewModel.seedRunThreadProjectionForTesting(victim.id)
         secondSurface.viewModel.selectThread(victim.id)
         secondSurface.viewModel.prompt = "second surface victim draft"
         secondSurface.viewModel.seedAdditionalThreadCachesForTesting(victim.id)
@@ -216,18 +214,27 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
                       "precondition: second surface caches the future victim")
         XCTAssertTrue(ctx.coordinator.autoContinuationThreadIdsForTesting.contains(victim.id),
                       "precondition: the shared coordinator caches the future victim")
-        XCTAssertEqual(firstSurface.viewModel.selectedThreadId, firstSelection)
+        XCTAssertEqual(firstSurface.viewModel.selectedThreadId, victim.id)
         XCTAssertEqual(secondSurface.viewModel.selectedThreadId, secondSelection)
 
         var createdEvents: [EventBus.Event] = []
+        var deletedEvents: [EventBus.Event] = []
         let eventSubscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
-            guard event.kind == "agent.thread.created",
-                  event.payload.objectValue?["workspace_id"]?.stringValue == workspace.id.value.uuidString else {
-                return
+            if event.kind == "agent.thread.created",
+               event.payload.objectValue?["workspace_id"]?.stringValue == workspace.id.value.uuidString {
+                createdEvents.append(event)
+            } else if event.kind == "agent.thread.deleted",
+                      event.payload.objectValue?["thread_id"]?.stringValue == victim.id.value.uuidString {
+                deletedEvents.append(event)
             }
-            createdEvents.append(event)
         }
         defer { EventBus.shared.unsubscribe(eventSubscription) }
+        firstSurface.viewModel.setReloadThreadListForTesting {
+            throw NSError(domain: "AgentSurfaceThreadBindingRouterTests.reload", code: 1)
+        }
+        secondSurface.viewModel.setReloadThreadListForTesting {
+            throw NSError(domain: "AgentSurfaceThreadBindingRouterTests.reload", code: 2)
+        }
 
         let created = try router.createAgentThread(
             workspace: workspace.id,
@@ -244,9 +251,13 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             || secondSurface.viewModel.threadCacheResidueForTesting.contains(victim.id) {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
+        firstSurface.viewModel.setReloadThreadListForTesting(nil)
+        secondSurface.viewModel.setReloadThreadListForTesting(nil)
 
         XCTAssertEqual(createdEvents.count, 1,
                        "quiet router creation must publish one real-time thread-created event")
+        XCTAssertEqual(deletedEvents.count, 1,
+                       "cap pruning must publish the authoritative victim before the created event")
         XCTAssertEqual(try ctx.threadRepo.count(workspaceId: workspace.id),
                        AgentThreadRepository.maxThreadsPerWorkspace)
         XCTAssertNil(try ctx.threadRepo.get(id: victim.id),
@@ -257,11 +268,17 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         XCTAssertFalse(secondSurface.viewModel.threadCacheResidueForTesting.contains(victim.id),
                        "the second EventBus-subscribed surface must evict the pre-pruned victim")
         XCTAssertFalse(ctx.coordinator.autoContinuationThreadIdsForTesting.contains(victim.id),
-                       "the shared coordinator must forget the pre-pruned victim once surfaces reload")
-        XCTAssertEqual(firstSurface.viewModel.selectedThreadId, firstSelection,
-                       "quiet creation must not yank the first open Agent App tab")
+                       "the shared coordinator must forget the pre-pruned victim before the failed rail reload")
+        XCTAssertFalse(firstSurface.viewModel.threads.contains(where: { $0.id == victim.id }),
+                       "the authoritative delete event must remove the stale rail row before list failure")
+        XCTAssertNil(firstSurface.viewModel.selectedThreadId,
+                     "a selected externally pruned victim must recover even when list fails")
+        XCTAssertEqual(firstSurface.viewModel.prompt, "first surface victim draft",
+                       "external-prune recovery must preserve the selected unsent draft")
         XCTAssertEqual(secondSurface.viewModel.selectedThreadId, secondSelection,
                        "quiet creation must not yank the second open Agent App tab")
+        XCTAssertTrue(firstSurface.viewModel.statusMessage.contains("Could not reload threads"))
+        XCTAssertTrue(secondSurface.viewModel.statusMessage.contains("Could not reload threads"))
     }
 
     // MARK: selectAgentThread targets exactly one surface when given a surfaceID

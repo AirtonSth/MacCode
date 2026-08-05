@@ -7100,6 +7100,7 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.attachments = preservedAttachments
         vm.seedAdditionalThreadCachesForTesting(victim.id)
         vm.seedSelectedThreadChromeForTesting(victim.id)
+        vm.seedRunThreadProjectionForTesting(victim.id)
         vm.coordinator.seedAutoContinuationStateForTesting(victim.id)
 
         for index in 0..<AgentThreadRepository.maxThreadsPerWorkspace {
@@ -7123,12 +7124,17 @@ final class AgentAppViewModelTests: XCTestCase {
 
         XCTAssertNil(try threadRepo.get(id: victim.id),
                      "cap enforcement must have committed the victim delete before list failed")
+        XCTAssertFalse(vm.threads.contains(where: { $0.id == victim.id }),
+                       "an authoritative cap victim must leave the rail before the fallible list")
         XCTAssertFalse(vm.threadCacheResidueForTesting.contains(victim.id),
                        "a post-cap list failure must not retain any victim VM cache")
         XCTAssertFalse(vm.coordinator.autoContinuationThreadIdsForTesting.contains(victim.id),
                        "a post-cap list failure must not retain coordinator state")
         XCTAssertNil(vm.selectedThreadId,
                      "a selected cap victim must become unbound even when the rail list fails")
+        vm.selectThread(victim.id)
+        XCTAssertNil(vm.selectedThreadId,
+                     "a deleted stale ID must not rebind the surface after the failed rail list")
         XCTAssertEqual(vm.prompt, "preserve this unsent draft",
                       "selection recovery must keep unsent user input in the fresh composer")
         XCTAssertEqual(vm.attachments, preservedAttachments,

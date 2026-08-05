@@ -709,8 +709,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             let prunedThreadIDs = Set(try threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspaceID))
             // Cap succeeded: release its returned victims before the next DB read,
             // so a transient list failure cannot retain state for already-deleted rows.
-            evictThreadCaches(prunedThreadIDs)
-            recoverDeletedSelectionIfNeeded(prunedThreadIDs)
+            applyAuthoritativeThreadDeletions(prunedThreadIDs)
             let reloadedThreads: [AgentThread]
             #if DEBUG
             if let reloadThreadListForTesting {
@@ -1053,6 +1052,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func selectThread(_ id: AgentThreadID, markRead: Bool = true) {
         guard !isDisposed else { return }
+        // Fast path is the current rail. The repository fallback supports a
+        // just-created row after a transient reload failure, while refusing to
+        // persist a binding to an authoritatively deleted stale ID.
+        guard threads.contains(where: { $0.id == id }) || (try? threadRepo.get(id: id)) != nil else { return }
         historyReplayNotice = nil
         let isThreadSwitch = selectedThreadId != id
         if isThreadSwitch {
@@ -3715,13 +3718,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                             baseBranch: executionMode == .worktree ? (baseBranch.isEmpty ? (gitBranch ?? "main") : baseBranch) : nil,
                             serviceTier: serviceTier, modelSelection: currentModelSelection,
                             runAsUser: runAsUser, routingConfiguration: routingConfiguration)
+        let prunedThreadIDs: [AgentThreadID]
         do {
             try threadRepo.upsert(t)
             // Drop oldest history when this create pushes past the workspace cap.
-            _ = try threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspaceID)
+            prunedThreadIDs = try threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspaceID)
         } catch {
             statusMessage = "Could not create thread: \(error)"
             return
+        }
+        if !prunedThreadIDs.isEmpty {
+            applyAuthoritativeThreadDeletions(Set(prunedThreadIDs))
+            onThreadLifecycle?(.deleted(prunedThreadIDs))
         }
         reloadThreads()
         onThreadLifecycle?(.created(threads.first(where: { $0.id == t.id }) ?? t))
@@ -4036,6 +4044,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         ids.formUnion(lastPersistedFinalIdByThread.keys)
         ids.formUnion(queueStatusByThread.keys)
         ids.formUnion(providerThreadSnapshotConfirmedAtByThread.keys)
+        ids.formUnion(runThreads.values)
         return ids
     }
 
@@ -4093,7 +4102,27 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         onSelectedThreadChanged?(nil)
     }
 
+    private func applyAuthoritativeThreadDeletions(_ deletedIDs: Set<AgentThreadID>) {
+        guard !deletedIDs.isEmpty else { return }
+        evictThreadCaches(deletedIDs)
+        threads.removeAll { deletedIDs.contains($0.id) }
+        recoverDeletedSelectionIfNeeded(deletedIDs)
+    }
+
     private func evictThreadCaches(_ ids: some Sequence<AgentThreadID>) {
+        let ids = Set(ids)
+        guard !ids.isEmpty else { return }
+        let removedRunIDs = Set(runThreads.compactMap { runId, threadId in
+            ids.contains(threadId) ? runId : nil
+        })
+        for runId in removedRunIDs {
+            runThreads.removeValue(forKey: runId)
+        }
+        if let currentRunId, removedRunIDs.contains(currentRunId) {
+            self.currentRunId = nil
+            runStartedAt = nil
+            isStopping = false
+        }
         for id in ids {
             repairedThreadIds.remove(id)
             threadWorkspaceCache.removeValue(forKey: id)
@@ -4151,6 +4180,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             queueStatusMessage = "test queue status"
             providerThreadSnapshotLastConfirmedAt = confirmedAt
         }
+    }
+
+    @discardableResult
+    func seedRunThreadProjectionForTesting(_ threadId: AgentThreadID) -> AgentRunID {
+        let runId = AgentRunID()
+        runThreads[runId] = threadId
+        return runId
     }
 
     /// Test-only logical payload measure for pruning regressions. This counts the
@@ -4568,6 +4604,25 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         default:
             break
         }
+    }
+
+    /// Apply authoritative deletion IDs before the fallible rail reload. Cap
+    /// producers publish these IDs because another surface cannot rediscover
+    /// them if its first post-delete list read fails.
+    public func handleThreadLifecycleEvent(kind: String, threadId: String?, threadIds: [String]?) {
+        let rawIDs: [String]
+        switch kind {
+        case "agent.thread.deleted":
+            rawIDs = threadId.map { [$0] } ?? []
+        case "agent.thread.deleted_many":
+            rawIDs = threadIds ?? []
+        default:
+            return
+        }
+        let deletedIDs = Set(rawIDs.compactMap { raw -> AgentThreadID? in
+            UUID(uuidString: raw).map(AgentThreadID.init)
+        })
+        applyAuthoritativeThreadDeletions(deletedIDs)
     }
 
     public func dismissProviderThreadSnapshotStatusMessage() {

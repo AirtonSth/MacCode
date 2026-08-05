@@ -532,6 +532,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         let queueSubscriptionToken = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
                             guard ev.kind.hasPrefix("agent.thread.") || ev.kind.hasPrefix("agent.message.queue") || ev.kind == "agent.message.queued" else { return }
                             DispatchQueue.main.async {
+                                agent?.viewModel.handleThreadLifecycleEvent(
+                                    kind: ev.kind,
+                                    threadId: ev.payload.objectValue?["thread_id"]?.stringValue,
+                                    threadIds: ev.payload.objectValue?["thread_ids"]?.arrayValue?.compactMap(\.stringValue)
+                                )
                                 agent?.viewModel.handleQueueLifecycleEvent(
                                     kind: ev.kind,
                                     threadId: ev.payload.objectValue?["thread_id"]?.stringValue,
@@ -2418,14 +2423,22 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             runAsUser: resolvedRunAs,
                             routingConfiguration: routingConfiguration)
         try ctx.threadRepo.upsert(t)
+        let prunedThreadIDs: [AgentThreadID]
         if let resolvedWorkspace {
-            _ = try? ctx.threadRepo.enforceWorkspaceThreadLimit(workspaceId: resolvedWorkspace)
+            prunedThreadIDs = (try? ctx.threadRepo.enforceWorkspaceThreadLimit(workspaceId: resolvedWorkspace)) ?? []
+        } else {
+            prunedThreadIDs = []
         }
         if !quiet {
             // Only bind/select the new thread on the requesting surface (if any).
             // Without a surfaceID this just refreshes rails — a thread created from
             // one client no longer hijacks every other open agent tab.
             try selectAgentThread(thread: t.id, surfaceID: surfaceID)
+        }
+        // Carry cap victims explicitly: a subscribed surface must evict them
+        // before its fallible post-create list read.
+        if !prunedThreadIDs.isEmpty {
+            publishAgentThreadLifecycle(.deleted(prunedThreadIDs))
         }
         // After rails reload: broadcast create so iOS mirrors and any EventBus
         // subscribers (including Agent App surfaces that listen for thread.*)
@@ -6037,6 +6050,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 let queueSubscriptionToken = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
                     guard ev.kind.hasPrefix("agent.thread.") || ev.kind.hasPrefix("agent.message.queue") || ev.kind == "agent.message.queued" else { return }
                     DispatchQueue.main.async {
+                        agent?.viewModel.handleThreadLifecycleEvent(
+                            kind: ev.kind,
+                            threadId: ev.payload.objectValue?["thread_id"]?.stringValue,
+                            threadIds: ev.payload.objectValue?["thread_ids"]?.arrayValue?.compactMap(\.stringValue)
+                        )
                         agent?.viewModel.handleQueueLifecycleEvent(
                             kind: ev.kind,
                             threadId: ev.payload.objectValue?["thread_id"]?.stringValue,
