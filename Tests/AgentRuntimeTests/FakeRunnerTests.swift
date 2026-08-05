@@ -1942,6 +1942,61 @@ final class FakeRunnerTests: XCTestCase {
         XCTAssertFalse(coordinator.deletedThreadRuntimeResidueForTesting.contains(thread.id))
     }
 
+    /// WHY: a durable read can become stale before its result claims ownership.
+    /// Retirement during that gap must invalidate the callback so it cannot
+    /// recreate usage or stream state after the committed delete.
+    func test_lateUsageReadPresent_deletedBeforeResolutionRejectsStaleAdmission() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-late-admission-race-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "late admission race", provider: .codex, model: "m")
+        let runId = AgentRunID()
+        try threadRepo.upsert(thread)
+        try runRepo.upsert(AgentRun(
+            id: runId,
+            threadId: thread.id,
+            provider: .codex,
+            model: "m",
+            status: .completed,
+            finishedAt: Date()
+        ))
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(scenario: .simpleAssistant(reply: "unused"))]
+        )
+        let readPresent = DispatchSemaphore(value: 0)
+        let resumeResolution = DispatchSemaphore(value: 0)
+        let callbackFinished = DispatchSemaphore(value: 0)
+        coordinator.lateRunAdmissionDidReadPresentForTesting = { id, candidateThreadId in
+            guard id == runId, candidateThreadId == thread.id else { return }
+            readPresent.signal()
+            resumeResolution.wait()
+        }
+
+        DispatchQueue.global().async {
+            coordinator.recordLateCumulativeUsageForTesting(
+                runId: runId,
+                threadId: thread.id,
+                totalTokens: 21
+            )
+            callbackFinished.signal()
+        }
+        XCTAssertEqual(readPresent.wait(timeout: .now() + 3), .success)
+
+        try threadRepo.delete(id: thread.id)
+        XCTAssertEqual(coordinator.retireDeletedThreads([thread.id])[thread.id], .retired)
+        resumeResolution.signal()
+        XCTAssertEqual(callbackFinished.wait(timeout: .now() + 3), .success)
+
+        XCTAssertNil(coordinator.runThreadOwnershipForTesting[runId])
+        XCTAssertFalse(coordinator.lateReceiptRunResidueForTesting.contains(runId))
+        XCTAssertFalse(coordinator.deletedThreadRuntimeResidueForTesting.contains(thread.id))
+        XCTAssertFalse(coordinator.pendingLateRunValidationIDsForTesting.contains(runId))
+    }
+
     /// WHY: the first callback may fail open for a transient durable read, but a
     /// later validation proving the graph present must clear only the marker and
     /// preserve the admitted usage state without another read on its fast path.

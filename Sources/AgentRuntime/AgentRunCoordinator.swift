@@ -832,7 +832,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// A late callback with no fast ownership first checks its durable graph.
     /// A transient read error may admit that exact callback once, then a bounded
     /// validation retry either confirms its graph or purges the new residue.
-    private var pendingLateRunValidations: [AgentRunID: AgentThreadID] = [:]
+    private struct LateRunAdmissionClaim: Equatable {
+        let threadId: AgentThreadID
+        let generation: UInt64
+        var validationPending: Bool
+
+        func matches(threadId: AgentThreadID, generation: UInt64) -> Bool {
+            self.threadId == threadId && self.generation == generation
+        }
+    }
+    private var lateRunAdmissionClaims: [AgentRunID: LateRunAdmissionClaim] = [:]
+    private var lateRunAdmissionGeneration: UInt64 = 0
     private static let pendingLateRunValidationLimit = 64
     private static let lateRunValidationTimedRetryLimit = 2
     private static let lateRunValidationRetryBaseDelayNanoseconds: UInt64 = 50_000_000
@@ -858,6 +868,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// `true` means the durable graph is present; production queries SQLite.
     var deletedThreadRetirementPresenceOverrideForTesting: ((AgentThreadID) throws -> Bool)?
     var lateRunAdmissionPresenceOverrideForTesting: ((AgentRunID, AgentThreadID) throws -> Bool)?
+    var lateRunAdmissionDidReadPresentForTesting: ((AgentRunID, AgentThreadID) -> Void)?
 #endif
     private var pendingReceiptFinalizations: [AgentRunID: PendingOrchestrationReceiptFinalization] = [:]
     private var receiptFinalizationRetryScheduled: Set<AgentRunID> = []
@@ -2484,7 +2495,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             || awaitingTerminationRuns.contains(runId)
             || providerTerminatedRuns.contains(runId)
             || pendingGracefulStopFallbacks.contains(runId)
-            || pendingLateRunValidations[runId] != nil
+            || lateRunAdmissionClaims[runId]?.validationPending == true
             || seq[runId] != nil
             || pendingStreamRunIds.values.contains(runId)
     }
@@ -2530,7 +2541,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private func purgeDeletedThreadRuntimeLocked(_ threadId: AgentThreadID) {
         let runIds = Set(
             runThreadOwnership.compactMap { $0.value == threadId ? $0.key : nil }
-                + pendingLateRunValidations.compactMap { $0.value == threadId ? $0.key : nil }
+                + lateRunAdmissionClaims.compactMap { $0.value.threadId == threadId ? $0.key : nil }
         ).sorted { $0.value.uuidString < $1.value.uuidString }
 
         providerTurnScopes.removeValue(forKey: threadId)
@@ -2580,7 +2591,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         pendingGracefulStopFallbacks.remove(runId)
         seq.removeValue(forKey: runId)
         runThreadOwnership.removeValue(forKey: runId)
-        pendingLateRunValidations.removeValue(forKey: runId)
+        lateRunAdmissionClaims.removeValue(forKey: runId)
     }
 
     private enum DurableRunGraphStatus {
@@ -2592,51 +2603,59 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// Owned callbacks never reach SQLite. Once normal ownership has drained,
     /// the exact durable run-to-thread graph becomes the admission authority.
     private func admitRunCallback(runId: AgentRunID, threadId: AgentThreadID) -> Bool {
-        let localState = lock.withLock { () -> (owned: Bool, rejected: Bool) in
-            if let pendingThreadId = pendingLateRunValidations[runId], pendingThreadId != threadId {
-                return (false, true)
-            }
+        let start = lock.withLock { () -> (owned: Bool, generation: UInt64?) in
+            if lateRunAdmissionClaims[runId] != nil { return (false, nil) }
             if let owner = runThreadOwnership[runId], owner != threadId {
-                return (false, true)
+                return (false, nil)
             }
-            let pending = pendingLateRunValidations[runId] != nil
-            if runThreadOwnership[runId] == threadId, !pending {
-                return (true, false)
+            if runThreadOwnership[runId] == threadId {
+                return (true, nil)
             }
             if deletedThreadRetirementsInFlight.contains(threadId) {
-                return (false, true)
+                return (false, nil)
             }
-            return (false, false)
+            guard lateRunAdmissionClaims.count < Self.pendingLateRunValidationLimit else {
+                return (false, nil)
+            }
+            lateRunAdmissionGeneration &+= 1
+            let generation = lateRunAdmissionGeneration
+            lateRunAdmissionClaims[runId] = LateRunAdmissionClaim(
+                threadId: threadId,
+                generation: generation,
+                validationPending: false
+            )
+            return (false, generation)
         }
-        if localState.owned { return true }
-        if localState.rejected { return false }
+        if start.owned { return true }
+        guard let generation = start.generation else { return false }
 
         do {
+            let status = try durableRunGraphStatus(runId: runId, threadId: threadId)
+            #if DEBUG
+            if case .present = status {
+                lateRunAdmissionDidReadPresentForTesting?(runId, threadId)
+            }
+            #endif
             return resolveLateRunGraphStatus(
-                try durableRunGraphStatus(runId: runId, threadId: threadId),
+                status,
                 runId: runId,
-                threadId: threadId
+                threadId: threadId,
+                generation: generation
             )
         } catch {
-            var admitted = false
-            lock.withLock {
-                if let pendingThreadId = pendingLateRunValidations[runId] {
-                    guard pendingThreadId == threadId else { return }
-                    return
+            let admitted = lock.withLock { () -> Bool in
+                guard var claim = lateRunAdmissionClaims[runId],
+                      claim.matches(threadId: threadId, generation: generation) else {
+                    return false
                 }
-                if let owner = runThreadOwnership[runId] {
-                    admitted = owner == threadId
-                    return
-                }
-                guard !deletedThreadRetirementsInFlight.contains(threadId),
-                      pendingLateRunValidations.count < Self.pendingLateRunValidationLimit else {
-                    return
-                }
-                pendingLateRunValidations[runId] = threadId
+                claim.validationPending = true
+                lateRunAdmissionClaims[runId] = claim
                 rememberRunThreadOwnershipLocked(runId: runId, threadId: threadId)
-                admitted = true
+                return true
             }
-            if admitted { scheduleLateRunValidation(runId: runId, threadId: threadId) }
+            if admitted {
+                scheduleLateRunValidation(runId: runId, threadId: threadId, generation: generation)
+            }
             return admitted
         }
     }
@@ -2660,23 +2679,35 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private func resolveLateRunGraphStatus(
         _ status: DurableRunGraphStatus,
         runId: AgentRunID,
-        threadId: AgentThreadID
+        threadId: AgentThreadID,
+        generation: UInt64
     ) -> Bool {
         switch status {
         case .present:
             return lock.withLock {
-                guard pendingLateRunValidations[runId].map({ $0 == threadId }) ?? true,
+                guard let claim = lateRunAdmissionClaims[runId],
+                      claim.matches(threadId: threadId, generation: generation),
                       runThreadOwnership[runId].map({ $0 == threadId }) ?? true else {
                     return false
                 }
-                pendingLateRunValidations.removeValue(forKey: runId)
+                lateRunAdmissionClaims.removeValue(forKey: runId)
                 rememberRunThreadOwnershipLocked(runId: runId, threadId: threadId)
                 return true
             }
         case .threadAbsent:
-            purgeRejectedLateRun(runId: runId, threadId: threadId, threadAbsent: true)
+            purgeRejectedLateRun(
+                runId: runId,
+                threadId: threadId,
+                generation: generation,
+                threadAbsent: true
+            )
         case .runAbsent:
-            purgeRejectedLateRun(runId: runId, threadId: threadId, threadAbsent: false)
+            purgeRejectedLateRun(
+                runId: runId,
+                threadId: threadId,
+                generation: generation,
+                threadAbsent: false
+            )
         }
         return false
     }
@@ -2684,6 +2715,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private func purgeRejectedLateRun(
         runId: AgentRunID,
         threadId: AgentThreadID,
+        generation: UInt64,
         threadAbsent: Bool
     ) {
         mirrorEventLock.lock()
@@ -2691,6 +2723,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         defer {
             lock.unlock()
             mirrorEventLock.unlock()
+        }
+        guard let claim = lateRunAdmissionClaims[runId],
+              claim.matches(threadId: threadId, generation: generation) else {
+            return
         }
         // A run that became active during the durable read owns its state. The
         // next callback will use normal ownership rather than this late path.
@@ -2701,13 +2737,21 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
     }
 
-    private func scheduleLateRunValidation(runId: AgentRunID, threadId: AgentThreadID) {
+    private func scheduleLateRunValidation(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        generation: UInt64
+    ) {
         Task.detached { [weak self] in
             for attempt in 0..<Self.lateRunValidationTimedRetryLimit {
                 let delay = Self.lateRunValidationRetryBaseDelayNanoseconds * UInt64(1 << attempt)
                 try? await Task.sleep(nanoseconds: delay)
                 guard let self,
-                      self.lock.withLock({ self.pendingLateRunValidations[runId] == threadId }) else {
+                      self.lock.withLock({
+                          guard let claim = self.lateRunAdmissionClaims[runId] else { return false }
+                          return claim.matches(threadId: threadId, generation: generation)
+                              && claim.validationPending
+                      }) else {
                     return
                 }
                 let status: DurableRunGraphStatus
@@ -2716,7 +2760,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 } catch {
                     continue
                 }
-                _ = self.resolveLateRunGraphStatus(status, runId: runId, threadId: threadId)
+                _ = self.resolveLateRunGraphStatus(
+                    status,
+                    runId: runId,
+                    threadId: threadId,
+                    generation: generation
+                )
                 return
             }
         }
@@ -3259,7 +3308,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     }
 
     var pendingLateRunValidationIDsForTesting: Set<AgentRunID> {
-        lock.withLock { Set(pendingLateRunValidations.keys) }
+        lock.withLock { Set(lateRunAdmissionClaims.keys) }
     }
 
     var runThreadOwnershipForTesting: [AgentRunID: AgentThreadID] {
