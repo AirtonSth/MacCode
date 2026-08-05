@@ -25,7 +25,11 @@ final class AgentAppGhostRunLatchTests: XCTestCase {
         let vm: AgentAppViewModel
         let coordinator: AgentRunCoordinator
         let threadRepo: AgentThreadRepository
+        let messageRepo: AgentMessageRepository
         let runRepo: AgentRunRepository
+        let db: SQLiteDB
+        let workspaceID: WorkspaceID
+        let cwd: String
         let threadId: AgentThreadID
     }
 
@@ -49,7 +53,8 @@ final class AgentAppGhostRunLatchTests: XCTestCase {
         vm.reloadThreads()
         vm.selectThread(thread.id, markRead: false)
         return Harness(vm: vm, coordinator: coordinator, threadRepo: threadRepo,
-                       runRepo: runRepo, threadId: thread.id)
+                       messageRepo: messageRepo, runRepo: runRepo, db: db,
+                       workspaceID: workspaceID, cwd: tmp, threadId: thread.id)
     }
 
     /// The exact frame codex replays when a recovered app-server session reconnects.
@@ -212,6 +217,393 @@ final class AgentAppGhostRunLatchTests: XCTestCase {
             .hidden,
             "with the stale projection gone the Stop affordance must disappear, not sit on Stopping…"
         )
+    }
+
+    /// Backlogged terminal callback for old run A must not idle-paint newer active B.
+    func test_lateTerminalFinishForRunA_doesNotClearSelectedOwnershipOfActiveRunB() async throws {
+        let h = try makeHarness()
+        let runA = AgentRun(
+            threadId: h.threadId,
+            provider: .codex,
+            model: "gpt-5.6-sol",
+            status: .completed,
+            startedAt: Date().addingTimeInterval(-120),
+            finishedAt: Date().addingTimeInterval(-60)
+        )
+        try h.runRepo.upsert(runA)
+        let runB = AgentRun(
+            threadId: h.threadId,
+            provider: .codex,
+            model: "gpt-5.6-sol",
+            status: .running
+        )
+        try h.runRepo.upsert(runB)
+
+        // Latch B as the surface's live tracked generation.
+        h.vm.runCoordinator(h.coordinator, didReceive: mcpStartupEvent(),
+                            run: runB.id, threadId: h.threadId)
+        await waitAsync("surface owns live run B") {
+            h.vm.currentRunId == runB.id && h.vm.status == .running
+        }
+        XCTAssertTrue(h.vm.isThreadStartingOrRunning(h.threadId))
+
+        // Delayed didFinish for terminal A (main-actor backlog / stale recovery).
+        h.vm.runCoordinator(
+            h.coordinator,
+            didFinish: runA.id,
+            threadId: h.threadId,
+            status: .completed,
+            finalMessage: "stale A final",
+            providerThreadId: "provider-a"
+        )
+
+        await waitAsync("main-actor drains finish callback") {
+            // Give the Task { @MainActor } a turn without requiring state change.
+            true
+        }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(h.vm.currentRunId, runB.id,
+                       "late terminal A must not clear currentRunId while exact durable/tracked B owns the thread")
+        XCTAssertEqual(h.vm.status, .running,
+                       "late terminal A must not paint selected status idle/completed over active B")
+        XCTAssertTrue(h.vm.isThreadStartingOrRunning(h.threadId),
+                      "Working/Stop chrome must stay bound to B")
+        XCTAssertNotNil(h.vm.runStartedAt,
+                        "Working-for clock for B must survive a stale A finish")
+        XCTAssertFalse(try h.messageRepo.list(threadId: h.threadId).contains {
+            $0.role == .assistant && $0.content == "stale A final"
+        }, "late A must not append stale final text after B has started")
+    }
+
+    func test_lateTerminalStatusForRunA_doesNotClearSelectedOwnershipOfActiveRunB() async throws {
+        let h = try makeHarness()
+        let runA = AgentRun(
+            threadId: h.threadId,
+            provider: .codex,
+            model: "gpt-5.6-sol",
+            status: .completed,
+            finishedAt: Date().addingTimeInterval(-30)
+        )
+        try h.runRepo.upsert(runA)
+        let runB = AgentRun(
+            threadId: h.threadId,
+            provider: .codex,
+            model: "gpt-5.6-sol",
+            status: .running
+        )
+        try h.runRepo.upsert(runB)
+
+        h.vm.runCoordinator(h.coordinator, didReceive: mcpStartupEvent(),
+                            run: runB.id, threadId: h.threadId)
+        await waitAsync("surface owns live run B") {
+            h.vm.currentRunId == runB.id && h.vm.status == .running
+        }
+
+        h.vm.runCoordinator(
+            h.coordinator,
+            didChangeStatus: .completed,
+            runId: runA.id,
+            threadId: h.threadId
+        )
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(h.vm.currentRunId, runB.id)
+        XCTAssertEqual(h.vm.status, .running)
+        XCTAssertTrue(h.vm.isThreadStartingOrRunning(h.threadId))
+    }
+
+    func test_staleRunningStatusForRunACannotClaimEmptySurfaceWhileDurableRunBIsActive() async throws {
+        let h = try makeHarness()
+        let runA = AgentRun(
+            threadId: h.threadId,
+            provider: .codex,
+            model: "gpt-5.6-sol",
+            status: .completed,
+            finishedAt: Date().addingTimeInterval(-30)
+        )
+        try h.runRepo.upsert(runA)
+        let runB = AgentRun(
+            threadId: h.threadId,
+            provider: .codex,
+            model: "gpt-5.6-sol",
+            status: .running
+        )
+        try h.runRepo.upsert(runB)
+        XCTAssertNil(h.vm.currentRunId, "precondition: selected surface has not latched B yet")
+
+        h.vm.runCoordinator(
+            h.coordinator,
+            didChangeStatus: .running,
+            runId: runA.id,
+            threadId: h.threadId
+        )
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertNil(h.vm.currentRunId,
+                     "ambient running callback for terminal A must not exploit an empty surface latch")
+        XCTAssertNotEqual(h.vm.status, .running)
+        XCTAssertFalse(h.vm.isThreadStartingOrRunning(h.threadId))
+    }
+
+    func test_matchingTerminalFinishForTrackedRunStillClearsSelectedState() async throws {
+        let h = try makeHarness()
+        let runA = AgentRun(
+            threadId: h.threadId,
+            provider: .codex,
+            model: "gpt-5.6-sol",
+            status: .running
+        )
+        try h.runRepo.upsert(runA)
+        h.vm.runCoordinator(h.coordinator, didReceive: mcpStartupEvent(),
+                            run: runA.id, threadId: h.threadId)
+        await waitAsync("surface owns run A") {
+            h.vm.currentRunId == runA.id
+        }
+        try h.runRepo.markStopped(id: runA.id, status: .completed)
+
+        h.vm.runCoordinator(
+            h.coordinator,
+            didFinish: runA.id,
+            threadId: h.threadId,
+            status: .completed,
+            finalMessage: "done",
+            providerThreadId: nil
+        )
+        await waitAsync("matching terminal A clears selected ownership") {
+            h.vm.currentRunId == nil && h.vm.status == .completed
+        }
+        XCTAssertFalse(h.vm.isThreadStartingOrRunning(h.threadId))
+    }
+
+    func test_staleRunMapDoesNotRejectCurrentRunTerminal() async throws {
+        let h = try makeHarness()
+        let staleA = AgentRun(
+            threadId: h.threadId,
+            provider: .codex,
+            model: "gpt-5.6-sol",
+            status: .running
+        )
+        try h.runRepo.upsert(staleA)
+        h.vm.runCoordinator(h.coordinator, didReceive: mcpStartupEvent(),
+                            run: staleA.id, threadId: h.threadId)
+        await waitAsync("surface caches run A") { h.vm.currentRunId == staleA.id }
+        try h.runRepo.markStopped(id: staleA.id, status: .completed)
+
+        let currentB = AgentRun(
+            threadId: h.threadId,
+            provider: .codex,
+            model: "gpt-5.6-sol",
+            status: .running
+        )
+        try h.runRepo.upsert(currentB)
+        h.vm.runCoordinator(h.coordinator, didReceive: mcpStartupEvent(),
+                            run: currentB.id, threadId: h.threadId)
+        await waitAsync("surface advances to run B while stale A map remains") {
+            h.vm.currentRunId == currentB.id
+        }
+        try h.runRepo.markStopped(id: currentB.id, status: .completed)
+
+        h.vm.runCoordinator(
+            h.coordinator,
+            didFinish: currentB.id,
+            threadId: h.threadId,
+            status: .completed,
+            finalMessage: "current B final",
+            providerThreadId: "provider-b"
+        )
+        await waitAsync("current B terminal clears the selected projection") {
+            h.vm.currentRunId == nil && h.vm.status == .completed
+        }
+
+        XCTAssertFalse(h.vm.isThreadStartingOrRunning(h.threadId))
+        XCTAssertTrue(try h.messageRepo.list(threadId: h.threadId).contains {
+            $0.role == .assistant && $0.content == "current B final"
+        }, "a stale cache entry for A must not suppress B's authoritative terminal/final")
+
+        // B is now fully terminal and currentRunId is nil. A callback arriving
+        // even later must still be rejected by retained generation ordering.
+        h.vm.runCoordinator(
+            h.coordinator,
+            didFinish: staleA.id,
+            threadId: h.threadId,
+            status: .completed,
+            finalMessage: "late stale A final",
+            providerThreadId: "provider-a"
+        )
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertNil(h.vm.currentRunId)
+        XCTAssertEqual(h.vm.status, .completed)
+        XCTAssertFalse(try h.messageRepo.list(threadId: h.threadId).contains {
+            $0.role == .assistant && $0.content == "late stale A final"
+        }, "older A must remain rejected after newer B already cleared current ownership")
+    }
+
+    func test_freshViewModelRejectsLateAAfterNewerTerminalB() async throws {
+        let h = try makeHarness()
+        let staleA = AgentRun(
+            threadId: h.threadId,
+            provider: .codex,
+            model: "gpt-5.6-sol",
+            status: .completed,
+            startedAt: Date().addingTimeInterval(60),
+            finishedAt: Date().addingTimeInterval(61)
+        )
+        try h.runRepo.upsert(staleA)
+        let newerB = AgentRun(
+            threadId: h.threadId,
+            provider: .codex,
+            model: "gpt-5.6-sol",
+            status: .completed,
+            startedAt: Date().addingTimeInterval(-60),
+            finishedAt: Date().addingTimeInterval(-59)
+        )
+        try h.runRepo.upsert(newerB)
+        // Updating A must not move its durable generation after B.
+        try h.runRepo.upsert(staleA)
+        XCTAssertEqual(try h.runRepo.latest(for: h.threadId)?.id, newerB.id)
+
+        h.vm.dispose()
+        let fresh = AgentAppViewModel(
+            workspaceID: h.workspaceID,
+            cwd: h.cwd,
+            coordinator: h.coordinator,
+            threadRepo: h.threadRepo,
+            messageRepo: h.messageRepo,
+            promptHistoryStore: PromptHistoryStore(db: h.db)
+        )
+        fresh.reloadThreads()
+        fresh.selectThread(h.threadId, markRead: false)
+        fresh.runCoordinator(
+            h.coordinator,
+            didFinish: staleA.id,
+            threadId: h.threadId,
+            status: .completed,
+            finalMessage: "stale A after reload",
+            providerThreadId: "provider-a"
+        )
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertFalse(try h.messageRepo.list(threadId: h.threadId).contains {
+            $0.role == .assistant && $0.content == "stale A after reload"
+        })
+        XCTAssertNil(fresh.currentRunId)
+        fresh.dispose()
+    }
+
+    func test_terminalCallbackFailsClosedWhenNewestDurabilityIsUnknown() async throws {
+        XCTAssertEqual(AgentAppViewModel.terminalCallbackAuthority(
+            runId: AgentRunID(),
+            latestObservedRunId: nil,
+            activeRunId: nil,
+            currentRunId: nil,
+            durableNewestLookup: { throw SQLiteError.step("injected") }
+        ), .unknown)
+
+        let h = try makeHarness()
+        let staleA = AgentRun(threadId: h.threadId, provider: .codex, model: "gpt-5.6-sol", status: .completed)
+        try h.runRepo.upsert(staleA)
+        let newerB = AgentRun(threadId: h.threadId, provider: .codex, model: "gpt-5.6-sol", status: .completed)
+        try h.runRepo.upsert(newerB)
+
+        h.db.beforeStatementStepForTesting = { sql in
+            guard sql.contains("FROM agent_runs"), sql.contains("ORDER BY rowid DESC") else { return }
+            h.db.beforeStatementStepForTesting = nil
+            h.db.injectedResultCodesForTesting = [10]
+        }
+        h.vm.runCoordinator(
+            h.coordinator,
+            didFinish: staleA.id,
+            threadId: h.threadId,
+            status: .completed,
+            finalMessage: "stale A during durability error",
+            providerThreadId: "provider-a"
+        )
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertFalse(try h.messageRepo.list(threadId: h.threadId).contains {
+            $0.role == .assistant && $0.content == "stale A during durability error"
+        })
+        XCTAssertNil(h.vm.currentRunId)
+    }
+
+    func test_rejectedOptimisticRunBRestoresLiveRunAAsLatestGeneration() async throws {
+        let h = try makeHarness()
+        let liveA = AgentRun(
+            threadId: h.threadId,
+            provider: .codex,
+            model: "gpt-5.6-sol",
+            status: .running
+        )
+        try h.runRepo.upsert(liveA)
+        h.vm.runCoordinator(h.coordinator, didReceive: mcpStartupEvent(),
+                            run: liveA.id, threadId: h.threadId)
+        await waitAsync("surface owns recovered live A") {
+            h.vm.currentRunId == liveA.id
+        }
+
+        // Mirrors startProviderRun's optimistic UI update followed by admission
+        // rejection because A still owns the provider session.
+        let rejectedB = AgentRunID()
+        let tracking = h.vm.beginOptimisticRunTracking(rejectedB, threadId: h.threadId)
+        h.vm.rollbackOptimisticRunTracking(tracking, durability: .confirmedAbsent)
+
+        try h.runRepo.markStopped(id: liveA.id, status: .completed)
+        h.vm.runCoordinator(
+            h.coordinator,
+            didFinish: liveA.id,
+            threadId: h.threadId,
+            status: .completed,
+            finalMessage: "legitimate A final",
+            providerThreadId: "provider-a"
+        )
+        await waitAsync("A terminal remains authorized after rejected B") {
+            h.vm.currentRunId == nil && h.vm.status == .completed
+        }
+
+        XCTAssertTrue(try h.messageRepo.list(threadId: h.threadId).contains {
+            $0.role == .assistant && $0.content == "legitimate A final"
+        }, "a rejected non-durable B must restore A's generation marker")
+    }
+
+    func test_unknownOptimisticRunBDurabilityFailsClosedAndPreservesBOrdering() async throws {
+        let h = try makeHarness()
+        let runA = AgentRun(
+            threadId: h.threadId,
+            provider: .codex,
+            model: "gpt-5.6-sol",
+            status: .running
+        )
+        try h.runRepo.upsert(runA)
+        h.vm.runCoordinator(h.coordinator, didReceive: mcpStartupEvent(),
+                            run: runA.id, threadId: h.threadId)
+        await waitAsync("surface owns A") { h.vm.currentRunId == runA.id }
+
+        let runB = AgentRunID()
+        let tracking = h.vm.beginOptimisticRunTracking(runB, threadId: h.threadId)
+        let durability = AgentAppViewModel.optimisticRunDurability {
+            throw NSError(
+                domain: "SQLite",
+                code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "database is locked"]
+            )
+        }
+        h.vm.rollbackOptimisticRunTracking(tracking, durability: durability)
+
+        try h.runRepo.markStopped(id: runA.id, status: .completed)
+        h.vm.runCoordinator(
+            h.coordinator,
+            didFinish: runA.id,
+            threadId: h.threadId,
+            status: .completed,
+            finalMessage: "stale A during unknown B durability",
+            providerThreadId: "provider-a"
+        )
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertFalse(try h.messageRepo.list(threadId: h.threadId).contains {
+            $0.role == .assistant && $0.content == "stale A during unknown B durability"
+        }, "a durability read error must preserve B ordering instead of treating B as absent")
     }
 }
 

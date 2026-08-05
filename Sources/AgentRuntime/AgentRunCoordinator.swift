@@ -891,6 +891,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     // while unfinished.
     private var autoContinuationCounts: [AgentThreadID: Int] = [:]
     private var autoContinuationTokens: [AgentThreadID: Int] = [:]
+    /// Passive recovery installs a process/parser callback generation per thread.
+    /// Foreground send invalidates the prior epoch so late recovery A cannot
+    /// publish lifecycle onto terminal history or a newer run B.
+    private var recoveryLifecycleEpochs: [AgentThreadID: UInt64] = [:]
     // PERF-MAC_AGENT-006: last assistant text persisted per thread, to dedup the
     // turnCompleted/finished pair without reloading the whole thread history.
     private var lastPersistedAssistantContent: [AgentThreadID: String] = [:]
@@ -1194,6 +1198,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return try runRepo.latestActive(for: threadId)
     }
 
+    /// Newest durable run generation for terminal callback ordering. Unlike
+    /// `durableActiveRun`, this retains authority after the newer run finishes.
+    public func durableLatestRun(threadId: AgentThreadID) throws -> AgentRun? {
+        try runRepo.latest(for: threadId)
+    }
+
     /// The currently-active run id for a thread (nil when idle). Lets a surface
     /// resync its per-surface `currentRunId` when it switches to an
     /// already-running thread, so Stop targets the right run.
@@ -1274,6 +1284,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         guard !hasProviderSession(threadId: request.threadId) else {
             throw AgentProviderAdapterError.unsupported("Provider session already has an in-flight turn")
         }
+        // The live-session rejection above must preserve recovery A. Once it
+        // succeeds, no registered recovery session remains authoritative and A
+        // must be retired before B becomes durable or crosses another await.
+        invalidateRecoveryLifecycleEpoch(for: request.threadId)
         lock.lock()
         let pendingStartFailureRunIds = pendingStartFailures.compactMap { runId, pending in
             pending.request.threadId == request.threadId ? runId : nil
@@ -2894,6 +2908,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     }
 
     public func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] {
+        // Terminal completed/failed/cancelled history is already durable. Do not
+        // spawn a live recovery process just to paint the recent window — that is
+        // the path that mapped ambient provider callbacks onto lastRunId.
+        if try shouldServeBoundedDurableHistoryWithoutLiveRecovery(threadId: threadId) {
+            return Self.boundedHotReplay(latestStreamEvents(threadId: threadId))
+        }
         let adapter = try adapterForThread(threadId)
         try await recoverAdapterSessionIfNeeded(threadId: threadId, adapter: adapter)
         return Self.boundedHotReplay(try await adapter.readThread(threadId: threadId))
@@ -3518,6 +3538,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // provider tag so `| distill` savings attribute to claude/codex (not "unknown").
         let recoveryRunID = AgentRunID()
         let recoveryEventRunId = try recoveryEventRunId(session: session, thread: thread)
+        let recoveryEpoch = beginRecoveryLifecycleEpoch(for: threadId)
         var environment = await recoveryEnvironmentProvider?(thread.provider, threadId) ?? [:]
         environment["REMOTE_CODE_AGENT_PROVIDER"] = thread.provider.rawValue
         // Resume bypasses providerEnvironment; re-stamp attempt + receipt so distill
@@ -3549,11 +3570,117 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             runAsUser: thread.runAsUser
         )
         try await adapter.recoverSession(request) { [weak self] event in
-            self?.handle(event: event, runId: recoveryEventRunId, threadId: threadId)
+            guard let self else { return }
+            guard self.recoveryEventIsAuthorized(
+                event,
+                runId: recoveryEventRunId,
+                threadId: threadId,
+                epoch: recoveryEpoch
+            ) else {
+                return
+            }
+            self.handle(event: event, runId: recoveryEventRunId, threadId: threadId)
         }
         lock.lock()
         providerTurnScopes[threadId] = ProviderTurnScope(environment: request.environment)
         lock.unlock()
+    }
+
+    /// Completed/failed/cancelled history has no live generation to reattach.
+    /// Serve the bounded durable stream without spawning provider recovery.
+    /// Interrupted/pending/running sessions still need live recover for Continue.
+    private func shouldServeBoundedDurableHistoryWithoutLiveRecovery(
+        threadId: AgentThreadID
+    ) throws -> Bool {
+        guard let thread = try threadRepo.get(id: threadId) else { return false }
+        switch thread.status {
+        case .completed, .failed, .cancelled:
+            break
+        case .pending, .running, .interrupted:
+            return false
+        }
+        guard try runRepo.latestActive(for: threadId) == nil else { return false }
+        guard let session = try providerSessionRepo?.get(threadId: threadId) else {
+            return true
+        }
+        switch session.status {
+        case .pending, .running, .interrupted:
+            return false
+        case .completed, .failed, .cancelled:
+            return true
+        }
+    }
+
+    private func isDurablePendingOrRunningRun(_ runId: AgentRunID) throws -> Bool {
+        guard let run = try runRepo.get(id: runId) else { return false }
+        switch run.status {
+        case .pending, .running:
+            return true
+        case .completed, .failed, .cancelled, .interrupted:
+            return false
+        }
+    }
+
+    /// Recovery callbacks can outlive the durable run they were attached to.
+    /// Recheck ownership at callback time so terminal A cannot keep publishing
+    /// lifecycle after A ended (even when no replacement B was started).
+    private func recoveryEventIsAuthorized(
+        _ event: AgentRunEvent,
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        epoch: UInt64
+    ) -> Bool {
+        guard isCurrentRecoveryLifecycleEpoch(epoch, threadId: threadId) else {
+            return false
+        }
+        if Self.passiveRecoveryEventIsAllowed(event) {
+            return true
+        }
+        lock.lock()
+        let terminalClaimed = finishingRuns.contains(runId)
+            || pendingTerminalEvents[runId] != nil
+            || deferredProviderTerminalEvents[runId] != nil
+        lock.unlock()
+        guard !terminalClaimed else { return false }
+        return (try? isDurablePendingOrRunningRun(runId)) == true
+    }
+
+    /// Terminal/missing recovery may repair a provider cursor and disclose why
+    /// resume degraded, but it cannot replay items/turns/status/finished through
+    /// the live coordinator path (those fan out UI activity and notifications).
+    nonisolated static func passiveRecoveryEventIsAllowed(_ event: AgentRunEvent) -> Bool {
+        switch event {
+        case .error:
+            return true
+        case .event(let assistantEvent):
+            switch assistantEvent {
+            case .threadStarted, .providerRuntime:
+                return true
+            default:
+                return false
+            }
+        case .status, .finished:
+            return false
+        }
+    }
+
+    @discardableResult
+    private func beginRecoveryLifecycleEpoch(for threadId: AgentThreadID) -> UInt64 {
+        lock.lock()
+        let next = (recoveryLifecycleEpochs[threadId] ?? 0) &+ 1
+        recoveryLifecycleEpochs[threadId] = next
+        lock.unlock()
+        return next
+    }
+
+    private func invalidateRecoveryLifecycleEpoch(for threadId: AgentThreadID) {
+        _ = beginRecoveryLifecycleEpoch(for: threadId)
+    }
+
+    private func isCurrentRecoveryLifecycleEpoch(_ epoch: UInt64, threadId: AgentThreadID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return recoveryLifecycleEpochs[threadId] == epoch
     }
 
     private func recoveryEventRunId(

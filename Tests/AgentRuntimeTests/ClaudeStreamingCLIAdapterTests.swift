@@ -4,7 +4,7 @@ import CoreModel
 
 final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
     func test_agentSDKBridgeInvalidatedAcceptancePermitBlocksTurnBeforeWireWrite() async throws {
-        guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
+        _ = try XCTUnwrap(ProcessLocator.resolve("node"), "node is required for the SDK interrupt regression")
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-sdk-acceptance-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
@@ -175,13 +175,13 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         try adapter.stopSession(threadId: threadId)
     }
 
-    func test_streamingCLIAdapterFinalizesAssistantTextWhenProcessExitsWithoutResult() async throws {
+    func test_streamingCLIAdapterPreservesPartialTextButFailsWhenProcessExitsWithoutResult() async throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-streaming-finalize-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         let script = tmp.appendingPathComponent("fake-claude")
         try """
-        #!/usr/bin/env python3
+        #!/usr/bin/python3
         import json, sys
         session = "stream-finalize-session"
         print(json.dumps({"type":"system","subtype":"init","session_id":session}), flush=True)
@@ -206,10 +206,12 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
             Task { await sink.record(event) }
         }
 
-        try await waitForFinish(in: sink, expected: "STREAM_ONLY_FINAL")
+        try await waitForTerminalStatus(in: sink, expected: .failed)
         let events = await sink.snapshot()
         XCTAssertTrue(Self.assistantTexts(in: events).contains("STREAM_ONLY_FINAL"),
                       "Claude streaming adapter must finalize buffered assistant text on EOF so the user sees a response even when result is missing")
+        XCTAssertFalse(Self.finishedPairs(events).contains { $0.0 == .completed },
+                       "partial text plus EOF is not an authoritative successful result")
     }
 
     func test_streamingCLIUnexpectedProcessExitIsFailureNotCancellation() async throws {
@@ -308,6 +310,71 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                           "cancel must ask the SDK query to interrupt before the grace timeout hard-closes its bridge")
     }
 
+    func test_agentSDKInterruptGraceAtomicallyDetachesABeforeStoppingWhileBStarts() async throws {
+        _ = try XCTUnwrap(ProcessLocator.resolve("node"), "node is required for the SDK interrupt-generation regression")
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-sdk-interrupt-claim-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+        try """
+        import readline from 'node:readline';
+        const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+        function write(obj) { process.stdout.write(JSON.stringify(obj) + '\\n'); }
+        for await (const line of rl) {
+          if (!line.trim()) continue;
+          const cmd = JSON.parse(line);
+          if (cmd.type === 'rc_configure') write({ type: 'system', subtype: 'init', session_id: 'sdk-interrupt-claim' });
+          if (cmd.type === 'rc_close') process.exit(0);
+          // Ignore rc_interrupt so the grace escalation owns teardown.
+        }
+        """.write(to: bridge, atomically: true, encoding: .utf8)
+
+        let adapter = ClaudeAgentSDKBridgeAdapter(
+            bridgeScriptPath: bridge.path,
+            interruptGracePeriod: 0.05
+        )
+        let threadId = AgentThreadID()
+        let runA = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "run A"
+        )) { _ in }
+        let claimEntered = DispatchSemaphore(value: 0)
+        let allowOldStop = DispatchSemaphore(value: 0)
+        adapter.beforeEscalatedSessionStopForTesting = {
+            claimEntered.signal()
+            allowOldStop.wait()
+        }
+        runA.cancel()
+        await Task.detached { claimEntered.wait() }.value
+        XCTAssertFalse(adapter.hasSession(threadId: threadId),
+                       "SDK A must be detached before its bridge is closed")
+
+        let runB = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "run B",
+            providerThreadId: "sdk-interrupt-claim"
+        )) { _ in }
+        runA.cancel()
+        XCTAssertTrue(adapter.hasSession(threadId: threadId),
+                      "stale SDK handle A cancel must not detach replacement bridge B")
+        adapter.beforeEscalatedSessionStopForTesting = nil
+        allowOldStop.signal()
+        try? await Task.sleep(nanoseconds: 150_000_000)
+
+        XCTAssertTrue(adapter.hasSession(threadId: threadId),
+                      "SDK A's delayed close must preserve replacement bridge B")
+        XCTAssertTrue(runB.process?.isRunning == true,
+                      "SDK A's delayed close must terminate only A's detached bridge")
+        adapter.stopAll()
+    }
+
     func test_recoverableRateLimitTelemetryDoesNotFailSuccessfulStreamingTurn() async throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-streaming-rate-limit-\(UUID().uuidString)", isDirectory: true)
@@ -321,6 +388,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
             if not line.strip():
                 continue
             print(json.dumps({"type":"rate_limit_event","limit_type":"requests","reset_at":"2026-05-24T22:00:00Z"}), flush=True)
+            print(json.dumps({"type":"assistant","message":{"content":[{"type":"text","text":"1 2 3 4 5 6 7 8 9 10"}]},"session_id":"rate-limit-session"}), flush=True)
             print(json.dumps({"type":"result","subtype":"success","is_error":False,"result":"1 2 3 4 5 6 7 8 9 10","session_id":"rate-limit-session"}), flush=True)
         """.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
@@ -1105,6 +1173,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
             fs.appendFileSync(log, JSON.stringify(cmd) + '\\n');
             write({ type: 'system', subtype: 'init', session_id: 'distill-session' });
           } else if (cmd.type === 'rc_turn') {
+            write({ type: 'assistant', message: { content: [{ type: 'text', text: 'OK' }] }, session_id: 'distill-session' });
             write({ type: 'result', subtype: 'success', is_error: false, result: 'OK', session_id: 'distill-session' });
           } else if (cmd.type === 'rc_close') {
             process.exit(0);
@@ -1186,7 +1255,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                        "Token Saver off must not inject the safety ABI")
     }
 
-    func test_agentSDKBridgeAdapterFinalizesAssistantTextWhenBridgeExitsWithoutResult() async throws {
+    func test_agentSDKBridgeAdapterPreservesPartialTextButFailsWhenBridgeExitsWithoutResult() async throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-sdk-finalize-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
@@ -1220,10 +1289,12 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
             Task { await sink.record(event) }
         }
 
-        try await waitForFinish(in: sink, expected: "SDK_ONLY_FINAL")
+        try await waitForTerminalStatus(in: sink, expected: .failed)
         let events = await sink.snapshot()
         XCTAssertTrue(Self.assistantTexts(in: events).contains("SDK_ONLY_FINAL"),
                       "Claude SDK bridge must finalize buffered assistant text on EOF so a bridge exit cannot drop the response")
+        XCTAssertFalse(Self.finishedPairs(events).contains { $0.0 == .completed },
+                       "bridge EOF without a result must remain failed even when partial text is readable")
     }
 
     func test_agentSDKBridgeRecoverableRateLimitTelemetryDoesNotFailSuccessfulTurn() async throws {
@@ -1242,6 +1313,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
             write({ type: 'system', subtype: 'init', session_id: 'sdk-rate-limit-session' });
           } else if (cmd.type === 'rc_turn') {
             write({ type: 'rate_limit_event', limit_type: 'requests', reset_at: '2026-05-24T22:00:00Z' });
+            write({ type: 'assistant', message: { content: [{ type: 'text', text: 'SDK_RATE_LIMIT_OK' }] }, session_id: 'sdk-rate-limit-session' });
             write({ type: 'result', subtype: 'success', is_error: false, result: 'SDK_RATE_LIMIT_OK', session_id: 'sdk-rate-limit-session' });
           } else if (cmd.type === 'rc_close') {
             process.exit(0);
@@ -2088,7 +2160,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         // indentation (the script then dies and the test measures the wrong thing).
         let body = "    "
         var lines: [String] = [
-            "#!/usr/bin/env python3",
+            "#!/usr/bin/python3",
             "import json, sys, time",
             "S = \"claude-bg-session\"",
             "def e(o):",
@@ -2107,10 +2179,19 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         if !neverCompletes {
             lines += [
                 body + "time.sleep(0.25)",
+                // Schema drift is ambiguity, not an authoritative idle snapshot.
+                body + "e({\"type\":\"system\",\"subtype\":\"background_tasks_changed\",\"tasks\":\"corrupt\",\"session_id\":S})",
+                body + "e({\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"MALFORMED_SNAPSHOT_MUST_NOT_FINISH\"}]},\"session_id\":S})",
+                body + "e({\"type\":\"result\",\"subtype\":\"success\",\"is_error\":False,\"result\":\"MALFORMED_SNAPSHOT_MUST_NOT_FINISH\",\"session_id\":S})",
                 // provider goes idle, then resumes the agent on its own
                 body + "e({\"type\":\"system\",\"subtype\":\"background_tasks_changed\",\"tasks\":[],\"session_id\":S})",
                 body + "e({\"type\":\"system\",\"subtype\":\"task_updated\",\"task_id\":\"T1\",\"patch\":{\"status\":\"completed\"},\"session_id\":S})",
                 body + "e({\"type\":\"system\",\"subtype\":\"task_notification\",\"task_id\":\"T1\",\"status\":\"completed\",\"session_id\":S})",
+                // Exact incident shape: zero-token ambient result emitted by the
+                // task notification. Assistant-shaped notification prose still
+                // cannot lend it foreground lifecycle ownership.
+                body + "e({\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"AMBIENT_NOTIFICATION_PROSE\"}]},\"session_id\":S})",
+                body + "e({\"type\":\"result\",\"subtype\":\"success\",\"is_error\":False,\"result\":\"\",\"session_id\":S,\"origin\":{\"kind\":\"task-notification\"},\"usage\":{\"input_tokens\":0,\"output_tokens\":0}})",
                 body + "e({\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"REAL_ANSWER_AFTER_BG\"}]},\"session_id\":S})",
                 body + "e({\"type\":\"result\",\"subtype\":\"success\",\"is_error\":False,\"result\":\"REAL_ANSWER_AFTER_BG\",\"session_id\":S})",
             ]
@@ -2147,8 +2228,15 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         }
         let deadline = Date().addingTimeInterval(4)
         while Date() < deadline {
-            let finished = await sink.snapshot().contains { if case .finished = $0 { return true }; return false }
-            if finished { break }
+            let snapshot = await sink.snapshot()
+            let finished = snapshot.contains { if case .finished = $0 { return true }; return false }
+            let stalled = snapshot.contains {
+                if case .event(.providerRuntime(let runtime)) = $0 {
+                    return runtime.method == "claude.turn.deferred.stall"
+                }
+                return false
+            }
+            if finished || (neverCompletes && stalled) { break }
             try? await Task.sleep(nanoseconds: 30_000_000)
         }
         // Settle briefly so a (wrong) second terminal would be observed too.
@@ -2174,7 +2262,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         let finishes = Self.finishedPairs(events)
 
         XCTAssertEqual(finishes.count, 1,
-                       "a run that left a background task running must produce exactly ONE terminal event, not one per provider `result`")
+                       "a run that left a background task running must produce exactly ONE terminal event, not one per provider `result`; observed: \(events)")
         XCTAssertEqual(finishes.first?.1, "REAL_ANSWER_AFTER_BG",
                        "the terminal must carry the answer the agent gave AFTER the background task completed — finishing on the premature `result` is what made the thread read as done while work was still running")
         XCTAssertFalse(finishes.contains { $0.1 == "PREMATURE_STANDING_BY" },
@@ -2194,12 +2282,10 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                        "the run must finish on the parent turn that follows the subagent's completion, carrying its real answer")
     }
 
-    func test_deferredFinishStillReachesTerminalWhenBackgroundWorkNeverCompletes() async throws {
-        // Liveness bound (Codex advisory): withholding the finish must never let a
-        // run hang non-terminal forever. If the provider never reports idle, the
-        // watchdog releases the withheld finish so the thread still settles (and
-        // the awaiting-banner fallback can drive it), instead of spinning as
-        // "working" with no way out.
+    func test_deferredFinishWatchdogIsDiagnosticAndNeverFabricatesSuccess() async throws {
+        // A quiet provider is not proof that background work completed. The
+        // watchdog may diagnose the stall, but only Stop/process exit or a later
+        // owned result may emit a terminal edge.
         let events = try await runBackgroundLifecycleTurn(
             taskType: "local_bash",
             neverCompletes: true,
@@ -2207,10 +2293,17 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         )
         let finishes = Self.finishedPairs(events)
 
-        XCTAssertEqual(finishes.count, 1,
-                       "the inactivity watchdog must emit exactly one terminal when the provider never goes idle")
-        XCTAssertEqual(finishes.first?.1, "PREMATURE_STANDING_BY",
-                       "with no resumed turn to supersede it, the withheld finish is what settles the run")
+        XCTAssertTrue(finishes.isEmpty,
+                      "watchdog inactivity must not turn PREMATURE_STANDING_BY into a green terminal")
+        let diagnostics = events.compactMap { event -> ProviderRuntimeEvent? in
+            if case .event(.providerRuntime(let runtime)) = event,
+               runtime.method == "claude.turn.deferred.stall" {
+                return runtime
+            }
+            return nil
+        }
+        XCTAssertEqual(diagnostics.count, 1,
+                       "a stalled deferred finish should emit one nonterminal diagnostic")
     }
 
     func test_turnWithoutBackgroundWorkFinishesImmediately() async throws {
@@ -2407,7 +2500,24 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
             }
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTFail("timed out waiting for \(expected)")
+        let observed = await sink.snapshot()
+        XCTFail("timed out waiting for \(expected); observed \(observed)")
+    }
+
+    private func waitForTerminalStatus(in sink: EventSink, expected: AgentRunStatus) async throws {
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            let events = await sink.snapshot()
+            if events.contains(where: {
+                if case .finished(let status, _, _) = $0 { return status == expected }
+                return false
+            }) {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let observed = await sink.snapshot()
+        XCTFail("timed out waiting for terminal status \(expected); observed \(observed)")
     }
 
     private func waitForUserInput(in sink: EventSink, requestId: String) async throws {

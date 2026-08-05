@@ -66,6 +66,54 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(finished.providerThreadId, "session-fixed")
     }
 
+    func test_staleCancelGraceFromRunADoesNotStopRunB() async throws {
+        // WHY: a delayed cancellation-grace timer from run A must not force-kill
+        // newer run B on the same resident session. Grace must capture the exact
+        // in-flight generation interrupted by cancel A.
+        let peer = try FakeGrokACPPeer(mode: .cancel)
+        defer { peer.remove() }
+        let grace: TimeInterval = 0.35
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path, cancellationGracePeriod: grace)
+        let threadId = AgentThreadID()
+
+        let boxA = GrokACPEventBox()
+        let handleA = try await adapter.startSession(makeRequest(threadId: threadId)) { boxA.append($0) }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        handleA.cancel()
+        let finishedA = try await boxA.waitFinished(timeout: 3)
+        XCTAssertEqual(finishedA.status, .cancelled)
+
+        // Start B while A's grace timer is still armed.
+        let boxB = GrokACPEventBox()
+        let handleB = try await adapter.sendTurn(makeRequest(
+            threadId: threadId,
+            providerThreadId: finishedA.providerThreadId
+        )) { boxB.append($0) }
+        handleA.cancel()
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(boxB.finishedCount, 0,
+                       "stale Grok handle A cancel must not terminalize run B")
+
+        // Wait past A's grace window. With the bug, A's timer sees B in-flight
+        // and stops the process; B then fails instead of remaining open.
+        try await Task.sleep(nanoseconds: UInt64((grace + 0.25) * 1_000_000_000))
+        XCTAssertEqual(
+            boxB.finishedCount,
+            0,
+            "stale cancel grace from run A must not terminalize run B"
+        )
+        XCTAssertTrue(
+            adapter.hasSession(threadId: threadId),
+            "run B must keep the resident Grok session alive after A's grace fires"
+        )
+
+        handleB.cancel()
+        let finishedB = try await boxB.waitFinished(timeout: 3)
+        XCTAssertEqual(finishedB.status, .cancelled,
+                       "run B must still cancel cleanly on its own interrupt")
+        adapter.stopAll()
+    }
+
     func test_crashBeforePromptResponseIsFailedButKeepsProviderIdentity() async throws {
         let peer = try FakeGrokACPPeer(mode: .crash)
         defer { peer.remove() }
@@ -557,24 +605,37 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         let threadId = AgentThreadID()
         let box = GrokACPEventBox()
         let handle = try await adapter.startSession(makeRequest(threadId: threadId)) { box.append($0) }
+        let escalationClaimed = GrokACPAsyncSignal()
+        let allowOldStop = DispatchSemaphore(value: 0)
+        adapter.beforeEscalatedSessionStopForTesting = {
+            Task { await escalationClaimed.signal() }
+            allowOldStop.wait()
+        }
         handle.cancel()
+        await escalationClaimed.wait()
+        XCTAssertFalse(adapter.hasSession(threadId: threadId),
+                       "the ignored-cancel generation must be atomically detached before its process is stopped")
+
+        // Start replacement B in the exact former check-to-stop gap. Releasing
+        // A's delayed teardown must stop only A's detached client, never B.
+        let replacement = GrokACPEventBox()
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: "session-fixed"
+        )) { replacement.append($0) }
+        allowOldStop.signal()
         let cancelled = try await box.waitFinished(timeout: 3)
         let savedProviderThreadId = try XCTUnwrap(cancelled.providerThreadId)
         XCTAssertEqual(cancelled.status, .cancelled)
-        XCTAssertFalse(adapter.hasSession(threadId: threadId),
-                       "a process that was force-killed cannot remain a reusable live session")
-
-        let recovered = GrokACPEventBox()
-        try await adapter.recoverSession(makeRequest(
-            threadId: threadId,
-            providerThreadId: savedProviderThreadId
-        )) { recovered.append($0) }
+        XCTAssertTrue(adapter.hasSession(threadId: threadId),
+                      "A's delayed stop must preserve replacement session B")
 
         let history = try await adapter.readThread(threadId: threadId)
         XCTAssertTrue(Self.assistantText(in: history).contains("replayed"),
                       "recovery must load the saved ACP identity into a fresh process")
-        XCTAssertFalse(recovered.assistantText.contains("replayed"),
+        XCTAssertFalse(replacement.assistantText.contains("replayed"),
                        "forced-cancel recovery must not push load replay into the live stream")
+        XCTAssertEqual(savedProviderThreadId, "session-fixed")
         XCTAssertEqual(peer.launchCount, 2)
         adapter.stopAll()
     }

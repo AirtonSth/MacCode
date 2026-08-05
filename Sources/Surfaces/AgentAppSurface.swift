@@ -409,6 +409,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var promptHistory: [String] = []
     private var promptHistoryCursor: Int?
     private var terminalRunIds = Set<AgentRunID>()
+    /// Latest run generation this surface observed as genuinely active for each
+    /// thread. Retained after terminal so a later callback from superseded A
+    /// cannot repaint/persist after newer B has already completed.
+    private var latestObservedRunByThread: [AgentThreadID: AgentRunID] = [:]
     private var timelineUpdateTickTask: Task<Void, Never>?
     // UX-XPLAT-DELETE-UNDO: drops the transient delete snapshot when the undo
     // window lapses. Cancelled on a new delete, on undo, or on teardown.
@@ -598,6 +602,89 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Maps an in-flight run back to its thread so a completion can mark
     /// the right thread unread even after the user navigated away (B6).
     private var runThreads: [AgentRunID: AgentThreadID] = [:]
+
+    struct OptimisticRunTrackingToken {
+        let runId: AgentRunID
+        let threadId: AgentThreadID
+        let previousLatestRunId: AgentRunID?
+    }
+
+    enum OptimisticRunDurability: Equatable {
+        case confirmedAbsent
+        case presentOrUnknown
+    }
+
+    enum TerminalCallbackAuthority: Equatable {
+        case owns
+        case superseded
+        case unknown
+    }
+
+    nonisolated static func optimisticRunDurability(
+        _ lookup: () throws -> AgentRunStatus?
+    ) -> OptimisticRunDurability {
+        do {
+            return try lookup() == nil ? .confirmedAbsent : .presentOrUnknown
+        } catch {
+            return .presentOrUnknown
+        }
+    }
+
+    nonisolated static func terminalCallbackAuthority(
+        runId: AgentRunID,
+        latestObservedRunId: AgentRunID?,
+        activeRunId: AgentRunID?,
+        currentRunId: AgentRunID?,
+        durableNewestLookup: () throws -> AgentRunID?
+    ) -> TerminalCallbackAuthority {
+        if let latestObservedRunId, latestObservedRunId != runId { return .superseded }
+        if let activeRunId, activeRunId != runId { return .superseded }
+        if let currentRunId, currentRunId != runId { return .superseded }
+        do {
+            guard let durableNewest = try durableNewestLookup() else { return .unknown }
+            return durableNewest == runId ? .owns : .superseded
+        } catch {
+            return .unknown
+        }
+    }
+
+    private func trackActiveRun(_ runId: AgentRunID, threadId: AgentThreadID) {
+        runThreads[runId] = threadId
+        latestObservedRunByThread[threadId] = runId
+    }
+
+    func beginOptimisticRunTracking(
+        _ runId: AgentRunID,
+        threadId: AgentThreadID
+    ) -> OptimisticRunTrackingToken {
+        let tracking = OptimisticRunTrackingToken(
+            runId: runId,
+            threadId: threadId,
+            previousLatestRunId: latestObservedRunByThread[threadId]
+        )
+        trackActiveRun(runId, threadId: threadId)
+        return tracking
+    }
+
+    /// Roll back only a run that never became durable. A provider can finish
+    /// synchronously before startRun returns; its durable row proves B was real
+    /// and its generation ordering must remain newer than A.
+    func rollbackOptimisticRunTracking(
+        _ token: OptimisticRunTrackingToken,
+        durability: OptimisticRunDurability
+    ) {
+        guard durability == .confirmedAbsent else { return }
+        if runThreads[token.runId] == token.threadId {
+            runThreads[token.runId] = nil
+        }
+        if latestObservedRunByThread[token.threadId] == token.runId {
+            if let previous = token.previousLatestRunId {
+                latestObservedRunByThread[token.threadId] = previous
+            } else {
+                latestObservedRunByThread.removeValue(forKey: token.threadId)
+            }
+        }
+    }
 
     /// Cross-thread mirror of `selectedThreadId` so nonisolated stream delivery
     /// can drop events for other surfaces without a MainActor hop. Updated on
@@ -3265,7 +3352,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         )
         if let durable {
             currentRunId = durable.id
-            runThreads[durable.id] = threadId
+            trackActiveRun(durable.id, threadId: threadId)
             if status != .running { status = .running }
         }
         ensureScheduledLivePoll(for: threadId)
@@ -3318,7 +3405,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 persisted: durable.startedAt
             )
             currentRunId = durable.id
-            runThreads[durable.id] = id
+            trackActiveRun(durable.id, threadId: id)
             if status != .running { status = .running }
         }
     }
@@ -4929,6 +5016,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             environment: graphifyEnv,
             runAsUser: threadRunAsUser
         )
+        let optimisticTracking = beginOptimisticRunTracking(runId, threadId: tid)
         do {
             guard var pendingThread = try threadRepo.get(id: tid) else {
                 throw NSError(
@@ -4945,11 +5033,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             status = .pending
             currentRunId = runId
-            runThreads[runId] = tid
             runStartedAt = nil
             isStopping = false
             onRunStateChange?()
         } catch {
+            rollbackOptimisticRunTracking(optimisticTracking, durability: .confirmedAbsent)
             statusMessage = "Failed to prepare run: \(error)"
             status = .failed
             return nil
@@ -4980,7 +5068,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.terminalRunIds.remove(runId)
                 if runStatus == .running || runStatus == .pending {
                     self.currentRunId = runId
-                    self.runThreads[runId] = tid
+                    self.trackActiveRun(runId, threadId: tid)
                     self.status = .running
                     self.runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
                         current: self.runStartedAt,
@@ -4998,6 +5086,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             return runId
         } catch {
+            let durability = Self.optimisticRunDurability {
+                try coordinator.runStatus(runId)
+            }
             await MainActor.run {
                 // Prefer LocalizedError copy so ManagedProviderAdmissionError shows
                 // the human message instead of the raw enum case name in the banner.
@@ -5005,7 +5096,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.statusMessage = "Failed to start: \(detail)"
                 self.status = .failed
                 self.currentRunId = nil
-                self.runThreads[runId] = nil
+                self.rollbackOptimisticRunTracking(
+                    optimisticTracking,
+                    durability: durability
+                )
+                if durability == .confirmedAbsent {
+                    // The rollback removed non-durable B.
+                } else {
+                    self.runThreads[runId] = nil
+                }
                 self.runStartedAt = nil
                 self.clearActivePlanFollowUpSuppressionIfSafe()
                 self.reloadThreads()
@@ -5465,6 +5564,44 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return false
     }
 
+    /// Whether a terminal status/finish for `runId` may clear or repaint the
+    /// selected thread's Working/idle chrome.
+    ///
+    /// WHY: a main-actor backlog can deliver old run A's terminal after newer
+    /// run B is already tracked or durable-active. A must not idle-paint over B.
+    private func terminalCallbackAuthority(
+        runId: AgentRunID,
+        threadId: AgentThreadID
+    ) -> TerminalCallbackAuthority {
+        Self.terminalCallbackAuthority(
+            runId: runId,
+            latestObservedRunId: latestObservedRunByThread[threadId],
+            activeRunId: coordinator.activeRunId(threadId: threadId),
+            currentRunId: threadId == selectedThreadId ? currentRunId : nil,
+            durableNewestLookup: { try coordinator.durableLatestRun(threadId: threadId)?.id }
+        )
+    }
+
+    /// Drop callback-cache generations that have no coordinator or durable
+    /// active ownership. This keeps a missed terminal for A from making the rail
+    /// look busy after the authoritative current B terminal arrives.
+    private func pruneStaleRunMappings(threadId: AgentThreadID) {
+        let authoritative: AgentRunID?
+        if let active = coordinator.activeRunId(threadId: threadId) {
+            authoritative = active
+        } else {
+            do {
+                authoritative = try coordinator.durableLatestRun(threadId: threadId)?.id
+            } catch {
+                // Unknown durability must retain protective mappings.
+                return
+            }
+        }
+        runThreads = runThreads.filter { runId, mappedThreadId in
+            mappedThreadId != threadId || runId == authoritative
+        }
+    }
+
     // PERF-MAC_AGENT-010: accumulate streaming events and flush all of them in
     // a single main-actor hop. A fast token stream emits thousands of events/sec;
     // the old code allocated one Task per event. Now the first event schedules
@@ -5530,7 +5667,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             if self.streamEventMayMarkRunActive(run, threadId: threadId) {
                 nextCurrentRunId = run
-                self.runThreads[run] = threadId
+                self.trackActiveRun(run, threadId: threadId)
                 if nextStatus != .running { nextStatus = .running }
                 // Stream events can mark the run running before startProviderRun
                 // assigns runStartedAt. Seed it so the live window does not fall
@@ -5632,7 +5769,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         if streamEventMayMarkRunActive(run, threadId: threadId) {
             currentRunId = run
-            runThreads[run] = threadId
+            trackActiveRun(run, threadId: threadId)
             if status != .running { status = .running }
         }
         timeline.apply(event)
@@ -5845,21 +5982,28 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 surfaceWorkspace: self.workspaceID
             ) else { return }
 
+            let terminalAuthority = self.terminalCallbackAuthority(runId: runId, threadId: finishedTid)
             self.terminalRunIds = Self.boundedTerminalRunIds(existing: self.terminalRunIds, adding: runId)
             self.runThreads[runId] = nil
+            self.pruneStaleRunMappings(threadId: finishedTid)
+            // Exact-run ownership: a backlogged terminal for old run A must not
+            // clear or paint over newer active B on the same selected thread.
+            let ownsSelectedPaint = terminalAuthority == .owns
             if status == .completed, let msg = finalMessage, !msg.isEmpty {
                 // The coordinator is normally the persistence owner, but
                 // live provider completions can arrive after stream drain on
                 // a background handler. Keep the restart contract here too.
-                self.persistFinalAssistantIfMissing(msg, threadId: finishedTid)
-                if finishedTid == self.selectedThreadId {
+                if ownsSelectedPaint {
+                    self.persistFinalAssistantIfMissing(msg, threadId: finishedTid)
+                }
+                if finishedTid == self.selectedThreadId, ownsSelectedPaint {
                     self.loadAllMessages(finishedTid)
                     self.suppressPersistedFinalDuplicatedByTimeline()
                     self.timeline.clearActivePlan()
                     self.scheduleTimelineUpdateTick()
                 }
             }
-            if finishedTid == self.selectedThreadId {
+            if finishedTid == self.selectedThreadId, ownsSelectedPaint {
                 if self.streamUIBackpressured {
                     self.rehydrateTimelineAfterStreamBackpressure(threadId: finishedTid)
                 }
@@ -5900,7 +6044,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // Coalesce N same-workspace Agent App tabs into one reload per surface.
             self.scheduleReloadThreads()
             self.loadGitBranchThrottled()   // the run may have changed the tree
-            if Self.shouldNotifyHostOfRunLifecycle(
+            if ownsSelectedPaint, Self.shouldNotifyHostOfRunLifecycle(
                 threadWorkspace: threadWorkspace,
                 surfaceWorkspace: self.workspaceID,
                 status: status,
@@ -5940,21 +6084,35 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             self.scheduleReloadThreads()
             if threadId == self.selectedThreadId {
                 if status == .running {
-                    self.status = status
-                    self.terminalRunIds.remove(runId)
-                    self.currentRunId = runId
-                    self.runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
-                        current: self.runStartedAt,
-                        persisted: (try? self.coordinator.runStartedAt(threadId: threadId)) ?? (try? self.coordinator.runStartedAt(runId: runId))
-                    )
-                    self.isStopping = false  // UX-MAC_AGENT-STOP: new run started; clear any stale stopping flag
+                    // Only a run that may claim live ownership can flip selected
+                    // paint to Working — never a stale recovery callback for A
+                    // after B already owns the thread.
+                    if self.streamEventMayMarkRunActive(runId, threadId: threadId)
+                        || self.currentRunId == runId {
+                        self.status = status
+                        self.terminalRunIds.remove(runId)
+                        self.currentRunId = runId
+                        self.trackActiveRun(runId, threadId: threadId)
+                        self.runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
+                            current: self.runStartedAt,
+                            persisted: (try? self.coordinator.runStartedAt(threadId: threadId)) ?? (try? self.coordinator.runStartedAt(runId: runId))
+                        )
+                        self.isStopping = false  // UX-MAC_AGENT-STOP: new run started; clear any stale stopping flag
+                    }
                 } else if Self.isTerminalRunStatus(status) {
                     // Always record the terminal runId so late stream events cannot
                     // re-inflate runThreads / Working after cancel/complete (ghost
                     // "Threads · N active"). Full selected-thread idle paint still
-                    // waits until the coordinator releases active ownership.
+                    // requires exact ownership of the current generation.
+                    let terminalAuthority = self.terminalCallbackAuthority(runId: runId, threadId: threadId)
                     self.terminalRunIds = Self.boundedTerminalRunIds(existing: self.terminalRunIds, adding: runId)
                     self.runThreads[runId] = nil
+                    self.pruneStaleRunMappings(threadId: threadId)
+                    guard terminalAuthority == .owns else {
+                        self.refreshSubagentActivity()
+                        self.onRunStateChange?()
+                        return
+                    }
                     if !self.coordinator.activeThreadIdsSnapshot().contains(threadId) {
                         self.status = status
                         self.currentRunId = nil
@@ -5965,7 +6123,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                         // Ownership still held: nudge durable reconcile so a
                         // finishedAt row cannot leave activeThreads ghosted.
                         _ = self.coordinator.reconcileStaleActiveOwnershipWithDurableState()
-                        if !self.coordinator.activeThreadIdsSnapshot().contains(threadId) {
+                        if !self.coordinator.activeThreadIdsSnapshot().contains(threadId),
+                           self.terminalCallbackAuthority(runId: runId, threadId: threadId) == .owns {
                             self.status = status
                             self.currentRunId = nil
                             self.runStartedAt = nil
@@ -5974,13 +6133,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                         }
                     }
                 } else {
-                    self.status = status
+                    if self.terminalCallbackAuthority(runId: runId, threadId: threadId) == .owns
+                        || self.currentRunId == nil
+                        || self.currentRunId == runId {
+                        self.status = status
+                    }
                 }
             } else if Self.isTerminalRunStatus(status) {
                 // Non-selected threads: still clear the rail projection so the
                 // active count and spinner drop when this run ends.
                 self.terminalRunIds = Self.boundedTerminalRunIds(existing: self.terminalRunIds, adding: runId)
                 self.runThreads[runId] = nil
+                self.pruneStaleRunMappings(threadId: threadId)
                 _ = self.coordinator.reconcileStaleActiveOwnershipWithDurableState()
             }
             // Admission receipts finalize on terminal status; refresh so Active/Done

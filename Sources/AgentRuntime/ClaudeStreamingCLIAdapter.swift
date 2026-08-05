@@ -82,9 +82,12 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         /// Re-armed by every later `result`; only the one observed while the
         /// pending set is empty becomes the run's single terminal event.
         var deferredFinish: DeferredFinish?
-        /// Liveness bound for a deferral (reset on any stream line). Guarantees a
-        /// terminal state even if the CLI never resumes; on expiry the withheld
-        /// finish is emitted so the awaiting-banner fallback can take over.
+        /// True once this invocation observed model/assistant activity. Parser
+        /// turn existence alone (ambient recovery `result`, user/tool/system
+        /// replay) must not own lifecycle completion.
+        var invocationHasForegroundOwnership = false
+        /// Liveness bound for a deferral (reset on any stream line). On expiry
+        /// emits a nonterminal stall diagnostic only — never status/finished.
         var deferralWatchdog: DispatchWorkItem?
         // PERF-008 / F4: signature of the last emitted snapshot state (the state
         // fields only, reason excluded) so identical snapshots fired by
@@ -124,6 +127,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     private let interruptGracePeriod: TimeInterval
     private let lock = NSLock()
     private var sessions: [AgentThreadID: Session] = [:]
+    var beforeEscalatedSessionStopForTesting: (() -> Void)?
     // UX-RESUME: set of thread IDs whose last session was killed by interruptTurn.
     // Cleared when sendTurn begins a new session for that thread. Guarded by `lock`.
     private var interruptedThreadIds: Set<AgentThreadID> = []
@@ -159,11 +163,9 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             // actionable message instead of a bare "CLI not found in PATH".
             throw ClaudeCLIUnavailableError(message: ClaudeRunner.missingBinaryMessage(binary))
         }
-        // CLAUDE-BG-LIFECYCLE: a run whose finish is withheld still owns
-        // `inFlightRunId`, which would make the guard below reject the user's next
-        // message. Settle the old run first so sending stays possible (and so the
-        // deferral can never bleed into a newer run).
-        flushDeferredFinish(session: session, reason: "new_turn")
+        // CLAUDE-BG-LIFECYCLE: a withheld finish keeps `inFlightRunId` until a
+        // later matching foreground result (or Stop / process exit). Do not flush
+        // a deferred success on new_turn — that fabricated green terminals.
         lock.lock()
         if session.inFlightRunId != nil {
             lock.unlock()
@@ -174,6 +176,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session.sawError = false
         session.status = .running
         session.cancellationRequested = false
+        session.invocationHasForegroundOwnership = false
+        session.deferredFinish = nil
+        session.deferralWatchdog?.cancel()
+        session.deferralWatchdog = nil
         // UX-RESUME: consume the interrupted flag for this thread so the
         // emission below fires exactly once per respawn, not on every turn.
         let wasInterrupted = interruptedThreadIds.remove(request.threadId) != nil
@@ -214,43 +220,96 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         }
         onEvent(.status(.running))
         return AgentRunHandle(runId: request.runId, process: session.process) { [weak self] in
-            try? self?.interruptTurn(threadId: request.threadId)
+            try? self?.interruptTurn(threadId: request.threadId, expectedRunId: request.runId)
         }
     }
 
     public func interruptTurn(threadId: AgentThreadID) throws {
+        try interruptTurn(threadId: threadId, expectedRunId: nil)
+    }
+
+    private func interruptTurn(threadId: AgentThreadID, expectedRunId: AgentRunID?) throws {
         lock.lock()
         let session = sessions[threadId]
+        let interruptedRunId = session?.inFlightRunId
+        if let expectedRunId, interruptedRunId != expectedRunId {
+            lock.unlock()
+            return
+        }
         // UX-RESUME: record the interrupt before any kill so the next sendTurn
         // on this thread knows to emit a "resuming session..." signal.
-        if session != nil {
+        if interruptedRunId != nil {
             interruptedThreadIds.insert(threadId)
             session?.cancellationRequested = true
         }
         lock.unlock()
         guard let session else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
+        guard let interruptedRunId else { return }
         // Attempt graceful interrupt via stream-json control message first.
         // This lets the Claude CLI finish writing and close cleanly, preserving
         // the warm session for potential resumption. Fall back to process kill
         // only if the stdin write fails (pipe closed, process already dead, etc.).
         let line = Self.controlInterruptLine()
+        var wroteCurrentGeneration = false
         let didSend = session.writeQueue.sync {
-            (try? GuardedStdinWrite.write(line,
-                                          to: session.stdinPipe.fileHandleForWriting,
-                                          process: session.process,
-                                          notFound: { AgentProviderAdapterError.sessionNotFound(session.threadId) })) != nil
+            lock.lock()
+            let isCurrent = ClaudeTurnLifecycleGuard.shouldEscalateInterrupt(
+                expectedRunId: interruptedRunId,
+                activeRunId: session.inFlightRunId,
+                sessionIsCurrent: sessions[threadId] === session
+            )
+            lock.unlock()
+            guard isCurrent else { return true }
+            wroteCurrentGeneration = true
+            return (try? GuardedStdinWrite.write(
+                line,
+                to: session.stdinPipe.fileHandleForWriting,
+                process: session.process,
+                notFound: { AgentProviderAdapterError.sessionNotFound(session.threadId) }
+            )) != nil
         }
         if !didSend {
-            try stopSession(threadId: threadId)
+            guard let claimed = detachSessionForInterrupt(
+                threadId: threadId,
+                session: session,
+                expectedRunId: interruptedRunId
+            ) else { return }
+            terminate(session: claimed, status: .cancelled)
             return
         }
+        guard wroteCurrentGeneration else { return }
+        // Capture the exact interrupted generation so a late timer from run A
+        // cannot escalate against run B on the reused warm session.
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + interruptGracePeriod) { [weak self, weak session] in
             guard let self, let session else { return }
-            self.lock.lock()
-            let stillRunning = self.sessions[threadId] === session && session.inFlightRunId != nil
-            self.lock.unlock()
-            if stillRunning { try? self.stopSession(threadId: threadId) }
+            guard let claimed = self.detachSessionForInterrupt(
+                threadId: threadId,
+                session: session,
+                expectedRunId: interruptedRunId
+            ) else { return }
+            self.beforeEscalatedSessionStopForTesting?()
+            self.terminate(session: claimed, status: .cancelled)
         }
+    }
+
+    /// Atomically removes the exact interrupted generation before process I/O.
+    /// Once detached, a newer turn can install a replacement session without a
+    /// stale grace timer being able to address it by thread id.
+    private func detachSessionForInterrupt(
+        threadId: AgentThreadID,
+        session: Session,
+        expectedRunId: AgentRunID
+    ) -> Session? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard ClaudeTurnLifecycleGuard.shouldEscalateInterrupt(
+            expectedRunId: expectedRunId,
+            activeRunId: session.inFlightRunId,
+            sessionIsCurrent: sessions[threadId] === session
+        ) else { return nil }
+        sessions.removeValue(forKey: threadId)
+        session.cancellationRequested = true
+        return session
     }
 
     /// Pure decision: should the next sendTurn emit a "resuming session..."
@@ -636,19 +695,38 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             // BEFORE the parser's turn events are processed below, so a `result`
             // in this same batch is judged against the up-to-date set.
             trackBackgroundWork(in: rawObject, session: session)
+            noteForegroundOwnership(from: rawObject, session: session)
         }
-        // Any stream line is liveness: a deferral must not time out while the CLI
-        // is still talking to us.
+        // Any stream line is liveness: reset the stall diagnostic timer while the
+        // CLI is still talking to us (never auto-finishes on expiry).
         refreshDeferralWatchdog(session: session)
         if let rawObject,
            let runtimeEvent = ProviderRuntimeEvent.fromJSONObject(rawObject, provider: .claude, source: "claude.stream-json") {
             emit(.event(.providerRuntime(runtimeEvent)), session: session)
         }
         let rawParsed = session.parser.parseLine(line)
+        let suppressUnownedLifecycle: Bool
+        if let rawObject {
+            lock.lock()
+            let hasOwnership = session.invocationHasForegroundOwnership
+            let cancellationRequested = session.cancellationRequested
+            lock.unlock()
+            suppressUnownedLifecycle = ClaudeTurnLifecycleGuard.suppressesTurnLifecycle(
+                for: rawObject,
+                hasForegroundOwnership: hasOwnership,
+                cancellationRequested: cancellationRequested
+            )
+        } else {
+            suppressUnownedLifecycle = false
+        }
+        let ownedParsed = ClaudeTurnLifecycleGuard.filteringTurnLifecycle(
+            rawParsed,
+            suppress: suppressUnownedLifecycle
+        )
         // New-turn reset MUST run before shell-detach observation: the first
         // assistant line of a turn often carries both turnStarted and a Bash
         // tool_use. Resetting after tracking would wipe the detach signal.
-        for event in rawParsed {
+        for event in ownedParsed {
             if case .turnStarted = event {
                 lock.lock()
                 session.sawDetachedShellSpawn = false
@@ -665,7 +743,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         // both the persisted stream event (UI reload source) and the coordinator
         // nudge path see the same marked text.
         let parsed = applyingDetachedShellAwaitingMarkerIfNeeded(
-            to: rawParsed,
+            to: ownedParsed,
             session: session
         )
         for event in parsed {
@@ -732,6 +810,11 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                 concludeTurn(finalMessage: finalMessage, session: session, allowDeferral: true)
             }
         }
+        if rawObject?["type"] as? String == "result" {
+            lock.lock()
+            session.invocationHasForegroundOwnership = false
+            lock.unlock()
+        }
     }
 
     /// CLAUDE-BG-LIFECYCLE — the fix for "thread reads as finished while a
@@ -758,20 +841,39 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     /// prevents by construction.
     private func concludeTurn(finalMessage: String?, session: Session, allowDeferral: Bool) {
         lock.lock()
+        guard session.inFlightRunId != nil else {
+            lock.unlock()
+            return
+        }
         let status: AgentRunStatus = session.cancellationRequested ? .cancelled : (session.sawError ? .failed : .completed)
-        session.status = status
         let providerThreadId = session.providerThreadId
         let pending = session.pendingBackgroundTaskIds
         let runId = session.inFlightRunId
-        let shouldDefer = allowDeferral && status == .completed && !pending.isEmpty
+        let hasOwnership = session.invocationHasForegroundOwnership
+        let action = ClaudeTurnLifecycleGuard.completionAction(
+            status: status,
+            hasForegroundOwnership: hasOwnership,
+            pendingTaskCount: pending.count,
+            allowDeferral: allowDeferral
+        )
+        if action == .ignore {
+            lock.unlock()
+            claudeStreamLog.info("claude.turn.ignored unowned result (no foreground ownership)")
+            return
+        }
+        let shouldDefer = action == .deferFinish
         if shouldDefer {
+            // The provider is still doing work; listSessions must not advertise
+            // an idle/completed session while the run remains owned.
+            session.status = .running
             session.deferredFinish = DeferredFinish(
                 status: status,
                 finalMessage: finalMessage,
                 providerThreadId: providerThreadId,
                 runId: runId
             )
-        } else {
+        } else if status == .completed {
+            // Completing on a matching empty-pending result clears any prior deferral.
             session.deferredFinish = nil
         }
         lock.unlock()
@@ -795,14 +897,18 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session: Session
     ) {
         lock.lock()
+        // Exactly-once: a concurrent finalize/stop may have already cleared ownership.
+        guard session.inFlightRunId != nil else {
+            lock.unlock()
+            return
+        }
         session.deferralWatchdog?.cancel()
         session.deferralWatchdog = nil
         session.deferredFinish = nil
-        lock.unlock()
-        emit(.status(status), session: session)
-        emit(.finished(status, finalMessage: finalMessage, providerThreadId: providerThreadId), session: session)
-        lock.lock()
+        session.status = status
         session.inFlightRunId = nil
+        session.invocationHasForegroundOwnership = false
+        let callback = session.onEvent
         session.onEvent = nil
         session.sawError = false
         session.pendingRequestIds.removeAll()
@@ -810,46 +916,63 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session.pendingBackgroundTaskIds.removeAll()
         session.sawDetachedShellSpawn = false
         lock.unlock()
+        callback?(.status(status))
+        callback?(.finished(status, finalMessage: finalMessage, providerThreadId: providerThreadId))
     }
 
-    /// Flushes a withheld finish for `session`, if one is still valid. Used by the
-    /// liveness watchdog and before a new turn reuses the session.
-    private func flushDeferredFinish(session: Session, reason: String) {
+    /// Marks current-invocation ownership from model/assistant protocol activity.
+    /// User, tool-result, system, and ambient recovery traffic do not qualify.
+    private func noteForegroundOwnership(from obj: [String: Any], session: Session) {
+        guard ClaudeTurnLifecycleGuard.hasForegroundOwnership(obj) else { return }
         lock.lock()
-        guard let deferred = session.deferredFinish,
-              deferred.runId == session.inFlightRunId else {
-            session.deferredFinish = nil
-            session.deferralWatchdog?.cancel()
-            session.deferralWatchdog = nil
-            lock.unlock()
-            return
-        }
+        session.invocationHasForegroundOwnership = true
         lock.unlock()
-        claudeStreamLog.info("claude.turn.deferred.flushed reason=\(reason, privacy: .public)")
-        emitTerminal(
-            status: deferred.status,
-            finalMessage: deferred.finalMessage,
-            providerThreadId: deferred.providerThreadId,
-            session: session
-        )
     }
 
-    /// (Re)arms the deferral liveness bound. No-op unless a finish is withheld.
+    /// (Re)arms the deferral stall diagnostic. No-op unless a finish is withheld.
+    /// Expiry never publishes status/finished — only a nonterminal diagnostic.
     private func refreshDeferralWatchdog(session: Session) {
         lock.lock()
         guard session.deferredFinish != nil else {
             lock.unlock()
             return
         }
+        let runId = session.deferredFinish?.runId
         session.deferralWatchdog?.cancel()
         let item = DispatchWorkItem { [weak self, weak session] in
             guard let self, let session else { return }
-            self.flushDeferredFinish(session: session, reason: "watchdog_inactivity")
+            self.emitDeferredStallDiagnostic(session: session, expectedRunId: runId)
         }
         session.deferralWatchdog = item
         let delay = deferredFinishInactivityTimeout
         lock.unlock()
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    /// Nonterminal stall signal for a deferred finish that has gone quiet.
+    private func emitDeferredStallDiagnostic(session: Session, expectedRunId: AgentRunID?) {
+        lock.lock()
+        guard let deferred = session.deferredFinish,
+              deferred.runId == session.inFlightRunId,
+              deferred.runId == expectedRunId else {
+            lock.unlock()
+            return
+        }
+        let pendingCount = session.pendingBackgroundTaskIds.count
+        lock.unlock()
+        claudeStreamLog.info("claude.turn.deferred.stall pendingTasks=\(pendingCount, privacy: .public)")
+        let payload = Self.jsonString([
+            "reason": "watchdog_inactivity",
+            "pendingTaskCount": pendingCount
+        ]) ?? "{}"
+        let event = AssistantEvent.providerRuntime(ProviderRuntimeEvent(
+            provider: .claude,
+            source: "claude.stream-json.lifecycle",
+            method: "claude.turn.deferred.stall",
+            payloadJSON: payload,
+            receivedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+        ))
+        emit(.event(event), session: session)
     }
 
     /// Updates the pending-background-work set from one raw stream line.
@@ -859,31 +982,13 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     /// for the ordering race where a `result` could precede the first snapshot,
     /// and a `task_updated` patch carrying a terminal status removes that id.
     private func trackBackgroundWork(in obj: [String: Any], session: Session) {
-        guard (obj["type"] as? String) == "system",
-              let subtype = obj["subtype"] as? String else { return }
-        switch subtype {
-        case "background_tasks_changed":
-            let ids = (obj["tasks"] as? [[String: Any]])?
-                .compactMap { $0["task_id"] as? String } ?? []
-            lock.lock()
-            session.pendingBackgroundTaskIds = Set(ids)
-            lock.unlock()
-        case "task_started":
-            guard let id = obj["task_id"] as? String else { return }
-            lock.lock()
-            session.pendingBackgroundTaskIds.insert(id)
-            lock.unlock()
-        case "task_updated", "task_notification":
-            guard let id = obj["task_id"] as? String else { return }
-            let status = (obj["patch"] as? [String: Any])?["status"] as? String
-                ?? obj["status"] as? String
-            guard let status, ["completed", "failed", "killed", "cancelled"].contains(status) else { return }
-            lock.lock()
-            session.pendingBackgroundTaskIds.remove(id)
-            lock.unlock()
-        default:
-            return
-        }
+        lock.lock()
+        let next = ClaudeTurnLifecycleGuard.updatedPendingTaskIDs(
+            current: session.pendingBackgroundTaskIds,
+            from: obj
+        )
+        if let next { session.pendingBackgroundTaskIds = next }
+        lock.unlock()
     }
 
     /// Observes raw `assistant` lines for foreground Bash tool_use commands that
@@ -1014,7 +1119,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         let rewritten = applyingDetachedShellAwaitingMarkerIfNeeded(to: [event], session: session)[0]
         record(rewritten, session: session)
         emit(.event(rewritten), session: session)
-        guard case .turnCompleted(let turnId, let finalMessage) = rewritten else { return }
+        guard case .turnCompleted(let turnId, _) = rewritten else { return }
 
         lock.lock()
         if !session.completedTurnIds.contains(turnId) {
@@ -1025,11 +1130,9 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         lock.unlock()
         emitSessionSnapshot(session: session, reason: "turn_completed")
 
-        // Reached only while finalizing a dead/closing stream: the CLI can no
-        // longer resume, so this turn is terminal and must not be deferred.
-        // Marker may still apply for a genuine `.completed` path; never for
-        // cancelled/failed (gated inside applyingDetachedShellAwaitingMarkerIfNeeded).
-        concludeTurn(finalMessage: finalMessage, session: session, allowDeferral: false)
+        // Preserve the partial assistant turn for history, but do not convert an
+        // EOF without an authoritative `result` into success. finishTerminated
+        // owns the failed/cancelled terminal edge for this dead process.
     }
 
     private func terminate(session: Session, status: AgentRunStatus) {

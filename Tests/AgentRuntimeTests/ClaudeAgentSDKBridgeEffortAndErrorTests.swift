@@ -91,7 +91,7 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
     // immediately; relying on a later Task.yield makes queue progress scheduler-
     // dependent and can strand Force until another lifecycle event happens.
     func test_finishedCallbackObservesIdleSession() async throws {
-        guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
+        _ = try XCTUnwrap(ProcessLocator.resolve("node"), "node is required for the SDK bridge regression")
         let tmp = try Self.makeTempDir(prefix: "rc2-sdk-causal-idle")
         defer { try? FileManager.default.removeItem(at: tmp) }
         let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
@@ -123,6 +123,83 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
         await fulfillment(of: [finished], timeout: 5)
         XCTAssertEqual(probe.observedStatuses, [.completed],
                        "the terminal callback is the causal idle edge; the adapter must commit idle state before publishing it")
+    }
+
+    // WHY: the production incident resumed a cancelled Claude session and the
+    // SDK emitted a zero-token task-notification `result`. A previous foreground
+    // assistant message must not lend lifecycle ownership to that later ambient
+    // result; only the subsequent assistant answer may finish the run.
+    func test_taskNotificationResultCannotFinishOwnedSDKRunBeforeFinalAssistantAnswer() async throws {
+        _ = try XCTUnwrap(ProcessLocator.resolve("node"), "node is required for the task-notification regression")
+        let tmp = try Self.makeTempDir(prefix: "rc2-sdk-task-notification")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+        try """
+        import readline from 'node:readline';
+        const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+        const session = 'sdk-task-notification';
+        function write(obj) { process.stdout.write(JSON.stringify(obj) + '\\n'); }
+        for await (const line of rl) {
+          if (!line.trim()) continue;
+          const cmd = JSON.parse(line);
+          if (cmd.type === 'rc_configure') {
+            write({ type: 'system', subtype: 'init', session_id: session });
+          } else if (cmd.type === 'rc_turn') {
+            write({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tool-bg', name: 'Bash', input: { command: 'sleep 1', run_in_background: true } }] }, session_id: session });
+            write({ type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'T1', task_type: 'local_bash' }], session_id: session });
+            write({ type: 'assistant', message: { content: [{ type: 'text', text: 'PREMATURE_STANDING_BY' }] }, session_id: session });
+            write({ type: 'result', subtype: 'success', is_error: false, result: 'PREMATURE_STANDING_BY', session_id: session });
+            setTimeout(() => {
+              write({ type: 'system', subtype: 'background_tasks_changed', tasks: 'corrupt', session_id: session });
+              write({ type: 'assistant', message: { content: [{ type: 'text', text: 'MALFORMED_SNAPSHOT_MUST_NOT_FINISH' }] }, session_id: session });
+              write({ type: 'result', subtype: 'success', is_error: false, result: 'MALFORMED_SNAPSHOT_MUST_NOT_FINISH', session_id: session });
+              write({ type: 'system', subtype: 'background_tasks_changed', tasks: [], session_id: session });
+              write({ type: 'system', subtype: 'task_notification', task_id: 'T1', status: 'completed', session_id: session });
+              write({ type: 'assistant', message: { content: [{ type: 'text', text: 'AMBIENT_NOTIFICATION_PROSE' }] }, session_id: session });
+              write({ type: 'result', subtype: 'success', is_error: false, result: '', session_id: session, origin: { kind: 'task-notification' }, usage: { input_tokens: 0, output_tokens: 0 } });
+              setTimeout(() => {
+                write({ type: 'assistant', message: { content: [{ type: 'text', text: 'REAL_ANSWER_AFTER_BG' }] }, session_id: session });
+                write({ type: 'result', subtype: 'success', is_error: false, result: 'REAL_ANSWER_AFTER_BG', session_id: session });
+              }, 40);
+            }, 40);
+          } else if (cmd.type === 'rc_close') {
+            process.exit(0);
+          }
+        }
+        """.write(to: bridge, atomically: true, encoding: .utf8)
+
+        let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "sonnet",
+            cwd: tmp.path,
+            prompt: "launch and wait"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        defer { try? adapter.stopSession(threadId: threadId) }
+
+        try await waitForFinish(in: sink, expected: "REAL_ANSWER_AFTER_BG")
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let events = await sink.snapshot()
+        let finishes = events.compactMap { event -> (AgentRunStatus, String?)? in
+            if case .finished(let status, let final, _) = event { return (status, final) }
+            return nil
+        }
+        XCTAssertEqual(finishes.count, 1,
+                       "background completion traffic must not create an earlier or duplicate terminal edge")
+        XCTAssertEqual(finishes.first?.0, .completed)
+        XCTAssertEqual(finishes.first?.1, "REAL_ANSWER_AFTER_BG",
+                       "only a result preceded by the resumed foreground assistant may own completion")
+        let completedTurns = events.filter {
+            if case .event(.turnCompleted) = $0 { return true }
+            return false
+        }
+        XCTAssertEqual(completedTurns.count, 3,
+                       "the malformed-snapshot result remains deferred; ambient task-notification must not synthesize another turn lifecycle")
     }
 
     // MARK: - Adapter: rc_configure carries effort + settings (F0)
@@ -545,6 +622,7 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
                 } else if (boundary === 'user_input' || boundary === 'cancel_input') {
                   write({ type: 'user_input_request', request_id: 'input-1', prompt: 'Choose', options: ['a'], session_id: 'sdk-write-input' });
                 } else {
+                  write({ type: 'assistant', message: { content: [{ type: 'text', text: 'FIRST_DONE' }] }, session_id: 'sdk-write-' + boundary });
                   write({ type: 'result', subtype: 'success', is_error: false, result: 'FIRST_DONE', session_id: 'sdk-write-' + boundary });
                 }
                 closeInput();
@@ -1396,6 +1474,9 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
             write({ type: 'system', subtype: 'init', session_id: '\(sessionId)' });
           } else if (cmd.type === 'rc_turn') {
             turn += 1;
+            // Foreground assistant activity is required for lifecycle ownership;
+            // result-only ambient/recovery traffic must not complete a run.
+            write({ type: 'assistant', message: { content: [{ type: 'text', text: 'DONE_' + turn }] }, session_id: '\(sessionId)' });
             write({ type: 'result', subtype: 'success', is_error: false, result: 'DONE_' + turn, session_id: '\(sessionId)' });
           } else if (cmd.type === 'rc_close') {
             process.exit(0);

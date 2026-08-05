@@ -123,6 +123,89 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
         XCTAssertFalse(adapter.hasSession(threadId: threadId),
                        "closed stdin must trigger the kill fallback and remove the session")
     }
+
+    func test_interruptGraceEscalatesOnlyCapturedRunGeneration() {
+        let runA = AgentRunID()
+        let runB = AgentRunID()
+
+        XCTAssertTrue(ClaudeTurnLifecycleGuard.shouldEscalateInterrupt(
+            expectedRunId: runA,
+            activeRunId: runA,
+            sessionIsCurrent: true
+        ), "A's timer may stop A while A still owns the registered session")
+        XCTAssertFalse(ClaudeTurnLifecycleGuard.shouldEscalateInterrupt(
+            expectedRunId: runA,
+            activeRunId: runB,
+            sessionIsCurrent: true
+        ), "A's late timer must not stop newer generation B")
+        XCTAssertFalse(ClaudeTurnLifecycleGuard.shouldEscalateInterrupt(
+            expectedRunId: runA,
+            activeRunId: runA,
+            sessionIsCurrent: false
+        ), "A's timer must not stop a replacement session")
+    }
+
+    func test_interruptGraceAtomicallyDetachesABeforeStoppingWhileBStarts() async throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-interrupt-claim-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let script = tmp.appendingPathComponent("fake-claude")
+        try """
+        #!/usr/bin/python3
+        import json, sys
+        print(json.dumps({"type":"system","subtype":"init","session_id":"interrupt-claim"}), flush=True)
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            # Deliberately ignore the graceful control interrupt so escalation runs.
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let adapter = ClaudeStreamingCLIAdapter(
+            binaryNameOverride: script.path,
+            interruptGracePeriod: 0.05
+        )
+        let threadId = AgentThreadID()
+        let runA = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "run A"
+        )) { _ in }
+        let claimEntered = DispatchSemaphore(value: 0)
+        let allowOldStop = DispatchSemaphore(value: 0)
+        adapter.beforeEscalatedSessionStopForTesting = {
+            claimEntered.signal()
+            allowOldStop.wait()
+        }
+        runA.cancel()
+        await Task.detached { claimEntered.wait() }.value
+        XCTAssertFalse(adapter.hasSession(threadId: threadId),
+                       "A must leave the registry atomically before its process teardown")
+
+        let runB = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "run B",
+            providerThreadId: "interrupt-claim"
+        )) { _ in }
+        runA.cancel()
+        XCTAssertTrue(adapter.hasSession(threadId: threadId),
+                      "stale handle A cancel must not detach replacement session B")
+        adapter.beforeEscalatedSessionStopForTesting = nil
+        allowOldStop.signal()
+        try? await Task.sleep(nanoseconds: 150_000_000)
+
+        XCTAssertTrue(adapter.hasSession(threadId: threadId),
+                      "A's delayed hard stop must not remove replacement session B")
+        XCTAssertTrue(runB.process?.isRunning == true,
+                      "A's delayed hard stop must terminate only A's detached process")
+        adapter.stopAll()
+    }
 }
 
 private actor EventSink {

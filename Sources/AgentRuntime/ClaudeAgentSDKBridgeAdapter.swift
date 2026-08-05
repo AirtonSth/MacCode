@@ -1,5 +1,6 @@
 import Foundation
 import CoreModel
+import os
 
 struct ClaudeSDKSessionRecord: Sendable, Equatable {
     let sessionId: String
@@ -30,6 +31,15 @@ enum ClaudeForkReconciliationError: Error, Equatable, CustomStringConvertible {
 }
 
 public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked Sendable {
+    /// A turn `result` withheld while protocol-tracked background work remains.
+    /// Carries `runId` so a late event can never finish a newer run.
+    struct DeferredFinish {
+        let status: AgentRunStatus
+        let finalMessage: String?
+        let providerThreadId: String?
+        let runId: AgentRunID?
+    }
+
     static let defaultSDKPackageSpec = "@anthropic-ai/claude-agent-sdk@0.3.157"
     static let bridgeProtocolVersion = 3
     static let defaultSDKVersion = "0.3.157"
@@ -92,6 +102,13 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         var bridgeUserInputIds = Set<String>()
         var bridgeUserInputSchemas: [String: [String: Any]] = [:]
         var cancellationRequested = false
+        /// Protocol-tracked background work when the SDK stream emits the same
+        /// system/task lifecycle records as the Claude CLI.
+        var pendingBackgroundTaskIds = Set<String>()
+        var deferredFinish: DeferredFinish?
+        /// True once this invocation observed model/assistant activity.
+        var invocationHasForegroundOwnership = false
+        var deferralWatchdog: DispatchWorkItem?
         let claudeExecutablePath: String?
         // Bounded raw stderr tail, retained so the terminal diagnostic can carry
         // the REAL Node failure reason (e.g. ERR_MODULE_NOT_FOUND / native binary
@@ -140,7 +157,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     private let binaryNameOverride: String?
     private let maxReadableEvents: Int
     private let interruptGracePeriod: TimeInterval
+    /// Injectable stall bound for deferred finishes (tests drive it in ms).
+    private let deferredFinishInactivityTimeout: TimeInterval
     private let sessionMutator: ClaudeSDKSessionMutating?
+    private let sdkLifecycleLog = Logger(subsystem: "io.remotecode.agent", category: "claude.sdk.lifecycle")
     /// Single-flight first-run `npm install` per cache directory + package spec
     /// so concurrent Claude starts cannot interleave node_modules.
     private static let sdkInstallTasksLock = NSLock()
@@ -152,6 +172,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     )
     private let bridgeCloseGracePeriod: TimeInterval = 0.25
     private var sessions: [AgentThreadID: Session] = [:]
+    var beforeEscalatedSessionStopForTesting: (() -> Void)?
     private var recoveredEvents: [AgentThreadID: [AssistantEvent]] = [:]
     private var rollbackResumeSessionAt: [AgentThreadID: String] = [:]
     private var rollbackProviderThreadIds: [AgentThreadID: String] = [:]
@@ -161,7 +182,8 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         bridgeScriptPath: String? = nil,
         binaryNameOverride: String? = nil,
         maxReadableEvents: Int = 5_000,
-        interruptGracePeriod: TimeInterval = 2
+        interruptGracePeriod: TimeInterval = 2,
+        deferredFinishInactivityTimeout: TimeInterval = 900
     ) {
         self.init(
             nodeBinary: nodeBinary,
@@ -169,6 +191,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             binaryNameOverride: binaryNameOverride,
             maxReadableEvents: maxReadableEvents,
             interruptGracePeriod: interruptGracePeriod,
+            deferredFinishInactivityTimeout: deferredFinishInactivityTimeout,
             sessionMutator: nil
         )
     }
@@ -179,6 +202,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         binaryNameOverride: String? = nil,
         maxReadableEvents: Int = 5_000,
         interruptGracePeriod: TimeInterval = 2,
+        deferredFinishInactivityTimeout: TimeInterval = 900,
         sessionMutator: ClaudeSDKSessionMutating?
     ) {
         self.nodeBinary = nodeBinary
@@ -187,6 +211,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         self.binaryNameOverride = binaryNameOverride
         self.maxReadableEvents = max(1, maxReadableEvents)
         self.interruptGracePeriod = max(0, interruptGracePeriod)
+        self.deferredFinishInactivityTimeout = max(0.01, deferredFinishInactivityTimeout)
         self.sessionMutator = sessionMutator
     }
 
@@ -397,6 +422,11 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         session.sawError = false
         session.status = .running
         session.cancellationRequested = false
+        session.invocationHasForegroundOwnership = false
+        session.deferredFinish = nil
+        session.deferralWatchdog?.cancel()
+        session.deferralWatchdog = nil
+        session.pendingBackgroundTaskIds.removeAll()
         lock.unlock()
 
         do {
@@ -432,33 +462,76 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         }
         onEvent(.status(.running))
         return AgentRunHandle(runId: request.runId, process: session.process) { [weak self] in
-            try? self?.requestCancellation(threadId: request.threadId)
+            try? self?.requestCancellation(threadId: request.threadId, expectedRunId: request.runId)
         }
     }
 
     public func interruptTurn(threadId: AgentThreadID) throws {
-        try requestCancellation(threadId: threadId)
+        try requestCancellation(threadId: threadId, expectedRunId: nil)
     }
 
-    private func requestCancellation(threadId: AgentThreadID) throws {
+    private func requestCancellation(threadId: AgentThreadID, expectedRunId: AgentRunID?) throws {
         lock.lock()
         let session = sessions[threadId]
-        session?.cancellationRequested = true
+        let interruptedRunId = session?.inFlightRunId
+        if let expectedRunId, interruptedRunId != expectedRunId {
+            lock.unlock()
+            return
+        }
+        if interruptedRunId != nil { session?.cancellationRequested = true }
         lock.unlock()
         guard let session else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
+        guard let interruptedRunId else { return }
         do {
-            try write(["type": "rc_interrupt"], to: session)
+            guard try writeInterruptIfCurrent(
+                session: session,
+                threadId: threadId,
+                expectedRunId: interruptedRunId
+            ) else { return }
         } catch {
-            try? stopSession(threadId: threadId)
+            if let claimed = detachSessionForInterrupt(
+                threadId: threadId,
+                session: session,
+                expectedRunId: interruptedRunId
+            ) {
+                terminate(claimed)
+            }
             throw error
         }
+        // Exact generation: run A's grace must not escalate against run B.
         cancellationQueue.asyncAfter(deadline: .now() + interruptGracePeriod) { [weak self, weak session] in
             guard let self, let session else { return }
-            self.lock.lock()
-            let stillRunning = self.sessions[threadId] === session && session.inFlightRunId != nil
-            self.lock.unlock()
-            if stillRunning { try? self.stopSession(threadId: threadId) }
+            guard let claimed = self.detachSessionForInterrupt(
+                threadId: threadId,
+                session: session,
+                expectedRunId: interruptedRunId
+            ) else { return }
+            self.beforeEscalatedSessionStopForTesting?()
+            self.terminate(claimed)
         }
+    }
+
+    /// Claims the exact interrupted generation under the registry lock before
+    /// terminating its bridge. A replacement session installed afterward is a
+    /// distinct object and cannot be stopped by this stale cancellation path.
+    private func detachSessionForInterrupt(
+        threadId: AgentThreadID,
+        session: Session,
+        expectedRunId: AgentRunID
+    ) -> Session? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard ClaudeTurnLifecycleGuard.shouldEscalateInterrupt(
+            expectedRunId: expectedRunId,
+            activeRunId: session.inFlightRunId,
+            sessionIsCurrent: sessions[threadId] === session
+        ) else { return nil }
+        sessions.removeValue(forKey: threadId)
+        session.cancellationRequested = true
+        recoveredEvents.removeValue(forKey: threadId)
+        rollbackResumeSessionAt.removeValue(forKey: threadId)
+        rollbackProviderThreadIds.removeValue(forKey: threadId)
+        return session
     }
 
     public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
@@ -1703,15 +1776,39 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
 
     private func handleLine(_ line: String, session: Session) {
         let bridgeUserInputRequest = Self.bridgeUserInputRequest(in: line)
-        let isSDKError = line.data(using: .utf8)
-            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["type"] as? String == "sdk_error"
+        let rawObject = line.data(using: .utf8)
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let isSDKError = rawObject?["type"] as? String == "sdk_error"
         if isSDKError { session.sawError = true }
+        if let rawObject {
+            trackBackgroundWork(in: rawObject, session: session)
+            noteForegroundOwnership(from: rawObject, session: session)
+        }
+        refreshDeferralWatchdog(session: session)
         if let runtimeEvent = ProviderRuntimeEvent.fromJSONLine(line, provider: .claude, source: "claude.agent-sdk") {
             let event = AssistantEvent.providerRuntime(runtimeEvent)
             record(event, session: session)
             emit(.event(event), session: session)
         }
-        let parsed = session.parser.parseLine(line)
+        let rawParsed = session.parser.parseLine(line)
+        let suppressUnownedLifecycle: Bool
+        if let rawObject {
+            lock.lock()
+            let hasOwnership = session.invocationHasForegroundOwnership
+            let cancellationRequested = session.cancellationRequested
+            lock.unlock()
+            suppressUnownedLifecycle = ClaudeTurnLifecycleGuard.suppressesTurnLifecycle(
+                for: rawObject,
+                hasForegroundOwnership: hasOwnership,
+                cancellationRequested: cancellationRequested
+            )
+        } else {
+            suppressUnownedLifecycle = false
+        }
+        let parsed = ClaudeTurnLifecycleGuard.filteringTurnLifecycle(
+            rawParsed,
+            suppress: suppressUnownedLifecycle
+        )
         for event in parsed {
             // The SDK emits AskUserQuestion as an assistant tool block before
             // canUseTool has registered its callback. The bridge then emits the
@@ -1758,8 +1855,13 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
                 session.activeTurnId = nil
                 lock.unlock()
                 emitSessionSnapshot(session: session, reason: "turn_completed")
-                finishActiveTurn(session, finalMessage: finalMessage)
+                concludeTurn(finalMessage: finalMessage, session: session, allowDeferral: true)
             }
+        }
+        if rawObject?["type"] as? String == "result" {
+            lock.lock()
+            session.invocationHasForegroundOwnership = false
+            lock.unlock()
         }
     }
 
@@ -1812,6 +1914,11 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         let shouldFinish = session.inFlightRunId != nil
         let callback = session.onEvent
         session.inFlightRunId = nil
+        session.deferredFinish = nil
+        session.deferralWatchdog?.cancel()
+        session.deferralWatchdog = nil
+        session.pendingBackgroundTaskIds.removeAll()
+        session.invocationHasForegroundOwnership = false
         let status: AgentRunStatus = session.cancellationRequested ? .cancelled : .failed
         session.status = status
         session.onEvent = nil
@@ -1839,7 +1946,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     private func handleFinalizedEvent(_ event: AssistantEvent, session: Session) {
         record(event, session: session)
         emit(.event(event), session: session)
-        guard case .turnCompleted(let turnId, let finalMessage) = event else { return }
+        guard case .turnCompleted(let turnId, _) = event else { return }
 
         lock.lock()
         if !session.completedTurnIds.contains(turnId) { session.completedTurnIds.append(turnId) }
@@ -1847,36 +1954,155 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         lock.unlock()
         emitSessionSnapshot(session: session, reason: "turn_completed")
 
-        finishActiveTurn(session, finalMessage: finalMessage)
+        // Preserve partial assistant text, but an EOF without the authoritative
+        // SDK `result` is failed/cancelled by finishTerminated, never completed.
     }
 
-    /// Commits the resident session's idle state before publishing the terminal
-    /// edge. Queue draining is triggered synchronously from `.finished`; emitting
-    /// first leaves that consumer observing a stale `.running` session and makes
-    /// progress depend on a later scheduler yield.
-    private func finishActiveTurn(_ session: Session, finalMessage: String?) {
+    /// Generation-safe terminal ownership matching ClaudeStreamingCLIAdapter:
+    /// ambient recovery cannot complete; pending protocol tasks defer; only a
+    /// later matching foreground result with empty pending tasks finishes once.
+    private func concludeTurn(finalMessage: String?, session: Session, allowDeferral: Bool) {
         lock.lock()
+        guard session.inFlightRunId != nil else {
+            lock.unlock()
+            return
+        }
         let status: AgentRunStatus = session.cancellationRequested
             ? .cancelled
             : (session.sawError ? .failed : .completed)
-        let callback = session.onEvent
         let providerThreadId = session.providerThreadId
+        let pending = session.pendingBackgroundTaskIds
+        let runId = session.inFlightRunId
+        let hasOwnership = session.invocationHasForegroundOwnership
+        let action = ClaudeTurnLifecycleGuard.completionAction(
+            status: status,
+            hasForegroundOwnership: hasOwnership,
+            pendingTaskCount: pending.count,
+            allowDeferral: allowDeferral
+        )
+        if action == .ignore {
+            lock.unlock()
+            sdkLifecycleLog.info("claude.sdk.turn.ignored unowned result")
+            return
+        }
+        let shouldDefer = action == .deferFinish
+        if shouldDefer {
+            session.status = .running
+            session.deferredFinish = DeferredFinish(
+                status: status,
+                finalMessage: finalMessage,
+                providerThreadId: providerThreadId,
+                runId: runId
+            )
+        } else if status == .completed {
+            session.deferredFinish = nil
+        }
+        lock.unlock()
+
+        if shouldDefer {
+            sdkLifecycleLog.info("claude.sdk.turn.deferred pendingTasks=\(pending.count, privacy: .public)")
+            emitSessionSnapshot(session: session, reason: "background_work_pending")
+            refreshDeferralWatchdog(session: session)
+            return
+        }
+        emitTerminal(status: status, finalMessage: finalMessage, providerThreadId: providerThreadId, session: session)
+    }
+
+    private func emitTerminal(
+        status: AgentRunStatus,
+        finalMessage: String?,
+        providerThreadId: String?,
+        session: Session
+    ) {
+        lock.lock()
+        guard session.inFlightRunId != nil else {
+            lock.unlock()
+            return
+        }
+        session.deferralWatchdog?.cancel()
+        session.deferralWatchdog = nil
+        session.deferredFinish = nil
         session.status = status
         session.inFlightRunId = nil
+        session.invocationHasForegroundOwnership = false
+        let callback = session.onEvent
         session.onEvent = nil
         session.sawError = false
         session.pendingRequestIds.removeAll()
         session.pendingUserInputIds.removeAll()
         session.bridgeUserInputIds.removeAll()
         session.bridgeUserInputSchemas.removeAll()
+        session.pendingBackgroundTaskIds.removeAll()
         lock.unlock()
-
+        // Commit idle before publishing so queue drain observers see causal idle.
         callback?(.status(status))
-        callback?(.finished(
-            status,
-            finalMessage: finalMessage,
-            providerThreadId: providerThreadId
+        callback?(.finished(status, finalMessage: finalMessage, providerThreadId: providerThreadId))
+    }
+
+    private func noteForegroundOwnership(from obj: [String: Any], session: Session) {
+        guard ClaudeTurnLifecycleGuard.hasForegroundOwnership(obj) else { return }
+        lock.lock()
+        session.invocationHasForegroundOwnership = true
+        lock.unlock()
+    }
+
+    private func trackBackgroundWork(in obj: [String: Any], session: Session) {
+        lock.lock()
+        let next = ClaudeTurnLifecycleGuard.updatedPendingTaskIDs(
+            current: session.pendingBackgroundTaskIds,
+            from: obj
+        )
+        if let next { session.pendingBackgroundTaskIds = next }
+        lock.unlock()
+    }
+
+    private func refreshDeferralWatchdog(session: Session) {
+        lock.lock()
+        guard session.deferredFinish != nil else {
+            lock.unlock()
+            return
+        }
+        let runId = session.deferredFinish?.runId
+        session.deferralWatchdog?.cancel()
+        let item = DispatchWorkItem { [weak self, weak session] in
+            guard let self, let session else { return }
+            self.emitDeferredStallDiagnostic(session: session, expectedRunId: runId)
+        }
+        session.deferralWatchdog = item
+        let delay = deferredFinishInactivityTimeout
+        lock.unlock()
+        cancellationQueue.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    private func emitDeferredStallDiagnostic(session: Session, expectedRunId: AgentRunID?) {
+        lock.lock()
+        guard let deferred = session.deferredFinish,
+              deferred.runId == session.inFlightRunId,
+              deferred.runId == expectedRunId else {
+            lock.unlock()
+            return
+        }
+        let pendingCount = session.pendingBackgroundTaskIds.count
+        lock.unlock()
+        sdkLifecycleLog.info("claude.sdk.turn.deferred.stall pendingTasks=\(pendingCount, privacy: .public)")
+        let payloadJSON: String
+        if let data = try? JSONSerialization.data(withJSONObject: [
+            "reason": "watchdog_inactivity",
+            "pendingTaskCount": pendingCount
+        ], options: [.sortedKeys]),
+           let s = String(data: data, encoding: .utf8) {
+            payloadJSON = s
+        } else {
+            payloadJSON = "{}"
+        }
+        let event = AssistantEvent.providerRuntime(ProviderRuntimeEvent(
+            provider: .claude,
+            source: "claude.agent-sdk.lifecycle",
+            method: "claude.turn.deferred.stall",
+            payloadJSON: payloadJSON,
+            receivedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
         ))
+        emit(.event(event), session: session)
     }
 
     private func terminate(_ session: Session) {
@@ -1957,6 +2183,36 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
                                         to: session.stdinPipe.fileHandleForWriting,
                                         process: session.process,
                                         notFound: { AgentProviderAdapterError.sessionNotFound(session.threadId) })
+        }
+    }
+
+    /// Serializes the generation check with the bridge write. If A finished and
+    /// B claimed the resident bridge before A's cancel reached the queue, the
+    /// stale cancel becomes a no-op instead of interrupting B.
+    private func writeInterruptIfCurrent(
+        session: Session,
+        threadId: AgentThreadID,
+        expectedRunId: AgentRunID
+    ) throws -> Bool {
+        let data = try JSONSerialization.data(withJSONObject: ["type": "rc_interrupt"])
+        var line = data
+        line.append(0x0A)
+        return try session.writeQueue.sync {
+            lock.lock()
+            let isCurrent = ClaudeTurnLifecycleGuard.shouldEscalateInterrupt(
+                expectedRunId: expectedRunId,
+                activeRunId: session.inFlightRunId,
+                sessionIsCurrent: sessions[threadId] === session
+            )
+            lock.unlock()
+            guard isCurrent else { return false }
+            try GuardedStdinWrite.write(
+                line,
+                to: session.stdinPipe.fileHandleForWriting,
+                process: session.process,
+                notFound: { AgentProviderAdapterError.sessionNotFound(session.threadId) }
+            )
+            return true
         }
     }
 

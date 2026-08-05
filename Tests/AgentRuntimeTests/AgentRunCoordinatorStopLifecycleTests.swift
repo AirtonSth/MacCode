@@ -20,16 +20,42 @@ import Persistence
 ///   user already redirected the thread.
 final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
 
+    private actor RunPreparedGate {
+        private var entered = false
+        private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+        func enterAndWait() async {
+            entered = true
+            let waiters = enteredWaiters
+            enteredWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+            await withCheckedContinuation { releaseContinuation = $0 }
+        }
+
+        func waitUntilEntered() async {
+            guard !entered else { return }
+            await withCheckedContinuation { enteredWaiters.append($0) }
+        }
+
+        func release() {
+            releaseContinuation?.resume()
+            releaseContinuation = nil
+        }
+    }
+
     // MARK: - Shared recorders
 
     /// Thread-safe recorder for coordinator lifecycle broadcasts.
     private final class LifecycleRecorder: AgentRunObserver, @unchecked Sendable {
         private let lock = NSLock()
         private var _finished: [(AgentRunID, AgentRunStatus)] = []
+        private var _statusChanges: [(AgentRunID, AgentRunStatus)] = []
         private var _cancelledStatusChanges = 0
         private var _runFinishedCallbacks: [(AgentThreadID, AgentRunStatus)] = []
 
         var finished: [(AgentRunID, AgentRunStatus)] { lock.lock(); defer { lock.unlock() }; return _finished }
+        var statusChanges: [(AgentRunID, AgentRunStatus)] { lock.lock(); defer { lock.unlock() }; return _statusChanges }
         var cancelledStatusChanges: Int { lock.lock(); defer { lock.unlock() }; return _cancelledStatusChanges }
         var runFinishedCallbacks: [(AgentThreadID, AgentRunStatus)] { lock.lock(); defer { lock.unlock() }; return _runFinishedCallbacks }
 
@@ -42,6 +68,7 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
             lock.lock(); _finished.append((runId, status)); lock.unlock()
         }
         func runCoordinator(_ c: AgentRunCoordinator, didChangeStatus status: AgentRunStatus, runId: AgentRunID, threadId: AgentThreadID) {
+            lock.lock(); _statusChanges.append((runId, status)); lock.unlock()
             guard status == .cancelled else { return }
             lock.lock(); _cancelledStatusChanges += 1; lock.unlock()
         }
@@ -139,14 +166,25 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
         private let lock = NSLock()
         private var _hasSession: Bool
         private let recoveryEvents: [AgentRunEvent]
+        private let supportsSendTurn: Bool
+        private let reportsLiveSummary: Bool
+        private var recoveryCallback: (@Sendable (AgentRunEvent) -> Void)?
+        private var recoveredThreadId: AgentThreadID?
         private var _recoverCalls = 0
         private var _stopSessionCalls = 0
         var recoverCalls: Int { lock.lock(); defer { lock.unlock() }; return _recoverCalls }
         var stopSessionCalls: Int { lock.lock(); defer { lock.unlock() }; return _stopSessionCalls }
 
-        init(hasSession: Bool = false, recoveryEvents: [AgentRunEvent] = []) {
+        init(
+            hasSession: Bool = false,
+            recoveryEvents: [AgentRunEvent] = [],
+            supportsSendTurn: Bool = false,
+            reportsLiveSummary: Bool = false
+        ) {
             _hasSession = hasSession
             self.recoveryEvents = recoveryEvents
+            self.supportsSendTurn = supportsSendTurn
+            self.reportsLiveSummary = reportsLiveSummary
         }
 
         func listModels() async -> [AgentModelDescriptor] { [] }
@@ -154,7 +192,12 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
             throw AgentProviderAdapterError.unsupported("startSession")
         }
         func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
-            throw AgentProviderAdapterError.unsupported("sendTurn")
+            guard supportsSendTurn else {
+                throw AgentProviderAdapterError.unsupported("sendTurn")
+            }
+            lock.lock(); _hasSession = true; lock.unlock()
+            onEvent(.status(.running))
+            return AgentRunHandle(runId: request.runId, process: nil) {}
         }
         func interruptTurn(threadId: AgentThreadID) throws {}
         func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {}
@@ -166,18 +209,176 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
             let events = lock.withLock { () -> [AgentRunEvent] in
                 _recoverCalls += 1
                 _hasSession = true
+                recoveredThreadId = request.threadId
+                recoveryCallback = onEvent
                 return recoveryEvents
             }
             for event in events {
                 onEvent(event)
             }
         }
-        func listSessions() -> [AgentProviderSessionSummary] { [] }
+        func listSessions() -> [AgentProviderSessionSummary] {
+            lock.withLock {
+                guard _hasSession, reportsLiveSummary else { return [] }
+                return [AgentProviderSessionSummary(
+                    threadId: recoveredThreadId ?? AgentThreadID(),
+                    provider: .codex,
+                    status: .running,
+                    providerThreadId: "provider-live"
+                )]
+            }
+        }
         func hasSession(threadId: AgentThreadID) -> Bool { lock.lock(); defer { lock.unlock() }; return _hasSession }
         func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] { [] }
         func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {}
         func stopAll() {}
         func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+
+        func emitLateRecovery(_ event: AgentRunEvent) {
+            let callback = lock.withLock { recoveryCallback }
+            callback?(event)
+        }
+    }
+
+    func test_passiveRecoveryFilterAllowsOnlyCursorDisclosureAndRuntimeTelemetry() {
+        XCTAssertTrue(AgentRunCoordinator.passiveRecoveryEventIsAllowed(.error("resume degraded")))
+        XCTAssertTrue(AgentRunCoordinator.passiveRecoveryEventIsAllowed(.event(
+            .threadStarted(threadId: "fresh", providerThreadId: "fresh")
+        )))
+        XCTAssertTrue(AgentRunCoordinator.passiveRecoveryEventIsAllowed(.event(.providerRuntime(
+            ProviderRuntimeEvent(
+                provider: .codex,
+                source: "test",
+                method: "session/recovered",
+                payloadJSON: "{}",
+                receivedAtMs: 1
+            )
+        ))))
+
+        XCTAssertFalse(AgentRunCoordinator.passiveRecoveryEventIsAllowed(.status(.completed)))
+        XCTAssertFalse(AgentRunCoordinator.passiveRecoveryEventIsAllowed(.finished(
+            .completed,
+            finalMessage: "ambient",
+            providerThreadId: "stale"
+        )))
+        XCTAssertFalse(AgentRunCoordinator.passiveRecoveryEventIsAllowed(.event(.turnStarted(turnId: "ambient"))))
+        XCTAssertFalse(AgentRunCoordinator.passiveRecoveryEventIsAllowed(.event(.turnCompleted(
+            turnId: "ambient",
+            finalMessage: "ambient"
+        ))))
+        XCTAssertFalse(AgentRunCoordinator.passiveRecoveryEventIsAllowed(.event(.itemStarted(item:
+            AssistantItem(
+                id: "ambient-item",
+                turnId: "ambient",
+                type: .assistantMessage,
+                state: .streaming,
+                startedAtMs: 1
+            )
+        ))))
+    }
+
+    func test_readThreadForTerminalHistoryUsesDurableStreamWithoutLiveRecovery() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("terminal-durable-read")
+        var thread = AgentThread(title: "terminal", provider: .codex, model: "fake-model")
+        thread.status = .completed
+        try threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            status: .completed,
+            finishedAt: Date()
+        )
+        try runRepo.upsert(run)
+        let durableEvent = AssistantEvent.turnCompleted(turnId: "durable-turn", finalMessage: "durable answer")
+        let encoded = try JSONEncoder().encode(durableEvent)
+        try runRepo.appendStreamEvent(
+            runId: run.id,
+            seq: 1,
+            kind: durableEvent.debugDescription,
+            payloadJSON: String(decoding: encoded, as: UTF8.self)
+        )
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .completed,
+            resumeCursor: "provider-terminal",
+            cwd: tmp,
+            model: "fake-model",
+            lastRunId: run.id
+        ))
+        let adapter = SpyRecoverAdapter(hasSession: false)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providerAdapters: [.codex: adapter]
+        )
+
+        let events = try await coordinator.readThread(threadId: thread.id)
+
+        XCTAssertEqual(adapter.recoverCalls, 0,
+                       "terminal history reads must not spawn a live provider recovery process")
+        XCTAssertTrue(events.contains {
+            if case .turnCompleted("durable-turn", "durable answer") = $0 { return true }
+            return false
+        }, "terminal read must still return the bounded durable stream")
+
+        var noSessionThread = AgentThread(title: "terminal no session", provider: .codex, model: "fake-model")
+        noSessionThread.status = .failed
+        try threadRepo.upsert(noSessionThread)
+        let noSessionRun = AgentRun(
+            threadId: noSessionThread.id,
+            provider: .codex,
+            model: "fake-model",
+            status: .failed,
+            finishedAt: Date()
+        )
+        try runRepo.upsert(noSessionRun)
+        let failureEvent = AssistantEvent.error(message: "durable failure", recoverable: true)
+        let failureData = try JSONEncoder().encode(failureEvent)
+        try runRepo.appendStreamEvent(
+            runId: noSessionRun.id,
+            seq: 1,
+            kind: failureEvent.debugDescription,
+            payloadJSON: String(decoding: failureData, as: UTF8.self)
+        )
+
+        let noSessionEvents = try await coordinator.readThread(threadId: noSessionThread.id)
+        XCTAssertEqual(adapter.recoverCalls, 0,
+                       "missing provider-session metadata on a terminal thread must still use durable history")
+        XCTAssertTrue(noSessionEvents.contains {
+            if case .error("durable failure", true) = $0 { return true }
+            return false
+        })
+
+        // A terminal-looking session row is not enough to choose durable-only
+        // history when any run for the thread is still pending/running. Session
+        // metadata can lag the run transaction during handoff.
+        var staleSessionThread = AgentThread(title: "stale terminal session", provider: .codex, model: "fake-model")
+        staleSessionThread.status = .completed
+        try threadRepo.upsert(staleSessionThread)
+        let activeRun = AgentRun(
+            threadId: staleSessionThread.id,
+            provider: .codex,
+            model: "fake-model",
+            status: .running
+        )
+        try runRepo.upsert(activeRun)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: staleSessionThread.id,
+            provider: .codex,
+            status: .completed,
+            resumeCursor: "provider-active",
+            cwd: tmp,
+            model: "fake-model",
+            lastRunId: activeRun.id
+        ))
+
+        _ = try await coordinator.readThread(threadId: staleSessionThread.id)
+        XCTAssertEqual(adapter.recoverCalls, 1,
+                       "a durable active run must defeat stale terminal session metadata and retain live recovery")
     }
 
     func test_stopRun_onLongFinishedThread_doesNotRespawnProviderOrBroadcastCancelled() async throws {
@@ -273,6 +474,10 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
             hasSession: false,
             recoveryEvents: [
                 .event(.threadStarted(threadId: "fresh-provider-thread", providerThreadId: "fresh-provider-thread")),
+                .event(.turnStarted(turnId: "ambient-recovery-turn")),
+                .event(.turnCompleted(turnId: "ambient-recovery-turn", finalMessage: "must not persist")),
+                .status(.completed),
+                .finished(.completed, finalMessage: "must not finish", providerThreadId: "fresh-provider-thread"),
                 .error("Previous session could not be resumed; starting a new session.")
             ]
         )
@@ -284,6 +489,11 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
             providerAdapters: [.codex: adapter]
         )
         let recorder = AssistantEventRecorder()
+        let lifecycle = LifecycleRecorder()
+        coordinator.addObserver(lifecycle)
+        coordinator.onRunFinished = { tid, _, status in
+            lifecycle.recordRunFinished(threadId: tid, status: status)
+        }
         coordinator.onAssistantEvent = { event, threadId, runId in
             recorder.record(event, threadId: threadId, runId: runId)
         }
@@ -303,6 +513,313 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
             },
             "the recoverable fallback disclosure must reach the app-shell listener with the durable prior run id"
         )
+        XCTAssertFalse(recorder.received.contains { event, _, _ in
+            if case .turnStarted = event { return true }
+            if case .turnCompleted = event { return true }
+            return false
+        }, "terminal/interrupted recovery must not replay synthetic turn lifecycle")
+        XCTAssertTrue(lifecycle.finished.isEmpty,
+                      "passive recovery of a non-running durable run cannot emit didFinish")
+        XCTAssertTrue(lifecycle.runFinishedCallbacks.isEmpty,
+                      "passive recovery cannot drain queued work or notify completion")
+        XCTAssertEqual(try runRepo.get(id: priorRun.id)?.status, .interrupted,
+                       "ambient recovery success must not repaint the durable prior run green")
+        XCTAssertFalse(try messageRepo.list(threadId: thread.id).contains {
+            $0.role == .assistant && $0.content == "must not persist"
+        }, "filtered recovery turnCompleted must not append assistant text")
+    }
+
+    func test_foregroundRunInvalidatesLateRecoveryCallbackEpoch() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("recovery-epoch")
+        var thread = AgentThread(title: "epoch", provider: .codex, model: "fake-model")
+        thread.status = .running
+        thread.providerThreadId = "provider-epoch"
+        try threadRepo.upsert(thread)
+        let runA = AgentRun(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            status: .running
+        )
+        try runRepo.upsert(runA)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .running,
+            resumeCursor: "provider-epoch",
+            cwd: tmp,
+            model: "fake-model",
+            lastRunId: runA.id
+        ))
+        let adapter = SpyRecoverAdapter(hasSession: false, supportsSendTurn: true)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providerAdapters: [.codex: adapter]
+        )
+        let lifecycle = LifecycleRecorder()
+        coordinator.addObserver(lifecycle)
+
+        _ = try await coordinator.readThread(threadId: thread.id)
+        XCTAssertEqual(adapter.recoverCalls, 1, "precondition: passive recovery callback A is attached")
+
+        // Durable state advances before foreground B. The recovery callback still
+        // exists inside the adapter, exactly like a parser/readability callback
+        // already queued before sendTurn replaces the live sink.
+        try runRepo.markStopped(id: runA.id, status: .completed)
+        thread.status = .completed
+        try threadRepo.upsert(thread)
+        var session = try XCTUnwrap(sessionRepo.get(threadId: thread.id))
+        session.status = .completed
+        try sessionRepo.upsert(session)
+
+        let runB = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "foreground B",
+            providerThreadId: "provider-epoch"
+        ))
+        XCTAssertEqual(try runRepo.get(id: runB)?.status, .running)
+
+        adapter.emitLateRecovery(.event(.turnCompleted(
+            turnId: "late-a",
+            finalMessage: "late recovery A"
+        )))
+        adapter.emitLateRecovery(.status(.completed))
+        adapter.emitLateRecovery(.finished(
+            .completed,
+            finalMessage: "late recovery A",
+            providerThreadId: "provider-epoch"
+        ))
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(try runRepo.get(id: runB)?.status, .running,
+                       "late recovery A cannot terminalize foreground B")
+        XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .running,
+                       "thread paint/durable status must remain owned by B")
+        XCTAssertTrue(lifecycle.finished.isEmpty,
+                      "invalidated recovery epoch must not fan out a terminal callback")
+        XCTAssertFalse(try messageRepo.list(threadId: thread.id).contains {
+            $0.role == .assistant && $0.content == "late recovery A"
+        }, "invalidated recovery epoch must not persist stale assistant text")
+    }
+
+    func test_recoveryLifecycleStopsOwningCallbacksAfterRunATerminalizesWithoutRunB() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("recovery-terminal-epoch")
+        var thread = AgentThread(title: "terminal epoch", provider: .codex, model: "fake-model")
+        thread.status = .running
+        thread.providerThreadId = "provider-terminal-epoch"
+        try threadRepo.upsert(thread)
+        let runA = AgentRun(threadId: thread.id, provider: .codex, model: "fake-model", status: .running)
+        try runRepo.upsert(runA)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .running,
+            resumeCursor: "provider-terminal-epoch",
+            cwd: tmp,
+            model: "fake-model",
+            lastRunId: runA.id
+        ))
+        let adapter = SpyRecoverAdapter(hasSession: false)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providerAdapters: [.codex: adapter]
+        )
+        let lifecycle = LifecycleRecorder()
+        let assistant = AssistantEventRecorder()
+        coordinator.addObserver(lifecycle)
+        coordinator.onAssistantEvent = { event, threadId, runId in
+            assistant.record(event, threadId: threadId, runId: runId)
+        }
+
+        _ = try await coordinator.readThread(threadId: thread.id)
+        XCTAssertEqual(adapter.recoverCalls, 1)
+
+        adapter.emitLateRecovery(.finished(
+            .completed,
+            finalMessage: "authoritative A",
+            providerThreadId: "provider-terminal-epoch"
+        ))
+        await waitUntil { (try? runRepo.get(id: runA.id)?.status) == .completed }
+        let finishedCount = lifecycle.finished.count
+        let statusCount = lifecycle.statusChanges.count
+
+        adapter.emitLateRecovery(.event(.turnCompleted(
+            turnId: "late-a",
+            finalMessage: "stale post-terminal A"
+        )))
+        adapter.emitLateRecovery(.status(.running))
+        adapter.emitLateRecovery(.finished(
+            .completed,
+            finalMessage: "stale post-terminal A",
+            providerThreadId: "provider-terminal-epoch"
+        ))
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(try runRepo.get(id: runA.id)?.status, .completed)
+        XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .completed)
+        XCTAssertEqual(lifecycle.finished.count, finishedCount)
+        XCTAssertEqual(lifecycle.statusChanges.count, statusCount)
+        XCTAssertFalse(assistant.received.contains { event, _, _ in
+            if case .turnCompleted(let turnId, _) = event { return turnId == "late-a" }
+            return false
+        })
+        XCTAssertFalse(try messageRepo.list(threadId: thread.id).contains {
+            $0.role == .assistant && $0.content == "stale post-terminal A"
+        })
+    }
+
+    func test_rejectedForegroundStartKeepsLiveRecoveryCallbackAuthorized() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("recovery-epoch-rejected-start")
+        var thread = AgentThread(title: "recovered live", provider: .codex, model: "fake-model")
+        thread.status = .running
+        thread.providerThreadId = "provider-live"
+        try threadRepo.upsert(thread)
+        let liveRun = AgentRun(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            status: .running
+        )
+        try runRepo.upsert(liveRun)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .running,
+            resumeCursor: "provider-live",
+            cwd: tmp,
+            model: "fake-model",
+            lastRunId: liveRun.id
+        ))
+        let adapter = SpyRecoverAdapter(
+            hasSession: false,
+            supportsSendTurn: true,
+            reportsLiveSummary: true
+        )
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providerAdapters: [.codex: adapter]
+        )
+
+        _ = try await coordinator.readThread(threadId: thread.id)
+        XCTAssertTrue(adapter.hasSession(threadId: thread.id), "precondition: recovery owns a live provider session")
+
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                threadId: thread.id,
+                provider: .codex,
+                model: "fake-model",
+                cwd: tmp,
+                prompt: "must be rejected",
+                providerThreadId: "provider-live"
+            ))
+            XCTFail("a foreground start cannot replace the live recovered turn")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("in-flight turn"))
+        }
+
+        adapter.emitLateRecovery(.finished(
+            .completed,
+            finalMessage: "recovered run completed",
+            providerThreadId: "provider-live"
+        ))
+        await waitUntil { (try? runRepo.get(id: liveRun.id)?.status) == .completed }
+
+        XCTAssertEqual(try runRepo.get(id: liveRun.id)?.status, .completed,
+                       "a rejected foreground attempt must not invalidate the still-live recovery generation")
+        XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .completed)
+    }
+
+    func test_foregroundPendingPersistenceAlreadyRejectsLateRecoveryA() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("recovery-epoch-pending-b")
+        var thread = AgentThread(title: "epoch handoff", provider: .codex, model: "fake-model")
+        thread.status = .running
+        thread.providerThreadId = "provider-epoch"
+        try threadRepo.upsert(thread)
+        let runA = AgentRun(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            status: .running
+        )
+        try runRepo.upsert(runA)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .running,
+            resumeCursor: "provider-epoch",
+            cwd: tmp,
+            model: "fake-model",
+            lastRunId: runA.id
+        ))
+        let adapter = SpyRecoverAdapter(hasSession: false, supportsSendTurn: true)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providerAdapters: [.codex: adapter]
+        )
+        _ = try await coordinator.readThread(threadId: thread.id)
+
+        try runRepo.markStopped(id: runA.id, status: .completed)
+        thread.status = .completed
+        try threadRepo.upsert(thread)
+        var session = try XCTUnwrap(sessionRepo.get(threadId: thread.id))
+        session.status = .completed
+        try sessionRepo.upsert(session)
+
+        let gate = RunPreparedGate()
+        coordinator.onRunPrepared = { _, _ in await gate.enterAndWait() }
+        let runB = AgentRunID()
+        let startB = Task {
+            try await coordinator.startRun(AgentRunRequest(
+                runId: runB,
+                threadId: thread.id,
+                provider: .codex,
+                model: "fake-model",
+                cwd: tmp,
+                prompt: "foreground B",
+                providerThreadId: "provider-epoch"
+            ))
+        }
+        await gate.waitUntilEntered()
+        XCTAssertEqual(try runRepo.get(id: runB)?.status, .pending,
+                       "precondition: B is durable before provider send")
+
+        adapter.emitLateRecovery(.event(.turnCompleted(
+            turnId: "late-a",
+            finalMessage: "late recovery A"
+        )))
+        adapter.emitLateRecovery(.finished(
+            .completed,
+            finalMessage: "late recovery A",
+            providerThreadId: "provider-epoch"
+        ))
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(try runRepo.get(id: runB)?.status, .pending,
+                       "recovery A must be invalid before B's pending graph becomes visible")
+        XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .pending)
+        XCTAssertFalse(try messageRepo.list(threadId: thread.id).contains {
+            $0.role == .assistant && $0.content == "late recovery A"
+        })
+
+        await gate.release()
+        let startedRunB = try await startB.value
+        XCTAssertEqual(startedRunB, runB)
+        XCTAssertEqual(try runRepo.get(id: runB)?.status, .running)
     }
 
     // MARK: - F22: runner-level errors are persisted

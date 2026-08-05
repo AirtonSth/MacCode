@@ -75,6 +75,9 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         var cancelRequested = false
         var forcedKillByUs = false
         var turnTerminalEmitted = false
+        /// Monotonic identity for the current in-flight prompt. Cancel-grace
+        /// timers capture this so a delayed kill for run A cannot stop run B.
+        var promptGeneration: UInt64 = 0
         var promptWritePermit = AgentRunAcceptancePermit()
         var onEvent: (@Sendable (AgentRunEvent) -> Void)?
         var history: [AssistantEvent] = []
@@ -124,6 +127,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     var beforePromptWriteForTesting: (() -> Void)?
     var beforePhysicalPromptWriteForTesting: (() -> Void)?
     var afterPromptWriteForTesting: (() -> Void)?
+    var beforeEscalatedSessionStopForTesting: (() -> Void)?
     var promptWriteAcceptanceCountForTesting: Int {
         synchronized { promptWriteAcceptanceCountForTestingStorage }
     }
@@ -315,12 +319,23 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     }
 
     public func interruptTurn(threadId: AgentThreadID) throws {
+        try interruptTurn(threadId: threadId, expectedGeneration: nil)
+    }
+
+    private func interruptTurn(threadId: AgentThreadID, expectedGeneration: UInt64?) throws {
         lock.lock()
         guard let session = sessions[threadId] else {
             lock.unlock()
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
+        if let expectedGeneration, session.promptGeneration != expectedGeneration {
+            lock.unlock()
+            return
+        }
         let shouldCancel = session.inFlight && !session.cancelRequested
+        // Capture the exact generation being interrupted so a delayed grace
+        // timer cannot force-kill a newer prompt on the same resident session.
+        let interruptedGeneration = session.promptGeneration
         if shouldCancel { session.cancelRequested = true }
         lock.unlock()
         guard shouldCancel else { return }
@@ -332,11 +347,26 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         }
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + cancellationGracePeriod) { [weak self, weak session] in
             guard let self, let session else { return }
-            self.lock.lock()
-            let force = session.inFlight && !session.turnTerminalEmitted
-            if force { session.forcedKillByUs = true }
-            self.lock.unlock()
-            if force { session.client.stop() }
+            let claim: (claimed: Bool, pending: [PendingPermission]) = self.lock.withLock {
+                guard self.sessions[threadId] === session,
+                      session.inFlight,
+                      !session.turnTerminalEmitted,
+                      session.promptGeneration == interruptedGeneration
+                else { return (false, []) }
+                self.sessions.removeValue(forKey: threadId)
+                session.isLive = false
+                session.forcedKillByUs = true
+                session.promptWritePermit.invalidate()
+                let pending = Array(session.pendingPermissions.values)
+                session.pendingPermissions.removeAll()
+                return (true, pending)
+            }
+            guard claim.claimed else { return }
+            self.beforeEscalatedSessionStopForTesting?()
+            for request in claim.pending {
+                request.continuation.resume(throwing: AgentProviderAdapterError.sessionNotFound(threadId))
+            }
+            session.client.stop()
         }
     }
 
@@ -625,6 +655,9 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             session.cancelRequested = false
             session.forcedKillByUs = false
             session.turnTerminalEmitted = false
+            // New in-flight identity; stale cancel grace from a prior prompt
+            // must not match this generation.
+            session.promptGeneration &+= 1
             session.onEvent = onEvent
         }
 
@@ -898,9 +931,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     }
 
     private func handle(for runId: AgentRunID, session: Session) -> AgentRunHandle {
-        AgentRunHandle(runId: runId, process: session.client.runningProcess) { [weak self, weak session] in
+        let generation = lock.withLock { session.promptGeneration }
+        return AgentRunHandle(runId: runId, process: session.client.runningProcess) { [weak self, weak session] in
             guard let self, let session else { return }
-            try? self.interruptTurn(threadId: session.threadId)
+            try? self.interruptTurn(threadId: session.threadId, expectedGeneration: generation)
         }
     }
 

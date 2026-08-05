@@ -316,6 +316,90 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                        "a quiet command item must reconcile against thread/read so lost terminal notifications cannot leave Working stuck")
     }
 
+    func test_reconcileTerminalClaimCannotFinishNewerTurnStartedInFormerCheckToMutationGap() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        client.readResponse = [
+            "thread": [
+                "id": "codex-thread-1",
+                "status": ["type": "idle"],
+                "turns": [[
+                    "id": "turn-app-server-1",
+                    "status": "completed",
+                    "items": [[
+                        "id": "answer-a",
+                        "type": "agentMessage",
+                        "text": "answer A"
+                    ]]
+                ]]
+            ]
+        ]
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let claimEntered = DispatchSemaphore(value: 0)
+        let allowClaim = DispatchSemaphore(value: 0)
+        adapter.beforeReconciledTerminalClaimForTesting = {
+            claimEntered.signal()
+            allowClaim.wait()
+        }
+        let threadId = AgentThreadID()
+        let sinkA = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "run A"
+        )) { event in
+            Task { await sinkA.record(event) }
+        }
+        client.notificationHandler?("item/started", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "item": [
+                "id": "quiet-command-a",
+                "type": "commandExecution",
+                "command": "echo waiting",
+                "status": "inProgress"
+            ]
+        ])
+
+        await Task.detached { claimEntered.wait() }.value
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1"
+        ])
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline, await sinkA.finish == nil {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let finishA = await sinkA.finish
+        XCTAssertNotNil(finishA, "normal notification must finish A before B starts")
+
+        let sinkB = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "run B",
+            providerThreadId: "codex-thread-1"
+        )) { event in
+            Task { await sinkB.record(event) }
+        }
+        adapter.beforeReconciledTerminalClaimForTesting = nil
+        allowClaim.signal()
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertEqual(adapter.listSessions().first?.status, .running,
+                       "stale reconciliation A must not clear or finish the newer generation B")
+        let finishB = await sinkB.finish
+        XCTAssertNil(finishB,
+                     "the stale A watchdog must emit no terminal through B's callback")
+        adapter.stopAll()
+    }
+
     func test_followUpTurnReusesLiveAppServerClientInsteadOfResumingInSecondProcess() async throws {
         let client = MockCodexAppServerClient(autoComplete: false)
         let factoryCallCount = LockedCounter()
@@ -327,7 +411,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         let threadId = AgentThreadID()
         let sink = EventSink()
 
-        _ = try await adapter.sendTurn(AgentRunRequest(
+        let handleA = try await adapter.sendTurn(AgentRunRequest(
             threadId: threadId,
             provider: .codex,
             model: "gpt-5.5",
@@ -352,12 +436,16 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         )) { event in
             Task { await sink.record(event) }
         }
+        handleA.cancel()
+        try await Task.sleep(nanoseconds: 50_000_000)
 
         XCTAssertEqual(factoryCallCount.value, 1,
                        "a follow-up turn must remain on the live app-server process so its notifications stay attached to the Agent App")
         XCTAssertEqual(client.openedRequests.count, 1,
                        "thread/resume is restart recovery, not the normal same-process follow-up path")
         XCTAssertEqual(client.startedTurns.map(\.request.prompt), ["first", "second"])
+        XCTAssertTrue(client.interruptedTurns.isEmpty,
+                      "stale Codex handle A cancel must not interrupt run B")
         XCTAssertFalse(client.didStop)
     }
 
