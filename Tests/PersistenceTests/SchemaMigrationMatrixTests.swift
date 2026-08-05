@@ -11,6 +11,7 @@ private final class ForkIntentMaintenanceProbe: @unchecked Sendable {
     private var didObserveDrain = false
     private var didObserveError = false
     private var storedReceipts: [ForkIntentMaintenanceReceipt] = []
+    private var storedReceiptTimes: [UInt64] = []
 
     init(
         firstBatchGate: DispatchSemaphore? = nil,
@@ -33,6 +34,7 @@ private final class ForkIntentMaintenanceProbe: @unchecked Sendable {
     func record(_ receipt: ForkIntentMaintenanceReceipt) {
         lock.lock()
         storedReceipts.append(receipt)
+        storedReceiptTimes.append(DispatchTime.now().uptimeNanoseconds)
         let shouldFulfillError = receipt.errorKind != nil && !didObserveError
         if shouldFulfillError { didObserveError = true }
         let shouldFulfillDrain = receipt.errorKind == nil
@@ -48,6 +50,12 @@ private final class ForkIntentMaintenanceProbe: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return storedReceipts
+    }
+
+    var receiptTimes: [UInt64] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedReceiptTimes
     }
 }
 
@@ -752,6 +760,16 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             $0.batchCount > 0
                 && $0.batchCount <= AgentThreadRepository.terminalForkIntentCleanupBatchSize
         }, "every transaction must process between 1 and 16 rows")
+        let receiptTimes = probe.receiptTimes
+        XCTAssertGreaterThanOrEqual(receiptTimes.count, 2)
+        let minimumDefaultInterBatchMilliseconds = zip(receiptTimes, receiptTimes.dropFirst())
+            .map { previous, next in Double(next - previous) / 1_000_000 }
+            .min() ?? 0
+        XCTAssertGreaterThanOrEqual(
+            minimumDefaultInterBatchMilliseconds,
+            5,
+            "the production 10ms success delay must pace every maintenance batch"
+        )
         for (state, payload) in preservedPayloads {
             let row = try db.prepare("""
                 SELECT source_messages_json, provider_creation_attempted
@@ -764,7 +782,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             XCTAssertEqual(row.columnInt64(1), 1)
         }
 
-        print("FORK_INTENT_MAINTENANCE_LOCAL startup_wall_seconds=\(String(format: "%.3f", startupWallSeconds)) before_db_wal_bytes=\(beforeBytes) startup_peak_db_wal_bytes=\(startupPeakBytes) eventual_peak_db_wal_bytes=\(eventualPeakBytes) after_db_wal_bytes=\(afterBytes) terminal_rows=\(terminalRows) batch_limit=\(AgentThreadRepository.terminalForkIntentCleanupBatchSize) batches=\(successfulReceipts.count)")
+        print("FORK_INTENT_MAINTENANCE_LOCAL startup_wall_seconds=\(String(format: "%.3f", startupWallSeconds)) before_db_wal_bytes=\(beforeBytes) startup_peak_db_wal_bytes=\(startupPeakBytes) eventual_peak_db_wal_bytes=\(eventualPeakBytes) after_db_wal_bytes=\(afterBytes) terminal_rows=\(terminalRows) batch_limit=\(AgentThreadRepository.terminalForkIntentCleanupBatchSize) batches=\(successfulReceipts.count) minimum_default_inter_batch_ms=\(String(format: "%.3f", minimumDefaultInterBatchMilliseconds))")
     }
 
     func test_largeMaintenanceBacklogPacesBatchesSoForegroundDatabaseWorkProgresses() throws {
@@ -864,6 +882,9 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         XCTAssertTrue(details.contains {
             $0.contains("USING INDEX idx_agent_thread_fork_intents_maintenance")
         }, "v62 must serve ordered maintenance candidates from its partial index: \(details)")
+        XCTAssertFalse(details.contains {
+            $0.contains("USE TEMP B-TREE")
+        }, "v62 must satisfy maintenance ordering without a temporary B-tree: \(details)")
     }
 
     func test_oldV61MaintenanceRollsBackFailedBatchAndRetriesToDrain() throws {
