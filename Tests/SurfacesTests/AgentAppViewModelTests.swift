@@ -6906,6 +6906,7 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.selectThread(b.id)
         // Seed the coordinator's per-thread auto-continuation state for A.
         vm.coordinator.seedAutoContinuationStateForTesting(a.id)
+        vm.seedAdditionalThreadCachesForTesting(a.id)
 
         XCTAssertTrue(vm.threadCacheResidueForTesting.contains(a.id),
                       "precondition: A is present in a per-thread VM cache")
@@ -6918,6 +6919,255 @@ final class AgentAppViewModelTests: XCTestCase {
                        "deleting a thread must leave no residue in any per-thread VM cache (F9)")
         XCTAssertFalse(vm.coordinator.autoContinuationThreadIdsForTesting.contains(a.id),
                        "deleting a thread must drop its coordinator auto-continuation state (F9)")
+    }
+
+    /// PERF-MAC_AGENT-013: coordinator broadcasts are shared by Agent App
+    /// surfaces. Reloading workspace A must not treat workspace B's cached event
+    /// state as an automatically pruned local thread and forget B in the shared
+    /// coordinator.
+    func test_reloadThreads_preservesForeignWorkspaceCacheAndCoordinatorState() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-shared-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [
+                .codex: FakeProviderRunner(provider: .codex),
+                .claude: FakeProviderRunner(provider: .claude)
+            ]
+        )
+        let workspaceA = WorkspaceID()
+        let workspaceB = WorkspaceID()
+        let vmA = AgentAppViewModel(
+            workspaceID: workspaceA,
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            draftRepo: AgentThreadDraftRepository(db: db),
+            attachmentStore: AgentAttachmentStore(root: URL(fileURLWithPath: tmp).appendingPathComponent("attachments-a")),
+            promptHistoryStore: PromptHistoryStore(db: db)
+        )
+        let vmB = AgentAppViewModel(
+            workspaceID: workspaceB,
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            draftRepo: AgentThreadDraftRepository(db: db),
+            attachmentStore: AgentAttachmentStore(root: URL(fileURLWithPath: tmp).appendingPathComponent("attachments-b")),
+            promptHistoryStore: PromptHistoryStore(db: db)
+        )
+        installRunnableProviderFixtures(on: vmA)
+        installRunnableProviderFixtures(on: vmB)
+        wireCanonicalThreadRead(vmA, repo: threadRepo)
+        wireCanonicalThreadRead(vmB, repo: threadRepo)
+
+        let threadA = AgentThread(workspaceId: workspaceA, title: "A", provider: .claude, model: "m")
+        let threadB = AgentThread(workspaceId: workspaceB, title: "B", provider: .claude, model: "m")
+        try threadRepo.upsert(threadA)
+        try threadRepo.upsert(threadB)
+        vmA.reloadThreads()
+        vmB.reloadThreads()
+        vmB.selectThread(threadB.id)
+        vmB.prompt = "foreign draft"
+        vmB.seedAdditionalThreadCachesForTesting(threadB.id)
+        coordinator.seedAutoContinuationStateForTesting(threadB.id)
+
+        // This is the real multi-workspace coordinator status path: A learns B's
+        // workspace membership, rejects the status as foreign, but retains the
+        // membership cache for future event filtering.
+        vmA.runCoordinator(
+            coordinator,
+            didChangeStatus: .running,
+            runId: AgentRunID(),
+            threadId: threadB.id
+        )
+        await waitAsync("foreign coordinator status is filtered") {
+            vmA.threadCacheResidueForTesting.contains(threadB.id)
+        }
+        vmA.handleQueueLifecycleEvent(
+            kind: "agent.message.queue.failed",
+            threadId: threadB.id.value.uuidString,
+            message: "foreign queue status"
+        )
+
+        XCTAssertTrue(vmA.threadCacheResidueForTesting.contains(threadB.id),
+                      "precondition: A holds B's foreign event/cache state")
+        XCTAssertTrue(vmB.threadCacheResidueForTesting.contains(threadB.id),
+                      "precondition: B owns its visible draft and per-thread caches")
+        XCTAssertTrue(coordinator.autoContinuationThreadIdsForTesting.contains(threadB.id),
+                      "precondition: B owns shared coordinator state")
+
+        vmA.reloadThreads()
+
+        XCTAssertTrue(vmA.threadCacheResidueForTesting.contains(threadB.id),
+                      "reloading A must retain foreign event/cache state rather than classify B as locally pruned")
+        XCTAssertTrue(vmB.threadCacheResidueForTesting.contains(threadB.id),
+                      "reloading A must not change B's ViewModel caches")
+        XCTAssertTrue(coordinator.autoContinuationThreadIdsForTesting.contains(threadB.id),
+                      "reloading A must not forget B's shared coordinator state")
+    }
+
+    /// PERF-MAC_AGENT-013: a create/RPC producer can enforce the cap before an
+    /// open surface reloads, discarding the victim IDs. The next scheduled reload
+    /// must reconcile its known thread/cache IDs against SQLite, including a
+    /// currently selected victim, rather than retaining stale drafts or state.
+    func test_scheduledReloadThreads_evictsCachesForAutomaticallyPrunedThreads() async throws {
+        var samples: [ThreadCapEvictionSample] = []
+        for index in 0..<7 { // two warm-ups, then five measured repetitions
+            let sample = try await runThreadCapEvictionWorkload()
+            samples.append(sample)
+            let phase = index < 2 ? "warmup" : "measured"
+            print("CACHE_EVICTION_SAMPLE phase=\(phase) index=\(index + 1) db_victims=\(sample.databaseVictimCount) cache_victims=\(sample.cachedVictimCount) coordinator_victims=\(sample.coordinatorVictimCount) draft_utf8_bytes=\(sample.cachedDraftUTF8Bytes) selected_prompt_before_utf8_bytes=\(sample.selectedPromptBeforeEvictionUTF8Bytes) selected_prompt_after_utf8_bytes=\(sample.selectedPromptAfterEvictionUTF8Bytes) selected_thread_bound_state_released=\(sample.selectedThreadBoundStateReleased) selected_recovered=\(sample.selectedThreadRecovered) automatic_prune_undo=\(sample.automaticPruneCreatedUndo) footprint_before_kb=\(sample.footprintBeforeReloadKB) footprint_settled_kb=\(sample.footprintAfterSettleKB)")
+        }
+
+        let measured = samples.dropFirst(2)
+        XCTAssertEqual(measured.count, 5, "the performance proof requires five measured repetitions after warm-up")
+        XCTAssertTrue(measured.allSatisfy { $0.databaseVictimCount == 0 },
+                      "automatic reload must preserve SQLite's cap decision")
+        XCTAssertTrue(measured.allSatisfy { $0.cachedVictimCount == 0 },
+                      "automatic cap pruning must leave no pruned thread ID in VM caches")
+        XCTAssertTrue(measured.allSatisfy { $0.coordinatorVictimCount == 0 },
+                      "automatic cap pruning must also forget coordinator per-thread state")
+        XCTAssertTrue(measured.allSatisfy { $0.cachedDraftUTF8Bytes == 0 },
+                      "automatic cap pruning must release the large unique drafts retained only by pruned IDs")
+        XCTAssertTrue(measured.allSatisfy(\.selectedThreadRecovered),
+                      "a selected victim must recover the surface to its fresh, unbound state")
+        XCTAssertTrue(measured.allSatisfy { $0.selectedPromptAfterEvictionUTF8Bytes == 0 },
+                      "recovering a selected victim must release its visible composer draft")
+        XCTAssertTrue(measured.allSatisfy(\.selectedThreadBoundStateReleased),
+                      "recovering a selected victim must clear its transcript, queue, and provider snapshot state")
+        XCTAssertTrue(measured.allSatisfy { !$0.automaticPruneCreatedUndo },
+                      "automatic cap pruning must not create the explicit-delete undo affordance")
+    }
+
+    private struct ThreadCapEvictionSample {
+        let databaseVictimCount: Int
+        let cachedVictimCount: Int
+        let coordinatorVictimCount: Int
+        let cachedDraftUTF8Bytes: Int
+        let selectedPromptBeforeEvictionUTF8Bytes: Int
+        let selectedPromptAfterEvictionUTF8Bytes: Int
+        let selectedThreadBoundStateReleased: Bool
+        let selectedThreadRecovered: Bool
+        let automaticPruneCreatedUndo: Bool
+        let footprintBeforeReloadKB: Int
+        let footprintAfterSettleKB: Int
+    }
+
+    private func runThreadCapEvictionWorkload() async throws -> ThreadCapEvictionSample {
+        let (vm, threadRepo) = try makeVM()
+        let victimCount = 3
+        let draftBytesPerVictim = 1_048_576
+        let oldest = Date(timeIntervalSince1970: 1_700_000_000)
+        var victims: [AgentThread] = []
+        for index in 0..<victimCount {
+            var victim = AgentThread(workspaceId: vm.workspaceID,
+                                     title: "old victim \(index)",
+                                     provider: .claude,
+                                     model: "m")
+            victim.status = .completed
+            victim.updatedAt = oldest.addingTimeInterval(TimeInterval(index))
+            try threadRepo.upsert(victim)
+            victims.append(victim)
+        }
+        var survivor = AgentThread(workspaceId: vm.workspaceID,
+                                   title: "survivor",
+                                   provider: .claude,
+                                   model: "m")
+        survivor.status = .completed
+        survivor.updatedAt = oldest.addingTimeInterval(TimeInterval(victimCount))
+        try threadRepo.upsert(survivor)
+        vm.reloadThreads()
+
+        for (index, victim) in victims.enumerated() {
+            vm.selectThread(victim.id)
+            vm.prompt = String(repeating: index == 0 ? "A" : index == 1 ? "B" : "C",
+                               count: draftBytesPerVictim)
+            vm.selectThread(survivor.id)
+            vm.coordinator.seedAutoContinuationStateForTesting(victim.id)
+            vm.seedAdditionalThreadCachesForTesting(victim.id)
+        }
+        let victimIDs = Set(victims.map(\.id))
+        XCTAssertEqual(vm.threadCacheResidueForTesting.intersection(victimIDs).count, victimCount,
+                       "precondition: every future victim is present in a VM cache")
+        XCTAssertEqual(vm.coordinator.autoContinuationThreadIdsForTesting.intersection(victimIDs).count, victimCount,
+                       "precondition: every future victim is present in coordinator state")
+        XCTAssertEqual(vm.cachedComposerDraftUTF8BytesForTesting, victimCount * draftBytesPerVictim,
+                       "precondition: the cache retains all unique victim drafts before automatic pruning")
+
+        // Keep a deleted thread selected. reloadThreads must publish the unbound
+        // selection rather than leaving the surface bound to a row gone from SQLite.
+        let selectedVictim = victims[0]
+        vm.selectThread(selectedVictim.id)
+        vm.seedAdditionalThreadCachesForTesting(selectedVictim.id)
+        let selectedPromptBeforeEvictionUTF8Bytes = vm.prompt.utf8.count
+        XCTAssertEqual(selectedPromptBeforeEvictionUTF8Bytes, draftBytesPerVictim,
+                       "precondition: the selected victim visibly retains its unique large draft")
+        try vm.messageRepo.append(AgentMessage(threadId: selectedVictim.id,
+                                               role: .assistant,
+                                               content: "selected victim transcript"))
+        await waitAsync("selected victim transcript loads") {
+            vm.messages.contains { $0.threadId == selectedVictim.id }
+        }
+        vm.timeline.apply(.turnStarted(turnId: "selected-victim-turn"))
+        XCTAssertEqual(vm.queueStatusMessage, "test queue status",
+                       "precondition: the selected victim owns the seeded queue status")
+        XCTAssertNotNil(vm.providerThreadSnapshotLastConfirmedAt,
+                        "precondition: the selected victim owns the seeded provider snapshot timestamp")
+        var recoveredSelection: AgentThreadID? = selectedVictim.id
+        vm.onSelectedThreadChanged = { recoveredSelection = $0 }
+
+        // Simulate externally-created/scheduled threads. The scheduled reload below
+        // is the automatic UI path that notices the oversized workspace and prunes it.
+        for index in 0..<(AgentThreadRepository.maxThreadsPerWorkspace - 1) {
+            var thread = AgentThread(workspaceId: vm.workspaceID,
+                                     title: "new thread \(index)",
+                                     provider: .claude,
+                                     model: "m")
+            thread.status = .completed
+            try threadRepo.upsert(thread)
+        }
+        XCTAssertEqual(try threadRepo.count(workspaceId: vm.workspaceID),
+                       AgentThreadRepository.maxThreadsPerWorkspace + victimCount,
+                       "precondition: the automatic reload receives an oversized workspace")
+
+        // This represents createThread/AppCommandRouter enforcing before the
+        // surface sees a lifecycle event. Its return is intentionally discarded.
+        let discardedPrunedThreadIDs = try threadRepo.enforceWorkspaceThreadLimit(workspaceId: vm.workspaceID)
+        XCTAssertEqual(Set(discardedPrunedThreadIDs), victimIDs,
+                       "precondition: the producer removes exactly the cached selected victims before reload")
+        XCTAssertEqual(try threadRepo.count(workspaceId: vm.workspaceID),
+                       AgentThreadRepository.maxThreadsPerWorkspace,
+                       "precondition: reload must recover already-pruned IDs without a new cap result")
+
+        let footprintBeforeReloadKB = currentProcessFootprintKB()
+        vm.scheduleReloadThreads(delayMilliseconds: 1)
+        await waitAsync("scheduled reload recovers the pre-pruned selected victim") {
+            vm.selectedThreadId == nil
+        }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        return ThreadCapEvictionSample(
+            databaseVictimCount: victims.filter { (try? threadRepo.get(id: $0.id)) != nil }.count,
+            cachedVictimCount: vm.threadCacheResidueForTesting.intersection(victimIDs).count,
+            coordinatorVictimCount: vm.coordinator.autoContinuationThreadIdsForTesting.intersection(victimIDs).count,
+            cachedDraftUTF8Bytes: vm.cachedComposerDraftUTF8BytesForTesting,
+            selectedPromptBeforeEvictionUTF8Bytes: selectedPromptBeforeEvictionUTF8Bytes,
+            selectedPromptAfterEvictionUTF8Bytes: vm.prompt.utf8.count,
+            selectedThreadBoundStateReleased: vm.messages.isEmpty
+                && vm.timeline.turns.isEmpty
+                && vm.queueStatusMessage == nil
+                && vm.providerThreadSnapshotLastConfirmedAt == nil,
+            selectedThreadRecovered: vm.selectedThreadId == nil && recoveredSelection == nil,
+            automaticPruneCreatedUndo: vm.pendingThreadDeletionUndo != nil,
+            footprintBeforeReloadKB: footprintBeforeReloadKB,
+            footprintAfterSettleKB: currentProcessFootprintKB()
+        )
     }
 
     // F2: computeTurnRenderInputs is the single per-turn derivation that replaced the

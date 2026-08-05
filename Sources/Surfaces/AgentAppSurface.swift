@@ -689,11 +689,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // Ghost Working: durable finishedAt must free coordinator ownership before
         // the rail counts active threads (missed/filtered didFinish left spinners).
         _ = coordinator.reconcileStaleActiveOwnershipWithDurableState()
+        let knownThreadIDs = Set(threads.map(\.id))
         do {
             // Cap first so oversized workspaces (scheduled runs, long sessions)
             // shrink before the rail reads. CASCADE removes messages.
-            _ = try threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspaceID)
-            threads = try threadRepo.list(workspaceId: workspaceID)
+            let prunedThreadIDs = try threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspaceID)
+            let reloadedThreads = try threadRepo.list(workspaceId: workspaceID)
+            let missingKnownThreadIDs = knownThreadIDs.subtracting(reloadedThreads.map(\.id))
+            evictThreadCaches(Set(prunedThreadIDs).union(missingKnownThreadIDs))
+            threads = reloadedThreads
             pruneStaleRunThreadProjections()
             // Clear Stopping… once a LaunchAgent-owned run is no longer active.
             if isStopping,
@@ -723,6 +727,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // to the fresh-composer state rather than render a dangling selection.
             selectedThreadId = nil
             publishInterestedThreadId(nil)
+            resetDeletedSelectionToFreshComposer()
             onSelectedThreadChanged?(nil)
         }
         // Refresh after selection recovery so a deleted thread cannot leave a
@@ -4001,6 +4006,54 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// auto-continuation bookkeeping. The thread's persistent state is captured for
     /// undo separately; these transient caches rebuild on demand if a delete is
     /// undone.
+    private func cachedThreadIDs() -> Set<AgentThreadID> {
+        var ids = repairedThreadIds
+        ids.formUnion(threadWorkspaceCache.keys)
+        ids.formUnion(composerDraftsByThread.keys)
+        ids.formUnion(lastPersistedAssistantContentByThread.keys)
+        ids.formUnion(lastPersistedFinalIdByThread.keys)
+        ids.formUnion(queueStatusByThread.keys)
+        ids.formUnion(providerThreadSnapshotConfirmedAtByThread.keys)
+        return ids
+    }
+
+    /// Clears visible state owned by a selected thread that disappeared outside the
+    /// explicit-delete flow. The selection is already nil when this runs, so the
+    /// existing reload helpers reset queue/checkpoint projections to fresh-composer
+    /// state without persisting a change for the deleted thread.
+    private func resetDeletedSelectionToFreshComposer() {
+        prompt = ""
+        composerCursorOffset = nil
+        attachments = []
+        attachmentInputError = nil
+        lastSentAttachmentCount = 0
+        pendingAttachmentRetryConfirmation = nil
+        messages = []
+        messageHistoryIsPartial = false
+        cancelOlderMessageLoad()
+        timeline = AssistantTimelineState()
+        timelineItemIndex = TimelineItemIndex(turns: [])
+        resetTimelineUpdateTick()
+        _ = streamEventBatch.drain()
+        streamUIBackpressured = false
+        historyReplayNotice = nil
+        sr1TranslatedMessageIds = []
+        sr1OriginalTextsByMessageId = [:]
+        providerThreadSnapshotStatusMessage = nil
+        providerThreadSnapshotLastConfirmedAt = nil
+        selectedThreadHasRecoverableContext = false
+        liveBackgroundShellCount = 0
+        currentRunId = nil
+        runStartedAt = nil
+        stopScheduledLivePoll()
+        userInputSelections = [:]
+        userInputDrafts = [:]
+        transcriptHistoryRevealCount = 0
+        planNotes = ""
+        reloadQueuedMessages()
+        reloadCheckpoints()
+    }
+
     private func evictThreadCaches(_ ids: some Sequence<AgentThreadID>) {
         for id in ids {
             repairedThreadIds.remove(id)
@@ -4008,6 +4061,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             composerDraftsByThread.removeValue(forKey: id)
             lastPersistedAssistantContentByThread.removeValue(forKey: id)
             lastPersistedFinalIdByThread.removeValue(forKey: id)
+            queueStatusByThread.removeValue(forKey: id)
+            providerThreadSnapshotConfirmedAtByThread.removeValue(forKey: id)
             coordinator.forgetThread(id)
         }
     }
@@ -4016,12 +4071,28 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Test-only: the set of thread ids still present in ANY per-thread VM cache,
     /// so a test can prove `evictThreadCaches` leaves no residue after a delete.
     var threadCacheResidueForTesting: Set<AgentThreadID> {
-        var ids = repairedThreadIds
-        ids.formUnion(threadWorkspaceCache.keys)
-        ids.formUnion(composerDraftsByThread.keys)
-        ids.formUnion(lastPersistedAssistantContentByThread.keys)
-        ids.formUnion(lastPersistedFinalIdByThread.keys)
-        return ids
+        cachedThreadIDs()
+    }
+
+    /// Seeds the two per-thread caches that are otherwise populated only by
+    /// queue/provider work, so cache-eviction regressions can observe them.
+    func seedAdditionalThreadCachesForTesting(_ threadId: AgentThreadID) {
+        let confirmedAt = Date(timeIntervalSince1970: 0)
+        queueStatusByThread[threadId] = "test queue status"
+        providerThreadSnapshotConfirmedAtByThread[threadId] = confirmedAt
+        if selectedThreadId == threadId {
+            queueStatusMessage = "test queue status"
+            providerThreadSnapshotLastConfirmedAt = confirmedAt
+        }
+    }
+
+    /// Test-only logical payload measure for pruning regressions. This counts the
+    /// UTF-8 text held by the in-memory composer draft cache, rather than allocator
+    /// footprint, so it remains deterministic when malloc retains freed pages.
+    var cachedComposerDraftUTF8BytesForTesting: Int {
+        composerDraftsByThread.values.reduce(into: 0) { total, drafts in
+            total += drafts.values.reduce(0) { $0 + $1.text.utf8.count }
+        }
     }
     #endif
 

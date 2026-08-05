@@ -145,6 +145,125 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             "A thread created by another client must not switch an open tab's selection (Bug B).")
     }
 
+    /// PERF-MAC_AGENT-013: scheduled/RPC creation enforces the cap before it
+    /// publishes `agent.thread.created`. Every open surface in the workspace
+    /// must evict the pre-pruned victim from its local caches when the real
+    /// EventBus notification asks it to reload, without changing either tab's
+    /// selected thread.
+    func test_quietRouterCreateAtCap_evictsPrePrunedVictimFromEveryOpenSurface() async throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-Cap-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "CAP", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+
+        let firstSurface = try XCTUnwrap(agentSurfaces(in: workspace.id).first)
+        let secondDescriptor = try router.createSurface(
+            workspace: workspace.id,
+            type: .agentApp,
+            paneID: nil,
+            title: "Second Agent App"
+        )
+        let secondSurface = try XCTUnwrap(
+            SurfaceRegistry.shared.surface(secondDescriptor.id) as? AgentAppSurface
+        )
+
+        let oldest = Date(timeIntervalSince1970: 1_700_000_000)
+        var victim = AgentThread(
+            workspaceId: workspace.id,
+            title: "oldest completed victim",
+            provider: .codex,
+            model: "fake-model"
+        )
+        victim.status = .completed
+        victim.updatedAt = oldest
+        try ctx.threadRepo.upsert(victim)
+        var survivors: [AgentThread] = []
+        for index in 0..<(AgentThreadRepository.maxThreadsPerWorkspace - 1) {
+            var thread = AgentThread(
+                workspaceId: workspace.id,
+                title: "existing \(index)",
+                provider: .codex,
+                model: "fake-model"
+            )
+            thread.status = .completed
+            thread.updatedAt = oldest.addingTimeInterval(TimeInterval(index + 1))
+            try ctx.threadRepo.upsert(thread)
+            survivors.append(thread)
+        }
+        XCTAssertEqual(
+            try ctx.threadRepo.count(workspaceId: workspace.id),
+            AgentThreadRepository.maxThreadsPerWorkspace,
+            "precondition: the quiet router create starts at the production cap"
+        )
+        firstSurface.viewModel.reloadThreads()
+        secondSurface.viewModel.reloadThreads()
+
+        let firstSelection = survivors[0].id
+        let secondSelection = survivors[1].id
+        firstSurface.viewModel.selectThread(victim.id)
+        firstSurface.viewModel.prompt = "first surface victim draft"
+        firstSurface.viewModel.seedAdditionalThreadCachesForTesting(victim.id)
+        firstSurface.viewModel.selectThread(firstSelection)
+        secondSurface.viewModel.selectThread(victim.id)
+        secondSurface.viewModel.prompt = "second surface victim draft"
+        secondSurface.viewModel.seedAdditionalThreadCachesForTesting(victim.id)
+        secondSurface.viewModel.selectThread(secondSelection)
+        ctx.coordinator.seedAutoContinuationStateForTesting(victim.id)
+
+        XCTAssertTrue(firstSurface.viewModel.threadCacheResidueForTesting.contains(victim.id),
+                      "precondition: first surface caches the future victim")
+        XCTAssertTrue(secondSurface.viewModel.threadCacheResidueForTesting.contains(victim.id),
+                      "precondition: second surface caches the future victim")
+        XCTAssertTrue(ctx.coordinator.autoContinuationThreadIdsForTesting.contains(victim.id),
+                      "precondition: the shared coordinator caches the future victim")
+        XCTAssertEqual(firstSurface.viewModel.selectedThreadId, firstSelection)
+        XCTAssertEqual(secondSurface.viewModel.selectedThreadId, secondSelection)
+
+        var createdEvents: [EventBus.Event] = []
+        let eventSubscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "agent.thread.created",
+                  event.payload.objectValue?["workspace_id"]?.stringValue == workspace.id.value.uuidString else {
+                return
+            }
+            createdEvents.append(event)
+        }
+        defer { EventBus.shared.unsubscribe(eventSubscription) }
+
+        let created = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "scheduled quiet create",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium,
+            routingConfiguration: nil,
+            quiet: true
+        )
+
+        for _ in 0..<100 where firstSurface.viewModel.threadCacheResidueForTesting.contains(victim.id)
+            || secondSurface.viewModel.threadCacheResidueForTesting.contains(victim.id) {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(createdEvents.count, 1,
+                       "quiet router creation must publish one real-time thread-created event")
+        XCTAssertEqual(try ctx.threadRepo.count(workspaceId: workspace.id),
+                       AgentThreadRepository.maxThreadsPerWorkspace)
+        XCTAssertNil(try ctx.threadRepo.get(id: victim.id),
+                     "the router must pre-prune the oldest completed victim at 101 rows")
+        XCTAssertNotNil(try ctx.threadRepo.get(id: created.id))
+        XCTAssertFalse(firstSurface.viewModel.threadCacheResidueForTesting.contains(victim.id),
+                       "the first EventBus-subscribed surface must evict the pre-pruned victim")
+        XCTAssertFalse(secondSurface.viewModel.threadCacheResidueForTesting.contains(victim.id),
+                       "the second EventBus-subscribed surface must evict the pre-pruned victim")
+        XCTAssertFalse(ctx.coordinator.autoContinuationThreadIdsForTesting.contains(victim.id),
+                       "the shared coordinator must forget the pre-pruned victim once surfaces reload")
+        XCTAssertEqual(firstSurface.viewModel.selectedThreadId, firstSelection,
+                       "quiet creation must not yank the first open Agent App tab")
+        XCTAssertEqual(secondSurface.viewModel.selectedThreadId, secondSelection,
+                       "quiet creation must not yank the second open Agent App tab")
+    }
+
     // MARK: selectAgentThread targets exactly one surface when given a surfaceID
 
     func test_selectAgentThread_targetsOnlyAddressedSurface() throws {
