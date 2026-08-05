@@ -9,7 +9,7 @@ private let forkIntentMaintenanceLog = Logger(
 
 struct ForkIntentMaintenanceReceipt: Equatable, Sendable {
     let batchCount: Int
-    let remainingCandidateCount: Int
+    let hasMore: Bool
     let durationMilliseconds: Int
     let errorKind: String?
 }
@@ -19,6 +19,7 @@ private final class ForkIntentMaintenanceLoop: SQLiteDBOwnedMaintenance, @unchec
     private let beforeBatch: (@Sendable () -> Void)?
     private let receiptHandler: (@Sendable (ForkIntentMaintenanceReceipt) -> Void)?
     private let retryDelayOverrideNanoseconds: UInt64?
+    private let successDelayOverrideNanoseconds: UInt64?
     private let lock = NSLock()
     private var task: Task<Void, Never>?
 
@@ -26,12 +27,14 @@ private final class ForkIntentMaintenanceLoop: SQLiteDBOwnedMaintenance, @unchec
         db: SQLiteDB,
         beforeBatch: (@Sendable () -> Void)?,
         receiptHandler: (@Sendable (ForkIntentMaintenanceReceipt) -> Void)?,
-        retryDelayOverrideNanoseconds: UInt64?
+        retryDelayOverrideNanoseconds: UInt64?,
+        successDelayOverrideNanoseconds: UInt64?
     ) {
         self.db = db
         self.beforeBatch = beforeBatch
         self.receiptHandler = receiptHandler
         self.retryDelayOverrideNanoseconds = retryDelayOverrideNanoseconds
+        self.successDelayOverrideNanoseconds = successDelayOverrideNanoseconds
     }
 
     func start() {
@@ -54,17 +57,41 @@ private final class ForkIntentMaintenanceLoop: SQLiteDBOwnedMaintenance, @unchec
     private func run() async {
         defer { clearTask() }
         var retryDelayNanoseconds: UInt64 = 10_000_000
+        var recoveringFromError = false
+        forkIntentMaintenanceLog.info("transition=start")
         while !Task.isCancelled {
             beforeBatch?()
             guard !Task.isCancelled, let receipt = performBatch() else { return }
             emit(receipt)
             if receipt.errorKind == nil {
                 retryDelayNanoseconds = 10_000_000
-                guard receipt.remainingCandidateCount > 0 else { return }
-                await Task.yield()
+                if recoveringFromError {
+                    forkIntentMaintenanceLog.info("transition=recovered")
+                    recoveringFromError = false
+                }
+                guard receipt.hasMore else {
+                    forkIntentMaintenanceLog.info("transition=drained")
+                    return
+                }
+                let delay = successDelayOverrideNanoseconds ?? 10_000_000
+                do {
+                    try await Task.sleep(nanoseconds: delay)
+                } catch {
+                    return
+                }
             } else {
+                if !recoveringFromError, let errorKind = receipt.errorKind {
+                    forkIntentMaintenanceLog.error(
+                        "transition=error error_kind=\(errorKind, privacy: .public)"
+                    )
+                    recoveringFromError = true
+                }
                 let delay = retryDelayOverrideNanoseconds ?? retryDelayNanoseconds
-                try? await Task.sleep(nanoseconds: delay)
+                do {
+                    try await Task.sleep(nanoseconds: delay)
+                } catch {
+                    return
+                }
                 retryDelayNanoseconds = min(retryDelayNanoseconds * 2, 1_000_000_000)
             }
         }
@@ -86,20 +113,18 @@ private final class ForkIntentMaintenanceLoop: SQLiteDBOwnedMaintenance, @unchec
             let batch = try AgentThreadRepository(db: db).maintainHistoricalForkIntents()
             let receipt = ForkIntentMaintenanceReceipt(
                 batchCount: batch.processedCount,
-                remainingCandidateCount: batch.remainingCandidateCount,
+                hasMore: batch.hasMore,
                 durationMilliseconds: Self.elapsedMilliseconds(since: startedAt),
                 errorKind: nil
             )
-            if batch.remainingCandidateCount == 0 {
+            if !batch.hasMore {
                 db.releaseOwnedMaintenance(self)
             }
             return receipt
         } catch {
-            let remaining = (try? AgentThreadRepository(db: db)
-                .historicalForkIntentMaintenanceCandidateCount()) ?? -1
             return ForkIntentMaintenanceReceipt(
                 batchCount: 0,
-                remainingCandidateCount: remaining,
+                hasMore: true,
                 durationMilliseconds: Self.elapsedMilliseconds(since: startedAt),
                 errorKind: String(describing: type(of: error))
             )
@@ -108,15 +133,6 @@ private final class ForkIntentMaintenanceLoop: SQLiteDBOwnedMaintenance, @unchec
 
     private func emit(_ receipt: ForkIntentMaintenanceReceipt) {
         receiptHandler?(receipt)
-        if let errorKind = receipt.errorKind {
-            forkIntentMaintenanceLog.error(
-                "batch_count=\(receipt.batchCount, privacy: .public) remaining_candidate_count=\(receipt.remainingCandidateCount, privacy: .public) duration_ms=\(receipt.durationMilliseconds, privacy: .public) error_kind=\(errorKind, privacy: .public)"
-            )
-        } else {
-            forkIntentMaintenanceLog.info(
-                "batch_count=\(receipt.batchCount, privacy: .public) remaining_candidate_count=\(receipt.remainingCandidateCount, privacy: .public) duration_ms=\(receipt.durationMilliseconds, privacy: .public)"
-            )
-        }
     }
 
     private static func elapsedMilliseconds(since start: UInt64) -> Int {
@@ -161,6 +177,7 @@ public final class Bootstrap {
     var beforeForkIntentMaintenanceBatchForTesting: (@Sendable () -> Void)?
     var forkIntentMaintenanceReceiptForTesting: (@Sendable (ForkIntentMaintenanceReceipt) -> Void)?
     var forkIntentMaintenanceRetryDelayNanosecondsForTesting: UInt64?
+    var forkIntentMaintenanceSuccessDelayNanosecondsForTesting: UInt64?
 
     public init(channel: ReleaseChannel, dbPathOverride: String? = nil, appSupportOverride: String? = nil) {
         self.channel = channel
@@ -231,7 +248,8 @@ public final class Bootstrap {
             db: db,
             beforeBatch: beforeForkIntentMaintenanceBatchForTesting,
             receiptHandler: forkIntentMaintenanceReceiptForTesting,
-            retryDelayOverrideNanoseconds: forkIntentMaintenanceRetryDelayNanosecondsForTesting
+            retryDelayOverrideNanoseconds: forkIntentMaintenanceRetryDelayNanosecondsForTesting,
+            successDelayOverrideNanoseconds: forkIntentMaintenanceSuccessDelayNanosecondsForTesting
         )
         if db.installOwnedMaintenance(maintenance) {
             maintenance.start()

@@ -1120,11 +1120,12 @@ public enum Schema {
         SchemaStep(62, """
         CREATE INDEX IF NOT EXISTS idx_agent_thread_fork_intents_maintenance
             ON agent_thread_fork_intents(
-                state,
-                provider_creation_attempted,
                 updated_at,
                 child_thread_id
-            );
+            )
+            WHERE state = 'local_committed'
+               OR state = 'compensated'
+               OR state = 'abandoned';
         """),
     ]
 

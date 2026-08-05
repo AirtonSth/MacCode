@@ -226,7 +226,7 @@ public final class AgentThreadRepository {
     public struct ForkIntentMaintenanceBatch: Equatable, Sendable {
         public let scrubbedCount: Int
         public let deletedCount: Int
-        public let remainingCandidateCount: Int
+        public let hasMore: Bool
 
         public var processedCount: Int { scrubbedCount + deletedCount }
     }
@@ -1040,14 +1040,7 @@ public final class AgentThreadRepository {
             AgentThreadRepository.terminalForkIntentCleanupBatchSize,
             max(0, limit)
         )
-        guard batchSize > 0 else {
-            return ForkIntentMaintenanceBatch(
-                scrubbedCount: 0,
-                deletedCount: 0,
-                remainingCandidateCount: try historicalForkIntentMaintenanceCandidateCount()
-            )
-        }
-        let counts = try db.performSync { database in
+        let result = try db.performSync { database in
             try database.transaction {
                 let candidates = try database.prepare("""
                     SELECT child_thread_id,
@@ -1056,19 +1049,23 @@ public final class AgentThreadRepository {
                                WHERE child.id = intent.child_thread_id
                            ) THEN 1 ELSE 0 END AS scrub_only
                     FROM agent_thread_fork_intents AS intent
+                         INDEXED BY idx_agent_thread_fork_intents_maintenance
                     WHERE (intent.state = 'local_committed'
-                           AND (intent.source_messages_json != '[]'
-                                OR NOT EXISTS (
-                                    SELECT 1 FROM agent_threads AS child
-                                    WHERE child.id = intent.child_thread_id
-                                )))
-                       OR intent.state = 'compensated'
-                       OR (intent.state = 'abandoned'
-                           AND intent.provider_creation_attempted = 0)
+                           OR intent.state = 'compensated'
+                           OR intent.state = 'abandoned')
+                      AND ((intent.state = 'local_committed'
+                            AND (intent.source_messages_json != '[]'
+                                 OR NOT EXISTS (
+                                     SELECT 1 FROM agent_threads AS child
+                                     WHERE child.id = intent.child_thread_id
+                                 )))
+                           OR intent.state = 'compensated'
+                           OR (intent.state = 'abandoned'
+                               AND intent.provider_creation_attempted = 0))
                     ORDER BY intent.updated_at ASC, intent.child_thread_id ASC
                     LIMIT ?;
                 """)
-                try candidates.bind(1, batchSize)
+                try candidates.bind(1, batchSize + 1)
                 var selected: [(childID: String, scrubOnly: Bool)] = []
                 while try candidates.step() {
                     guard let childID = candidates.columnText(0) else {
@@ -1076,6 +1073,7 @@ public final class AgentThreadRepository {
                     }
                     selected.append((childID, candidates.columnInt64(1) != 0))
                 }
+                let hasMore = selected.count > batchSize
 
                 let scrub = try database.prepare("""
                     UPDATE agent_thread_fork_intents
@@ -1102,7 +1100,7 @@ public final class AgentThreadRepository {
                 """)
                 var scrubbed = 0
                 var deleted = 0
-                for candidate in selected {
+                for candidate in selected.prefix(batchSize) {
                     let mutation = candidate.scrubOnly ? scrub : delete
                     mutation.reset()
                     try mutation.bind(1, candidate.childID)
@@ -1117,13 +1115,13 @@ public final class AgentThreadRepository {
                         deleted += Int(changes.columnInt64(0))
                     }
                 }
-                return (scrubbed, deleted)
+                return (scrubbed, deleted, hasMore)
             }
         }
         return ForkIntentMaintenanceBatch(
-            scrubbedCount: counts.0,
-            deletedCount: counts.1,
-            remainingCandidateCount: try historicalForkIntentMaintenanceCandidateCount()
+            scrubbedCount: result.0,
+            deletedCount: result.1,
+            hasMore: result.2
         )
     }
 

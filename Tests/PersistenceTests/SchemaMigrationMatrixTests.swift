@@ -36,7 +36,7 @@ private final class ForkIntentMaintenanceProbe: @unchecked Sendable {
         let shouldFulfillError = receipt.errorKind != nil && !didObserveError
         if shouldFulfillError { didObserveError = true }
         let shouldFulfillDrain = receipt.errorKind == nil
-            && receipt.remainingCandidateCount == 0
+            && !receipt.hasMore
             && !didObserveDrain
         if shouldFulfillDrain { didObserveDrain = true }
         lock.unlock()
@@ -48,6 +48,39 @@ private final class ForkIntentMaintenanceProbe: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return storedReceipts
+    }
+}
+
+private final class ForkIntentFairnessProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let firstReceiptExpectation: XCTestExpectation
+    private let secondReceiptExpectation: XCTestExpectation
+    private var storedReceipts: [ForkIntentMaintenanceReceipt] = []
+    private var receiptTimes: [UInt64] = []
+
+    init(
+        firstReceiptExpectation: XCTestExpectation,
+        secondReceiptExpectation: XCTestExpectation
+    ) {
+        self.firstReceiptExpectation = firstReceiptExpectation
+        self.secondReceiptExpectation = secondReceiptExpectation
+    }
+
+    func record(_ receipt: ForkIntentMaintenanceReceipt) {
+        guard receipt.errorKind == nil else { return }
+        lock.lock()
+        storedReceipts.append(receipt)
+        receiptTimes.append(DispatchTime.now().uptimeNanoseconds)
+        let count = storedReceipts.count
+        lock.unlock()
+        if count == 1 { firstReceiptExpectation.fulfill() }
+        if count == 2 { secondReceiptExpectation.fulfill() }
+    }
+
+    var snapshot: (receipts: [ForkIntentMaintenanceReceipt], times: [UInt64]) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (storedReceipts, receiptTimes)
     }
 }
 
@@ -732,6 +765,105 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         }
 
         print("FORK_INTENT_MAINTENANCE_LOCAL startup_wall_seconds=\(String(format: "%.3f", startupWallSeconds)) before_db_wal_bytes=\(beforeBytes) startup_peak_db_wal_bytes=\(startupPeakBytes) eventual_peak_db_wal_bytes=\(eventualPeakBytes) after_db_wal_bytes=\(afterBytes) terminal_rows=\(terminalRows) batch_limit=\(AgentThreadRepository.terminalForkIntentCleanupBatchSize) batches=\(successfulReceipts.count)")
+    }
+
+    func test_largeMaintenanceBacklogPacesBatchesSoForegroundDatabaseWorkProgresses() throws {
+        let root = NSTemporaryDirectory() + "rc2-fork-intent-maintenance-fairness-" + UUID().uuidString
+        let dbPath = root + "/remotecode.sqlite"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+
+        do {
+            let seed = try SQLiteDB(path: dbPath)
+            try Schema.migrate(seed)
+            try seed.transaction {
+                let insert = try seed.prepare("""
+                    INSERT INTO agent_thread_fork_intents(
+                        child_thread_id, source_thread_id, provider, idempotency_key,
+                        state, child_thread_json, source_messages_json,
+                        provider_child_thread_id, last_error, created_at, updated_at,
+                        provider_creation_attempted
+                    ) VALUES(?, ?, 'codex', ?, 'compensated', '{}', '[]',
+                             'provider-child', NULL, 'created', ?, 1);
+                """)
+                for index in 0..<1_000 {
+                    insert.reset()
+                    try insert.bind(1, String(format: "fairness-child-%04d", index))
+                    try insert.bind(2, "fairness-source-\(index)")
+                    try insert.bind(3, "fairness-key-\(index)")
+                    try insert.bind(4, String(format: "%04d", index))
+                    _ = try insert.step()
+                }
+            }
+        }
+
+        let firstReceipt = expectation(description: "first bounded batch completes")
+        let secondReceipt = expectation(description: "second bounded batch completes after pacing")
+        let probe = ForkIntentFairnessProbe(
+            firstReceiptExpectation: firstReceipt,
+            secondReceiptExpectation: secondReceipt
+        )
+        let bootstrap = Bootstrap(channel: .debug, dbPathOverride: dbPath, appSupportOverride: root)
+        bootstrap.forkIntentMaintenanceSuccessDelayNanosecondsForTesting = 250_000_000
+        bootstrap.forkIntentMaintenanceReceiptForTesting = { probe.record($0) }
+        let (_, db) = try bootstrap.run()
+
+        wait(for: [firstReceipt], timeout: 5)
+        let foregroundStarted = DispatchTime.now().uptimeNanoseconds
+        let foreground = try db.prepare("SELECT COUNT(*) FROM schema_meta;")
+        XCTAssertTrue(try foreground.step())
+        XCTAssertGreaterThan(foreground.columnInt64(0), 0)
+        let foregroundMilliseconds = Double(
+            DispatchTime.now().uptimeNanoseconds - foregroundStarted
+        ) / 1_000_000
+        XCTAssertLessThan(foregroundMilliseconds, 100,
+                          "foreground DB work must acquire operationLock during the success pacing window")
+        XCTAssertEqual(probe.snapshot.receipts.count, 1,
+                       "foreground DB work must finish before the next maintenance batch starts")
+
+        wait(for: [secondReceipt], timeout: 5)
+        let snapshot = probe.snapshot
+        XCTAssertGreaterThanOrEqual(snapshot.receipts.count, 2)
+        XCTAssertTrue(snapshot.receipts.prefix(2).allSatisfy {
+            $0.batchCount > 0
+                && $0.batchCount <= AgentThreadRepository.terminalForkIntentCleanupBatchSize
+                && $0.hasMore
+        }, "a 1000-row backlog must mutate at most 16 rows per transaction")
+        let interBatchMilliseconds = Double(snapshot.times[1] - snapshot.times[0]) / 1_000_000
+        XCTAssertGreaterThanOrEqual(interBatchMilliseconds, 200,
+                                    "successful batches must not spin in a tight loop")
+        print("FORK_INTENT_MAINTENANCE_FAIRNESS foreground_ms=\(String(format: "%.3f", foregroundMilliseconds)) inter_batch_ms=\(String(format: "%.3f", interBatchMilliseconds)) backlog_rows=1000 batch_limit=\(AgentThreadRepository.terminalForkIntentCleanupBatchSize)")
+    }
+
+    func test_v62MaintenanceQueryPlanUsesPartialUpdatedAtIndex() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let plan = try db.prepare("""
+            EXPLAIN QUERY PLAN
+            SELECT child_thread_id
+            FROM agent_thread_fork_intents AS intent
+                 INDEXED BY idx_agent_thread_fork_intents_maintenance
+            WHERE (intent.state = 'local_committed'
+                   OR intent.state = 'compensated'
+                   OR intent.state = 'abandoned')
+              AND ((intent.state = 'local_committed'
+                    AND (intent.source_messages_json != '[]'
+                         OR NOT EXISTS (
+                             SELECT 1 FROM agent_threads AS child
+                             WHERE child.id = intent.child_thread_id
+                         )))
+                   OR intent.state = 'compensated'
+                   OR (intent.state = 'abandoned'
+                       AND intent.provider_creation_attempted = 0))
+            ORDER BY intent.updated_at ASC, intent.child_thread_id ASC
+            LIMIT 17;
+        """)
+        var details: [String] = []
+        while try plan.step() {
+            if let detail = plan.columnText(3) { details.append(detail) }
+        }
+        XCTAssertTrue(details.contains {
+            $0.contains("USING INDEX idx_agent_thread_fork_intents_maintenance")
+        }, "v62 must serve ordered maintenance candidates from its partial index: \(details)")
     }
 
     func test_oldV61MaintenanceRollsBackFailedBatchAndRetriesToDrain() throws {
