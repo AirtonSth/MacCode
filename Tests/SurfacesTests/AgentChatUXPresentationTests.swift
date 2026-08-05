@@ -222,13 +222,69 @@ final class AgentChatUXPresentationTests: XCTestCase {
             .turn(live),
             .turn(afterLive),
         ]
-        let split = AgentAppView.splitTrailingLiveTurns(entries)
+        let split = AgentAppView.splitTrailingLiveTurns(entries, latestLiveTurnId: "live")
         XCTAssertEqual(split.history.map(\.id), [entries[0].id, entries[1].id])
         XCTAssertEqual(split.liveTail.map(\.id), [entries[2].id, entries[3].id])
         XCTAssertEqual(
             (split.history + split.liveTail).map(\.id),
             entries.map(\.id),
             "history+liveTail must equal original order"
+        )
+    }
+
+    func test_splitTrailingLiveTurns_staleUnfinishedDoesNotDisableLazy() {
+        // WHY: a stuck unfinished turn near the top must stay Lazy; only the
+        // current live (or trailing unfinished) is eager.
+        let stuckLive = AssistantTurnSnapshot(
+            turnId: "stuck",
+            items: [AssistantItem(id: "s", turnId: "stuck", type: .tool, state: .streaming, startedAtMs: 1)],
+            finished: false
+        )
+        let laterFinished = AssistantTurnSnapshot(
+            turnId: "later",
+            items: [AssistantItem(id: "l", turnId: "later", type: .tool, state: .completed, startedAtMs: 2, finishedAtMs: 3)],
+            finished: true
+        )
+        let currentLive = AssistantTurnSnapshot(
+            turnId: "now",
+            items: [AssistantItem(id: "n", turnId: "now", type: .tool, state: .streaming, startedAtMs: 4)],
+            finished: false
+        )
+        let paint: [AgentAppView.TranscriptEntry] = [
+            .turn(stuckLive),
+            .turn(laterFinished),
+            .turn(currentLive),
+        ]
+        let split = AgentAppView.splitTrailingLiveTurns(paint, latestLiveTurnId: "now")
+        XCTAssertEqual(split.history.map(\.id), [paint[0].id, paint[1].id])
+        XCTAssertEqual(split.liveTail.map(\.id), [paint[2].id])
+        // Without latest id: only trailing unfinished peels.
+        let peel = AgentAppView.splitTrailingLiveTurns(paint)
+        XCTAssertEqual(peel.liveTail.map(\.id), [paint[2].id])
+        XCTAssertEqual(peel.history.map(\.id), [paint[0].id, paint[1].id])
+    }
+
+    func test_turnSortTime_usesOnlyFirstItemStartedAt() {
+        // WHY: min() pulls the turn backward when a later parallel tool has an
+        // earlier host stamp — Lazy identity thrash mid-stream.
+        let turn = AssistantTurnSnapshot(
+            turnId: "t",
+            items: [
+                AssistantItem(id: "a", turnId: "t", type: .tool, state: .streaming, startedAtMs: 5_000),
+                AssistantItem(id: "b", turnId: "t", type: .tool, state: .streaming, startedAtMs: 1_000),
+            ],
+            finished: false
+        )
+        XCTAssertEqual(
+            AgentAppView.TranscriptEntry.turn(turn).sortTime,
+            5.0,
+            "must use first item startedAtMs, not min across items"
+        )
+        let empty = AssistantTurnSnapshot(turnId: "empty", items: [], finished: false, startedAtMs: 7_000)
+        XCTAssertEqual(
+            AgentAppView.TranscriptEntry.turn(empty).sortTime,
+            7.0,
+            "empty turn falls back to turn.startedAtMs"
         )
     }
 

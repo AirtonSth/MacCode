@@ -1187,17 +1187,21 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         turns.removeFirst(dropCount)
     }
 
-    // F10: keep one turn's `items` array bounded (see `liveTurnItemLimit`). Trims the
-    // oldest items and drops their orphaned SR1 item translations, mirroring `trimTurns`.
+    // F10: keep one turn's `items` array bounded (see `liveTurnItemLimit`). Trims
+    // oldest items **after** index 0 — items[0].startedAtMs is the transcript sort
+    // anchor; dropping it reorders Lazy rows mid-stream. Also drops orphaned SR1.
     private mutating func trimTurnItems(at idx: Int) {
         guard turns[idx].items.count > Self.liveTurnItemLimit else { return }
-        let dropCount = turns[idx].items.count - Self.liveTurnItemLimit
-        if !sr1TranslationsByItemId.isEmpty {
-            for item in turns[idx].items.prefix(dropCount) {
+        let first = turns[idx].items[0]
+        let rest = Array(turns[idx].items.dropFirst())
+        let keepRest = Self.liveTurnItemLimit - 1
+        let dropFromRest = max(0, rest.count - keepRest)
+        if dropFromRest > 0, !sr1TranslationsByItemId.isEmpty {
+            for item in rest.prefix(dropFromRest) {
                 sr1TranslationsByItemId.removeValue(forKey: item.id)
             }
         }
-        turns[idx].items.removeFirst(dropCount)
+        turns[idx].items = [first] + Array(rest.suffix(keepRest))
     }
 
     private mutating func trimPendingRequests() {

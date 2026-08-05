@@ -8758,11 +8758,12 @@ public struct AgentAppView: View {
             case .message(let message):
                 return message.createdAt.timeIntervalSince1970
             case .turn(let turn):
-                // Anti-disorder: freeze on first item's startedAt (append order), not
-                // min() — a later parallel tool with an earlier host stamp must not
-                // pull the turn backward mid-stream. Fall back to turn.startedAtMs
-                // so empty live turns do not sort at epoch 0 (above the user bubble).
-                if let started = turn.items.lazy.compactMap(\.startedAtMs).first {
+                // Anti-disorder: only the **first** item's startedAt counts (append
+                // order). Never min() and never "first non-nil later item" — both can
+                // jump the key when a later tool arrives or an earlier item's stamp
+                // fills in. Fall back to turn.startedAtMs so empty live turns do not
+                // sort at epoch 0 (above the user bubble).
+                if let started = turn.items.first?.startedAtMs {
                     return TimeInterval(started) / 1000
                 }
                 if let started = turn.startedAtMs {
@@ -8827,24 +8828,40 @@ public struct AgentAppView: View {
         )
     }
 
-    /// Unfinished turns (from the **first** live entry through the end) stay
-    /// **eager** outside LazyVStack so streaming rows never participate in lazy
-    /// placement. Position-based "peel only the trailing unfinished" leaked a
-    /// still-live row into Lazy when any later entry sorted after it. Order is
-    /// preserved: history + liveTail == original sequence.
+    /// Eager suffix for the **current** streaming turn only.
+    ///
+    /// - Prefer `latestLiveTurnId` when present and unfinished: everything from
+    ///   that row to the end is eager (streaming row never inside Lazy).
+    /// - Else peel only **trailing** unfinished turns (never the first unfinished
+    ///   in the whole list — a stale interrupted turn near the top would force
+    ///   the entire paint window eager and defeat virtualization).
+    /// history + liveTail == original sequence.
     nonisolated static func splitTrailingLiveTurns(
-        _ entries: [TranscriptEntry]
+        _ entries: [TranscriptEntry],
+        latestLiveTurnId: String? = nil
     ) -> (history: [TranscriptEntry], liveTail: [TranscriptEntry]) {
-        guard let firstLive = entries.firstIndex(where: {
-            if case .turn(let turn) = $0 { return !turn.finished }
-            return false
-        }) else {
-            return (entries, [])
+        if let lid = latestLiveTurnId,
+           let idx = entries.firstIndex(where: {
+               if case .turn(let turn) = $0 { return turn.turnId == lid && !turn.finished }
+               return false
+           }) {
+            return (
+                Array(entries.prefix(idx)),
+                Array(entries.suffix(from: idx))
+            )
         }
-        return (
-            Array(entries.prefix(firstLive)),
-            Array(entries.suffix(from: firstLive))
-        )
+        var liveTail: [TranscriptEntry] = []
+        var end = entries.count
+        while end > 0 {
+            let idx = end - 1
+            if case .turn(let turn) = entries[idx], !turn.finished {
+                liveTail.insert(entries[idx], at: 0)
+                end = idx
+            } else {
+                break
+            }
+        }
+        return (Array(entries.prefix(end)), liveTail)
     }
 
     /// F7: build the merged transcript in O(N) by merging two already-ordered
@@ -10089,23 +10106,29 @@ public struct AgentAppView: View {
                             vm.transcriptHistoryRevealCount,
                             hiddenCount
                         )
-                        // History (lazy, releases off-screen) + trailing live turns
-                        // eager (advisor: streaming row never inside Lazy placement).
-                        let split = Self.splitTrailingLiveTurns(entries)
-                        let historyEntries: [TranscriptEntry] = {
-                            var h = split.history
+                        // Build full paint sequence first, THEN split live/eager.
+                        // Splitting only the idle window left unfinished turns inside
+                        // revealed-older history (Lazy) — the split exists to prevent that.
+                        let paintSequence: [TranscriptEntry] = {
                             if revealedHiddenCount > 0 {
-                                let older = Self.ensuringTranscriptOrder(
-                                    Self.hiddenTranscriptRevealWindow(
-                                        allItems: allEntries,
-                                        visibleWindow: entries,
-                                        revealCount: revealedHiddenCount
-                                    )
+                                let older = Self.hiddenTranscriptRevealWindow(
+                                    allItems: allEntries,
+                                    visibleWindow: entries,
+                                    revealCount: revealedHiddenCount
                                 )
-                                h = Self.ensuringTranscriptOrder(older + h)
+                                return Self.ensuringTranscriptOrder(older + entries)
                             }
-                            return h
+                            return entries
                         }()
+                        let latestLiveId = paintSequence.reversed().compactMap { entry -> String? in
+                            if case .turn(let turn) = entry, !turn.finished { return turn.turnId }
+                            return nil
+                        }.first
+                        let split = Self.splitTrailingLiveTurns(
+                            paintSequence,
+                            latestLiveTurnId: latestLiveId
+                        )
+                        let historyEntries = split.history
                         let liveTail = split.liveTail
                         VStack(alignment: .leading, spacing: 32) {
                             if vm.messageHistoryIsPartial {
@@ -11764,40 +11787,35 @@ public struct AgentAppView: View {
             .accessibilityIdentifier(live ? "agent.liveWork.\(turn.turnId)" : "agent.completedWork.\(turn.turnId)")
 
             if expanded {
-                // Bounded height + LazyVStack so only on-screen steps mount
-                // (nested Lazy without max height expands to full content height).
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: DS.Space.lg) {
-                        if slice.hiddenCount > 0 {
-                            Button {
-                                let base = max(0, blocks.count - AgentWorkDisclosureLayout.expandedPaintWindow)
-                                workDisclosureRevealByTurn[turn.turnId] = AgentWorkDisclosureLayout.advancedRevealCount(
-                                    current: reveal,
-                                    hiddenBase: base
-                                )
-                                workDisclosureLayoutEpoch &+= 1
-                            } label: {
-                                Text("Show earlier steps (\(slice.hiddenCount) hidden)")
-                                    .font(DS.Font.caption)
-                                    .foregroundColor(DS.Palette.accent)
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityIdentifier("agent.work.revealEarlier.\(turn.turnId)")
+                // paintSlice caps at expandedPaintWindow — no nested ScrollView.
+                // Nested maxHeight ScrollView froze the live stream below the fold
+                // and stole the outer transcript pan (iOS). Outer pin-to-bottom
+                // follows growth again; Lazy still defers off-screen step rows.
+                LazyVStack(alignment: .leading, spacing: DS.Space.lg) {
+                    if slice.hiddenCount > 0 {
+                        Button {
+                            let base = max(0, blocks.count - AgentWorkDisclosureLayout.expandedPaintWindow)
+                            workDisclosureRevealByTurn[turn.turnId] = AgentWorkDisclosureLayout.advancedRevealCount(
+                                current: reveal,
+                                hiddenBase: base
+                            )
+                            workDisclosureLayoutEpoch &+= 1
+                        } label: {
+                            Text("Show earlier steps (\(slice.hiddenCount) hidden)")
+                                .font(DS.Font.caption)
+                                .foregroundColor(DS.Palette.accent)
                         }
-                        ForEach(slice.rows) { block in
-                            switch block {
-                            case .item(let item): itemRow(item)
-                            case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
-                            }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("agent.work.revealEarlier.\(turn.turnId)")
+                    }
+                    ForEach(slice.rows) { block in
+                        switch block {
+                        case .item(let item): itemRow(item)
+                        case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
                         }
                     }
-                    .padding(.leading, DS.Space.md)
                 }
-                .frame(
-                    maxHeight: AgentWorkDisclosureLayout.maxViewportHeight,
-                    alignment: .top
-                )
-                .fixedSize(horizontal: false, vertical: blocks.count <= 6)
+                .padding(.leading, DS.Space.md)
                 .transition(.opacity.combined(with: .move(edge: .top)))
                 .accessibilityIdentifier("agent.work.lazyList.\(turn.turnId)")
             }
