@@ -753,16 +753,25 @@ struct DiffPreviewText: View {
 /// Cursor-style "Edit path" card with line numbers and red/green hunks.
 struct AgentFileEditDiffCard: View {
     let model: AgentFileEditDiffPresentation.Model
-    var initiallyExpanded: Bool = true
+    var initiallyExpanded: Bool = false
     @State private var expanded: Bool
+    @State private var showAllLines = false
 
-    init(model: AgentFileEditDiffPresentation.Model, initiallyExpanded: Bool = true) {
+    init(
+        model: AgentFileEditDiffPresentation.Model,
+        initiallyExpanded: Bool = AgentWorkDisclosureLayout.diffDefaultExpanded
+    ) {
         self.model = model
         self.initiallyExpanded = initiallyExpanded
         _expanded = State(initialValue: initiallyExpanded)
     }
 
     var body: some View {
+        let visible = AgentWorkDisclosureLayout.visibleDiffLines(
+            model.lines,
+            isMeta: { $0.kind == .meta },
+            showAll: showAllLines
+        )
         VStack(alignment: .leading, spacing: 0) {
             Button {
                 withAnimation(.easeInOut(duration: 0.14)) { expanded.toggle() }
@@ -796,18 +805,32 @@ struct AgentFileEditDiffCard: View {
             .accessibilityIdentifier("agent.fileEdit.header")
 
             if expanded {
+                // Single selection container — not per-line — keeps recycling cheap.
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(model.lines.filter { $0.kind != .meta }) { line in
+                    ForEach(visible.rows) { line in
                         diffLineRow(line)
                     }
-                    if model.hiddenLineCount > 0 {
-                        Text("… \(model.hiddenLineCount) more lines")
+                    if visible.hiddenCount > 0 {
+                        Button {
+                            showAllLines = true
+                        } label: {
+                            Text("Show \(visible.hiddenCount) more lines")
+                                .font(DS.Font.caption2)
+                                .foregroundColor(DS.Palette.accent)
+                                .padding(.horizontal, DS.Space.sm)
+                                .padding(.vertical, 4)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("agent.fileEdit.showMore")
+                    } else if model.hiddenLineCount > 0 {
+                        Text("… \(model.hiddenLineCount) more lines truncated")
                             .font(DS.Font.caption2)
                             .foregroundColor(DS.Palette.textTertiary)
                             .padding(.horizontal, DS.Space.sm)
                             .padding(.vertical, 4)
                     }
                 }
+                .textSelection(.enabled)
                 .background(DS.Palette.surface)
             }
         }
@@ -849,7 +872,6 @@ struct AgentFileEditDiffCard: View {
             Text(displayText(for: line))
                 .font(DS.Font.monoSmall)
                 .foregroundColor(fg)
-                .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.vertical, 1)

@@ -190,6 +190,24 @@ final class AgentChatUXPresentationTests: XCTestCase {
         XCTAssertEqual(rebuilt.mode, "full_rebuild")
     }
 
+    func test_workDisclosureLayout_paintSliceAndDiffPreview() {
+        let all = Array(0..<100)
+        let slice = AgentWorkDisclosureLayout.paintSlice(all: all, revealCount: 0)
+        XCTAssertEqual(slice.rows.count, AgentWorkDisclosureLayout.expandedPaintWindow)
+        XCTAssertEqual(slice.hiddenCount, 100 - AgentWorkDisclosureLayout.expandedPaintWindow)
+        let more = AgentWorkDisclosureLayout.paintSlice(all: all, revealCount: 48)
+        XCTAssertEqual(more.rows.count, 96)
+        let lines = (0..<50).map { "L\($0)" }
+        let preview = AgentWorkDisclosureLayout.visibleDiffLines(
+            lines,
+            isMeta: { $0.hasPrefix("M") },
+            showAll: false,
+            previewLimit: 10
+        )
+        XCTAssertEqual(preview.rows.count, 10)
+        XCTAssertEqual(preview.hiddenCount, 40)
+    }
+
     func test_turnChatComposition_liveAllInWork_finishedFinalOutside() {
         // WHY: chat chrome must match iOS — user | Work so far | final only.
         let live = AgentTurnChatComposition.splitItems(

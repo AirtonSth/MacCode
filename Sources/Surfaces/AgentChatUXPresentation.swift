@@ -296,6 +296,55 @@ public enum AgentTurnChatComposition {
     public static func liveOutsideBlocksMustBeEmpty() -> Bool { true }
 }
 
+// MARK: - Work disclosure layout (lazy viewport + densify)
+
+/// Viewport bounds for expanded Work so far so only on-screen steps mount.
+/// Nested LazyVStack only virtualizes when height is bounded (inner ScrollView).
+public enum AgentWorkDisclosureLayout {
+    /// Max height of the expanded work list (points).
+    public static let maxViewportHeight: CGFloat = 420
+    /// Hint for estimated step row height (layout assist / tests).
+    public static let estimatedStepMinHeight: CGFloat = 36
+    /// Max step blocks painted in the lazy list before "show earlier".
+    public static let expandedPaintWindow = 48
+    public static let expandedRevealPage = 48
+    /// Diff card: collapsed by default; preview this many non-meta lines when open.
+    public static let diffDefaultExpanded = false
+    public static let diffPreviewLineLimit = 32
+
+    /// Slice work blocks for paint: oldest may stay folded behind a reveal control.
+    public static func paintSlice<T>(
+        all: [T],
+        revealCount: Int,
+        window: Int = expandedPaintWindow
+    ) -> (hiddenCount: Int, rows: [T]) {
+        let cap = max(1, window)
+        guard all.count > cap else { return (0, all) }
+        let hiddenBase = all.count - cap
+        let revealed = min(max(0, revealCount), hiddenBase)
+        let start = hiddenBase - revealed
+        return (hiddenBase - revealed, Array(all[start...]))
+    }
+
+    public static func advancedRevealCount(current: Int, hiddenBase: Int, page: Int = expandedRevealPage) -> Int {
+        min(hiddenBase, max(0, current) + max(1, page))
+    }
+
+    /// Visible code lines for a diff card (non-meta), with optional full expand.
+    public static func visibleDiffLines<Line>(
+        _ lines: [Line],
+        isMeta: (Line) -> Bool,
+        showAll: Bool,
+        previewLimit: Int = diffPreviewLineLimit
+    ) -> (rows: [Line], hiddenCount: Int) {
+        let code = lines.filter { !isMeta($0) }
+        if showAll || code.count <= previewLimit {
+            return (code, 0)
+        }
+        return (Array(code.prefix(previewLimit)), code.count - previewLimit)
+    }
+}
+
 // MARK: - Work so far expand policy
 
 /// Pure policy for default-open latest live "Work so far" and collapse-all on final.

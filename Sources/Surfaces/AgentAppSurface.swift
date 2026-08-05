@@ -8076,8 +8076,12 @@ public struct AgentAppView: View {
     @State private var expandedCompletedWorkTurns: Set<String> = []
     /// Live turns the user manually collapsed (suppresses default-open latest live).
     @State private var userCollapsedLiveWorkTurns: Set<String> = []
+    /// How many older Work so far steps the user revealed per turn (paint window).
+    @State private var workDisclosureRevealByTurn: [String: Int] = [:]
     /// Turn ids already treated as finished for collapse-all-on-final (one-shot).
     @State private var knownFinishedWorkTurnIds: Set<String> = []
+    /// Bumps when expanded work height changes so pinned readers re-assert bottom.
+    @State private var workDisclosureLayoutEpoch: Int = 0
     @State private var queuedMessagePendingCancel: AgentQueuedMessage?
     @State private var pendingSessionApproval: PendingSessionApprovalConfirmation?
     @State private var expandedRequestPreviews: Set<String> = []
@@ -10205,7 +10209,16 @@ public struct AgentAppView: View {
             // token delta does not schedule redundant scroll work.
             .onChange(of: vm.timelineUpdateTick) { _ in
                 collapseAllCompletedWorkOnFinalIfNeeded()
+                // Double-pass: first tick after layout of streamed rows, second
+                // after work-disclosure height settles (LazyVStack materialize).
                 scheduleTimelineScrollToBottom(proxy)
+                DispatchQueue.main.async {
+                    scheduleTimelineScrollToBottom(proxy)
+                }
+            }
+            .onChange(of: workDisclosureLayoutEpoch) { _ in
+                guard timelineSticksToBottom else { return }
+                scheduleTimelineScrollToBottom(proxy, force: true)
             }
             .onChange(of: vm.messages.last?.id) { _ in
                 // New user/assistant bubble identity — force pin without waiting
@@ -10592,6 +10605,7 @@ public struct AgentAppView: View {
                         startedAtMs: request.createdAtMs
                     )
                 ), model.hasRenderableCode {
+                    // Approvals keep the patch visible; transcript cards stay collapsed.
                     AgentFileEditDiffCard(model: model, initiallyExpanded: true)
                 } else {
                     let expanded = expandedRequestPreviews.contains(request.id)
@@ -10827,11 +10841,35 @@ public struct AgentAppView: View {
         // layout pass + animation churn on every delta); only animate on settle
         // (idle, or an explicit forced scroll). TimelineScrollFollower re-pins to the
         // exact post-layout bottom on its own; this is the discrete-event re-assert.
+        // Prefer concrete latest content id when available — BOTTOM alone can stick
+        // one lazy work-row above the true end after Work so far height jumps.
+        let target = Self.latestScrollTargetId(
+            messages: vm.messages,
+            turns: vm.timeline.turns
+        ) ?? "BOTTOM"
         if vm.status == .running && !force {
+            proxy.scrollTo(target, anchor: .bottom)
             proxy.scrollTo("BOTTOM", anchor: .bottom)
         } else {
-            withAnimation(DS.Motion.micro) { proxy.scrollTo("BOTTOM", anchor: .bottom) }
+            withAnimation(DS.Motion.micro) {
+                proxy.scrollTo(target, anchor: .bottom)
+                proxy.scrollTo("BOTTOM", anchor: .bottom)
+            }
         }
+    }
+
+    /// Prefer last message or turn id for scroll anchoring (stable across work expand).
+    nonisolated static func latestScrollTargetId(
+        messages: [AgentMessage],
+        turns: [AssistantTurnSnapshot]
+    ) -> String? {
+        if let lastMsg = messages.last {
+            return "message-\(lastMsg.id.value.uuidString)"
+        }
+        if let lastTurn = turns.last {
+            return "turn-\(lastTurn.turnId)"
+        }
+        return nil
     }
 
     // TimelineScrollFollower reports pin transitions from real AppKit geometry — these
@@ -11424,6 +11462,7 @@ public struct AgentAppView: View {
         let cleared = AgentCompletedWorkExpandPolicy.clearedExpansionState()
         expandedCompletedWorkTurns = cleared.expanded
         userCollapsedLiveWorkTurns = cleared.collapsedLive
+        workDisclosureRevealByTurn = [:]
         expandedLiveWorkCache.clear()
     }
 
@@ -11624,10 +11663,16 @@ public struct AgentAppView: View {
         live: Bool = false
     ) -> some View {
         let expanded = isCompletedWorkExpanded(for: turn)
+        let reveal = workDisclosureRevealByTurn[turn.turnId] ?? 0
+        let slice = AgentWorkDisclosureLayout.paintSlice(all: blocks, revealCount: reveal)
         VStack(alignment: .leading, spacing: DS.Space.md) {
             Button {
                 withAnimation(.easeInOut(duration: 0.16)) {
+                    let wasExpanded = isCompletedWorkExpanded(for: turn)
                     toggleCompletedWork(for: turn)
+                    if !wasExpanded {
+                        workDisclosureLayoutEpoch &+= 1
+                    }
                 }
             } label: {
                 HStack(spacing: DS.Space.sm) {
@@ -11652,16 +11697,42 @@ public struct AgentAppView: View {
             .accessibilityIdentifier(live ? "agent.liveWork.\(turn.turnId)" : "agent.completedWork.\(turn.turnId)")
 
             if expanded {
-                VStack(alignment: .leading, spacing: DS.Space.lg) {
-                    ForEach(blocks) { block in
-                        switch block {
-                        case .item(let item): itemRow(item)
-                        case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
+                // Bounded height + LazyVStack so only on-screen steps mount
+                // (nested Lazy without max height expands to full content height).
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: DS.Space.lg) {
+                        if slice.hiddenCount > 0 {
+                            Button {
+                                let base = max(0, blocks.count - AgentWorkDisclosureLayout.expandedPaintWindow)
+                                workDisclosureRevealByTurn[turn.turnId] = AgentWorkDisclosureLayout.advancedRevealCount(
+                                    current: reveal,
+                                    hiddenBase: base
+                                )
+                                workDisclosureLayoutEpoch &+= 1
+                            } label: {
+                                Text("Show earlier steps (\(slice.hiddenCount) hidden)")
+                                    .font(DS.Font.caption)
+                                    .foregroundColor(DS.Palette.accent)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("agent.work.revealEarlier.\(turn.turnId)")
+                        }
+                        ForEach(slice.rows) { block in
+                            switch block {
+                            case .item(let item): itemRow(item)
+                            case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
+                            }
                         }
                     }
+                    .padding(.leading, DS.Space.md)
                 }
-                .padding(.leading, DS.Space.md)
+                .frame(
+                    maxHeight: AgentWorkDisclosureLayout.maxViewportHeight,
+                    alignment: .top
+                )
+                .fixedSize(horizontal: false, vertical: blocks.count <= 6)
                 .transition(.opacity.combined(with: .move(edge: .top)))
+                .accessibilityIdentifier("agent.work.lazyList.\(turn.turnId)")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -11794,7 +11865,10 @@ public struct AgentAppView: View {
         // Cursor-style file edit: show path + red/green hunks inline in the thread.
         if let editModel = AgentFileEditDiffPresentation.model(for: item),
            editModel.hasRenderableCode || item.type == .fileChange {
-            AgentFileEditDiffCard(model: editModel)
+            AgentFileEditDiffCard(
+                model: editModel,
+                initiallyExpanded: AgentWorkDisclosureLayout.diffDefaultExpanded
+            )
         } else {
             standardToolRow(item)
         }
