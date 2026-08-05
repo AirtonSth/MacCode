@@ -1061,12 +1061,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard !isDisposed else { return }
         let selectedThread: AgentThread
         do {
-            guard let persistedThread = try threadRepo.get(id: id) else { return }
+            guard let persistedThread = try threadRepo.get(id: id) else {
+                statusMessage = "Could not open thread: The thread is no longer available."
+                return
+            }
             selectedThread = persistedThread
         } catch {
             statusMessage = "Could not open thread: \(error)"
             return
         }
+        guard let selectedWorkspaceID = selectedThread.workspaceId,
+              selectedWorkspaceID == workspaceID else {
+            statusMessage = "Could not open thread: The thread belongs to another workspace."
+            return
+        }
+        threadWorkspaceCache[id] = selectedWorkspaceID
         if statusMessage.contains(Self.deletedThreadDraftRecoveryMessage) {
             statusMessage = ""
         }
@@ -4605,9 +4614,29 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func handleQueueLifecycleEvent(kind: String, threadId: String?, message: String?) {
+        switch kind {
+        case "agent.message.queue.failed", AgentQueueEventKinds.drained, AgentQueueEventKinds.cancelled:
+            break
+        default:
+            return
+        }
         guard let threadId,
               let uuid = UUID(uuidString: threadId) else { return }
         let eventThreadId = AgentThreadID(uuid)
+        let eventWorkspaceID: WorkspaceID?
+        if let cachedWorkspaceID = threadWorkspaceCache[eventThreadId] {
+            eventWorkspaceID = cachedWorkspaceID
+        } else {
+            do {
+                eventWorkspaceID = try threadRepo.get(id: eventThreadId)?.workspaceId
+            } catch {
+                return
+            }
+            if eventWorkspaceID == workspaceID {
+                threadWorkspaceCache[eventThreadId] = eventWorkspaceID
+            }
+        }
+        guard eventWorkspaceID == workspaceID else { return }
         switch kind {
         case "agent.message.queue.failed":
             let status = message ?? "The queued message could not start yet."
@@ -4620,7 +4649,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 setQueueStatus(nil, threadId: eventThreadId)
             }
         default:
-            break
+            return
         }
     }
 

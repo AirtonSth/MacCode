@@ -7219,6 +7219,90 @@ final class AgentAppViewModelTests: XCTestCase {
 
         XCTAssertNil(vm.selectedThreadId,
                      "repository absence must win over stale in-memory rail membership")
+        XCTAssertTrue(vm.statusMessage.contains("Could not open thread"),
+                      "a missing stale rail row must fail loud")
+    }
+
+    func test_selectThread_repositoryFallbackCachesLocalOwnershipAndRejectsForeignRow() throws {
+        let (vm, threadRepo) = try makeVM()
+        let local = AgentThread(workspaceId: vm.workspaceID, title: "local fallback", provider: .claude, model: "m")
+        let foreign = AgentThread(workspaceId: WorkspaceID(), title: "foreign fallback", provider: .claude, model: "m")
+        try threadRepo.upsert(local)
+        try threadRepo.upsert(foreign)
+        XCTAssertTrue(vm.threads.isEmpty,
+                      "precondition: both rows were inserted after the initial rail load")
+
+        vm.selectThread(local.id, markRead: false)
+        XCTAssertEqual(vm.selectedThreadId, local.id,
+                       "a persisted local row must remain selectable before rail insertion")
+
+        vm.selectThread(foreign.id, markRead: false)
+        XCTAssertEqual(vm.selectedThreadId, local.id,
+                       "a surface must not bind a repository row owned by another workspace")
+        XCTAssertTrue(vm.statusMessage.contains("Could not open thread"),
+                      "cross-workspace selection must fail loud")
+
+        vm.seedAdditionalThreadCachesForTesting(local.id)
+        vm.seedRunThreadProjectionForTesting(local.id)
+        vm.coordinator.seedAutoContinuationStateForTesting(local.id)
+        vm.coordinator.seedAutoContinuationStateForTesting(foreign.id)
+        try threadRepo.delete(id: local.id)
+
+        vm.reloadThreads()
+
+        XCTAssertNil(vm.selectedThreadId,
+                     "a selected fallback row deleted externally must recover to the fresh composer")
+        XCTAssertFalse(vm.threadCacheResidueForTesting.contains(local.id),
+                       "fallback selection must cache local ownership so reload can evict every deleted-thread projection")
+        XCTAssertFalse(vm.coordinator.autoContinuationThreadIdsForTesting.contains(local.id),
+                       "deleted local fallback ownership must leave the shared coordinator")
+        XCTAssertTrue(vm.coordinator.autoContinuationThreadIdsForTesting.contains(foreign.id),
+                      "local reconciliation must preserve foreign coordinator ownership")
+    }
+
+    func test_queueLifecycleEvents_cacheOnlyLocalPreRailOwnershipAcrossReloadFailures() throws {
+        let (vm, threadRepo) = try makeVM()
+        let local = AgentThread(workspaceId: vm.workspaceID, title: "local queue", provider: .claude, model: "m")
+        let foreign = AgentThread(workspaceId: WorkspaceID(), title: "foreign queue", provider: .claude, model: "m")
+        try threadRepo.upsert(local)
+        try threadRepo.upsert(foreign)
+        vm.coordinator.seedAutoContinuationStateForTesting(foreign.id)
+        XCTAssertTrue(vm.threads.isEmpty,
+                      "precondition: queue events arrive before either row enters this rail")
+
+        vm.handleQueueLifecycleEvent(
+            kind: "agent.message.queue.failed",
+            threadId: local.id.value.uuidString,
+            message: "local queue failure"
+        )
+        vm.handleQueueLifecycleEvent(
+            kind: "agent.message.queue.failed",
+            threadId: foreign.id.value.uuidString,
+            message: "foreign queue failure"
+        )
+
+        XCTAssertTrue(vm.threadCacheResidueForTesting.contains(local.id),
+                      "a local pre-rail queue event must cache workspace ownership for later reconciliation")
+        XCTAssertFalse(vm.threadCacheResidueForTesting.contains(foreign.id),
+                       "a foreign queue event must not retain ViewModel state")
+
+        vm.setReloadThreadListForTesting {
+            throw NSError(domain: "AgentAppViewModelTests.queuePreRail", code: 1)
+        }
+        vm.reloadThreads()
+        vm.setReloadThreadListForTesting(nil)
+        XCTAssertTrue(vm.threadCacheResidueForTesting.contains(local.id),
+                      "a failed list must retain valid local queue state while its row still exists")
+        XCTAssertFalse(vm.threadCacheResidueForTesting.contains(foreign.id),
+                       "a failed list must not manufacture foreign queue state")
+
+        try threadRepo.delete(id: local.id)
+        vm.reloadThreads()
+
+        XCTAssertFalse(vm.threadCacheResidueForTesting.contains(local.id),
+                       "the next successful reload must evict the externally deleted local queue state")
+        XCTAssertTrue(vm.coordinator.autoContinuationThreadIdsForTesting.contains(foreign.id),
+                      "local queue reconciliation must not forget foreign coordinator ownership")
     }
 
     /// PERF-MAC_AGENT-013: a create/RPC producer can enforce the cap before an
