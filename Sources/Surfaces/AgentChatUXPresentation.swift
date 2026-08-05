@@ -262,6 +262,571 @@ public enum AgentCompletedWorkPresentation {
     }
 }
 
+// MARK: - Turn chat composition (macOS ↔ iOS parity)
+
+/// Single rule for every turn in the Agent chat:
+/// **user message** (transcript) → **Work so far** (all non-final work) → **final agent message** only outside.
+/// Live turns have no outside tool/group rows; the active stream lives inside Work so far when expanded.
+public enum AgentTurnChatComposition {
+    /// Split renderable turn items into work (disclosure) vs outside (final answer only).
+    /// - Live / unfinished: everything is work; outside is empty.
+    /// - Finished: `finalItemIDs` paint outside (or only via finalMessage field); rest is work.
+    public static func splitItems<Item>(
+        _ items: [Item],
+        turnFinished: Bool,
+        isFinalItem: (Item) -> Bool
+    ) -> (work: [Item], outside: [Item]) {
+        if !turnFinished {
+            return (items, [])
+        }
+        var work: [Item] = []
+        var outside: [Item] = []
+        work.reserveCapacity(items.count)
+        for item in items {
+            if isFinalItem(item) {
+                outside.append(item)
+            } else {
+                work.append(item)
+            }
+        }
+        return (work, outside)
+    }
+
+    /// Live Work so far must own every non-final step (no active-tail leak outside).
+    public static func liveOutsideBlocksMustBeEmpty() -> Bool { true }
+}
+
+// MARK: - Work so far expand policy
+
+/// Pure policy for default-open latest live "Work so far" and collapse-all on final.
+/// UI only stores user overrides; this decides painted expanded state.
+public enum AgentCompletedWorkExpandPolicy {
+    /// - isLive / isLatestLiveTurn: only the current unfinished turn defaults open.
+    /// - userExplicitlyExpanded: finished (or non-default) turns the user opened.
+    /// - userCollapsedWhileLive: user hid the live default-open disclosure.
+    public static func isExpanded(
+        isLive: Bool,
+        isLatestLiveTurn: Bool,
+        userExplicitlyExpanded: Bool,
+        userCollapsedWhileLive: Bool
+    ) -> Bool {
+        if isLive && isLatestLiveTurn {
+            return !userCollapsedWhileLive
+        }
+        return userExplicitlyExpanded
+    }
+
+    /// Final assistant answer / turn finish: collapse every work disclosure.
+    public static func clearedExpansionState() -> (expanded: Set<String>, collapsedLive: Set<String>) {
+        ([], [])
+    }
+
+    /// Apply a user toggle. Returns updated override sets.
+    public static func toggle(
+        turnId: String,
+        currentlyExpanded: Bool,
+        isLive: Bool,
+        isLatestLiveTurn: Bool,
+        userExpanded: Set<String>,
+        userCollapsedLive: Set<String>
+    ) -> (expanded: Set<String>, collapsedLive: Set<String>) {
+        var expanded = userExpanded
+        var collapsed = userCollapsedLive
+        if currentlyExpanded {
+            expanded.remove(turnId)
+            if isLive && isLatestLiveTurn {
+                collapsed.insert(turnId)
+            }
+        } else {
+            collapsed.remove(turnId)
+            expanded.insert(turnId)
+        }
+        return (expanded, collapsed)
+    }
+}
+
+// MARK: - Expanded work block growth (append-friendly)
+
+/// Pure helpers so live expanded "Work so far" prefers append / prefix reuse
+/// over treating every stream tick as a brand-new full block list.
+public enum AgentCompletedWorkBlockGrowth {
+    public static func isPrefixStableAppend(previousIds: [String], nextIds: [String]) -> Bool {
+        guard nextIds.count >= previousIds.count else { return false }
+        for i in previousIds.indices where previousIds[i] != nextIds[i] {
+            return false
+        }
+        return true
+    }
+
+    /// First item index that must be re-blocked when growing previous → next.
+    /// `previousIds.count` means fully reusable (identical length). `0` = full rebuild.
+    public static func rebuildFromItemIndex(
+        previousIds: [String],
+        previousGroupable: [Bool],
+        nextIds: [String]
+    ) -> Int {
+        guard isPrefixStableAppend(previousIds: previousIds, nextIds: nextIds) else {
+            return 0
+        }
+        if nextIds.count == previousIds.count {
+            return previousIds.count
+        }
+        // Trailing open groupable run may absorb newly settled tools.
+        var openRunStart = previousIds.count
+        while openRunStart > 0,
+              openRunStart - 1 < previousGroupable.count,
+              previousGroupable[openRunStart - 1] {
+            openRunStart -= 1
+        }
+        return openRunStart
+    }
+
+    /// Longest leading block-id prefix shared by previous and next full builds.
+    public static func reusableBlockPrefixCount(
+        previousBlockIds: [String],
+        nextBlockIds: [String]
+    ) -> Int {
+        var n = 0
+        let limit = min(previousBlockIds.count, nextBlockIds.count)
+        while n < limit && previousBlockIds[n] == nextBlockIds[n] {
+            n += 1
+        }
+        return n
+    }
+
+    /// Documents growth mode for tests and callers.
+    /// - reuse: same settled ids → keep previous block identities
+    /// - append: previous block ids are a strict prefix of next → only suffix is new
+    /// - in_place_last_plus_append: last block id stable (group grew) + optional new blocks
+    /// - full_rebuild: not prefix-stable
+    /// - partial_rebuild: reuse common block id prefix only
+    public static func growthDecision(
+        previousItemIds: [String],
+        previousBlockIds: [String],
+        nextItemIds: [String],
+        nextBlockIds: [String]
+    ) -> (mode: String, reusedCount: Int, appendedBlockIds: [String]) {
+        guard isPrefixStableAppend(previousIds: previousItemIds, nextIds: nextItemIds) else {
+            return ("full_rebuild", 0, nextBlockIds)
+        }
+        if nextItemIds.count == previousItemIds.count {
+            return ("reuse", previousBlockIds.count, [])
+        }
+        if previousBlockIds.isEmpty {
+            return ("append", 0, nextBlockIds)
+        }
+        if nextBlockIds.starts(with: previousBlockIds) {
+            return ("append", previousBlockIds.count, Array(nextBlockIds.dropFirst(previousBlockIds.count)))
+        }
+        let common = reusableBlockPrefixCount(
+            previousBlockIds: previousBlockIds,
+            nextBlockIds: nextBlockIds
+        )
+        if common == previousBlockIds.count - 1,
+           common < nextBlockIds.count,
+           previousBlockIds.last == nextBlockIds[common] {
+            return (
+                "in_place_last_plus_append",
+                common + 1,
+                Array(nextBlockIds.dropFirst(common + 1))
+            )
+        }
+        return ("partial_rebuild", common, Array(nextBlockIds.dropFirst(common)))
+    }
+}
+
+// MARK: - File edit diff (Cursor-style timeline card)
+
+/// Pure extraction + line model for agent file edits shown inline in the thread.
+/// WHY: users need to see what changed (path + red/green hunks), not a raw JSON/tool dump.
+public enum AgentFileEditDiffPresentation {
+    public enum LineKind: Sendable, Equatable {
+        case meta
+        case hunk
+        case context
+        case addition
+        case deletion
+    }
+
+    public struct Line: Sendable, Equatable, Identifiable {
+        public var id: Int
+        public var kind: LineKind
+        /// Source text without the leading unified-diff marker for code lines.
+        public var text: String
+        public var oldLineNumber: Int?
+        public var newLineNumber: Int?
+
+        public init(
+            id: Int,
+            kind: LineKind,
+            text: String,
+            oldLineNumber: Int? = nil,
+            newLineNumber: Int? = nil
+        ) {
+            self.id = id
+            self.kind = kind
+            self.text = text
+            self.oldLineNumber = oldLineNumber
+            self.newLineNumber = newLineNumber
+        }
+
+        /// Number column: prefer new side for additions/context, old for deletions.
+        public var displayLineNumber: Int? {
+            switch kind {
+            case .deletion: return oldLineNumber
+            case .addition, .context: return newLineNumber ?? oldLineNumber
+            case .meta, .hunk: return nil
+            }
+        }
+    }
+
+    public struct Model: Sendable, Equatable {
+        public var path: String?
+        public var lines: [Line]
+        public var hiddenLineCount: Int
+
+        public init(path: String?, lines: [Line], hiddenLineCount: Int = 0) {
+            self.path = path
+            self.lines = lines
+            self.hiddenLineCount = hiddenLineCount
+        }
+
+        public var hasRenderableCode: Bool {
+            lines.contains { $0.kind == .addition || $0.kind == .deletion || $0.kind == .context }
+        }
+    }
+
+    public static let defaultMaxLines = 160
+
+    /// True when this timeline item should paint as an Edit diff card.
+    public static func shouldPresent(item: AssistantItem) -> Bool {
+        if item.type == .fileChange { return model(for: item) != nil }
+        // Claude Edit/Write and similar tools store structured JSON in body.
+        if item.type == .tool || item.type == .commandExecution || item.type == .dynamicToolCall {
+            return model(for: item) != nil
+        }
+        return false
+    }
+
+    public static func model(for item: AssistantItem, maxLines: Int = defaultMaxLines) -> Model? {
+        let path = extractPath(from: item)
+        guard let raw = extractDiffText(from: item), !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        let parsed = parseUnifiedDiff(raw, maxLines: maxLines)
+        guard parsed.lines.contains(where: {
+            $0.kind == .addition || $0.kind == .deletion || $0.kind == .context || $0.kind == .hunk
+        }) else {
+            // Still show path-only edits with a single meta line when we only know the path.
+            if let path, !path.isEmpty {
+                return Model(
+                    path: path,
+                    lines: [Line(id: 0, kind: .meta, text: "File updated")],
+                    hiddenLineCount: 0
+                )
+            }
+            return nil
+        }
+        let resolvedPath = path ?? parsed.inferredPath
+        return Model(path: resolvedPath, lines: parsed.lines, hiddenLineCount: parsed.hidden)
+    }
+
+    public static func extractPath(from item: AssistantItem) -> String? {
+        if let resource = item.resourcePath?.trimmingCharacters(in: .whitespacesAndNewlines), !resource.isEmpty {
+            return resource
+        }
+        if let fromSummary = pathCandidate(in: item.summary ?? ""), !fromSummary.isEmpty {
+            return fromSummary
+        }
+        for blob in [item.body, item.output ?? ""] {
+            if let p = pathFromJSON(blob) { return p }
+            if let p = pathFromUnifiedDiff(blob) { return p }
+        }
+        return nil
+    }
+
+    public static func extractDiffText(from item: AssistantItem) -> String? {
+        for blob in [item.output ?? "", item.body] {
+            let trimmed = blob.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            if looksLikeDiff(trimmed) { return trimmed }
+            if let fromJSON = diffFromJSONChanges(trimmed) { return fromJSON }
+            if let fromEdit = synthesizeDiffFromEditJSON(trimmed) { return fromEdit }
+            if let fromPatch = extractApplyPatchBlock(trimmed) { return fromPatch }
+        }
+        return nil
+    }
+
+    public static func looksLikeDiff(_ text: String) -> Bool {
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true).prefix(60) {
+            let s = String(line)
+            if s.hasPrefix("diff --git ") || s.hasPrefix("@@") || s.hasPrefix("--- ") || s.hasPrefix("+++ ") {
+                return true
+            }
+            if s.hasPrefix("*** Begin Patch") || s.hasPrefix("*** Update File:") || s.hasPrefix("*** Add File:") {
+                return true
+            }
+        }
+        // Heuristic: several +/- code lines without being a bullet list.
+        var plus = 0, minus = 0
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true).prefix(80) {
+            if line.hasPrefix("+") && !line.hasPrefix("++") { plus += 1 }
+            if line.hasPrefix("-") && !line.hasPrefix("--") { minus += 1 }
+        }
+        return plus + minus >= 2 && (plus > 0 || minus > 0)
+    }
+
+    /// Parse unified / apply-patch style text into numbered display lines.
+    public static func parseUnifiedDiff(_ text: String, maxLines: Int = defaultMaxLines) -> (lines: [Line], hidden: Int, inferredPath: String?) {
+        let rawLines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var out: [Line] = []
+        out.reserveCapacity(min(rawLines.count, maxLines))
+        var oldN = 0
+        var newN = 0
+        var inferredPath: String?
+        var index = 0
+        for raw in rawLines {
+            if out.count >= maxLines { break }
+            let line = raw
+            if line.hasPrefix("diff --git ") {
+                inferredPath = inferredPath ?? pathFromDiffGitLine(line)
+                out.append(Line(id: index, kind: .meta, text: line)); index += 1
+                continue
+            }
+            if line.hasPrefix("--- ") || line.hasPrefix("+++ ") {
+                if line.hasPrefix("+++ ") {
+                    inferredPath = inferredPath ?? pathFromDiffFileHeader(line)
+                } else if inferredPath == nil {
+                    inferredPath = pathFromDiffFileHeader(line)
+                }
+                out.append(Line(id: index, kind: .meta, text: line)); index += 1
+                continue
+            }
+            if line.hasPrefix("*** Update File:") || line.hasPrefix("*** Add File:") || line.hasPrefix("*** Delete File:") {
+                inferredPath = inferredPath ?? line.split(separator: ":", maxSplits: 1).last.map {
+                    String($0).trimmingCharacters(in: .whitespaces)
+                }
+                out.append(Line(id: index, kind: .meta, text: line)); index += 1
+                continue
+            }
+            if line.hasPrefix("*** Begin Patch") || line.hasPrefix("*** End Patch") {
+                out.append(Line(id: index, kind: .meta, text: line)); index += 1
+                continue
+            }
+            if line.hasPrefix("@@") {
+                if let (o, n) = parseHunkHeader(line) {
+                    oldN = o
+                    newN = n
+                }
+                out.append(Line(id: index, kind: .hunk, text: line)); index += 1
+                continue
+            }
+            if line.hasPrefix("+") && !line.hasPrefix("+++") {
+                let text = String(line.dropFirst())
+                out.append(Line(id: index, kind: .addition, text: text, oldLineNumber: nil, newLineNumber: newN))
+                newN += 1
+                index += 1
+                continue
+            }
+            if line.hasPrefix("-") && !line.hasPrefix("---") {
+                let text = String(line.dropFirst())
+                out.append(Line(id: index, kind: .deletion, text: text, oldLineNumber: oldN, newLineNumber: nil))
+                oldN += 1
+                index += 1
+                continue
+            }
+            // Context (leading space or plain)
+            let text = line.hasPrefix(" ") ? String(line.dropFirst()) : line
+            if line.hasPrefix(" ") || (!line.isEmpty && !line.hasPrefix("\\")) {
+                out.append(Line(id: index, kind: .context, text: text, oldLineNumber: oldN, newLineNumber: newN))
+                if !line.isEmpty {
+                    oldN += 1
+                    newN += 1
+                }
+                index += 1
+            } else if line.hasPrefix("\\") {
+                out.append(Line(id: index, kind: .meta, text: line)); index += 1
+            }
+        }
+        let hidden = max(0, rawLines.count - out.count)
+        return (out, hidden, inferredPath)
+    }
+
+    /// Claude Edit/Write JSON → synthetic unified-ish hunk.
+    public static func synthesizeDiffFromEditJSON(_ body: String) -> String? {
+        guard let obj = jsonObject(body) else { return nil }
+        let path = (obj["file_path"] as? String)
+            ?? (obj["path"] as? String)
+            ?? (obj["filePath"] as? String)
+            ?? "file"
+        if let oldS = obj["old_string"] as? String, let newS = obj["new_string"] as? String {
+            return buildSyntheticDiff(path: path, oldText: oldS, newText: newS)
+        }
+        if let content = (obj["content"] as? String) ?? (obj["new_string"] as? String),
+           obj["old_string"] == nil {
+            // Write / create: all additions
+            var lines = ["*** Add File: \(path)", "@@"]
+            for line in content.split(separator: "\n", omittingEmptySubsequences: false) {
+                lines.append("+\(line)")
+            }
+            return lines.joined(separator: "\n")
+        }
+        return nil
+    }
+
+    // MARK: - Internals
+
+    private static func buildSyntheticDiff(path: String, oldText: String, newText: String) -> String {
+        let oldLines = oldText.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let newLines = newText.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var out = [
+            "*** Update File: \(path)",
+            "@@ -\(1),\(oldLines.count) +\(1),\(newLines.count) @@"
+        ]
+        for line in oldLines { out.append("-\(line)") }
+        for line in newLines { out.append("+\(line)") }
+        return out.joined(separator: "\n")
+    }
+
+    private static func diffFromJSONChanges(_ body: String) -> String? {
+        guard let data = body.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        // { "changes": [ ... ] } or bare array
+        let changes: [[String: Any]]
+        if let dict = json as? [String: Any] {
+            if let patch = dict["patch"] as? String, looksLikeDiff(patch) { return patch }
+            if let diff = dict["diff"] as? String, looksLikeDiff(diff) { return diff }
+            if let arr = dict["changes"] as? [[String: Any]] {
+                changes = arr
+            } else {
+                return nil
+            }
+        } else if let arr = json as? [[String: Any]] {
+            changes = arr
+        } else {
+            return nil
+        }
+        var chunks: [String] = []
+        for change in changes {
+            let path = (change["path"] as? String)
+                ?? (change["file"] as? String)
+                ?? (change["filename"] as? String)
+                ?? "file"
+            if let diff = (change["diff"] as? String)
+                ?? (change["patch"] as? String)
+                ?? (change["unified_diff"] as? String)
+                ?? (change["unifiedDiff"] as? String),
+               !diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if looksLikeDiff(diff) {
+                    chunks.append(diff)
+                } else {
+                    chunks.append("*** Update File: \(path)\n@@\n\(diff)")
+                }
+                continue
+            }
+            if let oldS = change["old_string"] as? String, let newS = change["new_string"] as? String {
+                chunks.append(buildSyntheticDiff(path: path, oldText: oldS, newText: newS))
+            }
+        }
+        guard !chunks.isEmpty else { return nil }
+        return chunks.joined(separator: "\n")
+    }
+
+    private static func extractApplyPatchBlock(_ text: String) -> String? {
+        guard text.contains("*** Begin Patch") || text.contains("*** Update File:") else { return nil }
+        return text
+    }
+
+    private static func pathFromJSON(_ body: String) -> String? {
+        guard let obj = jsonObject(body) else { return nil }
+        for key in ["file_path", "path", "filePath", "filename", "file"] {
+            if let p = (obj[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !p.isEmpty {
+                return p
+            }
+        }
+        if let changes = obj["changes"] as? [[String: Any]],
+           let first = changes.first {
+            for key in ["path", "file", "filename"] {
+                if let p = (first[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !p.isEmpty {
+                    return p
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func pathFromUnifiedDiff(_ text: String) -> String? {
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true).prefix(20) {
+            let s = String(line)
+            if s.hasPrefix("diff --git ") { return pathFromDiffGitLine(s) }
+            if s.hasPrefix("+++ ") { return pathFromDiffFileHeader(s) }
+            if s.hasPrefix("*** Update File:") || s.hasPrefix("*** Add File:") {
+                return s.split(separator: ":", maxSplits: 1).last.map {
+                    String($0).trimmingCharacters(in: .whitespaces)
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func pathCandidate(in text: String) -> String? {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard t.contains("/") || t.contains(".") else { return nil }
+        // "Changed path/to/file.swift" / "1 file change · foo.ts"
+        if let range = t.range(of: #"(/[^\s]+|\S+\.\w{1,8})"#, options: .regularExpression) {
+            return String(t[range])
+        }
+        return nil
+    }
+
+    private static func pathFromDiffGitLine(_ line: String) -> String? {
+        // diff --git a/foo b/foo
+        let parts = line.split(separator: " ")
+        guard parts.count >= 4 else { return nil }
+        let b = String(parts[3])
+        if b.hasPrefix("b/") { return String(b.dropFirst(2)) }
+        return b
+    }
+
+    private static func pathFromDiffFileHeader(_ line: String) -> String? {
+        // +++ b/path or --- a/path
+        var rest = line
+        if rest.hasPrefix("+++ ") || rest.hasPrefix("--- ") {
+            rest = String(rest.dropFirst(4))
+        }
+        if rest == "/dev/null" { return nil }
+        if rest.hasPrefix("a/") || rest.hasPrefix("b/") {
+            return String(rest.dropFirst(2))
+        }
+        return rest.split(separator: "\t").first.map(String.init)
+    }
+
+    private static func parseHunkHeader(_ line: String) -> (Int, Int)? {
+        // @@ -12,4 +12,10 @@
+        guard let re = try? NSRegularExpression(pattern: #"@@\s*-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s*@@"#) else {
+            return nil
+        }
+        let ns = line as NSString
+        guard let match = re.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)),
+              match.numberOfRanges >= 3,
+              let oldR = Range(match.range(at: 1), in: line),
+              let newR = Range(match.range(at: 2), in: line),
+              let old = Int(line[oldR]),
+              let new = Int(line[newR]) else { return nil }
+        return (old, new)
+    }
+
+    private static func jsonObject(_ body: String) -> [String: Any]? {
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("{"),
+              let data = trimmed.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return obj
+    }
+}
+
 // MARK: - Thread rail row copy
 
 /// Pure thread-row subtitle + monogram for denser rail scanning.

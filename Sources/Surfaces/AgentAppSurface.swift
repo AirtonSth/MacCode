@@ -238,8 +238,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public private(set) var historyReplayNotice: String?
     public static let historyReplayNoticeText = "Showing the recent Agent history window. Earlier transcript events remain outside the hot replay budget."
 
+    /// Never surface the hot-replay window as a user-visible banner.
+    /// Partial history still loads; only the notice copy is suppressed.
     public static func replayNoticeText(isPartial: Bool) -> String? {
-        isPartial ? historyReplayNoticeText : nil
+        _ = isPartial
+        return nil
     }
     /// CLAUDE-BG-LIFECYCLE: how many CLI-owned background shells / async
     /// subagents the provider last reported as still running, from the
@@ -8069,7 +8072,12 @@ public struct AgentAppView: View {
     @State private var lastAutomaticPlanSidebarChange: TimeInterval?
     @State private var proposedPlanExpanded = false
     @State private var showWorkLog = false
+    /// User-opened finished (or non-default) work disclosures.
     @State private var expandedCompletedWorkTurns: Set<String> = []
+    /// Live turns the user manually collapsed (suppresses default-open latest live).
+    @State private var userCollapsedLiveWorkTurns: Set<String> = []
+    /// Turn ids already treated as finished for collapse-all-on-final (one-shot).
+    @State private var knownFinishedWorkTurnIds: Set<String> = []
     @State private var queuedMessagePendingCancel: AgentQueuedMessage?
     @State private var pendingSessionApproval: PendingSessionApprovalConfirmation?
     @State private var expandedRequestPreviews: Set<String> = []
@@ -8287,6 +8295,66 @@ public struct AgentAppView: View {
         return blocks
     }
 
+    /// Prefer append / sealed-prefix reuse when expanded live work only grew a tail.
+    /// WHY: full `turnRenderBlocks(settled)` on every stream tick rematerializes O(N) rows.
+    static func appendFriendlyCompletedWorkBlocks(
+        previousItems: [AssistantItem],
+        previousBlocks: [TurnRenderBlock],
+        nextItems: [AssistantItem],
+        groupThreshold: Int = 2
+    ) -> [TurnRenderBlock] {
+        let previousIds = previousItems.map(\.id)
+        let nextIds = nextItems.map(\.id)
+        guard AgentCompletedWorkBlockGrowth.isPrefixStableAppend(
+            previousIds: previousIds,
+            nextIds: nextIds
+        ) else {
+            return turnRenderBlocks(nextItems, groupThreshold: groupThreshold)
+        }
+        if nextIds.count == previousIds.count {
+            if !previousBlocks.isEmpty || nextItems.isEmpty {
+                return previousBlocks
+            }
+            return turnRenderBlocks(nextItems, groupThreshold: groupThreshold)
+        }
+        // Fast path: pure tool runs collapse to one group/item list — append items only.
+        if !nextItems.isEmpty,
+           previousItems.allSatisfy({ isGroupableTool($0.type) }),
+           nextItems.allSatisfy({ isGroupableTool($0.type) }) {
+            if nextItems.count >= groupThreshold {
+                return [.toolGroup(id: nextItems[0].id, items: nextItems)]
+            }
+            if previousBlocks.count == nextItems.count - (nextItems.count - previousItems.count),
+               previousItems.count < groupThreshold {
+                // Still below group threshold: reuse prior .item shells and append new.
+                let newItems = Array(nextItems.dropFirst(previousItems.count))
+                return previousBlocks + newItems.map { .item($0) }
+            }
+            return turnRenderBlocks(nextItems, groupThreshold: groupThreshold)
+        }
+        let previousGroupable = previousItems.map { isGroupableTool($0.type) }
+        let from = AgentCompletedWorkBlockGrowth.rebuildFromItemIndex(
+            previousIds: previousIds,
+            previousGroupable: previousGroupable,
+            nextIds: nextIds
+        )
+        if from <= 0 {
+            return turnRenderBlocks(nextItems, groupThreshold: groupThreshold)
+        }
+        let sealedItems = Array(previousItems.prefix(from))
+        let sealedBlockCount = turnRenderBlockCount(sealedItems, groupThreshold: groupThreshold)
+        let sealedBlocks: [TurnRenderBlock]
+        if sealedBlockCount == 0 {
+            sealedBlocks = []
+        } else if sealedBlockCount <= previousBlocks.count {
+            sealedBlocks = Array(previousBlocks.prefix(sealedBlockCount))
+        } else {
+            return turnRenderBlocks(nextItems, groupThreshold: groupThreshold)
+        }
+        let tail = Array(nextItems.suffix(from: from))
+        return sealedBlocks + turnRenderBlocks(tail, groupThreshold: groupThreshold)
+    }
+
     /// F2: the per-turn data `turnView` needs, computed once instead of re-deriving
     /// `renderableItems` / `completedFinalAssistantItemIDs` (twice) / block grouping /
     /// plan filtering on every SwiftUI body pass. Pure value so it can be memoized for
@@ -8300,6 +8368,8 @@ public struct AgentAppView: View {
         var completedWorkBlockCount: Int
         var hiddenLiveItemCount: Int
         var shouldRenderFinal: Bool
+        /// Settled/work source items when expanded (for append-friendly cache). Empty when collapsed.
+        var expandedWorkSourceItems: [AssistantItem] = []
     }
 
     static func computeTurnRenderInputs(turn: AssistantTurnSnapshot,
@@ -8307,7 +8377,9 @@ public struct AgentAppView: View {
                                         proposedPlans allPlans: [AssistantProposedPlan],
                                         running: Bool,
                                         expandCompletedWork: Bool = false,
-                                        followUpWorkAnchorMs: Int64? = nil) -> TurnRenderInputs {
+                                        followUpWorkAnchorMs: Int64? = nil,
+                                        previousExpandedWorkItems: [AssistantItem]? = nil,
+                                        previousExpandedWorkBlocks: [TurnRenderBlock]? = nil) -> TurnRenderInputs {
         let turnPlans = allPlans.filter {
             $0.turnId == turn.turnId && !$0.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
@@ -8318,55 +8390,57 @@ public struct AgentAppView: View {
         let rawRenderable = renderableItems(in: turn, persistedAssistantTexts: persistedAssistantTexts)
             .filter { !($0.type == .plan && !turnPlans.isEmpty) }
         let renderable = itemsAfterFollowUpAnchor(rawRenderable, anchorMs: followUpWorkAnchorMs)
-        let runningTurn = !turn.finished && running
-        // Chat-fluid live path: fold already-settled tools/thoughts into the same
-        // "Worked" disclosure used after completion, and only paint the active
-        // tail (streaming item + brief context). Grok emits Thought between tools,
-        // which breaks consecutive tool grouping — without this partition the live
-        // transcript re-expands every command as a full toolRow.
-        if runningTurn {
-            let (settled, active) = partitionLiveTurnItems(renderable)
-            let activeVisible = visibleLiveTurnItems(active, running: true)
-            let hiddenLiveItemCount = max(0, renderable.count - settled.count - activeVisible.count)
-            // PERF: the collapsed disclosure only needs a count. Building full
-            // TurnRenderBlock trees for 200+ settled tools on every body pass was
-            // a main-thread tax during long live turns.
-            let workCount = turnRenderBlockCount(settled)
-            let workBlocks = AgentCompletedWorkPresentation.shouldBuildBlocks(
-                expandCompletedWork: expandCompletedWork,
-                workItemCount: workCount
-            ) ? turnRenderBlocks(settled) : []
-            return TurnRenderInputs(
-                turnPlans: turnPlans,
-                visibleBlocks: turnRenderBlocks(activeVisible),
-                completedWorkBlocks: workBlocks,
-                completedWorkBlockCount: workCount,
-                hiddenLiveItemCount: hiddenLiveItemCount,
-                shouldRenderFinal: false
-            )
-        }
+        // Chat composition (macOS ↔ iOS parity): user → Work so far (ALL non-final) → final only.
+        // Live: no tool/group rows outside the disclosure (active tail no longer leaks).
         let finalIDs = turn.finished
             ? completedFinalAssistantItemIDs(in: turn, renderableItems: renderable, persistedAssistantTexts: persistedAssistantTexts)
             : []
-        let workItems = turn.finished ? renderable.filter { !finalIDs.contains($0.id) } : []
-        let visibleAssistant = turn.finished ? renderable.filter { finalIDs.contains($0.id) } : renderable
-        let visibleBlocks = turnRenderBlocks(visibleAssistant)
-        let workCount = turnRenderBlockCount(workItems)
-        let completedWorkBlocks = AgentCompletedWorkPresentation.shouldBuildBlocks(
+        let split = AgentTurnChatComposition.splitItems(
+            renderable,
+            turnFinished: turn.finished,
+            isFinalItem: { finalIDs.contains($0.id) }
+        )
+        // Live body caps keep expanded Work so far paint cheap without leaving rows outside.
+        let workSourceItems: [AssistantItem] = {
+            guard !turn.finished, running else { return split.work }
+            return split.work.map(liveRenderableCopy)
+        }()
+        let workCount = turnRenderBlockCount(split.work)
+        let shouldBuild = AgentCompletedWorkPresentation.shouldBuildBlocks(
             expandCompletedWork: expandCompletedWork,
             workItemCount: workCount
-        ) ? turnRenderBlocks(workItems) : []
-        let shouldRenderFinal = turn.finalAssistantMessage != nil
+        )
+        let workBlocks: [TurnRenderBlock]
+        if shouldBuild {
+            if !turn.finished,
+               let prevItems = previousExpandedWorkItems,
+               let prevBlocks = previousExpandedWorkBlocks {
+                workBlocks = appendFriendlyCompletedWorkBlocks(
+                    previousItems: prevItems,
+                    previousBlocks: prevBlocks,
+                    nextItems: workSourceItems
+                )
+            } else {
+                workBlocks = turnRenderBlocks(workSourceItems)
+            }
+        } else {
+            workBlocks = []
+        }
+        // Outside the disclosure: final assistant item(s) only (finished). Live: empty.
+        let visibleBlocks = turn.finished ? turnRenderBlocks(split.outside) : []
+        let shouldRenderFinal = turn.finished
+            && turn.finalAssistantMessage != nil
             && shouldRenderFinalAssistantMessage(turn, persistedAssistantTexts: persistedAssistantTexts)
-            // If every item was scoped out as pre-follow-up, don't re-paint the
-            // prior turn's final answer under the new user bubble.
-            && !(followUpWorkAnchorMs != nil && renderable.isEmpty && workItems.isEmpty)
-        return TurnRenderInputs(turnPlans: turnPlans,
-                                visibleBlocks: visibleBlocks,
-                                completedWorkBlocks: completedWorkBlocks,
-                                completedWorkBlockCount: workCount,
-                                hiddenLiveItemCount: 0,
-                                shouldRenderFinal: shouldRenderFinal)
+            && !(followUpWorkAnchorMs != nil && renderable.isEmpty && split.work.isEmpty)
+        return TurnRenderInputs(
+            turnPlans: turnPlans,
+            visibleBlocks: visibleBlocks,
+            completedWorkBlocks: workBlocks,
+            completedWorkBlockCount: workCount,
+            hiddenLiveItemCount: 0,
+            shouldRenderFinal: shouldRenderFinal,
+            expandedWorkSourceItems: shouldBuild ? workSourceItems : []
+        )
     }
 
     /// Count-only twin of `turnRenderBlocks` — same grouping rules, no block allocs.
@@ -9110,24 +9184,97 @@ public struct AgentAppView: View {
     static nonisolated(unsafe) var turnRenderComputeCountForTesting = 0
     #endif
 
+    /// Append cache for expanded live work so stream ticks append rather than full re-tree.
+    /// Held in `@State` so the reference survives SwiftUI body re-evals.
+    private final class ExpandedLiveWorkCache {
+        var turnId: String?
+        var items: [AssistantItem] = []
+        var blocks: [TurnRenderBlock] = []
+        func clear() {
+            turnId = nil
+            items = []
+            blocks = []
+        }
+    }
+    @State private var expandedLiveWorkCache = ExpandedLiveWorkCache()
+
+    private var latestLiveWorkTurnId: String? {
+        vm.timeline.turns.last(where: { !$0.finished })?.turnId
+    }
+
+    private func isCompletedWorkExpanded(for turn: AssistantTurnSnapshot) -> Bool {
+        let latest = latestLiveWorkTurnId
+        return AgentCompletedWorkExpandPolicy.isExpanded(
+            isLive: !turn.finished,
+            isLatestLiveTurn: latest == turn.turnId,
+            userExplicitlyExpanded: expandedCompletedWorkTurns.contains(turn.turnId),
+            userCollapsedWhileLive: userCollapsedLiveWorkTurns.contains(turn.turnId)
+        )
+    }
+
+    private func toggleCompletedWork(for turn: AssistantTurnSnapshot) {
+        let latest = latestLiveWorkTurnId
+        let currently = isCompletedWorkExpanded(for: turn)
+        let result = AgentCompletedWorkExpandPolicy.toggle(
+            turnId: turn.turnId,
+            currentlyExpanded: currently,
+            isLive: !turn.finished,
+            isLatestLiveTurn: latest == turn.turnId,
+            userExpanded: expandedCompletedWorkTurns,
+            userCollapsedLive: userCollapsedLiveWorkTurns
+        )
+        expandedCompletedWorkTurns = result.expanded
+        userCollapsedLiveWorkTurns = result.collapsedLive
+        if !result.expanded.contains(turn.turnId) && !(latest == turn.turnId && !turn.finished && !result.collapsedLive.contains(turn.turnId)) {
+            if expandedLiveWorkCache.turnId == turn.turnId {
+                expandedLiveWorkCache.clear()
+            }
+        }
+    }
+
     /// F2: the memoized entry point used by `turnView`. Finished turns are immutable,
     /// so their inputs are cached against a signature that also folds in the external
     /// dependencies (persisted assistant texts + proposed plans). Running/unfinished
     /// turns are computed fresh every pass.
     private func turnRenderInputs(for turn: AssistantTurnSnapshot) -> TurnRenderInputs {
         let running = vm.selectedThreadRunIsStartingOrRunning
-        let expandWork = expandedCompletedWorkTurns.contains(turn.turnId)
+        let expandWork = isCompletedWorkExpanded(for: turn)
         let followUpAnchorMs = Self.followUpWorkAnchorMs(
             status: vm.status,
             newestUserMessageAt: vm.messages.last(where: { $0.role == .user })?.createdAt
         )
+        let prevItems: [AssistantItem]?
+        let prevBlocks: [TurnRenderBlock]?
+        if expandWork,
+           !turn.finished,
+           expandedLiveWorkCache.turnId == turn.turnId,
+           !expandedLiveWorkCache.items.isEmpty {
+            prevItems = expandedLiveWorkCache.items
+            prevBlocks = expandedLiveWorkCache.blocks
+        } else {
+            prevItems = nil
+            prevBlocks = nil
+        }
         guard turn.finished else {
-            return computeTurnRenderInputsCounted(
+            let value = computeTurnRenderInputsCounted(
                 turn: turn,
                 running: running,
                 expandCompletedWork: expandWork,
-                followUpWorkAnchorMs: followUpAnchorMs
+                followUpWorkAnchorMs: followUpAnchorMs,
+                previousExpandedWorkItems: prevItems,
+                previousExpandedWorkBlocks: prevBlocks
             )
+            if expandWork, !value.expandedWorkSourceItems.isEmpty {
+                expandedLiveWorkCache.turnId = turn.turnId
+                expandedLiveWorkCache.items = value.expandedWorkSourceItems
+                expandedLiveWorkCache.blocks = value.completedWorkBlocks
+            } else if expandedLiveWorkCache.turnId == turn.turnId {
+                expandedLiveWorkCache.clear()
+            }
+            return value
+        }
+        if expandedLiveWorkCache.turnId == turn.turnId {
+            expandedLiveWorkCache.clear()
         }
         let plansKey = "\(vm.timeline.proposedPlans.count)|\(vm.timeline.proposedPlans.last?.id ?? "-")"
         let signature = Self.finishedTurnRenderSignature(
@@ -9169,7 +9316,9 @@ public struct AgentAppView: View {
         turn: AssistantTurnSnapshot,
         running: Bool,
         expandCompletedWork: Bool,
-        followUpWorkAnchorMs: Int64?
+        followUpWorkAnchorMs: Int64?,
+        previousExpandedWorkItems: [AssistantItem]? = nil,
+        previousExpandedWorkBlocks: [TurnRenderBlock]? = nil
     ) -> TurnRenderInputs {
         #if DEBUG
         Self.turnRenderComputeCountForTesting &+= 1
@@ -9180,7 +9329,9 @@ public struct AgentAppView: View {
             proposedPlans: vm.timeline.proposedPlans,
             running: running,
             expandCompletedWork: expandCompletedWork,
-            followUpWorkAnchorMs: followUpWorkAnchorMs
+            followUpWorkAnchorMs: followUpWorkAnchorMs,
+            previousExpandedWorkItems: previousExpandedWorkItems,
+            previousExpandedWorkBlocks: previousExpandedWorkBlocks
         )
     }
 
@@ -10053,6 +10204,7 @@ public struct AgentAppView: View {
             // Prefer coalesced paint tick over raw message/turn counts so every
             // token delta does not schedule redundant scroll work.
             .onChange(of: vm.timelineUpdateTick) { _ in
+                collapseAllCompletedWorkOnFinalIfNeeded()
                 scheduleTimelineScrollToBottom(proxy)
             }
             .onChange(of: vm.messages.last?.id) { _ in
@@ -10090,6 +10242,8 @@ public struct AgentAppView: View {
             .onChange(of: vm.selectedThreadId) { _ in
                 vm.transcriptHistoryRevealCount = 0
                 pendingSessionApproval = nil
+                collapseAllWorkDisclosures()
+                knownFinishedWorkTurnIds = []
             }
         }
     }
@@ -10104,6 +10258,7 @@ public struct AgentAppView: View {
         if !expandedRequestPreviews.isEmpty { expandedRequestPreviews.formIntersection(liveRequestIds) }
         let liveTurnIds = Set(vm.timeline.turns.map(\.turnId))
         if !expandedCompletedWorkTurns.isEmpty { expandedCompletedWorkTurns.formIntersection(liveTurnIds) }
+        if !userCollapsedLiveWorkTurns.isEmpty { userCollapsedLiveWorkTurns.formIntersection(liveTurnIds) }
     }
 
     // UX-MAC_AGENT-BG-AWAIT / incomplete-turn: when a thread ends incomplete
@@ -10423,28 +10578,45 @@ public struct AgentAppView: View {
                     .help("Copy command")
                 }
             case .applyPatch, .fileChange:
-                let expanded = expandedRequestPreviews.contains(request.id)
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    Button {
-                        if expanded { expandedRequestPreviews.remove(request.id) }
-                        else { expandedRequestPreviews.insert(request.id) }
-                    } label: {
-                        HStack(spacing: DS.Space.xs) {
-                            Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                                .font(.system(size: 8)).foregroundColor(DS.Palette.textTertiary)
-                            Text(expanded ? "Hide diff" : "Show diff")
-                                .font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                // Prefer Cursor-style edit card when the approval detail is a real patch.
+                if let model = AgentFileEditDiffPresentation.model(
+                    for: AssistantItem(
+                        id: request.id,
+                        turnId: request.turnId ?? "",
+                        type: .fileChange,
+                        state: .streaming,
+                        summary: request.title,
+                        body: "",
+                        output: detail,
+                        resourcePath: nil,
+                        startedAtMs: request.createdAtMs
+                    )
+                ), model.hasRenderableCode {
+                    AgentFileEditDiffCard(model: model, initiallyExpanded: true)
+                } else {
+                    let expanded = expandedRequestPreviews.contains(request.id)
+                    VStack(alignment: .leading, spacing: DS.Space.xs) {
+                        Button {
+                            if expanded { expandedRequestPreviews.remove(request.id) }
+                            else { expandedRequestPreviews.insert(request.id) }
+                        } label: {
+                            HStack(spacing: DS.Space.xs) {
+                                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                                    .font(.system(size: 8)).foregroundColor(DS.Palette.textTertiary)
+                                Text(expanded ? "Hide diff" : "Show diff")
+                                    .font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                            }
                         }
-                    }
-                    .buttonStyle(.plain)
-                    if expanded {
-                        DiffPreviewText(detail)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(DS.Space.sm)
-                            .background(DS.Palette.surface)
-                            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                            .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                        .buttonStyle(.plain)
+                        if expanded {
+                            DiffPreviewText(detail)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(DS.Space.sm)
+                                .background(DS.Palette.surface)
+                                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                                    .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                        }
                     }
                 }
             default:
@@ -11242,10 +11414,33 @@ public struct AgentAppView: View {
     /// fresh chat turn. Atomically resets both model and view state.
     private func collapseTranscriptForNewTurn() {
         vm.transcriptHistoryRevealCount = 0
-        expandedCompletedWorkTurns = []
+        collapseAllWorkDisclosures()
         expandedTools = []
         expandedToolGroups = []
         expandedReasoning = []
+    }
+
+    private func collapseAllWorkDisclosures() {
+        let cleared = AgentCompletedWorkExpandPolicy.clearedExpansionState()
+        expandedCompletedWorkTurns = cleared.expanded
+        userCollapsedLiveWorkTurns = cleared.collapsedLive
+        expandedLiveWorkCache.clear()
+    }
+
+    /// When a turn first gains a final answer / finishes, collapse every Work so far.
+    private func collapseAllCompletedWorkOnFinalIfNeeded() {
+        let finishedIds = Set(
+            vm.timeline.turns
+                .filter { turn in
+                    turn.finished
+                        || !(turn.finalAssistantMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+                }
+                .map(\.turnId)
+        )
+        let newlyFinished = finishedIds.subtracting(knownFinishedWorkTurnIds)
+        knownFinishedWorkTurnIds = finishedIds
+        guard !newlyFinished.isEmpty else { return }
+        collapseAllWorkDisclosures()
     }
 
     /// Shared chrome for user prompt bubbles (text + padding + fill). Sized by
@@ -11387,6 +11582,7 @@ public struct AgentAppView: View {
             // Finished turns and live turns both fold settled work into one
             // disclosure so follow-ups read as chat (answer + compact work), not
             // a re-expanded command dump of the whole turn.
+            // Work so far owns every non-final step (live + finished). Outside = final only.
             if inputs.completedWorkBlockCount > 0 {
                 completedWorkDisclosure(
                     turn: turn,
@@ -11395,29 +11591,17 @@ public struct AgentAppView: View {
                     live: !turn.finished
                 )
             }
-            if !turn.finished {
-                if inputs.hiddenLiveItemCount > 0 {
-                    hiddenLiveTurnItemsRow(inputs.hiddenLiveItemCount)
-                }
-                ForEach(blocks) { block in
-                    switch block {
-                    case .item(let item): itemRow(item)
-                    case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
-                    }
-                }
-            }
             // Full access: no plan review card — plans auto-implement without Approve.
             if !vm.suppressesProposedPlanReview {
                 ForEach(inputs.turnPlans) { plan in
                     proposedPlanRow(plan)
                 }
             }
-            if turn.finished {
-                ForEach(blocks) { block in
-                    switch block {
-                    case .item(let item): itemRow(item)
-                    case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
-                    }
+            // Final assistant item rows (finished only). Live leaves this empty by composition.
+            ForEach(blocks) { block in
+                switch block {
+                case .item(let item): itemRow(item)
+                case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
                 }
             }
             // Only show the turn's final text if no assistant-message item
@@ -11439,15 +11623,11 @@ public struct AgentAppView: View {
         workBlockCount: Int,
         live: Bool = false
     ) -> some View {
-        let expanded = expandedCompletedWorkTurns.contains(turn.turnId)
+        let expanded = isCompletedWorkExpanded(for: turn)
         VStack(alignment: .leading, spacing: DS.Space.md) {
             Button {
                 withAnimation(.easeInOut(duration: 0.16)) {
-                    if expanded {
-                        expandedCompletedWorkTurns.remove(turn.turnId)
-                    } else {
-                        expandedCompletedWorkTurns.insert(turn.turnId)
-                    }
+                    toggleCompletedWork(for: turn)
                 }
             } label: {
                 HStack(spacing: DS.Space.sm) {
@@ -11611,6 +11791,17 @@ public struct AgentAppView: View {
 
     @ViewBuilder
     private func toolRow(_ item: AssistantItem) -> some View {
+        // Cursor-style file edit: show path + red/green hunks inline in the thread.
+        if let editModel = AgentFileEditDiffPresentation.model(for: item),
+           editModel.hasRenderableCode || item.type == .fileChange {
+            AgentFileEditDiffCard(model: editModel)
+        } else {
+            standardToolRow(item)
+        }
+    }
+
+    @ViewBuilder
+    private func standardToolRow(_ item: AssistantItem) -> some View {
         let presentation = AgentTimelineItemPresentation.make(for: item)
         let displayLabel = AgentTimelineItemPresentation.toolDisplayLabel(for: item)
         // Prefer uncapped raw shell for expand/copy so live body caps cannot mangle JSON.

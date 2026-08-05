@@ -749,3 +749,120 @@ struct DiffPreviewText: View {
         return out
     }
 }
+
+/// Cursor-style "Edit path" card with line numbers and red/green hunks.
+struct AgentFileEditDiffCard: View {
+    let model: AgentFileEditDiffPresentation.Model
+    var initiallyExpanded: Bool = true
+    @State private var expanded: Bool
+
+    init(model: AgentFileEditDiffPresentation.Model, initiallyExpanded: Bool = true) {
+        self.model = model
+        self.initiallyExpanded = initiallyExpanded
+        _expanded = State(initialValue: initiallyExpanded)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.14)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: DS.Space.sm) {
+                    Image(systemName: "diamond.fill")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                    Text("Edit")
+                        .font(DS.Font.caption.weight(.semibold))
+                        .foregroundColor(DS.Palette.textSecondary)
+                    if let path = model.path, !path.isEmpty {
+                        Text(path)
+                            .font(DS.Font.monoSmall)
+                            .foregroundColor(DS.Palette.warning)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                    }
+                    Spacer(minLength: 0)
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
+                .padding(.horizontal, DS.Space.sm)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(expanded ? "Hide file edit diff" : "Show file edit diff")
+            .accessibilityIdentifier("agent.fileEdit.header")
+
+            if expanded {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(model.lines.filter { $0.kind != .meta }) { line in
+                        diffLineRow(line)
+                    }
+                    if model.hiddenLineCount > 0 {
+                        Text("… \(model.hiddenLineCount) more lines")
+                            .font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .padding(.horizontal, DS.Space.sm)
+                            .padding(.vertical, 4)
+                    }
+                }
+                .background(DS.Palette.surface)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.surfaceRaised.opacity(0.55))
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+        )
+        .accessibilityIdentifier("agent.fileEdit.diff")
+    }
+
+    @ViewBuilder
+    private func diffLineRow(_ line: AgentFileEditDiffPresentation.Line) -> some View {
+        let bg: Color = {
+            switch line.kind {
+            case .addition: return DS.Palette.success.opacity(0.14)
+            case .deletion: return DS.Palette.danger.opacity(0.16)
+            case .hunk: return DS.Palette.accent.opacity(0.06)
+            default: return Color.clear
+            }
+        }()
+        let fg: Color = {
+            switch line.kind {
+            case .addition: return DS.Palette.success
+            case .deletion: return DS.Palette.danger
+            case .hunk: return DS.Palette.accent
+            case .context: return DS.Palette.textSecondary
+            case .meta: return DS.Palette.textTertiary
+            }
+        }()
+        HStack(alignment: .firstTextBaseline, spacing: 0) {
+            Text(line.displayLineNumber.map(String.init) ?? " ")
+                .font(DS.Font.monoSmall.monospacedDigit())
+                .foregroundColor(DS.Palette.textTertiary)
+                .frame(width: 36, alignment: .trailing)
+                .padding(.trailing, 8)
+            Text(displayText(for: line))
+                .font(DS.Font.monoSmall)
+                .foregroundColor(fg)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.vertical, 1)
+        .padding(.trailing, DS.Space.sm)
+        .background(bg)
+    }
+
+    private func displayText(for line: AgentFileEditDiffPresentation.Line) -> String {
+        switch line.kind {
+        case .addition: return line.text.isEmpty ? " " : line.text
+        case .deletion: return line.text.isEmpty ? " " : line.text
+        case .hunk: return line.text
+        case .context, .meta: return line.text.isEmpty ? " " : line.text
+        }
+    }
+}

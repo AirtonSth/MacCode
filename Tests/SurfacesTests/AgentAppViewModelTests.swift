@@ -5154,15 +5154,19 @@ final class AgentAppViewModelTests: XCTestCase {
     }
 
     func test_partialHotReplayUsesInformationalNotice_notErrorBanner() {
-        // WHY: a bounded replay window is expected for large threads; it must
-        // not occupy the red provider/persistence error channel shown in the UI.
-        XCTAssertEqual(
+        // WHY: partial hot replay still loads, but the user-facing banner copy is
+        // suppressed so the strip never shows the hot-replay budget notice.
+        XCTAssertNil(
             AgentAppViewModel.replayNoticeText(isPartial: true),
-            AgentAppViewModel.historyReplayNoticeText
+            "partial hot replay must not surface the history window notice"
         )
         XCTAssertNil(
             AgentAppViewModel.replayNoticeText(isPartial: false),
             "complete replay must not leave a stale history notice"
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.historyReplayNoticeText.isEmpty,
+            "constant retained for any residual references but never assigned for display"
         )
     }
 
@@ -7678,9 +7682,13 @@ final class AgentAppViewModelTests: XCTestCase {
         )
         let inputs = AgentAppView.computeTurnRenderInputs(
             turn: turn, persistedAssistantTexts: [], proposedPlans: [], running: true)
-        XCTAssertEqual(inputs.visibleBlocks.count, 1, "a running turn shows its live item")
-        XCTAssertTrue(inputs.completedWorkBlocks.isEmpty, "a running turn has no completed work disclosure")
-        XCTAssertEqual(inputs.completedWorkBlockCount, 0, "no settled work when only the live item exists")
+        // Chat parity: live tools live inside Work so far, never as outside rows.
+        XCTAssertTrue(inputs.visibleBlocks.isEmpty,
+                      "live turns paint no tool rows outside Work so far")
+        XCTAssertEqual(inputs.completedWorkBlockCount, 1,
+                       "the sole streaming tool still counts as Work so far · 1 step")
+        XCTAssertTrue(inputs.completedWorkBlocks.isEmpty,
+                      "collapsed disclosure stays count-only")
         XCTAssertFalse(inputs.shouldRenderFinal, "a running turn has no final answer yet")
     }
 

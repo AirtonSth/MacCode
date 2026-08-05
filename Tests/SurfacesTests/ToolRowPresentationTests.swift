@@ -352,9 +352,11 @@ final class ToolRowPresentationTests: XCTestCase {
             expandCompletedWork: false
         )
         XCTAssertGreaterThan(collapsed.completedWorkBlockCount, 0,
-                             "settled work must become a collapsible work disclosure while running")
+                             "all live work counts toward Work so far (macOS↔iOS chat parity)")
         XCTAssertTrue(collapsed.completedWorkBlocks.isEmpty,
                       "collapsed live work must not materialize full blocks (PERF)")
+        XCTAssertTrue(collapsed.visibleBlocks.isEmpty,
+                      "live turns never paint tools outside Work so far")
         let expanded = AgentAppView.computeTurnRenderInputs(
             turn: turn,
             persistedAssistantTexts: [],
@@ -363,20 +365,62 @@ final class ToolRowPresentationTests: XCTestCase {
             expandCompletedWork: true
         )
         XCTAssertFalse(expanded.completedWorkBlocks.isEmpty,
-                       "expanded live work materializes the settled blocks for the disclosure body")
+                       "expanded live work materializes disclosure body including active tail")
         XCTAssertEqual(expanded.completedWorkBlockCount, expanded.completedWorkBlocks.count)
-        XCTAssertFalse(collapsed.visibleBlocks.isEmpty,
-                       "the active streaming command must still paint live")
-        // Active blocks should not re-list every completed command.
-        let visibleIds = collapsed.visibleBlocks.flatMap { block -> [String] in
+        XCTAssertTrue(expanded.visibleBlocks.isEmpty,
+                      "parity: no Ran N / tool rows outside Work so far while live")
+        let workIds = expanded.completedWorkBlocks.flatMap { block -> [String] in
             switch block {
             case .item(let i): return [i.id]
             case .toolGroup(_, let group): return group.map(\.id)
             }
         }
-        XCTAssertTrue(visibleIds.contains("now"))
-        XCTAssertFalse(visibleIds.contains("done-0"),
-                       "early completed commands must not stay expanded in the live path")
+        XCTAssertTrue(workIds.contains("now"), "streaming tool lives inside Work so far")
+        XCTAssertTrue(workIds.contains("done-0"), "settled tools live inside Work so far")
+        // Append-friendly second projection: pass prior expanded blocks so growth reuses identity.
+        let priorItems = expanded.expandedWorkSourceItems
+        let priorBlocks = expanded.completedWorkBlocks
+        var more = items
+        more.insert(
+            AssistantItem(
+                id: "done-extra", turnId: turnId, type: .commandExecution, state: .completed,
+                summary: nil, body: "", startedAtMs: 1
+            ),
+            at: more.count - 1
+        )
+        let turn2 = AssistantTurnSnapshot(turnId: turnId, items: more.map { copy in
+            AssistantItem(
+                id: copy.id, turnId: turnId, type: copy.type, state: copy.state,
+                summary: nil, body: "", startedAtMs: 1
+            )
+        })
+        let expanded2 = AgentAppView.computeTurnRenderInputs(
+            turn: turn2,
+            persistedAssistantTexts: [],
+            proposedPlans: [],
+            running: true,
+            expandCompletedWork: true,
+            previousExpandedWorkItems: priorItems,
+            previousExpandedWorkBlocks: priorBlocks
+        )
+        XCTAssertFalse(expanded2.completedWorkBlocks.isEmpty)
+        let prevIds = priorBlocks.map(\.id)
+        let nextIds = expanded2.completedWorkBlocks.map(\.id)
+        let decision = AgentCompletedWorkBlockGrowth.growthDecision(
+            previousItemIds: priorItems.map(\.id),
+            previousBlockIds: prevIds,
+            nextItemIds: expanded2.expandedWorkSourceItems.map(\.id),
+            nextBlockIds: nextIds
+        )
+        // Insert-before-stream is not pure suffix growth; append path only requires
+        // non-empty work blocks and stable disclosure (outside still empty).
+        XCTAssertTrue(expanded2.visibleBlocks.isEmpty)
+        XCTAssertGreaterThanOrEqual(
+            expanded2.completedWorkBlockCount,
+            expanded.completedWorkBlockCount,
+            "extra settled tool increases Work so far step count"
+        )
+        _ = decision // growth mode depends on insert vs pure append
     }
 
     func test_turnRenderBlockCount_matchesTurnRenderBlocksCount() {

@@ -232,15 +232,27 @@ final class AgentAppFollowUpUXSeamTests: XCTestCase {
             followUpWorkAnchorMs: 9_500
         )
         XCTAssertGreaterThan(inputs.completedWorkBlockCount, 0,
-                             "post-anchor settled tools must count toward Work so far")
-        let visibleIds = inputs.visibleBlocks.flatMap { block -> [String] in
+                             "post-anchor tools must count toward Work so far")
+        XCTAssertTrue(inputs.visibleBlocks.isEmpty,
+                      "live Work so far owns all non-final rows; nothing paints outside")
+        // Expand once to inspect ids (collapsed is count-only).
+        let expanded = AgentAppView.computeTurnRenderInputs(
+            turn: turn,
+            persistedAssistantTexts: [],
+            proposedPlans: [],
+            running: true,
+            expandCompletedWork: true,
+            followUpWorkAnchorMs: 9_500
+        )
+        let workIds = expanded.completedWorkBlocks.flatMap { block -> [String] in
             switch block {
             case .item(let i): return [i.id]
             case .toolGroup(_, let group): return group.map(\.id)
             }
         }
-        XCTAssertTrue(visibleIds.contains("new-stream"))
-        XCTAssertFalse(visibleIds.contains("old-1"),
+        XCTAssertTrue(workIds.contains("new-stream"),
+                      "streaming tool is inside Work so far")
+        XCTAssertFalse(workIds.contains("old-1"),
                        "pre-anchor tools must never paint under the new user message")
     }
 

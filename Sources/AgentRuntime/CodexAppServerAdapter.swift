@@ -2646,6 +2646,17 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let itemType = assistantItemType(for: type)
         let state = itemState(for: string(item, "status"))
         let summary = summary(for: item, type: type)
+        let resourcePath: String? = {
+            if itemType == .imageView { return string(item, "path") }
+            if itemType == .fileChange {
+                if let path = string(item, "path") ?? string(item, "file") { return path }
+                if let changes = item["changes"] as? [[String: Any]],
+                   let first = changes.first {
+                    return string(first, "path") ?? string(first, "file")
+                }
+            }
+            return nil
+        }()
         var events: [AssistantEvent] = [
             .itemStarted(item: AssistantItem(
                 id: id,
@@ -2653,7 +2664,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 type: itemType,
                 state: state == .completed ? .streaming : state,
                 summary: summary,
-                resourcePath: itemType == .imageView ? string(item, "path") : nil,
+                resourcePath: resourcePath,
                 startedAtMs: startedAtMs
             ))
         ]
@@ -2837,6 +2848,26 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case "commandExecution", "local_shell_call":
             return string(item, "aggregatedOutput") ?? string(item, "command") ?? stringBodyFallback(for: item)
         case "fileChange":
+            // Prefer human-readable patch/diff over opaque JSON so the Agent
+            // App can paint a Cursor-style Edit card in the timeline.
+            if let patch = string(item, "patch") ?? string(item, "diff") ?? string(item, "unified_diff"),
+               !patch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return patch
+            }
+            if let changes = item["changes"] as? [[String: Any]] {
+                var chunks: [String] = []
+                for change in changes {
+                    let path = string(change, "path") ?? string(change, "file") ?? "file"
+                    if let diff = string(change, "diff") ?? string(change, "patch")
+                        ?? string(change, "unified_diff") ?? string(change, "unifiedDiff"),
+                       !diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        chunks.append(diff)
+                    } else if let oldS = string(change, "old_string"), let newS = string(change, "new_string") {
+                        chunks.append("*** Update File: \(path)\n@@\n-\(oldS.replacingOccurrences(of: "\n", with: "\n-"))\n+\(newS.replacingOccurrences(of: "\n", with: "\n+"))")
+                    }
+                }
+                if !chunks.isEmpty { return chunks.joined(separator: "\n") }
+            }
             return jsonString(item["changes"]) ?? stringBodyFallback(for: item)
         case "mcpToolCall", "mcp_call":
             return jsonString(item["result"]) ?? (item["error"] as? [String: Any]).flatMap { string($0, "message") } ?? stringBodyFallback(for: item)
