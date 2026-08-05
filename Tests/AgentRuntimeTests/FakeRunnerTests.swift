@@ -1724,6 +1724,90 @@ final class FakeRunnerTests: XCTestCase {
               let data = json.data(using: .utf8) else { return nil }
         return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     }
+
+    /// WHY: a committed cap delete cascades SQLite rows but does not release a
+    /// completed resident provider process or retry buffers held by this process.
+    /// Retirement must clear those without inventing a cancelled lifecycle.
+    func test_retireDeletedThreads_releasesTerminalResidentSessionAndBufferedFailureState() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-retire-deleted-thread-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let thread = AgentThread(title: "retire", provider: .codex, model: "m")
+        try threadRepo.upsert(thread)
+        let adapter = SpyProviderAdapter(provider: .codex)
+        adapter.sessionSummaries = [
+            AgentProviderSessionSummary(
+                threadId: thread.id,
+                provider: .codex,
+                status: .completed,
+                providerThreadId: "resident-idle"
+            )
+        ]
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providerAdapters: [.codex: adapter]
+        )
+        coordinator.seedDeletedThreadRuntimeStateForTesting(thread.id)
+        XCTAssertTrue(coordinator.deletedThreadRuntimeResidueForTesting.contains(thread.id))
+        var lifecycleEvents = 0
+        coordinator.onRunFinished = { _, _, _ in lifecycleEvents += 1 }
+
+        try threadRepo.delete(id: thread.id)
+        coordinator.retireDeletedThreads([thread.id])
+        coordinator.retireDeletedThreads([thread.id])
+
+        XCTAssertEqual(adapter.stopSessionCallCount, 1,
+                       "an idle resident session must be released exactly once after its row commits deleted")
+        XCTAssertFalse(coordinator.deletedThreadRuntimeResidueForTesting.contains(thread.id),
+                       "deleted threads must not retain stream buffers, retry failures, or per-thread caches")
+        XCTAssertEqual(lifecycleEvents, 0,
+                       "retiring an already-terminal session must not emit a synthetic run lifecycle")
+    }
+
+    /// WHY: deletion evidence alone cannot authorize tearing down a running or
+    /// provider-mismatched session. Those may be foreign work whose identity is
+    /// unavailable after the durable row has gone away.
+    func test_retireDeletedThreads_preservesActiveAndForeignProviderSessions() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-retire-preserve-provider-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let active = AgentThread(title: "active", provider: .codex, model: "m")
+        let foreign = AgentThread(title: "foreign", provider: .codex, model: "m")
+        try threadRepo.upsert(active)
+        try threadRepo.upsert(foreign)
+        let adapter = SpyProviderAdapter(provider: .codex)
+        adapter.sessionSummaries = [
+            AgentProviderSessionSummary(
+                threadId: active.id,
+                provider: .codex,
+                status: .running,
+                providerThreadId: "active-session"
+            ),
+            AgentProviderSessionSummary(
+                threadId: foreign.id,
+                provider: .claude,
+                status: .completed,
+                providerThreadId: "foreign-session"
+            )
+        ]
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providerAdapters: [.codex: adapter]
+        )
+
+        try threadRepo.delete(id: active.id)
+        try threadRepo.delete(id: foreign.id)
+        coordinator.retireDeletedThreads([active.id, foreign.id])
+
+        XCTAssertEqual(adapter.stopSessionCallCount, 0,
+                       "active or provider-mismatched sessions must remain untouched by post-delete retirement")
+        XCTAssertEqual(adapter.sessionSummaries.count, 2,
+                       "conservative retirement must preserve the adapter's foreign/active ownership")
+    }
 }
 
 private extension AssistantEvent {

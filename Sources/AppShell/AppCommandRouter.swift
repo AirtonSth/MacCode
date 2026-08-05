@@ -620,6 +620,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         agent.viewModel.onThreadLifecycle = { [weak self] event in
                             self?.publishAgentThreadLifecycle(event)
                         }
+                        agent.viewModel.retireDeletedThreadRuntime = { [weak ctx] ids, coordinatorAlreadyRetired in
+                            ctx?.retireDeletedAgentThreads(
+                                ids,
+                                coordinatorAlreadyRetired: coordinatorAlreadyRetired
+                            )
+                        }
                         Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
                         wireQueueDrainControl(on: agent.viewModel, context: ctx)
                         Self.wireTokenSaverThreadFooter(on: agent.viewModel, context: ctx)
@@ -2440,6 +2446,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             routingConfiguration: routingConfiguration)
         let prunedThreadIDs = try ctx.threadRepo.upsertEnforcingWorkspaceThreadLimit(t)
         // Apply/publish victims before any fallible surface reload or selection.
+        ctx.retireDeletedAgentThreads(prunedThreadIDs)
         if !prunedThreadIDs.isEmpty {
             publishAgentThreadLifecycle(.deleted(prunedThreadIDs))
         }
@@ -2530,6 +2537,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             routingConfiguration: resolvedRouting
         )
         let prunedThreadIDs = try ctx.threadRepo.upsertEnforcingWorkspaceThreadLimit(thread)
+        ctx.retireDeletedAgentThreads(prunedThreadIDs)
         if !prunedThreadIDs.isEmpty {
             publishAgentThreadLifecycle(.deleted(prunedThreadIDs))
         }
@@ -2797,6 +2805,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
             throw error
         }
+        ctx.retireDeletedAgentThreads(prunedThreadIDs)
         publishAgentThreadDeletions(prunedThreadIDs)
         // Rail refresh only across surfaces; the initiating macOS surface (if
         // local) selects the PR thread through its own view-model path.
@@ -6146,6 +6155,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 }
                 agent.viewModel.onThreadLifecycle = { [weak self] event in
                     self?.publishAgentThreadLifecycle(event)
+                }
+                agent.viewModel.retireDeletedThreadRuntime = { [weak ctx] ids, coordinatorAlreadyRetired in
+                    ctx?.retireDeletedAgentThreads(
+                        ids,
+                        coordinatorAlreadyRetired: coordinatorAlreadyRetired
+                    )
                 }
                 Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
                 wireQueueDrainControl(on: agent.viewModel, context: ctx)

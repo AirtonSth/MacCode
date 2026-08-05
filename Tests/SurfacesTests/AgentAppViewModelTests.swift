@@ -7450,7 +7450,7 @@ final class AgentAppViewModelTests: XCTestCase {
             let sample = try await runThreadCapEvictionWorkload()
             samples.append(sample)
             let phase = index < 2 ? "warmup" : "measured"
-            print("CACHE_EVICTION_SAMPLE phase=\(phase) index=\(index + 1) db_victims=\(sample.databaseVictimCount) cache_victims=\(sample.cachedVictimCount) coordinator_victims=\(sample.coordinatorVictimCount) draft_utf8_bytes=\(sample.cachedDraftUTF8Bytes) selected_prompt_before_utf8_bytes=\(sample.selectedPromptBeforeEvictionUTF8Bytes) selected_prompt_after_utf8_bytes=\(sample.selectedPromptAfterEvictionUTF8Bytes) selected_thread_bound_state_released=\(sample.selectedThreadBoundStateReleased) selected_recovered=\(sample.selectedThreadRecovered) automatic_prune_undo=\(sample.automaticPruneCreatedUndo) footprint_before_kb=\(sample.footprintBeforeReloadKB) footprint_settled_kb=\(sample.footprintAfterSettleKB)")
+            print("CACHE_EVICTION_SAMPLE phase=\(phase) index=\(index + 1) db_victims=\(sample.databaseVictimCount) cache_victims=\(sample.cachedVictimCount) coordinator_victims=\(sample.coordinatorVictimCount) cached_composer_utf8_bytes=\(sample.cachedComposerUTF8Bytes) selected_prompt_before_utf8_bytes=\(sample.selectedPromptBeforeEvictionUTF8Bytes) selected_prompt_after_utf8_bytes=\(sample.selectedPromptAfterEvictionUTF8Bytes) selected_thread_bound_state_released=\(sample.selectedThreadBoundStateReleased) selected_recovered=\(sample.selectedThreadRecovered) automatic_prune_undo=\(sample.automaticPruneCreatedUndo) footprint_before_kb=\(sample.footprintBeforeReloadKB) footprint_settled_kb=\(sample.footprintAfterSettleKB)")
         }
 
         let measured = samples.dropFirst(2)
@@ -7461,8 +7461,8 @@ final class AgentAppViewModelTests: XCTestCase {
                       "automatic cap pruning must leave no pruned thread ID in VM caches")
         XCTAssertTrue(measured.allSatisfy { $0.coordinatorVictimCount == 0 },
                       "automatic cap pruning must also forget coordinator per-thread state")
-        XCTAssertTrue(measured.allSatisfy { $0.cachedDraftUTF8Bytes == 0 },
-                      "automatic cap pruning must release the large unique drafts retained only by pruned IDs")
+        XCTAssertTrue(measured.allSatisfy { $0.cachedComposerUTF8Bytes == 0 },
+                      "automatic cap pruning must release only large memory-only composer cache entries retained by pruned IDs")
         XCTAssertTrue(measured.allSatisfy(\.selectedThreadRecovered),
                       "a selected victim must recover the surface to its fresh, unbound state")
         XCTAssertTrue(measured.allSatisfy {
@@ -7480,7 +7480,7 @@ final class AgentAppViewModelTests: XCTestCase {
         let databaseVictimCount: Int
         let cachedVictimCount: Int
         let coordinatorVictimCount: Int
-        let cachedDraftUTF8Bytes: Int
+        let cachedComposerUTF8Bytes: Int
         let selectedPromptBeforeEvictionUTF8Bytes: Int
         let selectedPromptAfterEvictionUTF8Bytes: Int
         let draftRecoveryNoticeShown: Bool
@@ -7494,7 +7494,7 @@ final class AgentAppViewModelTests: XCTestCase {
     private func runThreadCapEvictionWorkload() async throws -> ThreadCapEvictionSample {
         let (vm, threadRepo) = try makeVM()
         let victimCount = 3
-        let draftBytesPerVictim = 1_048_576
+        let cachedBytesPerVictim = 1_048_576
         let oldest = Date(timeIntervalSince1970: 1_700_000_000)
         var victims: [AgentThread] = []
         for index in 0..<victimCount {
@@ -7517,10 +7517,14 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.reloadThreads()
 
         for (index, victim) in victims.enumerated() {
-            vm.selectThread(victim.id)
-            vm.prompt = String(repeating: index == 0 ? "A" : index == 1 ? "B" : "C",
-                               count: draftBytesPerVictim)
-            vm.selectThread(survivor.id)
+            vm.seedComposerDraftCacheForTesting(
+                victim.id,
+                providerInstanceId: AgentProvider.claude.rawValue,
+                text: String(
+                    repeating: index == 0 ? "A" : index == 1 ? "B" : "C",
+                    count: cachedBytesPerVictim
+                )
+            )
             vm.coordinator.seedAutoContinuationStateForTesting(victim.id)
             vm.seedAdditionalThreadCachesForTesting(victim.id)
         }
@@ -7529,8 +7533,17 @@ final class AgentAppViewModelTests: XCTestCase {
                        "precondition: every future victim is present in a VM cache")
         XCTAssertEqual(vm.coordinator.autoContinuationThreadIdsForTesting.intersection(victimIDs).count, victimCount,
                        "precondition: every future victim is present in coordinator state")
-        XCTAssertEqual(vm.cachedComposerDraftUTF8BytesForTesting, victimCount * draftBytesPerVictim,
-                       "precondition: the cache retains all unique victim drafts before automatic pruning")
+        XCTAssertEqual(vm.cachedComposerDraftUTF8BytesForTesting, victimCount * cachedBytesPerVictim,
+                       "precondition: the cache retains all unique memory-only entries before automatic pruning")
+        for victim in victims {
+            XCTAssertNil(
+                try vm.draftRepo?.get(
+                    threadId: victim.id,
+                    providerInstanceId: AgentProvider.claude.rawValue
+                ),
+                "benchmark fixtures must not count durable user drafts as cap-reclaimable memory"
+            )
+        }
 
         // Keep a deleted thread selected. reloadThreads must publish the unbound
         // selection rather than leaving the surface bound to a row gone from SQLite.
@@ -7538,8 +7551,8 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.selectThread(selectedVictim.id)
         vm.seedAdditionalThreadCachesForTesting(selectedVictim.id)
         let selectedPromptBeforeEvictionUTF8Bytes = vm.prompt.utf8.count
-        XCTAssertEqual(selectedPromptBeforeEvictionUTF8Bytes, draftBytesPerVictim,
-                       "precondition: the selected victim visibly retains its unique large draft")
+        XCTAssertEqual(selectedPromptBeforeEvictionUTF8Bytes, cachedBytesPerVictim,
+                       "precondition: the selected victim visibly retains its unique large cache entry")
         try vm.messageRepo.append(AgentMessage(threadId: selectedVictim.id,
                                                role: .assistant,
                                                content: "selected victim transcript"))
@@ -7589,7 +7602,7 @@ final class AgentAppViewModelTests: XCTestCase {
             databaseVictimCount: victims.filter { (try? threadRepo.get(id: $0.id)) != nil }.count,
             cachedVictimCount: vm.threadCacheResidueForTesting.intersection(victimIDs).count,
             coordinatorVictimCount: vm.coordinator.autoContinuationThreadIdsForTesting.intersection(victimIDs).count,
-            cachedDraftUTF8Bytes: vm.cachedComposerDraftUTF8BytesForTesting,
+            cachedComposerUTF8Bytes: vm.cachedComposerDraftUTF8BytesForTesting,
             selectedPromptBeforeEvictionUTF8Bytes: selectedPromptBeforeEvictionUTF8Bytes,
             selectedPromptAfterEvictionUTF8Bytes: vm.prompt.utf8.count,
             draftRecoveryNoticeShown: vm.statusMessage.contains("unsent draft was kept"),

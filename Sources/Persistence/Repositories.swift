@@ -274,6 +274,34 @@ public final class AgentThreadRepository {
         }
     }
 
+    /// Retention may reclaim only disposable history. A durable composer draft
+    /// belongs to the user even when its thread is idle, and a materialized
+    /// worktree owns a filesystem resource that this cap does not clean up.
+    /// Keep this predicate shared by preflight, selection, and the guarded
+    /// DELETE so a concurrent draft/worktree change rolls the whole transaction
+    /// back instead of losing it after an initially safe selection.
+    private func workspaceThreadLimitEligibilityPredicate(candidateAlias: String) -> String {
+        """
+        AND NULLIF(TRIM(COALESCE(\(candidateAlias).worktree_path, '')), '') IS NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM agent_thread_drafts AS draft
+            WHERE draft.thread_id = \(candidateAlias).id
+              AND (
+                  LENGTH(TRIM(COALESCE(draft.text, ''))) > 0
+                  OR CASE
+                      WHEN json_valid(COALESCE(draft.attachments_json, '')) = 1
+                      THEN CASE
+                          WHEN json_type(draft.attachments_json) = 'array'
+                          THEN json_array_length(draft.attachments_json) > 0
+                          ELSE 1
+                      END
+                      ELSE LENGTH(TRIM(COALESCE(draft.attachments_json, ''))) > 0
+                  END
+              )
+        )
+        """
+    }
+
     /// Cheap fail-fast check before a producer performs irreversible or
     /// expensive work. The capped transaction remains authoritative for races.
     public func preflightWorkspaceThreadInsertion(
@@ -311,6 +339,7 @@ public final class AgentThreadRepository {
                         AND (intent.source_thread_id = candidate.id
                              OR intent.child_thread_id = candidate.id)
                   )
+                  \(workspaceThreadLimitEligibilityPredicate(candidateAlias: "candidate"))
                   \(exclusion);
             """)
             try statement.bind(1, workspaceId.value.uuidString)
@@ -588,6 +617,7 @@ public final class AgentThreadRepository {
                     AND (intent.source_thread_id = candidate.id
                          OR intent.child_thread_id = candidate.id)
               )
+              \(workspaceThreadLimitEligibilityPredicate(candidateAlias: "candidate"))
               \(exclusion)
             ORDER BY candidate.pinned ASC, candidate.updated_at ASC, candidate.id ASC
             LIMIT ?;
@@ -619,7 +649,8 @@ public final class AgentThreadRepository {
                   WHERE intent.state IN ('prepared', 'provider_created', 'compensating')
                     AND (intent.source_thread_id = agent_threads.id
                          OR intent.child_thread_id = agent_threads.id)
-              );
+              )
+              \(workspaceThreadLimitEligibilityPredicate(candidateAlias: "agent_threads"));
         """)
         try deletion.bind(1, id.value.uuidString)
         _ = try deletion.step()

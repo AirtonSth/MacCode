@@ -161,6 +161,171 @@ final class ThreadReorderTransactionTests: XCTestCase {
                        "oldest idle history must be pruned first")
     }
 
+    /// WHY: the automatic cap is allowed to reclaim cached history, never an
+    /// unsent user draft or a thread that owns a materialized worktree. Both a
+    /// clean and a dirty worktree are resources outside this DELETE transaction.
+    func test_workspaceThreadLimitProtectsDurableDraftsAndCleanOrDirtyWorktrees() throws {
+        let db = try makeDB()
+        let repo = AgentThreadRepository(db: db)
+        let drafts = AgentThreadDraftRepository(db: db)
+        let wid = try makeWorkspace(db: db)
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-thread-cap-protected-\(UUID().uuidString)", isDirectory: true)
+        let cleanPath = root.appendingPathComponent("clean", isDirectory: true)
+        let dirtyPath = root.appendingPathComponent("dirty", isDirectory: true)
+        try FileManager.default.createDirectory(at: cleanPath, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dirtyPath, withIntermediateDirectories: true)
+        try Data("uncommitted".utf8).write(to: dirtyPath.appendingPathComponent("dirty.txt"))
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        var draft = AgentThread(workspaceId: wid, title: "durable draft", provider: .codex, model: "m")
+        draft.status = .completed
+        draft.updatedAt = Date(timeIntervalSince1970: 1)
+        var cleanWorktree = AgentThread(
+            workspaceId: wid,
+            title: "clean worktree",
+            provider: .codex,
+            model: "m",
+            status: .completed,
+            executionMode: .worktree,
+            worktreePath: cleanPath.path
+        )
+        cleanWorktree.updatedAt = Date(timeIntervalSince1970: 2)
+        var dirtyWorktree = AgentThread(
+            workspaceId: wid,
+            title: "dirty worktree",
+            provider: .codex,
+            model: "m",
+            status: .completed,
+            executionMode: .worktree,
+            worktreePath: dirtyPath.path
+        )
+        dirtyWorktree.updatedAt = Date(timeIntervalSince1970: 3)
+        var disposable = AgentThread(workspaceId: wid, title: "disposable cache", provider: .codex, model: "m")
+        disposable.status = .completed
+        disposable.updatedAt = Date(timeIntervalSince1970: 4)
+        for thread in [draft, cleanWorktree, dirtyWorktree, disposable] {
+            try repo.upsert(thread)
+        }
+        try drafts.upsert(AgentThreadDraft(
+            threadId: draft.id,
+            providerInstanceId: "codex",
+            text: "do not lose this unsent prompt",
+            attachments: [AgentAttachment(path: root.appendingPathComponent("note.txt").path, kind: .file)]
+        ))
+
+        let created = AgentThread(workspaceId: wid, title: "new thread", provider: .codex, model: "m")
+        let pruned = try repo.upsertEnforcingWorkspaceThreadLimit(created, limit: 4)
+
+        XCTAssertEqual(pruned, [disposable.id],
+                       "only genuinely disposable cached history may satisfy the cap")
+        for protected in [draft, cleanWorktree, dirtyWorktree] {
+            XCTAssertNotNil(try repo.get(id: protected.id),
+                            "automatic retention must preserve \(protected.title)")
+        }
+        XCTAssertNotNil(try repo.get(id: created.id))
+    }
+
+    /// WHY: when every possible victim owns user data or a worktree, the new row
+    /// must roll back as one transaction. Returning an empty victim list while
+    /// retaining the overflowing row would falsely report a successful cap pass.
+    func test_workspaceThreadLimitFailsAtomicallyWhenOnlyDraftAndWorktreeRowsRemain() throws {
+        let db = try makeDB()
+        let repo = AgentThreadRepository(db: db)
+        let drafts = AgentThreadDraftRepository(db: db)
+        let wid = try makeWorkspace(db: db)
+        var draft = AgentThread(workspaceId: wid, title: "protected draft", provider: .codex, model: "m")
+        draft.status = .completed
+        var cleanWorktree = AgentThread(
+            workspaceId: wid,
+            title: "protected clean worktree",
+            provider: .codex,
+            model: "m",
+            status: .completed,
+            executionMode: .worktree,
+            worktreePath: "/tmp/clean-worktree"
+        )
+        var dirtyWorktree = AgentThread(
+            workspaceId: wid,
+            title: "protected dirty worktree",
+            provider: .codex,
+            model: "m",
+            status: .completed,
+            executionMode: .worktree,
+            worktreePath: "/tmp/dirty-worktree"
+        )
+        draft.updatedAt = Date(timeIntervalSince1970: 1)
+        cleanWorktree.updatedAt = Date(timeIntervalSince1970: 2)
+        dirtyWorktree.updatedAt = Date(timeIntervalSince1970: 3)
+        for thread in [draft, cleanWorktree, dirtyWorktree] {
+            try repo.upsert(thread)
+        }
+        try drafts.upsert(AgentThreadDraft(
+            threadId: draft.id,
+            providerInstanceId: "codex",
+            text: "",
+            attachments: [AgentAttachment(path: "/tmp/attachment.txt", kind: .file)]
+        ))
+        let prospective = AgentThread(workspaceId: wid, title: "must roll back", provider: .codex, model: "m")
+        let originalIDs = Set([draft.id, cleanWorktree.id, dirtyWorktree.id])
+
+        XCTAssertThrowsError(try repo.enforceWorkspaceThreadLimit(workspaceId: wid, limit: 2)) {
+            XCTAssertTrue($0 is AgentThreadCapacityError)
+        }
+        XCTAssertThrowsError(try repo.preflightWorkspaceThreadInsertion(
+            workspaceId: wid,
+            prospectiveThreadId: prospective.id,
+            limit: 3
+        )) { XCTAssertTrue($0 is AgentThreadCapacityError) }
+        XCTAssertThrowsError(try repo.upsertEnforcingWorkspaceThreadLimit(prospective, limit: 3)) {
+            XCTAssertTrue($0 is AgentThreadCapacityError)
+        }
+
+        XCTAssertEqual(Set(try repo.list(workspaceId: wid).map(\.id)), originalIDs,
+                       "a protected-only cap failure must leave every original row untouched")
+        XCTAssertNil(try repo.get(id: prospective.id),
+                     "the rejected producer row must roll back with the failed cap transaction")
+    }
+
+    /// WHY: selection is advisory. If an idle thread gains a durable draft in
+    /// the narrow selection-to-delete window, the final DELETE guard must fail
+    /// loud and roll back every tentative delete instead of silently cascading
+    /// the just-saved draft.
+    func test_enforceWorkspaceThreadLimit_draftAddedDuringVictimDeleteRollsBackEverything() throws {
+        let db = try makeDB()
+        let repo = AgentThreadRepository(db: db)
+        let drafts = AgentThreadDraftRepository(db: db)
+        let wid = try makeWorkspace(db: db)
+        var threads: [AgentThread] = []
+        for index in 0..<3 {
+            var thread = AgentThread(workspaceId: wid, title: "candidate \(index)", provider: .codex, model: "m")
+            thread.status = .completed
+            thread.updatedAt = Date(timeIntervalSince1970: TimeInterval(index))
+            try repo.upsert(thread)
+            threads.append(thread)
+        }
+        var addedDraft = false
+        db.beforeStatementStepForTesting = { sql in
+            guard !addedDraft, sql.contains("DELETE FROM agent_threads") else { return }
+            addedDraft = true
+            try? drafts.upsert(AgentThreadDraft(
+                threadId: threads[0].id,
+                providerInstanceId: "codex",
+                text: "saved during cap delete"
+            ))
+        }
+        defer { db.beforeStatementStepForTesting = nil }
+
+        XCTAssertThrowsError(try repo.enforceWorkspaceThreadLimit(workspaceId: wid, limit: 2)) {
+            XCTAssertTrue($0 is AgentThreadCapacityError)
+        }
+        XCTAssertTrue(addedDraft)
+        XCTAssertEqual(Set(try repo.list(workspaceId: wid).map(\.id)), Set(threads.map(\.id)),
+                       "the transaction must restore all rows when the selected victim becomes protected")
+        XCTAssertNil(try drafts.get(threadId: threads[0].id),
+                     "the simulated concurrent draft belongs to the rolled-back cap transaction")
+    }
+
     /// WHY: a victim can become active after selection but before deletion.
     /// Reload-time retention must revalidate under one transaction and roll
     /// every tentative delete back instead of deleting the newly active row.

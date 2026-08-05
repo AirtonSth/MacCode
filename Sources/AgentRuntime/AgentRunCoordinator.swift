@@ -2299,6 +2299,171 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         try? providerSessionRepo?.markStopped(threadId: threadId, status: .completed)
     }
 
+    /// Retires process-local ownership only after a thread DELETE has committed.
+    ///
+    /// A cap delete cascades durable run/session rows, but resident adapters and
+    /// in-memory retry buffers are process state. Never route this through
+    /// `stopRun`: a completed idle session must not manufacture a cancelled run
+    /// lifecycle. Conversely, an active, pending, or unsummarized provider
+    /// session is deliberately left untouched -- it may belong to work this
+    /// coordinator cannot safely identify from a deleted row.
+    public func retireDeletedThreads(_ ids: [AgentThreadID]) {
+        var seen: Set<AgentThreadID> = []
+        let ordered = ids
+            .filter { seen.insert($0).inserted }
+            .sorted { $0.value.uuidString < $1.value.uuidString }
+        for threadId in ordered {
+            guard isDurablyDeleted(threadId),
+                  !hasDurableActiveRun(threadId),
+                  !hasUnsafeInMemoryOwnership(threadId),
+                  let terminalResidentAdapters = terminalResidentAdapters(forDeletedThread: threadId) else {
+                continue
+            }
+
+            // A terminal resident session owns no runnable work. Releasing it is
+            // intentionally best effort: the committed delete still requires its
+            // stale buffers and retry state to be dropped if an adapter has already
+            // reaped the process underneath us.
+            for adapter in terminalResidentAdapters {
+                try? adapter.stopSession(threadId: threadId)
+            }
+
+            // Stream writers take mirrorEventLock before lock. Match that order so
+            // a last buffered event cannot resurrect a deleted thread's state while
+            // this reaper is clearing it.
+            mirrorEventLock.lock()
+            lock.lock()
+            if !hasUnsafeInMemoryOwnershipLocked(threadId) {
+                purgeDeletedThreadRuntimeLocked(threadId)
+            }
+            lock.unlock()
+            mirrorEventLock.unlock()
+        }
+    }
+
+    private func isDurablyDeleted(_ threadId: AgentThreadID) -> Bool {
+        do {
+            return try threadRepo.get(id: threadId) == nil
+        } catch {
+            // A database read failure is never permission to tear down a provider.
+            return false
+        }
+    }
+
+    private func hasDurableActiveRun(_ threadId: AgentThreadID) -> Bool {
+        do {
+            return try runRepo.latestActive(for: threadId) != nil
+        } catch {
+            // Preserve a session when durable ownership cannot be verified.
+            return true
+        }
+    }
+
+    private func hasUnsafeInMemoryOwnership(_ threadId: AgentThreadID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return hasUnsafeInMemoryOwnershipLocked(threadId)
+    }
+
+    private func hasUnsafeInMemoryOwnershipLocked(_ threadId: AgentThreadID) -> Bool {
+        activeThreads[threadId] != nil
+            || pendingProviderStarts[threadId] != nil
+            || pendingThreadStops.contains(threadId)
+            || exclusiveThreadMutations.contains(threadId)
+    }
+
+    /// Returns nil when any adapter state could be active or belongs to a
+    /// different provider. An empty result is safe and simply means no resident
+    /// session needs releasing.
+    private func terminalResidentAdapters(
+        forDeletedThread threadId: AgentThreadID
+    ) -> [AgentProviderAdapter]? {
+        lock.lock()
+        let adapters = Array(providers.values)
+        lock.unlock()
+
+        var terminalAdapters: [AgentProviderAdapter] = []
+        for adapter in adapters {
+            let summaries = adapter.listSessions().filter { $0.threadId == threadId }
+            let hasSession = adapter.hasSession(threadId: threadId)
+            if hasSession && summaries.isEmpty {
+                // An adapter that cannot summarize a session may still own an
+                // in-flight provider process. Treat it as foreign/unsafe.
+                return nil
+            }
+            guard summaries.allSatisfy({
+                $0.provider == adapter.provider && Self.isTerminalThreadStatus($0.status)
+            }) else {
+                return nil
+            }
+            if hasSession {
+                terminalAdapters.append(adapter)
+            }
+        }
+        return terminalAdapters
+    }
+
+    /// Must be called with mirrorEventLock and lock held, in that order.
+    private func purgeDeletedThreadRuntimeLocked(_ threadId: AgentThreadID) {
+        var runIds: Set<AgentRunID> = []
+        if let runId = pendingStreamRunIds[threadId] {
+            runIds.insert(runId)
+        }
+        for (runId, pending) in pendingStartFailures where pending.request.threadId == threadId {
+            runIds.insert(runId)
+        }
+        for (runId, pending) in pendingReceiptFinalizations where pending.threadId == threadId {
+            runIds.insert(runId)
+        }
+        for (runId, pending) in deferredProviderTerminalEvents where pending.threadId == threadId {
+            runIds.insert(runId)
+        }
+
+        providerTurnScopes.removeValue(forKey: threadId)
+        streamEventsSincePrune.removeValue(forKey: threadId)
+        pendingStreamWrites.removeValue(forKey: threadId)
+        pendingStreamRunIds.removeValue(forKey: threadId)
+        pendingStreamPrunes.remove(threadId)
+        lastStreamFlushMs.removeValue(forKey: threadId)
+        mirrorPersistenceFailures.removeValue(forKey: threadId)
+        autoContinuationCounts.removeValue(forKey: threadId)
+        autoContinuationTokens.removeValue(forKey: threadId)
+        lastPersistedAssistantContent.removeValue(forKey: threadId)
+        if lastCheckpointRevertUndo?.threadId == threadId {
+            lastCheckpointRevertUndo = nil
+        }
+
+        for runId in runIds {
+            active.removeValue(forKey: runId)
+            activeRunMetadata.removeValue(forKey: runId)
+            activeTurnIds.removeValue(forKey: runId)
+            latestTokenUsage.removeValue(forKey: runId)
+            reconciledTokenUsage.removeValue(forKey: runId)
+            receiptUsageFinalizationInFlight.remove(runId)
+            receiptUsageEnrichmentRetryScheduled.remove(runId)
+            pendingReceiptFinalizations.removeValue(forKey: runId)
+            receiptFinalizationRetryScheduled.remove(runId)
+            latestRunErrorMessages.removeValue(forKey: runId)
+            orchestrationDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
+            externalReceiptLeaseWorkItems.removeValue(forKey: runId)?.cancel()
+            activeAssistantMessageIds.removeValue(forKey: runId)
+            activeProviderTextItemTypes.removeValue(forKey: runId)
+            bufferedProviderTextItems.removeValue(forKey: runId)
+            providerTextTranslationsInFlight.removeValue(forKey: runId)
+            deferredProviderTerminalEvents.removeValue(forKey: runId)
+            activeDistillOutputRuns.remove(runId)
+            finishingRuns.remove(runId)
+            pendingTerminalEvents.removeValue(forKey: runId)
+            terminalRetryScheduled.remove(runId)
+            pendingStartFailures.removeValue(forKey: runId)
+            startFailureRetryScheduled.remove(runId)
+            awaitingTerminationRuns.remove(runId)
+            providerTerminatedRuns.remove(runId)
+            pendingGracefulStopFallbacks.remove(runId)
+            seq.removeValue(forKey: runId)
+        }
+    }
+
     /// Classifies the local initiator for a terminal transition (plan-final T1–T3).
     public static func terminalInitiator(
         status: AgentRunStatus,
@@ -2715,6 +2880,97 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     var autoContinuationThreadIdsForTesting: Set<AgentThreadID> {
         lock.lock(); defer { lock.unlock() }
         return Set(autoContinuationCounts.keys).union(autoContinuationTokens.keys)
+    }
+
+    /// Seeds the terminal/buffered state that can survive a database-cascaded
+    /// delete. It intentionally does not create active ownership: retirement
+    /// must clear these retry paths without emitting a run lifecycle event.
+    @discardableResult
+    func seedDeletedThreadRuntimeStateForTesting(_ threadId: AgentThreadID) -> AgentRunID {
+        let runId = AgentRunID()
+        let request = AgentRunRequest(
+            runId: runId,
+            threadId: threadId,
+            provider: .codex,
+            model: "test-model",
+            cwd: "/tmp",
+            prompt: "test"
+        )
+        var batch = StreamWriteBatch()
+        batch.append(StreamWriteItem(seq: 1, kind: "test", payloadJSON: "{}", providerEvent: nil))
+        lock.lock()
+        providerTurnScopes[threadId] = ProviderTurnScope(environment: [:])
+        streamEventsSincePrune[threadId] = 1
+        pendingStreamWrites[threadId] = batch
+        pendingStreamRunIds[threadId] = runId
+        pendingStreamPrunes.insert(threadId)
+        lastStreamFlushMs[threadId] = 1
+        mirrorPersistenceFailures[threadId] = NSError(domain: "test", code: 1)
+        autoContinuationCounts[threadId] = 1
+        autoContinuationTokens[threadId] = 1
+        lastPersistedAssistantContent[threadId] = "retained assistant text"
+        pendingReceiptFinalizations[runId] = PendingOrchestrationReceiptFinalization(
+            runId: runId,
+            threadId: threadId,
+            status: .failed,
+            usage: nil,
+            qualityOutcome: "test"
+        )
+        deferredProviderTerminalEvents[runId] = DeferredProviderTerminalEvent(
+            status: .failed,
+            finalMessage: nil,
+            providerThreadId: nil,
+            threadId: threadId,
+            allowFinalResponseTranslation: false,
+            providerTerminalAcknowledged: true
+        )
+        pendingTerminalEvents[runId] = PendingTerminalEvent(
+            status: .failed,
+            finalMessage: nil,
+            providerThreadId: nil,
+            assistantMessage: nil,
+            finishedAt: Date(),
+            providerTerminalAcknowledged: true,
+            errorMessage: "test"
+        )
+        pendingStartFailures[runId] = PendingStartFailure(
+            request: request,
+            adapterKey: "test",
+            binaryIdentity: nil,
+            preserveRecoverableSession: false,
+            otherRunActive: false,
+            message: "test",
+            event: .error(message: "test", recoverable: true),
+            streamEvent: AgentRunRepository.StreamWriteIntent(
+                seq: 1,
+                kind: "test",
+                payloadJSON: "{}",
+                providerEvent: nil
+            ),
+            finishedAt: Date()
+        )
+        orchestrationDeadlineWorkItems[runId] = DispatchWorkItem {}
+        externalReceiptLeaseWorkItems[runId] = DispatchWorkItem {}
+        lock.unlock()
+        return runId
+    }
+
+    var deletedThreadRuntimeResidueForTesting: Set<AgentThreadID> {
+        lock.lock(); defer { lock.unlock() }
+        var ids = Set(providerTurnScopes.keys)
+        ids.formUnion(streamEventsSincePrune.keys)
+        ids.formUnion(pendingStreamWrites.keys)
+        ids.formUnion(pendingStreamRunIds.keys)
+        ids.formUnion(pendingStreamPrunes)
+        ids.formUnion(lastStreamFlushMs.keys)
+        ids.formUnion(mirrorPersistenceFailures.keys)
+        ids.formUnion(autoContinuationCounts.keys)
+        ids.formUnion(autoContinuationTokens.keys)
+        ids.formUnion(lastPersistedAssistantContent.keys)
+        ids.formUnion(pendingStartFailures.values.map { $0.request.threadId })
+        ids.formUnion(pendingReceiptFinalizations.values.map(\.threadId))
+        ids.formUnion(deferredProviderTerminalEvents.values.map(\.threadId))
+        return ids
     }
     #endif
 
@@ -3209,6 +3465,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 providerSession: childRuntime,
                 forkIntentChildThreadId: intent.childThread.id
             )
+            // The local graph transaction has committed. Retire only its returned
+            // victims now; fork intent transitions and lifecycle publication stay
+            // with their existing callers.
+            retireDeletedThreads(prunedThreadIDs)
             return AgentThreadForkResult(thread: persistedChild, prunedThreadIDs: prunedThreadIDs)
         } catch {
             let forkPersistenceRequiresCompensation: Bool

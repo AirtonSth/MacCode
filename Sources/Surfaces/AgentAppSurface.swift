@@ -261,6 +261,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// repo write + reloadThreads) so the host can mirror them to remote
     /// clients. Wired by AppCommandRouter like onThreadConfigPersisted.
     public var onThreadLifecycle: ((AgentThreadLifecycleEvent) -> Void)?
+    /// Post-commit process-global retirement for automatic cap victims. The
+    /// boolean is true only when AgentRunCoordinator's native fork producer
+    /// already retired its coordinator state and the host only needs queue state.
+    public var retireDeletedThreadRuntime: (([AgentThreadID], Bool) -> Void)?
     /// When non-nil, Stop for LaunchAgent-owned scheduled runs is routed here
     /// (path B). Return true if the request was accepted / already terminal.
     public var stopScheduledThread: ((AgentThreadID, AgentRunID?) async -> Bool)?
@@ -711,6 +715,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             let prunedThreadIDs = try threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspaceID)
             // Cap succeeded: release its returned victims before the next DB read,
             // so a transient list failure cannot retain state for already-deleted rows.
+            retireCommittedThreadPrunes(prunedThreadIDs)
             applyAuthoritativeThreadDeletions(Set(prunedThreadIDs))
             if !prunedThreadIDs.isEmpty {
                 onThreadLifecycle?(.deleted(prunedThreadIDs))
@@ -3754,6 +3759,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return
         }
         if !prunedThreadIDs.isEmpty {
+            retireCommittedThreadPrunes(prunedThreadIDs)
             applyAuthoritativeThreadDeletions(Set(prunedThreadIDs))
             onThreadLifecycle?(.deleted(prunedThreadIDs))
         }
@@ -4141,6 +4147,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         recoverDeletedSelectionIfNeeded(deletedIDs)
     }
 
+    /// The repository transaction is authoritative for the victim list. Retire
+    /// global runtime state before local cache eviction or lifecycle fan-out so a
+    /// failed rail reload cannot leave a deleted provider session behind.
+    private func retireCommittedThreadPrunes(
+        _ ids: [AgentThreadID],
+        coordinatorAlreadyRetired: Bool = false
+    ) {
+        guard !ids.isEmpty else { return }
+        if let retireDeletedThreadRuntime {
+            retireDeletedThreadRuntime(ids, coordinatorAlreadyRetired)
+        } else if !coordinatorAlreadyRetired {
+            coordinator.retireDeletedThreads(ids)
+        }
+    }
+
     private func evictThreadCaches(_ ids: some Sequence<AgentThreadID>) {
         let ids = Set(ids)
         guard !ids.isEmpty else { return }
@@ -4212,6 +4233,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             queueStatusMessage = "test queue status"
             providerThreadSnapshotLastConfirmedAt = confirmedAt
         }
+    }
+
+    /// Seeds only the in-memory composer cache. Cap-performance fixtures must
+    /// not manufacture durable user drafts, because those are now protected from
+    /// automatic retention and are not memory the cap is allowed to reclaim.
+    func seedComposerDraftCacheForTesting(
+        _ threadId: AgentThreadID,
+        providerInstanceId: String,
+        text: String
+    ) {
+        composerDraftsByThread[threadId, default: [:]][providerInstanceId] = AgentThreadDraft(
+            threadId: threadId,
+            providerInstanceId: providerInstanceId,
+            text: text
+        )
     }
 
     @discardableResult
@@ -4304,6 +4340,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return false
         }
         if !prunedThreadIDs.isEmpty {
+            retireCommittedThreadPrunes(prunedThreadIDs)
             applyAuthoritativeThreadDeletions(Set(prunedThreadIDs))
             onThreadLifecycle?(.deleted(prunedThreadIDs))
         }
@@ -4495,6 +4532,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 childThread: child
             )
             if !result.prunedThreadIDs.isEmpty {
+                retireCommittedThreadPrunes(
+                    result.prunedThreadIDs,
+                    coordinatorAlreadyRetired: true
+                )
                 applyAuthoritativeThreadDeletions(Set(result.prunedThreadIDs))
                 onThreadLifecycle?(.deleted(result.prunedThreadIDs))
             }

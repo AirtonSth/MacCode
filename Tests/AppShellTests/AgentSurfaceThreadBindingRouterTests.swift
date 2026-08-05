@@ -289,7 +289,6 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         firstSurface.viewModel.prompt = "first surface victim draft"
         firstSurface.viewModel.seedAdditionalThreadCachesForTesting(victim.id)
         secondSurface.viewModel.selectThread(victim.id)
-        secondSurface.viewModel.prompt = "second surface victim draft"
         secondSurface.viewModel.seedAdditionalThreadCachesForTesting(victim.id)
         secondSurface.viewModel.selectThread(secondSelection)
         ctx.coordinator.seedAutoContinuationStateForTesting(victim.id)
@@ -394,7 +393,6 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         // victim before its injected reload failure.
         let uiVictim = survivors[0]
         secondSurface.viewModel.selectThread(uiVictim.id)
-        secondSurface.viewModel.prompt = "second surface local-create victim draft"
         secondSurface.viewModel.seedAdditionalThreadCachesForTesting(uiVictim.id)
         secondSurface.viewModel.selectThread(secondSelection)
         ctx.coordinator.seedAutoContinuationStateForTesting(uiVictim.id)
@@ -537,6 +535,107 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         XCTAssertNotNil(try ctx.threadRepo.get(id: created.id))
         XCTAssertEqual(victimEvents.count, 1,
                        "the routed producer must publish its authoritative victim")
+    }
+
+    /// WHY: scheduled/RPC creation has no Agent App surface to evict local
+    /// state. Its cap commit must still release the host queue state, completed
+    /// resident session, and coordinator retry buffers exactly once.
+    func test_headlessCreateAtCap_retiresGlobalRuntimeWithoutAnAgentSurface() throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-HeadlessRetire-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "HEADLESS-RETIRE", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        closeAndUnregisterAgentSurfaces(workspace: workspace.id)
+        XCTAssertTrue(agentSurfaces(in: workspace.id).isEmpty,
+                      "precondition: this producer must run without an Agent App surface")
+
+        let oldest = Date(timeIntervalSince1970: 1_700_000_000)
+        var victim = AgentThread(workspaceId: workspace.id, title: "headless victim", provider: .codex, model: "m")
+        victim.status = .completed
+        victim.updatedAt = oldest
+        try ctx.threadRepo.upsert(victim)
+        for index in 0..<(AgentThreadRepository.maxThreadsPerWorkspace - 1) {
+            var survivor = AgentThread(workspaceId: workspace.id, title: "survivor \(index)", provider: .codex, model: "m")
+            survivor.status = .completed
+            survivor.updatedAt = oldest.addingTimeInterval(TimeInterval(index + 1))
+            try ctx.threadRepo.upsert(survivor)
+        }
+
+        let adapter = IdleSessionRetirementAdapter(provider: .codex)
+        adapter.seedTerminalSession(threadId: victim.id)
+        ctx.coordinator.replaceProviderAdapter(.codex, adapter: adapter)
+        ctx.coordinator.seedDeletedThreadRuntimeStateForTesting(victim.id)
+        ctx.seedDeletedThreadQueueRuntimeStateForTesting(victim.id)
+
+        _ = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "scheduled create",
+            provider: .codex,
+            model: "m",
+            permissionMode: .supervised,
+            reasoningEffort: .medium,
+            routingConfiguration: nil,
+            quiet: true
+        )
+
+        XCTAssertNil(try ctx.threadRepo.get(id: victim.id))
+        XCTAssertEqual(adapter.stopSessionCallCount, 1,
+                       "headless cap eviction must release a terminal resident provider session")
+        XCTAssertFalse(ctx.coordinator.deletedThreadRuntimeResidueForTesting.contains(victim.id),
+                       "headless cap eviction must clear coordinator buffers and retry failures")
+        XCTAssertFalse(ctx.deletedThreadQueueRuntimeResidueForTesting.contains(victim.id),
+                       "headless cap eviction must clear queue waiters, permits, leases, and promotions")
+    }
+
+    /// WHY: the Agent App producer must use the same post-commit path as the
+    /// headless producer, before it fans out the deleted lifecycle event.
+    func test_surfaceCreateAtCap_retiresGlobalRuntimeBeforeLifecycleFanout() throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-SurfaceRetire-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "SURFACE-RETIRE", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        let surface = try XCTUnwrap(agentSurfaces(in: workspace.id).first)
+
+        let oldest = Date(timeIntervalSince1970: 1_700_000_000)
+        var victim = AgentThread(workspaceId: workspace.id, title: "surface victim", provider: .codex, model: "m")
+        victim.status = .completed
+        victim.updatedAt = oldest
+        try ctx.threadRepo.upsert(victim)
+        for index in 0..<(AgentThreadRepository.maxThreadsPerWorkspace - 1) {
+            var survivor = AgentThread(workspaceId: workspace.id, title: "survivor \(index)", provider: .codex, model: "m")
+            survivor.status = .completed
+            survivor.updatedAt = oldest.addingTimeInterval(TimeInterval(index + 1))
+            try ctx.threadRepo.upsert(survivor)
+        }
+        surface.viewModel.reloadThreads()
+
+        let adapter = IdleSessionRetirementAdapter(provider: .codex)
+        adapter.seedTerminalSession(threadId: victim.id)
+        ctx.coordinator.replaceProviderAdapter(.codex, adapter: adapter)
+        ctx.coordinator.seedDeletedThreadRuntimeStateForTesting(victim.id)
+        ctx.seedDeletedThreadQueueRuntimeStateForTesting(victim.id)
+        let existingLifecycle = surface.viewModel.onThreadLifecycle
+        var lifecycleObservedRetirement = false
+        surface.viewModel.onThreadLifecycle = { event in
+            if case let .deleted(ids) = event, ids.contains(victim.id) {
+                lifecycleObservedRetirement = adapter.stopSessionCallCount == 1
+                    && !ctx.coordinator.deletedThreadRuntimeResidueForTesting.contains(victim.id)
+                    && !ctx.deletedThreadQueueRuntimeResidueForTesting.contains(victim.id)
+            }
+            existingLifecycle?(event)
+        }
+
+        surface.viewModel.createThread(title: "surface create")
+
+        XCTAssertNil(try ctx.threadRepo.get(id: victim.id))
+        XCTAssertTrue(lifecycleObservedRetirement,
+                      "surface lifecycle fan-out must observe globally retired cap-victim state")
+        XCTAssertEqual(adapter.stopSessionCallCount, 1,
+                       "surface cap eviction must release the completed resident session once")
+        XCTAssertFalse(ctx.coordinator.deletedThreadRuntimeResidueForTesting.contains(victim.id),
+                       "surface cap eviction must clear coordinator retry/buffer state")
+        XCTAssertFalse(ctx.deletedThreadQueueRuntimeResidueForTesting.contains(victim.id),
+                       "surface cap eviction must clear AppContext queue state")
     }
 
     func test_routerCreateAtCap_deleteFailureRollsBackCreationAndPublishesNothing() throws {
@@ -1771,4 +1870,81 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             "thread A must own the remote user message"
         )
     }
+}
+
+private final class IdleSessionRetirementAdapter: AgentProviderAdapter, @unchecked Sendable {
+    let provider: AgentProvider
+    private let lock = NSLock()
+    private var sessions: [AgentThreadID: AgentProviderSessionSummary] = [:]
+    private var stops = 0
+
+    init(provider: AgentProvider) {
+        self.provider = provider
+    }
+
+    var stopSessionCallCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return stops
+    }
+
+    func seedTerminalSession(threadId: AgentThreadID) {
+        lock.lock()
+        sessions[threadId] = AgentProviderSessionSummary(
+            threadId: threadId,
+            provider: provider,
+            status: .completed,
+            providerThreadId: "resident-idle"
+        )
+        lock.unlock()
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+    func startSession(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        try await sendTurn(request, onEvent: onEvent)
+    }
+    func sendTurn(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+    func interruptTurn(threadId: AgentThreadID) throws {}
+    func respondToRequest(
+        threadId: AgentThreadID,
+        requestId: String,
+        response: AgentProviderRequestResponse
+    ) async throws {}
+    func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {}
+    func stopSession(threadId: AgentThreadID) throws {
+        lock.lock()
+        stops += 1
+        sessions.removeValue(forKey: threadId)
+        lock.unlock()
+    }
+    func recoverSession(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws {}
+    func listSessions() -> [AgentProviderSessionSummary] {
+        lock.lock(); defer { lock.unlock() }
+        return Array(sessions.values)
+    }
+    func hasSession(threadId: AgentThreadID) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return sessions[threadId] != nil
+    }
+    func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] { [] }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {}
+    func stopAll() {
+        lock.lock()
+        sessions.removeAll()
+        lock.unlock()
+    }
+    func streamEvents(
+        threadId: AgentThreadID,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) throws {}
 }

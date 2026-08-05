@@ -428,6 +428,29 @@ public final class AppContext {
     var tokenSaverEntitlementModelValidationOverrideForTesting: TokenSaverModelValidation?
     var queueDrainWaiterCountForTesting: Int { queueDrainWaiters.count }
     var queueDrainSuppressedThreadCountForTesting: Int { queueDrainSuppressionLeases.count }
+    #if DEBUG
+    var deletedThreadQueueRuntimeResidueForTesting: Set<AgentThreadID> {
+        Set(queueDrainWaiters.keys)
+            .union(queueDrainSuppressionLeases.keys)
+            .union(queueDispatchAcceptancePermits.keys)
+            .union(deferredQueuePromotions.keys)
+    }
+
+    func seedDeletedThreadQueueRuntimeStateForTesting(_ threadId: AgentThreadID) {
+        queueDrainWaiters[threadId] = QueueDrainWaiter(
+            token: UUID(),
+            task: Task<Void, Never> {
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+            }
+        )
+        queueDrainSuppressionLeases[threadId] = [UUID()]
+        queueDispatchAcceptancePermits[threadId] = AgentRunAcceptancePermit()
+        deferredQueuePromotions[threadId] = DeferredQueuePromotion(
+            ownerId: AgentQueuedMessageID(),
+            targetId: AgentQueuedMessageID()
+        )
+    }
+    #endif
     /// Test seam: sandbox the SessionLearn target instruction files so tests never write
     /// into the developer's real ~/.claude/CLAUDE.md or ~/.codex/AGENTS.md.
     var sessionLearnInstructionFilesOverrideForTesting: [URL]?
@@ -452,7 +475,43 @@ public final class AppContext {
     /// Debounce window for coalescing per-token usage writes into one disk write.
     private static let tokenSaverUsageDebounceInterval: TimeInterval = 0.75
 
+    /// Releases host-owned state after a cap transaction has committed its
+    /// deletes. This deliberately has no EventBus/UI side effect: callers retain
+    /// the existing delete-before-create publication order. A failed read or a
+    /// restored row is not permission to cancel queue/provider ownership.
+    func retireDeletedAgentThreads(
+        _ ids: [AgentThreadID],
+        coordinatorAlreadyRetired: Bool = false
+    ) {
+        var seen: Set<AgentThreadID> = []
+        let ordered = ids
+            .filter { seen.insert($0).inserted }
+            .sorted { $0.value.uuidString < $1.value.uuidString }
+        let committed = ordered.filter { id in
+            do {
+                return try threadRepo.get(id: id) == nil
+            } catch {
+                return false
+            }
+        }
+        guard !committed.isEmpty else { return }
+
+        for threadId in committed {
+            queueDrainWaiters.removeValue(forKey: threadId)?.task.cancel()
+            queueDrainSuppressionLeases.removeValue(forKey: threadId)
+            queueDispatchAcceptancePermits.removeValue(forKey: threadId)?.invalidate()
+            deferredQueuePromotions.removeValue(forKey: threadId)
+        }
+        if !coordinatorAlreadyRetired {
+            coordinator.retireDeletedThreads(committed)
+        }
+    }
+
     func enqueueRecoveredForkPrunedThreadIDs(_ ids: [AgentThreadID]) {
+        // reconcileForkIntent already retired coordinator state immediately after
+        // its local graph commit. Do the host queue portion even before a router
+        // or Agent App surface exists; lifecycle publication remains deferred.
+        retireDeletedAgentThreads(ids, coordinatorAlreadyRetired: true)
         pendingRecoveredForkPrunedThreadIDs.formUnion(ids)
         drainRecoveredForkPrunedThreadIDsIfPossible()
     }
@@ -3245,6 +3304,7 @@ public final class AppContext {
                     capsuleText: capsule.text
                 ))
             }
+            retireDeletedAgentThreads(prunedThreadIDs)
             router?.publishAgentThreadDeletions(prunedThreadIDs)
             return child
         } catch {
