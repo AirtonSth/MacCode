@@ -587,10 +587,10 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
                        "headless cap eviction must clear queue waiters, permits, leases, and promotions")
     }
 
-    /// WHY: an intermittent durable-thread read must defer retirement rather
-    /// than treating an unknown row as deleted. The retry may later clear the
-    /// exact committed victim, but cannot stop its terminal session prematurely.
-    func test_headlessCreateAtCap_retriesTransientRetirementReadWithoutPrematureSessionStop() async throws {
+    /// WHY: AppContext must retain queue ownership when the coordinator's
+    /// second verification fails after retirement has already been entered.
+    /// A later drain may retire the exact victim once both reads succeed.
+    func test_headlessCreateAtCap_retriesCoordinatorSecondReadWithoutPrematureQueuePurge() async throws {
         let dir = NSTemporaryDirectory() + "RC2Bind-HeadlessRetryRetire-" + UUID().uuidString
         let (ctx, router) = try makeRouter(dir)
         let workspace = try router.createWorkspace(name: "HEADLESS-RETRY", cwd: NSTemporaryDirectory())
@@ -617,19 +617,18 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         ctx.coordinator.seedDeletedThreadRuntimeStateForTesting(victim.id)
         ctx.seedDeletedThreadQueueRuntimeStateForTesting(victim.id)
         var verificationAttempts = 0
-        ctx.deletedThreadRetirementVerificationForTesting = { id in
-            guard id == victim.id else {
-                return try ctx.threadRepo.get(id: id) == nil
-            }
+        var failSecondRead = true
+        ctx.coordinator.deletedThreadRetirementPresenceOverrideForTesting = { id in
+            guard id == victim.id else { return true }
             verificationAttempts += 1
-            if verificationAttempts <= 3 {
+            if failSecondRead && verificationAttempts.isMultiple(of: 2) {
                 throw NSError(domain: "AgentSurfaceThreadBindingRouterTests.retirement", code: 1)
             }
-            return try ctx.threadRepo.get(id: id) == nil
+            return false
         }
         ctx.deletedThreadRetirementRetryDelayNanosecondsForTesting = 1_000_000
         defer {
-            ctx.deletedThreadRetirementVerificationForTesting = nil
+            ctx.coordinator.deletedThreadRetirementPresenceOverrideForTesting = nil
             ctx.deletedThreadRetirementRetryDelayNanosecondsForTesting = nil
         }
         var runLifecycleEvents = 0
@@ -658,11 +657,11 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
                       "queue state must remain intact until the retry confirms deletion")
 
         let retryDeadline = Date().addingTimeInterval(3)
-        while Date() < retryDeadline && verificationAttempts < 3 {
+        while Date() < retryDeadline && verificationAttempts < 6 {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
-        XCTAssertEqual(verificationAttempts, 3,
-                       "the bounded timer budget must make its configured retry attempts")
+        XCTAssertEqual(verificationAttempts, 6,
+                       "the initial attempt and two bounded retries must each reach the second coordinator read")
         XCTAssertEqual(adapter.stopSessionCallCount, 0,
                        "timer-budget exhaustion must retain—not prematurely retire—the unknown victim")
         XCTAssertTrue(ctx.pendingDeletedThreadRetirementIDsForTesting.contains(victim.id),
@@ -670,10 +669,11 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
 
         // The next lifecycle drain retries the retained exact ID and may now
         // safely retire it because the durable read succeeds.
+        failSecondRead = false
         ctx.retireDeletedAgentThreads([victim.id])
 
-        XCTAssertEqual(verificationAttempts, 4,
-                       "the next lifecycle drain must re-read the retained victim id")
+        XCTAssertEqual(verificationAttempts, 8,
+                       "the next lifecycle drain must complete both coordinator verification reads")
         XCTAssertEqual(adapter.stopSessionCallCount, 1,
                        "a confirmed deletion must retire the terminal resident session exactly once")
         XCTAssertFalse(ctx.pendingDeletedThreadRetirementIDsForTesting.contains(victim.id))

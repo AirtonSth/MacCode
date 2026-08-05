@@ -769,6 +769,15 @@ public struct AgentThreadForkResult: Sendable, Equatable {
     }
 }
 
+/// Result of a post-commit thread-retirement attempt. Only `.retired` may
+/// clear host-owned runtime state; `.confirmedPresent` means a restored row
+/// still owns that state, and `.retryRequired` leaves everything intact.
+public enum AgentDeletedThreadRetirementOutcome: Equatable, Sendable {
+    case retired
+    case confirmedPresent
+    case retryRequired
+}
+
 public final class AgentRunCoordinator: @unchecked Sendable {
     private struct ProviderTurnScope: Equatable {
         let tokenSaverEnabled: Bool
@@ -817,6 +826,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// snapshot or receipt retry is cleared, so those maps cannot reconstruct a
     /// deleted thread safely on their own.
     private var runThreadOwnership: [AgentRunID: AgentThreadID] = [:]
+    /// Transient retirement barrier. It is never a tombstone: it exists only
+    /// while one coordinator attempt is checking/stopping a deleted thread.
+    private var deletedThreadRetirementsInFlight: Set<AgentThreadID> = []
+    /// A late callback with no fast ownership first checks its durable graph.
+    /// A transient read error may admit that exact callback once, then a bounded
+    /// validation retry either confirms its graph or purges the new residue.
+    private var pendingLateRunValidations: [AgentRunID: AgentThreadID] = [:]
+    private static let pendingLateRunValidationLimit = 64
+    private static let lateRunValidationTimedRetryLimit = 2
+    private static let lateRunValidationRetryBaseDelayNanoseconds: UInt64 = 50_000_000
     private typealias RunMetadata = (provider: AgentProvider, providerInstanceId: String?, model: String, cwd: String, serviceTier: AgentServiceTier, runtimeMode: AgentPermissionMode, interactionMode: AgentInteractionMode, adapterKey: String, binaryIdentity: String?)
     private var activeRunMetadata: [AgentRunID: RunMetadata] = [:]
     /// Process environments are immutable after launch. Resident provider adapters
@@ -835,6 +854,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// Test-only failure/false seam for a late cumulative usage correction.
     /// Production always calls the durable orchestration runtime directly.
     var receiptUsageEnrichmentOverrideForTesting: ((AgentRunID, AssistantTokenUsage) throws -> Bool)?
+    /// Test-only durable-read seams for retirement and post-cleanup callbacks.
+    /// `true` means the durable graph is present; production queries SQLite.
+    var deletedThreadRetirementPresenceOverrideForTesting: ((AgentThreadID) throws -> Bool)?
+    var lateRunAdmissionPresenceOverrideForTesting: ((AgentRunID, AgentThreadID) throws -> Bool)?
 #endif
     private var pendingReceiptFinalizations: [AgentRunID: PendingOrchestrationReceiptFinalization] = [:]
     private var receiptFinalizationRetryScheduled: Set<AgentRunID> = []
@@ -2321,56 +2344,86 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// lifecycle. Conversely, an active, pending, or unsummarized provider
     /// session is deliberately left untouched -- it may belong to work this
     /// coordinator cannot safely identify from a deleted row.
-    public func retireDeletedThreads(_ ids: [AgentThreadID]) {
+    @discardableResult
+    public func retireDeletedThreads(
+        _ ids: [AgentThreadID]
+    ) -> [AgentThreadID: AgentDeletedThreadRetirementOutcome] {
         var seen: Set<AgentThreadID> = []
         let ordered = ids
             .filter { seen.insert($0).inserted }
             .sorted { $0.value.uuidString < $1.value.uuidString }
+        var outcomes: [AgentThreadID: AgentDeletedThreadRetirementOutcome] = [:]
         for threadId in ordered {
-            guard isDurablyDeleted(threadId),
-                  !hasDurableActiveRun(threadId),
+            outcomes[threadId] = retireDeletedThread(threadId)
+        }
+        return outcomes
+    }
+
+    private func retireDeletedThread(
+        _ threadId: AgentThreadID
+    ) -> AgentDeletedThreadRetirementOutcome {
+        let registered = lock.withLock {
+            deletedThreadRetirementsInFlight.insert(threadId).inserted
+        }
+        guard registered else { return .retryRequired }
+        defer {
+            lock.withLock {
+                _ = deletedThreadRetirementsInFlight.remove(threadId)
+            }
+        }
+
+        do {
+            guard try !isDeletedThreadPresentForRetirement(threadId) else {
+                return .confirmedPresent
+            }
+            guard try !hasDurableActiveRun(threadId),
                   !hasUnsafeInMemoryOwnership(threadId),
                   let terminalResidentAdapters = terminalResidentAdapters(forDeletedThread: threadId) else {
-                continue
+                return .retryRequired
             }
 
-            // A terminal resident session owns no runnable work. Releasing it is
-            // intentionally best effort: the committed delete still requires its
-            // stale buffers and retry state to be dropped if an adapter has already
-            // reaped the process underneath us.
+            // Re-read immediately before touching an adapter. This closes the
+            // ordinary restore/read race and makes a read failure fail closed.
+            if try isDeletedThreadPresentForRetirement(threadId) {
+                return .confirmedPresent
+            }
+            guard try !hasDurableActiveRun(threadId),
+                  !hasUnsafeInMemoryOwnership(threadId) else {
+                return .retryRequired
+            }
+
             for adapter in terminalResidentAdapters {
-                try? adapter.stopSession(threadId: threadId)
+                try adapter.stopSession(threadId: threadId)
             }
-
-            // Stream writers take mirrorEventLock before lock. Match that order so
-            // a last buffered event cannot resurrect a deleted thread's state while
-            // this reaper is clearing it.
-            mirrorEventLock.lock()
-            lock.lock()
-            if !hasUnsafeInMemoryOwnershipLocked(threadId) {
-                purgeDeletedThreadRuntimeLocked(threadId)
-            }
-            lock.unlock()
-            mirrorEventLock.unlock()
+        } catch {
+            // A database or adapter failure never permits host/runtime purge.
+            return .retryRequired
         }
+
+        // Stream writers take mirrorEventLock before lock. Match that order so a
+        // last buffered event cannot resurrect a deleted thread while we clear it.
+        mirrorEventLock.lock()
+        lock.lock()
+        let mayPurge = !hasUnsafeInMemoryOwnershipLocked(threadId)
+        if mayPurge {
+            purgeDeletedThreadRuntimeLocked(threadId)
+        }
+        lock.unlock()
+        mirrorEventLock.unlock()
+        return mayPurge ? .retired : .retryRequired
     }
 
-    private func isDurablyDeleted(_ threadId: AgentThreadID) -> Bool {
-        do {
-            return try threadRepo.get(id: threadId) == nil
-        } catch {
-            // A database read failure is never permission to tear down a provider.
-            return false
+    private func isDeletedThreadPresentForRetirement(_ threadId: AgentThreadID) throws -> Bool {
+        #if DEBUG
+        if let presence = deletedThreadRetirementPresenceOverrideForTesting {
+            return try presence(threadId)
         }
+        #endif
+        return try threadRepo.get(id: threadId) != nil
     }
 
-    private func hasDurableActiveRun(_ threadId: AgentThreadID) -> Bool {
-        do {
-            return try runRepo.latestActive(for: threadId) != nil
-        } catch {
-            // Preserve a session when durable ownership cannot be verified.
-            return true
-        }
+    private func hasDurableActiveRun(_ threadId: AgentThreadID) throws -> Bool {
+        try runRepo.latestActive(for: threadId) != nil
     }
 
     private func hasUnsafeInMemoryOwnership(_ threadId: AgentThreadID) -> Bool {
@@ -2431,6 +2484,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             || awaitingTerminationRuns.contains(runId)
             || providerTerminatedRuns.contains(runId)
             || pendingGracefulStopFallbacks.contains(runId)
+            || pendingLateRunValidations[runId] != nil
             || seq[runId] != nil
             || pendingStreamRunIds.values.contains(runId)
     }
@@ -2474,9 +2528,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     /// Must be called with mirrorEventLock and lock held, in that order.
     private func purgeDeletedThreadRuntimeLocked(_ threadId: AgentThreadID) {
-        let runIds = runThreadOwnership
-            .compactMap { $0.value == threadId ? $0.key : nil }
-            .sorted { $0.value.uuidString < $1.value.uuidString }
+        let runIds = Set(
+            runThreadOwnership.compactMap { $0.value == threadId ? $0.key : nil }
+                + pendingLateRunValidations.compactMap { $0.value == threadId ? $0.key : nil }
+        ).sorted { $0.value.uuidString < $1.value.uuidString }
 
         providerTurnScopes.removeValue(forKey: threadId)
         streamEventsSincePrune.removeValue(forKey: threadId)
@@ -2491,36 +2546,179 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         if lastCheckpointRevertUndo?.threadId == threadId {
             lastCheckpointRevertUndo = nil
         }
+        for runId in runIds { purgeRunRuntimeLocked(runId) }
+    }
 
-        for runId in runIds {
-            active.removeValue(forKey: runId)
-            activeRunMetadata.removeValue(forKey: runId)
-            activeTurnIds.removeValue(forKey: runId)
-            latestTokenUsage.removeValue(forKey: runId)
-            reconciledTokenUsage.removeValue(forKey: runId)
-            receiptUsageFinalizationInFlight.remove(runId)
-            receiptUsageEnrichmentRetryScheduled.remove(runId)
-            pendingReceiptFinalizations.removeValue(forKey: runId)
-            receiptFinalizationRetryScheduled.remove(runId)
-            latestRunErrorMessages.removeValue(forKey: runId)
-            orchestrationDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
-            externalReceiptLeaseWorkItems.removeValue(forKey: runId)?.cancel()
-            activeAssistantMessageIds.removeValue(forKey: runId)
-            activeProviderTextItemTypes.removeValue(forKey: runId)
-            bufferedProviderTextItems.removeValue(forKey: runId)
-            providerTextTranslationsInFlight.removeValue(forKey: runId)
-            deferredProviderTerminalEvents.removeValue(forKey: runId)
-            activeDistillOutputRuns.remove(runId)
-            finishingRuns.remove(runId)
-            pendingTerminalEvents.removeValue(forKey: runId)
-            terminalRetryScheduled.remove(runId)
-            pendingStartFailures.removeValue(forKey: runId)
-            startFailureRetryScheduled.remove(runId)
-            awaitingTerminationRuns.remove(runId)
-            providerTerminatedRuns.remove(runId)
-            pendingGracefulStopFallbacks.remove(runId)
-            seq.removeValue(forKey: runId)
-            runThreadOwnership.removeValue(forKey: runId)
+    /// Must be called with `lock` held. Removes only state owned by one rejected
+    /// callback run, preserving any active or foreign run on the same thread.
+    private func purgeRunRuntimeLocked(_ runId: AgentRunID) {
+        active.removeValue(forKey: runId)
+        activeRunMetadata.removeValue(forKey: runId)
+        activeTurnIds.removeValue(forKey: runId)
+        latestTokenUsage.removeValue(forKey: runId)
+        reconciledTokenUsage.removeValue(forKey: runId)
+        receiptUsageFinalizationInFlight.remove(runId)
+        receiptUsageEnrichmentRetryScheduled.remove(runId)
+        pendingReceiptFinalizations.removeValue(forKey: runId)
+        receiptFinalizationRetryScheduled.remove(runId)
+        latestRunErrorMessages.removeValue(forKey: runId)
+        orchestrationDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
+        externalReceiptLeaseWorkItems.removeValue(forKey: runId)?.cancel()
+        activeAssistantMessageIds.removeValue(forKey: runId)
+        activeProviderTextItemTypes.removeValue(forKey: runId)
+        bufferedProviderTextItems.removeValue(forKey: runId)
+        providerTextTranslationsInFlight.removeValue(forKey: runId)
+        deferredProviderTerminalEvents.removeValue(forKey: runId)
+        activeDistillOutputRuns.remove(runId)
+        finishingRuns.remove(runId)
+        pendingTerminalEvents.removeValue(forKey: runId)
+        terminalRetryScheduled.remove(runId)
+        pendingStartFailures.removeValue(forKey: runId)
+        startFailureRetryScheduled.remove(runId)
+        awaitingTerminationRuns.remove(runId)
+        providerTerminatedRuns.remove(runId)
+        pendingGracefulStopFallbacks.remove(runId)
+        seq.removeValue(forKey: runId)
+        runThreadOwnership.removeValue(forKey: runId)
+        pendingLateRunValidations.removeValue(forKey: runId)
+    }
+
+    private enum DurableRunGraphStatus {
+        case present
+        case threadAbsent
+        case runAbsent
+    }
+
+    /// Owned callbacks never reach SQLite. Once normal ownership has drained,
+    /// the exact durable run-to-thread graph becomes the admission authority.
+    private func admitRunCallback(runId: AgentRunID, threadId: AgentThreadID) -> Bool {
+        let localState = lock.withLock { () -> (owned: Bool, rejected: Bool) in
+            if let pendingThreadId = pendingLateRunValidations[runId], pendingThreadId != threadId {
+                return (false, true)
+            }
+            if let owner = runThreadOwnership[runId], owner != threadId {
+                return (false, true)
+            }
+            let pending = pendingLateRunValidations[runId] != nil
+            if runThreadOwnership[runId] == threadId, !pending {
+                return (true, false)
+            }
+            if deletedThreadRetirementsInFlight.contains(threadId) {
+                return (false, true)
+            }
+            return (false, false)
+        }
+        if localState.owned { return true }
+        if localState.rejected { return false }
+
+        do {
+            return resolveLateRunGraphStatus(
+                try durableRunGraphStatus(runId: runId, threadId: threadId),
+                runId: runId,
+                threadId: threadId
+            )
+        } catch {
+            var admitted = false
+            lock.withLock {
+                if let pendingThreadId = pendingLateRunValidations[runId] {
+                    guard pendingThreadId == threadId else { return }
+                    return
+                }
+                if let owner = runThreadOwnership[runId] {
+                    admitted = owner == threadId
+                    return
+                }
+                guard !deletedThreadRetirementsInFlight.contains(threadId),
+                      pendingLateRunValidations.count < Self.pendingLateRunValidationLimit else {
+                    return
+                }
+                pendingLateRunValidations[runId] = threadId
+                rememberRunThreadOwnershipLocked(runId: runId, threadId: threadId)
+                admitted = true
+            }
+            if admitted { scheduleLateRunValidation(runId: runId, threadId: threadId) }
+            return admitted
+        }
+    }
+
+    private func durableRunGraphStatus(
+        runId: AgentRunID,
+        threadId: AgentThreadID
+    ) throws -> DurableRunGraphStatus {
+        #if DEBUG
+        if let presence = lateRunAdmissionPresenceOverrideForTesting {
+            return try presence(runId, threadId) ? .present : .runAbsent
+        }
+        #endif
+        guard try threadRepo.get(id: threadId) != nil else { return .threadAbsent }
+        guard let run = try runRepo.get(id: runId), run.threadId == threadId else {
+            return .runAbsent
+        }
+        return .present
+    }
+
+    private func resolveLateRunGraphStatus(
+        _ status: DurableRunGraphStatus,
+        runId: AgentRunID,
+        threadId: AgentThreadID
+    ) -> Bool {
+        switch status {
+        case .present:
+            return lock.withLock {
+                guard pendingLateRunValidations[runId].map({ $0 == threadId }) ?? true,
+                      runThreadOwnership[runId].map({ $0 == threadId }) ?? true else {
+                    return false
+                }
+                pendingLateRunValidations.removeValue(forKey: runId)
+                rememberRunThreadOwnershipLocked(runId: runId, threadId: threadId)
+                return true
+            }
+        case .threadAbsent:
+            purgeRejectedLateRun(runId: runId, threadId: threadId, threadAbsent: true)
+        case .runAbsent:
+            purgeRejectedLateRun(runId: runId, threadId: threadId, threadAbsent: false)
+        }
+        return false
+    }
+
+    private func purgeRejectedLateRun(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        threadAbsent: Bool
+    ) {
+        mirrorEventLock.lock()
+        lock.lock()
+        defer {
+            lock.unlock()
+            mirrorEventLock.unlock()
+        }
+        // A run that became active during the durable read owns its state. The
+        // next callback will use normal ownership rather than this late path.
+        guard active[runId] == nil, !activeThreads.values.contains(runId) else { return }
+        purgeRunRuntimeLocked(runId)
+        if threadAbsent, !hasUnsafeInMemoryOwnershipLocked(threadId) {
+            purgeDeletedThreadRuntimeLocked(threadId)
+        }
+    }
+
+    private func scheduleLateRunValidation(runId: AgentRunID, threadId: AgentThreadID) {
+        Task.detached { [weak self] in
+            for attempt in 0..<Self.lateRunValidationTimedRetryLimit {
+                let delay = Self.lateRunValidationRetryBaseDelayNanoseconds * UInt64(1 << attempt)
+                try? await Task.sleep(nanoseconds: delay)
+                guard let self,
+                      self.lock.withLock({ self.pendingLateRunValidations[runId] == threadId }) else {
+                    return
+                }
+                let status: DurableRunGraphStatus
+                do {
+                    status = try self.durableRunGraphStatus(runId: runId, threadId: threadId)
+                } catch {
+                    continue
+                }
+                _ = self.resolveLateRunGraphStatus(status, runId: runId, threadId: threadId)
+                return
+            }
         }
     }
 
@@ -3050,6 +3248,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             runId: runId,
             threadId: threadId
         )
+    }
+
+    func handleRunEventForTesting(
+        _ event: AgentRunEvent,
+        runId: AgentRunID,
+        threadId: AgentThreadID
+    ) {
+        handle(event: event, runId: runId, threadId: threadId)
+    }
+
+    var pendingLateRunValidationIDsForTesting: Set<AgentRunID> {
+        lock.withLock { Set(pendingLateRunValidations.keys) }
     }
 
     var runThreadOwnershipForTesting: [AgentRunID: AgentThreadID] {
@@ -4339,6 +4549,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         runId: AgentRunID,
         threadId: AgentThreadID
     ) {
+        guard admitRunCallback(runId: runId, threadId: threadId) else { return }
+        recordAdmittedReconciledTokenUsage(usage, runId: runId, threadId: threadId)
+    }
+
+    private func recordAdmittedReconciledTokenUsage(
+        _ usage: AssistantTokenUsage,
+        runId: AgentRunID,
+        threadId: AgentThreadID
+    ) {
         lock.lock()
         rememberRunThreadOwnershipLocked(runId: runId, threadId: threadId)
         var accumulator = reconciledTokenUsage[runId] ?? ReconciledTokenUsageAccumulator()
@@ -4536,9 +4755,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         allowFinalResponseTranslation: Bool = true,
         providerTerminalAcknowledged: Bool = true
     ) {
-        lock.lock()
-        rememberRunThreadOwnershipLocked(runId: runId, threadId: threadId)
-        lock.unlock()
+        guard admitRunCallback(runId: runId, threadId: threadId) else { return }
         switch event {
         case .event(let rawEvent):
             let ev = sanitizeFinalAssistantEvent(rawEvent)
@@ -4548,7 +4765,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 threadId: threadId
             )
             if case .tokenUsage(let usage) = ev {
-                recordReconciledTokenUsage(usage, runId: runId, threadId: threadId)
+                recordAdmittedReconciledTokenUsage(usage, runId: runId, threadId: threadId)
             }
             if allowFinalResponseTranslation,
                case .turnCompleted(let turnId, let finalMessage) = ev,
