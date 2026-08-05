@@ -262,6 +262,73 @@ public enum AgentCompletedWorkPresentation {
     }
 }
 
+// MARK: - Transcript order (anti-disorder)
+
+/// Stable total order for chat rows. Used by merge, paint window, and Lazy lists.
+/// Order key: (sortTime ascending, id ascending). Rematerialization MUST preserve
+/// the id sequence from the last structural merge — never re-sort by live payloads.
+public enum AgentTranscriptOrder {
+    public static func ordersBefore(
+        lhsTime: TimeInterval,
+        lhsId: String,
+        rhsTime: TimeInterval,
+        rhsId: String
+    ) -> Bool {
+        if lhsTime == rhsTime { return lhsId < rhsId }
+        return lhsTime < rhsTime
+    }
+
+    /// True when each adjacent pair is non-decreasing under the total order.
+    public static func isOrdered(
+        times: [TimeInterval],
+        ids: [String]
+    ) -> Bool {
+        guard times.count == ids.count, times.count > 1 else { return true }
+        for i in 1..<times.count {
+            if ordersBefore(
+                lhsTime: times[i],
+                lhsId: ids[i],
+                rhsTime: times[i - 1],
+                rhsId: ids[i - 1]
+            ) {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Returns `entries` unchanged when already ordered; otherwise a fully sorted copy.
+    public static func ensuringOrdered<T>(
+        _ entries: [T],
+        time: (T) -> TimeInterval,
+        id: (T) -> String
+    ) -> [T] {
+        guard entries.count > 1 else { return entries }
+        let times = entries.map(time)
+        let ids = entries.map(id)
+        if isOrdered(times: times, ids: ids) { return entries }
+        return entries.sorted {
+            ordersBefore(lhsTime: time($0), lhsId: id($0), rhsTime: time($1), rhsId: id($1))
+        }
+    }
+
+    /// Rematerialize payloads by id map while **preserving** `orderedIds` sequence.
+    /// Unknown ids are dropped (never inserted mid-list) so Lazy identity stays stable.
+    public static func rematerializePreservingOrder<T>(
+        orderedIds: [String],
+        payloadsById: [String: T]
+    ) -> [T] {
+        var out: [T] = []
+        out.reserveCapacity(orderedIds.count)
+        for id in orderedIds {
+            if let payload = payloadsById[id] {
+                out.append(payload)
+            }
+        }
+        return out
+    }
+}
+
 // MARK: - Turn chat composition (macOS ↔ iOS parity)
 
 /// Single rule for every turn in the Agent chat:

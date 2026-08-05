@@ -190,6 +190,70 @@ final class AgentChatUXPresentationTests: XCTestCase {
         XCTAssertEqual(rebuilt.mode, "full_rebuild")
     }
 
+    func test_splitTrailingLiveTurns_preservesOrder_andKeepsLiveEager() {
+        // WHY: Lazy history + eager live tail must reassemble to the same sequence;
+        // a finished entry after a live turn must stay in the eager suffix so the
+        // still-streaming row never migrates into LazyVStack.
+        let finished = AssistantTurnSnapshot(
+            turnId: "done",
+            items: [AssistantItem(id: "i", turnId: "done", type: .tool, state: .completed, startedAtMs: 1, finishedAtMs: 2)],
+            finished: true
+        )
+        let live = AssistantTurnSnapshot(
+            turnId: "live",
+            items: [AssistantItem(id: "j", turnId: "live", type: .tool, state: .streaming, startedAtMs: 3)],
+            finished: false
+        )
+        let afterLive = AssistantTurnSnapshot(
+            turnId: "after",
+            items: [AssistantItem(id: "k", turnId: "after", type: .tool, state: .completed, startedAtMs: 4, finishedAtMs: 5)],
+            finished: true
+        )
+        let msg = AgentMessage(
+            id: AgentMessageID(),
+            threadId: AgentThreadID(),
+            role: .user,
+            content: "hi",
+            createdAt: Date(timeIntervalSince1970: 0.5)
+        )
+        let entries: [AgentAppView.TranscriptEntry] = [
+            .message(msg),
+            .turn(finished),
+            .turn(live),
+            .turn(afterLive),
+        ]
+        let split = AgentAppView.splitTrailingLiveTurns(entries)
+        XCTAssertEqual(split.history.map(\.id), [entries[0].id, entries[1].id])
+        XCTAssertEqual(split.liveTail.map(\.id), [entries[2].id, entries[3].id])
+        XCTAssertEqual(
+            (split.history + split.liveTail).map(\.id),
+            entries.map(\.id),
+            "history+liveTail must equal original order"
+        )
+    }
+
+    func test_transcriptOrder_ensuringOrdered_fixesInversionWithoutDuplicates() {
+        // WHY: Lazy lists require a stable total order; disorder would reshuffle rows mid-stream.
+        struct E: Equatable { let id: String; let t: TimeInterval }
+        let disordered = [
+            E(id: "message-b", t: 2),
+            E(id: "message-a", t: 1),
+            E(id: "turn-z", t: 1.5),
+        ]
+        let ordered = AgentTranscriptOrder.ensuringOrdered(disordered, time: \.t, id: \.id)
+        XCTAssertEqual(ordered.map(\.id), ["message-a", "turn-z", "message-b"])
+        let already = AgentTranscriptOrder.ensuringOrdered(ordered, time: \.t, id: \.id)
+        XCTAssertEqual(already.map(\.id), ordered.map(\.id), "already-ordered list must not reshuffle")
+        XCTAssertTrue(
+            AgentTranscriptOrder.isOrdered(times: ordered.map(\.t), ids: ordered.map(\.id))
+        )
+        let remat = AgentTranscriptOrder.rematerializePreservingOrder(
+            orderedIds: ["message-a", "turn-z", "message-b"],
+            payloadsById: ["message-a": "A", "message-b": "B", "turn-z": "T", "extra": "X"]
+        )
+        XCTAssertEqual(remat, ["A", "T", "B"], "rematerialize keeps sequence; never inserts unknown mid-list")
+    }
+
     func test_workDisclosureLayout_paintSliceAndDiffPreview() {
         let all = Array(0..<100)
         let slice = AgentWorkDisclosureLayout.paintSlice(all: all, revealCount: 0)

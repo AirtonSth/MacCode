@@ -8758,10 +8758,11 @@ public struct AgentAppView: View {
             case .message(let message):
                 return message.createdAt.timeIntervalSince1970
             case .turn(let turn):
-                // Prefer first item time (stable once content exists). Fall back to
-                // turn.startedAtMs so an empty live turn does not sort at epoch 0
-                // (which placed Thinking… *above* the user message that triggered it).
-                if let started = turn.items.map(\.startedAtMs).min() {
+                // Anti-disorder: freeze on first item's startedAt (append order), not
+                // min() — a later parallel tool with an earlier host stamp must not
+                // pull the turn backward mid-stream. Fall back to turn.startedAtMs
+                // so empty live turns do not sort at epoch 0 (above the user bubble).
+                if let started = turn.items.lazy.compactMap(\.startedAtMs).first {
                     return TimeInterval(started) / 1000
                 }
                 if let started = turn.startedAtMs {
@@ -8809,8 +8810,41 @@ public struct AgentAppView: View {
     /// total order (deterministic regardless of sort stability). Message and turn
     /// ids carry distinct prefixes, so two entries never tie on (sortTime, id).
     nonisolated static func transcriptEntryOrdersBefore(_ lhs: TranscriptEntry, _ rhs: TranscriptEntry) -> Bool {
-        if lhs.sortTime == rhs.sortTime { return lhs.id < rhs.id }
-        return lhs.sortTime < rhs.sortTime
+        AgentTranscriptOrder.ordersBefore(
+            lhsTime: lhs.sortTime,
+            lhsId: lhs.id,
+            rhsTime: rhs.sortTime,
+            rhsId: rhs.id
+        )
+    }
+
+    /// Fail-closed paint order: if anything inverted the list, re-sort once.
+    nonisolated static func ensuringTranscriptOrder(_ entries: [TranscriptEntry]) -> [TranscriptEntry] {
+        AgentTranscriptOrder.ensuringOrdered(
+            entries,
+            time: \.sortTime,
+            id: \.id
+        )
+    }
+
+    /// Unfinished turns (from the **first** live entry through the end) stay
+    /// **eager** outside LazyVStack so streaming rows never participate in lazy
+    /// placement. Position-based "peel only the trailing unfinished" leaked a
+    /// still-live row into Lazy when any later entry sorted after it. Order is
+    /// preserved: history + liveTail == original sequence.
+    nonisolated static func splitTrailingLiveTurns(
+        _ entries: [TranscriptEntry]
+    ) -> (history: [TranscriptEntry], liveTail: [TranscriptEntry]) {
+        guard let firstLive = entries.firstIndex(where: {
+            if case .turn(let turn) = $0 { return !turn.finished }
+            return false
+        }) else {
+            return (entries, [])
+        }
+        return (
+            Array(entries.prefix(firstLive)),
+            Array(entries.suffix(from: firstLive))
+        )
     }
 
     /// F7: build the merged transcript in O(N) by merging two already-ordered
@@ -8892,7 +8926,9 @@ public struct AgentAppView: View {
             transcriptCache.entries = refreshed
             return refreshed
         }
-        let merged = Self.mergeTranscriptEntries(messages: vm.messages, turns: vm.timeline.turns)
+        let merged = Self.ensuringTranscriptOrder(
+            Self.mergeTranscriptEntries(messages: vm.messages, turns: vm.timeline.turns)
+        )
         transcriptCache.signature = signature
         transcriptCache.entries = merged
         return merged
@@ -10031,33 +10067,47 @@ public struct AgentAppView: View {
                     // User bubbles size against this content column, not the raw viewport.
                     let timelineColumnWidth = max(0, viewport.size.width - 44)
                     ScrollView {
-                        // PERF-MAC_AGENT-022: the live transcript is already bounded.
-                        // `LazyVStack` repeatedly hit SwiftUI LazyLayout placement loops
-                        // while rows streamed in/out, so use an eager stack for the small
-                        // visible window and keep full history in the model.
-                        VStack(alignment: .leading, spacing: 32) {
-                            let allEntries = transcriptEntries
-                            let entries = Self.visibleTranscriptWindow(
+                        // Viewport virtualization: LazyVStack releases off-screen rows.
+                        // Guardrails vs historical LazyLayout loops (PERF-MAC_AGENT-022):
+                        // 1) Stable row .id = TranscriptEntry.id (never index-based)
+                        // 2) Order from single merge; rematerialize never re-sorts
+                        // 3) ensuringTranscriptOrder before paint (anti-disorder)
+                        // 4) Pin geometry via TimelineScrollFollower, not preference loops
+                        let allEntries = Self.ensuringTranscriptOrder(transcriptEntries)
+                        let entries = Self.ensuringTranscriptOrder(
+                            Self.visibleTranscriptWindow(
                                 entries: allEntries,
                                 status: vm.status,
                                 runStartedAt: vm.runStartedAt
                             )
-                            let hiddenCount = Self.hiddenTranscriptCount(
-                                totalCount: allEntries.count,
-                                visibleCount: entries.count
-                            )
-                            let revealedHiddenCount = min(
-                                vm.transcriptHistoryRevealCount,
-                                hiddenCount
-                            )
-                            TimelineScrollFollower(
-                                slack: Self.timelineBottomRevealSlack,
-                                pinned: timelineSticksToBottom,
-                                onScrolledAway: { onTimelineScrolledAway() },
-                                onReturnedToBottom: { onTimelineReturnedToBottom() }
-                            )
-                            .frame(width: 0, height: 0)
-                            .accessibilityHidden(true)
+                        )
+                        let hiddenCount = Self.hiddenTranscriptCount(
+                            totalCount: allEntries.count,
+                            visibleCount: entries.count
+                        )
+                        let revealedHiddenCount = min(
+                            vm.transcriptHistoryRevealCount,
+                            hiddenCount
+                        )
+                        // History (lazy, releases off-screen) + trailing live turns
+                        // eager (advisor: streaming row never inside Lazy placement).
+                        let split = Self.splitTrailingLiveTurns(entries)
+                        let historyEntries: [TranscriptEntry] = {
+                            var h = split.history
+                            if revealedHiddenCount > 0 {
+                                let older = Self.ensuringTranscriptOrder(
+                                    Self.hiddenTranscriptRevealWindow(
+                                        allItems: allEntries,
+                                        visibleWindow: entries,
+                                        revealCount: revealedHiddenCount
+                                    )
+                                )
+                                h = Self.ensuringTranscriptOrder(older + h)
+                            }
+                            return h
+                        }()
+                        let liveTail = split.liveTail
+                        VStack(alignment: .leading, spacing: 32) {
                             if vm.messageHistoryIsPartial {
                                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                                     Text("Showing the recent message window. Earlier messages remain stored locally.")
@@ -10081,6 +10131,7 @@ public struct AgentAppView: View {
                                     .disabled(vm.isLoadingOlderMessages)
                                     .accessibilityIdentifier("agent.transcript.loadOlderMessages")
                                 }
+                                .id("agent.transcript.partialHeader")
                             }
                             if hiddenCount > 0 {
                                 runningHiddenTranscriptRow(
@@ -10094,34 +10145,25 @@ public struct AgentAppView: View {
                                         )
                                     }
                                 )
+                                .id("agent.transcript.revealControl")
                             }
-                            if revealedHiddenCount > 0 {
-                                let hiddenEntries = Self.hiddenTranscriptRevealWindow(
-                                    allItems: allEntries,
-                                    visibleWindow: entries,
-                                    revealCount: revealedHiddenCount
-                                )
-                                ForEach(hiddenEntries) { entry in
-                                    switch entry {
-                                    case .message(let message):
-                                        messageRow(message, columnWidth: timelineColumnWidth)
-                                    case .turn(let turn):
-                                        turnView(turn)
-                                    }
+                            // Finished / stable history — Lazy releases off-screen.
+                            LazyVStack(alignment: .leading, spacing: 32) {
+                                ForEach(historyEntries) { entry in
+                                    transcriptEntryRow(entry, columnWidth: timelineColumnWidth)
+                                        .id(entry.id)
                                 }
                             }
-                            ForEach(entries) { entry in
-                                switch entry {
-                                case .message(let message):
-                                    messageRow(message, columnWidth: timelineColumnWidth)
-                                case .turn(let turn):
-                                    turnView(turn)
-                                }
+                            // Live streaming turns — eager, outside Lazy.
+                            ForEach(liveTail) { entry in
+                                transcriptEntryRow(entry, columnWidth: timelineColumnWidth)
+                                    .id(entry.id)
                             }
                             // B-1: one chip for the whole thread, after the newest
                             // finished answer — never N copies under every final.
                             if !vm.selectedThreadRunIsStartingOrRunning {
                                 tokenSaverThreadFooter()
+                                    .id("agent.tokenSaver.footer")
                             }
                             if Self.shouldRenderActivePlan(
                                 plan: vm.activePlan,
@@ -10130,26 +10172,30 @@ public struct AgentAppView: View {
                                 newestUserMessageAt: vm.messages.last(where: { $0.role == .user })?.createdAt
                             ), let plan = vm.activePlan {
                                 activePlanRow(plan)
+                                    .id("agent.activePlan")
                             }
                             if vm.messages.isEmpty && vm.timeline.turns.isEmpty && vm.timeline.error == nil {
                                 emptyConversation
+                                    .id("agent.emptyConversation")
                             }
-                            if vm.selectedThreadRunIsStartingOrRunning { workingStatus }
-                            else if vm.selectedThreadIsPreparingRun { loadingStatus }
-                            if let err = vm.timeline.error { errorRow(err) }
-                            // UX-MAC_AGENT-CONTINUE: show inline Continue only when the
-                            // selected thread was interrupted by a relaunch and is not
-                            // currently running. One tap replays recoverableResumeContext.
+                            if vm.selectedThreadRunIsStartingOrRunning {
+                                workingStatus
+                                    .id("agent.workingStatus")
+                            } else if vm.selectedThreadIsPreparingRun {
+                                loadingStatus
+                                    .id("agent.loadingStatus")
+                            }
+                            if let err = vm.timeline.error {
+                                errorRow(err)
+                                    .id("agent.timeline.error")
+                            }
                             if AgentAppViewModel.showsContinueAction(
                                 hasRecoverableContext: vm.selectedThreadHasRecoverableContext,
                                 runActive: vm.selectedThreadRunIsStartingOrRunning
-                            ) { interruptedContinueRow }
-                            // Scroll-to target only. Bottom detection is handled by the
-                            // AppKit TimelineScrollFollower above — NOT by a per-layout
-                            // GeometryReader preference, which fed onPreferenceChange -> @State
-                            // writes -> body invalidation -> re-layout -> new maxY ... a
-                            // self-sustaining layout loop that froze the UI on scroll
-                            // (PERF-MAC_AGENT-021).
+                            ) {
+                                interruptedContinueRow
+                                    .id("agent.continue.interrupted")
+                            }
                             Color.clear
                                 .frame(height: 1)
                                 .id("BOTTOM")
@@ -10158,6 +10204,17 @@ public struct AgentAppView: View {
                         .padding(.vertical, 32)
                         .frame(width: viewport.size.width, alignment: .leading)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    // Pin probe outside lazy content (advisor rule 3).
+                    .background(alignment: .top) {
+                        TimelineScrollFollower(
+                            slack: Self.timelineBottomRevealSlack,
+                            pinned: timelineSticksToBottom,
+                            onScrolledAway: { onTimelineScrolledAway() },
+                            onReturnedToBottom: { onTimelineReturnedToBottom() }
+                        )
+                        .frame(width: 0, height: 0)
+                        .accessibilityHidden(true)
                     }
                     .coordinateSpace(name: "agentTimeline")
                     .background(DS.Palette.bg)
@@ -11607,6 +11664,16 @@ public struct AgentAppView: View {
                 .italic()
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder
+    private func transcriptEntryRow(_ entry: TranscriptEntry, columnWidth: CGFloat) -> some View {
+        switch entry {
+        case .message(let message):
+            messageRow(message, columnWidth: columnWidth)
+        case .turn(let turn):
+            turnView(turn)
         }
     }
 
