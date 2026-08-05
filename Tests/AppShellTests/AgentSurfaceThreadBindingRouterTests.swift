@@ -380,6 +380,9 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         let (ctx, router) = try makeRouter(dir)
         let workspace = try router.createWorkspace(name: "ROUTED-CAP", cwd: NSTemporaryDirectory())
         defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        closeAndUnregisterAgentSurfaces(workspace: workspace.id)
+        XCTAssertTrue(agentSurfaces(in: workspace.id).isEmpty,
+                      "the routed RPC cap path must publish its victim without an open Agent surface")
         let oldest = Date(timeIntervalSince1970: 1_700_000_000)
         var victim = AgentThread(workspaceId: workspace.id, title: "routed victim", provider: .codex, model: "m")
         victim.status = .completed

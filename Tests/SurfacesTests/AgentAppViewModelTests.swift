@@ -7215,7 +7215,7 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(vm.threads.contains(where: { $0.id == deleted.id }),
                       "precondition: the failed cross-process reconciliation leaves a stale rail snapshot")
 
-        vm.selectThread(deleted.id)
+        vm.selectThread(deleted.id, markRead: false)
 
         XCTAssertNil(vm.selectedThreadId,
                      "repository absence must win over stale in-memory rail membership")
