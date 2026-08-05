@@ -4836,9 +4836,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     private func sanitizeFinalAssistantText(_ text: String) -> String {
         // Shared provider-agnostic choke point for final assistant text: strip
-        // unresolved CCR handles, then strip raw tool-invocation markup (and leave
-        // the uncalled-tool incomplete-turn signal). Covers claude / codex / grok.
-        AssistantToolMarkupSanitizer.sanitize(RetrieveHandleSanitizer.strip(text))
+        // leaked model control tokens (e.g. Grok `<|eos|>`), then unresolved CCR
+        // handles, then raw tool-invocation markup (leaving the uncalled-tool
+        // incomplete-turn signal). Covers claude / codex / grok.
+        AssistantToolMarkupSanitizer.sanitize(
+            RetrieveHandleSanitizer.strip(
+                ProviderControlTokenSanitizer.strip(text)
+            )
+        )
     }
 
     private func sanitizeFinalAssistantText(_ text: String?) -> String? {
@@ -4855,10 +4860,30 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     }
 
     private func sanitizeFinalAssistantEvent(_ ev: AssistantEvent) -> AssistantEvent {
-        if case .turnCompleted(let turnId, let finalMessage) = ev {
+        switch ev {
+        case .turnCompleted(let turnId, let finalMessage):
             return .turnCompleted(turnId: turnId, finalMessage: sanitizeFinalAssistantText(finalMessage))
+        case .itemDelta(let itemId, let bodyAppend, let outputAppend, let summary):
+            // Defense in depth for live stream: drop leaked control tokens from
+            // body deltas without trimming (preserves inter-chunk whitespace).
+            guard let bodyAppend, ProviderControlTokenSanitizer.containsControlToken(bodyAppend) else {
+                return ev
+            }
+            let cleaned = ProviderControlTokenSanitizer.stripStreamingChunk(bodyAppend)
+            if cleaned.isEmpty, outputAppend == nil, summary == nil {
+                // Token-only delta — emit a no-op empty body so callers keep
+                // item identity without flashing `<|eos|>`.
+                return .itemDelta(itemId: itemId, bodyAppend: "", outputAppend: nil, summary: nil)
+            }
+            return .itemDelta(
+                itemId: itemId,
+                bodyAppend: cleaned.isEmpty ? nil : cleaned,
+                outputAppend: outputAppend,
+                summary: summary
+            )
+        default:
+            return ev
         }
-        return ev
     }
 
     private func recordReconciledTokenUsage(

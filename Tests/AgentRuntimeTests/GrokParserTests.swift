@@ -171,6 +171,28 @@ final class GrokParserTests: XCTestCase {
         XCTAssertEqual(parser.capturedSessionId, "preassigned")
     }
 
+    /// CLI path parity with GrokACPEventMapper: leaked `<|eos|>` must not appear
+    /// in streamed deltas or turnCompleted.finalMessage.
+    func test_stripsLeakedControlTokensFromTextStream() {
+        let parser = GrokParser()
+        var events: [AssistantEvent] = []
+        events += parser.parseLine(#"{"type":"text","data":"Repos"}"#)
+        events += parser.parseLine(#"{"type":"text","data":"8"}"#)
+        events += parser.parseLine(#"{"type":"text","data":"<|eos|>"}"#)
+        events += parser.parseLine(#"{"type":"end","stopReason":"EndTurn"}"#)
+
+        let text = events.compactMap { ev -> String? in
+            if case .itemDelta(_, let body, _, _) = ev { return body }
+            return nil
+        }.joined()
+        XCTAssertEqual(text, "Repos8")
+        XCTAssertFalse(text.contains("<|eos|>"))
+        XCTAssertTrue(events.contains {
+            if case .turnCompleted(_, let final) = $0 { return final == "Repos8" }
+            return false
+        })
+    }
+
     func test_toolCallClosesOpenReasoning() {
         let parser = GrokParser()
         var events: [AssistantEvent] = []

@@ -15,6 +15,10 @@ public final class GrokACPEventMapper: @unchecked Sendable {
     private var reasoningItemId: String?
     private var assistantItemId: String?
     private var currentAssistantPhase = ""
+    /// Last non-empty assistant phase before a tool_call reset. Used only when
+    /// the trailing phase is empty after control-token strip (pure `<|eos|>`)
+    /// so finishTurn does not yield a nil final after a turn that already spoke.
+    private var lastNonEmptyAssistantPhase = ""
     private var finished = false
     private var seenEventIds = Set<String>()
     /// Shell-detached work Grok does NOT track: a tool_call whose rawInput
@@ -50,6 +54,7 @@ public final class GrokACPEventMapper: @unchecked Sendable {
             turnId = id
             finished = false
             currentAssistantPhase = ""
+            lastNonEmptyAssistantPhase = ""
             finalAssistantMessage = nil
             sawDetachedShellSpawn = false
             events.append(.turnStarted(turnId: id))
@@ -70,6 +75,7 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         turnId = nil
         finished = true
         currentAssistantPhase = ""
+        lastNonEmptyAssistantPhase = ""
         finalAssistantMessage = nil
         sawDetachedShellSpawn = false
     }
@@ -100,6 +106,9 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         case "agent_thought_chunk":
             let text = Self.contentText(update["content"])
             guard !text.isEmpty else { return events }
+            if !currentAssistantPhase.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                lastNonEmptyAssistantPhase = currentAssistantPhase
+            }
             closeAssistant(&events)
             currentAssistantPhase = ""
             let itemId = openReasoning(&events, now: now)
@@ -116,6 +125,11 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         case "tool_call":
             closeReasoning(&events)
             closeAssistant(&events)
+            // Preserve last real answer phase before tools; pure-EOS tail after
+            // tools can fall back instead of wiping the visible final entirely.
+            if !currentAssistantPhase.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                lastNonEmptyAssistantPhase = currentAssistantPhase
+            }
             currentAssistantPhase = ""
             let id = update["toolCallId"] as? String ?? UUID().uuidString
             let title = update["title"] as? String ?? "Grok tool"
@@ -269,7 +283,13 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         closeOpenItems(&events)
         guard let turnId else { return events }
         finished = true
-        var final = currentAssistantPhase.isEmpty ? nil : currentAssistantPhase
+        // Prefer the trailing phase; if it is empty after control-token strip
+        // (pure `<|eos|>`), fall back to the last non-empty pre-tool phase so
+        // a turn that already spoke does not persist a nil/missing answer.
+        let trailing = currentAssistantPhase.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = lastNonEmptyAssistantPhase.trimmingCharacters(in: .whitespacesAndNewlines)
+        var final: String? = !trailing.isEmpty ? currentAssistantPhase
+            : (!fallback.isEmpty ? lastNonEmptyAssistantPhase : nil)
         // Stamp only for a COMPLETED turn (end_turn). Never for failed/cancelled.
         // Single stamp on finalAssistantMessage so both .turnCompleted here and
         // adapter .finished (which reads the same property) see the marker once.
@@ -280,6 +300,7 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         events.append(.turnCompleted(turnId: turnId, finalMessage: finalAssistantMessage))
         self.turnId = nil
         currentAssistantPhase = ""
+        lastNonEmptyAssistantPhase = ""
         sawDetachedShellSpawn = false
         return events
     }
@@ -308,6 +329,7 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         turnId = id
         finished = false
         currentAssistantPhase = ""
+        lastNonEmptyAssistantPhase = ""
         sawDetachedShellSpawn = false
         events.append(.turnStarted(turnId: id))
     }
@@ -365,9 +387,19 @@ public final class GrokACPEventMapper: @unchecked Sendable {
     }
 
     private static func contentText(_ value: Any?) -> String {
-        if let string = value as? String { return string }
-        guard let content = value as? [String: Any] else { return "" }
-        return content["text"] as? String ?? ""
+        let raw: String
+        if let string = value as? String {
+            raw = string
+        } else if let content = value as? [String: Any] {
+            raw = content["text"] as? String ?? ""
+        } else {
+            raw = ""
+        }
+        // Grok occasionally streams tokenizer control markers into
+        // agent_message_chunk / agent_thought_chunk (live incident: final body
+        // was literally `Repos8<|eos|>`). Drop them at the parse seam so the
+        // timeline, finalMessage, and UI never see them.
+        return ProviderControlTokenSanitizer.stripStreamingChunk(raw)
     }
 
     private static func toolOutput(_ update: [String: Any]) -> String? {

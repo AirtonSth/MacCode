@@ -678,6 +678,96 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(mapper.latestUsage?.totalTokens, 12)
     }
 
+    /// Live incident: last agent_message_chunk phase was `Repos` + `8` + `<|eos|>`
+    /// and became the only visible final answer. Control tokens must never reach
+    /// turnCompleted.finalMessage or itemDelta bodies.
+    func test_mapperStripsLeakedControlTokensFromFinalAndDeltas() {
+        let mapper = GrokACPEventMapper(sessionId: "grok-eos-leak")
+        var events: [AssistantEvent] = []
+        events += mapper.beginTurn()
+        events += mapper.consumeSessionUpdate([
+            "sessionUpdate": "agent_message_chunk",
+            "content": ["type": "text", "text": "Repos"]
+        ])
+        events += mapper.consumeSessionUpdate([
+            "sessionUpdate": "agent_message_chunk",
+            "content": ["type": "text", "text": "8"]
+        ])
+        events += mapper.consumeSessionUpdate([
+            "sessionUpdate": "agent_message_chunk",
+            "content": ["type": "text", "text": "<|eos|>"]
+        ])
+        events += mapper.finishTurn(stopReason: "end_turn", usage: nil)
+
+        let deltaBodies = events.compactMap { ev -> String? in
+            if case .itemDelta(_, let body, _, _) = ev { return body }
+            return nil
+        }
+        XCTAssertFalse(deltaBodies.contains { $0.contains("<|") || $0.contains("|>") },
+                       "streamed itemDelta must never carry control tokens")
+        XCTAssertEqual(deltaBodies.joined(), "Repos8")
+        XCTAssertTrue(events.contains {
+            if case .turnCompleted(_, let final) = $0 { return final == "Repos8" }
+            return false
+        }, "final must strip <|eos|> while keeping residual prose")
+        XCTAssertEqual(mapper.finalAssistantMessage, "Repos8")
+    }
+
+    func test_mapperPureEosPhaseYieldsNilFinalMessage() {
+        let mapper = GrokACPEventMapper(sessionId: "grok-eos-only")
+        var events: [AssistantEvent] = []
+        events += mapper.beginTurn()
+        events += mapper.consumeSessionUpdate([
+            "sessionUpdate": "agent_message_chunk",
+            "content": ["type": "text", "text": "<|eos|>"]
+        ])
+        events += mapper.finishTurn(stopReason: "end_turn", usage: nil)
+
+        XCTAssertTrue(events.contains {
+            if case .turnCompleted(_, let final) = $0 { return final == nil }
+            return false
+        }, "token-only final phase must not invent a visible answer")
+        XCTAssertNil(mapper.finalAssistantMessage)
+        XCTAssertFalse(events.contains {
+            if case .itemDelta(_, let body, _, _) = $0 { return body?.isEmpty == false }
+            return false
+        }, "token-only chunks must not open a non-empty assistant delta")
+    }
+
+    /// After tools, a pure `<|eos|>` tail must fall back to the pre-tool phase
+    /// so finishTurn does not wipe a turn that already spoke.
+    func test_mapperFallsBackToPreToolPhaseWhenTrailingPhaseIsOnlyEos() {
+        let mapper = GrokACPEventMapper(sessionId: "grok-eos-fallback")
+        var events: [AssistantEvent] = []
+        events += mapper.beginTurn()
+        events += mapper.consumeSessionUpdate([
+            "sessionUpdate": "agent_message_chunk",
+            "content": ["type": "text", "text": "preface answer"]
+        ])
+        events += mapper.consumeSessionUpdate([
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t1",
+            "title": "read_file",
+            "rawInput": ["path": "a.txt"]
+        ])
+        events += mapper.consumeSessionUpdate([
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t1",
+            "status": "completed"
+        ])
+        events += mapper.consumeSessionUpdate([
+            "sessionUpdate": "agent_message_chunk",
+            "content": ["type": "text", "text": "<|eos|>"]
+        ])
+        events += mapper.finishTurn(stopReason: "end_turn", usage: nil)
+
+        XCTAssertTrue(events.contains {
+            if case .turnCompleted(_, let final) = $0 { return final == "preface answer" }
+            return false
+        }, "empty trailing phase after control-token strip must fall back to last real phase")
+        XCTAssertEqual(mapper.finalAssistantMessage, "preface answer")
+    }
+
     func test_loadReplayEventIdsAreDeduplicated() {
         let mapper = GrokACPEventMapper(sessionId: "s")
         let update: [String: Any] = [

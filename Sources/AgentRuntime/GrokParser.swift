@@ -27,6 +27,9 @@ public final class GrokParser {
     private var reasoningItemId: String?
     private var assistantItemId: String?
     private var assembledAssistantBody = ""
+    /// Last non-empty assistant phase before tools/thought reset. Pure-EOS
+    /// trailing phase falls back to this so finalMessage is not wiped to nil.
+    private var lastNonEmptyAssistantPhase = ""
     private var turnFinished = false
 
     public var capturedSessionId: String? { sessionId }
@@ -54,7 +57,10 @@ public final class GrokParser {
             // Terminal UX: a new thought phase after answer/tool text is a *new*
             // Thinking… row (chronological), not more tokens on the first Thought
             // block sitting above the message.
-            if assistantItemId != nil { assembledAssistantBody = "" }
+            if assistantItemId != nil {
+                rememberAssistantPhaseBeforeReset()
+                assembledAssistantBody = ""
+            }
             closeAssistantItem(&out)
             let itemId = openReasoningItem(&out, now: now)
             out.append(.itemDelta(itemId: itemId, bodyAppend: chunk, outputAppend: nil, summary: nil))
@@ -86,8 +92,7 @@ public final class GrokParser {
             closeOpenItems(&out)
             if let turnId = currentTurnId, !turnFinished {
                 turnFinished = true
-                let final = assembledAssistantBody.isEmpty ? nil : assembledAssistantBody
-                out.append(.turnCompleted(turnId: turnId, finalMessage: final))
+                out.append(.turnCompleted(turnId: turnId, finalMessage: resolvedFinalMessage()))
             }
 
         case "error":
@@ -108,7 +113,10 @@ public final class GrokParser {
         case "tool_call", "tool_use", "tool":
             ensureTurn(&out)
             // Tools break a thought phase (same as the Grok TUI timeline order).
-            if assistantItemId != nil { assembledAssistantBody = "" }
+            if assistantItemId != nil {
+                rememberAssistantPhaseBeforeReset()
+                assembledAssistantBody = ""
+            }
             closeReasoningItem(&out)
             closeAssistantItem(&out)
             let name = (obj["name"] as? String)
@@ -148,8 +156,7 @@ public final class GrokParser {
         closeOpenItems(&out)
         if let turnId = currentTurnId, !turnFinished {
             turnFinished = true
-            let final = assembledAssistantBody.isEmpty ? nil : assembledAssistantBody
-            out.append(.turnCompleted(turnId: turnId, finalMessage: final))
+            out.append(.turnCompleted(turnId: turnId, finalMessage: resolvedFinalMessage()))
         }
         return out
     }
@@ -157,10 +164,32 @@ public final class GrokParser {
     // MARK: - Internals
 
     private func textChunk(from obj: [String: Any]) -> String {
-        if let s = obj["data"] as? String { return s }
-        if let s = obj["text"] as? String { return s }
-        if let s = obj["content"] as? String { return s }
-        return ""
+        let raw: String
+        if let s = obj["data"] as? String {
+            raw = s
+        } else if let s = obj["text"] as? String {
+            raw = s
+        } else if let s = obj["content"] as? String {
+            raw = s
+        } else {
+            raw = ""
+        }
+        // Same control-token defense as GrokACPEventMapper.contentText — CLI
+        // streaming-json can leak `<|eos|>` into type=text / type=thought.
+        return ProviderControlTokenSanitizer.stripStreamingChunk(raw)
+    }
+
+    private func rememberAssistantPhaseBeforeReset() {
+        if !assembledAssistantBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lastNonEmptyAssistantPhase = assembledAssistantBody
+        }
+    }
+
+    private func resolvedFinalMessage() -> String? {
+        let trailing = assembledAssistantBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trailing.isEmpty { return assembledAssistantBody }
+        let fallback = lastNonEmptyAssistantPhase.trimmingCharacters(in: .whitespacesAndNewlines)
+        return fallback.isEmpty ? nil : lastNonEmptyAssistantPhase
     }
 
     private func ensureThread(_ out: inout [AssistantEvent]) {
