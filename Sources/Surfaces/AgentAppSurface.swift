@@ -8105,11 +8105,8 @@ public struct AgentAppView: View {
     @State private var showCustomModelField = false
     @State private var customModelDraft = ""
     /// Composer Simple (attach/model/send) vs Power (full toolbar).
-    @AppStorage("agent.composer.chromeMode.v1") private var composerChromeModeRaw =
-        AgentComposerChromeMode.simple.rawValue
-    private var composerChromeMode: AgentComposerChromeMode {
-        AgentComposerChromeMode(rawValue: composerChromeModeRaw) ?? .simple
-    }
+    /// Always full chrome — no Simple/Power collapse toggle on macOS.
+    private var composerChromeMode: AgentComposerChromeMode { .power }
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
@@ -12724,7 +12721,6 @@ public struct AgentAppView: View {
             if AgentComposerChromePresentation.shows(.execution, mode: composerChromeMode) {
                 executionMenu
             }
-            composerChromeModeToggle
             Spacer(minLength: DS.Space.xs)
             if vm.selectedThreadRunIsStartingOrRunning {
                 Image(systemName: "arrow.triangle.2.circlepath")
@@ -12744,27 +12740,6 @@ public struct AgentAppView: View {
                 sendStopButton
             }
         }
-    }
-
-    private var composerChromeModeToggle: some View {
-        Button {
-            let current = composerChromeMode
-            composerChromeModeRaw = (current == .simple ? AgentComposerChromeMode.power : .simple).rawValue
-        } label: {
-            Image(systemName: composerChromeMode == .simple ? "chevron.up.circle" : "chevron.down.circle")
-                .font(.system(size: 12, weight: .medium))
-                .frame(width: 26, height: 26)
-        }
-        .buttonStyle(.plain)
-        .foregroundColor(DS.Palette.textSecondary)
-        .help(composerChromeMode == .simple
-              ? AgentComposerChromePresentation.toggleAccessibilityLabelSimple
-              : AgentComposerChromePresentation.toggleAccessibilityLabelPower)
-        .accessibilityLabel(composerChromeMode == .simple
-            ? AgentComposerChromePresentation.toggleAccessibilityLabelSimple
-            : AgentComposerChromePresentation.toggleAccessibilityLabelPower)
-        .accessibilityIdentifier("agent.composer.chromeMode")
-        .accessibilityValue(composerChromeMode.rawValue)
     }
 
     // MARK: System status strip + working phase strip

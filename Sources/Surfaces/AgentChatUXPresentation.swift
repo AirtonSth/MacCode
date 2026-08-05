@@ -224,8 +224,8 @@ public enum AgentComposerChromeControl: String, Sendable, Equatable, CaseIterabl
 }
 
 /// Pure control visibility for composer Simple vs Power chrome.
-/// WHY: default power users still need attach/model/send; advanced identity and
-/// safety controls stay one gesture away to reduce footer density.
+/// macOS Agent App always paints `.power` (no collapse toggle). The simple set
+/// remains for unit tests and any non-macOS caller that still densifies.
 public enum AgentComposerChromePresentation {
     public static func controls(for mode: AgentComposerChromeMode) -> Set<AgentComposerChromeControl> {
         switch mode {
@@ -239,9 +239,6 @@ public enum AgentComposerChromePresentation {
     public static func shows(_ control: AgentComposerChromeControl, mode: AgentComposerChromeMode) -> Bool {
         controls(for: mode).contains(control)
     }
-
-    public static let toggleAccessibilityLabelSimple = "Show advanced composer controls"
-    public static let toggleAccessibilityLabelPower = "Hide advanced composer controls"
 }
 
 // MARK: - Completed work density (perf)
