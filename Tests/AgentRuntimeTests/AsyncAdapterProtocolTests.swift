@@ -126,6 +126,19 @@ final class AsyncAdapterProtocolTests: XCTestCase {
 
     private struct TestError: Error, Equatable { let tag: String }
 
+    private final class PrunedThreadBatchRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var batches: [[AgentThreadID]] = []
+
+        func record(_ ids: [AgentThreadID]) {
+            lock.withLock { batches.append(ids) }
+        }
+
+        var snapshot: [[AgentThreadID]] {
+            lock.withLock { batches }
+        }
+    }
+
     // MARK: - Harness
 
     private func makeCoordinator(adapter: AgentProviderAdapter) throws -> (AgentRunCoordinator, AgentThreadID) {
@@ -434,6 +447,132 @@ final class AsyncAdapterProtocolTests: XCTestCase {
         XCTAssertEqual(Set(try threadRepo.list(workspaceId: workspaceID).map(\.id)), originalIDs)
         XCTAssertNil(try threadRepo.get(id: child.id))
         XCTAssertEqual(try threadRepo.getForkIntent(childThreadId: child.id)?.state, .compensated)
+    }
+
+    func test_reconcileForkIntentsOnLaunch_reportsCapVictimOnlyAfterChildGraphCommits() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-launch-fork-cap-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let workspaceID = WorkspaceID()
+        var parent = AgentThread(
+            workspaceId: workspaceID,
+            title: "launch parent",
+            provider: .codex,
+            model: "fake-model",
+            providerThreadId: "provider-parent",
+            status: .completed
+        )
+        parent.updatedAt = Date(timeIntervalSince1970: 10)
+        var victim = AgentThread(
+            workspaceId: workspaceID,
+            title: "launch victim",
+            provider: .codex,
+            model: "fake-model",
+            status: .completed
+        )
+        victim.updatedAt = Date(timeIntervalSince1970: 1)
+        try threadRepo.upsert(parent)
+        try threadRepo.upsert(victim)
+        try messageRepo.append(AgentMessage(threadId: parent.id, role: .user, content: "copy before callback"))
+        for index in 0..<(AgentThreadRepository.maxThreadsPerWorkspace - 2) {
+            var protected = AgentThread(
+                workspaceId: workspaceID,
+                title: "protected \(index)",
+                provider: .codex,
+                model: "fake-model"
+            )
+            protected.status = index.isMultiple(of: 2) ? .running : .pending
+            try threadRepo.upsert(protected)
+        }
+        let child = AgentThread(
+            workspaceId: workspaceID,
+            title: "recovered child",
+            provider: .codex,
+            model: "fake-model"
+        )
+        _ = try threadRepo.prepareForkIntent(
+            sourceThreadId: parent.id,
+            childThread: child,
+            idempotencyKey: "launch-cap-\(child.id.value.uuidString)"
+        )
+        let adapter = FakeAdapter()
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerAdapters: [.codex: adapter]
+        )
+        let recorder = PrunedThreadBatchRecorder()
+        coordinator.onRecoveredForkPrunedThreadIDs = { ids in
+            recorder.record(ids)
+        }
+
+        await coordinator.reconcileForkIntentsOnLaunch()
+
+        XCTAssertEqual(adapter.calls, ["forkThread"])
+        XCTAssertEqual(recorder.snapshot, [[victim.id]])
+        XCTAssertNil(try threadRepo.get(id: victim.id))
+        XCTAssertEqual(try threadRepo.get(id: child.id)?.providerThreadId, "provider-child")
+        XCTAssertEqual(try messageRepo.list(threadId: child.id).map(\.content), ["copy before callback"],
+                       "the callback must observe the complete committed child graph")
+        XCTAssertEqual(try threadRepo.getForkIntent(childThreadId: child.id)?.state, .localCommitted)
+    }
+
+    func test_reconcilePreparedForkIntentAtProtectedCapacityRejectsBeforeProviderCall() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-launch-fork-protected-cap-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let workspaceID = WorkspaceID()
+        var parent = AgentThread(
+            workspaceId: workspaceID,
+            title: "launch parent",
+            provider: .codex,
+            model: "fake-model",
+            providerThreadId: "provider-parent"
+        )
+        parent.status = .running
+        try threadRepo.upsert(parent)
+        for index in 0..<(AgentThreadRepository.maxThreadsPerWorkspace - 1) {
+            var protected = AgentThread(
+                workspaceId: workspaceID,
+                title: "protected \(index)",
+                provider: .codex,
+                model: "fake-model"
+            )
+            protected.status = index.isMultiple(of: 2) ? .running : .pending
+            try threadRepo.upsert(protected)
+        }
+        let child = AgentThread(
+            workspaceId: workspaceID,
+            title: "must not reach provider",
+            provider: .codex,
+            model: "fake-model"
+        )
+        _ = try threadRepo.prepareForkIntent(
+            sourceThreadId: parent.id,
+            childThread: child,
+            idempotencyKey: "launch-protected-\(child.id.value.uuidString)"
+        )
+        let adapter = FakeAdapter()
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providerAdapters: [.codex: adapter]
+        )
+        let recorder = PrunedThreadBatchRecorder()
+        coordinator.onRecoveredForkPrunedThreadIDs = { ids in recorder.record(ids) }
+
+        await coordinator.reconcileForkIntentsOnLaunch()
+
+        XCTAssertTrue(adapter.calls.isEmpty,
+                      "known protected saturation must reject a prepared recovery before provider mutation")
+        XCTAssertTrue(recorder.snapshot.isEmpty)
+        XCTAssertNil(try threadRepo.get(id: child.id))
+        XCTAssertEqual(try threadRepo.count(workspaceId: workspaceID),
+                       AgentThreadRepository.maxThreadsPerWorkspace)
+        XCTAssertEqual(try threadRepo.getForkIntent(childThreadId: child.id)?.state, .prepared)
     }
 
     func test_respondToRequest_propagatesAdapterError() async throws {

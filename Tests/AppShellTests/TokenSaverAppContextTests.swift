@@ -1871,9 +1871,22 @@ final class TokenSaverAppContextTests: XCTestCase {
             scorecardID: "rollover-scorecard"
         ))
         var lifecycleEvents: [EventBus.Event] = []
+        var callbackObservedCommittedGraph = false
         let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
             guard event.kind == "agent.thread.deleted" || event.kind == "agent.thread.deleted_many" else { return }
             lifecycleEvents.append(event)
+            do {
+                let statement = try context.db.prepare(
+                    "SELECT child_thread_id FROM token_saver_rollover_capsules LIMIT 1;"
+                )
+                guard try statement.step(),
+                      let rawChildID = statement.columnText(0),
+                      let uuid = UUID(uuidString: rawChildID) else { return }
+                let childID = AgentThreadID(uuid)
+                callbackObservedCommittedGraph = try context.threadRepo.get(id: childID) != nil
+                    && !context.messageRepo.list(threadId: childID).isEmpty
+                    && context.tokenSaverRolloverRepo.get(childThreadID: rawChildID) != nil
+            } catch {}
         }
         defer { EventBus.shared.unsubscribe(token) }
 
@@ -1886,6 +1899,93 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertNotNil(try context.tokenSaverRolloverRepo.get(childThreadID: child.id.value.uuidString))
         XCTAssertEqual(lifecycleEvents.count, 1,
                        "the committed rollover must publish its authoritative victim exactly once")
+        XCTAssertTrue(callbackObservedCommittedGraph,
+                      "the deletion callback must observe child, capsule message, and capsule after one atomic commit")
+    }
+
+    func test_rolloverAtCap_graphWriteFailureRollsBackVictimAndPublishesNothing() throws {
+        let context = try AppContext(
+            channel: .debug,
+            appSupportOverride: NSTemporaryDirectory() + "RC2RolloverCapRollback-" + UUID().uuidString
+        )
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        let workspaceID = WorkspaceID()
+        let projectID = ProjectID()
+        var victim = AgentThread(
+            projectId: projectID,
+            workspaceId: workspaceID,
+            title: "victim must survive",
+            provider: .codex,
+            model: "test",
+            status: .completed
+        )
+        victim.updatedAt = Date(timeIntervalSince1970: 1)
+        try context.threadRepo.upsert(victim)
+        var parent = AgentThread(
+            projectId: projectID,
+            workspaceId: workspaceID,
+            title: "rollover parent",
+            provider: .codex,
+            model: "test",
+            status: .completed
+        )
+        parent.pinned = true
+        parent.updatedAt = Date()
+        try context.threadRepo.upsert(parent)
+        var originalIDs: Set<AgentThreadID> = [victim.id, parent.id]
+        for index in 0..<(AgentThreadRepository.maxThreadsPerWorkspace - 2) {
+            var protected = AgentThread(
+                projectId: projectID,
+                workspaceId: workspaceID,
+                title: "protected \(index)",
+                provider: .codex,
+                model: "test"
+            )
+            protected.status = index.isMultiple(of: 2) ? .running : .pending
+            try context.threadRepo.upsert(protected)
+            originalIDs.insert(protected.id)
+        }
+        try context.messageRepo.append(.init(threadId: parent.id, role: .user, content: "preserve parent"))
+        try context.tokenSaverLaneStateRepo.upsert(.init(
+            projectID: projectID.value.uuidString,
+            lane: "rollover_capsule",
+            state: "promoted",
+            reason: "test",
+            evidenceLevel: "provider_usage",
+            ownerRole: "Operations Owner:test",
+            permissionBoundary: "project",
+            retentionDays: 30,
+            optedOut: false,
+            killSwitchActive: false,
+            attributionJoined: true,
+            reconciliationPassed: true,
+            usageSemanticsAvailable: true,
+            scorecardID: "rollover-scorecard"
+        ))
+        try context.db.execute("""
+            CREATE TRIGGER fail_capped_rollover_capsule
+            BEFORE INSERT ON token_saver_rollover_capsules
+            BEGIN SELECT RAISE(ABORT, 'forced capped capsule failure'); END;
+        """)
+        var lifecycleEvents: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind.hasPrefix("agent.thread.") else { return }
+            lifecycleEvents.append(event)
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        XCTAssertThrowsError(try context.createTokenSaverRollover(parentThreadID: parent.id))
+
+        XCTAssertEqual(Set(try context.threadRepo.list(workspaceId: workspaceID).map(\.id)), originalIDs)
+        XCTAssertNotNil(try context.threadRepo.get(id: victim.id),
+                        "a graph write failure must roll back the tentative cap victim")
+        let capsules = try context.db.prepare("SELECT COUNT(*) FROM token_saver_rollover_capsules;")
+        XCTAssertTrue(try capsules.step())
+        XCTAssertEqual(capsules.columnInt64(0), 0)
+        XCTAssertTrue(lifecycleEvents.isEmpty,
+                      "rolled-back rollover graph and victim deletes must publish no lifecycle")
     }
 
     func test_rolloverProtectedCapacityFailsBeforeGraphWritesAndPublishesNothing() throws {

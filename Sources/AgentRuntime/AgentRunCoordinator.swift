@@ -945,6 +945,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public var onActiveRunProjectionChanged: ((ActiveRunProjection, ActiveRunProjectionCause) -> Void)?
     public var onMessageAppended: ((AgentMessage) -> Void)?
     public var onPersistenceIssue: ((String, AgentThreadID, AgentRunID) -> Void)?
+    /// Launch-only fork recovery can commit retention victims before AppShell's
+    /// router exists. Fired after the child graph transaction commits so the
+    /// host can queue and later mirror those authoritative deletions.
+    public var onRecoveredForkPrunedThreadIDs: (@Sendable ([AgentThreadID]) async -> Void)?
 
     /// Host-injected provider admission gate. AppShell owns memory/process policy;
     /// AgentRuntime only enforces its fail-closed decision before any provider
@@ -3048,7 +3052,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return
         }
         defer { endExclusiveThreadMutation(intent.sourceThreadId) }
+        var committedPrunedThreadIDs: [AgentThreadID] = []
         do {
+            if intent.state == .prepared, let workspaceID = intent.childThread.workspaceId {
+                try threadRepo.preflightWorkspaceThreadInsertion(
+                    workspaceId: workspaceID,
+                    prospectiveThreadId: intent.childThread.id,
+                    excludedVictimIDs: [intent.sourceThreadId]
+                )
+            }
             if intent.state != .compensating,
                try threadRepo.get(id: intent.sourceThreadId) != nil {
                 try await recoverAdapterSessionIfNeeded(threadId: intent.sourceThreadId, adapter: adapter)
@@ -3058,7 +3070,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     "provider fork recovery schema is no longer compatible"
                 )
             }
-            _ = try await reconcileForkIntent(intent, adapter: adapter)
+            committedPrunedThreadIDs = try await reconcileForkIntent(intent, adapter: adapter).prunedThreadIDs
         } catch {
             try? threadRepo.recordForkIntentError(
                 childThreadId: intent.childThread.id,
@@ -3067,6 +3079,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             agentRunLog.error(
                 "fork.reconcile.failed child=\(intent.childThread.id.value.uuidString, privacy: .public) error=\(String(describing: error), privacy: .public)"
             )
+            return
+        }
+        if !committedPrunedThreadIDs.isEmpty {
+            await onRecoveredForkPrunedThreadIDs?(committedPrunedThreadIDs)
         }
     }
 

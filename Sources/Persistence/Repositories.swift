@@ -359,21 +359,33 @@ public final class AgentThreadRepository {
         limit: Int,
         excludedVictimIDs: Set<AgentThreadID> = []
     ) throws -> [AgentThreadID] {
-        let cap = max(1, limit)
         try upsert(thread)
         guard let workspaceID = thread.workspaceId else { return [] }
-        let victims = try workspaceThreadLimitVictims(
+        return try enforceWorkspaceThreadLimitInCurrentTransaction(
             workspaceId: workspaceID,
-            limit: cap,
+            limit: limit,
             excluding: excludedVictimIDs.union([thread.id])
+        )
+    }
+
+    func enforceWorkspaceThreadLimitInCurrentTransaction(
+        workspaceId: WorkspaceID,
+        limit: Int,
+        excluding excludedThreadIDs: Set<AgentThreadID>
+    ) throws -> [AgentThreadID] {
+        let cap = max(1, limit)
+        let victims = try workspaceThreadLimitVictims(
+            workspaceId: workspaceId,
+            limit: cap,
+            excluding: excludedThreadIDs
         )
         for id in victims {
             try delete(id: id)
         }
-        let actualCount = try count(workspaceId: workspaceID)
+        let actualCount = try count(workspaceId: workspaceId)
         guard actualCount <= cap else {
             throw AgentThreadCapacityError.workspaceLimitExceeded(
-                workspaceId: workspaceID,
+                workspaceId: workspaceId,
                 limit: cap,
                 actualCount: actualCount
             )

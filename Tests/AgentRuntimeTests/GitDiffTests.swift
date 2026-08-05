@@ -515,6 +515,46 @@ final class GitDiffTests: XCTestCase {
         XCTAssertEqual(GitDiff.branches(in: prep.worktreePath).current, prep.branch)
     }
 
+    func test_removeRegisteredWorktree_removesOnlyExactTarget() throws {
+        let dir = try mkTmpRepo()
+        let first = dir + "-cleanup-first"
+        let second = dir + "-cleanup-second"
+        defer {
+            try? FileManager.default.removeItem(atPath: first)
+            try? FileManager.default.removeItem(atPath: second)
+            try? FileManager.default.removeItem(atPath: dir)
+        }
+        try seedCommit(dir)
+        XCTAssertTrue(GitDiff.createWorktree(
+            in: dir,
+            path: first,
+            branch: "cleanup-first",
+            baseBranch: "main"
+        ).ok)
+        XCTAssertTrue(GitDiff.createWorktree(
+            in: dir,
+            path: second,
+            branch: "cleanup-second",
+            baseBranch: "main"
+        ).ok)
+        try "untracked hook residue\n".write(
+            toFile: first + "/untracked.txt",
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let result = GitDiff.removeRegisteredWorktree(in: dir, worktreePath: first)
+
+        XCTAssertTrue(result.ok, result.message)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: first),
+                       "the just-created target must be force-cleaned even if a hook leaves untracked residue")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: second),
+                      "cleanup of a failed PR commit must not remove another registered worktree")
+        XCTAssertFalse(GitDiff.removeRegisteredWorktree(in: dir, worktreePath: dir).ok,
+                       "the cleanup API must never accept the primary checkout")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir))
+    }
+
     // MARK: splitCombinedDiff -- per-file splitting of a combined git diff output
     //
     // WHY: captureFileDiffs collapses N per-file git subprocesses into one

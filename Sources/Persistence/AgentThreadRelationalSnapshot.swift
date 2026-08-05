@@ -108,23 +108,37 @@ public extension AgentThreadRepository {
         }
     }
 
-    /// Restore every captured row in foreign-key-safe order in one transaction.
-    /// Any conflict or corrupt row rolls the entire restore back.
+    /// Compatibility wrapper for callers that do not consume retention victims.
+    /// Restore still enforces the hard workspace cap atomically.
     func restore(_ snapshot: AgentThreadRelationalSnapshot) throws {
+        _ = try restoreEnforcingWorkspaceThreadLimit(snapshot)
+    }
+
+    /// Restore every captured row and enforce each affected workspace's hard cap
+    /// in the same transaction. Restored IDs are never eligible victims. Any
+    /// conflict, corrupt row, victim-delete failure, or protected saturation
+    /// rolls the restored graph and every tentative victim delete back together.
+    @discardableResult
+    func restoreEnforcingWorkspaceThreadLimit(
+        _ snapshot: AgentThreadRelationalSnapshot,
+        limit: Int = AgentThreadRepository.maxThreadsPerWorkspace
+    ) throws -> [AgentThreadID] {
         try db.performSync { database in
             try database.transaction {
-                for table in snapshot.tables where !table.rows.isEmpty {
-                    let columns = table.columns.map { "\"\($0)\"" }.joined(separator: ", ")
-                    let values = Self.placeholders(table.columns.count)
-                    let sql = "INSERT INTO \"\(table.name)\" (\(columns)) VALUES (\(values));"
-                    for row in table.rows {
-                        let statement = try database.prepare(sql)
-                        for (offset, value) in row.enumerated() {
-                            try Self.bind(value, at: Int32(offset + 1), to: statement)
-                        }
-                        _ = try statement.step()
-                    }
+                try Self.restoreRelationalSnapshotInCurrentTransaction(snapshot, database: database)
+                let restoredIDs = Set(snapshot.threads.map(\.id))
+                let workspaceIDs = Set(snapshot.threads.compactMap(\.workspaceId)).sorted {
+                    $0.value.uuidString < $1.value.uuidString
                 }
+                var prunedThreadIDs: [AgentThreadID] = []
+                for workspaceID in workspaceIDs {
+                    prunedThreadIDs.append(contentsOf: try enforceWorkspaceThreadLimitInCurrentTransaction(
+                        workspaceId: workspaceID,
+                        limit: limit,
+                        excluding: restoredIDs
+                    ))
+                }
+                return prunedThreadIDs
             }
         }
     }
@@ -170,6 +184,24 @@ private extension AgentThreadRepository {
             bindingRepeats: 2
         )
     ]
+
+    static func restoreRelationalSnapshotInCurrentTransaction(
+        _ snapshot: AgentThreadRelationalSnapshot,
+        database: SQLiteDB
+    ) throws {
+        for table in snapshot.tables where !table.rows.isEmpty {
+            let columns = table.columns.map { "\"\($0)\"" }.joined(separator: ", ")
+            let values = placeholders(table.columns.count)
+            let sql = "INSERT INTO \"\(table.name)\" (\(columns)) VALUES (\(values));"
+            for row in table.rows {
+                let statement = try database.prepare(sql)
+                for (offset, value) in row.enumerated() {
+                    try bind(value, at: Int32(offset + 1), to: statement)
+                }
+                _ = try statement.step()
+            }
+        }
+    }
 
     static func captureRelationalSnapshot(
         database: SQLiteDB,

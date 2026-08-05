@@ -4192,9 +4192,21 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.reloadThreads()
         vm.selectThread(parentID)
         var lifecycleEvents: [AgentThreadLifecycleEvent] = []
-        vm.onThreadLifecycle = { lifecycleEvents.append($0) }
+        var selectedThreadAtDeletion: AgentThreadID?
+        var victimWasAbsentAtDeletion = false
+        vm.onThreadLifecycle = { event in
+            lifecycleEvents.append(event)
+            if case .deleted = event {
+                selectedThreadAtDeletion = vm.selectedThreadId
+                victimWasAbsentAtDeletion = (try? threadRepo.get(id: victim.id)) == nil
+            }
+        }
+        vm.setReloadThreadListForTesting {
+            throw NSError(domain: "AgentAppViewModelTests.forkCapReload", code: 1)
+        }
 
         await vm.forkCurrentThread()
+        vm.setReloadThreadListForTesting(nil)
 
         let childID = try XCTUnwrap(vm.selectedThreadId)
         XCTAssertNotEqual(childID, parentID)
@@ -4208,6 +4220,12 @@ final class AgentAppViewModelTests: XCTestCase {
             return XCTFail("the surface must publish the committed retention victim before selection")
         }
         XCTAssertEqual(deletedIDs, [victim.id])
+        XCTAssertEqual(selectedThreadAtDeletion, parentID,
+                       "the authoritative victim must be applied and published before selecting the child")
+        XCTAssertTrue(victimWasAbsentAtDeletion,
+                      "the deletion callback must observe the committed victim, never a speculative delete")
+        XCTAssertTrue(vm.statusMessage.contains("Could not reload threads"),
+                      "a failed post-commit rail read must remain visible while the durable child is selected")
     }
 
     func test_forkCurrentThread_transcriptWriteFailureLeavesNoChildAndKeepsParentSelected() async throws {
@@ -4224,6 +4242,27 @@ final class AgentAppViewModelTests: XCTestCase {
         parent.providerThreadId = "provider-parent"
         try threadRepo.upsert(parent)
         try vm.messageRepo.append(AgentMessage(threadId: parentId, role: .user, content: "must remain atomic"))
+        var victim = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "victim must roll back",
+            provider: .codex,
+            model: "fake-model",
+            status: .completed
+        )
+        victim.updatedAt = Date(timeIntervalSince1970: 1)
+        try threadRepo.upsert(victim)
+        var originalIDs: Set<AgentThreadID> = [parentId, victim.id]
+        for index in 0..<(AgentThreadRepository.maxThreadsPerWorkspace - 2) {
+            var protected = AgentThread(
+                workspaceId: vm.workspaceID,
+                title: "protected \(index)",
+                provider: .codex,
+                model: "fake-model"
+            )
+            protected.status = index.isMultiple(of: 2) ? .running : .pending
+            try threadRepo.upsert(protected)
+            originalIDs.insert(protected.id)
+        }
         try threadRepo.db.execute("""
             CREATE TRIGGER fail_fork_message_copy
             BEFORE INSERT ON agent_messages
@@ -4232,13 +4271,19 @@ final class AgentAppViewModelTests: XCTestCase {
             """)
         vm.reloadThreads()
         vm.selectThread(parentId)
+        var lifecycleEvents: [AgentThreadLifecycleEvent] = []
+        vm.onThreadLifecycle = { lifecycleEvents.append($0) }
 
         await vm.forkCurrentThread()
 
         XCTAssertEqual(vm.selectedThreadId, parentId,
                        "a failed local fork transaction must never select a partial child")
-        XCTAssertEqual(try threadRepo.list().map(\.id), [parentId],
+        XCTAssertEqual(Set(try threadRepo.list(workspaceId: vm.workspaceID).map(\.id)), originalIDs,
                        "message-copy failure must roll back the child thread instead of leaving a partial rail item")
+        XCTAssertNotNil(try threadRepo.get(id: victim.id),
+                        "the failed child graph transaction must roll back its tentative cap victim")
+        XCTAssertTrue(lifecycleEvents.isEmpty,
+                      "a rolled-back child graph and victim delete must publish no lifecycle")
         XCTAssertTrue(vm.statusMessage.contains("Could not fork thread"),
                       "the parent surface must report the atomic fork failure")
     }

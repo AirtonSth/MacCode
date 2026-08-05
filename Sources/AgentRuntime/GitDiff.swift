@@ -492,6 +492,34 @@ public enum GitDiff {
         return GitPullRequestPreparation(ref: ref, worktreePath: path, branch: branch, result: GitActionResult(ok: add.exit == 0, message: actionMessage(add)))
     }
 
+    /// Removes exactly one worktree that Git still registers for `cwd`.
+    /// The exact registration check prevents cleanup of an unrelated directory
+    /// when PR preparation succeeds but the subsequent thread commit fails.
+    public static func removeRegisteredWorktree(in cwd: String, worktreePath: String) -> GitActionResult {
+        guard isGit(cwd) else {
+            return GitActionResult(ok: false, message: "Not a git repository.")
+        }
+        let root = URL(fileURLWithPath: cwd).standardizedFileURL.path
+        let target = URL(fileURLWithPath: worktreePath).standardizedFileURL.path
+        guard !target.isEmpty, target != root else {
+            return GitActionResult(ok: false, message: "Refusing to remove the primary worktree.")
+        }
+        let registered = run(["worktree", "list", "--porcelain"], cwd: cwd)
+        guard registered.exit == 0 else {
+            return GitActionResult(ok: false, message: actionMessage(registered))
+        }
+        let registeredPaths = Set(registered.stdout.split(separator: "\n").compactMap { line -> String? in
+            guard line.hasPrefix("worktree ") else { return nil }
+            return URL(fileURLWithPath: String(line.dropFirst("worktree ".count)))
+                .standardizedFileURL.path
+        })
+        guard registeredPaths.contains(target) else {
+            return GitActionResult(ok: false, message: "Worktree is not registered for this repository.")
+        }
+        let removal = run(["worktree", "remove", "--force", "--", target], cwd: cwd)
+        return GitActionResult(ok: removal.exit == 0, message: actionMessage(removal))
+    }
+
     /// Stages every change (`git add -A`) then commits with `message`.
     public static func commit(in cwd: String, message: String) -> GitActionResult {
         guard isGit(cwd) else { return GitActionResult(ok: false, message: "Not a git repository.") }

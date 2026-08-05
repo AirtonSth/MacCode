@@ -70,6 +70,59 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             """)
     }
 
+    @discardableResult
+    private func runGit(_ arguments: [String]) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["git"] + arguments
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        let text = String(
+            data: output.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        ) ?? ""
+        guard process.terminationStatus == 0 else {
+            throw NSError(
+                domain: "AgentSurfaceThreadBindingRouterTests.git",
+                code: Int(process.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: text]
+            )
+        }
+        return text
+    }
+
+    private func makePullRequestRepository(number: Int = 7) throws -> (checkout: String, bare: String) {
+        let checkout = NSTemporaryDirectory() + "RC2Bind-PRRepo-" + UUID().uuidString
+        let bare = checkout + "-origin.git"
+        try FileManager.default.createDirectory(atPath: checkout, withIntermediateDirectories: true)
+        try runGit(["init", "-q", "-b", "main", checkout])
+        try runGit(["-C", checkout, "config", "user.email", "test@remotecode.local"])
+        try runGit(["-C", checkout, "config", "user.name", "RemoteCode Test"])
+        try Data("base\n".utf8).write(to: URL(fileURLWithPath: checkout).appendingPathComponent("base.txt"))
+        try runGit(["-C", checkout, "add", "base.txt"])
+        try runGit(["-C", checkout, "commit", "-q", "-m", "base"])
+        try runGit(["init", "--bare", "-q", bare])
+        try runGit(["-C", checkout, "remote", "add", "origin", bare])
+        try runGit(["-C", checkout, "push", "-q", "origin", "main"])
+        try runGit(["-C", checkout, "checkout", "-q", "-b", "feature/pr-\(number)"])
+        try Data("pull request\n".utf8).write(to: URL(fileURLWithPath: checkout).appendingPathComponent("pr.txt"))
+        try runGit(["-C", checkout, "add", "pr.txt"])
+        try runGit(["-C", checkout, "commit", "-q", "-m", "pull request"])
+        try runGit(["-C", checkout, "push", "-q", "origin", "HEAD:refs/pull/\(number)/head"])
+        try runGit(["-C", checkout, "checkout", "-q", "main"])
+        return (checkout, bare)
+    }
+
+    private func defaultPullRequestWorktreePath(checkout: String, number: Int = 7) -> String {
+        let root = URL(fileURLWithPath: checkout).standardizedFileURL
+        return root.deletingLastPathComponent()
+            .appendingPathComponent("\(root.lastPathComponent)-pr-worktrees")
+            .appendingPathComponent("pr-\(number)").path
+    }
+
     // MARK: Bug A — new tab does not adopt the workspace's existing thread
 
     func test_newAgentTab_doesNotAdoptExistingWorkspaceThread() throws {
@@ -723,6 +776,189 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         try assertOriginalState("local UI")
     }
 
+    func test_preparePullRequestAtCapPrunesVictimAndPublishesDeletion() throws {
+        let repository = try makePullRequestRepository()
+        let worktreeRoot = URL(
+            fileURLWithPath: defaultPullRequestWorktreePath(checkout: repository.checkout)
+        ).deletingLastPathComponent().path
+        defer {
+            try? FileManager.default.removeItem(atPath: worktreeRoot)
+            try? FileManager.default.removeItem(atPath: repository.checkout)
+            try? FileManager.default.removeItem(atPath: repository.bare)
+        }
+        let dir = NSTemporaryDirectory() + "RC2Bind-PRCapSuccess-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "PR-CAP-SUCCESS", cwd: repository.checkout)
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        var victim = AgentThread(
+            workspaceId: workspace.id,
+            title: "old PR victim",
+            provider: .codex,
+            model: "m",
+            status: .completed
+        )
+        victim.updatedAt = Date(timeIntervalSince1970: 1)
+        try ctx.threadRepo.upsert(victim)
+        for index in 0..<(AgentThreadRepository.maxThreadsPerWorkspace - 1) {
+            var protected = AgentThread(
+                workspaceId: workspace.id,
+                title: "protected \(index)",
+                provider: .codex,
+                model: "m"
+            )
+            protected.status = index.isMultiple(of: 2) ? .running : .pending
+            try ctx.threadRepo.upsert(protected)
+        }
+        var deletedEvents: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "agent.thread.deleted" else { return }
+            deletedEvents.append(event)
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        let created = try router.prepareAgentThreadForPullRequest(
+            workspace: workspace.id,
+            url: "https://github.com/acme/widget/pull/7",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium,
+            serviceTier: .auto,
+            modelSelection: nil,
+            providerInstanceId: nil
+        )
+        defer {
+            _ = GitDiff.removeRegisteredWorktree(
+                in: repository.checkout,
+                worktreePath: created.worktreePath ?? ""
+            )
+        }
+
+        XCTAssertEqual(try ctx.threadRepo.count(workspaceId: workspace.id),
+                       AgentThreadRepository.maxThreadsPerWorkspace)
+        XCTAssertNil(try ctx.threadRepo.get(id: victim.id))
+        XCTAssertNotNil(try ctx.threadRepo.get(id: created.id))
+        XCTAssertEqual(deletedEvents.count, 1)
+        XCTAssertEqual(deletedEvents.first?.payload.objectValue?["thread_id"]?.stringValue,
+                       victim.id.value.uuidString)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(created.worktreePath)))
+    }
+
+    func test_preparePullRequestCapacityRaceCleansOnlyCreatedWorktree() throws {
+        let repository = try makePullRequestRepository()
+        let preparedPath = defaultPullRequestWorktreePath(checkout: repository.checkout)
+        let worktreeRoot = URL(fileURLWithPath: preparedPath).deletingLastPathComponent().path
+        let unrelatedPath = repository.checkout + "-unrelated-worktree"
+        defer {
+            try? FileManager.default.removeItem(atPath: worktreeRoot)
+            try? FileManager.default.removeItem(atPath: unrelatedPath)
+            try? FileManager.default.removeItem(atPath: repository.checkout)
+            try? FileManager.default.removeItem(atPath: repository.bare)
+        }
+        XCTAssertTrue(GitDiff.createWorktree(
+            in: repository.checkout,
+            path: unrelatedPath,
+            branch: "unrelated-race",
+            baseBranch: "main"
+        ).ok)
+        let dir = NSTemporaryDirectory() + "RC2Bind-PRCapRace-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "PR-CAP-RACE", cwd: repository.checkout)
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        for index in 0..<(AgentThreadRepository.maxThreadsPerWorkspace - 1) {
+            var protected = AgentThread(
+                workspaceId: workspace.id,
+                title: "protected \(index)",
+                provider: .codex,
+                model: "m"
+            )
+            protected.status = index.isMultiple(of: 2) ? .running : .pending
+            try ctx.threadRepo.upsert(protected)
+        }
+        var concurrent = AgentThread(
+            workspaceId: workspace.id,
+            title: "concurrent protected create",
+            provider: .codex,
+            model: "m"
+        )
+        concurrent.status = .running
+        router.beforePullRequestThreadCommitForTesting = {
+            try ctx.threadRepo.upsert(concurrent)
+        }
+        defer { router.beforePullRequestThreadCommitForTesting = nil }
+
+        XCTAssertThrowsError(try router.prepareAgentThreadForPullRequest(
+            workspace: workspace.id,
+            url: "https://github.com/acme/widget/pull/7",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium,
+            serviceTier: .auto,
+            modelSelection: nil,
+            providerInstanceId: nil
+        )) { error in
+            XCTAssertTrue(error is AgentThreadCapacityError)
+        }
+
+        XCTAssertEqual(try ctx.threadRepo.count(workspaceId: workspace.id),
+                       AgentThreadRepository.maxThreadsPerWorkspace)
+        XCTAssertNotNil(try ctx.threadRepo.get(id: concurrent.id))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: preparedPath),
+                       "a raced post-preflight capacity failure must remove its new PR worktree")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unrelatedPath),
+                      "cleanup must preserve unrelated registered worktrees")
+        XCTAssertTrue(GitDiff.isGit(repository.checkout),
+                      "cleanup must preserve the primary checkout")
+        _ = GitDiff.removeRegisteredWorktree(in: repository.checkout, worktreePath: unrelatedPath)
+    }
+
+    func test_preparePullRequestVictimDeleteFailureCleansOnlyCreatedWorktree() throws {
+        let repository = try makePullRequestRepository()
+        let preparedPath = defaultPullRequestWorktreePath(checkout: repository.checkout)
+        let worktreeRoot = URL(fileURLWithPath: preparedPath).deletingLastPathComponent().path
+        let unrelatedPath = repository.checkout + "-unrelated-delete-worktree"
+        defer {
+            try? FileManager.default.removeItem(atPath: worktreeRoot)
+            try? FileManager.default.removeItem(atPath: unrelatedPath)
+            try? FileManager.default.removeItem(atPath: repository.checkout)
+            try? FileManager.default.removeItem(atPath: repository.bare)
+        }
+        XCTAssertTrue(GitDiff.createWorktree(
+            in: repository.checkout,
+            path: unrelatedPath,
+            branch: "unrelated-delete",
+            baseBranch: "main"
+        ).ok)
+        let dir = NSTemporaryDirectory() + "RC2Bind-PRDeleteFailure-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "PR-DELETE-FAILURE", cwd: repository.checkout)
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        let originalIDs = try fillWorkspaceToThreadCap(workspace.id, context: ctx)
+        let triggerName = "fail_pr_cap_delete"
+        try installThreadCapDeleteAbortTrigger(ctx, named: triggerName)
+        defer { try? ctx.db.execute("DROP TRIGGER \(triggerName);") }
+
+        XCTAssertThrowsError(try router.prepareAgentThreadForPullRequest(
+            workspace: workspace.id,
+            url: "https://github.com/acme/widget/pull/7",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium,
+            serviceTier: .auto,
+            modelSelection: nil,
+            providerInstanceId: nil
+        ))
+
+        XCTAssertEqual(Set(try ctx.threadRepo.list(workspaceId: workspace.id).map(\.id)), originalIDs,
+                       "victim-delete failure must roll back the PR thread and preserve every original row")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: preparedPath))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unrelatedPath))
+        XCTAssertTrue(GitDiff.isGit(repository.checkout))
+        _ = GitDiff.removeRegisteredWorktree(in: repository.checkout, worktreePath: unrelatedPath)
+    }
+
     func test_deletionBridges_applyAuthoritativeIDsBeforeFailedSurfaceReload() async throws {
         let dir = NSTemporaryDirectory() + "RC2Bind-DeletionBridges-" + UUID().uuidString
         let (ctx, router) = try makeRouter(dir)
@@ -848,6 +1084,159 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         XCTAssertTrue(ctx.coordinator.autoContinuationThreadIdsForTesting.isDisjoint(with: localManyIDs))
         XCTAssertTrue(receiver.viewModel.threads.allSatisfy { !localManyIDs.contains($0.id) })
         XCTAssertNil(receiver.viewModel.selectedThreadId)
+    }
+
+    func test_reloadThreads_capVictimFansOutToSiblingSurfaceBeforeFailedList() async throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-ReloadCapFanout-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "RELOAD-CAP-FANOUT", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        let producer = try XCTUnwrap(agentSurfaces(in: workspace.id).first)
+        let receiverDescriptor = try router.createSurface(
+            workspace: workspace.id,
+            type: .agentApp,
+            paneID: nil,
+            title: "Reload cap receiver"
+        )
+        let receiver = try XCTUnwrap(
+            SurfaceRegistry.shared.surface(receiverDescriptor.id) as? AgentAppSurface
+        )
+
+        var victim = AgentThread(
+            workspaceId: workspace.id,
+            title: "old reload victim",
+            provider: .codex,
+            model: "m",
+            status: .completed
+        )
+        victim.updatedAt = Date(timeIntervalSince1970: 1)
+        try ctx.threadRepo.upsert(victim)
+        for index in 0..<(AgentThreadRepository.maxThreadsPerWorkspace - 1) {
+            var survivor = AgentThread(
+                workspaceId: workspace.id,
+                title: "survivor \(index)",
+                provider: .codex,
+                model: "m",
+                status: .completed
+            )
+            survivor.updatedAt = Date(timeIntervalSince1970: TimeInterval(100 + index))
+            try ctx.threadRepo.upsert(survivor)
+        }
+        producer.viewModel.reloadThreads()
+        receiver.viewModel.reloadThreads()
+        receiver.viewModel.selectThread(victim.id)
+        receiver.viewModel.prompt = "preserve reload victim draft"
+        receiver.viewModel.seedAdditionalThreadCachesForTesting(victim.id)
+        receiver.viewModel.seedRunThreadProjectionForTesting(victim.id)
+        ctx.coordinator.seedAutoContinuationStateForTesting(victim.id)
+
+        var overflow = AgentThread(
+            workspaceId: workspace.id,
+            title: "raw overflow",
+            provider: .codex,
+            model: "m",
+            status: .completed
+        )
+        overflow.updatedAt = Date(timeIntervalSince1970: 10_000)
+        try ctx.threadRepo.upsert(overflow)
+        receiver.viewModel.setReloadThreadListForTesting {
+            throw NSError(domain: "AgentSurfaceThreadBindingRouterTests.reloadCapFanout", code: 1)
+        }
+        var deletedEvents: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "agent.thread.deleted" else { return }
+            deletedEvents.append(event)
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        producer.viewModel.reloadThreads()
+
+        for _ in 0..<100 where receiver.viewModel.threadCacheResidueForTesting.contains(victim.id)
+            || !receiver.viewModel.statusMessage.contains("Could not reload threads") {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        receiver.viewModel.setReloadThreadListForTesting(nil)
+
+        XCTAssertEqual(try ctx.threadRepo.count(workspaceId: workspace.id),
+                       AgentThreadRepository.maxThreadsPerWorkspace)
+        XCTAssertNil(try ctx.threadRepo.get(id: victim.id))
+        XCTAssertEqual(deletedEvents.count, 1,
+                       "reload-time cap enforcement must publish each committed victim once")
+        XCTAssertEqual(deletedEvents.first?.payload.objectValue?["thread_id"]?.stringValue,
+                       victim.id.value.uuidString)
+        XCTAssertFalse(receiver.viewModel.threadCacheResidueForTesting.contains(victim.id),
+                       "the sibling surface must apply the authoritative victim before its list fails")
+        XCTAssertFalse(ctx.coordinator.autoContinuationThreadIdsForTesting.contains(victim.id))
+        XCTAssertNil(receiver.viewModel.selectedThreadId)
+        XCTAssertEqual(receiver.viewModel.prompt, "preserve reload victim draft")
+        XCTAssertTrue(receiver.viewModel.statusMessage.contains("Could not reload threads"))
+    }
+
+    func test_recoveredForkVictimQueuedBeforeRouterDrainsOnceAndEvictsSurfaces() async throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-RecoveredForkQueue-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "RECOVERED-FORK-QUEUE", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        let producer = try XCTUnwrap(agentSurfaces(in: workspace.id).first)
+        let receiverDescriptor = try router.createSurface(
+            workspace: workspace.id,
+            type: .agentApp,
+            paneID: nil,
+            title: "Recovered fork receiver"
+        )
+        let receiver = try XCTUnwrap(
+            SurfaceRegistry.shared.surface(receiverDescriptor.id) as? AgentAppSurface
+        )
+        let victim = AgentThread(
+            workspaceId: workspace.id,
+            title: "launch-recovery victim",
+            provider: .codex,
+            model: "m"
+        )
+        try ctx.threadRepo.upsert(victim)
+        producer.viewModel.reloadThreads()
+        receiver.viewModel.reloadThreads()
+        receiver.viewModel.selectThread(victim.id)
+        receiver.viewModel.prompt = "preserve recovered-fork draft"
+        receiver.viewModel.seedAdditionalThreadCachesForTesting(victim.id)
+        receiver.viewModel.seedRunThreadProjectionForTesting(victim.id)
+        ctx.coordinator.seedAutoContinuationStateForTesting(victim.id)
+
+        try ctx.threadRepo.delete(id: victim.id)
+        receiver.viewModel.setReloadThreadListForTesting {
+            throw NSError(domain: "AgentSurfaceThreadBindingRouterTests.recoveredForkQueue", code: 1)
+        }
+        ctx.router = nil
+        ctx.enqueueRecoveredForkPrunedThreadIDs([victim.id, victim.id])
+        XCTAssertTrue(receiver.viewModel.threadCacheResidueForTesting.contains(victim.id),
+                      "without a router, the committed victim must remain queued rather than silently dropped")
+        var deletedEvents: [EventBus.Event] = []
+        var createdEvents: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            if event.kind == "agent.thread.deleted" { deletedEvents.append(event) }
+            if event.kind == "agent.thread.created" { createdEvents.append(event) }
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        ctx.router = router
+
+        for _ in 0..<100 where receiver.viewModel.threadCacheResidueForTesting.contains(victim.id)
+            || !receiver.viewModel.statusMessage.contains("Could not reload threads") {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        receiver.viewModel.setReloadThreadListForTesting(nil)
+
+        XCTAssertEqual(deletedEvents.count, 1,
+                       "the pending set must deduplicate and drain the committed victim once")
+        XCTAssertEqual(deletedEvents.first?.payload.objectValue?["thread_id"]?.stringValue,
+                       victim.id.value.uuidString)
+        XCTAssertTrue(createdEvents.isEmpty,
+                      "launch recovery must not synthesize a created event for the pruned victim")
+        XCTAssertFalse(receiver.viewModel.threadCacheResidueForTesting.contains(victim.id))
+        XCTAssertFalse(ctx.coordinator.autoContinuationThreadIdsForTesting.contains(victim.id))
+        XCTAssertNil(receiver.viewModel.selectedThreadId)
+        XCTAssertEqual(receiver.viewModel.prompt, "preserve recovered-fork draft")
+        XCTAssertTrue(receiver.viewModel.statusMessage.contains("Could not reload threads"))
     }
 
     // MARK: selectAgentThread targets exactly one surface when given a surfaceID

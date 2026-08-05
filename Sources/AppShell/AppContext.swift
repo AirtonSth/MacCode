@@ -339,7 +339,10 @@ public final class AppContext {
     public var state = LayoutState()
 
     public let coordinator: AgentRunCoordinator
-    public var router: AppCommandRouter!
+    public var router: AppCommandRouter! {
+        didSet { drainRecoveredForkPrunedThreadIDsIfPossible() }
+    }
+    private var pendingRecoveredForkPrunedThreadIDs: Set<AgentThreadID> = []
     public var socketServer: UnixSocketServer?
     private let tokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefreshing
     private var tokenSaverAccountUsageRefreshTask: Task<Void, Never>?
@@ -448,6 +451,20 @@ public final class AppContext {
     private static var didLogEmptyTokenSaverLaneState = false
     /// Debounce window for coalescing per-token usage writes into one disk write.
     private static let tokenSaverUsageDebounceInterval: TimeInterval = 0.75
+
+    func enqueueRecoveredForkPrunedThreadIDs(_ ids: [AgentThreadID]) {
+        pendingRecoveredForkPrunedThreadIDs.formUnion(ids)
+        drainRecoveredForkPrunedThreadIDsIfPossible()
+    }
+
+    private func drainRecoveredForkPrunedThreadIDsIfPossible() {
+        guard let router, !pendingRecoveredForkPrunedThreadIDs.isEmpty else { return }
+        let ids = pendingRecoveredForkPrunedThreadIDs.sorted {
+            $0.value.uuidString < $1.value.uuidString
+        }
+        pendingRecoveredForkPrunedThreadIDs.removeAll()
+        router.publishAgentThreadDeletions(ids)
+    }
 
     /// Accumulates streaming tool body/output so Codex/Grok `itemDelta` paths still
     /// detect `graphify query|path|explain` (not only one-shot `itemStarted`).
@@ -626,6 +643,11 @@ public final class AppContext {
             },
             providerAdapters: [.codex: codex, .claude: claude, .grok: grok]
         )
+        self.coordinator.onRecoveredForkPrunedThreadIDs = { [weak contextReference] ids in
+            await MainActor.run {
+                contextReference?.value?.enqueueRecoveredForkPrunedThreadIDs(ids)
+            }
+        }
         // plan-final W0: durable terminal ledger write-before-UI (diagnostics dir).
         let diagnosticsDir = self.appSupportDirectory.appendingPathComponent("diagnostics", isDirectory: true)
         self.coordinator.terminalTransitionLedger = TerminalTransitionLedger(directory: diagnosticsDir)

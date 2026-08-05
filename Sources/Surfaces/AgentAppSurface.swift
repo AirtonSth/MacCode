@@ -708,10 +708,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         do {
             // Cap first so oversized workspaces (scheduled runs, long sessions)
             // shrink before the rail reads. CASCADE removes messages.
-            let prunedThreadIDs = Set(try threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspaceID))
+            let prunedThreadIDs = try threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspaceID)
             // Cap succeeded: release its returned victims before the next DB read,
             // so a transient list failure cannot retain state for already-deleted rows.
-            applyAuthoritativeThreadDeletions(prunedThreadIDs)
+            applyAuthoritativeThreadDeletions(Set(prunedThreadIDs))
+            if !prunedThreadIDs.isEmpty {
+                onThreadLifecycle?(.deleted(prunedThreadIDs))
+            }
             let reloadedThreads: [AgentThread]
             #if DEBUG
             if let reloadThreadListForTesting {
@@ -4282,10 +4285,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             threadDeletionUndoExpiryTask?.cancel()
             return false
         }
+        let prunedThreadIDs: [AgentThreadID]
         do {
             if let relationalSnapshot = undo.relationalSnapshot {
-                try threadRepo.restore(relationalSnapshot)
+                prunedThreadIDs = try threadRepo.restoreEnforcingWorkspaceThreadLimit(relationalSnapshot)
             } else {
+                prunedThreadIDs = []
                 for snapshot in undo.snapshots {
                     let plan = ThreadDeletionUndo.restorePlan(for: snapshot)
                     try threadRepo.upsert(plan.thread)
@@ -4298,6 +4303,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             statusMessage = "Could not restore deleted thread data: \(error)"
             return false
         }
+        if !prunedThreadIDs.isEmpty {
+            applyAuthoritativeThreadDeletions(Set(prunedThreadIDs))
+            onThreadLifecycle?(.deleted(prunedThreadIDs))
+        }
         releaseThreadDeletionUndoGCPin(undo)
         pendingThreadDeletionUndo = nil
         threadDeletionUndoExpiryTask?.cancel()
@@ -4305,7 +4314,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // Remote mirrors already saw the delete event; re-announce the restored
         // threads so they reappear without a manual thread-list refetch.
         for snapshot in undo.snapshots {
-            onThreadLifecycle?(.created(threads.first(where: { $0.id == snapshot.thread.id }) ?? snapshot.thread))
+            if let restored = threads.first(where: { $0.id == snapshot.thread.id }) {
+                onThreadLifecycle?(.created(restored))
+            }
         }
         if let restore = undo.previouslySelectedThreadId,
            threads.contains(where: { $0.id == restore }) {

@@ -255,6 +255,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     var terminalRestartRuntimePreparerForTesting: ((WorkspaceID, String, SurfaceID) -> TerminalPreparedPTYRuntime?)?
     var terminalRestartPreparedDiscardAdditionalBarrierForTesting: (() -> SurfaceTerminationBarrier?)?
     var queueDispatchBeforeProviderStartForTesting: (() async -> Void)?
+    var beforePullRequestThreadCommitForTesting: (() throws -> Void)?
     var codexForkProtocolSupportProbe: (String, [String: String]) -> Bool = { binary, environment in
         CodexForkProtocolSupport.probe(binary: binary, environment: environment).isSupported
     }
@@ -2782,7 +2783,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             modelSelection: modelSelection ?? AgentModelSelection(provider: provider, modelId: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier)
         )
         thread.updatedAt = Date()
-        let prunedThreadIDs = try ctx.threadRepo.upsertEnforcingWorkspaceThreadLimit(thread)
+        let prunedThreadIDs: [AgentThreadID]
+        do {
+            try beforePullRequestThreadCommitForTesting?()
+            prunedThreadIDs = try ctx.threadRepo.upsertEnforcingWorkspaceThreadLimit(thread)
+        } catch {
+            let cleanup = GitDiff.removeRegisteredWorktree(in: cwd, worktreePath: prep.worktreePath)
+            if !cleanup.ok {
+                throw JSONRPCError(
+                    code: -32051,
+                    message: "PR thread commit failed: \(error.localizedDescription) Worktree cleanup also failed: \(cleanup.message)"
+                )
+            }
+            throw error
+        }
         publishAgentThreadDeletions(prunedThreadIDs)
         // Rail refresh only across surfaces; the initiating macOS surface (if
         // local) selects the PR thread through its own view-model path.
