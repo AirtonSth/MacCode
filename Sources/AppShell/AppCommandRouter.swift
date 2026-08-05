@@ -376,6 +376,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 "order": .array(order.map { .string($0.value.uuidString) })
             ]))
         case .deleted(let ids):
+            let rawIDs = ids.map { $0.value.uuidString }
+            let kind = ids.count > 1 ? "agent.thread.deleted_many" : "agent.thread.deleted"
+            for surface in SurfaceRegistry.shared.all() {
+                guard let agent = surface as? AgentAppSurface else { continue }
+                agent.viewModel.handleThreadLifecycleEvent(
+                    kind: kind,
+                    threadId: rawIDs.count == 1 ? rawIDs[0] : nil,
+                    threadIds: rawIDs.count > 1 ? rawIDs : nil
+                )
+            }
             if ids.count > 1 {
                 EventBus.shared.publish(kind: "agent.thread.deleted_many", payload: .object([
                     "thread_ids": .array(ids.map { .string($0.value.uuidString) })
@@ -2429,16 +2439,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         } else {
             prunedThreadIDs = []
         }
+        // Apply/publish victims before any fallible surface reload or selection.
+        if !prunedThreadIDs.isEmpty {
+            publishAgentThreadLifecycle(.deleted(prunedThreadIDs))
+        }
         if !quiet {
             // Only bind/select the new thread on the requesting surface (if any).
             // Without a surfaceID this just refreshes rails — a thread created from
             // one client no longer hijacks every other open agent tab.
             try selectAgentThread(thread: t.id, surfaceID: surfaceID)
-        }
-        // Carry cap victims explicitly: a subscribed surface must evict them
-        // before its fallible post-create list read.
-        if !prunedThreadIDs.isEmpty {
-            publishAgentThreadLifecycle(.deleted(prunedThreadIDs))
         }
         // After rails reload: broadcast create so iOS mirrors and any EventBus
         // subscribers (including Agent App surfaces that listen for thread.*)
@@ -2521,6 +2530,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             routingConfiguration: resolvedRouting
         )
         try ctx.threadRepo.upsert(thread)
+        let prunedThreadIDs: [AgentThreadID]
+        if let resolvedWorkspace {
+            prunedThreadIDs = try ctx.threadRepo.enforceWorkspaceThreadLimit(workspaceId: resolvedWorkspace)
+        } else {
+            prunedThreadIDs = []
+        }
+        if !prunedThreadIDs.isEmpty {
+            publishAgentThreadLifecycle(.deleted(prunedThreadIDs))
+        }
         if parentThread == nil {
             try selectAgentThread(thread: thread.id, surfaceID: surfaceID)
         } else {

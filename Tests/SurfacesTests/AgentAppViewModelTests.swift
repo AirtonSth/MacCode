@@ -7147,6 +7147,19 @@ final class AgentAppViewModelTests: XCTestCase {
                        "partial-failure recovery must synchronously clear deleted-thread Token Saver ledger total")
         XCTAssertTrue(vm.statusMessage.contains("Could not reload threads"),
                       "the partial list failure must still fail loud")
+        XCTAssertTrue(vm.statusMessage.contains("your unsent draft was kept"),
+                      "draft recovery and the reload error must coexist in the system strip")
+
+        vm.createThread(title: "continue preserved draft")
+
+        XCTAssertNotNil(vm.selectedThreadId,
+                        "New Thread must bind the recovered fresh composer")
+        XCTAssertEqual(vm.prompt, "preserve this unsent draft",
+                       "New Thread must transfer the recovered prompt into its thread draft")
+        XCTAssertEqual(vm.attachments, preservedAttachments,
+                       "New Thread must transfer the recovered attachments into its thread draft")
+        XCTAssertFalse(vm.statusMessage.contains("your unsent draft was kept"),
+                       "the composer-scoped recovery notice must clear after binding a valid thread")
     }
 
     /// Deleted-many is the existing EventBus contract for multiple victims. It
@@ -7185,6 +7198,27 @@ final class AgentAppViewModelTests: XCTestCase {
                      "a selected deleted-many victim must recover to the fresh composer")
         XCTAssertEqual(vm.prompt, "draft for second victim",
                        "selected unsent input remains preserved during deleted-many recovery")
+    }
+
+    func test_selectThread_rejectsRepositoryMissingStaleRailRow() throws {
+        let (vm, threadRepo) = try makeVM()
+        let deleted = AgentThread(workspaceId: vm.workspaceID, title: "stale rail", provider: .claude, model: "m")
+        try threadRepo.upsert(deleted)
+        vm.reloadThreads()
+        XCTAssertTrue(vm.threads.contains(where: { $0.id == deleted.id }))
+        try threadRepo.delete(id: deleted.id)
+        vm.setReloadThreadListForTesting {
+            throw NSError(domain: "AgentAppViewModelTests.staleRail", code: 1)
+        }
+        vm.reloadThreads()
+        vm.setReloadThreadListForTesting(nil)
+        XCTAssertTrue(vm.threads.contains(where: { $0.id == deleted.id }),
+                      "precondition: the failed cross-process reconciliation leaves a stale rail snapshot")
+
+        vm.selectThread(deleted.id)
+
+        XCTAssertNil(vm.selectedThreadId,
+                     "repository absence must win over stale in-memory rail membership")
     }
 
     /// PERF-MAC_AGENT-013: a create/RPC producer can enforce the cap before an

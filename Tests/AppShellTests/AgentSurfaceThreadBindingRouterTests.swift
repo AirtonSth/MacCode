@@ -247,7 +247,9 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         )
 
         for _ in 0..<100 where firstSurface.viewModel.threadCacheResidueForTesting.contains(victim.id)
-            || secondSurface.viewModel.threadCacheResidueForTesting.contains(victim.id) {
+            || secondSurface.viewModel.threadCacheResidueForTesting.contains(victim.id)
+            || !firstSurface.viewModel.statusMessage.contains("Could not reload threads")
+            || !secondSurface.viewModel.statusMessage.contains("Could not reload threads") {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         firstSurface.viewModel.setReloadThreadListForTesting(nil)
@@ -296,13 +298,15 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         XCTAssertTrue(secondSurface.viewModel.threadCacheResidueForTesting.contains(uiVictim.id))
         createdEvents.removeAll()
         deletedEvents.removeAll()
+        secondSurface.viewModel.dismissStatusMessage()
         secondSurface.viewModel.setReloadThreadListForTesting {
             throw NSError(domain: "AgentSurfaceThreadBindingRouterTests.localReload", code: 3)
         }
 
         firstSurface.viewModel.createThread(title: "local UI create")
 
-        for _ in 0..<100 where secondSurface.viewModel.threadCacheResidueForTesting.contains(uiVictim.id) {
+        for _ in 0..<100 where secondSurface.viewModel.threadCacheResidueForTesting.contains(uiVictim.id)
+            || !secondSurface.viewModel.statusMessage.contains("Could not reload threads") {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         secondSurface.viewModel.setReloadThreadListForTesting(nil)
@@ -323,6 +327,110 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         XCTAssertEqual(secondSurface.viewModel.selectedThreadId, secondSelection,
                        "UI creation must preserve the unrelated surface selection")
         XCTAssertTrue(secondSurface.viewModel.statusMessage.contains("Could not reload threads"))
+    }
+
+    func test_targetedCreate_hydratesRepositoryThreadWhenRailReloadFails() throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-TargetedCreate-" + UUID().uuidString
+        let (_, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "TARGETED-CREATE", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        let surface = try XCTUnwrap(agentSurfaces(in: workspace.id).first)
+        let previous = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "previous",
+            provider: .codex,
+            model: "gpt-5.6",
+            permissionMode: .supervised,
+            reasoningEffort: .medium,
+            surfaceID: surface.descriptor.id,
+            routingConfiguration: nil
+        )
+        surface.viewModel.prompt = "previous thread draft"
+        surface.viewModel.promptWasEdited()
+        surface.viewModel.setReloadThreadListForTesting {
+            throw NSError(domain: "AgentSurfaceThreadBindingRouterTests.targetedCreate", code: 1)
+        }
+
+        let created = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "targeted",
+            provider: .claude,
+            model: "claude-sonnet-4-5",
+            permissionMode: .fullAccess,
+            reasoningEffort: .high,
+            surfaceID: surface.descriptor.id,
+            routingConfiguration: nil
+        )
+        surface.viewModel.setReloadThreadListForTesting(nil)
+
+        XCTAssertEqual(surface.viewModel.selectedThreadId, created.id)
+        XCTAssertEqual(surface.viewModel.provider, .claude,
+                       "repository fallback must hydrate provider after the failed rail reload")
+        XCTAssertEqual(surface.viewModel.model, "claude-sonnet-4-5")
+        XCTAssertEqual(surface.viewModel.permissionMode, .fullAccess)
+        XCTAssertEqual(surface.viewModel.prompt, "",
+                       "the new thread must not display the previous thread's composer")
+        surface.viewModel.selectThread(previous.id)
+        XCTAssertEqual(surface.viewModel.prompt, "previous thread draft",
+                       "the previous composer must remain bound to its original thread")
+    }
+
+    func test_routedCreateAtCap_enforcesLimitAndPublishesVictim() async throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-RoutedCap-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "ROUTED-CAP", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        let oldest = Date(timeIntervalSince1970: 1_700_000_000)
+        var victim = AgentThread(workspaceId: workspace.id, title: "routed victim", provider: .codex, model: "m")
+        victim.status = .completed
+        victim.updatedAt = oldest
+        try ctx.threadRepo.upsert(victim)
+        for index in 0..<(AgentThreadRepository.maxThreadsPerWorkspace - 1) {
+            var thread = AgentThread(workspaceId: workspace.id, title: "survivor \(index)", provider: .codex, model: "m")
+            thread.status = .completed
+            thread.updatedAt = oldest.addingTimeInterval(TimeInterval(index + 1))
+            try ctx.threadRepo.upsert(thread)
+        }
+        var victimEvents: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "agent.thread.deleted",
+                  event.payload.objectValue?["thread_id"]?.stringValue == victim.id.value.uuidString else { return }
+            victimEvents.append(event)
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+        let selection = AgentModelSelection(
+            provider: .codex,
+            modelId: "gpt-5.6",
+            reasoningEffort: .medium,
+            serviceTier: .auto
+        )
+
+        let created = try await router.createAgentThreadRouting(
+            workspace: workspace.id,
+            title: "routed create",
+            provider: .codex,
+            model: "gpt-5.6",
+            permissionMode: .supervised,
+            reasoningEffort: .medium,
+            serviceTier: .auto,
+            modelSelection: selection,
+            providerInstanceId: nil,
+            runAsUser: nil,
+            surfaceID: nil,
+            routing: AgentRoutingRequest(
+                mode: .manual,
+                expectedRevision: 0,
+                manualSelection: selection
+            )
+        )
+
+        XCTAssertEqual(try ctx.threadRepo.count(workspaceId: workspace.id),
+                       AgentThreadRepository.maxThreadsPerWorkspace)
+        XCTAssertNil(try ctx.threadRepo.get(id: victim.id),
+                     "the explicit-routing RPC path must enforce the same workspace cap")
+        XCTAssertNotNil(try ctx.threadRepo.get(id: created.id))
+        XCTAssertEqual(victimEvents.count, 1,
+                       "the routed producer must publish its authoritative victim")
     }
 
     // MARK: selectAgentThread targets exactly one surface when given a surfaceID

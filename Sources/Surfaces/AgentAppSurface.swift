@@ -200,6 +200,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public private(set) var customModelsByProvider: [AgentProvider: [String]] = [:]
     @Published public var status: AgentRunStatus = .pending
     @Published public var statusMessage: String = ""
+    private static let deletedThreadDraftRecoveryMessage =
+        "Thread removed; your unsent draft was kept in a fresh composer."
     /// Informational replay state is separate from statusMessage so a bounded
     /// history window cannot be presented as a provider/persistence error.
     @Published public private(set) var historyReplayNotice: String?
@@ -733,7 +735,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 isStopping = false
             }
         } catch {
-            statusMessage = "Could not reload threads: \(error)"
+            let reloadFailure = "Could not reload threads: \(error)"
+            if statusMessage.contains(Self.deletedThreadDraftRecoveryMessage) {
+                statusMessage = "\(Self.deletedThreadDraftRecoveryMessage) \(reloadFailure)"
+            } else {
+                statusMessage = reloadFailure
+            }
             return
         }
         // PERF-MAC_AGENT-009: refresh the thread->workspace cache so didChangeStatus
@@ -1052,10 +1059,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func selectThread(_ id: AgentThreadID, markRead: Bool = true) {
         guard !isDisposed else { return }
-        // Fast path is the current rail. The repository fallback supports a
-        // just-created row after a transient reload failure, while refusing to
-        // persist a binding to an authoritatively deleted stale ID.
-        guard threads.contains(where: { $0.id == id }) || (try? threadRepo.get(id: id)) != nil else { return }
+        let selectedThread: AgentThread
+        do {
+            guard let persistedThread = try threadRepo.get(id: id) else { return }
+            selectedThread = persistedThread
+        } catch {
+            statusMessage = "Could not open thread: \(error)"
+            return
+        }
+        if statusMessage.contains(Self.deletedThreadDraftRecoveryMessage) {
+            statusMessage = ""
+        }
         historyReplayNotice = nil
         let isThreadSwitch = selectedThreadId != id
         if isThreadSwitch {
@@ -1090,49 +1104,47 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // wired by the host after init, so restore-time selects don't re-persist.
         if isThreadSwitch { onSelectedThreadChanged?(id) }
         reloadQueuedMessages()
-        if let t = threads.first(where: { $0.id == id }) {
-            let routing = t.effectiveRoutingConfiguration
-            routingMode = routing.mode
-            let manual = routing.manualSelection
-            provider = manual.provider
-            providerInstanceId = routing.manualProviderInstanceId ?? manual.provider.rawValue
-            runAsUser = t.runAsUser ?? AgentRunAsUser.current()
-            model = manual.effectiveModel
-            permissionMode = t.permissionMode
-            reasoningEffort = manual.reasoningEffort
-            serviceTier = manual.serviceTier
-            executionMode = t.executionMode
-            baseBranch = t.baseBranch ?? gitBranch ?? "main"
-            worktreePath = t.worktreePath
-            status = t.status
-            if isThreadSwitch { restoreComposerDraft(for: t) }
-            if let trackedRunId = trackedRunId(for: id) {
-                // UX-XPLAT-008: use the host's persisted run start time so
-                // "Working for Xs" reflects real elapsed time even after
-                // selectThread is called mid-run (e.g. after app relaunch or
-                // switching away and back). Fallback to Date() only when the
-                // run record is not yet committed (race on the very first tick).
-                runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
-                    current: runStartedAt,
-                    persisted: try? coordinator.runStartedAt(threadId: id)
-                )
-                // RUN-LIFECYCLE-STREAM-004: resync currentRunId to THIS thread's
-                // active run. Without this, switching to an already-running
-                // thread left a stale currentRunId from the previous thread, so
-                // Stop could cancel the wrong thread's run.
-                currentRunId = trackedRunId
-                stopScheduledLivePoll()
-            } else if isScheduledThreadRunning?(id) == true {
-                // Path B: LaunchAgent owns the provider process. This process has
-                // no coordinator session, so the old branch cleared runStartedAt
-                // and the UI stuck on "Working for 0s" even while tools ran.
-                // Shared SQLite still has agent_runs.started_at + stream events.
-                bindScheduledOwnedRun(threadId: id)
-            } else {
-                currentRunId = nil
-                runStartedAt = nil
-                stopScheduledLivePoll()
-            }
+        let routing = selectedThread.effectiveRoutingConfiguration
+        routingMode = routing.mode
+        let manual = routing.manualSelection
+        provider = manual.provider
+        providerInstanceId = routing.manualProviderInstanceId ?? manual.provider.rawValue
+        runAsUser = selectedThread.runAsUser ?? AgentRunAsUser.current()
+        model = manual.effectiveModel
+        permissionMode = selectedThread.permissionMode
+        reasoningEffort = manual.reasoningEffort
+        serviceTier = manual.serviceTier
+        executionMode = selectedThread.executionMode
+        baseBranch = selectedThread.baseBranch ?? gitBranch ?? "main"
+        worktreePath = selectedThread.worktreePath
+        status = selectedThread.status
+        if isThreadSwitch { restoreComposerDraft(for: selectedThread) }
+        if let trackedRunId = trackedRunId(for: id) {
+            // UX-XPLAT-008: use the host's persisted run start time so
+            // "Working for Xs" reflects real elapsed time even after
+            // selectThread is called mid-run (e.g. after app relaunch or
+            // switching away and back). Fallback to Date() only when the
+            // run record is not yet committed (race on the very first tick).
+            runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
+                current: runStartedAt,
+                persisted: try? coordinator.runStartedAt(threadId: id)
+            )
+            // RUN-LIFECYCLE-STREAM-004: resync currentRunId to THIS thread's
+            // active run. Without this, switching to an already-running
+            // thread left a stale currentRunId from the previous thread, so
+            // Stop could cancel the wrong thread's run.
+            currentRunId = trackedRunId
+            stopScheduledLivePoll()
+        } else if isScheduledThreadRunning?(id) == true {
+            // Path B: LaunchAgent owns the provider process. This process has
+            // no coordinator session, so the old branch cleared runStartedAt
+            // and the UI stuck on "Working for 0s" even while tools ran.
+            // Shared SQLite still has agent_runs.started_at + stream events.
+            bindScheduledOwnedRun(threadId: id)
+        } else {
+            currentRunId = nil
+            runStartedAt = nil
+            stopScheduledLivePoll()
         }
         normalizeInteractionModeForSelectedProvider()
         // UX-MAC_AGENT-CONTINUE: check whether the newly selected thread was
@@ -3731,6 +3743,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             applyAuthoritativeThreadDeletions(Set(prunedThreadIDs))
             onThreadLifecycle?(.deleted(prunedThreadIDs))
         }
+        if selectedThreadId == nil {
+            // A fresh composer can hold user input, including a draft preserved
+            // from an automatically pruned selection. Bind that input to the
+            // new row before selectThread restores its thread-scoped draft.
+            persistComposerDraft(for: t.id)
+        }
         reloadThreads()
         onThreadLifecycle?(.created(threads.first(where: { $0.id == t.id }) ?? t))
         selectThread(t.id)
@@ -4097,7 +4115,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         publishInterestedThreadId(nil)
         resetDeletedSelectionToFreshComposer()
         if preservedUnsentDraft {
-            statusMessage = "Thread removed; your unsent draft was kept in a fresh composer."
+            statusMessage = Self.deletedThreadDraftRecoveryMessage
         }
         onSelectedThreadChanged?(nil)
     }
