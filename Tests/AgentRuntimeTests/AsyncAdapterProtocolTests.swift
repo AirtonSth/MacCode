@@ -351,7 +351,7 @@ final class AsyncAdapterProtocolTests: XCTestCase {
                 provider: .codex,
                 model: "fake-model"
             )
-            thread.status = index.isMultiple(of: 2) ? .running : .pending
+            thread.status = .running
             try threadRepo.upsert(thread)
             originalIDs.insert(thread.id)
         }
@@ -413,7 +413,7 @@ final class AsyncAdapterProtocolTests: XCTestCase {
                 provider: .codex,
                 model: "fake-model"
             )
-            thread.status = index.isMultiple(of: 2) ? .running : .pending
+            thread.status = .running
             try threadRepo.upsert(thread)
             originalIDs.insert(thread.id)
         }
@@ -483,7 +483,7 @@ final class AsyncAdapterProtocolTests: XCTestCase {
                 provider: .codex,
                 model: "fake-model"
             )
-            protected.status = index.isMultiple(of: 2) ? .running : .pending
+            protected.status = .running
             try threadRepo.upsert(protected)
         }
         let child = AgentThread(
@@ -541,7 +541,7 @@ final class AsyncAdapterProtocolTests: XCTestCase {
                 provider: .codex,
                 model: "fake-model"
             )
-            protected.status = index.isMultiple(of: 2) ? .running : .pending
+            protected.status = .running
             try threadRepo.upsert(protected)
         }
         let child = AgentThread(

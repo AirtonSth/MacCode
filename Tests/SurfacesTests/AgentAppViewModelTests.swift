@@ -4184,7 +4184,7 @@ final class AgentAppViewModelTests: XCTestCase {
                 provider: .codex,
                 model: "fake-model"
             )
-            thread.status = index.isMultiple(of: 2) ? .running : .pending
+            thread.status = .running
             try threadRepo.upsert(thread)
             originalIDs.insert(thread.id)
         }
@@ -4259,7 +4259,7 @@ final class AgentAppViewModelTests: XCTestCase {
                 provider: .codex,
                 model: "fake-model"
             )
-            protected.status = index.isMultiple(of: 2) ? .running : .pending
+            protected.status = .running
             try threadRepo.upsert(protected)
             originalIDs.insert(protected.id)
         }
@@ -7278,7 +7278,7 @@ final class AgentAppViewModelTests: XCTestCase {
                 provider: .codex,
                 model: "m"
             )
-            thread.status = index.isMultiple(of: 2) ? .running : .pending
+            thread.status = .running
             try threadRepo.upsert(thread)
             protectedIDs.insert(thread.id)
         }

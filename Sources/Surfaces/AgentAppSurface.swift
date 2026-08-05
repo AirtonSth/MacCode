@@ -533,39 +533,52 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self?.sr1TranslatedMessageIds.insert(msgId)
             }
         }
-        // Init must populate the rail before restore-time selectThread; never
-        // defer that first load through the async workspace hub.
-        reloadThreadsImmediate()
-        if let newThreadDefaultsStore {
-            if let saved = newThreadDefaultsStore.load() {
-                restoreNewThreadDefaults(saved)
-            } else if let latest = threads.max(by: { $0.updatedAt < $1.updatedAt }) {
-                let routing = latest.effectiveRoutingConfiguration
-                restoreNewThreadDefaults(AgentNewThreadDefaults(
-                    routingMode: routing.mode,
-                    runAsUser: latest.runAsUser,
-                    provider: routing.manualSelection.provider,
-                    providerInstanceId: routing.manualProviderInstanceId ?? routing.manualSelection.provider.rawValue,
-                    model: routing.manualSelection.effectiveModel,
-                    reasoningEffort: routing.manualSelection.reasoningEffort
-                ))
-                rememberNewThreadDefaults()
+        // XCTest: same-stack rail load so selectThread(initial) sees rows.
+        // Production: first cap+list off MainActor so opening a tab does not hitch.
+        let pendingInitialThreadId = initialThreadId
+        if Self.isRunningUnitTests {
+            reloadThreadsImmediate()
+            applyNewThreadDefaultsFromRailIfNeeded()
+            if let pendingInitialThreadId, threads.contains(where: { $0.id == pendingInitialThreadId }) {
+                selectThread(pendingInitialThreadId)
+            } else {
+                publishInterestedThreadId(selectedThreadId)
             }
-        }
-        // Per-surface thread binding: select ONLY the thread this surface was
-        // restored/created with. A brand-new tab passes nil and stays on the
-        // fresh-composer state instead of auto-adopting the workspace's first
-        // thread (the new-tab-clone bug). onSelectedThreadChanged is wired by
-        // the host *after* init, so this restore-time select does not re-persist.
-        if let initialThreadId, threads.contains(where: { $0.id == initialThreadId }) {
-            selectThread(initialThreadId)
         } else {
-            // Fresh composer / no restore: still publish the empty interest set so
-            // nonisolated stream delivery never buffers against a stale mirror.
-            publishInterestedThreadId(selectedThreadId)
+            publishInterestedThreadId(nil)
+            Task { @MainActor [weak self] in
+                guard let self, !self.isDisposed else { return }
+                let snapshot = await self.loadRailSnapshotOffMainActor()
+                self.applyRailSnapshot(snapshot)
+                self.applyNewThreadDefaultsFromRailIfNeeded()
+                if let pendingInitialThreadId,
+                   self.threads.contains(where: { $0.id == pendingInitialThreadId }) {
+                    self.selectThread(pendingInitialThreadId)
+                } else {
+                    self.publishInterestedThreadId(self.selectedThreadId)
+                }
+            }
         }
         loadGitBranch()
         AgentWorkspaceRailReloadCoordinator.shared.register(self)
+    }
+
+    private func applyNewThreadDefaultsFromRailIfNeeded() {
+        guard let newThreadDefaultsStore else { return }
+        if let saved = newThreadDefaultsStore.load() {
+            restoreNewThreadDefaults(saved)
+        } else if let latest = threads.max(by: { $0.updatedAt < $1.updatedAt }) {
+            let routing = latest.effectiveRoutingConfiguration
+            restoreNewThreadDefaults(AgentNewThreadDefaults(
+                routingMode: routing.mode,
+                runAsUser: latest.runAsUser,
+                provider: routing.manualSelection.provider,
+                providerInstanceId: routing.manualProviderInstanceId ?? routing.manualSelection.provider.rawValue,
+                model: routing.manualSelection.effectiveModel,
+                reasoningEffort: routing.manualSelection.reasoningEffort
+            ))
+            rememberNewThreadDefaults()
+        }
     }
 
     public func reloadCustomModels() {
@@ -1887,12 +1900,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Hot transcript body budget for the UI process. Durable history stays in
     /// SQLite; only this many UTF-8 body bytes stay resident in `messages`.
     /// (Was 96 MB — too large for huge threads; older rows load via keyset pages.)
-    /// Hot UI transcript budget. 16 MiB caused multi-second re-renders on fat threads.
-    nonisolated static let fullLoadBodyBudgetBytes = 2 * 1024 * 1024
+    /// First-paint / hot UI body budget. Lower than durable retention so opening
+    /// a fat thread does not re-render multi-MiB of markdown on MainActor.
+    nonisolated static let fullLoadBodyBudgetBytes = 768 * 1024
     /// Hot message page (newest first). Older durable rows remain outside the
-    /// hot UI window (`messageHistoryIsPartial`) and load on demand.
-    /// Align UI page size with durable per-thread message retention (100).
-    nonisolated static let messageHistoryPageLimit = 100
+    /// hot UI window (`messageHistoryIsPartial`) and load on demand via scroll.
+    nonisolated static let messageHistoryPageLimit = 40
 
     private func loadAllMessages(_ id: AgentThreadID) {
         // SQLite access remains on the app's established DB actor, but the query is
@@ -3456,7 +3469,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         scheduledLiveStreamCount = coordinator.latestStreamEvents(threadId: threadId).count
         scheduledLivePollTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1))
+                // 2s is enough for LaunchAgent-owned progress; 1s doubled MainActor work.
+                try? await Task.sleep(for: .seconds(2))
                 guard let self, !Task.isCancelled, !self.isDisposed else { return }
                 self.tickScheduledLivePoll()
             }
@@ -5932,8 +5946,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return
         }
         if quantum.hasMore {
+            // Small gap so input/scroll can interleave between paint quanta.
             Task { @MainActor [weak self] in
-                await Task.yield()
+                try? await Task.sleep(for: .milliseconds(4))
                 self?.flushStreamEvents()
             }
         }
@@ -6235,8 +6250,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private func scheduleTimelineUpdateTick() {
         guard timelineUpdateTickTask == nil else { return }
+        // ~30 Hz paint coalesce (was 16 ms / 60 Hz) — fewer full transcript
+        // re-evaluations while tokens stream.
         timelineUpdateTickTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(16))
+            try? await Task.sleep(for: .milliseconds(33))
             guard !Task.isCancelled else { return }
             self.timelineUpdateTick &+= 1
             self.timelineUpdateTickTask = nil
@@ -6602,14 +6619,13 @@ final class InterestedThreadBox: @unchecked Sendable {
 final class StreamEventBatch: @unchecked Sendable {
     struct Limits: Equatable {
         /// Hot UI queue only — durable stream history is bounded separately.
-        /// Sized for a 16 GB MacBook class machine: leave headroom for the OS,
-        /// Chrome, and provider processes while absorbing multi-minute tool
-        /// storms (Chrome HTML dumps, shell output) without thrashing the latch.
-        /// ~256 MB is ~1.5% of 16 GB and still fail-closed above that.
-        var maxBufferedCount: Int = 32_768
-        var maxBufferedBytes: Int = 256 * 1_024 * 1_024
-        var drainCount: Int = 512
-        var drainBytes: Int = 8 * 1_024 * 1_024
+        /// Hot UI queue only — durable stream history is bounded separately.
+        /// Smaller quanta keep each MainActor hop short so scrolling/composer
+        /// stay responsive during tool storms (rehydrate fills gaps after).
+        var maxBufferedCount: Int = 8_192
+        var maxBufferedBytes: Int = 32 * 1_024 * 1_024
+        var drainCount: Int = 64
+        var drainBytes: Int = 1 * 1_024 * 1_024
     }
 
     enum AppendOutcome: Equatable {
@@ -9057,6 +9073,10 @@ public struct AgentAppView: View {
             vm.handleTranscriptLink(url) ? .handled : .systemAction
         })
         .task {
+            // Let the first transcript/composer frame paint before provider
+            // catalog probes (claude/codex/grok model lists) compete for CPU.
+            try? await Task.sleep(for: .milliseconds(1_500))
+            guard !Task.isCancelled else { return }
             if vm.providerSnapshots.isEmpty {
                 await vm.loadProviderSnapshots()
                 // F10: the snapshot path drops the live/fallback signal —
@@ -9841,11 +9861,15 @@ public struct AgentAppView: View {
                 collapseTranscriptForNewTurn()
                 scheduleTimelineScrollToBottom(proxy, force: true)
             }
-            .onChange(of: vm.messages.count) { _ in
+            // Prefer coalesced paint tick + last-message identity over raw counts
+            // so every token/turn delta does not schedule redundant scroll work.
+            .onChange(of: vm.timelineUpdateTick) { _ in
+                scheduleTimelineScrollToBottom(proxy)
+            }
+            .onChange(of: vm.messages.last?.id) { _ in
                 scheduleTimelineScrollToBottom(proxy)
             }
             .onChange(of: vm.timeline.turns.count) { _ in
-                scheduleTimelineScrollToBottom(proxy)
                 // PERF-MAC_AGENT-012: drop expansion ids for items that no longer
                 // exist (turns are memory-capped at AssistantTimelineState.liveTurnLimit)
                 // so the sets don't leak over a long session. Runs only on a turn

@@ -420,7 +420,7 @@ final class AgentThreadDeletionUndoTests: XCTestCase {
                 provider: .codex,
                 model: "m"
             )
-            protected.status = index.isMultiple(of: 2) ? .running : .pending
+            protected.status = .running
             protected.updatedAt = Date(timeIntervalSince1970: TimeInterval(20 + index))
             try vm.threadRepo.upsert(protected)
         }
@@ -506,7 +506,7 @@ final class AgentThreadDeletionUndoTests: XCTestCase {
                 provider: .codex,
                 model: "m"
             )
-            protected.status = index.isMultiple(of: 2) ? .running : .pending
+            protected.status = .running
             try vm.threadRepo.upsert(protected)
         }
         vm.reloadThreads()

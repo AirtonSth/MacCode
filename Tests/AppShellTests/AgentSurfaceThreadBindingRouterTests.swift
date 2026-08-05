@@ -867,10 +867,13 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         let workspace = try router.createWorkspace(name: "PROTECTED-CAP", cwd: NSTemporaryDirectory())
         defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
         let surface = try XCTUnwrap(agentSurfaces(in: workspace.id).first)
+        // Only `running` is non-reclaimable under the hard cap; `pending` may be
+        // pruned as idle capacity pressure. Protected-capacity tests must not mix in
+        // reclaimable pending shells.
         let existingIDs = try fillWorkspaceToThreadCap(
             workspace.id,
             context: ctx,
-            statuses: [.running, .pending]
+            statuses: [.running]
         )
         surface.viewModel.reloadThreads()
         var lifecycleEvents: [EventBus.Event] = []
@@ -911,8 +914,11 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             XCTAssertEqual(actualCount, AgentThreadRepository.maxThreadsPerWorkspace + 1)
             XCTAssertGreaterThan(diagnostics.protectedCounts["active"] ?? 0, 0,
                                  "diagnostics must explain that active rows block disposal")
-            XCTAssertTrue(error.localizedDescription.contains("No disposable empty thread"),
-                          "capacity error must be actionable for operators")
+            XCTAssertTrue(
+                error.localizedDescription.contains("No reclaimable terminal thread")
+                    || error.localizedDescription.contains("No disposable empty thread"),
+                "capacity error must be actionable for operators"
+            )
         }
         try assertOriginalState("normal router")
 
@@ -1011,7 +1017,7 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
                 provider: .codex,
                 model: "m"
             )
-            protected.status = index.isMultiple(of: 2) ? .running : .pending
+            protected.status = .running
             try ctx.threadRepo.upsert(protected)
         }
         var deletedEvents: [EventBus.Event] = []
@@ -1077,7 +1083,7 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
                 provider: .codex,
                 model: "m"
             )
-            protected.status = index.isMultiple(of: 2) ? .running : .pending
+            protected.status = .running
             try ctx.threadRepo.upsert(protected)
         }
         var concurrent = AgentThread(
