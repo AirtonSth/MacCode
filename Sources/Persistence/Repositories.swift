@@ -190,6 +190,11 @@ public struct AgentThreadForkIntent: Codable, Sendable, Equatable {
     public let provider: AgentProvider
     public let idempotencyKey: String
     public let state: AgentThreadForkIntentState
+    /// `prepared` alone is not proof that an adapter was never called: a crash
+    /// can land after a provider accepts the stable key but before its child id
+    /// is durably recorded. New intents start false and flip before that call;
+    /// legacy rows migrate as true so they remain ambiguity-safe.
+    public let providerCreationAttempted: Bool
     public let providerChildThreadId: String?
     public let lastError: String?
     public let createdAt: Date
@@ -213,6 +218,10 @@ public final class AgentThreadRepository {
     /// Soft product cap: keep each workspace's thread table bounded so scheduled
     /// runs and long sessions cannot grow SQLite without limit.
     public static let maxThreadsPerWorkspace = 100
+    /// Startup performs at most this many causal legacy-terminal removals in one
+    /// transaction. This bounds work, not eligibility: recoverable rows are
+    /// never candidates regardless of age or count.
+    public static let terminalForkIntentCleanupBatchSize = 16
 
     let db: SQLiteDB
     public init(db: SQLiteDB) { self.db = db }
@@ -769,19 +778,56 @@ public final class AgentThreadRepository {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let childJSON = String(decoding: try encoder.encode(childThread), as: UTF8.self)
-        try db.performSync { database in
+        return try db.performSync { database in
             try database.transaction {
                 guard try get(id: sourceThreadId) != nil else {
                     throw AgentThreadForkPersistenceError.sourceThreadNotFound
                 }
+
+                // Same durable child/key is a retry, not a second snapshot. Any
+                // mismatch is a conflict rather than an unsafe best-effort merge.
+                if let existing = try getForkIntent(childThreadId: childThread.id) {
+                    guard existing.sourceThreadId == sourceThreadId,
+                          existing.provider == childThread.provider,
+                          existing.idempotencyKey == idempotencyKey,
+                          existing.childThread == childThread else {
+                        throw AgentThreadForkPersistenceError.intentConflict
+                    }
+                    return existing
+                }
+
+                let keyCollision = try database.prepare("""
+                    SELECT 1 FROM agent_thread_fork_intents
+                    WHERE idempotency_key = ?
+                    LIMIT 1;
+                """)
+                try keyCollision.bind(1, idempotencyKey)
+                guard try keyCollision.step() == false else {
+                    throw AgentThreadForkPersistenceError.intentConflict
+                }
+
+                // BEGIN IMMEDIATE serializes this admission across processes.
+                // Check before reading/encoding the transcript so a distinct
+                // child cannot inflate either retained payload or provider work.
+                let recoverableSourceIntent = try database.prepare("""
+                    SELECT 1 FROM agent_thread_fork_intents
+                    WHERE source_thread_id = ?
+                      AND state IN ('prepared', 'provider_created', 'compensating')
+                    LIMIT 1;
+                """)
+                try recoverableSourceIntent.bind(1, sourceThreadId.value.uuidString)
+                guard try recoverableSourceIntent.step() == false else {
+                    throw AgentThreadForkPersistenceError.recoverableIntentExists
+                }
+
                 let sourceMessages = try AgentMessageRepository(db: database).list(threadId: sourceThreadId)
                 let sourceMessagesJSON = String(decoding: try encoder.encode(sourceMessages), as: UTF8.self)
                 let insert = try database.prepare("""
-                    INSERT OR IGNORE INTO agent_thread_fork_intents(
+                    INSERT INTO agent_thread_fork_intents(
                         child_thread_id, source_thread_id, provider, idempotency_key,
                         state, child_thread_json, source_messages_json, provider_child_thread_id,
-                        last_error, created_at, updated_at
-                    ) VALUES(?, ?, ?, ?, 'prepared', ?, ?, NULL, NULL, ?, ?);
+                        last_error, created_at, updated_at, provider_creation_attempted
+                    ) VALUES(?, ?, ?, ?, 'prepared', ?, ?, NULL, NULL, ?, ?, 0);
                 """)
                 try insert.bind(1, childThread.id.value.uuidString)
                 try insert.bind(2, sourceThreadId.value.uuidString)
@@ -792,22 +838,19 @@ public final class AgentThreadRepository {
                 try insert.bind(7, iso.string(from: date))
                 try insert.bind(8, iso.string(from: date))
                 _ = try insert.step()
+                guard let intent = try getForkIntent(childThreadId: childThread.id) else {
+                    throw AgentThreadForkPersistenceError.intentConflict
+                }
+                return intent
             }
         }
-        guard let intent = try getForkIntent(childThreadId: childThread.id),
-              intent.sourceThreadId == sourceThreadId,
-              intent.provider == childThread.provider,
-              intent.idempotencyKey == idempotencyKey else {
-            throw AgentThreadForkPersistenceError.intentConflict
-        }
-        return intent
     }
 
     public func getForkIntent(childThreadId: AgentThreadID) throws -> AgentThreadForkIntent? {
         let statement = try db.prepare("""
             SELECT source_thread_id, provider, idempotency_key, state,
                    child_thread_json, source_messages_json, provider_child_thread_id, last_error,
-                   created_at, updated_at
+                   created_at, updated_at, provider_creation_attempted
             FROM agent_thread_fork_intents WHERE child_thread_id = ?;
         """)
         try statement.bind(1, childThreadId.value.uuidString)
@@ -828,6 +871,7 @@ public final class AgentThreadRepository {
             provider: provider,
             idempotencyKey: statement.columnText(2) ?? "",
             state: state,
+            providerCreationAttempted: statement.columnInt64(10) != 0,
             providerChildThreadId: statement.columnText(6),
             lastError: statement.columnText(7),
             createdAt: parseDate(statement.columnText(8)),
@@ -863,6 +907,32 @@ public final class AgentThreadRepository {
         return try statement.step()
     }
 
+    /// Records the point after which `prepared` must be treated as provider-call
+    /// ambiguous. The call is idempotent so a relaunch can retry the keyed
+    /// adapter request without losing its exact transcript snapshot.
+    @discardableResult
+    public func markForkProviderCreationAttempted(
+        childThreadId: AgentThreadID,
+        at date: Date = Date()
+    ) throws -> AgentThreadForkIntent {
+        let update = try db.prepare("""
+            UPDATE agent_thread_fork_intents
+            SET provider_creation_attempted = 1, updated_at = ?
+            WHERE child_thread_id = ?
+              AND state = 'prepared'
+              AND provider_creation_attempted = 0;
+        """)
+        try update.bind(1, iso.string(from: date))
+        try update.bind(2, childThreadId.value.uuidString)
+        _ = try update.step()
+        guard let intent = try getForkIntent(childThreadId: childThreadId),
+              intent.state == .prepared,
+              intent.providerCreationAttempted else {
+            throw AgentThreadForkPersistenceError.intentConflict
+        }
+        return intent
+    }
+
     @discardableResult
     public func recordForkProviderCreated(
         childThreadId: AgentThreadID,
@@ -872,7 +942,7 @@ public final class AgentThreadRepository {
         let update = try db.prepare("""
             UPDATE agent_thread_fork_intents
             SET state = 'provider_created', provider_child_thread_id = ?,
-                last_error = NULL, updated_at = ?
+                provider_creation_attempted = 1, last_error = NULL, updated_at = ?
             WHERE child_thread_id = ? AND state = 'prepared';
         """)
         try update.bind(1, providerChildThreadId)
@@ -909,41 +979,114 @@ public final class AgentThreadRepository {
         return intent
     }
 
-    public func markForkCompensated(childThreadId: AgentThreadID, at date: Date = Date()) throws {
-        let update = try db.prepare("""
-            UPDATE agent_thread_fork_intents
-            SET state = 'compensated', source_messages_json = '[]',
-                last_error = NULL, updated_at = ?
-            WHERE child_thread_id = ? AND state = 'compensating';
+    public func markForkCompensated(childThreadId: AgentThreadID, at _: Date = Date()) throws {
+        let delete = try db.prepare("""
+            DELETE FROM agent_thread_fork_intents
+            WHERE child_thread_id = ?
+              AND state = 'compensating'
+              AND provider_child_thread_id IS NOT NULL;
         """)
-        try update.bind(1, iso.string(from: date))
-        try update.bind(2, childThreadId.value.uuidString)
-        _ = try update.step()
-        guard try getForkIntent(childThreadId: childThreadId)?.state == .compensated else {
+        try delete.bind(1, childThreadId.value.uuidString)
+        _ = try delete.step()
+        let changes = try db.prepare("SELECT changes();")
+        guard try changes.step(), changes.columnInt64(0) == 1,
+              try getForkIntent(childThreadId: childThreadId) == nil else {
             throw AgentThreadForkPersistenceError.intentConflict
         }
     }
 
-    public func markPreparedForkAbandoned(childThreadId: AgentThreadID, error: String, at date: Date = Date()) throws {
-        let update = try db.prepare("""
-            UPDATE agent_thread_fork_intents
-            SET state = 'abandoned', source_messages_json = '[]',
-                last_error = ?, updated_at = ?
-            WHERE child_thread_id = ? AND state = 'prepared' AND provider_child_thread_id IS NULL;
+    /// A missing source is safe to retire only before the durable intent records
+    /// that a provider call could have begun. The delete itself is the terminal
+    /// outcome: retaining an `abandoned` tombstone would reintroduce row growth.
+    public func markPreparedForkAbandoned(childThreadId: AgentThreadID, error _: String, at _: Date = Date()) throws {
+        let delete = try db.prepare("""
+            DELETE FROM agent_thread_fork_intents
+            WHERE child_thread_id = ?
+              AND state = 'prepared'
+              AND provider_child_thread_id IS NULL
+              AND provider_creation_attempted = 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM agent_threads AS source
+                  WHERE source.id = agent_thread_fork_intents.source_thread_id
+              );
         """)
-        try update.bind(1, error)
-        try update.bind(2, iso.string(from: date))
-        try update.bind(3, childThreadId.value.uuidString)
-        _ = try update.step()
-        guard try getForkIntent(childThreadId: childThreadId)?.state == .abandoned else {
+        try delete.bind(1, childThreadId.value.uuidString)
+        _ = try delete.step()
+        let changes = try db.prepare("SELECT changes();")
+        guard try changes.step(), changes.columnInt64(0) == 1,
+              try getForkIntent(childThreadId: childThreadId) == nil else {
             throw AgentThreadForkPersistenceError.intentConflict
+        }
+    }
+
+    /// Removes only historical terminal rows whose terminal outcome is already
+    /// causally known. Each transaction selects and rechecks a small batch, so a
+    /// crash either rolls the whole batch back or leaves the next startup with a
+    /// strictly smaller candidate set. Recoverable rows are never selected.
+    @discardableResult
+    public func deleteCausallyRetiredForkIntents(
+        limit: Int = AgentThreadRepository.terminalForkIntentCleanupBatchSize
+    ) throws -> Int {
+        let batchSize = max(0, limit)
+        guard batchSize > 0 else { return 0 }
+        return try db.performSync { database in
+            try database.transaction {
+                let candidates = try database.prepare("""
+                    SELECT child_thread_id
+                    FROM agent_thread_fork_intents AS intent
+                    WHERE intent.state = 'compensated'
+                       OR (intent.state = 'abandoned'
+                           AND intent.provider_creation_attempted = 0)
+                       OR (intent.state = 'local_committed'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM agent_threads AS child
+                               WHERE child.id = intent.child_thread_id
+                           ))
+                    ORDER BY intent.updated_at ASC, intent.child_thread_id ASC
+                    LIMIT ?;
+                """)
+                try candidates.bind(1, batchSize)
+                var childIDs: [String] = []
+                while try candidates.step() {
+                    guard let childID = candidates.columnText(0) else {
+                        throw AgentThreadForkPersistenceError.corruptIntent
+                    }
+                    childIDs.append(childID)
+                }
+
+                let delete = try database.prepare("""
+                    DELETE FROM agent_thread_fork_intents
+                    WHERE child_thread_id = ?
+                      AND (
+                          state = 'compensated'
+                          OR (state = 'abandoned' AND provider_creation_attempted = 0)
+                          OR (state = 'local_committed' AND NOT EXISTS (
+                              SELECT 1 FROM agent_threads AS child
+                              WHERE child.id = agent_thread_fork_intents.child_thread_id
+                          ))
+                      );
+                """)
+                var deleted = 0
+                for childID in childIDs {
+                    delete.reset()
+                    try delete.bind(1, childID)
+                    _ = try delete.step()
+                    let changes = try database.prepare("SELECT changes();")
+                    guard try changes.step() else {
+                        throw AgentThreadForkPersistenceError.intentConflict
+                    }
+                    deleted += Int(changes.columnInt64(0))
+                }
+                return deleted
+            }
         }
     }
 
     public func recordForkIntentError(childThreadId: AgentThreadID, error: String, at date: Date = Date()) throws {
         let update = try db.prepare("""
             UPDATE agent_thread_fork_intents SET last_error = ?, updated_at = ?
-            WHERE child_thread_id = ? AND state != 'local_committed' AND state != 'compensated';
+            WHERE child_thread_id = ?
+              AND state IN ('prepared', 'provider_created', 'compensating');
         """)
         try update.bind(1, error)
         try update.bind(2, iso.string(from: date))
@@ -1026,6 +1169,7 @@ public final class AgentThreadRepository {
 public enum AgentThreadForkPersistenceError: Error, Equatable {
     case sourceThreadNotFound
     case intentConflict
+    case recoverableIntentExists
     case providerIdentityConflict
     case childThreadConflict
     case invalidIntentState(AgentThreadForkIntentState)

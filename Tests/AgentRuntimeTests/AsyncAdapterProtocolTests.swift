@@ -446,7 +446,8 @@ final class AsyncAdapterProtocolTests: XCTestCase {
         XCTAssertEqual(adapter.calls, ["forkThread", "compensateFork"])
         XCTAssertEqual(Set(try threadRepo.list(workspaceId: workspaceID).map(\.id)), originalIDs)
         XCTAssertNil(try threadRepo.get(id: child.id))
-        XCTAssertEqual(try threadRepo.getForkIntent(childThreadId: child.id)?.state, .compensated)
+        XCTAssertNil(try threadRepo.getForkIntent(childThreadId: child.id),
+                     "the local intent is deleted only after compensateFork confirms provider cleanup")
     }
 
     func test_reconcileForkIntentsOnLaunch_reportsCapVictimOnlyAfterChildGraphCommits() async throws {

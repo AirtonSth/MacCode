@@ -338,8 +338,9 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             "named step must sit after the shared integration base"
         )
         // The composed head has Message identity, named checkpoint list,
-        // Token Saver per-thread totals (59), then terminal fork transcript
-        // scrubbing (60). This catches duplicate/reordered slots.
+        // Token Saver per-thread totals (59), terminal fork transcript
+        // scrubbing (60), then causal fork cleanup support (61). This catches
+        // duplicate/reordered slots.
         let postBase = Schema.steps.filter {
             $0.version > Schema.sharedIntegrationBaseVersion
         }
@@ -347,6 +348,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             Schema.sharedIntegrationBaseVersion + 1,
             Schema.checkpointListSchemaVersion,
             59,
+            60,
             Schema.currentVersion,
         ])
     }
@@ -506,8 +508,8 @@ final class SchemaMigrationMatrixTests: XCTestCase {
                        "re-running must not alter the recorded version")
     }
 
-    func test_v59ForkIntentTranscriptScrubIsAtomicSelectiveAndIdempotent() throws {
-        XCTAssertEqual(Schema.currentVersion, 60)
+    func test_v59ToV60ForkIntentTranscriptScrubIsAtomicSelectiveAndIdempotent() throws {
+        XCTAssertGreaterThanOrEqual(Schema.currentVersion, 61)
         let db = try SQLiteDB(path: ":memory:")
         try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 59 })
         let largePayload = "[\"\(String(repeating: "x", count: 128 * 1024))\"]"
@@ -541,7 +543,8 @@ final class SchemaMigrationMatrixTests: XCTestCase {
                  AND NEW.source_messages_json = '[]'
             BEGIN SELECT RAISE(ABORT, 'injected terminal scrub failure'); END;
         """)
-        XCTAssertThrowsError(try Schema.migrateSteps(db, Schema.steps))
+        let v60Steps = Schema.steps.filter { $0.version <= 60 }
+        XCTAssertThrowsError(try Schema.migrateSteps(db, v60Steps))
         XCTAssertEqual(try maxVersion(db), 59,
                        "the scrub and schema version must roll back as one migration step")
         let afterRollback = try db.prepare("""
@@ -554,8 +557,8 @@ final class SchemaMigrationMatrixTests: XCTestCase {
                        "one failed terminal update must roll every earlier scrub back")
 
         try db.execute("DROP TRIGGER fail_terminal_fork_scrub;")
-        try Schema.migrateSteps(db, Schema.steps)
-        XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
+        try Schema.migrateSteps(db, v60Steps)
+        XCTAssertEqual(try maxVersion(db), 60)
 
         let rows = try db.prepare("""
             SELECT child_thread_id, source_thread_id, provider, idempotency_key,
@@ -584,7 +587,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
                            "only terminal transcript payloads may be scrubbed")
         }
 
-        XCTAssertNoThrow(try Schema.migrate(db))
+        XCTAssertNoThrow(try Schema.migrateSteps(db, v60Steps))
         let afterRerun = try db.prepare("""
             SELECT state, length(CAST(source_messages_json AS BLOB))
             FROM agent_thread_fork_intents ORDER BY state ASC;
@@ -595,6 +598,223 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             XCTAssertEqual(Int(afterRerun.columnInt64(1)), terminal ? 2 : largePayload.utf8.count,
                            "re-running head migration must be an idempotent no-op")
         }
+        try Schema.migrateSteps(db, Schema.steps)
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion,
+                       "the forward-only v61 lifecycle support must follow an already-applied v60 scrub")
+    }
+
+    func test_v59ForkIntentMigrationBenchmark() throws {
+        XCTAssertGreaterThanOrEqual(Schema.currentVersion, 61)
+        let root = NSTemporaryDirectory() + "rc2-fork-intent-v60-benchmark-" + UUID().uuidString
+        let dbPath = root + "/remotecode.sqlite"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+
+        let db = try SQLiteDB(path: dbPath)
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 59 })
+        let terminalPayload = "[\"" + String(repeating: "x", count: 256 * 1024) + "\"]"
+        let terminalStates = ["local_committed", "compensated", "abandoned"]
+        let terminalRows = 1_000
+        let recoverableStates = ["prepared", "provider_created", "compensating"]
+
+        try db.performSync { database in
+            try database.transaction {
+                let insert = try database.prepare("""
+                    INSERT INTO agent_thread_fork_intents(
+                        child_thread_id, source_thread_id, provider, idempotency_key,
+                        state, child_thread_json, source_messages_json,
+                        provider_child_thread_id, last_error, created_at, updated_at
+                    ) VALUES(?, ?, 'codex', ?, ?, '{}', ?, NULL, NULL, 'created', 'updated');
+                """)
+                for index in 0..<(terminalRows + recoverableStates.count) {
+                    insert.reset()
+                    let state = index < terminalRows
+                        ? terminalStates[index % terminalStates.count]
+                        : recoverableStates[index - terminalRows]
+                    try insert.bind(1, "child-\(index)")
+                    try insert.bind(2, "source-\(index)")
+                    try insert.bind(3, "key-\(index)")
+                    try insert.bind(4, state)
+                    try insert.bind(5, terminalPayload)
+                    _ = try insert.step()
+                }
+            }
+        }
+        try db.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+
+        func fileBytes(_ path: String) -> Int64 {
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+                  let size = attributes[.size] as? NSNumber else { return 0 }
+            return size.int64Value
+        }
+        func totalBytes() -> Int64 {
+            fileBytes(dbPath) + fileBytes(dbPath + "-wal")
+        }
+        func countRows(_ sql: String) throws -> Int {
+            let statement = try db.prepare(sql)
+            defer { statement.reset() }
+            guard try statement.step() else { return 0 }
+            return Int(statement.columnInt64(0))
+        }
+
+        let beforeBytes = totalBytes()
+        let sampleLock = NSLock()
+        var peakBytes = beforeBytes
+        let sampleQueue = DispatchQueue(label: "rc2-fork-intent-v60-benchmark-sampler")
+        let sampler = DispatchSource.makeTimerSource(queue: sampleQueue)
+        sampler.schedule(deadline: .now(), repeating: .milliseconds(1))
+        sampler.setEventHandler {
+            let bytes = totalBytes()
+            sampleLock.lock()
+            peakBytes = max(peakBytes, bytes)
+            sampleLock.unlock()
+        }
+        sampler.resume()
+        let startedAt = Date()
+        let v60Steps = Schema.steps.filter { $0.version <= 60 }
+        try Schema.migrateSteps(db, v60Steps)
+        let wallSeconds = Date().timeIntervalSince(startedAt)
+        sampler.cancel()
+        sampleQueue.sync {}
+        sampleLock.lock()
+        peakBytes = max(peakBytes, totalBytes())
+        sampleLock.unlock()
+        let afterBytes = totalBytes()
+
+        XCTAssertLessThanOrEqual(wallSeconds, 10,
+                                 "the v60 startup migration must finish the 1,000-row 256 KiB corpus within its declared 10-second budget")
+        XCTAssertLessThanOrEqual(peakBytes - beforeBytes, 8 * 1_024 * 1_024,
+                                 "the v60 migration must not duplicate the 256 MiB terminal corpus into the database or WAL")
+
+        XCTAssertEqual(try countRows("""
+            SELECT COUNT(*) FROM agent_thread_fork_intents
+            WHERE state IN ('local_committed', 'compensated', 'abandoned')
+              AND source_messages_json = '[]';
+        """), terminalRows)
+        XCTAssertEqual(try countRows("""
+            SELECT COUNT(*) FROM agent_thread_fork_intents
+            WHERE state IN ('prepared', 'provider_created', 'compensating')
+              AND length(CAST(source_messages_json AS BLOB)) = \(terminalPayload.utf8.count);
+        """), recoverableStates.count)
+        XCTAssertNoThrow(try Schema.migrateSteps(db, v60Steps),
+                         "re-running the completed migration must be an idempotent no-op")
+        try Schema.migrateSteps(db, Schema.steps)
+        XCTAssertEqual(try countRows("SELECT COUNT(*) FROM schema_meta WHERE version = 61;"), 1,
+                       "head migration must record the forward-only causal cleanup support")
+
+        print("FORK_INTENT_V60_BENCH wall_seconds=\(String(format: "%.3f", wallSeconds)) before_bytes=\(beforeBytes) peak_bytes=\(peakBytes) after_bytes=\(afterBytes) peak_delta_bytes=\(peakBytes - beforeBytes) after_delta_bytes=\(afterBytes - beforeBytes) terminal_rows=\(terminalRows) recoverable_rows=\(recoverableStates.count)")
+    }
+
+    func test_v61CausalForkIntentCleanupIsBoundedCrashSafeAndResumableOnStartup() throws {
+        XCTAssertEqual(Schema.currentVersion, 61)
+        let root = NSTemporaryDirectory() + "rc2-fork-intent-v61-cleanup-" + UUID().uuidString
+        let dbPath = root + "/remotecode.sqlite"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let batchSize = AgentThreadRepository.terminalForkIntentCleanupBatchSize
+        let candidateCount = batchSize + 2
+
+        func scalar(_ db: SQLiteDB, _ sql: String) throws -> Int {
+            let statement = try db.prepare(sql)
+            defer { statement.reset() }
+            guard try statement.step() else { return 0 }
+            return Int(statement.columnInt64(0))
+        }
+
+        do {
+            let legacy = try SQLiteDB(path: dbPath)
+            try Schema.migrateSteps(legacy, Schema.steps.filter { $0.version <= 60 })
+            let insert = try legacy.prepare("""
+                INSERT INTO agent_thread_fork_intents(
+                    child_thread_id, source_thread_id, provider, idempotency_key,
+                    state, child_thread_json, source_messages_json,
+                    provider_child_thread_id, last_error, created_at, updated_at
+                ) VALUES(?, ?, 'codex', ?, ?, '{}', ?, 'provider-child', NULL, 'created', 'updated');
+            """)
+            for index in 0..<candidateCount {
+                insert.reset()
+                try insert.bind(1, String(format: "candidate-%04d", index))
+                try insert.bind(2, "source-\(index)")
+                try insert.bind(3, "key-\(index)")
+                try insert.bind(4, index.isMultiple(of: 2) ? "compensated" : "local_committed")
+                try insert.bind(5, "[\"historical terminal payload\"]")
+                _ = try insert.step()
+            }
+            insert.reset()
+            try insert.bind(1, "recoverable-prepared")
+            try insert.bind(2, "source-recoverable")
+            try insert.bind(3, "key-recoverable")
+            try insert.bind(4, "prepared")
+            try insert.bind(5, "[\"recoverable transcript\"]")
+            _ = try insert.step()
+            insert.reset()
+            try insert.bind(1, "legacy-abandoned")
+            try insert.bind(2, "source-abandoned")
+            try insert.bind(3, "key-abandoned")
+            try insert.bind(4, "abandoned")
+            try insert.bind(5, "[]")
+            _ = try insert.step()
+            try legacy.execute("""
+                INSERT INTO agent_threads(id, title, provider, model, status, created_at, updated_at)
+                VALUES('candidate-\(String(format: "%04d", 1))', 'live child', 'codex', 'm', 'completed', 'created', 'updated');
+            """)
+            try legacy.execute("""
+                CREATE TRIGGER fail_causal_fork_cleanup
+                BEFORE DELETE ON agent_thread_fork_intents
+                WHEN OLD.child_thread_id = 'candidate-\(String(format: "%04d", 2))'
+                BEGIN SELECT RAISE(ABORT, 'injected causal cleanup failure'); END;
+            """)
+        }
+
+        let bootstrap = Bootstrap(
+            channel: .debug,
+            dbPathOverride: dbPath,
+            appSupportOverride: root
+        )
+        XCTAssertThrowsError(try bootstrap.run()) { error in
+            XCTAssertTrue(String(describing: error).contains("injected causal cleanup failure"))
+        }
+
+        let afterFailure = try SQLiteDB(path: dbPath)
+        XCTAssertEqual(try scalar(afterFailure, "SELECT MAX(version) FROM schema_meta;"), Schema.currentVersion,
+                       "schema progress commits before a bounded maintenance batch can fail")
+        XCTAssertEqual(try scalar(afterFailure, """
+            SELECT COUNT(*) FROM agent_thread_fork_intents
+            WHERE state = 'compensated'
+               OR (state = 'local_committed' AND child_thread_id != 'candidate-0001');
+        """), candidateCount - 1,
+                       "a failed batch must roll back every tentative terminal deletion")
+        XCTAssertEqual(try scalar(afterFailure, """
+            SELECT provider_creation_attempted FROM agent_thread_fork_intents
+            WHERE child_thread_id = 'recoverable-prepared';
+        """), 1,
+                       "legacy recoverable rows default to ambiguous rather than becoming deletable")
+        try afterFailure.execute("DROP TRIGGER fail_causal_fork_cleanup;")
+
+        let (_, firstDB) = try bootstrap.run()
+        XCTAssertEqual(try scalar(firstDB, """
+            SELECT COUNT(*) FROM agent_thread_fork_intents
+            WHERE state = 'compensated'
+               OR (state = 'local_committed' AND child_thread_id != 'candidate-0001');
+        """), candidateCount - 1 - batchSize,
+                       "one startup must delete no more than its configured causal batch")
+        XCTAssertEqual(try scalar(firstDB, """
+            SELECT COUNT(*) FROM agent_thread_fork_intents
+            WHERE child_thread_id = 'recoverable-prepared'
+              AND source_messages_json = '["recoverable transcript"]';
+        """), 1,
+                       "recoverable transcript payloads must survive every maintenance retry exactly")
+        XCTAssertEqual(try scalar(firstDB, """
+            SELECT COUNT(*) FROM agent_thread_fork_intents
+            WHERE child_thread_id IN ('candidate-0001', 'legacy-abandoned');
+        """), 2,
+                       "a live local child and an unproven legacy abandonment are not cleanup candidates")
+
+        let (_, secondDB) = try bootstrap.run()
+        XCTAssertEqual(try scalar(secondDB, """
+            SELECT COUNT(*) FROM agent_thread_fork_intents
+            WHERE state = 'compensated'
+               OR (state = 'local_committed' AND child_thread_id != 'candidate-0001');
+        """), 0,
+                       "the next startup resumes from the remaining causal candidates without a cursor replay")
     }
 
     // MARK: - Monotonically-increasing version numbers

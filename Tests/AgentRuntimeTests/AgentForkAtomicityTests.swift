@@ -188,6 +188,27 @@ final class AgentForkAtomicityTests: XCTestCase {
         return Int(statement.columnInt64(0))
     }
 
+    private func forkIntentRowCount(_ harness: Harness, sourceThreadId: AgentThreadID) throws -> Int {
+        let statement = try harness.db.prepare(
+            "SELECT COUNT(*) FROM agent_thread_fork_intents WHERE source_thread_id = ?;"
+        )
+        defer { statement.reset() }
+        try statement.bind(1, sourceThreadId.value.uuidString)
+        guard try statement.step() else { return 0 }
+        return Int(statement.columnInt64(0))
+    }
+
+    private func forkIntentPayloadBytes(_ harness: Harness, sourceThreadId: AgentThreadID) throws -> Int {
+        let statement = try harness.db.prepare("""
+            SELECT COALESCE(SUM(length(CAST(source_messages_json AS BLOB))), 0)
+            FROM agent_thread_fork_intents WHERE source_thread_id = ?;
+        """)
+        defer { statement.reset() }
+        try statement.bind(1, sourceThreadId.value.uuidString)
+        guard try statement.step() else { return 0 }
+        return Int(statement.columnInt64(0))
+    }
+
     func test_unsafeProvidersFailClosedBeforeProviderOrLocalMutation() async throws {
         for provider in AgentProvider.allCases {
             let harness = try makeHarness(provider: provider)
@@ -262,7 +283,7 @@ final class AgentForkAtomicityTests: XCTestCase {
         XCTAssertEqual(adapter.providerCreations, 1)
     }
 
-    func test_forkIntentTranscriptSurvivesRecoverableStatesAndClearsInEveryTerminalTombstone() throws {
+    func test_recoverableTranscriptsRemainExactAndCausalTerminalRowsDoNotSurvive() throws {
         let payloadBytes = 256 * 1024
 
         func prepareLargeIntent(_ harness: Harness, suffix: String) throws -> AgentThreadForkIntent {
@@ -278,38 +299,73 @@ final class AgentForkAtomicityTests: XCTestCase {
             )
         }
 
-        func assertIdentity(
-            _ actual: AgentThreadForkIntent,
-            prepared: AgentThreadForkIntent,
-            state: AgentThreadForkIntentState,
-            providerChildThreadId: String?,
-            lastError: String?,
-            file: StaticString = #filePath,
-            line: UInt = #line
-        ) {
-            XCTAssertEqual(actual.state, state, file: file, line: line)
-            XCTAssertEqual(actual.sourceThreadId, prepared.sourceThreadId, file: file, line: line)
-            XCTAssertEqual(actual.childThread, prepared.childThread, file: file, line: line)
-            XCTAssertEqual(actual.provider, prepared.provider, file: file, line: line)
-            XCTAssertEqual(actual.idempotencyKey, prepared.idempotencyKey, file: file, line: line)
-            XCTAssertEqual(actual.providerChildThreadId, providerChildThreadId, file: file, line: line)
-            XCTAssertEqual(actual.lastError, lastError, file: file, line: line)
+        let compensationHarness = try makeHarness()
+        let prepared = try prepareLargeIntent(compensationHarness, suffix: "C")
+        let preparedBytes = try sourceMessagesJSONByteCount(compensationHarness)
+        XCTAssertGreaterThan(preparedBytes, payloadBytes,
+                             "prepared must retain the complete fork-boundary transcript")
+        XCTAssertFalse(prepared.providerCreationAttempted,
+                       "a newly prepared intent proves no provider call has begun yet")
+        let attempted = try compensationHarness.threadRepo.markForkProviderCreationAttempted(
+            childThreadId: compensationHarness.child.id
+        )
+        XCTAssertTrue(attempted.providerCreationAttempted)
+        XCTAssertEqual(try sourceMessagesJSONByteCount(compensationHarness), preparedBytes,
+                       "the pre-call ambiguity marker must not alter recovery evidence")
+        let providerCreated = try compensationHarness.threadRepo.recordForkProviderCreated(
+            childThreadId: compensationHarness.child.id,
+            providerChildThreadId: "provider-compensated"
+        )
+        XCTAssertEqual(providerCreated.state, .providerCreated)
+        XCTAssertEqual(try sourceMessagesJSONByteCount(compensationHarness), preparedBytes,
+                       "provider_created recovery still needs the exact prepared transcript")
+        let compensating = try compensationHarness.threadRepo.markForkCompensating(
+            childThreadId: compensationHarness.child.id,
+            error: "local graph conflict"
+        )
+        XCTAssertEqual(compensating.state, .compensating)
+        XCTAssertEqual(try sourceMessagesJSONByteCount(compensationHarness), preparedBytes,
+                       "compensating retry must retain the exact recovery transcript")
+        try compensationHarness.threadRepo.markForkCompensated(childThreadId: compensationHarness.child.id)
+        XCTAssertNil(try compensationHarness.threadRepo.getForkIntent(childThreadId: compensationHarness.child.id),
+                     "a confirmed provider deletion must remove its terminal local row")
+
+        let unattemptedHarness = try makeHarness()
+        _ = try prepareLargeIntent(unattemptedHarness, suffix: "A")
+        try unattemptedHarness.threadRepo.delete(id: unattemptedHarness.parent.id)
+        try unattemptedHarness.threadRepo.markPreparedForkAbandoned(
+            childThreadId: unattemptedHarness.child.id,
+            error: "source disappeared before any provider call"
+        )
+        XCTAssertNil(try unattemptedHarness.threadRepo.getForkIntent(childThreadId: unattemptedHarness.child.id),
+                     "only a durably unattempted provider creation may be causally abandoned")
+
+        let ambiguousHarness = try makeHarness()
+        _ = try prepareLargeIntent(ambiguousHarness, suffix: "U")
+        _ = try ambiguousHarness.threadRepo.markForkProviderCreationAttempted(
+            childThreadId: ambiguousHarness.child.id
+        )
+        let ambiguousBytes = try sourceMessagesJSONByteCount(ambiguousHarness)
+        try ambiguousHarness.threadRepo.delete(id: ambiguousHarness.parent.id)
+        XCTAssertThrowsError(try ambiguousHarness.threadRepo.markPreparedForkAbandoned(
+            childThreadId: ambiguousHarness.child.id,
+            error: "provider call may have crossed the crash boundary"
+        )) { error in
+            XCTAssertEqual(error as? AgentThreadForkPersistenceError, .intentConflict)
         }
+        XCTAssertEqual(try sourceMessagesJSONByteCount(ambiguousHarness), ambiguousBytes,
+                       "an ambiguous keyed provider call must retain its full recovery transcript")
 
         let committedHarness = try makeHarness()
-        let committedPrepared = try prepareLargeIntent(committedHarness, suffix: "L")
-        let committedPreparedBytes = try sourceMessagesJSONByteCount(committedHarness)
-        XCTAssertGreaterThan(committedPreparedBytes, payloadBytes,
-                             "prepared must retain the complete fork-boundary transcript")
+        _ = try prepareLargeIntent(committedHarness, suffix: "L")
+        _ = try committedHarness.threadRepo.markForkProviderCreationAttempted(
+            childThreadId: committedHarness.child.id
+        )
         let committedProviderID = "provider-local-committed"
-        let providerCreated = try committedHarness.threadRepo.recordForkProviderCreated(
+        _ = try committedHarness.threadRepo.recordForkProviderCreated(
             childThreadId: committedHarness.child.id,
             providerChildThreadId: committedProviderID
         )
-        assertIdentity(providerCreated, prepared: committedPrepared, state: .providerCreated,
-                       providerChildThreadId: committedProviderID, lastError: nil)
-        XCTAssertEqual(try sourceMessagesJSONByteCount(committedHarness), committedPreparedBytes,
-                       "provider_created recovery still needs the exact prepared transcript")
         var committedChild = committedHarness.child
         committedChild.providerThreadId = committedProviderID
         _ = try committedHarness.threadRepo.persistForkedChildGraphReturningPrunedThreadIDs(
@@ -318,58 +374,30 @@ final class AgentForkAtomicityTests: XCTestCase {
             providerSession: nil,
             forkIntentChildThreadId: committedChild.id
         )
-        let localCommitted = try XCTUnwrap(
-            committedHarness.threadRepo.getForkIntent(childThreadId: committedChild.id)
-        )
-        assertIdentity(localCommitted, prepared: committedPrepared, state: .localCommitted,
-                       providerChildThreadId: committedProviderID, lastError: nil)
-        XCTAssertTrue(localCommitted.sourceMessages.isEmpty)
+        XCTAssertEqual(try committedHarness.threadRepo.getForkIntent(childThreadId: committedChild.id)?.state,
+                       .localCommitted)
         XCTAssertEqual(try sourceMessagesJSONByteCount(committedHarness), 2,
-                       "local_committed must retain only the [] tombstone payload")
+                       "the retained local-child idempotency marker must not retain a transcript copy")
 
-        let compensatedHarness = try makeHarness()
-        let compensatedPrepared = try prepareLargeIntent(compensatedHarness, suffix: "C")
-        let compensatedPreparedBytes = try sourceMessagesJSONByteCount(compensatedHarness)
-        let compensatedProviderID = "provider-compensated"
-        _ = try compensatedHarness.threadRepo.recordForkProviderCreated(
-            childThreadId: compensatedHarness.child.id,
-            providerChildThreadId: compensatedProviderID
-        )
-        let compensatingError = "local graph conflict"
-        let compensating = try compensatedHarness.threadRepo.markForkCompensating(
-            childThreadId: compensatedHarness.child.id,
-            error: compensatingError
-        )
-        assertIdentity(compensating, prepared: compensatedPrepared, state: .compensating,
-                       providerChildThreadId: compensatedProviderID, lastError: compensatingError)
-        XCTAssertEqual(try sourceMessagesJSONByteCount(compensatedHarness), compensatedPreparedBytes,
-                       "compensating retry must retain the recovery transcript")
-        try compensatedHarness.threadRepo.markForkCompensated(childThreadId: compensatedHarness.child.id)
-        let compensated = try XCTUnwrap(
-            compensatedHarness.threadRepo.getForkIntent(childThreadId: compensatedHarness.child.id)
-        )
-        assertIdentity(compensated, prepared: compensatedPrepared, state: .compensated,
-                       providerChildThreadId: compensatedProviderID, lastError: nil)
-        XCTAssertTrue(compensated.sourceMessages.isEmpty)
-        XCTAssertEqual(try sourceMessagesJSONByteCount(compensatedHarness), 2,
-                       "compensated must retain only the [] tombstone payload")
+        try committedHarness.db.execute("""
+            CREATE TRIGGER fail_local_committed_intent_delete
+            BEFORE DELETE ON agent_thread_fork_intents
+            WHEN OLD.child_thread_id = '\(committedChild.id.value.uuidString)'
+            BEGIN SELECT RAISE(ABORT, 'injected terminal intent delete failure'); END;
+        """)
+        XCTAssertThrowsError(try committedHarness.threadRepo.delete(id: committedChild.id)) { error in
+            XCTAssertTrue(String(describing: error).contains("injected terminal intent delete failure"))
+        }
+        XCTAssertNotNil(try committedHarness.threadRepo.get(id: committedChild.id),
+                        "the child delete must roll back when its terminal intent cannot delete")
+        XCTAssertNotNil(try committedHarness.threadRepo.getForkIntent(childThreadId: committedChild.id),
+                        "the terminal intent must roll back with the child delete")
 
-        let abandonedHarness = try makeHarness()
-        let abandonedPrepared = try prepareLargeIntent(abandonedHarness, suffix: "A")
-        XCTAssertGreaterThan(try sourceMessagesJSONByteCount(abandonedHarness), payloadBytes)
-        let abandonedError = "source disappeared before provider creation"
-        try abandonedHarness.threadRepo.markPreparedForkAbandoned(
-            childThreadId: abandonedHarness.child.id,
-            error: abandonedError
-        )
-        let abandoned = try XCTUnwrap(
-            abandonedHarness.threadRepo.getForkIntent(childThreadId: abandonedHarness.child.id)
-        )
-        assertIdentity(abandoned, prepared: abandonedPrepared, state: .abandoned,
-                       providerChildThreadId: nil, lastError: abandonedError)
-        XCTAssertTrue(abandoned.sourceMessages.isEmpty)
-        XCTAssertEqual(try sourceMessagesJSONByteCount(abandonedHarness), 2,
-                       "abandoned must retain only the [] tombstone payload")
+        try committedHarness.db.execute("DROP TRIGGER fail_local_committed_intent_delete;")
+        try committedHarness.threadRepo.delete(id: committedChild.id)
+        XCTAssertNil(try committedHarness.threadRepo.get(id: committedChild.id))
+        XCTAssertNil(try committedHarness.threadRepo.getForkIntent(childThreadId: committedChild.id),
+                     "every child-delete path must leave no orphan local_committed row")
     }
 
     func test_parentRunCannotRaceAheadOfPreparedLaunchRecovery() async throws {
@@ -506,6 +534,8 @@ final class AgentForkAtomicityTests: XCTestCase {
         }
         XCTAssertEqual(adapter.providerCreations, 1)
         XCTAssertEqual(try harness.threadRepo.getForkIntent(childThreadId: harness.child.id)?.state, .prepared)
+        XCTAssertTrue(try harness.threadRepo.getForkIntent(childThreadId: harness.child.id)?.providerCreationAttempted == true,
+                      "the crash window must remain durably marked as provider-call ambiguous")
         try assertNoLocalChild(harness)
 
         try harness.db.execute("DROP TRIGGER fail_provider_created_transition;")
@@ -651,8 +681,174 @@ final class AgentForkAtomicityTests: XCTestCase {
 
         XCTAssertTrue(adapter.forkRequests.isEmpty,
                       "a missing source before provider creation must never create a detached provider child")
-        XCTAssertEqual(try harness.threadRepo.getForkIntent(childThreadId: harness.child.id)?.state, .abandoned)
+        XCTAssertNil(try harness.threadRepo.getForkIntent(childThreadId: harness.child.id),
+                     "a source that disappeared before an attempted provider call leaves no terminal tombstone")
         try assertNoLocalChild(harness)
+    }
+
+    func test_oneRecoverableIntentPerSourceRejectsDistinctChildBeforeProviderMutation() async throws {
+        let harness = try makeHarness()
+        let adapter = KeyedForkAdapter()
+        let first = try harness.threadRepo.prepareForkIntent(
+            sourceThreadId: harness.parent.id,
+            childThread: harness.child,
+            idempotencyKey: stableKey(harness.child.id)
+        )
+        let rowsBefore = try forkIntentRowCount(harness, sourceThreadId: harness.parent.id)
+        let payloadBefore = try forkIntentPayloadBytes(harness, sourceThreadId: harness.parent.id)
+
+        let sameRetry = try harness.threadRepo.prepareForkIntent(
+            sourceThreadId: harness.parent.id,
+            childThread: harness.child,
+            idempotencyKey: stableKey(harness.child.id)
+        )
+        XCTAssertEqual(sameRetry, first,
+                       "the same durable child/key retry must reuse the original recovery identity")
+        XCTAssertEqual(try forkIntentRowCount(harness, sourceThreadId: harness.parent.id), rowsBefore)
+        XCTAssertEqual(try forkIntentPayloadBytes(harness, sourceThreadId: harness.parent.id), payloadBefore)
+
+        let distinctChild = AgentThread(
+            workspaceId: harness.parent.workspaceId,
+            title: "distinct child",
+            provider: harness.parent.provider,
+            model: harness.parent.model,
+            status: .completed,
+            worktreePath: harness.root
+        )
+        do {
+            _ = try await harness.coordinator(adapter: adapter).forkThread(
+                sourceThreadId: harness.parent.id,
+                childThread: distinctChild
+            )
+            XCTFail("a source with recoverable fork evidence must reject a distinct child")
+        } catch let error as AgentThreadForkPersistenceError {
+            XCTAssertEqual(error, .recoverableIntentExists)
+        }
+
+        XCTAssertTrue(adapter.forkRequests.isEmpty,
+                      "admission must fail before a distinct child reaches the provider")
+        XCTAssertEqual(try forkIntentRowCount(harness, sourceThreadId: harness.parent.id), rowsBefore,
+                       "rejected admission must not add a terminal or recoverable row")
+        XCTAssertEqual(try forkIntentPayloadBytes(harness, sourceThreadId: harness.parent.id), payloadBefore,
+                       "rejected admission must not duplicate the source transcript payload")
+    }
+
+    func test_concurrentDistinctForksLeaveOneRecoverableIntentAndOneProviderCall() async throws {
+        let harness = try makeHarness()
+        let adapter = KeyedForkAdapter()
+        let providerEntered = expectation(description: "first provider fork entered")
+        let releaseProvider = DispatchSemaphore(value: 0)
+        adapter.onFork {
+            providerEntered.fulfill()
+            releaseProvider.wait()
+        }
+        let firstCoordinator = harness.coordinator(adapter: adapter)
+        let secondCoordinator = harness.coordinator(adapter: adapter)
+        let firstTask = Task {
+            try await firstCoordinator.forkThread(
+                sourceThreadId: harness.parent.id,
+                childThread: harness.child
+            )
+        }
+        await fulfillment(of: [providerEntered], timeout: 2)
+
+        let distinctChild = AgentThread(
+            workspaceId: harness.parent.workspaceId,
+            title: "concurrent distinct child",
+            provider: harness.parent.provider,
+            model: harness.parent.model,
+            status: .completed,
+            worktreePath: harness.root
+        )
+        let rowsBefore = try forkIntentRowCount(harness, sourceThreadId: harness.parent.id)
+        let payloadBefore = try forkIntentPayloadBytes(harness, sourceThreadId: harness.parent.id)
+        do {
+            _ = try await secondCoordinator.forkThread(
+                sourceThreadId: harness.parent.id,
+                childThread: distinctChild
+            )
+            XCTFail("a concurrent distinct child must not overtake the first durable intent")
+        } catch let error as AgentThreadForkPersistenceError {
+            XCTAssertEqual(error, .recoverableIntentExists)
+        }
+        XCTAssertEqual(adapter.forkRequests.count, 1,
+                       "only the first admitted intent may call the provider")
+        XCTAssertEqual(try forkIntentRowCount(harness, sourceThreadId: harness.parent.id), rowsBefore)
+        XCTAssertEqual(try forkIntentPayloadBytes(harness, sourceThreadId: harness.parent.id), payloadBefore)
+
+        releaseProvider.signal()
+        let firstResult = try await firstTask.value
+        XCTAssertEqual(firstResult.id, harness.child.id)
+        XCTAssertEqual(adapter.providerCreations, 1)
+        XCTAssertEqual(try harness.threadRepo.getForkIntent(childThreadId: harness.child.id)?.state, .localCommitted)
+    }
+
+    func test_preexistingChildConflictFailsBeforeProviderFork() async throws {
+        let harness = try makeHarness()
+        let adapter = KeyedForkAdapter()
+        _ = try harness.threadRepo.prepareForkIntent(
+            sourceThreadId: harness.parent.id,
+            childThread: harness.child,
+            idempotencyKey: stableKey(harness.child.id)
+        )
+        let payloadBefore = try sourceMessagesJSONByteCount(harness)
+        var conflictingChild = harness.child
+        conflictingChild.providerThreadId = "unexpected-provider-child"
+        try harness.threadRepo.upsert(conflictingChild)
+
+        do {
+            _ = try await harness.coordinator(adapter: adapter).forkThread(
+                sourceThreadId: harness.parent.id,
+                childThread: harness.child
+            )
+            XCTFail("a preexisting local child with another provider identity must fail loudly")
+        } catch let error as AgentThreadForkPersistenceError {
+            XCTAssertEqual(error, .childThreadConflict)
+        }
+        XCTAssertTrue(adapter.forkRequests.isEmpty,
+                      "a local child conflict must short-circuit before provider mutation")
+        XCTAssertEqual(try sourceMessagesJSONByteCount(harness), payloadBefore,
+                       "a conflict must preserve the recoverable transcript exactly")
+    }
+
+    func test_capDeletingLocalCommittedChildDeletesIntentInTheSameTransaction() throws {
+        let harness = try makeHarness()
+        var child = harness.child
+        child.worktreePath = nil
+        _ = try harness.threadRepo.prepareForkIntent(
+            sourceThreadId: harness.parent.id,
+            childThread: child,
+            idempotencyKey: stableKey(child.id)
+        )
+        _ = try harness.threadRepo.markForkProviderCreationAttempted(childThreadId: child.id)
+        _ = try harness.threadRepo.recordForkProviderCreated(
+            childThreadId: child.id,
+            providerChildThreadId: "provider-cap-child"
+        )
+        child.providerThreadId = "provider-cap-child"
+        _ = try harness.threadRepo.persistForkedChildGraphReturningPrunedThreadIDs(
+            sourceThreadId: harness.parent.id,
+            childThread: child,
+            providerSession: nil,
+            forkIntentChildThreadId: child.id
+        )
+        XCTAssertEqual(try harness.threadRepo.getForkIntent(childThreadId: child.id)?.state, .localCommitted)
+
+        let prospective = AgentThread(
+            workspaceId: harness.parent.workspaceId,
+            title: "cap producer",
+            provider: harness.parent.provider,
+            model: harness.parent.model,
+            status: .completed
+        )
+        let pruned = try harness.threadRepo.upsertEnforcingWorkspaceThreadLimit(prospective, limit: 2)
+
+        XCTAssertEqual(pruned, [child.id],
+                       "the completed child is the only cap-eligible row because its source owns a worktree")
+        XCTAssertNil(try harness.threadRepo.get(id: child.id))
+        XCTAssertNil(try harness.threadRepo.getForkIntent(childThreadId: child.id),
+                     "the cap's child DELETE must remove the local_committed identity marker atomically")
+        XCTAssertNotNil(try harness.threadRepo.get(id: prospective.id))
     }
 
     func test_concurrentDuplicateCallsProduceOneProviderAndOneLocalChild() async throws {
@@ -751,7 +947,8 @@ final class AgentForkAtomicityTests: XCTestCase {
         XCTAssertEqual(adapter.providerCreations, 1)
         XCTAssertEqual(adapter.compensationCalls, 1)
         XCTAssertTrue(adapter.providerChildren.isEmpty)
-        XCTAssertEqual(try harness.threadRepo.getForkIntent(childThreadId: harness.child.id)?.state, .compensated)
+        XCTAssertNil(try harness.threadRepo.getForkIntent(childThreadId: harness.child.id),
+                     "the intent is removable only after successful provider compensation")
         try assertNoLocalChild(harness)
     }
 
@@ -780,7 +977,8 @@ final class AgentForkAtomicityTests: XCTestCase {
         XCTAssertEqual(adapter.providerCreations, 1)
         XCTAssertEqual(adapter.compensationCalls, 2)
         XCTAssertTrue(adapter.providerChildren.isEmpty)
-        XCTAssertEqual(try harness.threadRepo.getForkIntent(childThreadId: harness.child.id)?.state, .compensated)
+        XCTAssertNil(try harness.threadRepo.getForkIntent(childThreadId: harness.child.id),
+                     "a successful relaunch compensation must retire its terminal row")
         try assertNoLocalChild(harness)
     }
 }

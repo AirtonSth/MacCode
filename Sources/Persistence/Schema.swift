@@ -22,8 +22,9 @@ public enum Schema {
         sharedIntegrationBaseVersion + 2
 
     /// Must equal the highest SchemaStep version (checkpoint list at 58, Token
-    /// Saver per-thread attribution at 59, fork transcript scrubbing at 60).
-    public static let currentVersion: Int = 60
+    /// Saver per-thread attribution at 59, fork transcript scrubbing at 60,
+    /// and causal fork-intent cleanup support at 61).
+    public static let currentVersion: Int = 61
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1103,6 +1104,20 @@ public enum Schema {
         SET source_messages_json = '[]'
         WHERE state IN ('local_committed', 'compensated', 'abandoned')
           AND source_messages_json != '[]';
+        """),
+        // v60 was already applied by some builds. Keep its bounded, measured
+        // transcript scrub stable and install forward-only lifecycle evidence
+        // plus the child-delete trigger in a new step.
+        SchemaStep(61, """
+        ALTER TABLE agent_thread_fork_intents
+        ADD COLUMN provider_creation_attempted INTEGER NOT NULL DEFAULT 1;
+        CREATE TRIGGER IF NOT EXISTS trg_agent_thread_fork_intent_delete_local_committed_child
+        AFTER DELETE ON agent_threads
+        BEGIN
+            DELETE FROM agent_thread_fork_intents
+            WHERE child_thread_id = OLD.id
+              AND state = 'local_committed';
+        END;
         """),
     ]
 

@@ -96,6 +96,10 @@ public final class Bootstrap {
         let db = try SQLiteDB(path: dbPath)
         try Schema.migrate(db)
         try db.enableFullDurability()
+        // Historical terminal rows may predate causal child-delete cleanup.
+        // Process only one rechecked batch per launch; recoverable fork evidence
+        // is deliberately never eligible for this startup maintenance.
+        _ = try AgentThreadRepository(db: db).deleteCausallyRetiredForkIntents()
         try CommandReceiptRepository(db: db).recoverInterruptedClaims()
         try initDefaults(db: db)
         return db

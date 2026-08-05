@@ -3372,6 +3372,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         adapter: AgentProviderAdapter
     ) async throws -> AgentThreadForkResult {
         var intent = try threadRepo.getForkIntent(childThreadId: initialIntent.childThread.id) ?? initialIntent
+        if let child = try threadRepo.get(id: intent.childThread.id) {
+            guard intent.state == .localCommitted,
+                  child.providerThreadId == intent.providerChildThreadId else {
+                throw AgentThreadForkPersistenceError.childThreadConflict
+            }
+            return AgentThreadForkResult(thread: child, prunedThreadIDs: [])
+        }
+        guard intent.state != .localCommitted else {
+            throw AgentThreadForkPersistenceError.childThreadConflict
+        }
         let request = AgentProviderForkRequest(
             sourceThreadId: intent.sourceThreadId,
             childThreadId: intent.childThread.id,
@@ -3380,13 +3390,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             sourceProviderThreadId: try threadRepo.get(id: intent.sourceThreadId)?.providerThreadId
         )
 
-        if intent.state == .localCommitted {
-            guard let child = try threadRepo.get(id: intent.childThread.id),
-                  child.providerThreadId == intent.providerChildThreadId else {
-                throw AgentThreadForkPersistenceError.childThreadConflict
-            }
-            return AgentThreadForkResult(thread: child, prunedThreadIDs: [])
-        }
         if intent.state == .compensated {
             throw AgentProviderAdapterError.unsupported("provider fork was compensated after local commit became impossible")
         }
@@ -3404,12 +3407,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
         if intent.state == .prepared {
             guard try threadRepo.get(id: intent.sourceThreadId) != nil else {
-                try threadRepo.markPreparedForkAbandoned(
-                    childThreadId: intent.childThread.id,
-                    error: "Source thread disappeared before provider creation."
-                )
+                if !intent.providerCreationAttempted {
+                    try threadRepo.markPreparedForkAbandoned(
+                        childThreadId: intent.childThread.id,
+                        error: "Source thread disappeared before provider creation."
+                    )
+                }
                 throw AgentThreadForkPersistenceError.sourceThreadNotFound
             }
+            intent = try threadRepo.markForkProviderCreationAttempted(
+                childThreadId: intent.childThread.id
+            )
             let providerChildThreadId: String
             do {
                 providerChildThreadId = try await adapter.forkThread(request)
