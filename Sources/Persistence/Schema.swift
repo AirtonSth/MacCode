@@ -22,9 +22,9 @@ public enum Schema {
         sharedIntegrationBaseVersion + 2
 
     /// Must equal the highest SchemaStep version (checkpoint list at 58, Token
-    /// Saver per-thread attribution at 59, fork transcript scrubbing at 60,
-    /// and causal fork-intent cleanup support at 61).
-    public static let currentVersion: Int = 61
+    /// Saver per-thread attribution at 59, fork lifecycle support at 61, and
+    /// bounded historical-maintenance lookup support at 62).
+    public static let currentVersion: Int = 62
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1096,18 +1096,16 @@ public enum Schema {
             updated_at TEXT NOT NULL
         );
         """),
-        // Terminal fork intents remain as small idempotency tombstones. Freed
-        // SQLite pages become reusable; this does not VACUUM and makes no
-        // database-file shrink or process-RSS claim.
+        // v60 never shipped. Historical payload maintenance cannot run as a
+        // schema step because that would make launch one corpus-sized write.
+        // Keep the version slot monotonic while the bounded resumable worker
+        // owns cleanup after bootstrap.
         SchemaStep(60, """
-        UPDATE agent_thread_fork_intents
-        SET source_messages_json = '[]'
-        WHERE state IN ('local_committed', 'compensated', 'abandoned')
-          AND source_messages_json != '[]';
+        SELECT 1;
         """),
-        // v60 was already applied by some builds. Keep its bounded, measured
-        // transcript scrub stable and install forward-only lifecycle evidence
-        // plus the child-delete trigger in a new step.
+        // Some pre-release databases already recorded v60. Install lifecycle
+        // evidence and child-delete behavior forward-only so those databases
+        // recover through the same bounded maintenance predicates.
         SchemaStep(61, """
         ALTER TABLE agent_thread_fork_intents
         ADD COLUMN provider_creation_attempted INTEGER NOT NULL DEFAULT 1;
@@ -1118,6 +1116,15 @@ public enum Schema {
             WHERE child_thread_id = OLD.id
               AND state = 'local_committed';
         END;
+        """),
+        SchemaStep(62, """
+        CREATE INDEX IF NOT EXISTS idx_agent_thread_fork_intents_maintenance
+            ON agent_thread_fork_intents(
+                state,
+                provider_creation_attempted,
+                updated_at,
+                child_thread_id
+            );
         """),
     ]
 

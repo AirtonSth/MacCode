@@ -218,10 +218,18 @@ public final class AgentThreadRepository {
     /// Soft product cap: keep each workspace's thread table bounded so scheduled
     /// runs and long sessions cannot grow SQLite without limit.
     public static let maxThreadsPerWorkspace = 100
-    /// Startup performs at most this many causal legacy-terminal removals in one
-    /// transaction. This bounds work, not eligibility: recoverable rows are
+    /// Each maintenance transaction processes at most this many historical
+    /// terminal rows. This bounds work, not eligibility: recoverable rows are
     /// never candidates regardless of age or count.
     public static let terminalForkIntentCleanupBatchSize = 16
+
+    public struct ForkIntentMaintenanceBatch: Equatable, Sendable {
+        public let scrubbedCount: Int
+        public let deletedCount: Int
+        public let remainingCandidateCount: Int
+
+        public var processedCount: Int { scrubbedCount + deletedCount }
+    }
 
     let db: SQLiteDB
     public init(db: SQLiteDB) { self.db = db }
@@ -1019,41 +1027,67 @@ public final class AgentThreadRepository {
         }
     }
 
-    /// Removes only historical terminal rows whose terminal outcome is already
-    /// causally known. Each transaction selects and rechecks a small batch, so a
-    /// crash either rolls the whole batch back or leaves the next startup with a
-    /// strictly smaller candidate set. Recoverable rows are never selected.
+    /// Scrubs or removes one bounded batch of historical terminal fork intents.
+    /// A live locally-committed child keeps its tombstone but no longer needs a
+    /// duplicated source transcript. Rows are deleted only when their terminal
+    /// outcome is causally known. Recoverable and ambiguous rows are never
+    /// selected, and a failed write rolls back this batch only.
     @discardableResult
-    public func deleteCausallyRetiredForkIntents(
+    public func maintainHistoricalForkIntents(
         limit: Int = AgentThreadRepository.terminalForkIntentCleanupBatchSize
-    ) throws -> Int {
-        let batchSize = max(0, limit)
-        guard batchSize > 0 else { return 0 }
-        return try db.performSync { database in
+    ) throws -> ForkIntentMaintenanceBatch {
+        let batchSize = min(
+            AgentThreadRepository.terminalForkIntentCleanupBatchSize,
+            max(0, limit)
+        )
+        guard batchSize > 0 else {
+            return ForkIntentMaintenanceBatch(
+                scrubbedCount: 0,
+                deletedCount: 0,
+                remainingCandidateCount: try historicalForkIntentMaintenanceCandidateCount()
+            )
+        }
+        let counts = try db.performSync { database in
             try database.transaction {
                 let candidates = try database.prepare("""
-                    SELECT child_thread_id
-                    FROM agent_thread_fork_intents AS intent
-                    WHERE intent.state = 'compensated'
-                       OR (intent.state = 'abandoned'
-                           AND intent.provider_creation_attempted = 0)
-                       OR (intent.state = 'local_committed'
-                           AND NOT EXISTS (
+                    SELECT child_thread_id,
+                           CASE WHEN state = 'local_committed' AND EXISTS (
                                SELECT 1 FROM agent_threads AS child
                                WHERE child.id = intent.child_thread_id
-                           ))
+                           ) THEN 1 ELSE 0 END AS scrub_only
+                    FROM agent_thread_fork_intents AS intent
+                    WHERE (intent.state = 'local_committed'
+                           AND (intent.source_messages_json != '[]'
+                                OR NOT EXISTS (
+                                    SELECT 1 FROM agent_threads AS child
+                                    WHERE child.id = intent.child_thread_id
+                                )))
+                       OR intent.state = 'compensated'
+                       OR (intent.state = 'abandoned'
+                           AND intent.provider_creation_attempted = 0)
                     ORDER BY intent.updated_at ASC, intent.child_thread_id ASC
                     LIMIT ?;
                 """)
                 try candidates.bind(1, batchSize)
-                var childIDs: [String] = []
+                var selected: [(childID: String, scrubOnly: Bool)] = []
                 while try candidates.step() {
                     guard let childID = candidates.columnText(0) else {
                         throw AgentThreadForkPersistenceError.corruptIntent
                     }
-                    childIDs.append(childID)
+                    selected.append((childID, candidates.columnInt64(1) != 0))
                 }
 
+                let scrub = try database.prepare("""
+                    UPDATE agent_thread_fork_intents
+                    SET source_messages_json = '[]'
+                    WHERE child_thread_id = ?
+                      AND state = 'local_committed'
+                      AND source_messages_json != '[]'
+                      AND EXISTS (
+                          SELECT 1 FROM agent_threads AS child
+                          WHERE child.id = agent_thread_fork_intents.child_thread_id
+                      );
+                """)
                 let delete = try database.prepare("""
                     DELETE FROM agent_thread_fork_intents
                     WHERE child_thread_id = ?
@@ -1066,19 +1100,50 @@ public final class AgentThreadRepository {
                           ))
                       );
                 """)
+                var scrubbed = 0
                 var deleted = 0
-                for childID in childIDs {
-                    delete.reset()
-                    try delete.bind(1, childID)
-                    _ = try delete.step()
+                for candidate in selected {
+                    let mutation = candidate.scrubOnly ? scrub : delete
+                    mutation.reset()
+                    try mutation.bind(1, candidate.childID)
+                    _ = try mutation.step()
                     let changes = try database.prepare("SELECT changes();")
                     guard try changes.step() else {
                         throw AgentThreadForkPersistenceError.intentConflict
                     }
-                    deleted += Int(changes.columnInt64(0))
+                    if candidate.scrubOnly {
+                        scrubbed += Int(changes.columnInt64(0))
+                    } else {
+                        deleted += Int(changes.columnInt64(0))
+                    }
                 }
-                return deleted
+                return (scrubbed, deleted)
             }
+        }
+        return ForkIntentMaintenanceBatch(
+            scrubbedCount: counts.0,
+            deletedCount: counts.1,
+            remainingCandidateCount: try historicalForkIntentMaintenanceCandidateCount()
+        )
+    }
+
+    public func historicalForkIntentMaintenanceCandidateCount() throws -> Int {
+        try db.performSync { database in
+            let count = try database.prepare("""
+                SELECT COUNT(*)
+                FROM agent_thread_fork_intents AS intent
+                WHERE (intent.state = 'local_committed'
+                       AND (intent.source_messages_json != '[]'
+                            OR NOT EXISTS (
+                                SELECT 1 FROM agent_threads AS child
+                                WHERE child.id = intent.child_thread_id
+                            )))
+                   OR intent.state = 'compensated'
+                   OR (intent.state = 'abandoned'
+                       AND intent.provider_creation_attempted = 0);
+            """)
+            guard try count.step() else { return 0 }
+            return Int(count.columnInt64(0))
         }
     }
 
