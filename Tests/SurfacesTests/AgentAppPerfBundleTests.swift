@@ -297,14 +297,11 @@ final class AgentAppPerfBundleTests: XCTestCase {
     // MARK: - PERF #1: bounded hot replay from a 5,000-event thread
 
     func test_threadOpenReplayFiveThousandEventsStaysWithinBudget() async throws {
-        // Thread-open hot replay is bounded by the coordinator's run-finish stream-event
-        // prune (keepLatest: 5,000). A completed run whose full history exceeds that cap
-        // therefore rehydrates only the latest 5,000 event rows = 1,000 turns (5 events/
-        // turn), with the newest turn preserved. Emit past the finish cap — 1,200 turns =
-        // 6,001 event rows — so the prune engages. (The hot-replay COUNT window is 16,384
-        // events; exceeding it to exercise write-time pruning would require emitting
-        // >16,384 events through the O(n^2) live-apply path, which runs ~120s and flakes,
-        // so the finish-prune bound is what this fast, deterministic fixture proves.)
+        // Thread-open hot replay is bounded by durable stream-event retention
+        // (`AgentEventRetentionPolicy.streamEventCountPerThread` = 100). A completed
+        // run that emitted far more events therefore rehydrates only the latest
+        // retained rows (~20 turns at 5 events/turn), with the newest assistant
+        // message preserved. Emit 1,200 turns so retention engages.
         let runner = ReplayBenchmarkRunner(turns: 1_200)
         let (vm, _) = try makeVM(provider: runner)
         vm.createThread(title: "bounded replay")
@@ -324,8 +321,9 @@ final class AgentAppPerfBundleTests: XCTestCase {
         let budgetMs = 2_000.0
 
         print("ThreadOpenReplayBenchmark events=6001 turns=1200 elapsedMs=\(Int(elapsedMs)) budgetMs=\(Int(budgetMs))")
-        XCTAssertEqual(vm.timeline.turns.count, 1_000,
-                       "thread-open hot replay must apply only the finish-pruned 5,000-event window (1,000 turns) on the MainActor, not the full 1,200-turn history")
+        // 100 retained stream events / 5 events per fixture turn = 20 turns.
+        XCTAssertEqual(vm.timeline.turns.count, 20,
+                       "thread-open hot replay must apply only the durable retention window, not the full 1,200-turn live history")
         XCTAssertEqual(vm.timeline.latestAssistantMessage, "REPLAY_1199",
                        "thread-open replay must preserve the newest assistant message after rebuilding the timeline")
         XCTAssertLessThanOrEqual(elapsedMs, budgetMs,
@@ -458,6 +456,82 @@ final class AgentAppPerfBundleTests: XCTestCase {
                        "delivering a status event for a foreign thread must not change the selection")
         XCTAssertEqual(vm.status, initialStatus,
                        "status event for a thread in a different workspace must be filtered by the cache and not update this surface's status")
+    }
+
+    // MARK: - Stream quantum pure reduce
+
+    /// WHY: production applies stream quanta off MainActor; the pure reducer must
+    /// preserve order and mark runs active only when pre-resolved, without SQLite.
+    func test_reduceStreamQuantum_appliesOrderedEventsAndActiveGate() {
+        let tid = AgentThreadID()
+        let run = AgentRunID()
+        let turnId = "pure-turn"
+        let itemId = "pure-item"
+        let input = StreamQuantumReduceInput(
+            selectedThreadId: tid,
+            timeline: AssistantTimelineState(),
+            suppressStaleActivePlanUpdates: false,
+            newestUserMessageAt: nil,
+            runStartedAt: nil,
+            hasQueuedFollowUp: false,
+            currentRunId: nil,
+            status: .pending,
+            lastErrorRecoverable: false,
+            liveBackgroundShellCount: 0,
+            runsAllowedToMarkActive: [run],
+            entries: [
+                StreamQuantumEntry(event: .turnStarted(turnId: turnId), run: run, threadId: tid),
+                StreamQuantumEntry(
+                    event: .itemStarted(item: AssistantItem(
+                        id: itemId, turnId: turnId, type: .assistantMessage,
+                        startedAtMs: 1
+                    )),
+                    run: run,
+                    threadId: tid
+                ),
+                StreamQuantumEntry(
+                    event: .itemDelta(itemId: itemId, bodyAppend: "hi", outputAppend: nil, summary: nil),
+                    run: run,
+                    threadId: tid
+                ),
+            ]
+        )
+        let reduced = AgentAppViewModel.reduceStreamQuantum(input)
+        XCTAssertTrue(reduced.appliedEvent)
+        XCTAssertEqual(reduced.currentRunId, run)
+        XCTAssertEqual(reduced.status, .running)
+        XCTAssertTrue(reduced.seedRunStartedAt)
+        XCTAssertEqual(reduced.timeline.turns.first?.items.first?.body, "hi")
+    }
+
+    func test_reduceStreamQuantum_dropsOtherThreadAndRespectsActiveGate() {
+        let selected = AgentThreadID()
+        let other = AgentThreadID()
+        let allowed = AgentRunID()
+        let denied = AgentRunID()
+        let input = StreamQuantumReduceInput(
+            selectedThreadId: selected,
+            timeline: AssistantTimelineState(),
+            suppressStaleActivePlanUpdates: false,
+            newestUserMessageAt: nil,
+            runStartedAt: Date(),
+            hasQueuedFollowUp: false,
+            currentRunId: nil,
+            status: .pending,
+            lastErrorRecoverable: false,
+            liveBackgroundShellCount: 0,
+            runsAllowedToMarkActive: [allowed],
+            entries: [
+                StreamQuantumEntry(event: .turnStarted(turnId: "other"), run: denied, threadId: other),
+                StreamQuantumEntry(event: .turnStarted(turnId: "ok"), run: denied, threadId: selected),
+            ]
+        )
+        let reduced = AgentAppViewModel.reduceStreamQuantum(input)
+        XCTAssertTrue(reduced.appliedEvent)
+        XCTAssertNil(reduced.currentRunId,
+                     "run not in runsAllowedToMarkActive must not latch Working")
+        XCTAssertEqual(reduced.status, .pending)
+        XCTAssertEqual(reduced.timeline.turns.map(\.turnId), ["ok"])
     }
 
     // MARK: - StreamEventBatch unit

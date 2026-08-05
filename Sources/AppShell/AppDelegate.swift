@@ -340,7 +340,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
         installMainMenu()
         windowController.show()
-        refreshTokenSaverAccountUsageOnLaunch()
+        // Do not fire multi-provider account-usage probes (claude /usage, grok
+        // models, …) on the first paint. Defer until the UI is interactive.
         startTokenSaverAccountUsageRefreshLoop()
         startDiagnosticsHeartbeat()
         logDiagnosticsHeartbeat(reason: "launch")
@@ -355,6 +356,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             // Explain folder TCC before restored surfaces/PTYs touch protected paths.
             self?.presentHostFileAccessOnboardingIfNeeded()
             self?.runDeferredStartup()
+        }
+        // Token Saver % rings: wait ~8s so boot probes do not pile on top of
+        // workspace restore / first Agent surface open.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+            self?.refreshTokenSaverAccountUsageOnLaunch()
         }
     }
 

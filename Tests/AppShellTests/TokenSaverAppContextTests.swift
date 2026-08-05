@@ -1849,7 +1849,7 @@ final class TokenSaverAppContextTests: XCTestCase {
                 provider: .codex,
                 model: "test"
             )
-            thread.status = index.isMultiple(of: 2) ? .running : .pending
+            thread.status = .running
             try context.threadRepo.upsert(thread)
             originalIDs.insert(thread.id)
         }
@@ -1943,7 +1943,7 @@ final class TokenSaverAppContextTests: XCTestCase {
                 provider: .codex,
                 model: "test"
             )
-            protected.status = index.isMultiple(of: 2) ? .running : .pending
+            protected.status = .running
             try context.threadRepo.upsert(protected)
             originalIDs.insert(protected.id)
         }
@@ -2016,7 +2016,7 @@ final class TokenSaverAppContextTests: XCTestCase {
                 provider: .codex,
                 model: "test"
             )
-            thread.status = index.isMultiple(of: 2) ? .running : .pending
+            thread.status = .running
             try context.threadRepo.upsert(thread)
             originalIDs.insert(thread.id)
         }
