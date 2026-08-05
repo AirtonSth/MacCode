@@ -226,7 +226,7 @@ public enum AgentThreadCapacityError: Error, Equatable, CustomStringConvertible,
                 .map { "\($0.key)=\($0.value)" }
                 .joined(separator: ", ")
             let detail = categories.isEmpty ? "" : " Protected: \(categories)."
-            return "Agent thread capacity reached: \(actualCount) threads for a best-effort limit of \(limit). No disposable empty thread is safe to remove. Close a bound thread or delete history you no longer need, then retry.\(detail)"
+            return "Agent thread capacity reached: \(actualCount) threads for a hard limit of \(limit). No reclaimable terminal thread is safe to remove (running, pinned, draft, worktree, or bound). Close or unpin a thread, then retry.\(detail)"
         }
     }
 
@@ -328,53 +328,18 @@ public final class AgentThreadRepository {
         }
     }
 
-    /// Retention may reclaim only a terminal, unpinned, truly empty shell.
-    /// Any transcript, provider identity, run/session/callback/plan/checkpoint,
-    /// queue, Token Saver record, draft, worktree, custom color, fork role, or
-    /// persisted surface binding makes the shell ineligible. Its title and
-    /// routing/model configuration are shell metadata reclaimed with the shell.
-    /// Keep this predicate shared by preflight, selection, and the guarded
-    /// DELETE so a concurrent draft/worktree change rolls the whole transaction
-    /// back instead of losing it after an initially safe selection.
+    /// Hard workspace cap: reclaim oldest *terminal* threads (including those with
+    /// history) when over the limit. Protected and never auto-deleted:
+    /// running/pending, pinned, durable drafts, worktrees, recoverable fork
+    /// intents, and live surface bindings (excluded via the live-binding set).
+    /// Keep this predicate shared by preflight, selection, and the guarded DELETE.
     private func workspaceThreadLimitEligibilityPredicate(candidateAlias: String) -> String {
         """
-        AND \(candidateAlias).status IN ('completed', 'failed', 'cancelled', 'interrupted')
+        -- Everything except an active run is reclaimable under the hard 5-thread
+        -- ceiling (includes pending shells and completed history with messages).
+        AND \(candidateAlias).status NOT IN ('running')
         AND \(candidateAlias).pinned = 0
-        AND NULLIF(TRIM(COALESCE(\(candidateAlias).provider_thread_id, '')), '') IS NULL
-        AND \(candidateAlias).diff_additions = 0
-        AND \(candidateAlias).diff_deletions = 0
-        AND \(candidateAlias).has_unread = 0
-        AND NULLIF(TRIM(COALESCE(\(candidateAlias).color, '')), '') IS NULL
         AND NULLIF(TRIM(COALESCE(\(candidateAlias).worktree_path, '')), '') IS NULL
-        AND NOT EXISTS (SELECT 1 FROM agent_messages AS row WHERE row.thread_id = \(candidateAlias).id)
-        AND NOT EXISTS (SELECT 1 FROM agent_runs AS row WHERE row.thread_id = \(candidateAlias).id)
-        AND NOT EXISTS (SELECT 1 FROM agent_turn_snapshots AS row WHERE row.thread_id = \(candidateAlias).id)
-        AND NOT EXISTS (SELECT 1 FROM provider_session_runtime AS row WHERE row.thread_id = \(candidateAlias).id)
-        AND NOT EXISTS (SELECT 1 FROM provider_pending_callbacks AS row WHERE row.thread_id = \(candidateAlias).id)
-        AND NOT EXISTS (
-            SELECT 1 FROM agent_proposed_plans AS row
-            WHERE row.thread_id = \(candidateAlias).id
-               OR row.implementation_thread_id = \(candidateAlias).id
-        )
-        AND NOT EXISTS (SELECT 1 FROM agent_turn_checkpoints AS row WHERE row.thread_id = \(candidateAlias).id)
-        AND NOT EXISTS (SELECT 1 FROM agent_turn_checkpoint_catalog_meta AS row WHERE row.thread_id = \(candidateAlias).id)
-        AND NOT EXISTS (SELECT 1 FROM agent_provider_event_logs AS row WHERE row.thread_id = \(candidateAlias).id)
-        AND NOT EXISTS (SELECT 1 FROM agent_queued_messages AS row WHERE row.thread_id = \(candidateAlias).id)
-        AND NOT EXISTS (SELECT 1 FROM scheduled_task_runs AS row WHERE row.thread_id = \(candidateAlias).id)
-        AND NOT EXISTS (SELECT 1 FROM token_saver_savings AS row WHERE row.thread_id = \(candidateAlias).id)
-        AND NOT EXISTS (SELECT 1 FROM token_saver_thread_totals AS row WHERE row.thread_id = \(candidateAlias).id)
-        AND NOT EXISTS (SELECT 1 FROM token_saver_recovery_objects AS row WHERE row.thread_id = \(candidateAlias).id)
-        AND NOT EXISTS (SELECT 1 FROM token_saver_session_learn_records AS row WHERE row.thread_id = \(candidateAlias).id)
-        AND NOT EXISTS (
-            SELECT 1 FROM token_saver_rollover_capsules AS row
-            WHERE row.parent_thread_id = \(candidateAlias).id
-               OR row.child_thread_id = \(candidateAlias).id
-        )
-        AND NOT EXISTS (SELECT 1 FROM token_saver_audit_events AS row WHERE row.thread_id = \(candidateAlias).id)
-        AND NOT EXISTS (
-            SELECT 1 FROM settings AS row
-            WHERE row.key = 'agent.plan_notes.' || \(candidateAlias).id
-        )
         AND NOT EXISTS (
             SELECT 1 FROM agent_thread_drafts AS draft
             WHERE draft.thread_id = \(candidateAlias).id
@@ -393,8 +358,9 @@ public final class AgentThreadRepository {
         )
         AND NOT EXISTS (
             SELECT 1 FROM agent_thread_fork_intents AS intent
-            WHERE intent.source_thread_id = \(candidateAlias).id
-               OR intent.child_thread_id = \(candidateAlias).id
+            WHERE intent.state IN ('prepared', 'provider_created', 'compensating')
+              AND (intent.source_thread_id = \(candidateAlias).id
+                   OR intent.child_thread_id = \(candidateAlias).id)
         )
         AND NOT EXISTS (
             SELECT 1

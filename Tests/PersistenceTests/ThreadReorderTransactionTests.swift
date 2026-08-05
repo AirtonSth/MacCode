@@ -163,9 +163,10 @@ final class ThreadReorderTransactionTests: XCTestCase {
                        "oldest empty shells must be pruned first")
     }
 
-    /// WHY: automatic retention must never delete a conversation with messages.
-    /// Empty shells remain reclaimable so the cap can still free room.
-    func test_workspaceThreadLimitProtectsTranscriptHistoryAndLiveSurfaceBinding() throws {
+    /// WHY: hard cap reclaims oldest terminal history (including messages) but
+    /// never a live-bound surface selection. Empty shells and old chats are both
+    /// eligible; binding is not.
+    func test_workspaceThreadLimitReclaimsHistoryButProtectsLiveSurfaceBinding() throws {
         let db = try makeDB()
         let repo = AgentThreadRepository(db: db)
         let messages = AgentMessageRepository(db: db)
@@ -174,16 +175,17 @@ final class ThreadReorderTransactionTests: XCTestCase {
         var withHistory = AgentThread(workspaceId: wid, title: "has history", provider: .codex, model: "m")
         withHistory.status = .completed
         withHistory.updatedAt = Date(timeIntervalSince1970: 1)
-        var liveBound = AgentThread(workspaceId: wid, title: "live bound empty shell", provider: .codex, model: "m")
+        var liveBound = AgentThread(workspaceId: wid, title: "live bound", provider: .codex, model: "m")
         liveBound.status = .completed
         liveBound.updatedAt = Date(timeIntervalSince1970: 2)
-        var disposable = AgentThread(workspaceId: wid, title: "empty shell", provider: .codex, model: "m")
-        disposable.status = .completed
-        disposable.updatedAt = Date(timeIntervalSince1970: 3)
-        for thread in [withHistory, liveBound, disposable] {
+        var newerHistory = AgentThread(workspaceId: wid, title: "newer history", provider: .codex, model: "m")
+        newerHistory.status = .completed
+        newerHistory.updatedAt = Date(timeIntervalSince1970: 3)
+        for thread in [withHistory, liveBound, newerHistory] {
             try repo.upsert(thread)
         }
-        try messages.append(AgentMessage(threadId: withHistory.id, role: .user, content: "keep me"))
+        try messages.append(AgentMessage(threadId: withHistory.id, role: .user, content: "old chat"))
+        try messages.append(AgentMessage(threadId: newerHistory.id, role: .user, content: "newer chat"))
         let surfaceID = SurfaceID()
         repo.setLiveSurfaceBinding(surfaceID: surfaceID, threadID: liveBound.id)
         XCTAssertEqual(repo.liveSurfaceBoundThreadIDsForTesting, [liveBound.id])
@@ -191,29 +193,36 @@ final class ThreadReorderTransactionTests: XCTestCase {
         let created = AgentThread(workspaceId: wid, title: "new thread", provider: .codex, model: "m")
         let pruned = try repo.upsertEnforcingWorkspaceThreadLimit(created, limit: 3)
 
-        XCTAssertEqual(pruned, [disposable.id],
-                       "only an unbound empty shell may be reclaimed under the product policy")
-        XCTAssertNotNil(try repo.get(id: withHistory.id))
-        XCTAssertNotNil(try repo.get(id: liveBound.id))
+        XCTAssertEqual(pruned, [withHistory.id],
+                       "oldest terminal history is reclaimed first, even with messages")
+        XCTAssertNil(try repo.get(id: withHistory.id))
+        XCTAssertNotNil(try repo.get(id: liveBound.id), "live surface binding must not be a victim")
+        XCTAssertNotNil(try repo.get(id: newerHistory.id))
         XCTAssertNotNil(try repo.get(id: created.id))
-        XCTAssertNil(try repo.get(id: disposable.id))
 
-        // With only protected rows left, capacity fails with actionable diagnostics.
+        // Wipe reclaimable terminals; leave only live-bound + active runs.
+        try repo.delete(id: newerHistory.id)
+        try repo.delete(id: created.id)
+        for index in 0..<2 {
+            var running = AgentThread(workspaceId: wid, title: "running \(index)", provider: .codex, model: "m")
+            running.status = .running
+            running.updatedAt = Date(timeIntervalSince1970: TimeInterval(10 + index))
+            try repo.upsert(running)
+        }
+        // liveBound + 2 running = 3; blocked create needs a victim but none eligible.
         let blocked = AgentThread(workspaceId: wid, title: "blocked", provider: .codex, model: "m")
         XCTAssertThrowsError(try repo.upsertEnforcingWorkspaceThreadLimit(blocked, limit: 3)) { error in
             guard case let .workspaceLimitExceeded(_, _, _, diagnostics)? =
                     error as? AgentThreadCapacityError else {
                 return XCTFail("expected capacity error with diagnostics")
             }
-            XCTAssertGreaterThan(diagnostics.protectedCounts["history"] ?? 0, 0)
             XCTAssertGreaterThan(diagnostics.protectedCounts["surface_bound"] ?? 0, 0)
             XCTAssertTrue(
-                (error as? AgentThreadCapacityError)?.description.contains("No disposable empty thread") == true
+                (error as? AgentThreadCapacityError)?.description.contains("No reclaimable terminal thread") == true
             )
         }
         XCTAssertNil(try repo.get(id: blocked.id))
 
-        // Closing the surface clears process-only protection.
         repo.setLiveSurfaceBinding(surfaceID: surfaceID, threadID: nil)
         XCTAssertTrue(repo.liveSurfaceBoundThreadIDsForTesting.isEmpty)
     }
