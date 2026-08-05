@@ -300,11 +300,17 @@ public final class AgentThreadRepository {
             let excludedRawIDs = excludedIDs.map { $0.value.uuidString }.sorted()
             let exclusion = excludedRawIDs.isEmpty
                 ? ""
-                : "AND id NOT IN (\(Array(repeating: "?", count: excludedRawIDs.count).joined(separator: ", ")))"
+                : "AND candidate.id NOT IN (\(Array(repeating: "?", count: excludedRawIDs.count).joined(separator: ", ")))"
             let statement = try db.prepare("""
-                SELECT COUNT(*) FROM agent_threads
-                WHERE workspace_id = ?
-                  AND status NOT IN ('running', 'pending')
+                SELECT COUNT(*) FROM agent_threads AS candidate
+                WHERE candidate.workspace_id = ?
+                  AND candidate.status NOT IN ('running', 'pending')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM agent_thread_fork_intents AS intent
+                      WHERE intent.state IN ('prepared', 'provider_created', 'compensating')
+                        AND (intent.source_thread_id = candidate.id
+                             OR intent.child_thread_id = candidate.id)
+                  )
                   \(exclusion);
             """)
             try statement.bind(1, workspaceId.value.uuidString)
@@ -380,7 +386,13 @@ public final class AgentThreadRepository {
             excluding: excludedThreadIDs
         )
         for id in victims {
-            try delete(id: id)
+            guard try deleteWorkspaceThreadLimitVictimIfStillEligible(id) else {
+                throw AgentThreadCapacityError.workspaceLimitExceeded(
+                    workspaceId: workspaceId,
+                    limit: cap,
+                    actualCount: try count(workspaceId: workspaceId)
+                )
+            }
         }
         let actualCount = try count(workspaceId: workspaceId)
         guard actualCount <= cap else {
@@ -541,10 +553,15 @@ public final class AgentThreadRepository {
         workspaceId: WorkspaceID,
         limit: Int = AgentThreadRepository.maxThreadsPerWorkspace
     ) throws -> [AgentThreadID] {
-        let victims = try workspaceThreadLimitVictims(workspaceId: workspaceId, limit: limit)
-        guard !victims.isEmpty else { return [] }
-        try delete(ids: victims)
-        return victims
+        try db.performSync { database in
+            try database.transaction {
+                try enforceWorkspaceThreadLimitInCurrentTransaction(
+                    workspaceId: workspaceId,
+                    limit: limit,
+                    excluding: []
+                )
+            }
+        }
     }
 
     private func workspaceThreadLimitVictims(
@@ -560,13 +577,19 @@ public final class AgentThreadRepository {
         let excludedRawIDs = excludedThreadIDs.map { $0.value.uuidString }.sorted()
         let exclusion = excludedRawIDs.isEmpty
             ? ""
-            : "AND id NOT IN (\(Array(repeating: "?", count: excludedRawIDs.count).joined(separator: ", ")))"
+            : "AND candidate.id NOT IN (\(Array(repeating: "?", count: excludedRawIDs.count).joined(separator: ", ")))"
         let st = try db.prepare("""
-            SELECT id FROM agent_threads
-            WHERE workspace_id = ?
-              AND status NOT IN ('running', 'pending')
+            SELECT candidate.id FROM agent_threads AS candidate
+            WHERE candidate.workspace_id = ?
+              AND candidate.status NOT IN ('running', 'pending')
+              AND NOT EXISTS (
+                  SELECT 1 FROM agent_thread_fork_intents AS intent
+                  WHERE intent.state IN ('prepared', 'provider_created', 'compensating')
+                    AND (intent.source_thread_id = candidate.id
+                         OR intent.child_thread_id = candidate.id)
+              )
               \(exclusion)
-            ORDER BY pinned ASC, updated_at ASC, id ASC
+            ORDER BY candidate.pinned ASC, candidate.updated_at ASC, candidate.id ASC
             LIMIT ?;
         """)
         try st.bind(1, workspaceId.value.uuidString)
@@ -581,6 +604,27 @@ public final class AgentThreadRepository {
             }
         }
         return victims
+    }
+
+    /// Victim selection is only advisory until this guarded DELETE executes.
+    /// Recheck active status and recoverable fork participation so any change
+    /// after selection aborts and rolls back the entire cap transaction.
+    private func deleteWorkspaceThreadLimitVictimIfStillEligible(_ id: AgentThreadID) throws -> Bool {
+        let deletion = try db.prepare("""
+            DELETE FROM agent_threads
+            WHERE id = ?
+              AND status NOT IN ('running', 'pending')
+              AND NOT EXISTS (
+                  SELECT 1 FROM agent_thread_fork_intents AS intent
+                  WHERE intent.state IN ('prepared', 'provider_created', 'compensating')
+                    AND (intent.source_thread_id = agent_threads.id
+                         OR intent.child_thread_id = agent_threads.id)
+              );
+        """)
+        try deletion.bind(1, id.value.uuidString)
+        _ = try deletion.step()
+        let changes = try db.prepare("SELECT changes();")
+        return try changes.step() && changes.columnInt64(0) == 1
     }
 
     /// Persists the complete local half of a provider-native fork as one graph.

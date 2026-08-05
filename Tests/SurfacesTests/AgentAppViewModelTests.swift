@@ -7265,6 +7265,37 @@ final class AgentAppViewModelTests: XCTestCase {
                        "the composer-scoped recovery notice must clear after binding a valid thread")
     }
 
+    /// A workspace can be oversized while every row is active or belongs to
+    /// recoverable work. Reload must fail loud and retain all rows rather than
+    /// reporting a successful cap pass or publishing an unsafe deletion.
+    func test_reloadThreads_hardCapFailurePreservesProtectedRowsAndPublishesNothing() throws {
+        let (vm, threadRepo) = try makeVM()
+        var protectedIDs = Set<AgentThreadID>()
+        for index in 0...AgentThreadRepository.maxThreadsPerWorkspace {
+            var thread = AgentThread(
+                workspaceId: vm.workspaceID,
+                title: "protected \(index)",
+                provider: .codex,
+                model: "m"
+            )
+            thread.status = index.isMultiple(of: 2) ? .running : .pending
+            try threadRepo.upsert(thread)
+            protectedIDs.insert(thread.id)
+        }
+        var lifecycleEvents: [AgentThreadLifecycleEvent] = []
+        vm.onThreadLifecycle = { lifecycleEvents.append($0) }
+
+        vm.reloadThreads()
+
+        XCTAssertEqual(try threadRepo.count(workspaceId: vm.workspaceID),
+                       AgentThreadRepository.maxThreadsPerWorkspace + 1)
+        XCTAssertEqual(Set(try threadRepo.list(workspaceId: vm.workspaceID).map(\.id)), protectedIDs)
+        XCTAssertTrue(lifecycleEvents.isEmpty,
+                      "a hard cap failure must not publish a deletion that did not commit")
+        XCTAssertTrue(vm.statusMessage.contains("Agent thread capacity exceeded"),
+                      "reload must fail loud when no protected row is eligible")
+    }
+
     /// Deleted-many is the existing EventBus contract for multiple victims. It
     /// must apply every authoritative ID before any subscriber reload can fail.
     func test_deletedManyLifecycleEvent_evictsEveryVictim() throws {

@@ -4307,21 +4307,35 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             applyAuthoritativeThreadDeletions(Set(prunedThreadIDs))
             onThreadLifecycle?(.deleted(prunedThreadIDs))
         }
+        // restoreEnforcingWorkspaceThreadLimit returned only after the complete
+        // relational graph committed. Materialize those exact committed rows now;
+        // this is not a snapshot fallback after a failed repository operation.
+        let committedRestoredThreads = undo.snapshots.map(\.thread)
+        let restoredIDs = Set(committedRestoredThreads.map(\.id))
+        threads.removeAll { restoredIDs.contains($0.id) }
+        threads.append(contentsOf: committedRestoredThreads)
+        threads.sort {
+            if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+            return $0.id.value.uuidString > $1.id.value.uuidString
+        }
+        for thread in committedRestoredThreads {
+            if let workspaceID = thread.workspaceId {
+                threadWorkspaceCache[thread.id] = workspaceID
+            }
+        }
         releaseThreadDeletionUndoGCPin(undo)
         pendingThreadDeletionUndo = nil
         threadDeletionUndoExpiryTask?.cancel()
-        reloadThreads()
         // Remote mirrors already saw the delete event; re-announce the restored
-        // threads so they reappear without a manual thread-list refetch.
-        for snapshot in undo.snapshots {
-            if let restored = threads.first(where: { $0.id == snapshot.thread.id }) {
-                onThreadLifecycle?(.created(restored))
-            }
+        // committed threads before any fallible rail reload.
+        for thread in committedRestoredThreads {
+            onThreadLifecycle?(.created(thread))
         }
         if let restore = undo.previouslySelectedThreadId,
-           threads.contains(where: { $0.id == restore }) {
+           restoredIDs.contains(restore) {
             selectThread(restore)
         }
+        reloadThreads()
         return true
     }
 

@@ -405,6 +405,11 @@ final class AgentThreadDeletionUndoTests: XCTestCase {
         victim.updatedAt = Date(timeIntervalSince1970: 1)
         try vm.threadRepo.upsert(restored)
         try vm.threadRepo.upsert(victim)
+        try vm.messageRepo.append(AgentMessage(
+            threadId: restored.id,
+            role: .user,
+            content: "restored readback"
+        ))
         for index in 0..<98 {
             var protected = AgentThread(
                 workspaceId: vm.workspaceID,
@@ -447,6 +452,10 @@ final class AgentThreadDeletionUndoTests: XCTestCase {
                 break
             }
         }
+        vm.setReloadThreadListForTesting {
+            throw NSError(domain: "AgentThreadDeletionUndoTests.forcedReloadFailure", code: 1)
+        }
+        defer { vm.setReloadThreadListForTesting(nil) }
 
         XCTAssertTrue(vm.undoLastThreadDeletion())
 
@@ -462,6 +471,15 @@ final class AgentThreadDeletionUndoTests: XCTestCase {
                       "Undo must never publish a created event for a row absent from the repository")
         XCTAssertTrue(vm.threads.contains(where: { $0.id == restored.id }))
         XCTAssertFalse(vm.threads.contains(where: { $0.id == victim.id }))
+        XCTAssertEqual(vm.selectedThreadId, restored.id,
+                       "the committed restore must rebind selection before the fallible reload")
+        for _ in 0..<100 where vm.messages.map(\.content) != ["restored readback"] {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(vm.messages.map(\.content), ["restored readback"],
+                       "selection must read back the committed relational graph before reload")
+        XCTAssertTrue(vm.statusMessage.contains("Could not reload threads"),
+                      "the later list failure must remain visible without hiding the restored row")
     }
 
     // WHY: restored IDs are protected from retention. If every remaining row is

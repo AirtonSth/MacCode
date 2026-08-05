@@ -161,6 +161,119 @@ final class ThreadReorderTransactionTests: XCTestCase {
                        "oldest idle history must be pruned first")
     }
 
+    /// WHY: a victim can become active after selection but before deletion.
+    /// Reload-time retention must revalidate under one transaction and roll
+    /// every tentative delete back instead of deleting the newly active row.
+    func test_enforceWorkspaceThreadLimit_changedVictimRollsBackEveryDelete() throws {
+        let db = try makeDB()
+        let repo = AgentThreadRepository(db: db)
+        let wid = try makeWorkspace(db: db)
+        var threads: [AgentThread] = []
+        for index in 0..<4 {
+            var thread = AgentThread(
+                workspaceId: wid,
+                title: "candidate \(index)",
+                provider: .codex,
+                model: "m"
+            )
+            thread.status = .completed
+            thread.updatedAt = Date(timeIntervalSince1970: TimeInterval(index))
+            try repo.upsert(thread)
+            threads.append(thread)
+        }
+        let changedVictim = threads[1]
+        var didChangeVictim = false
+        var mutationError: Error?
+        db.beforeStatementStepForTesting = { sql in
+            guard !didChangeVictim, sql.contains("DELETE FROM agent_threads") else { return }
+            didChangeVictim = true
+            do {
+                try db.execute("""
+                    UPDATE agent_threads SET status = 'running'
+                    WHERE id = '\(changedVictim.id.value.uuidString)';
+                    """)
+            } catch {
+                mutationError = error
+            }
+        }
+        defer { db.beforeStatementStepForTesting = nil }
+
+        XCTAssertThrowsError(try repo.enforceWorkspaceThreadLimit(workspaceId: wid, limit: 2)) {
+            XCTAssertTrue($0 is AgentThreadCapacityError)
+        }
+
+        XCTAssertTrue(didChangeVictim, "the race hook must run between victim selection and deletion")
+        XCTAssertNil(mutationError)
+        XCTAssertEqual(try repo.count(workspaceId: wid), 4,
+                       "a changed victim must roll back every earlier tentative victim delete")
+        XCTAssertEqual(try repo.get(id: changedVictim.id)?.status, .completed,
+                       "the simulated concurrent status write belongs to the rolled-back transaction")
+        XCTAssertEqual(Set(try repo.list(workspaceId: wid).map(\.id)), Set(threads.map(\.id)))
+    }
+
+    /// WHY: one producer enforcing the cap must not prune the durable recovery
+    /// identities of another in-flight fork. Both source and child are protected
+    /// in every recoverable intent state, including preflight eligibility counts.
+    func test_concurrentCapProducerProtectsRecoverableForkSourceAndChildGlobally() throws {
+        for intentState in [
+            AgentThreadForkIntentState.prepared,
+            .providerCreated,
+            .compensating
+        ] {
+            let db = try makeDB()
+            let repo = AgentThreadRepository(db: db)
+            let wid = try makeWorkspace(db: db)
+            var source = AgentThread(workspaceId: wid, title: "source", provider: .codex, model: "m")
+            source.status = .completed
+            source.updatedAt = Date(timeIntervalSince1970: 1)
+            var child = AgentThread(workspaceId: wid, title: "child", provider: .codex, model: "m")
+            child.status = .completed
+            child.updatedAt = Date(timeIntervalSince1970: 2)
+            try repo.upsert(source)
+            _ = try repo.prepareForkIntent(
+                sourceThreadId: source.id,
+                childThread: child,
+                idempotencyKey: "fork-\(intentState.rawValue)"
+            )
+            if intentState != .prepared {
+                _ = try repo.recordForkProviderCreated(
+                    childThreadId: child.id,
+                    providerChildThreadId: "provider-\(intentState.rawValue)"
+                )
+            }
+            if intentState == .compensating {
+                _ = try repo.markForkCompensating(childThreadId: child.id, error: "retry cleanup")
+            }
+            // Model a recoverable local child row left by an interrupted producer.
+            try repo.upsert(child)
+            let prospective = AgentThread(workspaceId: wid, title: "prospective", provider: .codex, model: "m")
+
+            XCTAssertThrowsError(try repo.preflightWorkspaceThreadInsertion(
+                workspaceId: wid,
+                prospectiveThreadId: prospective.id,
+                limit: 2
+            )) { error in
+                XCTAssertTrue(error is AgentThreadCapacityError,
+                              "\(intentState.rawValue) participants are not eligible preflight victims")
+            }
+
+            var sibling = AgentThread(workspaceId: wid, title: "eligible sibling", provider: .codex, model: "m")
+            sibling.status = .completed
+            sibling.updatedAt = Date(timeIntervalSince1970: 3)
+            try repo.upsert(sibling)
+            var producer = prospective
+            producer.status = .completed
+            producer.updatedAt = Date(timeIntervalSince1970: 4)
+            let pruned = try repo.upsertEnforcingWorkspaceThreadLimit(producer, limit: 3)
+
+            XCTAssertEqual(pruned, [sibling.id],
+                           "\(intentState.rawValue) must protect source and child from another producer")
+            XCTAssertNotNil(try repo.get(id: source.id))
+            XCTAssertNotNil(try repo.get(id: child.id))
+            XCTAssertNotNil(try repo.get(id: producer.id))
+        }
+    }
+
     // MARK: - promoteToFront: final positions after transaction wrap
 
     /// WHY: promoteToFront now issues a single transaction for all position UPDATEs.
