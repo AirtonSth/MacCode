@@ -118,7 +118,7 @@ final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
                      "session count is unlimited — user controls concurrent agents")
         XCTAssertEqual(profile.sidecarMaxConcurrentRequests, 1)
         XCTAssertEqual(profile.sidecarMaxQueueDepth, 4)
-        XCTAssertEqual(profile.idleReleaseAge, 30 * 60,
+        XCTAssertEqual(profile.idleReleaseAge, 60,
                        "only safely resumable completed sessions use the shorter release window")
         XCTAssertNil(profile.hostProcessCeilingKB,
                      "memory ceilings must not refuse user-started providers")

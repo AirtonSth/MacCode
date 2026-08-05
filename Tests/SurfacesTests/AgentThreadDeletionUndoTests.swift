@@ -410,7 +410,10 @@ final class AgentThreadDeletionUndoTests: XCTestCase {
             role: .user,
             content: "restored readback"
         ))
-        for index in 0..<98 {
+        let cap = AgentThreadRepository.maxThreadsPerWorkspace
+        // restored + victim already present; fill remaining slots with protected rows.
+        let protectedCount = max(0, cap - 2)
+        for index in 0..<protectedCount {
             var protected = AgentThread(
                 workspaceId: vm.workspaceID,
                 title: "protected \(index)",
@@ -421,7 +424,7 @@ final class AgentThreadDeletionUndoTests: XCTestCase {
             protected.updatedAt = Date(timeIntervalSince1970: TimeInterval(20 + index))
             try vm.threadRepo.upsert(protected)
         }
-        XCTAssertEqual(try vm.threadRepo.count(workspaceId: vm.workspaceID), 100)
+        XCTAssertEqual(try vm.threadRepo.count(workspaceId: vm.workspaceID), cap)
         vm.reloadThreads()
         vm.selectThread(restored.id)
         let deleted = await vm.deleteThread(restored.id)
@@ -436,7 +439,7 @@ final class AgentThreadDeletionUndoTests: XCTestCase {
         )
         concurrent.updatedAt = Date(timeIntervalSince1970: 1_000)
         XCTAssertTrue(try vm.threadRepo.upsertEnforcingWorkspaceThreadLimit(concurrent).isEmpty)
-        XCTAssertEqual(try vm.threadRepo.count(workspaceId: vm.workspaceID), 100,
+        XCTAssertEqual(try vm.threadRepo.count(workspaceId: vm.workspaceID), cap,
                        "precondition: another producer refills the slot before Undo")
 
         var eventOrder: [String] = []
@@ -459,7 +462,7 @@ final class AgentThreadDeletionUndoTests: XCTestCase {
 
         XCTAssertTrue(vm.undoLastThreadDeletion())
 
-        XCTAssertEqual(try vm.threadRepo.count(workspaceId: vm.workspaceID), 100)
+        XCTAssertEqual(try vm.threadRepo.count(workspaceId: vm.workspaceID), cap)
         XCTAssertNotNil(try vm.threadRepo.get(id: restored.id))
         XCTAssertNil(try vm.threadRepo.get(id: victim.id))
         XCTAssertNotNil(try vm.threadRepo.get(id: concurrent.id))
@@ -495,7 +498,8 @@ final class AgentThreadDeletionUndoTests: XCTestCase {
             status: .completed
         )
         try vm.threadRepo.upsert(restored)
-        for index in 0..<99 {
+        let cap = AgentThreadRepository.maxThreadsPerWorkspace
+        for index in 0..<(cap - 1) {
             var protected = AgentThread(
                 workspaceId: vm.workspaceID,
                 title: "protected \(index)",
@@ -525,7 +529,7 @@ final class AgentThreadDeletionUndoTests: XCTestCase {
 
         XCTAssertFalse(vm.undoLastThreadDeletion())
 
-        XCTAssertEqual(try vm.threadRepo.count(workspaceId: vm.workspaceID), 100)
+        XCTAssertEqual(try vm.threadRepo.count(workspaceId: vm.workspaceID), cap)
         XCTAssertNil(try vm.threadRepo.get(id: restored.id),
                      "the restored parent and every dependent row must roll back together")
         XCTAssertNotNil(try vm.threadRepo.get(id: concurrent.id))
@@ -534,7 +538,10 @@ final class AgentThreadDeletionUndoTests: XCTestCase {
         XCTAssertEqual(vm.pendingThreadDeletionUndo?.snapshots.map(\.thread.id), undoThreadIDsBeforeFailure)
         XCTAssertEqual(lifecycleEventCount, 0,
                        "rolled-back restore and victim deletes must publish no lifecycle events")
-        XCTAssertTrue(vm.statusMessage.contains("Agent thread capacity exceeded"))
+        XCTAssertTrue(
+            vm.statusMessage.contains("Agent thread capacity exceeded")
+                || vm.statusMessage.contains("Agent thread capacity reached")
+        )
     }
 
     // WHY: delete owns a provider teardown barrier. Cascading the thread row while

@@ -322,7 +322,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             self?.handleDeniedPost(content)
         }
         reapIdleProviderSessions()
-        providerSessionReaperTimer = Timer.scheduledTimer(withTimeInterval: 10 * 60, repeats: true) { [weak self] _ in
+        // Scan frequently enough to honor a 1–2 minute idleReleaseAge.
+        providerSessionReaperTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             guard let delegate = self else { return }
             Task { @MainActor in
                 delegate.reapIdleProviderSessions()

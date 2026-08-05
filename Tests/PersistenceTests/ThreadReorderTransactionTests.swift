@@ -131,9 +131,10 @@ final class ThreadReorderTransactionTests: XCTestCase {
             "list must order by updated_at DESC so the most recent activity is first")
     }
 
-    /// WHY: each workspace keeps at most 100 threads so scheduled runs cannot
-    /// grow SQLite without bound. Only empty terminal shells are eligible; among
-    /// those, the oldest updated_at go first. Active runs never qualify.
+    /// WHY: each workspace keeps at most maxThreadsPerWorkspace (5) so scheduled
+    /// runs cannot grow SQLite without bound. Only empty terminal shells are
+    /// eligible; among those, the oldest updated_at go first. Active runs never
+    /// qualify.
     func test_enforceWorkspaceThreadLimit_prunesOldestBeyond100() throws {
         let db = try makeDB()
         let repo = AgentThreadRepository(db: db)
@@ -215,6 +216,34 @@ final class ThreadReorderTransactionTests: XCTestCase {
         // Closing the surface clears process-only protection.
         repo.setLiveSurfaceBinding(surfaceID: surfaceID, threadID: nil)
         XCTAssertTrue(repo.liveSurfaceBoundThreadIDsForTesting.isEmpty)
+    }
+
+    /// WHY: long agent sessions must not retain unbounded durable messages;
+    /// only the newest N movements stay in SQLite after each append.
+    func test_append_prunesMessagesKeepingOnlyLatest100() throws {
+        let db = try makeDB()
+        let threads = AgentThreadRepository(db: db)
+        let messages = AgentMessageRepository(db: db)
+        let wid = try makeWorkspace(db: db)
+        var thread = AgentThread(workspaceId: wid, title: "long chat", provider: .codex, model: "m")
+        thread.status = .completed
+        try threads.upsert(thread)
+
+        let keep = AgentMessageRepository.maxMessagesPerThread
+        for index in 0..<(keep + 25) {
+            try messages.append(AgentMessage(
+                threadId: thread.id,
+                role: index.isMultiple(of: 2) ? .user : .assistant,
+                content: "msg-\(index)",
+                createdAt: Date(timeIntervalSince1970: TimeInterval(index))
+            ))
+        }
+        let remaining = try messages.list(threadId: thread.id)
+        XCTAssertEqual(remaining.count, keep)
+        XCTAssertEqual(remaining.first?.content, "msg-25",
+                       "oldest messages beyond the retention window must be deleted")
+        XCTAssertEqual(remaining.last?.content, "msg-\(keep + 24)",
+                       "the newest message must survive pruning")
     }
 
     /// WHY: the automatic cap is allowed to reclaim cached history, never an

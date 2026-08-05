@@ -563,6 +563,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             publishInterestedThreadId(selectedThreadId)
         }
         loadGitBranch()
+        AgentWorkspaceRailReloadCoordinator.shared.register(self)
     }
 
     public func reloadCustomModels() {
@@ -652,6 +653,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func dispose() {
         guard !isDisposed else { return }
         isDisposed = true
+        AgentWorkspaceRailReloadCoordinator.shared.unregister(self)
         stopScheduledLivePoll()
         pendingGitRefresh?.cancel()
         pendingGitRefresh = nil
@@ -693,6 +695,92 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         timeline = AssistantTimelineState()
         sr1TranslatedMessageIds = []
         sr1OriginalTextsByMessageId = [:]
+    }
+
+    /// Used by the multi-surface rail reload hub (EventBus fan-out).
+    var isDisposedForReloadCoordination: Bool { isDisposed }
+
+    /// Cap + list off MainActor so multi-tab EventBus storms do not block UI.
+    func loadRailSnapshotOffMainActor() async -> AgentWorkspaceRailReloadCoordinator.RailSnapshot {
+        let repo = threadRepo
+        let coordinator = coordinator
+        let workspaceID = workspaceID
+        #if DEBUG
+        let listOverride = reloadThreadListForTesting
+        #endif
+        return await Task.detached(priority: .userInitiated) {
+            _ = coordinator.reconcileStaleActiveOwnershipWithDurableState()
+            do {
+                let pruned = try repo.enforceWorkspaceThreadLimit(workspaceId: workspaceID)
+                let listed: [AgentThread]
+                #if DEBUG
+                if let listOverride {
+                    listed = try listOverride()
+                } else {
+                    listed = try repo.list(workspaceId: workspaceID)
+                }
+                #else
+                listed = try repo.list(workspaceId: workspaceID)
+                #endif
+                return AgentWorkspaceRailReloadCoordinator.RailSnapshot(
+                    workspaceID: workspaceID,
+                    threads: listed,
+                    prunedThreadIDs: pruned
+                )
+            } catch {
+                return AgentWorkspaceRailReloadCoordinator.RailSnapshot(
+                    workspaceID: workspaceID,
+                    threads: [],
+                    prunedThreadIDs: [],
+                    errorDescription: String(describing: error)
+                )
+            }
+        }.value
+    }
+
+    /// Applies a coalesced rail snapshot produced once per workspace debounce window.
+    func applyRailSnapshot(_ snapshot: AgentWorkspaceRailReloadCoordinator.RailSnapshot) {
+        guard !isDisposed, snapshot.workspaceID == workspaceID else { return }
+        if let errorDescription = snapshot.errorDescription {
+            let reloadFailure = "Could not reload threads: \(errorDescription)"
+            if statusMessage.contains(Self.deletedThreadDraftRecoveryMessage) {
+                statusMessage = "\(Self.deletedThreadDraftRecoveryMessage) \(reloadFailure)"
+            } else {
+                statusMessage = reloadFailure
+            }
+            return
+        }
+        let knownLocalThreadIDs = Set(threads.map(\.id)).union(
+            threadWorkspaceCache.compactMap { id, workspace in
+                workspace == workspaceID ? id : nil
+            }
+        )
+        retireCommittedThreadPrunes(snapshot.prunedThreadIDs)
+        applyAuthoritativeThreadDeletions(Set(snapshot.prunedThreadIDs))
+        if !snapshot.prunedThreadIDs.isEmpty {
+            onThreadLifecycle?(.deleted(snapshot.prunedThreadIDs))
+        }
+        let missingKnownThreadIDs = knownLocalThreadIDs.subtracting(snapshot.threads.map(\.id))
+        evictThreadCaches(missingKnownThreadIDs)
+        threads = snapshot.threads
+        recoverDeletedSelectionIfNeeded(missingKnownThreadIDs)
+        pruneStaleRunThreadProjections()
+        if isStopping,
+           let selectedThreadId,
+           trackedRunId(for: selectedThreadId) == nil,
+           isScheduledThreadRunning?(selectedThreadId) != true {
+            isStopping = false
+        }
+        for t in threads {
+            if let wid = t.workspaceId {
+                threadWorkspaceCache[t.id] = wid
+            }
+        }
+        repairPlaceholderThreadTitles()
+        if let sel = selectedThreadId, !threads.contains(where: { $0.id == sel }) {
+            recoverDeletedSelectionIfNeeded([sel])
+        }
+        refreshSubagentActivity()
     }
 
     public func reloadThreads() {
@@ -1772,10 +1860,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Hot transcript body budget for the UI process. Durable history stays in
     /// SQLite; only this many UTF-8 body bytes stay resident in `messages`.
     /// (Was 96 MB — too large for huge threads; older rows load via keyset pages.)
-    nonisolated static let fullLoadBodyBudgetBytes = 16 * 1024 * 1024
+    /// Hot UI transcript budget. 16 MiB caused multi-second re-renders on fat threads.
+    nonisolated static let fullLoadBodyBudgetBytes = 2 * 1024 * 1024
     /// Hot message page (newest first). Older durable rows remain outside the
     /// hot UI window (`messageHistoryIsPartial`) and load on demand.
-    nonisolated static let messageHistoryPageLimit = 200
+    /// Align UI page size with durable per-thread message retention (100).
+    nonisolated static let messageHistoryPageLimit = 100
 
     private func loadAllMessages(_ id: AgentThreadID) {
         // SQLite access remains on the app's established DB actor, but the query is

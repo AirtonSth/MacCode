@@ -236,7 +236,8 @@ public enum AgentThreadCapacityError: Error, Equatable, CustomStringConvertible,
 public final class AgentThreadRepository {
     /// Best-effort retention cap: keep each workspace's disposable empty shells
     /// bounded without deleting user-owned or operational state.
-    public static let maxThreadsPerWorkspace = 100
+    /// Hard product ceiling: at most 5 threads per workspace (storage pressure).
+    public static let maxThreadsPerWorkspace = 5
     /// Each maintenance transaction processes at most this many historical
     /// terminal rows. This bounds work, not eligibility: recoverable rows are
     /// never candidates regardless of age or count.
@@ -1516,6 +1517,10 @@ public final class AgentMessageRepository: @unchecked Sendable {
     private let decoder = JSONDecoder()
     public init(db: SQLiteDB) { self.db = db }
 
+    /// Durable transcript retention: keep only the newest N messages per thread
+    /// so long-running agent sessions cannot grow `agent_messages` without bound.
+    public static let maxMessagesPerThread = 100
+
     public func append(_ m: AgentMessage) throws {
         let bodyBytes = m.content.utf8.count
         let bodySHA256 = Self.bodySHA256Hex(m.content)
@@ -1546,6 +1551,32 @@ public final class AgentMessageRepository: @unchecked Sendable {
         try st.bind(6, try attachmentsJSON(m.attachments))
         try st.bind(7, bodySHA256)
         try st.bind(8, bodyBytes)
+        _ = try st.step()
+        try pruneMessagesKeepingLatest(threadId: m.threadId, limit: Self.maxMessagesPerThread)
+    }
+
+    /// Deletes oldest durable messages so only the newest `limit` remain.
+    public func pruneMessagesKeepingLatest(
+        threadId: AgentThreadID,
+        limit: Int = AgentMessageRepository.maxMessagesPerThread
+    ) throws {
+        let keep = max(1, limit)
+        // Nested SELECT required: SQLite rejects LIMIT directly inside DELETE … NOT IN.
+        let st = try db.prepare("""
+            DELETE FROM agent_messages
+            WHERE thread_id = ?
+              AND rowid NOT IN (
+                SELECT rowid FROM (
+                    SELECT rowid FROM agent_messages
+                    WHERE thread_id = ?
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?
+                )
+              );
+            """)
+        try st.bind(1, threadId.value.uuidString)
+        try st.bind(2, threadId.value.uuidString)
+        try st.bind(3, Int64(keep))
         _ = try st.step()
     }
 
@@ -3669,7 +3700,10 @@ public final class AgentRunRepository: @unchecked Sendable {
         return events
     }
 
-    public func pruneProviderEventLogs(threadId: AgentThreadID, keepLatest limit: Int = 10_000) throws {
+    public func pruneProviderEventLogs(
+        threadId: AgentThreadID,
+        keepLatest limit: Int = AgentEventRetentionPolicy.production.providerLogCountPerThread
+    ) throws {
         try pruneProviderEventLogs(
             threadId: threadId,
             keepLatest: limit,
@@ -3723,7 +3757,10 @@ public final class AgentRunRepository: @unchecked Sendable {
         return try changedRowCount(db) > 0
     }
 
-    public func pruneStreamEvents(threadId: AgentThreadID, keepLatest limit: Int = 5_000) throws {
+    public func pruneStreamEvents(
+        threadId: AgentThreadID,
+        keepLatest limit: Int = AgentEventRetentionPolicy.production.streamEventCountPerThread
+    ) throws {
         try pruneStreamEvents(
             threadId: threadId,
             keepLatest: limit,

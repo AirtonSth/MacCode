@@ -1797,10 +1797,10 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             "thread_id": .string(threadId.value.uuidString)
         ]))
 
-        // Yield only until the restored subscription's main-queue callback has
-        // attempted its injected-failure reload; do not manually reload/reconcile.
-        for _ in 0..<100 where !restoredSurface.viewModel.statusMessage.contains("Could not reload threads") {
-            await Task.yield()
+        // Coalesced EventBus reload debounces (~50ms) then loads off MainActor.
+        // Wait wall-clock until the injected-failure rail apply surfaces the error.
+        for _ in 0..<200 where !restoredSurface.viewModel.statusMessage.contains("Could not reload threads") {
+            try await Task.sleep(nanoseconds: 10_000_000)
         }
         restoredSurface.viewModel.setReloadThreadListForTesting(nil)
 
