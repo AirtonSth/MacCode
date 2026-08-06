@@ -6423,22 +6423,37 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             let target = itemType == .reasoning ? ProviderTextTarget.body : rawTarget
 
             lock.lock()
-            var runBuffers = bufferedProviderTextItems[runId] ?? [:]
-            if var buffered = runBuffers[itemId] {
-                // PERF: same O(n²) residual as timeline itemDelta — under the SR1
-                // hold lock, `cappedText(text + delta)` rebuilt the growing buffer
-                // on every token. appendCapped stays under liveTextLimit without
-                // reallocating the full body on the common path.
+            // PERF: same O(n²) residual as timeline itemDelta — under the SR1
+            // hold lock, `cappedText(text + delta)` rebuilt the growing buffer
+            // on every token. appendCapped stays under liveTextLimit without
+            // reallocating the full body on the common path.
+            //
+            // The append must run *through* the dictionary storage. Copying the
+            // entry out first (`if var buffered = runBuffers[itemId]`) leaves the
+            // String referenced by both the copy and the dictionary, so every
+            // append copies the whole accumulated body back out — the exact
+            // O(n)-per-token cost appendCapped exists to remove.
+            //
+            // The outer key is resolved once into an index and the inner
+            // existence is checked before the unwrap, so the only `!` left is on
+            // a key this same statement just proved present. Every mutation of
+            // `bufferedProviderTextItems` happens under `lock` (see the removals
+            // in purgeRunRuntimeLocked and the itemCompleted branch below), which
+            // is what keeps the check and the append agreeing. DO NOT move the
+            // append outside the lock or insert a call between the guard and the
+            // append: either would let a concurrent removal turn the unwrap into
+            // a process-fatal trap on a provider callback thread.
+            if let runIndex = bufferedProviderTextItems.index(forKey: runId),
+               bufferedProviderTextItems.values[runIndex].index(forKey: itemId) != nil {
                 AssistantTimelineState.appendCapped(
-                    &buffered.text,
+                    &bufferedProviderTextItems.values[runIndex][itemId]!.text,
                     append: delta,
                     limit: AssistantTimelineState.liveTextLimit
                 )
-                runBuffers[itemId] = buffered
-                bufferedProviderTextItems[runId] = runBuffers
                 lock.unlock()
                 return .hold
             }
+            var runBuffers = bufferedProviderTextItems[runId] ?? [:]
             let shouldBuffer = shouldBufferProviderTextPrefix(delta)
             if shouldBuffer {
                 runBuffers[itemId] = BufferedProviderTextItem(

@@ -6198,7 +6198,85 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         )
     }
 
-    private func commitStreamQuantum(_ reduced: StreamQuantumReduceResult) {
+    /// How many applied stream events may pass before a coalesced aggregate
+    /// hot-text budget walk is forced anyway.
+    ///
+    /// Bounded overshoot — the binding constraint is the `quantumBytes >= 64 KiB`
+    /// gate in `reduceStreamQuantum`, NOT the per-item caps. Any quantum at or
+    /// over 64 KiB forces the walk in the same commit, and every quantum that
+    /// skips still adds at least 1 to the counter, so at most `threshold - 1`
+    /// quanta of `< 64 KiB` each can accumulate: under 1 MiB against the 96 MiB
+    /// `AssistantTimelineState.aggregateHotTextByteLimit`. Changing either this
+    /// threshold or that 64 KiB gate changes the bound; the per-item
+    /// `liveTextLimit` / `liveOutputLimit` caps are a second, independent bound
+    /// and must not be mistaken for this one.
+    static let streamAggregateBudgetThreshold = 16
+
+    /// Coalescing decision for the O(items) aggregate hot-text budget walk.
+    ///
+    /// Extracted from `commitStreamQuantum` so the skip window is directly
+    /// testable: the walk itself is cheap per item but ran on every token quantum.
+    static func aggregateBudgetDecision(
+        force: Bool,
+        opsSinceLastWalk: Int,
+        appliedEventCount: Int,
+        threshold: Int = streamAggregateBudgetThreshold
+    ) -> (runsWalk: Bool, nextOps: Int) {
+        let ops = opsSinceLastWalk + max(1, appliedEventCount)
+        if force || ops >= max(1, threshold) { return (true, 0) }
+        return (false, ops)
+    }
+
+    /// True when republishing SR1 translation state can change anything.
+    ///
+    /// `refreshSR1TranslationStateFromTimeline` derives the published set purely
+    /// from `timeline.sr1TranslationsByMessageId` and REPLACES it, so with every
+    /// side empty it is a no-op — the common case on every streamed token. The
+    /// published-side terms keep the clearing path alive after the aggregate
+    /// budget walk evicts translations.
+    static func shouldPublishSR1State(
+        timeline: AssistantTimelineState,
+        publishedIds: Set<AgentMessageID>,
+        publishedOriginals: [AgentMessageID: String]
+    ) -> Bool {
+        !timeline.sr1TranslationsByMessageId.isEmpty
+            || !timeline.sr1TranslationsByItemId.isEmpty
+            || !publishedIds.isEmpty
+            || !publishedOriginals.isEmpty
+    }
+
+    #if DEBUG
+    /// Test-only override for the aggregate hot-text ceiling.
+    ///
+    /// The walk-before-publish order in `commitStreamQuantum` is load-bearing:
+    /// the walk evicts SR1 translations and the publish guard must observe the
+    /// post-eviction timeline. Proving that composition needs a real eviction,
+    /// and allocating 96 MiB in a unit test is not viable — so tests lower the
+    /// ceiling instead. DEBUG-only so release builds keep the constant.
+    var aggregateHotTextByteLimitForTesting: Int?
+    #endif
+
+    /// The ceiling `commitStreamQuantum` actually enforces.
+    ///
+    /// Resolved here rather than with a `#if DEBUG` fork at the call site, so the
+    /// statement that ships is the same statement tests execute. A fork there
+    /// would leave release relying on `enforceAggregateHotTextBudget`'s default
+    /// argument while DEBUG passed one explicitly — and a future change to that
+    /// default would silently diverge the two with no test failing.
+    var activeAggregateHotTextByteLimit: Int {
+        #if DEBUG
+        return aggregateHotTextByteLimitForTesting ?? AssistantTimelineState.aggregateHotTextByteLimit
+        #else
+        return AssistantTimelineState.aggregateHotTextByteLimit
+        #endif
+    }
+
+    /// Counter behind `streamAggregateBudgetThreshold`. Not `private` so a test
+    /// can assert it actually resets when the walk runs — a regression that drops
+    /// the reset would otherwise leave the pure-function tests green.
+    var streamAggregateBudgetOpsForTesting: Int { streamAggregateBudgetOps }
+
+    func commitStreamQuantum(_ reduced: StreamQuantumReduceResult) {
         guard reduced.appliedEvent else { return }
         suppressStaleActivePlanUpdates = reduced.suppressStaleActivePlanUpdates
         for (run, threadId) in reduced.runThreadBindings {
@@ -6216,20 +6294,25 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             liveBackgroundShellCount = reduced.liveBackgroundShellCount
         }
         timeline = reduced.timeline
-        // Coalesce full O(items) aggregate walks: pure token quanta skip until
-        // 16 applies or a structural/large quantum forces a check. 16 * 512 KiB
-        // drain ceiling << 96 MiB hot budget, so temporary overshoot is safe.
-        streamAggregateBudgetOps += max(1, reduced.appliedEventCount)
-        if reduced.forceAggregateBudget || streamAggregateBudgetOps >= 16 {
-            timeline.enforceAggregateHotTextBudget()
-            streamAggregateBudgetOps = 0
+        let budget = Self.aggregateBudgetDecision(
+            force: reduced.forceAggregateBudget,
+            opsSinceLastWalk: streamAggregateBudgetOps,
+            appliedEventCount: reduced.appliedEventCount
+        )
+        streamAggregateBudgetOps = budget.nextOps
+        if budget.runsWalk {
+            timeline.enforceAggregateHotTextBudget(byteLimit: activeAggregateHotTextByteLimit)
         }
-        // Skip SR1 publish when both sides empty — common path on every token.
-        let hasTimelineSR1 = !timeline.sr1TranslationsByMessageId.isEmpty
-            || !timeline.sr1TranslationsByItemId.isEmpty
-        if hasTimelineSR1
-            || !sr1TranslatedMessageIds.isEmpty
-            || !sr1OriginalTextsByMessageId.isEmpty {
+        // Order is load-bearing: the walk above can evict translations, and the
+        // guard below must see the post-eviction timeline so the published cache
+        // clears with them. Pinned by
+        // test_commitStreamQuantum_coalescesWalkThenPublishesEvictedSR1State,
+        // which fails if these two blocks are swapped.
+        if Self.shouldPublishSR1State(
+            timeline: timeline,
+            publishedIds: sr1TranslatedMessageIds,
+            publishedOriginals: sr1OriginalTextsByMessageId
+        ) {
             refreshSR1TranslationStateFromTimeline()
         }
         scheduleTimelineUpdateTick()
@@ -7725,7 +7808,9 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
     /// `String.count` grapheme walk of multi-10k command dumps dominated body eval
     /// the same way pre-F11 `cappedText` did. Use O(1) `utf8.count` under-limit
     /// and O(limit) index arithmetic when over (same contract as
-    /// `AgentAppView.cappedVisibleText`). Dropped label uses UTF-8 residual.
+    /// `AgentAppView.cappedVisibleText`). The dropped residual is a UTF-8 byte
+    /// count — an exact grapheme delta would need the O(n) walk this avoids — so
+    /// the marker reports a size, not a character count.
     static func cappedDetail(_ text: String, limit: Int = 6_000, for item: AssistantItem? = nil) -> String {
         let clean = stripANSI(text)
         if let item, isSkillToolItem(item) {
@@ -7740,7 +7825,31 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         }
         let head = clean[..<end]
         let dropped = max(1, clean.utf8.count - head.utf8.count)
-        return "\(head)\n… \(dropped) more characters truncated in view …"
+        return "\(head)\n… \(truncationSizeLabel(dropped)) more truncated in view …"
+    }
+
+    /// Human-readable size for a truncation marker.
+    ///
+    /// The residual these markers can report runs to six digits (`liveOutputLimit`
+    /// is 400_000), and every other byte quantity this app shows the user goes
+    /// through `ByteCountFormatter` (Settings, Sidebar, Files, SSH). Formatting
+    /// here keeps the transcript consistent with that convention instead of
+    /// printing a raw digit wall.
+    ///
+    /// Three properties this deliberately accepts, so they are not mistaken for
+    /// bugs later:
+    /// - **Lossy.** 4032 B and 4064 B both render "4 KB". The marker communicates
+    ///   scale, not an exact count; the exact bytes are in the stored event.
+    /// - **Locale-dependent.** 1_500_000 renders "1.5 MB" under en and "1,5 MB"
+    ///   under pt-BR, while the surrounding sentence stays English. That matches
+    ///   the rest of the app, which is not localized but does format numbers.
+    /// - **~1.3 µs per call**, measured `-O`, against ~0.01 µs for the raw `Int`
+    ///   it replaced. It runs only on the over-limit branch, and only once per
+    ///   truncated string per paint, against ~6.5 µs for the cap work beside it
+    ///   (which this MR brought down from ~180 µs). Caching the formatter does
+    ///   not help — the cost is in formatting, not allocation.
+    static func truncationSizeLabel(_ byteCount: Int) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(max(0, byteCount)), countStyle: .file)
     }
 
     /// Remove ANSI/VT control sequences (SGR colors, cursor moves, OSC) so command output is
@@ -8784,8 +8893,10 @@ public struct AgentAppView: View {
     /// F11 insight as `AssistantTimelineState.cappedText`: `utf8.count` is O(1)
     /// and every grapheme is ≥1 UTF-8 byte, so `utf8 ≤ limit` ⇒ `count ≤ limit`.
     /// Over the byte budget, end-relative / start-relative index arithmetic is
-    /// O(limit) instead of O(n). The "dropped" label uses the UTF-8 residual
-    /// (exact for ASCII Agent streams; a slightly high upper bound for multi-byte).
+    /// O(limit) instead of O(n). The "dropped" residual is a UTF-8 byte count —
+    /// an exact grapheme delta would need the O(n) walk this avoids — so the
+    /// marker reports a formatted size rather than overstating a character count
+    /// for multi-byte transcripts.
     static func cappedVisibleText(_ text: String, limit: Int, truncatedLabel: String = "truncated in live view") -> String {
         let limit = max(0, limit)
         guard limit > 0 else { return "" }
@@ -8798,7 +8909,7 @@ public struct AgentAppView: View {
         }
         let head = text[..<end]
         let dropped = max(1, text.utf8.count - head.utf8.count)
-        return "\(head)\n... \(dropped) more characters \(truncatedLabel) ..."
+        return "\(head)\n... \(AgentTimelineItemPresentation.truncationSizeLabel(dropped)) more \(truncatedLabel) ..."
     }
 
     static func cappedOptionalVisibleText(_ text: String?, limit: Int, truncatedLabel: String = "truncated in live view") -> String? {
@@ -8829,7 +8940,7 @@ public struct AgentAppView: View {
     /// Same O(n)→O(limit) rationale as `cappedVisibleText` — streaming Thought /
     /// tool bodies grow far past the live window; every paint must not re-scan the
     /// full held body just to decide whether to show the tail.
-    static func cappedVisibleTextTail(_ text: String, limit: Int, truncatedLabel: String = "earlier characters truncated in live view") -> String {
+    static func cappedVisibleTextTail(_ text: String, limit: Int, truncatedLabel: String = "of earlier output truncated in live view") -> String {
         let limit = max(0, limit)
         guard limit > 0 else { return "" }
         guard text.utf8.count > limit else { return text }
@@ -8839,7 +8950,7 @@ public struct AgentAppView: View {
         }
         let tail = text[start...]
         let dropped = max(1, text.utf8.count - tail.utf8.count)
-        return "... \(dropped) \(truncatedLabel) ...\n\(tail)"
+        return "... \(AgentTimelineItemPresentation.truncationSizeLabel(dropped)) \(truncatedLabel) ...\n\(tail)"
     }
 
     static func toolCommandPreview(for item: AssistantItem) -> String? {

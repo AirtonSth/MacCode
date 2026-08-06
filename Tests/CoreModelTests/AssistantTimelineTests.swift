@@ -624,8 +624,11 @@ final class AssistantTimelineTests: XCTestCase {
     }
 
     /// Microbench: growing body via + vs appendCapped (n=5 medians).
-    /// Covers both timeline itemDelta and coordinator SR1 provider-text buffer growth
-    /// (AgentRunCoordinator.interceptProviderTextEvent hold path).
+    ///
+    /// Scope: the timeline `itemDelta` shape only — a directly-owned `var body`.
+    /// The coordinator SR1 hold buffer keeps its entry inside a dictionary, where
+    /// copy-on-write aliasing changes the result, so it is measured separately by
+    /// `test_microbench_sr1HoldBuffer_inPlaceDictionaryAppendBeatsCopyOut`.
     func test_microbench_itemDeltaAppend_appendCappedFasterThanPlusRebuild() {
         let token = String(repeating: "x", count: 32)
         let deltas = 4_000
@@ -676,6 +679,165 @@ final class AssistantTimelineTests: XCTestCase {
             improvement, 5.0,
             "appendCapped must improve median wall time by ≥5% (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
         )
+    }
+
+    /// WHY: `AgentRunCoordinator.interceptProviderTextEvent` keeps the SR1 hold
+    /// buffer inside `bufferedProviderTextItems[runId][itemId]`. Copying the entry
+    /// out (`if var buffered = runBuffers[itemId]`) before appending leaves the
+    /// String storage referenced by both the copy and the dictionary, so
+    /// copy-on-write reallocates the whole accumulated body on every token —
+    /// appendCapped alone does not remove the O(n)-per-token cost there. This pins
+    /// that the coordinator must append *through* the dictionary subscripts, which
+    /// is the shape shipped at AgentRunCoordinator.swift interceptProviderTextEvent.
+    ///
+    /// Measured at two sizes so the reported win is attributable to copy-on-write
+    /// elimination (an O(n)-per-token cost that must grow with buffer size) rather
+    /// than to the two dictionary write-backs the in-place shape also removes (a
+    /// fixed O(1) cost per token, which would show a flat ratio).
+    ///
+    /// Scope: this measures the shape, on a proxy struct — the real
+    /// `BufferedProviderTextItem` and `bufferedProviderTextItems` are private to
+    /// `AgentRunCoordinator` and cannot be constructed from a test.
+    func test_microbench_sr1HoldBuffer_inPlaceDictionaryAppendBeatsCopyOut() {
+        struct HoldBuffer { var text: String }
+        let token = String(repeating: "x", count: 32)
+        let warmup = 2
+        let samples = 5
+        let limit = AssistantTimelineState.liveTextLimit
+
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+
+        /// Legacy shape: copy the entry out, append, write it back.
+        func timeCopyOut(_ deltas: Int) -> Double {
+            var outer: [String: [String: HoldBuffer]] = ["run": ["item": HoldBuffer(text: "")]]
+            let start = DispatchTime.now().uptimeNanoseconds
+            for _ in 0..<deltas {
+                var inner = outer["run"] ?? [:]
+                if var buffered = inner["item"] {
+                    AssistantTimelineState.appendCapped(&buffered.text, append: token, limit: limit)
+                    inner["item"] = buffered
+                    outer["run"] = inner
+                }
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertEqual(outer["run"]?["item"]?.text.utf8.count, min(limit, deltas * token.utf8.count))
+            return Double(end - start) / 1_000_000.0
+        }
+
+        /// Shipped shape: resolve the outer key to an index once, then append
+        /// through the dictionary storage so it stays uniquely referenced.
+        func timeInPlace(_ deltas: Int) -> Double {
+            var outer: [String: [String: HoldBuffer]] = ["run": ["item": HoldBuffer(text: "")]]
+            let start = DispatchTime.now().uptimeNanoseconds
+            for _ in 0..<deltas {
+                if let runIndex = outer.index(forKey: "run"),
+                   outer.values[runIndex].index(forKey: "item") != nil {
+                    AssistantTimelineState.appendCapped(
+                        &outer.values[runIndex]["item"]!.text, append: token, limit: limit
+                    )
+                }
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertEqual(outer["run"]?["item"]?.text.utf8.count, min(limit, deltas * token.utf8.count))
+            return Double(end - start) / 1_000_000.0
+        }
+
+        // Both shapes must produce the identical buffer — this is a perf fix only.
+        // Crosses the cap so the over-limit re-cap branch is covered too.
+        var copyOut: [String: [String: HoldBuffer]] = ["run": ["item": HoldBuffer(text: "")]]
+        var inPlace: [String: [String: HoldBuffer]] = ["run": ["item": HoldBuffer(text: "")]]
+        for index in 0..<2_000 {
+            let chunk = ["a", "não ", "这是", "😀", token][index % 5]
+            var inner = copyOut["run"] ?? [:]
+            if var buffered = inner["item"] {
+                AssistantTimelineState.appendCapped(&buffered.text, append: chunk, limit: 4_000)
+                inner["item"] = buffered
+                copyOut["run"] = inner
+            }
+            if let runIndex = inPlace.index(forKey: "run"),
+               inPlace.values[runIndex].index(forKey: "item") != nil {
+                AssistantTimelineState.appendCapped(
+                    &inPlace.values[runIndex]["item"]!.text, append: chunk, limit: 4_000
+                )
+            }
+        }
+        XCTAssertEqual(copyOut["run"]?["item"]?.text, inPlace["run"]?["item"]?.text,
+                       "in-place dictionary append must be byte-identical to the copy-out shape")
+        XCTAssertEqual(copyOut["run"]?["item"]?.text.count, 4_000,
+                       "equivalence fixture must actually cross the cap")
+
+        func ratio(_ deltas: Int) -> (before: Double, after: Double, improvement: Double) {
+            for _ in 0..<warmup { _ = timeCopyOut(deltas); _ = timeInPlace(deltas) }
+            var before: [Double] = []
+            var after: [Double] = []
+            for _ in 0..<samples {
+                before.append(timeCopyOut(deltas))
+                after.append(timeInPlace(deltas))
+            }
+            let beforeMed = median(before)
+            let afterMed = median(after)
+            return (beforeMed, afterMed, (beforeMed - afterMed) / beforeMed * 100.0)
+        }
+
+        let small = ratio(500)
+        let large = ratio(4_000)
+        NSLog("[perf-proof] sr1HoldBuffer small_copyOut_ms=%@ small_inPlace_ms=%@ small_pct=%.2f large_copyOut_ms=%@ large_inPlace_ms=%@ large_pct=%.2f",
+              String(small.before), String(small.after), small.improvement,
+              String(large.before), String(large.after), large.improvement)
+        XCTAssertGreaterThan(
+            large.improvement, 5.0,
+            "appending through the dictionary must beat copy-out by ≥5% (got \(large.improvement)%; before=\(large.before)ms after=\(large.after)ms)"
+        )
+        // Copy-on-write elimination is O(n) per token, so the absolute saving must
+        // grow super-linearly with buffer size. A fixed per-token overhead (the two
+        // removed dictionary writes) would scale ~8x for 8x the tokens; CoW removal
+        // scales with the accumulated body, so require clearly more than that.
+        //
+        // `smallSaving` is a sub-0.1 ms quantity, so a single spiked sample in the
+        // small arm could inflate it and flip this red on a loaded machine. Compare
+        // against a floor as well so the ratio is only trusted when the small arm's
+        // 8x projection is still comfortably below what the large arm measured.
+        let smallSaving = small.before - small.after
+        let largeSaving = large.before - large.after
+        let projected = min(smallSaving * 8.0, small.before * 8.0)
+        XCTAssertGreaterThan(
+            largeSaving, projected,
+            "saving must grow faster than token count (CoW elimination, not fixed overhead): small=\(smallSaving)ms large=\(largeSaving)ms projected=\(projected)ms"
+        )
+    }
+
+    /// WHY: `appendCapped`'s cheap path only applies while the buffer is UNDER the
+    /// limit. Once a held body saturates `liveTextLimit`, every further token takes
+    /// the re-cap branch — `cappedText` walks graphemes and rebuilds the suffix —
+    /// which for the SR1 hold path runs with the coordinator's lock held. This is
+    /// not a regression (the pre-MR shape paid it on every token regardless), but
+    /// the win must not be claimed for the saturated regime.
+    ///
+    /// Scope: this PINS the saturated behaviour and its equivalence with the
+    /// rebuild path. It does NOT measure the saturated cost — the timed arms above
+    /// push 128 KB against a 200_000 B limit and never cross it, so no benchmark
+    /// in this suite covers the saturated regime. Adding an over-cap fast path is
+    /// open follow-up work.
+    func test_appendCapped_saturatedRegimeStillRecapsEveryToken() {
+        let limit = 4_000
+        var body = String(repeating: "a", count: limit)
+        AssistantTimelineState.appendCapped(&body, append: "bcdef", limit: limit)
+        XCTAssertEqual(body.count, limit, "at the cap the buffer must stay pinned to the limit")
+        XCTAssertTrue(body.hasSuffix("bcdef"), "the newest tokens must survive the re-cap")
+        XCTAssertFalse(body.hasPrefix("aaaaa" + "bcdef"), "the oldest bytes must be dropped")
+
+        // Equivalence at saturation, which the growth benchmark never reaches.
+        var viaAppend = String(repeating: "z", count: limit)
+        var viaRebuild = String(repeating: "z", count: limit)
+        for token in ["x", "não", "😀", String(repeating: "q", count: 64)] {
+            AssistantTimelineState.appendCapped(&viaAppend, append: token, limit: limit)
+            viaRebuild = AssistantTimelineState.cappedText(viaRebuild + token, limit: limit)
+            XCTAssertEqual(viaAppend, viaRebuild,
+                           "saturated appendCapped must still equal the rebuild path")
+        }
     }
 
 }
