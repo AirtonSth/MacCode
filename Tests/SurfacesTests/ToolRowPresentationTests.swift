@@ -42,6 +42,109 @@ final class ToolRowPresentationTests: XCTestCase {
         XCTAssertEqual(AgentTimelineItemPresentation.cappedDetail("short", limit: 6_000), "short")
     }
 
+    /// WHY: multi-byte graphemes can sit under the grapheme window while over the
+    /// UTF-8 budget — expanded tool detail must not over-truncate them.
+    func test_cappedDetail_preservesMultibyteUnderGraphemeLimit() {
+        let multibyte = "héllo" // 5 graphemes, >5 UTF-8 bytes
+        XCTAssertGreaterThan(multibyte.utf8.count, 5)
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.cappedDetail(multibyte, limit: 5),
+            multibyte,
+            "tool detail cap must stay grapheme-based for multi-byte text under the limit"
+        )
+        let emoji = "😀😀😀😀"
+        let capped = AgentTimelineItemPresentation.cappedDetail(emoji, limit: 2)
+        XCTAssertTrue(capped.hasPrefix("😀😀"))
+        XCTAssertTrue(capped.contains("truncated in view"))
+    }
+
+    /// Microbench: full-body `String.count` walk vs O(limit) index tool detail cap.
+    /// Simulates expanded tool-row paint re-capping a long command dump.
+    ///
+    /// `cappedDetail` bundles `stripANSI` with the cap, and stripANSI dominates
+    /// (~90% of wall time on an 80k body). Timing the two arms end to end reported
+    /// a ~9% delta for a cap that got ~50x cheaper. Subtracting a separately
+    /// sampled stripANSI floor does NOT fix that: the isolated signal is smaller
+    /// than the inter-loop noise, so the subtraction clamps to zero and reports a
+    /// vacuous 100%.
+    ///
+    /// So hoist the shared cost out instead of estimating it. Both arms run on the
+    /// same pre-stripped `clean`, timing only the cap. The index arm is pinned to
+    /// the shipped `cappedDetail` output first, so the benchmark cannot drift away
+    /// from the product path it stands for.
+    func test_microbench_cappedDetail_indexFasterThanFullGraphemeCount() {
+        let body = String(repeating: "x", count: 80_000)
+        let limit = 6_000
+        let iterations = 2_000
+        let warmup = 2
+        let samples = 5
+        let clean = AgentTimelineItemPresentation.stripANSI(body)
+
+        func median(_ values: [Double]) -> Double {
+            let s = values.sorted()
+            return s[s.count / 2]
+        }
+
+        /// Legacy shape: full O(n) grapheme count, then prefix.
+        func legacyCap(_ text: String) -> String {
+            guard text.count > limit else { return text }
+            let head = text.prefix(limit)
+            let dropped = text.count - head.count
+            return "\(head)\n… \(dropped) more characters truncated in view …"
+        }
+
+        /// Shipped shape: O(1) utf8 gate + O(limit) index arithmetic.
+        func indexCap(_ text: String) -> String {
+            guard text.utf8.count > limit else { return text }
+            guard let end = text.index(text.startIndex, offsetBy: limit, limitedBy: text.endIndex),
+                  end < text.endIndex else { return text }
+            let head = text[..<end]
+            let dropped = max(1, text.utf8.count - head.utf8.count)
+            return "\(head)\n… \(AgentTimelineItemPresentation.truncationSizeLabel(dropped)) more truncated in view …"
+        }
+
+        // Pin: the benchmarked shape must equal what the product function returns,
+        // so a future change to cappedDetail cannot silently leave this measuring
+        // a stale algorithm.
+        XCTAssertEqual(indexCap(clean), AgentTimelineItemPresentation.cappedDetail(body, limit: limit),
+                       "benchmarked index shape must match the shipped cappedDetail output")
+
+        func time(_ shape: (String) -> String) -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for _ in 0..<iterations { sink &+= shape(clean).utf8.count }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        for _ in 0..<warmup { _ = time(legacyCap); _ = time(indexCap) }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            before.append(time(legacyCap))
+            after.append(time(indexCap))
+        }
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = (beforeMed - afterMed) / beforeMed * 100.0
+        // Key names the ISOLATED cap sub-step, not end-to-end `cappedDetail`:
+        // the shipped function still calls stripANSI on every invocation, so its
+        // end-to-end improvement is far smaller (~9%). Quoting this number as
+        // "cappedDetail got 90% faster" would repeat the over-claim this whole
+        // correction exists to stop.
+        NSLog("[perf-proof] cappedDetail_isolatedCap legacy_count_ms=%@ index_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+              String(beforeMed), String(afterMed), improvement,
+              String(describing: before), String(describing: after))
+        XCTAssertGreaterThan(
+            improvement, 50.0,
+            "isolated tool detail cap must beat the full grapheme count by ≥50% (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
+        )
+        let capped = AgentTimelineItemPresentation.cappedDetail(body, limit: limit)
+        XCTAssertTrue(capped.contains("truncated in view"))
+        XCTAssertTrue(capped.hasPrefix(String(body.prefix(limit))))
+    }
+
     func test_skillToolOutputIsNeverTruncatedEvenWhenLarge() {
         // WHY: skill content is a protected verbatim category. Ordinary tool output
         // still uses the generic cap; Skill must return complete bodies so the agent

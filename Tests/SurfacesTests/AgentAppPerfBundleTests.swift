@@ -764,6 +764,634 @@ final class AgentAppPerfBundleTests: XCTestCase {
         XCTAssertEqual(state.activePlan?.steps.first?.status, .inProgress,
                        "memory eviction must preserve compact active-plan identity and status")
     }
+
+    // MARK: - PERF 2026-08-05 residual hot path
+
+    /// estimatedHotQueueBytes must be positive and never force a JSON encode.
+    /// WHY: StreamEventBatch admission previously allocated JSONEncoder per token.
+    func test_estimatedHotQueueBytes_coversItemDeltaAndLargeErrorWithoutEncode() {
+        let small = AssistantEvent.itemDelta(
+            itemId: "i", bodyAppend: "hello", outputAppend: nil, summary: nil
+        )
+        let large = AssistantEvent.error(
+            message: String(repeating: "x", count: 50_000), recoverable: true
+        )
+        XCTAssertGreaterThan(small.estimatedHotQueueBytes, 0)
+        XCTAssertGreaterThanOrEqual(
+            large.estimatedHotQueueBytes, 50_000,
+            "estimate must track payload so hard-ceiling saturation still fires"
+        )
+        // Estimate must be enough to admit tiny events under tiny budgets.
+        let batch = StreamEventBatch(limits: .init(
+            maxBufferedCount: 8,
+            maxBufferedBytes: 4_096,
+            drainCount: 8,
+            drainBytes: 4_096
+        ))
+        let tid = AgentThreadID()
+        let run = AgentRunID()
+        XCTAssertEqual(
+            batch.appendBounded(event: small, run: run, threadId: tid),
+            .scheduled
+        )
+    }
+
+    /// Microbench: admission sizing via estimate vs JSONEncoder (same machine, n=5).
+    /// Primary metric is wall time for 20_000 itemDelta size measurements.
+    func test_microbench_hotQueueSizing_estimateFasterThanJSONEncoder() throws {
+        let events: [AssistantEvent] = (0..<64).map { i in
+            .itemDelta(
+                itemId: "item",
+                bodyAppend: String(repeating: "a", count: 16 + (i % 8)),
+                outputAppend: nil,
+                summary: nil
+            )
+        }
+        let iterations = 20_000
+        let warmup = 2
+        let samples = 5
+
+        func median(_ values: [Double]) -> Double {
+            let s = values.sorted()
+            return s[s.count / 2]
+        }
+
+        func timeJSON() -> Double {
+            let encoder = JSONEncoder()
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for i in 0..<iterations {
+                let event = events[i % events.count]
+                sink &+= (try? encoder.encode(event).count) ?? 0
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0 // ms
+        }
+
+        func timeEstimate() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for i in 0..<iterations {
+                sink &+= events[i % events.count].estimatedHotQueueBytes
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        for _ in 0..<warmup { _ = timeJSON(); _ = timeEstimate() }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            before.append(timeJSON())
+            after.append(timeEstimate())
+        }
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = (beforeMed - afterMed) / beforeMed * 100.0
+        NSLog("[perf-proof] hotQueueSizing json_ms=%@ estimate_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+              String(beforeMed), String(afterMed), improvement,
+              String(describing: before), String(describing: after))
+        XCTAssertGreaterThan(
+            improvement, 50.0,
+            "estimate must be substantially faster than JSONEncoder sizing (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
+        )
+    }
+
+    // MARK: - PERF 2026-08-06 live-view cap (no full grapheme count)
+
+    /// WHY: multi-byte graphemes can sit under the grapheme window while over the
+    /// UTF-8 budget — the live cap must not over-truncate them (same F11 contract).
+    func test_cappedVisibleText_preservesMultibyteUnderGraphemeLimit() {
+        let multibyte = "héllo" // 5 graphemes, >5 UTF-8 bytes
+        XCTAssertGreaterThan(multibyte.utf8.count, 5)
+        XCTAssertEqual(
+            AgentAppView.cappedVisibleText(multibyte, limit: 5),
+            multibyte,
+            "live head-cap must stay grapheme-based for multi-byte text under the limit"
+        )
+        XCTAssertEqual(
+            AgentAppView.cappedVisibleTextTail(multibyte, limit: 5),
+            multibyte,
+            "live tail-cap must stay grapheme-based for multi-byte text under the limit"
+        )
+        let emoji = "😀😀😀😀"
+        let head = AgentAppView.cappedVisibleText(emoji, limit: 2)
+        XCTAssertTrue(head.hasPrefix("😀😀"), "emoji head-cap keeps first two graphemes")
+        XCTAssertFalse(head.contains("😀😀😀"), "emoji head-cap must drop the trailing pair")
+        let tail = AgentAppView.cappedVisibleTextTail(emoji, limit: 2)
+        XCTAssertTrue(tail.contains("😀😀"), "emoji tail-cap keeps last two graphemes")
+        XCTAssertTrue(tail.hasPrefix("..."), "over-limit tail-cap still emits the omission marker")
+    }
+
+    /// Microbench: full-body `String.count` walk vs O(limit) index live cap.
+    /// Simulates streaming paint re-capping a long held tool/reasoning body.
+    func test_microbench_liveVisibleCap_indexFasterThanFullGraphemeCount() throws {
+        let body = String(repeating: "b", count: 80_000)
+        let limit = AgentAppView.liveTurnBodyCharacterLimit // 2_000
+        let iterations = 2_000
+        let warmup = 2
+        let samples = 5
+
+        func median(_ values: [Double]) -> Double {
+            let s = values.sorted()
+            return s[s.count / 2]
+        }
+
+        /// Legacy path retained only for A/B: O(n) grapheme count every paint.
+        func timeLegacyCount() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for _ in 0..<iterations {
+                // Mirror the pre-fix cappedVisibleTextTail body.
+                if body.count > limit {
+                    let tail = body.suffix(limit)
+                    let dropped = body.count - tail.count
+                    sink &+= dropped &+ tail.count
+                } else {
+                    sink &+= body.count
+                }
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        func timeIndexCap() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for _ in 0..<iterations {
+                let capped = AgentAppView.cappedVisibleTextTail(body, limit: limit)
+                sink &+= capped.utf8.count
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        for _ in 0..<warmup { _ = timeLegacyCount(); _ = timeIndexCap() }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            before.append(timeLegacyCount())
+            after.append(timeIndexCap())
+        }
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = (beforeMed - afterMed) / beforeMed * 100.0
+        NSLog("[perf-proof] liveVisibleCap legacy_count_ms=%@ index_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+              String(beforeMed), String(afterMed), improvement,
+              String(describing: before), String(describing: after))
+        XCTAssertGreaterThan(
+            improvement, 5.0,
+            "live-view tail cap must beat full grapheme count by ≥5% (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
+        )
+        // Functional pin: tail window still surfaces the newest bytes.
+        let capped = AgentAppView.cappedVisibleTextTail(body + "LATEST", limit: limit)
+        XCTAssertTrue(capped.contains("LATEST"))
+        XCTAssertTrue(capped.hasPrefix("..."))
+    }
+
+    // MARK: - PERF 2026-08-06 assistant dedupe cache gate
+
+    /// Microbench: warm paint path re-checks cache eligibility with grapheme
+    /// `String.count` vs O(1) `utf8.count` (product residual in
+    /// `normalizedAssistantText` / `compactAssistantText`).
+    ///
+    /// WHY: `hiddenPersistedAssistantMessageIDs` re-runs on every
+    /// `timelineUpdateTick`; NSCache hits still paid a full grapheme walk per
+    /// body just to decide whether the cache key path was allowed.
+    func test_microbench_assistantDedupeGate_utf8FasterThanGraphemeCount() throws {
+        // Under the 16_384 byte cache budget; typical completed assistant body.
+        let text = String(repeating: "word ", count: 2_400) // 12_000 ASCII bytes
+        let limit = 16_384
+        XCTAssertLessThanOrEqual(text.utf8.count, limit)
+        let iterations = 30_000
+        let warmup = 2
+        let samples = 5
+
+        func median(_ values: [Double]) -> Double {
+            let s = values.sorted()
+            return s[s.count / 2]
+        }
+
+        /// Legacy residual: O(n) grapheme count before every warm cache admission.
+        func timeLegacyGraphemeGate() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for _ in 0..<iterations {
+                if text.count <= limit {
+                    sink &+= 1
+                }
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertEqual(sink, iterations)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        /// Product path: O(1) UTF-8 length gate.
+        func timeUTF8Gate() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for _ in 0..<iterations {
+                if text.utf8.count <= limit {
+                    sink &+= 1
+                }
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertEqual(sink, iterations)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        for _ in 0..<warmup { _ = timeLegacyGraphemeGate(); _ = timeUTF8Gate() }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            before.append(timeLegacyGraphemeGate())
+            after.append(timeUTF8Gate())
+        }
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = (beforeMed - afterMed) / beforeMed * 100.0
+        NSLog("[perf-proof] assistantDedupeGate grapheme_ms=%@ utf8_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+              String(beforeMed), String(afterMed), improvement,
+              String(describing: before), String(describing: after))
+        XCTAssertGreaterThan(
+            improvement, 5.0,
+            "dedupe cache gate must beat grapheme count by ≥5% (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
+        )
+
+        // Functional pin: same combined-answer hide contract as AgentAppViewModelTests.
+        let threadId = AgentThreadID()
+        let persisted = AgentMessage(
+            threadId: threadId,
+            role: .assistant,
+            content: "S start. D inspect. O done."
+        )
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage,
+                              body: "S start. D inspect.", startedAtMs: 1),
+                AssistantItem(id: "msg-2", turnId: "turn-1", type: .assistantMessage,
+                              body: "O done.", startedAtMs: 2)
+            ],
+            finished: true
+        )
+        XCTAssertEqual(
+            AgentAppView.hiddenPersistedAssistantMessageIDs(messages: [persisted], timelineTurns: [turn]),
+            [persisted.id],
+            "utf8 cache gate must not change hidden-persisted dedupe semantics"
+        )
+    }
+
+    // MARK: - Coalesced aggregate hot-text budget walk
+
+    private func streamInput(
+        entries: [StreamQuantumEntry],
+        thread: AgentThreadID,
+        run: AgentRunID,
+        timeline: AssistantTimelineState = AssistantTimelineState()
+    ) -> StreamQuantumReduceInput {
+        StreamQuantumReduceInput(
+            selectedThreadId: thread,
+            timeline: timeline,
+            suppressStaleActivePlanUpdates: false,
+            newestUserMessageAt: nil,
+            runStartedAt: nil,
+            hasQueuedFollowUp: false,
+            currentRunId: nil,
+            status: .pending,
+            lastErrorRecoverable: false,
+            liveBackgroundShellCount: 0,
+            runsAllowedToMarkActive: [run],
+            entries: entries
+        )
+    }
+
+    /// WHY: the budget walk is the only thing holding the 96 MiB aggregate hot-text
+    /// ceiling. Coalescing it is safe only while pure token quanta are the sole
+    /// events allowed to skip — a future event added to the skip list could grow
+    /// the timeline unboundedly between walks. Pin the classification.
+    func test_reduceStreamQuantum_onlyPureTokenQuantaSkipTheBudgetWalk() {
+        let tid = AgentThreadID()
+        let run = AgentRunID()
+        let turnId = "budget-turn"
+        let itemId = "budget-item"
+        var seeded = AssistantTimelineState()
+        seeded.apply(.turnStarted(turnId: turnId))
+        seeded.apply(.itemStarted(item: AssistantItem(
+            id: itemId, turnId: turnId, type: .assistantMessage, startedAtMs: 0
+        )))
+
+        let tokenOnly = AgentAppViewModel.reduceStreamQuantum(streamInput(
+            entries: [
+                StreamQuantumEntry(
+                    event: .itemDelta(itemId: itemId, bodyAppend: "tok", outputAppend: nil, summary: nil),
+                    run: run, threadId: tid
+                ),
+                StreamQuantumEntry(event: .itemProgress(itemId: itemId, progress: 0.5), run: run, threadId: tid),
+            ],
+            thread: tid, run: run, timeline: seeded
+        ))
+        XCTAssertTrue(tokenOnly.appliedEvent)
+        XCTAssertFalse(tokenOnly.forceAggregateBudget,
+                       "pure token quanta must not force the O(items) budget walk")
+        XCTAssertEqual(tokenOnly.appliedEventCount, 2)
+
+        let structural = AgentAppViewModel.reduceStreamQuantum(streamInput(
+            entries: [
+                StreamQuantumEntry(
+                    event: .itemDelta(itemId: itemId, bodyAppend: "tok", outputAppend: nil, summary: nil),
+                    run: run, threadId: tid
+                ),
+                StreamQuantumEntry(event: .itemCompleted(itemId: itemId, finalState: .completed),
+                                   run: run, threadId: tid),
+            ],
+            thread: tid, run: run, timeline: seeded
+        ))
+        XCTAssertTrue(structural.forceAggregateBudget,
+                      "a structural event must force the budget walk in the same quantum")
+
+        // A single large delta is over the 64 KiB quantum gate even though its
+        // event kind is skippable.
+        let large = AgentAppViewModel.reduceStreamQuantum(streamInput(
+            entries: [
+                StreamQuantumEntry(
+                    event: .itemDelta(itemId: itemId,
+                                      bodyAppend: String(repeating: "x", count: 70_000),
+                                      outputAppend: nil, summary: nil),
+                    run: run, threadId: tid
+                )
+            ],
+            thread: tid, run: run, timeline: seeded
+        ))
+        XCTAssertTrue(large.forceAggregateBudget,
+                      "a quantum over the 64 KiB gate must force the budget walk")
+    }
+
+    /// WHY: skipping the walk is bounded ONLY by this counter. If it stopped
+    /// resetting, or the threshold stopped being reached, the hot-text ceiling
+    /// would never be enforced during a long pure-token stream.
+    func test_aggregateBudgetDecision_coalescesTokenQuantaAndAlwaysConverges() {
+        var ops = 0
+        // 15 single-event token quanta skip the walk...
+        for step in 1..<AgentAppViewModel.streamAggregateBudgetThreshold {
+            let decision = AgentAppViewModel.aggregateBudgetDecision(
+                force: false, opsSinceLastWalk: ops, appliedEventCount: 1
+            )
+            XCTAssertFalse(decision.runsWalk, "token quantum \(step) must skip the walk")
+            XCTAssertEqual(decision.nextOps, step, "counter must accumulate applied events")
+            ops = decision.nextOps
+        }
+        // ...and the 16th forces it and resets the counter.
+        let forced = AgentAppViewModel.aggregateBudgetDecision(
+            force: false, opsSinceLastWalk: ops, appliedEventCount: 1
+        )
+        XCTAssertTrue(forced.runsWalk, "the threshold-th applied event must force the walk")
+        XCTAssertEqual(forced.nextOps, 0, "forcing the walk must reset the counter")
+
+        // A structural quantum forces immediately and resets, regardless of count.
+        let structural = AgentAppViewModel.aggregateBudgetDecision(
+            force: true, opsSinceLastWalk: 0, appliedEventCount: 1
+        )
+        XCTAssertTrue(structural.runsWalk)
+        XCTAssertEqual(structural.nextOps, 0)
+
+        // A fat quantum reaches the threshold in one commit.
+        let fat = AgentAppViewModel.aggregateBudgetDecision(
+            force: false, opsSinceLastWalk: 0,
+            appliedEventCount: AgentAppViewModel.streamAggregateBudgetThreshold
+        )
+        XCTAssertTrue(fat.runsWalk, "one quantum carrying threshold events must force the walk")
+
+        // A quantum that applied nothing still advances the counter, so a stream
+        // of empty commits cannot stall the walk forever.
+        let empty = AgentAppViewModel.aggregateBudgetDecision(
+            force: false, opsSinceLastWalk: 0, appliedEventCount: 0
+        )
+        XCTAssertFalse(empty.runsWalk)
+        XCTAssertEqual(empty.nextOps, 1)
+    }
+
+    // MARK: - SR1 publish skip
+
+    /// WHY: the skip exists to avoid rebuilding the published SR1 sets on every
+    /// token. It is only safe while it is a strict superset of the cases where
+    /// refreshSR1TranslationStateFromTimeline can change state — in particular the
+    /// eviction path, where the timeline is already empty but the published cache
+    /// still holds badges that MUST be cleared.
+    func test_shouldPublishSR1State_skipsOnlyWhenRepublishIsANoOp() {
+        let empty = AssistantTimelineState()
+        XCTAssertFalse(
+            AgentAppViewModel.shouldPublishSR1State(
+                timeline: empty, publishedIds: [], publishedOriginals: [:]
+            ),
+            "both sides empty is the pure-token path and must skip"
+        )
+
+        var translated = AssistantTimelineState()
+        translated.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: UUID().uuidString, originalText: "o", rewrittenText: "r"
+        )))
+        XCTAssertFalse(translated.sr1TranslationsByMessageId.isEmpty)
+        XCTAssertTrue(
+            AgentAppViewModel.shouldPublishSR1State(
+                timeline: translated, publishedIds: [], publishedOriginals: [:]
+            ),
+            "a new translation must always publish"
+        )
+
+        // Eviction shape: the aggregate budget walk emptied the timeline, but the
+        // published badges are still live and have to be cleared.
+        let stale = AgentMessageID(UUID())
+        XCTAssertTrue(
+            AgentAppViewModel.shouldPublishSR1State(
+                timeline: empty, publishedIds: [stale], publishedOriginals: [:]
+            ),
+            "budget-evicted translations must still clear the published id set"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldPublishSR1State(
+                timeline: empty, publishedIds: [], publishedOriginals: [stale: "o"]
+            ),
+            "budget-evicted translations must still clear the published originals"
+        )
+
+        var itemOnly = AssistantTimelineState()
+        itemOnly.apply(.sr1Translation(AssistantSR1Translation(
+            itemId: "item", originalText: "o", rewrittenText: "r"
+        )))
+        XCTAssertFalse(itemOnly.sr1TranslationsByItemId.isEmpty)
+        XCTAssertTrue(
+            AgentAppViewModel.shouldPublishSR1State(
+                timeline: itemOnly, publishedIds: [], publishedOriginals: [:]
+            ),
+            "item-scoped translations must not be silently dropped by the guard"
+        )
+    }
+
+    // MARK: - commitStreamQuantum composition (the wiring the pure units miss)
+
+    private func reducedQuantum(
+        timeline: AssistantTimelineState,
+        force: Bool,
+        appliedEventCount: Int = 1
+    ) -> StreamQuantumReduceResult {
+        StreamQuantumReduceResult(
+            appliedEvent: true,
+            timeline: timeline,
+            currentRunId: nil,
+            status: .running,
+            lastErrorRecoverable: false,
+            liveBackgroundShellCount: 0,
+            suppressStaleActivePlanUpdates: false,
+            seedRunStartedAt: false,
+            runThreadBindings: [:],
+            hasProposedPlan: false,
+            forceAggregateBudget: force,
+            appliedEventCount: appliedEventCount
+        )
+    }
+
+    /// WHY: `aggregateBudgetDecision` and `shouldPublishSR1State` are pure and
+    /// individually tested, but the invariant that actually protects the hot-text
+    /// ceiling lives in their COMPOSITION inside `commitStreamQuantum`: the
+    /// counter must be written back, and the budget walk must run BEFORE the
+    /// publish guard reads the timeline. A regression that drops
+    /// `streamAggregateBudgetOps = budget.nextOps`, or swaps the two blocks, would
+    /// leave both unit tests green. This drives the real method.
+    func test_commitStreamQuantum_coalescesWalkThenPublishesEvictedSR1State() throws {
+        let (vm, _) = try makeVM()
+        vm.aggregateHotTextByteLimitForTesting = 4_000
+
+        // A timeline holding one SR1 translation, well under the lowered ceiling.
+        let messageId = UUID().uuidString
+        var small = AssistantTimelineState()
+        small.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: messageId, originalText: "original", rewrittenText: "rewritten"
+        )))
+        vm.commitStreamQuantum(reducedQuantum(timeline: small, force: true))
+        XCTAssertEqual(vm.sr1TranslatedMessageIds.count, 1,
+                       "a committed translation must publish its badge")
+        XCTAssertEqual(vm.streamAggregateBudgetOpsForTesting, 0,
+                       "a forced walk must reset the coalescing counter")
+
+        // Pure token quanta coalesce: the counter accumulates and never resets
+        // until the threshold, which is the only thing bounding the skip window.
+        for step in 1..<AgentAppViewModel.streamAggregateBudgetThreshold {
+            vm.commitStreamQuantum(reducedQuantum(timeline: small, force: false))
+            XCTAssertEqual(vm.streamAggregateBudgetOpsForTesting, step,
+                           "token quantum \(step) must accumulate, not reset")
+        }
+        vm.commitStreamQuantum(reducedQuantum(timeline: small, force: false))
+        XCTAssertEqual(vm.streamAggregateBudgetOpsForTesting, 0,
+                       "the threshold-th applied event must run the walk and reset")
+
+        // Now exceed the lowered ceiling. The walk must evict the translation AND
+        // the publish guard must observe the post-eviction timeline, clearing the
+        // badge. If the guard ran before the walk, the badge would survive.
+        //
+        // The oversize must live in the TRANSLATION itself: enforceAggregateHotTextBudget
+        // clears item bodies first and returns as soon as it is back under the
+        // ceiling, so a large item body would be freed without ever reaching the
+        // sr1Translations eviction loops.
+        var oversized = AssistantTimelineState()
+        oversized.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: messageId,
+            originalText: String(repeating: "o", count: 10_000),
+            rewrittenText: String(repeating: "r", count: 10_000)
+        )))
+        XCTAssertGreaterThan(oversized.aggregateHotTextByteCount, 4_000,
+                             "fixture must actually exceed the lowered ceiling")
+
+        vm.commitStreamQuantum(reducedQuantum(timeline: oversized, force: true))
+        XCTAssertTrue(vm.timeline.sr1TranslationsByMessageId.isEmpty,
+                      "the budget walk must evict translations over the ceiling")
+        XCTAssertTrue(vm.sr1TranslatedMessageIds.isEmpty,
+                      "walk-then-publish order must clear badges evicted in the same commit")
+        XCTAssertTrue(vm.sr1OriginalTextsByMessageId.isEmpty,
+                      "evicted originals must not survive in the published cache")
+    }
+
+    // MARK: - Truncation marker contract (the one deliberate output change)
+
+    /// WHY: the marker's size is a UTF-8 residual, and the differential proof that
+    /// compared old vs new output normalised the number away. Without these,
+    /// nothing pins either the reported quantity or the formatting convention, so
+    /// a revert to a raw grapheme count, to a raw integer, or to measuring the
+    /// residual before ANSI stripping would fail no test.
+    ///
+    /// Precision, stated honestly: `ByteCountFormatter` rounds, so these pin the
+    /// residual to its formatter bucket (~±500 B at KB scale), NOT to the byte.
+    /// A one-byte off-by-one would still pass. The ANSI case below is sized so the
+    /// stripped and unstripped measurements land in DIFFERENT buckets, and asserts
+    /// that they do — otherwise that assertion would not discriminate either.
+    func test_truncationMarkers_reportFormattedUTF8Residual() {
+        let limit = 64
+        let body = String(repeating: "x", count: 4_096)
+
+        let head = AgentAppView.cappedVisibleText(body, limit: limit)
+        let headKept = String(body.prefix(limit))
+        XCTAssertTrue(head.hasPrefix(headKept))
+        XCTAssertTrue(
+            head.contains(AgentTimelineItemPresentation.truncationSizeLabel(
+                body.utf8.count - headKept.utf8.count
+            )),
+            "head cap must report the formatted UTF-8 residual it actually dropped"
+        )
+        XCTAssertFalse(head.contains("more characters"),
+                       "the marker must not claim a character count it never computes")
+
+        let tail = AgentAppView.cappedVisibleTextTail(body, limit: limit)
+        let tailKept = String(body.suffix(limit))
+        XCTAssertTrue(tail.hasSuffix(tailKept))
+        XCTAssertTrue(
+            tail.contains(AgentTimelineItemPresentation.truncationSizeLabel(
+                body.utf8.count - tailKept.utf8.count
+            )),
+            "tail cap must report the formatted UTF-8 residual it actually dropped"
+        )
+        XCTAssertFalse(tail.contains("earlier characters"),
+                       "the tail marker must not claim a character count either")
+
+        // cappedDetail measures the residual AFTER stripping ANSI, not before.
+        // Sized so stripped (999 B) and unstripped (1008 B) fall either side of a
+        // formatter bucket boundary; the assertion below proves they do, so this
+        // case actually discriminates instead of matching both ways.
+        let ansiBody = String(repeating: "x", count: limit + 999)
+        let ansi = "\u{1B}[31m" + ansiBody + "\u{1B}[0m"
+        let detail = AgentTimelineItemPresentation.cappedDetail(ansi, limit: limit)
+        let clean = AgentTimelineItemPresentation.stripANSI(ansi)
+        let detailKept = String(clean.prefix(limit))
+        let strippedLabel = AgentTimelineItemPresentation.truncationSizeLabel(
+            clean.utf8.count - detailKept.utf8.count
+        )
+        let unstrippedLabel = AgentTimelineItemPresentation.truncationSizeLabel(
+            ansi.utf8.count - detailKept.utf8.count
+        )
+        XCTAssertNotEqual(strippedLabel, unstrippedLabel,
+                          "fixture must straddle a formatter bucket or this case proves nothing")
+        XCTAssertTrue(detail.contains(strippedLabel),
+                      "tool detail residual must be measured on the ANSI-stripped body")
+        XCTAssertFalse(detail.contains(unstrippedLabel),
+                       "tool detail residual must NOT be measured before ANSI stripping")
+        XCTAssertFalse(detail.contains("more characters"))
+
+        // Formatting convention: sizes go through ByteCountFormatter like every
+        // other byte quantity the app shows, not a raw six-digit integer.
+        let wide = AgentAppView.cappedVisibleText(String(repeating: "y", count: 400_000), limit: 2_000)
+        XCTAssertTrue(
+            wide.contains(AgentTimelineItemPresentation.truncationSizeLabel(398_000)),
+            "large residuals must render through the shared size formatter"
+        )
+        XCTAssertFalse(
+            wide.contains("398000"),
+            "large residuals must not render as a raw digit wall"
+        )
+    }
+
 }
 
 private final class ReplayBenchmarkRunner: AgentProviderRunner, @unchecked Sendable {

@@ -671,6 +671,82 @@ public enum AssistantEvent: Codable, Sendable, Equatable {
         case .error(let m, _): return "error(\(m))"
         }
     }
+
+    /// Cheap upper-bound for hot-queue / hot-replay admission sizing.
+    ///
+    /// WHY: `JSONEncoder().encode(event)` on every stream token allocated a full
+    /// encoder + Data graph thousands of times per second on the Agent App path.
+    /// UTF-8 payload sums are O(1) per string and intentionally slightly high so
+    /// the queue becomes *more* eviction-eager under pressure, never less
+    /// protective than true wire size for typical payloads.
+    public var estimatedHotQueueBytes: Int {
+        // Envelope covers type tag + JSON keys + UUID/int scaffolding.
+        let envelope = 128
+        func s(_ value: String?) -> Int { value?.utf8.count ?? 0 }
+        switch self {
+        case .threadStarted(let t, let p):
+            return envelope + t.utf8.count + s(p)
+        case .turnStarted(let t):
+            return envelope + t.utf8.count
+        case .itemStarted(let item):
+            return envelope
+                + item.id.utf8.count + item.turnId.utf8.count
+                + item.body.utf8.count + s(item.output) + s(item.summary) + s(item.resourcePath)
+        case .itemDelta(let id, let body, let output, let summary):
+            return envelope + id.utf8.count + s(body) + s(output) + s(summary)
+        case .itemState(let id, _):
+            return envelope + id.utf8.count
+        case .itemProgress(let id, _):
+            return envelope + id.utf8.count
+        case .itemCompleted(let id, _):
+            return envelope + id.utf8.count
+        case .turnCompleted(let t, let final):
+            return envelope + t.utf8.count + s(final)
+        case .proposedPlan(let plan):
+            return envelope + plan.id.utf8.count + s(plan.turnId) + plan.markdown.utf8.count
+        case .activePlanUpdated(let plan):
+            var total = envelope + s(plan.explanation)
+            for step in plan.steps {
+                total += step.id.utf8.count + step.title.utf8.count
+            }
+            return total
+        case .requestOpened(let request):
+            return envelope + request.id.utf8.count + s(request.turnId)
+                + request.title.utf8.count + s(request.detail)
+        case .requestResolved(let id, _):
+            return envelope + id.utf8.count
+        case .userInputRequested(let request):
+            var total = envelope + request.id.utf8.count + s(request.turnId)
+                + request.prompt.utf8.count + s(request.answer)
+            for option in request.options { total += option.utf8.count }
+            for question in request.questions {
+                total += question.id.utf8.count + question.prompt.utf8.count + s(question.header)
+                for option in question.options {
+                    total += option.label.utf8.count + s(option.detail)
+                }
+            }
+            return total
+        case .userInputResolved(let id, let answer):
+            return envelope + id.utf8.count + s(answer)
+        case .tokenUsage:
+            return envelope + 64
+        case .accountUsage:
+            return envelope + 96
+        case .contextCompaction(let summary):
+            return envelope + s(summary)
+        case .providerRuntime(let event):
+            return envelope
+                + event.id.utf8.count + event.source.utf8.count + event.method.utf8.count
+                + s(event.providerTurnId) + s(event.providerItemId)
+                + s(event.providerRequestId) + event.payloadJSON.utf8.count
+        case .sr1Translation(let translation):
+            return envelope
+                + s(translation.itemId) + s(translation.messageId)
+                + translation.originalText.utf8.count + translation.rewrittenText.utf8.count
+        case .error(let message, _):
+            return envelope + message.utf8.count
+        }
+    }
 }
 
 public struct AssistantTurnSnapshot: Codable, Sendable, Equatable {
@@ -1000,10 +1076,12 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         case .itemDelta(let iid, let bodyAppend, let outputAppend, let summary):
             let applied = mutateItem(iid) { item in
                 if let b = bodyAppend {
-                    item.body = Self.cappedText(item.body + b, limit: Self.liveTextLimit)
+                    Self.appendCapped(&item.body, append: b, limit: Self.liveTextLimit)
                 }
                 if let o = outputAppend {
-                    item.output = Self.cappedText((item.output ?? "") + o, limit: Self.liveOutputLimit)
+                    var output = item.output ?? ""
+                    Self.appendCapped(&output, append: o, limit: Self.liveOutputLimit)
+                    item.output = output
                 }
                 if let s = summary { item.summary = s }
             }
@@ -1011,10 +1089,10 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                 var pending = pendingItemDeltas[iid] ?? PendingItemDelta()
                 if pendingItemDeltas[iid] == nil { pendingItemDeltaOrder.append(iid) }
                 if let b = bodyAppend {
-                    pending.body = Self.cappedText(pending.body + b, limit: Self.liveTextLimit)
+                    Self.appendCapped(&pending.body, append: b, limit: Self.liveTextLimit)
                 }
                 if let o = outputAppend {
-                    pending.output = Self.cappedText(pending.output + o, limit: Self.liveOutputLimit)
+                    Self.appendCapped(&pending.output, append: o, limit: Self.liveOutputLimit)
                 }
                 if let s = summary { pending.summary = s }
                 pendingItemDeltas[iid] = pending
@@ -1253,10 +1331,12 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     private func applyPendingDelta(_ pending: PendingItemDelta?, to item: inout AssistantItem) {
         guard let pending else { return }
         if !pending.body.isEmpty {
-            item.body = Self.cappedText(item.body + pending.body, limit: Self.liveTextLimit)
+            Self.appendCapped(&item.body, append: pending.body, limit: Self.liveTextLimit)
         }
         if !pending.output.isEmpty {
-            item.output = Self.cappedText((item.output ?? "") + pending.output, limit: Self.liveOutputLimit)
+            var output = item.output ?? ""
+            Self.appendCapped(&output, append: pending.output, limit: Self.liveOutputLimit)
+            item.output = output
         }
         if let summary = pending.summary {
             item.summary = summary
@@ -1323,6 +1403,24 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     public static func normalizedProgress(_ value: Double) -> Double {
         if value > 1 { return min(1, max(0, value / 100)) }
         return min(1, max(0, value))
+    }
+
+    /// Append `append` into `target`, preserving grapheme caps when over limit.
+    ///
+    /// WHY: `target = cappedText(target + append)` rebuilt the full growing body
+    /// on every token (`O(n)` copy per delta → `O(n²)` for a long stream).
+    /// Under the UTF-8 budget, `String.append` is amortized and CoW-friendly.
+    public static func appendCapped(_ target: inout String, append: String, limit: Int) {
+        guard !append.isEmpty else { return }
+        let nextUTF8 = target.utf8.count + append.utf8.count
+        if nextUTF8 <= limit {
+            target.append(append)
+            return
+        }
+        // Multi-byte graphemes can still be within the grapheme limit when UTF-8
+        // exceeds it — append then apply the existing grapheme-aware cap.
+        target.append(append)
+        target = cappedText(target, limit: limit)
     }
 
     public static func cappedText(_ value: String, limit: Int = liveTextLimit) -> String {
