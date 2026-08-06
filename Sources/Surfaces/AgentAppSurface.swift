@@ -8622,6 +8622,13 @@ public struct AgentAppView: View {
     // instead of regex; these run for every assistant row on every render, and
     // regex over capped 80k-char bodies dominated the dedup cost. Results are
     // memoized so repeated comparisons of the same body don't re-scan.
+    //
+    // PERF 2026-08-06: cache eligibility used `text.count` (O(n) grapheme walk)
+    // *before* the NSCache lookup. Stream paint re-runs hidden-persisted dedupe
+    // on every timelineUpdateTick; warm cache hits still paid a full walk per
+    // assistant body. UTF-8 length is O(1) and every grapheme is ≥1 byte, so
+    // `utf8 ≤ limit` is a safe under-limit admission for the byte-budgeted cache
+    // (slightly more eager to skip cache for multi-byte text — still correct).
     private static let dedupeCacheCharacterLimit = 16_384
     private static let normalizedTextCache: NSCache<NSString, NSString> = {
         let cache = NSCache<NSString, NSString>()
@@ -8637,7 +8644,7 @@ public struct AgentAppView: View {
     }()
 
     private static func normalizedAssistantText(_ text: String) -> String {
-        guard text.count <= dedupeCacheCharacterLimit else {
+        guard text.utf8.count <= dedupeCacheCharacterLimit else {
             return makeNormalizedAssistantText(text)
         }
         let key = text as NSString
@@ -8651,7 +8658,7 @@ public struct AgentAppView: View {
 
     private static func makeNormalizedAssistantText(_ text: String) -> String {
         var out = String()
-        out.reserveCapacity(text.count)
+        out.reserveCapacity(text.utf8.count)
         var pendingSpace = false
         for scalar in text.unicodeScalars {
             if CharacterSet.whitespacesAndNewlines.contains(scalar) {
@@ -8666,7 +8673,7 @@ public struct AgentAppView: View {
     }
 
     private static func compactAssistantText(_ text: String) -> String {
-        guard text.count <= dedupeCacheCharacterLimit else {
+        guard text.utf8.count <= dedupeCacheCharacterLimit else {
             return makeCompactAssistantText(text)
         }
         let key = text as NSString
@@ -8680,7 +8687,7 @@ public struct AgentAppView: View {
 
     private static func makeCompactAssistantText(_ text: String) -> String {
         var out = String()
-        out.reserveCapacity(text.count)
+        out.reserveCapacity(text.utf8.count)
         for scalar in text.unicodeScalars where !CharacterSet.whitespacesAndNewlines.contains(scalar) {
             out.unicodeScalars.append(scalar)
         }

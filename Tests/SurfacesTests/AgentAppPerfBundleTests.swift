@@ -953,6 +953,99 @@ final class AgentAppPerfBundleTests: XCTestCase {
         XCTAssertTrue(capped.hasPrefix("..."))
     }
 
+    // MARK: - PERF 2026-08-06 assistant dedupe cache gate
+
+    /// Microbench: warm paint path re-checks cache eligibility with grapheme
+    /// `String.count` vs O(1) `utf8.count` (product residual in
+    /// `normalizedAssistantText` / `compactAssistantText`).
+    ///
+    /// WHY: `hiddenPersistedAssistantMessageIDs` re-runs on every
+    /// `timelineUpdateTick`; NSCache hits still paid a full grapheme walk per
+    /// body just to decide whether the cache key path was allowed.
+    func test_microbench_assistantDedupeGate_utf8FasterThanGraphemeCount() throws {
+        // Under the 16_384 byte cache budget; typical completed assistant body.
+        let text = String(repeating: "word ", count: 2_400) // 12_000 ASCII bytes
+        let limit = 16_384
+        XCTAssertLessThanOrEqual(text.utf8.count, limit)
+        let iterations = 30_000
+        let warmup = 2
+        let samples = 5
+
+        func median(_ values: [Double]) -> Double {
+            let s = values.sorted()
+            return s[s.count / 2]
+        }
+
+        /// Legacy residual: O(n) grapheme count before every warm cache admission.
+        func timeLegacyGraphemeGate() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for _ in 0..<iterations {
+                if text.count <= limit {
+                    sink &+= 1
+                }
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertEqual(sink, iterations)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        /// Product path: O(1) UTF-8 length gate.
+        func timeUTF8Gate() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for _ in 0..<iterations {
+                if text.utf8.count <= limit {
+                    sink &+= 1
+                }
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertEqual(sink, iterations)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        for _ in 0..<warmup { _ = timeLegacyGraphemeGate(); _ = timeUTF8Gate() }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            before.append(timeLegacyGraphemeGate())
+            after.append(timeUTF8Gate())
+        }
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = (beforeMed - afterMed) / beforeMed * 100.0
+        NSLog("[perf-proof] assistantDedupeGate grapheme_ms=%@ utf8_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+              String(beforeMed), String(afterMed), improvement,
+              String(describing: before), String(describing: after))
+        XCTAssertGreaterThan(
+            improvement, 5.0,
+            "dedupe cache gate must beat grapheme count by ≥5% (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
+        )
+
+        // Functional pin: same combined-answer hide contract as AgentAppViewModelTests.
+        let threadId = AgentThreadID()
+        let persisted = AgentMessage(
+            threadId: threadId,
+            role: .assistant,
+            content: "S start. D inspect. O done."
+        )
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage,
+                              body: "S start. D inspect.", startedAtMs: 1),
+                AssistantItem(id: "msg-2", turnId: "turn-1", type: .assistantMessage,
+                              body: "O done.", startedAtMs: 2)
+            ],
+            finished: true
+        )
+        XCTAssertEqual(
+            AgentAppView.hiddenPersistedAssistantMessageIDs(messages: [persisted], timelineTurns: [turn]),
+            [persisted.id],
+            "utf8 cache gate must not change hidden-persisted dedupe semantics"
+        )
+    }
+
 }
 
 private final class ReplayBenchmarkRunner: AgentProviderRunner, @unchecked Sendable {
