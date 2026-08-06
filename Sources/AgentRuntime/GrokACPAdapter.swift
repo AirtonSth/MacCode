@@ -87,6 +87,11 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         /// current prompt generation. Absolute max is measured from this and is
         /// **not** reset by later stream events (those only refresh inactivity).
         var turnWatchdogArmedAt: Date?
+        /// True while `fireTurnInactivityWatchdog` is synthesizing a terminal.
+        /// Blocks emit→refresh→fire re-entry: when inactivity and absolute max
+        /// both expire (~same default 900s), refresh used to call fire
+        /// synchronously from emit and recurse until SIGBUS (stack guard).
+        var turnWatchdogSynthesisInProgress = false
         var promptWritePermit = AgentRunAcceptancePermit()
         var onEvent: (@Sendable (AgentRunEvent) -> Void)?
         var history: [AssistantEvent] = []
@@ -651,6 +656,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             session.cancelRequested = false
             session.forcedKillByUs = false
             session.turnTerminalEmitted = false
+            session.turnWatchdogSynthesisInProgress = false
             session.promptGeneration &+= 1
             session.onEvent = onEvent
             cancelTurnWatchdogLocked(session: session)
@@ -917,6 +923,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         lock.lock()
         guard !session.turnTerminalEmitted else { lock.unlock(); return }
         session.turnTerminalEmitted = true
+        session.turnWatchdogSynthesisInProgress = false
         session.inFlight = false
         session.status = status
         cancelTurnWatchdogLocked(session: session)
@@ -943,6 +950,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
               session.inFlight,
               session.promptAccepted,
               !session.turnTerminalEmitted,
+              !session.turnWatchdogSynthesisInProgress,
               session.promptGeneration == generation else {
             lock.unlock()
             return
@@ -957,7 +965,13 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             session.turnWatchdog?.cancel()
             session.turnWatchdog = nil
             lock.unlock()
-            fireTurnInactivityWatchdog(session: session, generation: generation)
+            // Absolute max already elapsed. Never call fire synchronously here:
+            // emit→refresh→fire→emit would recurse when inactivity and absolute
+            // max land together (production defaults are both 900s).
+            DispatchQueue.global(qos: .utility).async { [weak self, weak session] in
+                guard let self, let session else { return }
+                self.fireTurnInactivityWatchdog(session: session, generation: generation)
+            }
             return
         }
         session.turnWatchdog?.cancel()
@@ -987,10 +1001,17 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
               session.inFlight,
               session.promptAccepted,
               !session.turnTerminalEmitted,
+              !session.turnWatchdogSynthesisInProgress,
               session.promptGeneration == generation else {
             lock.unlock()
             return
         }
+        // Claim synthesis before any emit. emit re-arms the watchdog; without
+        // this flag that re-arm can re-enter fire while absolute max is already
+        // spent and overflow the GCD worker stack (crash: RemoteCode.SQLiteDB
+        // stack guard via EventBus during nested publishes).
+        session.turnWatchdogSynthesisInProgress = true
+        cancelTurnWatchdogLocked(session: session)
         lock.unlock()
         let hasFinal = session.mapper.hasSpeakableFinalContent
         let status: AgentRunStatus = hasFinal ? .completed : .failed
@@ -1035,7 +1056,11 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         }
         session.history.append(event)
         let generation = session.promptGeneration
-        let shouldArmWatchdog = session.inFlight && session.promptAccepted
+        // Do not re-arm while the watchdog is synthesizing a terminal: that path
+        // is what previously re-entered fireTurnInactivityWatchdog from emit.
+        let shouldArmWatchdog = session.inFlight
+            && session.promptAccepted
+            && !session.turnWatchdogSynthesisInProgress
         let callback = session.onEvent
         lock.unlock()
         callback?(.event(event))

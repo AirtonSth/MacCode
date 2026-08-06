@@ -54,6 +54,35 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
                        "exactly one .finished — late prompt result must not double-terminate")
     }
 
+    /// WHY: crash 2026-08-06 (RemoteCode 2.0.37) — EXC_BAD_ACCESS / SIGBUS on
+    /// stack guard while EventLog prune ran under nested EventBus publishes.
+    /// Production defaults set both inactivity and absolute max to 900s, so when
+    /// the inactivity timer fires the absolute budget is already spent.
+    /// fire→emit→refresh used to call fire again synchronously and recurse until
+    /// the process died. Equal short timeouts force that co-expiry path.
+    func test_turnWatchdogCoExpiryDoesNotRecurseWhenAbsoluteMaxAlsoSpent() async throws {
+        let peer = try FakeGrokACPPeer(mode: .hangAfterFinal)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(
+            binaryNameOverride: peer.path,
+            cancellationGracePeriod: 0.05,
+            turnInactivityTimeout: 0.15,
+            turnInactivityAbsoluteMaxTimeout: 0.15
+        )
+        let request = makeRequest()
+        let box = GrokACPEventBox()
+        _ = try await adapter.startSession(request) { box.append($0) }
+
+        let finished = try await box.waitFinished(timeout: 4)
+        XCTAssertEqual(finished.status, .completed,
+                       "co-expired absolute max must still synthesize a single completed terminal")
+        XCTAssertTrue(box.hasWatchdogSynthesizedMarker,
+                      "watchdog marker must still land once for forensics")
+        try await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertEqual(box.finishedCount, 1,
+                       "co-expiry must not double-terminate or re-enter fire after synthesis")
+    }
+
     func test_foreignRunAsDoesNotRecordTokenSaverCensus() async throws {
         let peer = try FakeGrokACPPeer(mode: .permission)
         defer { peer.remove() }
