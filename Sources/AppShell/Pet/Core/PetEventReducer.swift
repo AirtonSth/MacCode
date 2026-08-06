@@ -342,9 +342,10 @@ public struct PetEventReducer: Sendable {
             }
             return status != .cancelled
         case .companionCue(let cue):
-            // Rebind return to the current semantic base. Work cues are scheduled
-            // 35–55s ahead; coding↔terminal/thinking shifts during that window used
-            // to fail the stale-return guard and drop every decorative work pose.
+            // Store return to the live semantic base (not a stale schedule-time
+            // snapshot). Production `playCompanionCue` already rebinds; this is
+            // defense-in-depth for pending/injected cues. Work-variant accept
+            // across work bases covers inject paths that skip the controller rebind.
             let returnBase = companionBaseState
             let returnMatches = cue.returnState == state
                 || cue.returnState == returnBase

@@ -1022,8 +1022,12 @@ public final class PetController {
 
     private func companionEligibility() -> PetCompanionEligibility {
         let settings = model.settings
+        // Use companionBaseState (no decorative transient), not reducer.state.
+        // WHY: while workingMouse/Bug/Engineer is showing, display state is not in
+        // the work-base set — using reducer.state cancelled the next work countdown
+        // and re-froze the laptop pose for a full 35–55s after every variant.
         return PetCompanionEligibility(
-            baseState: reducer.state,
+            baseState: reducer.companionBaseState,
             attentionCount: model.count,
             activeRunCount: reducer.activeRunCount,
             isVisible: windowController?.isVisible == true,
@@ -1084,6 +1088,10 @@ public final class PetController {
         _ cue: PetCompanionCue,
         allowsStaticReaction: Bool = false
     ) {
+        // Always re-arm the companion loop after this attempt. Early returns used
+        // to leave companionTask == nil with no pending schedule during long runs.
+        defer { scheduleCompanionBehavior() }
+
         guard model.settings.petEnabled, !isScreenLocked else { return }
         let motionAllowed = model.settings.petAnimationsEnabled
             && !model.settings.petReduceMotion
@@ -1093,18 +1101,24 @@ public final class PetController {
             pendingCompanionCue = cue
             return
         }
+        // Drain any cue stashed while the visual runtime was missing.
+        if pendingCompanionCue != nil {
+            pendingCompanionCue = nil
+        }
         let alignedDuration = animationController.loopSafeDurationMilliseconds(
             for: cue.state,
             requested: cue.durationMilliseconds
         )
-        // Always rebind return to the live semantic base so a 35–55s delayed work
-        // cue still lands after coding↔terminal/thinking drift (stale return used
-        // to reject the cue and leave the laptop "coding" pose forever).
+        // Hardening: rebind return to the live semantic base at fire time
+        // (defense-in-depth; production mints return from eligibility after the delay).
         let effectiveCue = PetCompanionCue(
             state: cue.state,
             returnState: reducer.companionBaseState,
             durationMilliseconds: alignedDuration
         )
+        // Avoid recursive defer double-schedule: apply → scheduleCompanionBehavior
+        // already; defer also runs. scheduleCompanionBehavior is idempotent when
+        // companionTask != nil, and apply may start a task first — OK.
         apply(reducer.reduce(
             .companionCue(effectiveCue),
             atMilliseconds: monotonicMilliseconds()

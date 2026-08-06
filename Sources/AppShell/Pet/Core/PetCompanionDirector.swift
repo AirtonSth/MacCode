@@ -87,9 +87,11 @@ public struct PetCompanionEligibility: Sendable, Equatable {
 
     /// Work variants (mouse / bug / engineer) while an agent run is active.
     ///
-    /// WHY ignore `attentionCount`: the Ready-for-you inbox often stays non-zero
-    /// for hours of completed/failed rows. Blocking work cues on that count left
-    /// the desktop pet frozen on base `.coding` (laptop) forever while agents ran.
+    /// WHY ignore `attentionCount` (primary root of forever-laptop): Ready-for-you
+    /// completed/failed rows keep the count non-zero for hours. That is the E5
+    /// freeze. `baseState` must be the **semantic** work base (companionBaseState),
+    /// not the display pose — calling with workingMouse as base would false-cancel
+    /// the next work countdown.
     var allowsWorkCue: Bool {
         guard allowsCompanionMotion, activeRunCount > 0 else { return false }
         switch baseState {
