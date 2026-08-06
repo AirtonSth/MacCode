@@ -3008,10 +3008,23 @@ final class AgentAppViewModelTests: XCTestCase {
             finished: true
         )
 
-        XCTAssertFalse(AgentAppView.shouldRenderFinalAssistantMessage(
+        // Turn has tool work → own the final after Work so far (message is hidden).
+        XCTAssertTrue(AgentAppView.shouldRenderFinalAssistantMessage(
             turn,
             persistedAssistantTexts: ["1 2 3 4 5 6 7 8 9 10"]
-        ), "when the final answer is already persisted as a normal assistant row, timeline fallback must not duplicate it")
+        ), "when Work so far exists, the turn must own the final after the disclosure even if a persisted row also holds the text")
+        let hidden = AgentAppView.hiddenPersistedAssistantMessageIDs(
+            messages: [
+                AgentMessage(
+                    threadId: AgentThreadID(),
+                    role: .assistant,
+                    content: "1 2 3 4 5 6 7 8 9 10"
+                )
+            ],
+            timelineTurns: [turn]
+        )
+        XCTAssertEqual(hidden.count, 1,
+                       "matching persisted assistant row must hide so the answer is not painted above Work so far")
     }
 
     func test_turnViewKeepsAssistantPartialVisibleWhenPersistedAnswerContainsIt() {

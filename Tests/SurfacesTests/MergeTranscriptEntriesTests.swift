@@ -143,5 +143,72 @@ final class MergeTranscriptEntriesTests: XCTestCase {
             ],
             "paint order must be user → Work so far turn → final answer"
         )
+        // With work + final, the turn owns the answer after Work so far and the
+        // message row is suppressed — so even if order slipped, only one answer.
+        XCTAssertTrue(
+            AgentAppView.shouldRenderFinalAssistantMessage(
+                workTurn,
+                persistedAssistantTexts: [final.content]
+            )
+        )
+        XCTAssertEqual(
+            AgentAppView.hiddenPersistedAssistantMessageIDs(
+                messages: [user, final],
+                timelineTurns: [workTurn]
+            ),
+            [final.id]
+        )
+    }
+
+    /// WHY: screenshot class — long Phases final + 200-step Work so far; answer
+    /// must not sit above the disclosure when a durable message row also exists.
+    func test_workTurnOwnsFinal_hidesMatchingMessage_whenToolsPresent() {
+        let tid = Self.tid
+        let longFinal = """
+        Soft-deletes FrontEgg profiles
+        Proof
+        Phases
+        | Phase | Result |
+        | plan | READY |
+        | work | implement |
+        """
+        let final = AgentMessage(
+            id: AgentMessageID(),
+            threadId: tid,
+            role: .assistant,
+            content: longFinal,
+            createdAt: Date(timeIntervalSince1970: 10)
+        )
+        let turn = AssistantTurnSnapshot(
+            turnId: "t-work",
+            items: (0..<5).map { i in
+                AssistantItem(
+                    id: "tool-\(i)",
+                    turnId: "t-work",
+                    type: .commandExecution,
+                    summary: "shell \(i)",
+                    startedAtMs: Int64(i + 1)
+                )
+            },
+            finalAssistantMessage: longFinal,
+            finished: true,
+            startedAtMs: 1
+        )
+        XCTAssertTrue(AgentAppView.turnHasWorkDisclosureContent(turn))
+        XCTAssertTrue(
+            AgentAppView.shouldRenderFinalAssistantMessage(
+                turn,
+                persistedAssistantTexts: [longFinal]
+            ),
+            "turn with tools must paint final after Work so far"
+        )
+        XCTAssertEqual(
+            AgentAppView.hiddenPersistedAssistantMessageIDs(
+                messages: [final],
+                timelineTurns: [turn]
+            ),
+            [final.id],
+            "persisted duplicate must not paint above Work so far"
+        )
     }
 }

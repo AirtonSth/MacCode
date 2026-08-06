@@ -568,11 +568,13 @@ public enum AgentTranscriptOrder {
     }
 
     private static func compactFinalText(_ text: String) -> String {
+        // Cap is high enough for long "Phases" tables; still bounded for cost.
+        let limit = 32_768
         var out = String()
-        out.reserveCapacity(min(text.utf8.count, 4_096))
+        out.reserveCapacity(min(text.utf8.count, limit))
         for scalar in text.unicodeScalars where !CharacterSet.whitespacesAndNewlines.contains(scalar) {
             out.unicodeScalars.append(scalar)
-            if out.utf8.count >= 4_096 { break }
+            if out.utf8.count >= limit { break }
         }
         return out
     }

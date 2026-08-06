@@ -8401,10 +8401,40 @@ public struct AgentAppView: View {
 
     static func shouldRenderFinalAssistantMessage(_ turn: AssistantTurnSnapshot, persistedAssistantTexts: [String] = []) -> Bool {
         guard let final = turn.finalAssistantMessage, !final.isEmpty else { return false }
-        if assistantText(final, matchesAny: persistedAssistantTexts) { return false }
         let bodies = renderableAssistantItemBodies(in: turn, persistedAssistantTexts: persistedAssistantTexts)
+        // Already painted as an assistant-item row outside Work so far — skip field.
         if assistantText(bodies.joined(separator: "\n"), equals: final) { return false }
-        return !bodies.contains { assistantText($0, matches: final) }
+        if bodies.contains(where: { assistantText($0, matches: final) }) { return false }
+        // WHY (open-thread order): when the turn has Work so far (tools/preambles)
+        // and the durable answer is also a persisted AgentMessage, prefer the
+        // turn-owned final (always after Work so far) and hide the message row.
+        // Without work, keep the old message-only path (no empty Work so far).
+        if turnHasWorkDisclosureContent(turn, finalText: final) {
+            return true
+        }
+        if assistantText(final, matchesAny: persistedAssistantTexts) { return false }
+        return true
+    }
+
+    /// True when the turn would show a Work so far / Worked disclosure (tools,
+    /// reasoning, or non-final assistant preambles). Pure for tests.
+    static func turnHasWorkDisclosureContent(
+        _ turn: AssistantTurnSnapshot,
+        finalText: String? = nil
+    ) -> Bool {
+        let final = (finalText ?? turn.finalAssistantMessage)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return turn.items.contains { item in
+            switch item.type {
+            case .assistantMessage:
+                guard !final.isEmpty else { return !item.body.isEmpty }
+                return !item.body.isEmpty
+                    && !assistantText(item.body, matches: final)
+                    && !assistantText(final, matches: item.body)
+            default:
+                return true
+            }
+        }
     }
 
     static func shouldRenderAssistantItemBody(_ body: String, priorAssistantTexts: [String] = [], persistedAssistantTexts: [String] = []) -> Bool {
@@ -8947,6 +8977,16 @@ public struct AgentAppView: View {
             let visibleAssistantText = renderableAssistantItemBodies(in: turn, persistedAssistantTexts: persistedTexts)
                 .joined(separator: "\n")
             hidden.formUnion(lookup.ids(equalTo: visibleAssistantText))
+            // Hide the durable transcript row when the turn owns Work so far +
+            // the same final after it — prevents answer-above-work on open.
+            if let final = turn.finalAssistantMessage, !final.isEmpty,
+               turnHasWorkDisclosureContent(turn, finalText: final) {
+                hidden.formUnion(lookup.ids(equalTo: final))
+                for message in assistantMessages where assistantText(message.content, matches: final)
+                    || assistantText(final, matches: message.content) {
+                    hidden.insert(message.id)
+                }
+            }
         }
         return hidden
     }
@@ -9167,8 +9207,15 @@ public struct AgentAppView: View {
         AgentTranscriptOrder.placingMatchingFinalsAfterTurns(
             entries,
             turnFinalText: { entry in
-                if case .turn(let turn) = entry { return turn.finalAssistantMessage }
-                return nil
+                guard case .turn(let turn) = entry else { return nil }
+                // Prefer explicit final; fall back to last assistant item so
+                // hydration rows without finalAssistantMessage still reorder.
+                if let final = turn.finalAssistantMessage?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                   !final.isEmpty {
+                    return final
+                }
+                return turn.items.last(where: { $0.type == .assistantMessage })?.body
             },
             assistantMessageText: { entry in
                 if case .message(let message) = entry, message.role == .assistant {
