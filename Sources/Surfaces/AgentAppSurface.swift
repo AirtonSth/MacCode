@@ -8756,10 +8756,29 @@ public struct AgentAppView: View {
         text
     }
 
+    /// Cap live-render text to the first `limit` graphemes (head window).
+    ///
+    /// PERF: `text.count` is an O(n) grapheme walk paid on every live-render copy
+    /// during streaming paint (~30 Hz via `timelineUpdateTick`). Long tool bodies
+    /// and reasoning streams can hold up to `liveTextLimit` (200k) bytes in the
+    /// timeline while the view only needs the first 2k characters. Use the same
+    /// F11 insight as `AssistantTimelineState.cappedText`: `utf8.count` is O(1)
+    /// and every grapheme is ≥1 UTF-8 byte, so `utf8 ≤ limit` ⇒ `count ≤ limit`.
+    /// Over the byte budget, end-relative / start-relative index arithmetic is
+    /// O(limit) instead of O(n). The "dropped" label uses the UTF-8 residual
+    /// (exact for ASCII Agent streams; a slightly high upper bound for multi-byte).
     static func cappedVisibleText(_ text: String, limit: Int, truncatedLabel: String = "truncated in live view") -> String {
-        guard text.count > limit else { return text }
-        let head = text.prefix(limit)
-        let dropped = text.count - head.count
+        let limit = max(0, limit)
+        guard limit > 0 else { return "" }
+        guard text.utf8.count > limit else { return text }
+        guard let end = text.index(text.startIndex, offsetBy: limit, limitedBy: text.endIndex),
+              end < text.endIndex else {
+            // Grapheme count ≤ limit even though UTF-8 exceeded the budget
+            // (multi-byte characters under the grapheme window).
+            return text
+        }
+        let head = text[..<end]
+        let dropped = max(1, text.utf8.count - head.utf8.count)
         return "\(head)\n... \(dropped) more characters \(truncatedLabel) ..."
     }
 
@@ -8786,11 +8805,21 @@ public struct AgentAppView: View {
         return copy
     }
 
-    /// Keep the newest `limit` characters (plus a short head-omission marker).
+    /// Keep the newest `limit` graphemes (plus a short head-omission marker).
+    ///
+    /// Same O(n)→O(limit) rationale as `cappedVisibleText` — streaming Thought /
+    /// tool bodies grow far past the live window; every paint must not re-scan the
+    /// full held body just to decide whether to show the tail.
     static func cappedVisibleTextTail(_ text: String, limit: Int, truncatedLabel: String = "earlier characters truncated in live view") -> String {
-        guard text.count > limit else { return text }
-        let tail = text.suffix(limit)
-        let dropped = text.count - tail.count
+        let limit = max(0, limit)
+        guard limit > 0 else { return "" }
+        guard text.utf8.count > limit else { return text }
+        guard let start = text.index(text.endIndex, offsetBy: -limit, limitedBy: text.startIndex),
+              start > text.startIndex else {
+            return text
+        }
+        let tail = text[start...]
+        let dropped = max(1, text.utf8.count - tail.utf8.count)
         return "... \(dropped) \(truncatedLabel) ...\n\(tail)"
     }
 

@@ -859,6 +859,100 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
     }
 
+    // MARK: - PERF 2026-08-06 live-view cap (no full grapheme count)
+
+    /// WHY: multi-byte graphemes can sit under the grapheme window while over the
+    /// UTF-8 budget — the live cap must not over-truncate them (same F11 contract).
+    func test_cappedVisibleText_preservesMultibyteUnderGraphemeLimit() {
+        let multibyte = "héllo" // 5 graphemes, >5 UTF-8 bytes
+        XCTAssertGreaterThan(multibyte.utf8.count, 5)
+        XCTAssertEqual(
+            AgentAppView.cappedVisibleText(multibyte, limit: 5),
+            multibyte,
+            "live head-cap must stay grapheme-based for multi-byte text under the limit"
+        )
+        XCTAssertEqual(
+            AgentAppView.cappedVisibleTextTail(multibyte, limit: 5),
+            multibyte,
+            "live tail-cap must stay grapheme-based for multi-byte text under the limit"
+        )
+        let emoji = "😀😀😀😀"
+        let head = AgentAppView.cappedVisibleText(emoji, limit: 2)
+        XCTAssertTrue(head.hasPrefix("😀😀"), "emoji head-cap keeps first two graphemes")
+        XCTAssertFalse(head.contains("😀😀😀"), "emoji head-cap must drop the trailing pair")
+        let tail = AgentAppView.cappedVisibleTextTail(emoji, limit: 2)
+        XCTAssertTrue(tail.contains("😀😀"), "emoji tail-cap keeps last two graphemes")
+        XCTAssertTrue(tail.hasPrefix("..."), "over-limit tail-cap still emits the omission marker")
+    }
+
+    /// Microbench: full-body `String.count` walk vs O(limit) index live cap.
+    /// Simulates streaming paint re-capping a long held tool/reasoning body.
+    func test_microbench_liveVisibleCap_indexFasterThanFullGraphemeCount() throws {
+        let body = String(repeating: "b", count: 80_000)
+        let limit = AgentAppView.liveTurnBodyCharacterLimit // 2_000
+        let iterations = 2_000
+        let warmup = 2
+        let samples = 5
+
+        func median(_ values: [Double]) -> Double {
+            let s = values.sorted()
+            return s[s.count / 2]
+        }
+
+        /// Legacy path retained only for A/B: O(n) grapheme count every paint.
+        func timeLegacyCount() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for _ in 0..<iterations {
+                // Mirror the pre-fix cappedVisibleTextTail body.
+                if body.count > limit {
+                    let tail = body.suffix(limit)
+                    let dropped = body.count - tail.count
+                    sink &+= dropped &+ tail.count
+                } else {
+                    sink &+= body.count
+                }
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        func timeIndexCap() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for _ in 0..<iterations {
+                let capped = AgentAppView.cappedVisibleTextTail(body, limit: limit)
+                sink &+= capped.utf8.count
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        for _ in 0..<warmup { _ = timeLegacyCount(); _ = timeIndexCap() }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            before.append(timeLegacyCount())
+            after.append(timeIndexCap())
+        }
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = (beforeMed - afterMed) / beforeMed * 100.0
+        NSLog("[perf-proof] liveVisibleCap legacy_count_ms=%@ index_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+              String(beforeMed), String(afterMed), improvement,
+              String(describing: before), String(describing: after))
+        XCTAssertGreaterThan(
+            improvement, 5.0,
+            "live-view tail cap must beat full grapheme count by ≥5% (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
+        )
+        // Functional pin: tail window still surfaces the newest bytes.
+        let capped = AgentAppView.cappedVisibleTextTail(body + "LATEST", limit: limit)
+        XCTAssertTrue(capped.contains("LATEST"))
+        XCTAssertTrue(capped.hasPrefix("..."))
+    }
+
 }
 
 private final class ReplayBenchmarkRunner: AgentProviderRunner, @unchecked Sendable {
