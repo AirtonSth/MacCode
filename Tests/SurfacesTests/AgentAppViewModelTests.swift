@@ -4934,7 +4934,7 @@ final class AgentAppViewModelTests: XCTestCase {
 
     /// WHY: equal-count provider snapshots still differed in event identity from
     /// local stream history, so fingerprint skip failed and every open rebuilt.
-    /// Gate is now strict item-count richness only.
+    /// Gate requires substantial richness once local already painted text.
     func test_shouldApplyDeferredSnapshotReplay_onlyWhenStrictlyRicher() {
         XCTAssertFalse(
             AgentAppViewModel.shouldApplyDeferredSnapshotReplay(
@@ -4956,6 +4956,29 @@ final class AgentAppViewModelTests: XCTestCase {
                 deferredSnapshotItemCount: 40
             ),
             "strictly richer snapshot must still recover thin local history"
+        )
+        // Residual blink: first paint already has a full transcript; provider
+        // +1 itemStarted must not wipe/rebuild (user sees text flash again).
+        XCTAssertFalse(
+            AgentAppViewModel.shouldApplyDeferredSnapshotReplay(
+                firstPaintItemCount: 40,
+                deferredSnapshotItemCount: 41
+            ),
+            "micro count noise must not rebuild a completed thread that already has text"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldApplyDeferredSnapshotReplay(
+                firstPaintItemCount: 40,
+                deferredSnapshotItemCount: 48
+            ),
+            "substantially richer provider history still recovers missing local turns"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldApplyDeferredSnapshotReplay(
+                firstPaintItemCount: 0,
+                deferredSnapshotItemCount: 3
+            ),
+            "empty first paint still accepts any provider recovery"
         )
     }
 

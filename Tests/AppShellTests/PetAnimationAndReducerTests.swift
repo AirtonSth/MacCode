@@ -282,8 +282,8 @@ final class PetAnimationAndReducerTests: XCTestCase {
     }
 
     func test_transientSourcesEmitTimerDirectivesAndSpecificItemsClearTurnThinking() {
-        let scheduledEvents: [(PetDomainEvent, PetAnimationState)] = [
-            (.contextCompaction, .thinking),
+        // Surface / terminal outcomes do not need a live agent run.
+        let freeEvents: [(PetDomainEvent, PetAnimationState)] = [
             (.browserNavigation, .search),
             (.file(.opened), .editing),
             (.file(.saved(conflictID: nil)), .editing),
@@ -293,7 +293,7 @@ final class PetAnimationAndReducerTests: XCTestCase {
             (.sshSession(.connected), .success)
         ]
 
-        for (event, state) in scheduledEvents {
+        for (event, state) in freeEvents {
             var reducer = PetEventReducer()
             let reduction = reducer.reduce(event, atMilliseconds: 0)
             XCTAssertEqual(reduction.state, state)
@@ -303,20 +303,32 @@ final class PetAnimationAndReducerTests: XCTestCase {
             XCTAssertGreaterThan(milliseconds, 0)
         }
 
+        // Agent plan/thinking flashes only while a host run is live (no blue-badge stick).
+        var compaction = PetEventReducer()
+        _ = compaction.reduce(.agentRunStarted(runID: "run-c"), atMilliseconds: 0)
+        let compacted = compaction.reduce(.contextCompaction, atMilliseconds: 1)
+        XCTAssertEqual(compacted.state, .thinking)
+        guard case .schedule(let compactMs) = compacted.transientTimerDirective else {
+            return XCTFail("contextCompaction must schedule its own transient expiry.")
+        }
+        XCTAssertGreaterThan(compactMs, 0)
+
         var reducer = PetEventReducer()
-        let turn = reducer.reduce(.agentTurnStarted, atMilliseconds: 0)
+        _ = reducer.reduce(.agentRunStarted(runID: "run-1"), atMilliseconds: 0)
+        let turn = reducer.reduce(.agentTurnStarted, atMilliseconds: 1)
         XCTAssertEqual(turn.state, .thinking)
         XCTAssertNotNil(turn.transientTimerDirective)
         let item = reducer.reduce(
             .agentItemStarted(itemID: "command-1", type: .commandExecution),
-            atMilliseconds: 1
+            atMilliseconds: 2
         )
         XCTAssertEqual(item.state, .terminal)
         XCTAssertEqual(item.transientTimerDirective, .cancel)
+        // Still one active run after item complete → base coding, not idle.
         XCTAssertEqual(
-            reducer.reduce(.agentItemCompleted(itemID: "command-1"), atMilliseconds: 2).state,
-            .idle,
-            "Starting a specific item must remove stale turn-level thinking."
+            reducer.reduce(.agentItemCompleted(itemID: "command-1"), atMilliseconds: 3).state,
+            .coding,
+            "Item complete with live run falls back to coding, not idle."
         )
     }
 
@@ -566,6 +578,70 @@ final class PetAnimationAndReducerTests: XCTestCase {
             "decorative work pose must not stick after host active set is empty"
         )
         XCTAssertEqual(cleared.state, .idle)
+    }
+
+    /// WHY: laptop / hard-hat / plan thinking are agent work poses — user rule is
+    /// no agent work without blue Active badge. File/browser flashes stay free.
+    func test_isWorkPose_coversLaptopHardHatAndPlanThinking() {
+        for state: PetAnimationState in [
+            .coding, .thinking, .listening,
+            .workingMouse, .workingBug, .workingEngineer,
+        ] {
+            XCTAssertTrue(
+                PetEventReducer.isWorkPose(state),
+                "\(state.rawValue) must clear when Active badge is zero"
+            )
+        }
+        for state: PetAnimationState in [
+            .idle, .waiting, .success, .failed, .approval,
+            .editing, .search, // surface flashes — OK without blue badge
+        ] {
+            XCTAssertFalse(PetEventReducer.isWorkPose(state))
+        }
+    }
+
+    /// EventBus agent lifecycle / companion events re-sync host Active after reduce.
+    func test_shouldResyncActiveRuns_coversWorkArmingEvents() {
+        XCTAssertTrue(PetController.shouldResyncActiveRuns(after: .agentRunStarted(runID: "r")))
+        XCTAssertTrue(PetController.shouldResyncActiveRuns(after: .agentTurnStarted))
+        XCTAssertTrue(PetController.shouldResyncActiveRuns(after: .agentItemStarted(
+            itemID: "i", type: .plan
+        )))
+        XCTAssertTrue(PetController.shouldResyncActiveRuns(after: .companionCue(
+            PetCompanionCue(state: .workingMouse, returnState: .coding)
+        )))
+        XCTAssertTrue(PetController.shouldResyncActiveRuns(after: .agentRunFinished(
+            runID: "r", status: .completed
+        )))
+        XCTAssertFalse(PetController.shouldResyncActiveRuns(after: .agentItemDelta))
+        XCTAssertFalse(PetController.shouldResyncActiveRuns(after: .browserNavigation))
+    }
+
+    /// Companion work cues require non-zero Active (blue badge), not EventBus ghosts.
+    func test_allowsWorkCue_requiresActiveRunCountNotJustBaseState() {
+        let ghost = PetCompanionEligibility(
+            baseState: .coding,
+            attentionCount: 0,
+            activeRunCount: 0,
+            isVisible: true,
+            animationsEnabled: true,
+            reducedMotion: false,
+            screenLocked: false
+        )
+        XCTAssertFalse(
+            ghost.allowsWorkCue,
+            "coding base with zero Active must not schedule laptop/hard-hat"
+        )
+        let live = PetCompanionEligibility(
+            baseState: .coding,
+            attentionCount: 0,
+            activeRunCount: 1,
+            isVisible: true,
+            animationsEnabled: true,
+            reducedMotion: false,
+            screenLocked: false
+        )
+        XCTAssertTrue(live.allowsWorkCue)
     }
 
     func test_startFinishPath_leavesNonWorkAfterSuccessExpires() {

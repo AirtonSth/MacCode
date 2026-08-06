@@ -222,12 +222,19 @@ public struct PetEventReducer: Sendable {
         )
     }
 
-    /// Work poses that must not stick when host active-run count is zero.
+    /// Agent work poses that must not stick when host Active (blue badge) is zero.
+    ///
+    /// Includes coding/plan-thinking and decorative laptop/hard-hat variants.
+    /// Excludes short surface flashes (files editing, browser search) which are
+    /// not agent-run poses and may play with zero Active rows.
     public static func isWorkPose(_ state: PetAnimationState) -> Bool {
         switch state {
-        case .coding, .editing, .terminal, .search, .gitReview, .thinking, .listening,
+        case .coding, .thinking, .listening,
              .workingMouse, .workingBug, .workingEngineer:
             return true
+        // editing/terminal/search/gitReview can be agent-item activeItems (already
+        // gated on activeRunIDs) or short non-agent surface transients — do not
+        // blanket-suppress the surface path when Active is empty.
         default:
             return false
         }

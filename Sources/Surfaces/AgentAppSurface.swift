@@ -2012,13 +2012,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     /// Deferred provider snapshot may replace the first local paint only when it
-    /// has strictly more renderable items (recovery of missing local history).
-    /// Equal or thinner snapshots must not rebuild — that was the multi-blink.
+    /// recovers **meaningfully** missing local history.
+    ///
+    /// Equal/thinner never rebuilds. When local already painted real content
+    /// (≥3 item starts), require a substantial gap so +1 telemetry/itemStarted
+    /// from the provider cannot blink a completed thread that already has text.
     nonisolated static func shouldApplyDeferredSnapshotReplay(
         firstPaintItemCount: Int,
         deferredSnapshotItemCount: Int
     ) -> Bool {
-        deferredSnapshotItemCount > firstPaintItemCount
+        guard deferredSnapshotItemCount > firstPaintItemCount else { return false }
+        // Thin/empty local: any strictly richer snapshot is recovery.
+        if firstPaintItemCount < 3 { return true }
+        // Local already has a painted transcript — only rebuild when provider
+        // is substantially richer (missing history), not for micro count noise.
+        let minExtra = max(5, firstPaintItemCount / 5)
+        return deferredSnapshotItemCount >= firstPaintItemCount + minExtra
     }
 
     /// Build a fully-applied timeline without intermediate @Published empties.
