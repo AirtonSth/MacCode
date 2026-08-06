@@ -99,6 +99,29 @@ final class PetCompanionDirectorTests: XCTestCase {
         XCTAssertEqual(first?.durationMilliseconds, 6_000)
     }
 
+    func test_workCueAllowedWhileAttentionInboxIsNonZero() {
+        // WHY: completed/failed Ready-for-you rows keep attentionCount > 0 for a
+        // long time; blocking work cues on that left the pet stuck on laptop coding.
+        var director = PetCompanionDirector()
+        let eligible = PetCompanionEligibility(
+            baseState: .coding,
+            attentionCount: 8,
+            activeRunCount: 2,
+            isVisible: true,
+            animationsEnabled: true,
+            reducedMotion: false,
+            screenLocked: false
+        )
+        XCTAssertTrue(eligible.allowsWorkCue)
+        XCTAssertFalse(eligible.allowsAmbientCue,
+                       "ambient idle clowning still requires a clear inbox")
+        XCTAssertNotNil(director.nextWorkCue(
+            eligibility: eligible,
+            preferredIndex: 1,
+            durationMilliseconds: 9_000
+        ))
+    }
+
     func test_notificationPounceOnlyOccursOnZeroToPositiveAndNeverOverridesBlockers() {
         var director = PetCompanionDirector()
 

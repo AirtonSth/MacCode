@@ -342,7 +342,14 @@ public struct PetEventReducer: Sendable {
             }
             return status != .cancelled
         case .companionCue(let cue):
-            guard (cue.returnState == state || cue.returnState == companionBaseState),
+            // Rebind return to the current semantic base. Work cues are scheduled
+            // 35–55s ahead; coding↔terminal/thinking shifts during that window used
+            // to fail the stale-return guard and drop every decorative work pose.
+            let returnBase = companionBaseState
+            let returnMatches = cue.returnState == state
+                || cue.returnState == returnBase
+                || (Self.isWorkVariant(cue.state) && Self.isWorkBase(returnBase))
+            guard returnMatches,
                   cue.state.isCompanionReaction,
                   !isBeingDragged,
                   !isScreenLocked,
@@ -356,7 +363,7 @@ public struct PetEventReducer: Sendable {
             setTransient(
                 cue.state,
                 milliseconds: cue.durationMilliseconds,
-                companionReturnState: cue.returnState
+                companionReturnState: returnBase
             )
             return false
         case .transientExpired:
@@ -520,6 +527,26 @@ public struct PetEventReducer: Sendable {
         switch event {
         case .agentItemDelta, .agentItemProgress, .surfaceOutput, .tokenUsage,
              .layoutChanged, .filesystemChanged:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Base agent-work states that own the pet while a run is live.
+    private static func isWorkBase(_ state: PetAnimationState) -> Bool {
+        switch state {
+        case .coding, .editing, .terminal, .search, .gitReview, .thinking, .listening:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Decorative work poses that rotate while an agent runs.
+    private static func isWorkVariant(_ state: PetAnimationState) -> Bool {
+        switch state {
+        case .workingMouse, .workingBug, .workingEngineer:
             return true
         default:
             return false

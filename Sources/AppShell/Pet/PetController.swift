@@ -1097,9 +1097,12 @@ public final class PetController {
             for: cue.state,
             requested: cue.durationMilliseconds
         )
+        // Always rebind return to the live semantic base so a 35–55s delayed work
+        // cue still lands after coding↔terminal/thinking drift (stale return used
+        // to reject the cue and leave the laptop "coding" pose forever).
         let effectiveCue = PetCompanionCue(
             state: cue.state,
-            returnState: cue.returnState,
+            returnState: reducer.companionBaseState,
             durationMilliseconds: alignedDuration
         )
         apply(reducer.reduce(

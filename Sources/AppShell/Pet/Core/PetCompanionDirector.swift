@@ -72,13 +72,24 @@ public struct PetCompanionEligibility: Sendable, Equatable {
     }
 
     private var allowsCompanionMotion: Bool {
-        isVisible && animationsEnabled && !reducedMotion && !screenLocked && attentionCount == 0
+        isVisible && animationsEnabled && !reducedMotion && !screenLocked
     }
 
+    /// Idle ambient (ball, groom, yawn…) only when nothing needs attention and
+    /// no agent is running — completed/failed inbox should keep the pet calm
+    /// without ambient clowning over a "Ready for you" badge.
     var allowsAmbientCue: Bool {
-        allowsCompanionMotion && activeRunCount == 0 && baseState == .idle
+        allowsCompanionMotion
+            && attentionCount == 0
+            && activeRunCount == 0
+            && baseState == .idle
     }
 
+    /// Work variants (mouse / bug / engineer) while an agent run is active.
+    ///
+    /// WHY ignore `attentionCount`: the Ready-for-you inbox often stays non-zero
+    /// for hours of completed/failed rows. Blocking work cues on that count left
+    /// the desktop pet frozen on base `.coding` (laptop) forever while agents ran.
     var allowsWorkCue: Bool {
         guard allowsCompanionMotion, activeRunCount > 0 else { return false }
         switch baseState {

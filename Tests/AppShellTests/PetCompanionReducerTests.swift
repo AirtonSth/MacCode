@@ -76,16 +76,18 @@ final class PetCompanionReducerTests: XCTestCase {
             "work variants must outrank every eligible base-work animation")
         XCTAssertEqual(reducer.reduce(.transientExpired, atMilliseconds: 1_202).state, .terminal)
 
-        let stale = reducer.reduce(
+        // Work variants may rebind across coding↔terminal (scheduled 35–55s earlier).
+        let rebound = reducer.reduce(
             .companionCue(PetCompanionCue(state: .workingBug, returnState: .coding)),
             atMilliseconds: 1_203
         )
-        XCTAssertEqual(stale.state, .terminal)
-        XCTAssertNil(stale.transientTimerDirective)
+        XCTAssertEqual(rebound.state, .workingBug,
+                       "stale returnState must not drop work poses while still in a work base")
+        XCTAssertEqual(reducer.reduce(.transientExpired, atMilliseconds: 2_403).state, .terminal)
 
         let invalid = reducer.reduce(
             .companionCue(PetCompanionCue(state: .approval, returnState: .terminal)),
-            atMilliseconds: 1_204
+            atMilliseconds: 2_404
         )
         XCTAssertEqual(invalid.state, .terminal)
         XCTAssertNil(invalid.transientTimerDirective)
