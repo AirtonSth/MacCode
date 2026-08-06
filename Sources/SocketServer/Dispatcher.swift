@@ -3949,6 +3949,11 @@ public final class JSONRPCDispatcher {
         object["active_run_started_at_ms"] = .number(Double(
             Int64(active.startedAt.timeIntervalSince1970 * 1_000)
         ))
+        // DB status can lag the coordinator (still completed/idle while a run is
+        // live). Mirror clients that gate on status would drop the blue badge /
+        // Live Activity while the pet is correct — force the wire status to
+        // running whenever we advertise a host-owned active_run_id.
+        object["status"] = .string(AgentRunStatus.running.rawValue)
     }
 
     private func messageSendResultPayload(_ result: AgentMessageSendResult) -> JSONValue {

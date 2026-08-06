@@ -356,9 +356,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// IDENTICAL to Dispatcher.threadPayload so iOS decodes RPC-driven and
     /// mac-UI-driven mutations with one code path. provider_locked derives
     /// best-effort from the message repo (false on error).
+    ///
+    /// Must include `status` + `active_run_id` — without them, iOS Workspaces
+    /// blue badge and Live Activity never learn about live agent runs that
+    /// only surface as coordinator-owned work on the Mac pet.
     private func agentThreadPayload(_ thread: AgentThread) -> JSONValue {
         let locked = !((try? listAgentMessages(thread: thread.id, limit: 1)) ?? []).isEmpty
         var payload: [String: JSONValue] = [
+            "id": .string(thread.id.value.uuidString),
             "thread_id": .string(thread.id.value.uuidString),
             "workspace_id": thread.workspaceId.map { .string($0.value.uuidString) } ?? .null,
             "title": .string(thread.title),
@@ -368,6 +373,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             "provider_instance_id": thread.providerInstanceId.map { .string($0) } ?? .null,
             "providerInstanceId": thread.providerInstanceId.map { .string($0) } ?? .null,
             "model": .string(thread.model),
+            "status": .string(thread.status.rawValue),
+            "has_unread": .bool(thread.hasUnread),
+            "hasUnread": .bool(thread.hasUnread),
             "provider_locked": .bool(locked),
             "providerLocked": .bool(locked),
             "permission_mode": .string(thread.permissionMode.rawValue),
@@ -382,7 +390,29 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         payload["pinned"] = .bool(thread.pinned)
         payload["sort_order"] = .number(Double(thread.sortOrder))
         appendAgentRouting(thread.effectiveRoutingConfiguration, to: &payload)
+        appendAgentActiveRun(to: &payload, thread: thread.id)
         return .object(payload)
+    }
+
+    /// Mirrors Dispatcher.appendActiveRun so agent.thread.updated events carry
+    /// the same host-owned run identity that agent.thread.list / encodeThread do.
+    private func appendAgentActiveRun(
+        to payload: inout [String: JSONValue],
+        thread: AgentThreadID
+    ) {
+        guard let active = try? activeAgentRun(thread: thread) else {
+            payload["active_run_id"] = .null
+            payload["active_run_started_at_ms"] = .null
+            return
+        }
+        payload["active_run_id"] = .string(active.runId.value.uuidString)
+        payload["activeRunId"] = .string(active.runId.value.uuidString)
+        payload["active_run_started_at_ms"] = .number(Double(
+            Int64(active.startedAt.timeIntervalSince1970 * 1_000)
+        ))
+        // Force wire status to running when a host-owned run is live so clients
+        // that also gate on status never drop the blue badge under DB lag.
+        payload["status"] = .string(AgentRunStatus.running.rawValue)
     }
 
     private func appendAgentRouting(_ routing: AgentRoutingConfiguration, to payload: inout [String: JSONValue]) {
