@@ -1,5 +1,6 @@
 import XCTest
 @testable import AppShell
+import AgentRuntime
 import CoreModel
 import Persistence
 import SocketServer
@@ -175,8 +176,17 @@ final class PetCompanionControllerTests: XCTestCase {
         defer { controller.stop() }
         controller.start()
 
+        let runUUID = UUID()
+        let threadUUID = UUID()
         EventBus.shared.publish(kind: "agent.run.started", payload: .object([
-            "run_id": .string(UUID().uuidString),
+            "run_id": .string(runUUID.uuidString),
+        ]))
+        // Host projection is authoritative; mirror production start order.
+        controller.applyActiveRunProjectionForTests(ActiveRunProjection(runs: [
+            ActiveRunProjection.Run(
+                threadId: AgentThreadID(threadUUID),
+                runId: AgentRunID(runUUID)
+            ),
         ]))
         try await waitForState(in: [
             .workingMouse, .workingBug, .workingEngineer,
@@ -186,6 +196,26 @@ final class PetCompanionControllerTests: XCTestCase {
         XCTAssertEqual(requestedRanges.first, 35...55)
         XCTAssertEqual(durationRequestCount, 1,
             "work reactions must use the same randomized 6–12 second provider as ambient and Care")
+    }
+
+    func test_emptyHostProjectionClearsEventBusGhostCodingPose() async throws {
+        let controller = try makeController(prefix: "GhostClear")
+        defer { controller.stop() }
+        controller.start()
+
+        let runUUID = UUID()
+        EventBus.shared.publish(kind: "agent.run.started", payload: .object([
+            "run_id": .string(runUUID.uuidString),
+        ]))
+        try await waitForState(.coding, controller: controller)
+
+        // Missed finish on the bus; host Active section is empty.
+        controller.applyActiveRunProjectionForTests(ActiveRunProjection(runs: []))
+        try await waitForState(.idle, controller: controller)
+        XCTAssertFalse(
+            PetEventReducer.isWorkPose(controller.modelForTests.animationState),
+            "empty host projection must clear ghost work pose"
+        )
     }
 
     func test_newReadyItemPouncesOnceThenReturnsToWaitingBadgeState() async throws {

@@ -155,8 +155,81 @@ public struct PetEventReducer: Sendable {
     }
 
     public var activeRunCount: Int { activeRunIDs.count }
+
+    /// Host-owned run ids currently tracked for animation (EventBus insert +
+    /// ActiveRunProjection reconcile). Exposed for tests / diagnostics.
+    public var trackedActiveRunIDs: Set<String> { activeRunIDs }
+
     var companionBaseState: PetAnimationState {
         derivedState(includeTransient: false, includeDragPose: false)
+    }
+
+    /// Replace the EventBus-held active-run set with the host coordinator
+    /// projection (source of truth for Ready-for-you Active section).
+    ///
+    /// WHY: `agent.run.started` can land without a matching finish (missed event,
+    /// adapter crash, process path). Without this, `activeRunIDs` stays non-empty
+    /// forever and `derivedState` keeps appending `.coding` with nothing running.
+    public mutating func reconcileActiveRunIDs(
+        _ hostRunIDs: Set<String>,
+        atMilliseconds timestamp: Int64
+    ) -> PetEventReduction {
+        pendingTransientTimerDirective = nil
+        let previousState = state
+        let normalized = Set(hostRunIDs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
+        let changed = normalized != activeRunIDs
+        activeRunIDs = normalized
+        if normalized.isEmpty {
+            // No host-owned runs → drop in-flight item poses tied to ghost work.
+            activeItems.removeAll()
+            // Drop decorative work variants that only make sense while a run is live.
+            if let t = transientState, Self.isWorkVariant(t) {
+                clearTransient()
+            }
+        }
+        let nextState = derivedState()
+        state = nextState
+        let stateChanged = previousState != nextState
+        guard changed || stateChanged else {
+            return PetEventReduction(
+                state: nextState,
+                disposition: .unchanged,
+                shouldRefreshAttention: false
+            )
+        }
+        let shouldCoalesce: Bool
+        if lastEmittedState == nextState,
+           let lastTimestamp = lastEmittedAtMilliseconds,
+           timestamp >= lastTimestamp {
+            shouldCoalesce = timestamp - lastTimestamp < coalescingWindowMilliseconds
+        } else {
+            shouldCoalesce = false
+        }
+        if shouldCoalesce {
+            return PetEventReduction(
+                state: nextState,
+                disposition: .coalesced,
+                shouldRefreshAttention: false
+            )
+        }
+        lastEmittedState = nextState
+        lastEmittedAtMilliseconds = timestamp
+        return PetEventReduction(
+            state: nextState,
+            disposition: .emitted,
+            shouldRefreshAttention: false
+        )
+    }
+
+    /// Work poses that must not stick when host active-run count is zero.
+    public static func isWorkPose(_ state: PetAnimationState) -> Bool {
+        switch state {
+        case .coding, .editing, .terminal, .search, .gitReview, .thinking, .listening,
+             .workingMouse, .workingBug, .workingEngineer:
+            return true
+        default:
+            return false
+        }
     }
 
     public static func mappedState(for event: PetDomainEvent) -> PetAnimationState? {

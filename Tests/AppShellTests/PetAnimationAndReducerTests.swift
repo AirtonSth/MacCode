@@ -510,4 +510,75 @@ final class PetAnimationAndReducerTests: XCTestCase {
         XCTAssertEqual(interaction.state, .idle)
         XCTAssertFalse(interaction.shouldRefreshAttention)
     }
+
+    /// Ghost path: EventBus start without finish leaves coding; host projection
+    /// empty must clear work pose (Ready-for-you has zero Active).
+    func test_reconcileActiveRunIDs_emptyHostClearsGhostCodingPose() {
+        var reducer = PetEventReducer(coalescingWindowMilliseconds: 0)
+        XCTAssertEqual(
+            reducer.reduce(.agentRunStarted(runID: "ghost-run"), atMilliseconds: 0).state,
+            .coding
+        )
+        XCTAssertEqual(reducer.activeRunCount, 1)
+        XCTAssertTrue(PetEventReducer.isWorkPose(reducer.state))
+
+        // Missed finish; host ActiveRunProjection is empty.
+        let cleared = reducer.reconcileActiveRunIDs([], atMilliseconds: 100)
+        XCTAssertEqual(reducer.activeRunCount, 0)
+        XCTAssertEqual(cleared.state, .idle)
+        XCTAssertFalse(
+            PetEventReducer.isWorkPose(cleared.state),
+            "zero host active runs must not keep a work pose"
+        )
+        XCTAssertTrue(reducer.trackedActiveRunIDs.isEmpty)
+    }
+
+    func test_reconcileActiveRunIDs_matchesHostProjectionAndKeepsRealWork() {
+        var reducer = PetEventReducer(coalescingWindowMilliseconds: 0)
+        _ = reducer.reduce(.agentRunStarted(runID: "run-a"), atMilliseconds: 0)
+        _ = reducer.reduce(.agentRunStarted(runID: "run-b"), atMilliseconds: 10)
+        XCTAssertEqual(reducer.activeRunCount, 2)
+
+        // Host still has only run-a (run-b finished without bus finish).
+        let synced = reducer.reconcileActiveRunIDs(["run-a"], atMilliseconds: 20)
+        XCTAssertEqual(reducer.trackedActiveRunIDs, ["run-a"])
+        XCTAssertEqual(synced.state, .coding)
+        XCTAssertTrue(PetEventReducer.isWorkPose(synced.state))
+
+        let done = reducer.reconcileActiveRunIDs([], atMilliseconds: 30)
+        XCTAssertEqual(done.state, .idle)
+        XCTAssertFalse(PetEventReducer.isWorkPose(done.state))
+    }
+
+    func test_reconcileActiveRunIDs_clearsGhostWorkVariantTransient() {
+        var reducer = PetEventReducer(coalescingWindowMilliseconds: 0)
+        _ = reducer.reduce(.agentRunStarted(runID: "run-1"), atMilliseconds: 0)
+        XCTAssertEqual(
+            reducer.reduce(
+                .companionCue(PetCompanionCue(state: .workingEngineer, returnState: .coding)),
+                atMilliseconds: 1
+            ).state,
+            .workingEngineer
+        )
+        let cleared = reducer.reconcileActiveRunIDs([], atMilliseconds: 2)
+        XCTAssertFalse(
+            PetEventReducer.isWorkPose(cleared.state),
+            "decorative work pose must not stick after host active set is empty"
+        )
+        XCTAssertEqual(cleared.state, .idle)
+    }
+
+    func test_startFinishPath_leavesNonWorkAfterSuccessExpires() {
+        var reducer = PetEventReducer(coalescingWindowMilliseconds: 0)
+        _ = reducer.reduce(.agentRunStarted(runID: "run-1"), atMilliseconds: 0)
+        XCTAssertTrue(PetEventReducer.isWorkPose(reducer.state))
+        _ = reducer.reduce(
+            .agentRunFinished(runID: "run-1", status: .completed),
+            atMilliseconds: 1
+        )
+        XCTAssertEqual(reducer.activeRunCount, 0)
+        XCTAssertEqual(reducer.state, .success)
+        XCTAssertEqual(reducer.reduce(.transientExpired, atMilliseconds: 2).state, .idle)
+        XCTAssertFalse(PetEventReducer.isWorkPose(reducer.state))
+    }
 }

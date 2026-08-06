@@ -54,6 +54,11 @@ public final class PetController {
     var modelForTests: PetViewModel { model }
     var windowControllerForTests: PetWindowController { windowController! }
     var animationTimerIsRunningForTests: Bool { animationController?.timerIsRunning == true }
+    /// Test seam: inject host ActiveRunProjection the same path production uses
+    /// after coordinator start/finish (reconciles pet work pose).
+    func applyActiveRunProjectionForTests(_ projection: ActiveRunProjection) {
+        applyActiveRunProjection(projection)
+    }
     var hasScheduledTasksForTests: Bool {
         transientTask != nil
             || companionTask != nil
@@ -829,6 +834,11 @@ public final class PetController {
     private func refreshActiveThreadsFromCoordinator() {
         let threadIDs = Array(context.coordinator.activeThreadIdsSnapshot())
         applyActiveThreadIDs(threadIDs)
+        // Reconcile animation active-run set to coordinator truth (not EventBus alone).
+        let hostRunIDs = Set(threadIDs.compactMap {
+            context.coordinator.activeRunId(threadId: $0)?.value.uuidString
+        })
+        reconcilePetActiveRuns(hostRunIDs)
     }
 
     private func applyActiveRunProjection(_ projection: ActiveRunProjection) {
@@ -842,6 +852,25 @@ public final class PetController {
             }
         }
         applyActiveThreadIDs(projection.runs.map(\.threadId), startedByThread: startedByThread)
+        // Host ActiveRunProjection is authoritative for pet work pose. Empty
+        // projection clears EventBus ghost run ids that never received finished.
+        let hostRunIDs = Set(projection.runs.map { $0.runId.value.uuidString })
+        reconcilePetActiveRuns(hostRunIDs)
+    }
+
+    /// Push host-authoritative active run ids into the pet reducer and refresh
+    /// animation. Shared by projection callbacks and coordinator snapshot refresh.
+    private func reconcilePetActiveRuns(_ hostRunIDs: Set<String>) {
+        let reduction = reducer.reconcileActiveRunIDs(
+            hostRunIDs,
+            atMilliseconds: monotonicMilliseconds()
+        )
+        if case .ignored = reduction.disposition {
+            // reconcile never ignores
+        } else {
+            scheduleIdleTimeout()
+        }
+        apply(reduction)
     }
 
     private func applyActiveThreadIDs(
