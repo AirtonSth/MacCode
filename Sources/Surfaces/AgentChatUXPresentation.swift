@@ -319,29 +319,55 @@ public enum AgentWorkingCatCopy {
     ]
 
     /// Activity phrase for the current elapsed window (no " for" suffix).
+    ///
+    /// - First 15s window is always **Working**.
+    /// - Later windows pick a **pseudo-random** cat activity (stable for that
+    ///   window so TimelineView ticks do not flicker). `seed` should come from
+    ///   the run start so different runs shuffle differently.
     public static func activity(
         elapsedSeconds: Int,
+        seed: UInt64 = 0,
         activities: [String] = activities,
         rotationSeconds: Int = rotationSeconds
     ) -> String {
         let list = activities.isEmpty ? ["Working"] : activities
         let period = max(1, rotationSeconds)
-        let index = max(0, elapsedSeconds) / period % list.count
-        return list[index]
+        let window = max(0, elapsedSeconds) / period
+        if window == 0 {
+            return "Working"
+        }
+        // Random among everything except the mandatory first "Working".
+        let pool: [String] = {
+            if list.count <= 1 { return list }
+            if list[0] == "Working" { return Array(list.dropFirst()) }
+            return list
+        }()
+        let index = Int(mix(seed: seed, window: UInt64(window)) % UInt64(pool.count))
+        return pool[index]
     }
 
     /// Display line: `"Purring for 20m 3s"`.
     public static func statusLabel(
         elapsedSeconds: Int,
+        seed: UInt64 = 0,
         activities: [String] = activities,
         rotationSeconds: Int = rotationSeconds
     ) -> String {
         let phrase = activity(
             elapsedSeconds: elapsedSeconds,
+            seed: seed,
             activities: activities,
             rotationSeconds: rotationSeconds
         )
         return "\(phrase) for \(AgentWorkingStripPresentation.formatElapsed(elapsedSeconds))"
+    }
+
+    /// SplitMix64-style mix so (seed, window) → stable non-sequential index.
+    nonisolated static func mix(seed: UInt64, window: UInt64) -> UInt64 {
+        var z = seed &+ (window &+ 1) &* 0x9E3779B97F4A7C15
+        z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+        z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+        return z ^ (z >> 31)
     }
 
     /// Stable VoiceOver / UITest label so assistive tech and tests still hear

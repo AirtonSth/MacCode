@@ -11408,11 +11408,12 @@ public struct AgentAppView: View {
             // keeps the elapsed counter accurate.
             TimelineView(ElapsedTickSchedule(start: vm.runStartedAt ?? Date())) { _ in
                 let seconds = workingElapsedSeconds
+                let seed = workingCatSeed
                 HStack(spacing: DS.Space.sm) {
                     ProgressView()
                         .controlSize(.small)
                         .accessibilityLabel("Running")
-                    Text(AgentWorkingCatCopy.statusLabel(elapsedSeconds: seconds))
+                    Text(AgentWorkingCatCopy.statusLabel(elapsedSeconds: seconds, seed: seed))
                         .font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
                         .accessibilityLabel(AgentWorkingCatCopy.accessibilityLabel(elapsedSeconds: seconds))
                         .accessibilityIdentifier("agent.workingStatus")
@@ -11440,6 +11441,12 @@ public struct AgentAppView: View {
     private var workingElapsedSeconds: Int {
         let now = vm.currentTime()
         return max(0, Int(now.timeIntervalSince(vm.runStartedAt ?? now)))
+    }
+
+    /// Stable per-run seed so post-Working phrases shuffle differently each run.
+    private var workingCatSeed: UInt64 {
+        let start = vm.runStartedAt ?? Date()
+        return UInt64(max(0, start.timeIntervalSince1970 * 1000))
     }
 
     private var elapsedString: String {

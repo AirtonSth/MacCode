@@ -65,27 +65,28 @@ final class AgentChatUXPresentationTests: XCTestCase {
         )
     }
 
-    func test_workingCatCopy_rotatesEveryFifteenSeconds() {
-        // WHY: same elapsed window must be stable; next window must advance.
-        XCTAssertEqual(AgentWorkingCatCopy.activity(elapsedSeconds: 0), "Working")
-        XCTAssertEqual(AgentWorkingCatCopy.activity(elapsedSeconds: 14), "Working")
+    func test_workingCatCopy_firstWindowIsWorkingThenRandomStable() {
+        // WHY: first status is always Working; later windows are random but
+        // stable within the 15s slot (no flicker on TimelineView ticks).
+        XCTAssertEqual(AgentWorkingCatCopy.activity(elapsedSeconds: 0, seed: 42), "Working")
+        XCTAssertEqual(AgentWorkingCatCopy.activity(elapsedSeconds: 14, seed: 42), "Working")
+        let at15 = AgentWorkingCatCopy.activity(elapsedSeconds: 15, seed: 42)
+        let at29 = AgentWorkingCatCopy.activity(elapsedSeconds: 29, seed: 42)
+        XCTAssertEqual(at15, at29, "same 15s window must not reshuffle mid-window")
+        XCTAssertNotEqual(at15, "Working", "after the first window, pick from the cat pool")
+        XCTAssertTrue(AgentWorkingCatCopy.activities.contains(at15))
+        // Different seeds (different runs) should usually diverge after Working.
+        let other = AgentWorkingCatCopy.activity(elapsedSeconds: 15, seed: 99)
+        XCTAssertNotEqual(at15, "Working")
+        XCTAssertTrue(AgentWorkingCatCopy.activities.contains(other))
         XCTAssertEqual(
-            AgentWorkingCatCopy.activity(elapsedSeconds: 15),
-            AgentWorkingCatCopy.activities[1]
-        )
-        XCTAssertEqual(
-            AgentWorkingCatCopy.statusLabel(elapsedSeconds: 95),
-            "\(AgentWorkingCatCopy.activities[95 / 15]) for 1m 35s"
+            AgentWorkingCatCopy.statusLabel(elapsedSeconds: 95, seed: 42),
+            "\(AgentWorkingCatCopy.activity(elapsedSeconds: 95, seed: 42)) for 1m 35s"
         )
         XCTAssertEqual(
             AgentWorkingCatCopy.accessibilityLabel(elapsedSeconds: 95),
             "Working for 1m 35s",
             "VoiceOver / UITests keep a stable Working-for label"
-        )
-        XCTAssertEqual(
-            AgentWorkingCatCopy.activity(elapsedSeconds: 100 * 15),
-            AgentWorkingCatCopy.activities[0],
-            "deck wraps after 100 phrases"
         )
     }
 
