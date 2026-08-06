@@ -182,8 +182,9 @@ public struct PetEventReducer: Sendable {
         if normalized.isEmpty {
             // No host-owned runs → drop in-flight item poses tied to ghost work.
             activeItems.removeAll()
-            // Drop decorative work variants that only make sense while a run is live.
-            if let t = transientState, Self.isWorkVariant(t) {
+            // Drop work-family transients (plan/thinking, coding, laptop/hard-hat
+            // variants). Keep success/failed/approval so terminal cues still play.
+            if let t = transientState, Self.isWorkPose(t) {
                 clearTransient()
             }
         }
@@ -378,13 +379,21 @@ public struct PetEventReducer: Sendable {
             clearTransient()
             return true
         case .agentTurnStarted:
+            // Thinking flash only while a host/event-bus run is live — never
+            // arm a sticky plan/work pose with zero active threads.
+            guard !activeRunIDs.isEmpty else { return false }
             setTransient(.thinking, milliseconds: Self.standardTransientMilliseconds)
             return false
         case .contextCompaction:
+            guard !activeRunIDs.isEmpty else { return false }
             setTransient(.thinking, milliseconds: Self.shortTransientMilliseconds)
             return false
         case .agentItemStarted(let itemID, let type):
             clearTransient(matching: .thinking)
+            // WHY: item.started can land without (or after) run.finished. Tracking
+            // plan/tool poses without an active run left the pet in work/plan with
+            // Ready-for-you Active empty. Only record items while a run is live.
+            guard !activeRunIDs.isEmpty else { return false }
             if let itemState = PetAnimationState.state(for: type) {
                 activeItems[itemID] = itemState
             }
@@ -423,8 +432,12 @@ public struct PetEventReducer: Sendable {
             let returnMatches = cue.returnState == state
                 || cue.returnState == returnBase
                 || (Self.isWorkVariant(cue.state) && Self.isWorkBase(returnBase))
+            // Work variants (laptop / hard-hat engineer) require a live run —
+            // never accept them when Active is empty (ghost work/plan stick).
+            let workVariantAllowed = !Self.isWorkVariant(cue.state) || !activeRunIDs.isEmpty
             guard returnMatches,
                   cue.state.isCompanionReaction,
+                  workVariantAllowed,
                   !isBeingDragged,
                   !isScreenLocked,
                   !isSleeping,
@@ -588,9 +601,20 @@ public struct PetEventReducer: Sendable {
         var candidates: [PetAnimationState] = [.idle]
         if !approvalRequestIDs.isEmpty || !fileConflictIDs.isEmpty { candidates.append(.approval) }
         if !questionRequestIDs.isEmpty { candidates.append(.question) }
-        if includeTransient, let transientState { candidates.append(transientState) }
-        candidates.append(contentsOf: activeItems.values)
-        if !activeRunIDs.isEmpty { candidates.append(.coding) }
+        if includeTransient, let transientState {
+            // Drop work-family transients when no run is live (missed expire +
+            // empty host). Approvals/success/failed still surface.
+            if Self.isWorkPose(transientState), activeRunIDs.isEmpty {
+                // skip sticky plan/coding/work-variant while Active is empty
+            } else {
+                candidates.append(transientState)
+            }
+        }
+        // Item poses (plan→thinking, tools→coding) only while a run is tracked.
+        if !activeRunIDs.isEmpty {
+            candidates.append(contentsOf: activeItems.values)
+            candidates.append(.coding)
+        }
         if isReconnecting { candidates.append(.reconnecting) }
         if attentionCount > 0 { candidates.append(.waiting) }
         if isSleeping { candidates.append(.sleeping) }

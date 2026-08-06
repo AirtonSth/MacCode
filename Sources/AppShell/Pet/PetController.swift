@@ -947,6 +947,11 @@ public final class PetController {
             )
         }
         model.apply(activeThreads: items)
+        // User-visible Active is empty → pet must leave work/plan even if EventBus
+        // still holds a ghost run id (missed finished / stale projection lag).
+        if threadIDs.isEmpty, reducer.activeRunCount > 0 || PetEventReducer.isWorkPose(model.animationState) {
+            reconcilePetActiveRuns([])
+        }
         publishLiveActivitySurface()
     }
 

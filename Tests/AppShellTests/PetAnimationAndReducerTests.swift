@@ -581,4 +581,59 @@ final class PetAnimationAndReducerTests: XCTestCase {
         XCTAssertEqual(reducer.reduce(.transientExpired, atMilliseconds: 2).state, .idle)
         XCTAssertFalse(PetEventReducer.isWorkPose(reducer.state))
     }
+
+    /// WHY: plan item.started without a live run left the pet in thinking/plan
+    /// (hard-hat / blueprint) while Ready-for-you Active was empty.
+    func test_itemStartedWithoutActiveRun_doesNotStickPlanPose() {
+        var reducer = PetEventReducer(coalescingWindowMilliseconds: 0)
+        let afterPlan = reducer.reduce(
+            .agentItemStarted(itemID: "plan-1", type: .plan),
+            atMilliseconds: 0
+        )
+        XCTAssertEqual(afterPlan.state, .idle)
+        XCTAssertEqual(reducer.activeRunCount, 0)
+        XCTAssertFalse(
+            PetEventReducer.isWorkPose(afterPlan.state),
+            "plan item without a run must not put the pet in work/plan mode"
+        )
+    }
+
+    /// WHY: tool/coding item without a run (or after missed finish) must not keep
+    /// the laptop pose when no thread is active.
+    func test_itemStartedWithoutActiveRun_doesNotStickCodingPose() {
+        var reducer = PetEventReducer(coalescingWindowMilliseconds: 0)
+        let afterTool = reducer.reduce(
+            .agentItemStarted(itemID: "tool-1", type: .tool),
+            atMilliseconds: 0
+        )
+        XCTAssertEqual(afterTool.state, .idle)
+        XCTAssertFalse(PetEventReducer.isWorkPose(afterTool.state))
+    }
+
+    /// WHY: work-variant companion cues (engineer hard-hat, laptop) must require
+    /// a live run — otherwise the pet freezes in work art with zero Active threads.
+    func test_workVariantCue_rejectedWhenNoActiveRun() {
+        var reducer = PetEventReducer(coalescingWindowMilliseconds: 0)
+        let cue = reducer.reduce(
+            .companionCue(PetCompanionCue(state: .workingEngineer, returnState: .coding)),
+            atMilliseconds: 0
+        )
+        XCTAssertEqual(cue.state, .idle)
+        XCTAssertFalse(PetEventReducer.isWorkPose(cue.state))
+    }
+
+    /// WHY: plan item during a run must clear when host Active goes empty even
+    /// if item.completed never arrives.
+    func test_reconcileEmpty_clearsPlanItemPoseAfterMissedItemCompleted() {
+        var reducer = PetEventReducer(coalescingWindowMilliseconds: 0)
+        _ = reducer.reduce(.agentRunStarted(runID: "run-1"), atMilliseconds: 0)
+        _ = reducer.reduce(
+            .agentItemStarted(itemID: "plan-1", type: .plan),
+            atMilliseconds: 1
+        )
+        XCTAssertEqual(reducer.state, .thinking)
+        let cleared = reducer.reconcileActiveRunIDs([], atMilliseconds: 2)
+        XCTAssertEqual(cleared.state, .idle)
+        XCTAssertFalse(PetEventReducer.isWorkPose(cleared.state))
+    }
 }
