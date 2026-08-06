@@ -4932,6 +4932,51 @@ final class AgentAppViewModelTests: XCTestCase {
         )
     }
 
+    /// WHY: equal-count provider snapshots still differed in event identity from
+    /// local stream history, so fingerprint skip failed and every open rebuilt.
+    /// Gate is now strict item-count richness only.
+    func test_shouldApplyDeferredSnapshotReplay_onlyWhenStrictlyRicher() {
+        XCTAssertFalse(
+            AgentAppViewModel.shouldApplyDeferredSnapshotReplay(
+                firstPaintItemCount: 40,
+                deferredSnapshotItemCount: 40
+            ),
+            "equal item counts must not rebuild (completed-thread multi-blink)"
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.shouldApplyDeferredSnapshotReplay(
+                firstPaintItemCount: 40,
+                deferredSnapshotItemCount: 12
+            ),
+            "thinner compacted snapshots must not rebuild over full local history"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldApplyDeferredSnapshotReplay(
+                firstPaintItemCount: 2,
+                deferredSnapshotItemCount: 40
+            ),
+            "strictly richer snapshot must still recover thin local history"
+        )
+    }
+
+    func test_selectThread_sameThreadSoftReselectDoesNotClearTimeline() throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "stable")
+        let tid = try XCTUnwrap(vm.selectedThreadId)
+        // Seed a visible turn so we can detect a wipe.
+        vm.timeline.apply(.turnStarted(turnId: "keep-me"))
+        vm.timeline.apply(.turnCompleted(turnId: "keep-me", finalMessage: "hello"))
+        XCTAssertEqual(vm.timeline.turns.map(\.turnId), ["keep-me"])
+        // Same-thread re-select (host refresh / rail re-click).
+        vm.selectThread(tid, markRead: false)
+        XCTAssertEqual(
+            vm.timeline.turns.map(\.turnId),
+            ["keep-me"],
+            "soft reselect must not wipe an already-painted timeline for the open thread"
+        )
+        XCTAssertEqual(vm.timeline.latestAssistantMessage, "hello")
+    }
+
     func test_timelineByReplaying_appliesWithoutPartialPublishPath() {
         // Pure builder used for atomic open: one value, fully applied.
         let events: [AssistantEvent] = [

@@ -1272,6 +1272,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// Bumped on every full thread open so deferred provider-snapshot tasks for
+    /// a prior open never wipe a newer selection (or the same thread re-selected soft).
+    private var selectThreadOpenGeneration: UInt64 = 0
+
     public func selectThread(_ id: AgentThreadID, markRead: Bool = true) {
         guard !isDisposed else { return }
         let selectedThread: AgentThread
@@ -1300,37 +1304,42 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         historyReplayNotice = nil
         let isThreadSwitch = selectedThreadId != id
-        if isThreadSwitch {
-            // IMP-MAC_AGENT-011: stash the leaving thread's draft before swapping,
-            // then restore the opened thread's draft (an in-progress prompt on a
-            // re-select of the same thread is left untouched).
-            if let previous = selectedThreadId { persistComposerDraft(for: previous) }
-            selectedThreadId = id
-            publishInterestedThreadId(id)
-            providerThreadSnapshotStatusMessage = nil
-            providerThreadSnapshotLastConfirmedAt = providerThreadSnapshotConfirmedAtByThread[id]
-            // F6: the SR1 translation maps are per-thread state. Reset them on a
-            // thread switch so they don't accumulate the union of every translated
-            // message (and its full original text) across every thread visited this
-            // session. refreshSR1TranslationStateFromTimeline() below rebuilds them
-            // from the opened thread's replayed timeline.
-            sr1TranslatedMessageIds = []
-            sr1OriginalTextsByMessageId = [:]
-            // Per-thread provider state: the opened thread republishes its own
-            // count on its next snapshot, so carrying the previous thread's
-            // shell count over would advertise work that isn't this thread's.
-            liveBackgroundShellCount = 0
-            // Plan-suppression is per open thread session: do not carry a queued
-            // follow-up suppress flag onto a different thread's durable plan.
-            suppressStaleActivePlanUpdates = false
-        } else {
-            selectedThreadId = id
-            publishInterestedThreadId(id)
+        // Same-thread re-select (rail click, host refreshAgentSurfaces, mark-read
+        // fan-out) used to re-run the full open path: wipe timeline, reload
+        // messages, re-fetch provider snapshot → multi-blink on an already-open
+        // thread. Soft path keeps the painted transcript and only syncs chrome.
+        if !isThreadSwitch {
+            softReselectOpenThread(selectedThread, markRead: markRead)
+            return
         }
+        // Full open path — only when the selected thread actually changes.
+        selectThreadOpenGeneration &+= 1
+        let openGeneration = selectThreadOpenGeneration
+        // IMP-MAC_AGENT-011: stash the leaving thread's draft before swapping,
+        // then restore the opened thread's draft.
+        if let previous = selectedThreadId { persistComposerDraft(for: previous) }
+        selectedThreadId = id
+        publishInterestedThreadId(id)
+        providerThreadSnapshotStatusMessage = nil
+        providerThreadSnapshotLastConfirmedAt = providerThreadSnapshotConfirmedAtByThread[id]
+        // F6: the SR1 translation maps are per-thread state. Reset them on a
+        // thread switch so they don't accumulate the union of every translated
+        // message (and its full original text) across every thread visited this
+        // session. refreshSR1TranslationStateFromTimeline() below rebuilds them
+        // from the opened thread's replayed timeline.
+        sr1TranslatedMessageIds = []
+        sr1OriginalTextsByMessageId = [:]
+        // Per-thread provider state: the opened thread republishes its own
+        // count on its next snapshot, so carrying the previous thread's
+        // shell count over would advertise work that isn't this thread's.
+        liveBackgroundShellCount = 0
+        // Plan-suppression is per open thread session: do not carry a queued
+        // follow-up suppress flag onto a different thread's durable plan.
+        suppressStaleActivePlanUpdates = false
         // Persist the per-surface binding so app restart restores THIS surface
         // to THIS thread (not threads.first). Only fires on an actual change;
         // wired by the host after init, so restore-time selects don't re-persist.
-        if isThreadSwitch { onSelectedThreadChanged?(id) }
+        onSelectedThreadChanged?(id)
         reloadQueuedMessages()
         let routing = selectedThread.effectiveRoutingConfiguration
         routingMode = routing.mode
@@ -1346,7 +1355,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         baseBranch = selectedThread.baseBranch ?? gitBranch ?? "main"
         worktreePath = selectedThread.worktreePath
         status = selectedThread.status
-        if isThreadSwitch { restoreComposerDraft(for: selectedThread) }
+        restoreComposerDraft(for: selectedThread)
         if let trackedRunId = trackedRunId(for: id) {
             // UX-XPLAT-008: use the host's persisted run start time so
             // "Working for Xs" reflects real elapsed time even after
@@ -1429,30 +1438,37 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if Self.shouldReadProviderSnapshot(
             hasRecoverableContext: selectedThreadHasRecoverableContext
         ) {
-            let firstPaintFingerprint = Self.replayPaintFingerprint(persistedReplay)
+            let persistedItemCount = Self.renderableItemCount(persistedEvents)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 do {
                     let snapshot = try await self.providerThreadSnapshotEvents(threadId: id)
-                    // Drop the result if the user switched threads while we were reading.
-                    guard self.selectedThreadId == id else { return }
+                    // Drop if the user switched threads OR a newer full open
+                    // superseded this task (soft reselect does not bump gen).
+                    guard self.selectedThreadId == id,
+                          self.selectThreadOpenGeneration == openGeneration else { return }
                     let confirmedAt = Date()
                     self.providerThreadSnapshotConfirmedAtByThread[id] = confirmedAt
                     self.providerThreadSnapshotLastConfirmedAt = confirmedAt
                     self.providerThreadSnapshotStatusMessage = nil
                     guard !snapshot.isEmpty else { return }
+                    let mergedSnapshot = self.mergePersistedContextTelemetry(
+                        snapshot: snapshot,
+                        persisted: persistedEvents
+                    )
+                    // Only replace the painted timeline when the provider has
+                    // STRICTLY more work items than local history. Equal/thinner
+                    // snapshots used to rebuild with a different event stream and
+                    // blink the same completed thread multiple times.
+                    let snapshotItemCount = Self.renderableItemCount(mergedSnapshot)
+                    guard Self.shouldApplyDeferredSnapshotReplay(
+                        firstPaintItemCount: persistedItemCount,
+                        deferredSnapshotItemCount: snapshotItemCount
+                    ) else { return }
                     let replayEvents = Self.chooseReplayEvents(
                         persisted: persistedEvents,
-                        snapshot: self.mergePersistedContextTelemetry(snapshot: snapshot, persisted: persistedEvents)
+                        snapshot: mergedSnapshot
                     )
-                    // No-op when the deferred source paints the same transcript we
-                    // already showed — wipe+rebuild was the open-thread blink.
-                    if Self.shouldSkipDeferredTimelineRebuild(
-                        firstPaintEvents: persistedReplay,
-                        deferredChosenEvents: replayEvents
-                    ) || Self.replayPaintFingerprint(replayEvents) == firstPaintFingerprint {
-                        return
-                    }
                     // Single atomic publish: never assign an empty intermediate timeline.
                     self.timeline = Self.timelineByReplaying(replayEvents)
                     self.rehydrateDurableActiveState(threadId: id)
@@ -1463,7 +1479,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     self.refreshSR1TranslationStateFromTimeline(preservingExisting: true)
                     self.timelineItemIndex = TimelineItemIndex(turns: self.timeline.turns)
                 } catch {
-                    guard self.selectedThreadId == id else { return }
+                    guard self.selectedThreadId == id,
+                          self.selectThreadOpenGeneration == openGeneration else { return }
                     let threadHasProviderContext = self.threads.first(where: { $0.id == id })?.providerThreadId?.isEmpty == false
                         || !persistedEvents.isEmpty
                     guard threadHasProviderContext else { return }
@@ -1994,6 +2011,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return replayPaintFingerprint(firstPaintEvents) == replayPaintFingerprint(deferredChosenEvents)
     }
 
+    /// Deferred provider snapshot may replace the first local paint only when it
+    /// has strictly more renderable items (recovery of missing local history).
+    /// Equal or thinner snapshots must not rebuild — that was the multi-blink.
+    nonisolated static func shouldApplyDeferredSnapshotReplay(
+        firstPaintItemCount: Int,
+        deferredSnapshotItemCount: Int
+    ) -> Bool {
+        deferredSnapshotItemCount > firstPaintItemCount
+    }
+
     /// Build a fully-applied timeline without intermediate @Published empties.
     nonisolated static func timelineByReplaying(_ events: [AssistantEvent]) -> AssistantTimelineState {
         var next = AssistantTimelineState()
@@ -2002,6 +2029,64 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         next.enforceAggregateHotTextBudget()
         return next
+    }
+
+    /// Same-thread re-select: sync chrome/status without wiping the transcript.
+    /// Host `refreshAgentSurfaces(reloadTranscriptIfSelected:)` and rail clicks
+    /// re-enter here; full open was causing 2–4 full reloads of the same thread.
+    private func softReselectOpenThread(_ selectedThread: AgentThread, markRead: Bool) {
+        let id = selectedThread.id
+        publishInterestedThreadId(id)
+        reloadQueuedMessages()
+        let routing = selectedThread.effectiveRoutingConfiguration
+        routingMode = routing.mode
+        let manual = routing.manualSelection
+        provider = manual.provider
+        providerInstanceId = routing.manualProviderInstanceId ?? manual.provider.rawValue
+        runAsUser = selectedThread.runAsUser ?? AgentRunAsUser.current()
+        model = manual.effectiveModel
+        permissionMode = selectedThread.permissionMode
+        reasoningEffort = manual.reasoningEffort
+        serviceTier = manual.serviceTier
+        executionMode = selectedThread.executionMode
+        baseBranch = selectedThread.baseBranch ?? gitBranch ?? "main"
+        worktreePath = selectedThread.worktreePath
+        status = selectedThread.status
+        if let trackedRunId = trackedRunId(for: id) {
+            runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
+                current: runStartedAt,
+                persisted: try? coordinator.runStartedAt(threadId: id)
+            )
+            currentRunId = trackedRunId
+            stopScheduledLivePoll()
+        } else if isScheduledThreadRunning?(id) == true {
+            bindScheduledOwnedRun(threadId: id)
+        } else if currentRunId != nil || runStartedAt != nil {
+            // Stay idle chrome if the open view already cleared run state.
+            currentRunId = nil
+            runStartedAt = nil
+            stopScheduledLivePoll()
+        }
+        normalizeInteractionModeForSelectedProvider()
+        selectedThreadHasRecoverableContext = coordinator.hasRecoverableContext(threadId: id)
+        if markRead, let markThreadRead {
+            do {
+                try markThreadRead(id)
+                if let idx = threads.firstIndex(where: { $0.id == id }) {
+                    threads[idx].hasUnread = false
+                }
+            } catch {
+                reloadThreads()
+            }
+        }
+        // Refresh durable messages without clearing the painted array first
+        // (loadAllMessages only clears on cross-thread id mismatch).
+        loadAllMessages(id)
+        reloadCheckpoints()
+        refreshSubagentActivity()
+        reloadTokenSaverThreadSavings()
+        // Do not bump focusTick / resetTimelineUpdateTick / re-fetch provider
+        // snapshot — that re-scrolled and re-blinked an already-open thread.
     }
 
     private func rehydrateProposedPlans(threadId: AgentThreadID) {
