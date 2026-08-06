@@ -26,6 +26,23 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(finished.finalMessage, "done")
     }
 
+    /// WHY: stopReason max_tokens is completed-class on the ACP wire. Treating it
+    /// as .failed produces a false error event and wrong run status.
+    func test_maxTokensStopReasonCompletesWithoutError() async throws {
+        let peer = try FakeGrokACPPeer(mode: .maxTokens)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path, cancellationGracePeriod: 0.05)
+        let request = makeRequest()
+        let box = GrokACPEventBox()
+        _ = try await adapter.startSession(request) { box.append($0) }
+        let finished = try await box.waitFinished(timeout: 3)
+        XCTAssertEqual(finished.status, .completed,
+                       "max_tokens must complete the turn, not fail it")
+        XCTAssertEqual(finished.finalMessage, "token cap reached")
+        XCTAssertTrue(box.errors.isEmpty,
+                      "completed-class stop reasons must not emit .error events")
+    }
+
     /// WHY: field 2026-08-05 — Grok streamed a full **COMPLETE** final then
     /// never resolved session/prompt (timeout: nil). Working latched 70m+ with
     /// Stop while durable agent_runs stayed running. The inactivity watchdog
@@ -1099,6 +1116,8 @@ private final class FakeGrokACPPeer {
         /// Streams speakable text + open tool_call, then hangs without terminal
         /// tool status — inactivity must synthesize interrupted, not completed.
         case hangAfterOpenTool
+        /// Completes session/prompt with stopReason max_tokens (completed-class).
+        case maxTokens
     }
     let root: URL
     let path: String
@@ -1194,6 +1213,11 @@ private final class FakeGrokACPPeer {
               if [ "$mode" = immediateResponse ]; then
                 printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"immediate"}}}}\n'
                 printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+                continue
+              fi
+              if [ "$mode" = maxTokens ]; then
+                printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"token cap reached"}}}}\n'
+                printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"max_tokens"}}\n' "$id"
                 continue
               fi
               if [ "$mode" = hangAfterFinal ]; then

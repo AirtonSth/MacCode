@@ -450,6 +450,37 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertTrue(final.contains("Workers launched"))
     }
 
+    /// WHY: max_tokens is completed-class — detached shell must still stamp
+    /// [[RC_AWAITING]] so the host can poll background work after a length cap.
+    func test_mapperShellDetachedToolCall_maxTokens_stampsAwaitingMarker() {
+        let mapper = GrokACPEventMapper(sessionId: "grok-detach-max-tokens")
+        var events: [AssistantEvent] = []
+        events += mapper.beginTurn()
+        let detachCmd = "nohup sleep 99 > /tmp/bg.log 2>&1 &\necho started"
+        events += mapper.consumeSessionUpdate([
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tool-detach-mt",
+            "title": "run_terminal_command",
+            "rawInput": ["command": detachCmd]
+        ])
+        events += mapper.consumeSessionUpdate([
+            "sessionUpdate": "agent_message_chunk",
+            "content": ["type": "text", "text": "capped after detach"]
+        ])
+        events += mapper.finishTurn(stopReason: "max_tokens", usage: nil)
+
+        let marker = BackgroundAwaitContinuation.awaitingMarker
+        let final = events.compactMap { event -> String? in
+            if case .turnCompleted(_, let msg) = event { return msg }
+            return nil
+        }.first
+        let stamped = try! XCTUnwrap(final)
+        XCTAssertTrue(stamped.contains(marker),
+                      "max_tokens + detached shell must stamp [[RC_AWAITING]]; got \(stamped)")
+        XCTAssertEqual(mapper.finalAssistantMessage, stamped)
+        XCTAssertTrue(stamped.contains("capped after detach"))
+    }
+
     func test_mapperNonDetachingAndFailedTerminals_doNotStampAwaitingMarker() {
         let marker = BackgroundAwaitContinuation.awaitingMarker
 
@@ -859,5 +890,104 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(GrokACPTerminalClassifier.status(promptResolved: false, cancelRequested: false, forcedKillByUs: false, terminationReason: .uncaughtSignal, exitStatus: 6), .failed)
         XCTAssertEqual(GrokACPTerminalClassifier.status(promptResolved: false, cancelRequested: true, forcedKillByUs: true, terminationReason: .uncaughtSignal, exitStatus: 15), .cancelled)
         XCTAssertEqual(GrokACPTerminalClassifier.status(promptResolved: true, cancelRequested: true, forcedKillByUs: false, terminationReason: .exit, exitStatus: 0), .completed)
+    }
+
+    /// WHY: max_tokens / max_turn_requests / refusal are successful ACP terminals
+    /// (wire tokens from grok-build stop_reason_wire). Misclassifying them as
+    /// .failed surfaces false error events and blocks awaiting-marker stamps.
+    func test_stopReasonClassifierMatrix_completedClassAndUnknown() {
+        let completed = ["end_turn", "max_tokens", "max_turn_requests", "refusal"]
+        for reason in completed {
+            XCTAssertEqual(
+                GrokACPTerminalClassifier.status(stopReason: reason),
+                .completed,
+                "\(reason) must complete the turn"
+            )
+            XCTAssertTrue(
+                GrokACPTerminalClassifier.isCompletedStopReason(reason),
+                "\(reason) is completed-class"
+            )
+        }
+        XCTAssertEqual(GrokACPTerminalClassifier.status(stopReason: "cancelled"), .cancelled)
+        XCTAssertFalse(GrokACPTerminalClassifier.isCompletedStopReason("cancelled"))
+        XCTAssertEqual(GrokACPTerminalClassifier.status(stopReason: "failed"), .failed)
+        XCTAssertEqual(GrokACPTerminalClassifier.status(stopReason: "unknown_wire"), .failed)
+        XCTAssertFalse(GrokACPTerminalClassifier.isCompletedStopReason("failed"))
+        XCTAssertFalse(GrokACPTerminalClassifier.isCompletedStopReason("unknown_wire"))
+    }
+
+    /// WHY: Foundation JSONSerialization escapes `/` as `\/` by default; grok-build
+    /// documents `session\/prompt` as a historical ACP method-parse hazard.
+    /// Outbound ACP lines must use `.withoutEscapingSlashes`.
+    func test_outboundACPJSONDoesNotEscapeMethodSlashes() throws {
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/prompt",
+            "params": ["sessionId": "s1"]
+        ]
+        let escaped = try JSONSerialization.data(withJSONObject: payload)
+        let canonical = try JSONSerialization.data(
+            withJSONObject: payload,
+            options: [.withoutEscapingSlashes]
+        )
+        let escapedText = String(decoding: escaped, as: UTF8.self)
+        let canonicalText = String(decoding: canonical, as: UTF8.self)
+        // Foundation default: method appears as session\/prompt (backslash + slash bytes).
+        XCTAssertTrue(
+            escapedText.contains("session\\/prompt"),
+            "sanity: Foundation default escapes slashes: \(escapedText)"
+        )
+        XCTAssertTrue(canonicalText.contains("\"method\":\"session/prompt\"")
+                        || canonicalText.contains("session/prompt"),
+                      "canonical form keeps unescaped method path: \(canonicalText)")
+        XCTAssertFalse(
+            canonicalText.contains("session\\/prompt"),
+            "canonical ACP method must not be slash-escaped: \(canonicalText)"
+        )
+        // GrokACPClient.write must use the same options as `canonical`.
+        // Guard the source seam so a future rewrite that drops the option fails CI.
+        // #file → …/Tests/AgentRuntimeTests/GrokACPProtocolTests.swift → package root
+        let packageRoot = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let clientSourceURL = packageRoot.appendingPathComponent("Sources/AgentRuntime/GrokACPClient.swift")
+        let clientSource = try String(contentsOf: clientSourceURL, encoding: .utf8)
+        XCTAssertTrue(
+            clientSource.contains("withoutEscapingSlashes"),
+            "GrokACPClient.write must serialize with .withoutEscapingSlashes"
+        )
+    }
+
+    /// WHY: UI/thread reasoning effort is ignored unless ACP set_model carries
+    /// `_meta.reasoningEffort` (grok-build REASONING_EFFORT_META_KEY).
+    func test_setModelParamsIncludeReasoningEffortMeta() throws {
+        // Reconstruct the params shape GrokACPClient.setModel must emit.
+        let effort = AgentReasoningEffort.high
+        var params: [String: Any] = ["sessionId": "sid", "modelId": "grok-4.5"]
+        params["_meta"] = ["reasoningEffort": effort.rawValue]
+        XCTAssertEqual((params["_meta"] as? [String: Any])?["reasoningEffort"] as? String, "high")
+        let root = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/AgentRuntime/GrokACPClient.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains("reasoningEffort"), "setModel must accept reasoningEffort")
+        XCTAssertTrue(
+            source.contains("_meta") && source.contains("reasoningEffort"),
+            "setModel must send _meta.reasoningEffort"
+        )
+        let adapter = try String(
+            contentsOf: root.appendingPathComponent("Sources/AgentRuntime/GrokACPAdapter.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(
+            adapter.contains("needsEffortBind") || adapter.contains("reasoningEffort: targetEffort"),
+            "Adapter must re-bind effort when it changes even if model id is unchanged"
+        )
     }
 }
