@@ -115,6 +115,47 @@ final class PetLiveActivityCopyTests: XCTestCase {
         )) else { return XCTFail("expected surface") }
         XCTAssertTrue(output.preview.hasPrefix("Needs you"))
         XCTAssertTrue(output.preview.contains("Approve: Run command"))
+        // Red badge present → clear thread deep-link so LA opens Ready for you.
+        XCTAssertNil(output.threadId)
+        XCTAssertNil(output.workspaceId)
+    }
+
+    /// WHY: only 1 Active + zero red badges must deep-link to that thread and
+    /// prefer live lastUpdatePreview over a stale LLM summary.
+    func testSingleActiveNoRedBadge_prefersLastUpdateAndKeepsThreadIds() {
+        let active = PetActiveThreadItem(
+            threadID: threadA,
+            workspaceID: workspace,
+            workspaceName: "elephant",
+            providerName: "Grok",
+            threadTitle: "autonomous agent",
+            lastUpdatePreview: "Running: git status"
+        )
+        guard let output = PetLiveActivityCopy.make(.init(
+            active: [active],
+            needsYou: [],
+            completed: [],
+            summary: "You are an autonomous coding agent…"
+        )) else { return XCTFail("expected surface") }
+        XCTAssertEqual(output.preview, "Running: git status")
+        XCTAssertEqual(output.threadId, threadA.value.uuidString)
+        XCTAssertEqual(output.workspaceId, workspace.value.uuidString)
+    }
+
+    func testItemDeltaPreviewSurfacesAssistantProse() {
+        let prose = PetController.itemDeltaPreview(payload: [
+            "item": .object([
+                "type": .string("assistantMessage"),
+                "body": .string("Checking the orphan reconcile path next.")
+            ])
+        ])
+        XCTAssertEqual(prose, "Checking the orphan reconcile path next.")
+        XCTAssertNil(PetController.itemDeltaPreview(payload: [
+            "item": .object([
+                "type": .string("tool"),
+                "body": .string("claude.session.snapshot")
+            ])
+        ]))
     }
 
     func testMultiActiveUsesOverviewAndPrefersNeedsYouInPreview() {

@@ -157,17 +157,29 @@ public enum PetLiveActivityCopy: Sendable {
             let title = runningTitle(count: 1)
             // Outcome split first; otherwise pet detail (ws - provider - title - elapsed).
             let status = outcomeSplit.isEmpty ? (row.detail ?? "Running") : outcomeSplit
-            // Single-active description: the local-LLM sentence when the model
-            // produced one, else the latest material thread update (tools /
-            // assistant), else identity detail. Attention still outranks all of
-            // it — "Needs you · Approve: Run command" is actionable and must not
-            // be replaced by prose.
-            let preview = attentionPreview
-                ?? input.summary
-                ?? row.lastUpdatePreview
-                ?? row.detail
-                ?? (detailThreadTitle(from: row.detail) ?? row.title)
-            let ids = routeIDs(from: row.route)
+            // Red badges (Needs you) → Ready-for-you inbox semantics: attention
+            // preview wins and we clear thread deep-link ids so LA tap opens the
+            // sheet. Zero red badges + single active → live last-update prose
+            // and remotecode://thread/... open (user contract).
+            let hasRedBadges = !input.needsYou.isEmpty
+            let preview: String
+            let ids: (workspaceId: String?, threadId: String?)
+            if hasRedBadges {
+                preview = attentionPreview
+                    ?? input.summary
+                    ?? row.lastUpdatePreview
+                    ?? row.detail
+                    ?? (detailThreadTitle(from: row.detail) ?? row.title)
+                ids = (nil, nil)
+            } else {
+                // Real-time progress first; LLM summary only as fallback so a
+                // stale sentence never covers a newer tool/assistant line.
+                preview = row.lastUpdatePreview
+                    ?? input.summary
+                    ?? row.detail
+                    ?? (detailThreadTitle(from: row.detail) ?? row.title)
+                ids = routeIDs(from: row.route)
+            }
             return Output(
                 title: title,
                 statusLine: sanitize(status, fallback: "Running"),

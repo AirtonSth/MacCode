@@ -176,14 +176,40 @@ final class LiveActivitySummaryTests: XCTestCase {
     // MARK: - Placement in the card
 
     func testSummaryBecomesTheDescriptionOnTheRunningCard() throws {
+        // No live lastUpdatePreview: LLM summary fills the description.
+        let quiet = PetActiveThreadItem(
+            threadID: threadA,
+            workspaceID: workspace,
+            workspaceName: "star",
+            providerName: "Grok",
+            threadTitle: "binding",
+            lastUpdatePreview: nil
+        )
         let output = try XCTUnwrap(PetLiveActivityCopy.make(.init(
-            active: [active(threadA)],
+            active: [quiet],
             needsYou: [],
             completed: [],
             summary: "Refactoring the per-surface thread binding."
         )))
         XCTAssertEqual(output.preview, "Refactoring the per-surface thread binding.")
         XCTAssertEqual(output.title, "1 Thread Running")
+
+        // Live last-update outranks a stale summary (real-time single-active card).
+        let withProgress = PetActiveThreadItem(
+            threadID: threadA,
+            workspaceID: workspace,
+            workspaceName: "star",
+            providerName: "Grok",
+            threadTitle: "binding",
+            lastUpdatePreview: "Running: swift test"
+        )
+        let live = try XCTUnwrap(PetLiveActivityCopy.make(.init(
+            active: [withProgress],
+            needsYou: [],
+            completed: [],
+            summary: "Refactoring the per-surface thread binding."
+        )))
+        XCTAssertEqual(live.preview, "Running: swift test")
     }
 
     func testSummaryBecomesTheDescriptionOnTheTerminalCard() throws {

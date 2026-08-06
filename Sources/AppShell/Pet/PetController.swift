@@ -497,6 +497,10 @@ public final class PetController {
         switch event.kind {
         case "agent.item.started":
             preview = Self.itemStartedPreview(payload: payload)
+        case "agent.item.delta":
+            // Live assistant/tool body growth — keep single-active LA description
+            // fresh without waiting for item.completed.
+            preview = Self.itemDeltaPreview(payload: payload)
         case "agent.item.completed":
             preview = Self.itemCompletedPreview(payload: payload)
         case "agent.turn.completed":
@@ -595,6 +599,30 @@ public final class PetController {
             return "Failed: tool"
         }
         return nil
+    }
+
+    /// Mid-stream body growth for the LA description (single-active, no red badge).
+    /// Prefer assistant prose; ignore empty / pure runtime noise.
+    nonisolated static func itemDeltaPreview(payload: [String: JSONValue]) -> String? {
+        // Common shapes: { item: { type, body } } or top-level body_append.
+        let item = payload["item"]?.objectValue
+        let type = item?["type"]?.stringValue
+            ?? payload["type"]?.stringValue
+            ?? ""
+        let body = nonempty(item?["body"])
+            ?? nonempty(payload["body_append"])
+            ?? nonempty(payload["bodyAppend"])
+            ?? nonempty(payload["body"])
+        guard let body, let friendly = friendlyPreview(body) else { return nil }
+        if type == "assistantMessage" || type.isEmpty {
+            return friendly
+        }
+        if type == "reasoning" {
+            return friendly
+        }
+        // Tools: only surface when body looks human (not dotted method ids).
+        if isProviderRuntimeNoise(friendly) { return nil }
+        return "Running: \(friendly)"
     }
 
     nonisolated static func turnCompletedPreview(payload: [String: JSONValue]) -> String? {
