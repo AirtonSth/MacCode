@@ -1392,7 +1392,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
         }
         loadAllMessages(id)
-        timeline = AssistantTimelineState()
         streamApplyGeneration &+= 1
         streamApplyInFlight = false
         streamFlushNeeded = false
@@ -1403,72 +1402,77 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if coordinator.hotReplayIsPartial(threadId: id) {
             historyReplayNotice = Self.replayNoticeText(isPartial: true)
         }
-        // PERF: the provider-thread snapshot read (coordinator.readThread) used to
-        // block thread-open for up to a provider round-trip (codex app-server),
-        // freezing the UI on every open/switch. Open instantly from persisted
-        // events (snapshot: nil), then fetch the provider snapshot off the main
-        // run loop and recompute the SAME full replay (chooseReplayEvents over
-        // persisted + snapshot, identical merge + order) and re-apply it. Final
-        // timeline state is identical to the pre-async path; only the provider
-        // snapshot portion is now deferred instead of blocking.
+        // PERF: open instantly from persisted events (no main-thread provider
+        // round-trip). Build the first timeline off the previous published value
+        // so SwiftUI sees one swap, not empty→partial apply ticks.
+        // Then optionally refresh from the provider snapshot asynchronously —
+        // only replace the published timeline when the chosen replay is richer
+        // (avoids the open-thread blink when snapshot == local history).
         let persistedReplay = Self.chooseReplayEvents(persisted: persistedEvents, snapshot: nil)
-        for event in persistedReplay {
-            timeline.apply(event)
-        }
-        timeline.enforceAggregateHotTextBudget()
+        // One publish of a fully-built timeline (not empty → apply-tick cascade).
+        timeline = Self.timelineByReplaying(persistedReplay)
         lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: persistedReplay)
         rehydrateDurableActiveState(threadId: id)
         // A pending follow-up means the user already superseded the prior Active
         // plan; keep it cleared across select/reopen until the next run starts.
         // Queued text stays in the queue UI only until drain starts the turn.
         restoreQueuedFollowupTranscriptPresentation(threadId: id)
+        rehydrateProposedPlans(threadId: id)
+        rehydratePendingCallbacks(threadId: id)
         refreshSR1TranslationStateFromTimeline(preservingExisting: true)
         // PERF: rebuild the O(1) item index once over the fully-replayed timeline so
         // subsequent item-location lookups skip the O(turns x items) linear scan.
         timelineItemIndex = TimelineItemIndex(turns: timeline.turns)
-        guard Self.shouldReadProviderSnapshot(
-            hasRecoverableContext: selectedThreadHasRecoverableContext
-        ) else { return }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                let snapshot = try await self.providerThreadSnapshotEvents(threadId: id)
-                // Drop the result if the user switched threads while we were reading.
-                guard self.selectedThreadId == id else { return }
-                let confirmedAt = Date()
-                self.providerThreadSnapshotConfirmedAtByThread[id] = confirmedAt
-                self.providerThreadSnapshotLastConfirmedAt = confirmedAt
-                self.providerThreadSnapshotStatusMessage = nil
-                guard !snapshot.isEmpty else { return }
-                let replayEvents = Self.chooseReplayEvents(
-                    persisted: persistedEvents,
-                    snapshot: self.mergePersistedContextTelemetry(snapshot: snapshot, persisted: persistedEvents)
-                )
-                self.timeline = AssistantTimelineState()
-                for event in replayEvents {
-                    self.timeline.apply(event)
-                }
-                self.timeline.enforceAggregateHotTextBudget()
-                self.rehydrateDurableActiveState(threadId: id)
-                self.restoreQueuedFollowupTranscriptPresentation(threadId: id)
-                self.lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: replayEvents)
-                self.refreshSR1TranslationStateFromTimeline(preservingExisting: true)
-                self.timelineItemIndex = TimelineItemIndex(turns: self.timeline.turns)
-            } catch {
-                guard self.selectedThreadId == id else { return }
-                let threadHasProviderContext = self.threads.first(where: { $0.id == id })?.providerThreadId?.isEmpty == false
-                    || !persistedEvents.isEmpty
-                guard threadHasProviderContext else { return }
-                self.providerThreadSnapshotStatusMessage = Self.providerThreadSnapshotFailureMessage(
-                    lastConfirmedAt: self.providerThreadSnapshotConfirmedAtByThread[id]
-                )
-            }
-        }
-        rehydrateProposedPlans(threadId: id)
-        rehydratePendingCallbacks(threadId: id)
         reloadCheckpoints()
         suppressPersistedFinalDuplicatedByTimeline()
         resetTimelineUpdateTick()
+        if Self.shouldReadProviderSnapshot(
+            hasRecoverableContext: selectedThreadHasRecoverableContext
+        ) {
+            let firstPaintFingerprint = Self.replayPaintFingerprint(persistedReplay)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    let snapshot = try await self.providerThreadSnapshotEvents(threadId: id)
+                    // Drop the result if the user switched threads while we were reading.
+                    guard self.selectedThreadId == id else { return }
+                    let confirmedAt = Date()
+                    self.providerThreadSnapshotConfirmedAtByThread[id] = confirmedAt
+                    self.providerThreadSnapshotLastConfirmedAt = confirmedAt
+                    self.providerThreadSnapshotStatusMessage = nil
+                    guard !snapshot.isEmpty else { return }
+                    let replayEvents = Self.chooseReplayEvents(
+                        persisted: persistedEvents,
+                        snapshot: self.mergePersistedContextTelemetry(snapshot: snapshot, persisted: persistedEvents)
+                    )
+                    // No-op when the deferred source paints the same transcript we
+                    // already showed — wipe+rebuild was the open-thread blink.
+                    if Self.shouldSkipDeferredTimelineRebuild(
+                        firstPaintEvents: persistedReplay,
+                        deferredChosenEvents: replayEvents
+                    ) || Self.replayPaintFingerprint(replayEvents) == firstPaintFingerprint {
+                        return
+                    }
+                    // Single atomic publish: never assign an empty intermediate timeline.
+                    self.timeline = Self.timelineByReplaying(replayEvents)
+                    self.rehydrateDurableActiveState(threadId: id)
+                    self.restoreQueuedFollowupTranscriptPresentation(threadId: id)
+                    self.rehydrateProposedPlans(threadId: id)
+                    self.rehydratePendingCallbacks(threadId: id)
+                    self.lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: replayEvents)
+                    self.refreshSR1TranslationStateFromTimeline(preservingExisting: true)
+                    self.timelineItemIndex = TimelineItemIndex(turns: self.timeline.turns)
+                } catch {
+                    guard self.selectedThreadId == id else { return }
+                    let threadHasProviderContext = self.threads.first(where: { $0.id == id })?.providerThreadId?.isEmpty == false
+                        || !persistedEvents.isEmpty
+                    guard threadHasProviderContext else { return }
+                    self.providerThreadSnapshotStatusMessage = Self.providerThreadSnapshotFailureMessage(
+                        lastConfirmedAt: self.providerThreadSnapshotConfirmedAtByThread[id]
+                    )
+                }
+            }
+        }
         // Do NOT auto-implement on select/reopen (pet, sidebar, restore). Opening a
         // thread is a view action — Full Access only auto-implements when a plan
         // arrives mid-stream, a run finishes with a pending plan, or the user
@@ -1938,6 +1942,66 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             if case .itemStarted = event { return count + 1 }
             return count
         }
+    }
+
+    /// Cheap paint identity for open-thread replay. Used to skip a second
+    /// full timeline wipe when the deferred provider snapshot would rebuild
+    /// the same content already shown from local events (blink fix).
+    nonisolated static func replayPaintFingerprint(_ events: [AssistantEvent]) -> String {
+        var parts: [String] = []
+        parts.reserveCapacity(events.count)
+        for event in events {
+            switch event {
+            case .threadStarted(let threadId, let providerThreadId):
+                parts.append("ts:\(threadId):\(providerThreadId ?? "")")
+            case .turnStarted(let turnId):
+                parts.append("t+:\(turnId)")
+            case .turnCompleted(let turnId, let finalMessage):
+                // Cap final so fingerprints stay cheap on huge answers.
+                let final = (finalMessage ?? "").prefix(64)
+                parts.append("t=:\(turnId):\(final)")
+            case .itemStarted(let item):
+                parts.append("i+:\(item.id):\(item.turnId):\(item.type.rawValue)")
+            case .itemCompleted(let itemId, _):
+                parts.append("i=:\(itemId)")
+            case .itemDelta(let itemId, let bodyAppend, _, _):
+                // Length-only: content growth still changes the fingerprint.
+                parts.append("id:\(itemId):\(bodyAppend?.utf8.count ?? 0)")
+            default:
+                // Plans, usage, requests etc. change chrome but not the main
+                // transcript blink path; omit for stability across rehydrate.
+                continue
+            }
+        }
+        return parts.joined(separator: "|")
+    }
+
+    /// True when the deferred snapshot path would paint the same transcript
+    /// already shown from the first local open pass — skip wipe+rebuild.
+    nonisolated static func shouldSkipDeferredTimelineRebuild(
+        firstPaintEvents: [AssistantEvent],
+        deferredChosenEvents: [AssistantEvent]
+    ) -> Bool {
+        // Prefer the cheap counts; fingerprint only when counts match.
+        guard renderableItemCount(firstPaintEvents) == renderableItemCount(deferredChosenEvents) else {
+            return false
+        }
+        guard firstPaintEvents.count == deferredChosenEvents.count else {
+            // Same item-starts but different event stream shape → rebuild.
+            // Still skip when fingerprints match (e.g. reordered telemetry only).
+            return replayPaintFingerprint(firstPaintEvents) == replayPaintFingerprint(deferredChosenEvents)
+        }
+        return replayPaintFingerprint(firstPaintEvents) == replayPaintFingerprint(deferredChosenEvents)
+    }
+
+    /// Build a fully-applied timeline without intermediate @Published empties.
+    nonisolated static func timelineByReplaying(_ events: [AssistantEvent]) -> AssistantTimelineState {
+        var next = AssistantTimelineState()
+        for event in events {
+            next.apply(event)
+        }
+        next.enforceAggregateHotTextBudget()
+        return next
     }
 
     private func rehydrateProposedPlans(threadId: AgentThreadID) {

@@ -4900,6 +4900,50 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(AgentAppViewModel.chooseReplayEvents(persisted: persisted, snapshot: nil).count, 5)
     }
 
+    /// WHY: opening an old completed thread used to wipe `timeline = []` then
+    /// re-apply the same (or equivalent) events when the provider snapshot
+    /// landed — SwiftUI rematerialized the transcript 2–3 times (blink).
+    func test_shouldSkipDeferredTimelineRebuild_whenSnapshotMatchesFirstPaint() {
+        let local = startedItems(12) + [
+            .turnCompleted(turnId: "t11", finalMessage: "done")
+        ]
+        XCTAssertTrue(
+            AgentAppViewModel.shouldSkipDeferredTimelineRebuild(
+                firstPaintEvents: local,
+                deferredChosenEvents: local
+            ),
+            "identical local + deferred sources must not trigger a second full rebuild"
+        )
+        let thinnerSnapshot = startedItems(4)
+        XCTAssertFalse(
+            AgentAppViewModel.shouldSkipDeferredTimelineRebuild(
+                firstPaintEvents: local,
+                deferredChosenEvents: thinnerSnapshot
+            ),
+            "a thinner deferred stream must not be treated as the same paint"
+        )
+        let richer = startedItems(20)
+        XCTAssertFalse(
+            AgentAppViewModel.shouldSkipDeferredTimelineRebuild(
+                firstPaintEvents: local,
+                deferredChosenEvents: richer
+            ),
+            "a richer deferred stream must rebuild so recovery still lands"
+        )
+    }
+
+    func test_timelineByReplaying_appliesWithoutPartialPublishPath() {
+        // Pure builder used for atomic open: one value, fully applied.
+        let events: [AssistantEvent] = [
+            .turnStarted(turnId: "t1"),
+            .itemStarted(item: AssistantItem(id: "i1", turnId: "t1", type: .assistantMessage, body: "hi", startedAtMs: 1)),
+            .turnCompleted(turnId: "t1", finalMessage: "hi")
+        ]
+        let timeline = AgentAppViewModel.timelineByReplaying(events)
+        XCTAssertEqual(timeline.turns.count, 1)
+        XCTAssertEqual(timeline.latestAssistantMessage, "hi")
+    }
+
     func test_loadWindowClipsHugePersistedMessagesBeforeRendering() async throws {
         let (vm, _) = try makeVM()
         vm.createThread(title: "huge")
