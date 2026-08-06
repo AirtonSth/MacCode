@@ -93,4 +93,55 @@ final class MergeTranscriptEntriesTests: XCTestCase {
                              "empty turns must not fall back to epoch 0 (which reorders them before every message)")
         XCTAssertGreaterThanOrEqual(emptySort, userAt)
     }
+
+    /// WHY: open-thread hydration can timestamp a durable final before the turn's
+    /// first tool stamp, painting the answer above "Work so far".
+    func test_paintOrdered_placesPersistedFinalAfterItsTurn() {
+        let tid = Self.tid
+        let user = AgentMessage(
+            id: AgentMessageID(),
+            threadId: tid,
+            role: .user,
+            content: "ship it",
+            createdAt: Date(timeIntervalSince1970: 100)
+        )
+        // Final persisted *before* turn sortTime (first tool at 200s).
+        let final = AgentMessage(
+            id: AgentMessageID(),
+            threadId: tid,
+            role: .assistant,
+            content: "Phases\n| A | B |",
+            createdAt: Date(timeIntervalSince1970: 150)
+        )
+        let workTurn = AssistantTurnSnapshot(
+            turnId: "long-turn",
+            items: [
+                AssistantItem(id: "tool-1", turnId: "long-turn", type: .tool, startedAtMs: 200_000)
+            ],
+            finalAssistantMessage: "Phases\n| A | B |",
+            finished: true,
+            startedAtMs: 200_000
+        )
+        let timeOrdered = AgentAppView.mergeTranscriptEntries(messages: [user, final], turns: [workTurn])
+        // Sanity: raw time order puts final message before the turn.
+        XCTAssertEqual(
+            timeOrdered.map(\.id),
+            [
+                AgentAppView.TranscriptEntry.message(user).id,
+                AgentAppView.TranscriptEntry.message(final).id,
+                AgentAppView.TranscriptEntry.turn(workTurn).id,
+            ],
+            "precondition: time order alone inverts final above Work so far"
+        )
+        let paint = AgentAppView.paintOrderedTranscriptEntries(timeOrdered)
+        XCTAssertEqual(
+            paint.map(\.id),
+            [
+                AgentAppView.TranscriptEntry.message(user).id,
+                AgentAppView.TranscriptEntry.turn(workTurn).id,
+                AgentAppView.TranscriptEntry.message(final).id,
+            ],
+            "paint order must be user → Work so far turn → final answer"
+        )
+    }
 }

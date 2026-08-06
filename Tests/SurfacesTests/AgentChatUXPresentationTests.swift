@@ -310,6 +310,51 @@ final class AgentChatUXPresentationTests: XCTestCase {
         XCTAssertEqual(remat, ["A", "T", "B"], "rematerialize keeps sequence; never inserts unknown mid-list")
     }
 
+    /// WHY: opening a long thread sometimes painted the persisted final *above*
+    /// "Work so far" when message.createdAt sorted before the turn sort anchor.
+    func test_placingMatchingFinalsAfterTurns_movesAnswerBelowWorkSoFar() {
+        struct Row: Equatable {
+            enum Kind { case user, turn, assistant }
+            let id: String
+            let kind: Kind
+            let text: String?
+        }
+        let inverted: [Row] = [
+            Row(id: "user", kind: .user, text: "do the work"),
+            Row(id: "final-msg", kind: .assistant, text: "Here is the Phases table answer"),
+            Row(id: "turn-1", kind: .turn, text: "Here is the Phases table answer"),
+        ]
+        let fixed = AgentTranscriptOrder.placingMatchingFinalsAfterTurns(
+            inverted,
+            turnFinalText: { $0.kind == .turn ? $0.text : nil },
+            assistantMessageText: { $0.kind == .assistant ? $0.text : nil },
+            textsMatch: AgentTranscriptOrder.finalTextsMatch
+        )
+        XCTAssertEqual(
+            fixed.map(\.id),
+            ["user", "turn-1", "final-msg"],
+            "final answer must paint after its turn (Work so far → final)"
+        )
+        let alreadyGood = AgentTranscriptOrder.placingMatchingFinalsAfterTurns(
+            fixed,
+            turnFinalText: { $0.kind == .turn ? $0.text : nil },
+            assistantMessageText: { $0.kind == .assistant ? $0.text : nil },
+            textsMatch: AgentTranscriptOrder.finalTextsMatch
+        )
+        XCTAssertEqual(alreadyGood.map(\.id), fixed.map(\.id), "idempotent when order is already correct")
+    }
+
+    func test_finalTextsMatch_ignoresWhitespaceNoise() {
+        XCTAssertTrue(
+            AgentTranscriptOrder.finalTextsMatch("Hello  world\n", "Hello world"),
+            "whitespace-only differences must still associate final with its turn"
+        )
+        XCTAssertFalse(
+            AgentTranscriptOrder.finalTextsMatch("alpha", "beta"),
+            "unrelated answers must not be reordered against each other"
+        )
+    }
+
     func test_workDisclosureLayout_paintSliceAndDiffPreview() {
         let all = Array(0..<100)
         let slice = AgentWorkDisclosureLayout.paintSlice(all: all, revealCount: 0)

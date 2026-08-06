@@ -324,6 +324,82 @@ public enum AgentTranscriptOrder {
         }
         return out
     }
+
+    /// Chat rule: **Work so far** (turn row) → **final answer** (persisted assistant message).
+    ///
+    /// On open/hydration a durable assistant message can sort *before* its turn when
+    /// `message.createdAt` is earlier than the turn's first-item sort anchor. That paints
+    /// the long final answer above the "Work so far · N steps" disclosure. Move each
+    /// matching assistant message to immediately after its turn so order stays stable.
+    ///
+    /// - Messages that already sit after their turn are left alone.
+    /// - Prefer the **last** matching turn when several finals collide on text.
+    public static func placingMatchingFinalsAfterTurns<Entry>(
+        _ entries: [Entry],
+        turnFinalText: (Entry) -> String?,
+        assistantMessageText: (Entry) -> String?,
+        textsMatch: (String, String) -> Bool
+    ) -> [Entry] {
+        guard entries.count > 1 else { return entries }
+
+        var turnFinals: [(index: Int, final: String)] = []
+        turnFinals.reserveCapacity(entries.count)
+        for (index, entry) in entries.enumerated() {
+            if let final = turnFinalText(entry)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !final.isEmpty {
+                turnFinals.append((index, final))
+            }
+        }
+        guard !turnFinals.isEmpty else { return entries }
+
+        // messageIndex → turnIndex to insert after
+        var moveAfterTurn: [Int: Int] = [:]
+        for (index, entry) in entries.enumerated() {
+            guard let text = assistantMessageText(entry)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !text.isEmpty else { continue }
+            guard let match = turnFinals.last(where: { textsMatch(text, $0.final) }) else { continue }
+            // Only lift messages that currently paint *above* their Work so far turn.
+            if index < match.index {
+                moveAfterTurn[index] = match.index
+            }
+        }
+        guard !moveAfterTurn.isEmpty else { return entries }
+
+        var pendingAfterTurn: [Int: [Entry]] = [:]
+        for (messageIndex, turnIndex) in moveAfterTurn {
+            pendingAfterTurn[turnIndex, default: []].append(entries[messageIndex])
+        }
+        let moved = Set(moveAfterTurn.keys)
+        var out: [Entry] = []
+        out.reserveCapacity(entries.count)
+        for (index, entry) in entries.enumerated() {
+            if moved.contains(index) { continue }
+            out.append(entry)
+            if let pending = pendingAfterTurn[index] {
+                out.append(contentsOf: pending)
+            }
+        }
+        return out
+    }
+
+    /// Lightweight final-text match for order repairs (no UI caches).
+    /// Treats equal normalized/compact forms as the same answer.
+    public static func finalTextsMatch(_ lhs: String, _ rhs: String) -> Bool {
+        let a = compactFinalText(lhs)
+        let b = compactFinalText(rhs)
+        guard !a.isEmpty, !b.isEmpty else { return false }
+        return a == b || a.contains(b) || b.contains(a)
+    }
+
+    private static func compactFinalText(_ text: String) -> String {
+        var out = String()
+        out.reserveCapacity(min(text.utf8.count, 4_096))
+        for scalar in text.unicodeScalars where !CharacterSet.whitespacesAndNewlines.contains(scalar) {
+            out.unicodeScalars.append(scalar)
+            if out.utf8.count >= 4_096 { break }
+        }
+        return out
+    }
 }
 
 // MARK: - Turn chat composition (macOS ↔ iOS parity)

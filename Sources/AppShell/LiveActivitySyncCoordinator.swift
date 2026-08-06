@@ -489,7 +489,7 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
             if let surface, surface.activeThreadCount > 0 {
                 // Surface has live actives — keep its detail lines, but never
                 // let title bury the running count (most important LA signal).
-                title = count == 1 ? "1 agent running" : "\(count) agents running"
+                title = PetLiveActivityCopy.runningTitle(count: count)
                 statusLine = surface.statusLine
                 preview = surface.preview
                 threadId = surface.threadId
@@ -499,7 +499,7 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
                 // Projection knows runs; pet surface missing or attention-only.
                 threadId = count == 1 ? projection.runs.first?.threadId.value.uuidString : nil
                 workspaceId = nil
-                title = count == 1 ? "1 agent running" : "\(count) agents running"
+                title = PetLiveActivityCopy.runningTitle(count: count)
                 if let surface {
                     statusLine = surface.statusLine.isEmpty ? "Running" : surface.statusLine
                     preview = surface.preview.isEmpty ? title : surface.preview

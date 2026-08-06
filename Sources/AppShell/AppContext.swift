@@ -3398,6 +3398,38 @@ public final class AppContext {
         }
     }
 
+    /// One-sentence Live Activity description, generated on-device.
+    ///
+    /// Returns nil whenever the local model cannot be used or does not produce
+    /// usable prose — the caller then keeps its deterministic preview, so the
+    /// Lock Screen never degrades because the model was busy, gated, or slow.
+    /// Uses `.sr1Humanize`, the only public distill mode that emits free natural
+    /// language; the other modes emit compressed S/C/D/R/O/N/P lines.
+    ///
+    /// No provider tokens are spent: this is the local Token Saver sidecar.
+    func liveActivityDescriptionSummary(
+        source: LiveActivitySummary.Source,
+        threadId: AgentThreadID?
+    ) async -> String? {
+        guard isTokenSaverRuntimeActive() else { return nil }
+        guard let client = currentDistillClient() else { return nil }
+
+        let targetLanguage = threadId.map { inferredUserLanguage(threadId: $0) } ?? "English"
+        let request = DistillRequest(
+            mode: .sr1Humanize,
+            priority: .background,
+            input: LiveActivitySummary.prompt(source: source, targetLanguage: targetLanguage),
+            maxOutputCharacters: LiveActivitySummary.maximumCharacters * 2
+        )
+        do {
+            let output = try await client.distill(request).output
+            return LiveActivitySummary.sanitized(output, source: source)
+        } catch {
+            NSLog("RemoteCode Live Activity summary skipped: \(error)")
+            return nil
+        }
+    }
+
     func tokenSaverHumanizeSR1Response(_ response: String, provider: AgentProvider, threadId: AgentThreadID, runId: AgentRunID? = nil) async -> String {
         // Token Saver owns every SR1 rewrite, including the deterministic fallback.
         // Check the live paid-feature gate before detection, fallback construction,

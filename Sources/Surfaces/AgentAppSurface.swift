@@ -9161,6 +9161,30 @@ public struct AgentAppView: View {
         )
     }
 
+    /// After time-order, force durable finals below their turn's Work so far.
+    /// WHY: opening a thread sometimes paints the persisted answer above the work disclosure.
+    nonisolated static func ensuringFinalAnswersFollowTurns(_ entries: [TranscriptEntry]) -> [TranscriptEntry] {
+        AgentTranscriptOrder.placingMatchingFinalsAfterTurns(
+            entries,
+            turnFinalText: { entry in
+                if case .turn(let turn) = entry { return turn.finalAssistantMessage }
+                return nil
+            },
+            assistantMessageText: { entry in
+                if case .message(let message) = entry, message.role == .assistant {
+                    return message.content
+                }
+                return nil
+            },
+            textsMatch: AgentTranscriptOrder.finalTextsMatch
+        )
+    }
+
+    /// Single paint-order gate: time order, then final-after-Work-so-far.
+    nonisolated static func paintOrderedTranscriptEntries(_ entries: [TranscriptEntry]) -> [TranscriptEntry] {
+        ensuringFinalAnswersFollowTurns(ensuringTranscriptOrder(entries))
+    }
+
     /// Only honor `latestLiveTurnId` when it sits in the recent eager tail.
     /// A stale unfinished near the top of a long paint set must not force the
     /// entire Lazy history into the eager path.
@@ -10438,10 +10462,10 @@ public struct AgentAppView: View {
                         // Guardrails vs historical LazyLayout loops (PERF-MAC_AGENT-022):
                         // 1) Stable row .id = TranscriptEntry.id (never index-based)
                         // 2) Order from single merge; rematerialize never re-sorts
-                        // 3) ensuringTranscriptOrder before paint (anti-disorder)
-                        // 4) Pin geometry via TimelineScrollFollower, not preference loops
-                        let allEntries = Self.ensuringTranscriptOrder(transcriptEntries)
-                        let entries = Self.ensuringTranscriptOrder(
+                        // 3) paintOrderedTranscriptEntries (time order + final after Work so far)
+                        // 4) Pin geometry via TimelineScrollFollower (inside scroll document)
+                        let allEntries = Self.paintOrderedTranscriptEntries(transcriptEntries)
+                        let entries = Self.paintOrderedTranscriptEntries(
                             Self.visibleTranscriptWindow(
                                 entries: allEntries,
                                 status: vm.status,
@@ -10466,7 +10490,7 @@ public struct AgentAppView: View {
                                     visibleWindow: entries,
                                     revealCount: revealedHiddenCount
                                 )
-                                return Self.ensuringTranscriptOrder(older + entries)
+                                return Self.paintOrderedTranscriptEntries(older + entries)
                             }
                             return entries
                         }()
@@ -10481,6 +10505,19 @@ public struct AgentAppView: View {
                         let historyEntries = split.history
                         let liveTail = split.liveTail
                         VStack(alignment: .leading, spacing: 32) {
+                            // Pin probe MUST live inside the scroll document so
+                            // `enclosingScrollView` resolves. Placing it on ScrollView's
+                            // `.background` left the follower detached → pin never
+                            // unpinned → auto-scroll stayed always-on (Ajuste 4).
+                            TimelineScrollFollower(
+                                slack: Self.timelineBottomRevealSlack,
+                                pinned: timelineSticksToBottom,
+                                onScrolledAway: { onTimelineScrolledAway() },
+                                onReturnedToBottom: { onTimelineReturnedToBottom() }
+                            )
+                            .frame(width: 0, height: 0)
+                            .accessibilityHidden(true)
+
                             if vm.messageHistoryIsPartial {
                                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                                     Text("Showing the recent message window. Earlier messages remain stored locally.")
@@ -10577,17 +10614,6 @@ public struct AgentAppView: View {
                         .padding(.vertical, 32)
                         .frame(width: viewport.size.width, alignment: .leading)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    // Pin probe outside lazy content (advisor rule 3).
-                    .background(alignment: .top) {
-                        TimelineScrollFollower(
-                            slack: Self.timelineBottomRevealSlack,
-                            pinned: timelineSticksToBottom,
-                            onScrolledAway: { onTimelineScrolledAway() },
-                            onReturnedToBottom: { onTimelineReturnedToBottom() }
-                        )
-                        .frame(width: 0, height: 0)
-                        .accessibilityHidden(true)
                     }
                     .coordinateSpace(name: "agentTimeline")
                     .background(DS.Palette.bg)
@@ -10689,6 +10715,10 @@ public struct AgentAppView: View {
                 pendingSessionApproval = nil
                 collapseAllWorkDisclosures()
                 knownFinishedWorkTurnIds = []
+                // Opening a thread: rejoin bottom (user expectation) and re-enable auto-follow.
+                timelineSticksToBottom = true
+                showScrollDownButton = false
+                scheduleTimelineScrollToBottom(proxy, force: true)
             }
         }
     }

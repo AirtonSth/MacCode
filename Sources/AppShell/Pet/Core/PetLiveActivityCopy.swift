@@ -8,15 +8,21 @@ public enum PetLiveActivityCopy: Sendable {
         public let active: [PetActiveThreadItem]
         public let needsYou: [PetAttentionItem]
         public let completed: [PetAttentionItem]
+        /// One-sentence local-LLM description of what the agent is doing.
+        /// Nil until the on-device model produces one (or forever, when Token
+        /// Saver is off) — the deterministic preview covers that case.
+        public let summary: String?
 
         public init(
             active: [PetActiveThreadItem],
             needsYou: [PetAttentionItem],
-            completed: [PetAttentionItem]
+            completed: [PetAttentionItem],
+            summary: String? = nil
         ) {
             self.active = active
             self.needsYou = needsYou
             self.completed = completed
+            self.summary = summary
         }
 
         public var isEmpty: Bool {
@@ -65,24 +71,99 @@ public enum PetLiveActivityCopy: Sendable {
         return makeAttentionOnly(input)
     }
 
+    // MARK: - Shared title / subtitle copy (iOS LiveActivityCopy twin)
+    //
+    // These three helpers are the single source of the Lock Screen wording on
+    // this side of the wire. The iOS twin is
+    // ios-app/App/Sources/Notifications/LiveActivityCopy.swift
+    // (workingTitle / completedTitle / doneFailedLine). iOS only paints its own
+    // copy on a card the Mac does not own, so the two must stay identical or the
+    // same state reads differently depending on who happens to own the card.
+
+    /// "1 Thread Running" / "N Threads Running".
+    public static func runningTitle(count: Int) -> String {
+        let n = max(0, count)
+        return n == 1 ? "1 Thread Running" : "\(n) Threads Running"
+    }
+
+    /// "1 Thread Completed" / "N Threads Completed" — finished, not necessarily green.
+    public static func completedTitle(count: Int) -> String {
+        let n = max(0, count)
+        return n == 1 ? "1 Thread Completed" : "\(n) Threads Completed"
+    }
+
+    /// "2 done - 7 failed" — the glanceable outcome split shown as the subtitle
+    /// on both the running and the terminal card.
+    public static func doneFailedLine(done: Int, failed: Int) -> String {
+        let d = max(0, done)
+        let f = max(0, failed)
+        if d > 0, f > 0 { return "\(d) done - \(f) failed" }
+        if d > 0 { return d == 1 ? "1 done" : "\(d) done" }
+        if f > 0 { return f == 1 ? "1 failed" : "\(f) failed" }
+        return ""
+    }
+
+    /// Outcome tally of finished agent *threads* in the pet's Completed bucket.
+    ///
+    /// Host notifications (git / project script / SSH transfer) also live in that
+    /// bucket but are deliberately excluded: they are not threads, so counting
+    /// them would make "N Threads Completed" lie. Interrupted runs are folded
+    /// into the failed side of the subtitle split (same rule as iOS
+    /// `terminalInbox`) but kept separate so an interrupt-only inbox can say so.
+    static func outcomeCounts(_ completed: [PetAttentionItem]) -> (done: Int, failed: Int, interrupted: Int) {
+        var done = 0
+        var failed = 0
+        var interrupted = 0
+        for item in completed {
+            switch item.kind {
+            case .agentOutcome(.completed): done += 1
+            case .agentOutcome(.failed): failed += 1
+            case .agentOutcome(.interrupted): interrupted += 1
+            case .notification, .callback:
+                continue
+            }
+        }
+        return (done, failed, interrupted)
+    }
+
+    /// Subtitle for the terminal card: the split, or the interrupt noun when a
+    /// stop was user-initiated rather than an error.
+    static func terminalStatusLine(done: Int, failed: Int, interrupted: Int) -> String {
+        if done == 0, failed == 0, interrupted > 0 {
+            return interrupted == 1 ? "1 interrupted" : "\(interrupted) interrupted"
+        }
+        return doneFailedLine(done: done, failed: failed + interrupted)
+    }
+
     // MARK: - Active (1 or many)
 
     private static func makeActive(_ input: Input) -> Output {
         let active = input.active
         let count = active.count
         let attentionPreview = attentionPreviewLine(needsYou: input.needsYou, completed: input.completed)
+        // Subtitle while threads run is the unread outcome split, matching the
+        // terminal card. Empty when nothing has finished yet — then the identity
+        // crumbs below take the slot instead of showing a blank line.
+        let outcomes = outcomeCounts(input.completed)
+        let outcomeSplit = doneFailedLine(
+            done: outcomes.done,
+            failed: outcomes.failed + outcomes.interrupted
+        )
 
         // Title is always the running count — most important Lock Screen signal
         // (iOS LiveActivityCopy.workingTitle parity). Thread identity stays on
         // statusLine / preview so outcomes and progress never replace the count.
         if count == 1, let row = active.first {
-            let title = "1 agent running"
-            // Prefer pet detail (ws - provider - title - elapsed) on status when present.
-            let status = row.detail ?? "Running"
-            // Single-active description: latest material thread update (tools /
-            // assistant) when known; identity detail only as fallback. Attention
-            // still wins so "Needs you" stays visible.
+            let title = runningTitle(count: 1)
+            // Outcome split first; otherwise pet detail (ws - provider - title - elapsed).
+            let status = outcomeSplit.isEmpty ? (row.detail ?? "Running") : outcomeSplit
+            // Single-active description: the local-LLM sentence when the model
+            // produced one, else the latest material thread update (tools /
+            // assistant), else identity detail. Attention still outranks all of
+            // it — "Needs you · Approve: Run command" is actionable and must not
+            // be replaced by prose.
             let preview = attentionPreview
+                ?? input.summary
                 ?? row.lastUpdatePreview
                 ?? row.detail
                 ?? (detailThreadTitle(from: row.detail) ?? row.title)
@@ -100,7 +181,7 @@ public enum PetLiveActivityCopy: Sendable {
         }
 
         // Multi active: overview shape (parity with iOS multi-run card).
-        let title = "\(count) agents running"
+        let title = runningTitle(count: count)
         let workspaces = unique(active.compactMap(\.workspaceName))
         let workspacePart: String?
         if workspaces.isEmpty {
@@ -121,7 +202,8 @@ public enum PetLiveActivityCopy: Sendable {
             providerPart = providers.prefix(2).joined(separator: ", ") + "…"
         }
         let statusParts = [workspacePart, providerPart].compactMap { $0 }
-        let statusLine = statusParts.isEmpty ? title : statusParts.joined(separator: " · ")
+        let crumbs = statusParts.isEmpty ? title : statusParts.joined(separator: " · ")
+        let statusLine = outcomeSplit.isEmpty ? crumbs : outcomeSplit
 
         let titles = unique(active.compactMap { detailThreadTitle(from: $0.detail) ?? shortTitle($0.title) })
         let listPreview: String
@@ -133,7 +215,7 @@ public enum PetLiveActivityCopy: Sendable {
             let head = titles.prefix(2).map { "• \($0)" }.joined(separator: "  · ")
             listPreview = "\(head)  · +\(titles.count - 2) more"
         }
-        let preview = attentionPreview ?? listPreview
+        let preview = attentionPreview ?? input.summary ?? listPreview
 
         return Output(
             title: title,
@@ -165,17 +247,38 @@ public enum PetLiveActivityCopy: Sendable {
         }()
 
         let title: String
+        let statusLine: String
         if !needs.isEmpty {
+            // Needs-you is a distinct, actionable state — never relabel a pending
+            // approval as "Completed" just because no thread is running.
             title = needs.count == 1
                 ? "1 item needs attention"
                 : "\(needs.count) items need attention"
+            statusLine = top.map { sanitize($0.title, fallback: title) } ?? title
         } else {
-            title = attentionCount == 1
-                ? "1 item ready"
-                : "\(attentionCount) items ready"
+            // Terminal inbox: "N Threads Completed" over the done/failed split
+            // (iOS LiveActivityCopy.terminalInbox parity).
+            let outcomes = outcomeCounts(done)
+            let threadTotal = outcomes.done + outcomes.failed + outcomes.interrupted
+            if threadTotal > 0 {
+                title = completedTitle(count: threadTotal)
+                statusLine = terminalStatusLine(
+                    done: outcomes.done,
+                    failed: outcomes.failed,
+                    interrupted: outcomes.interrupted
+                )
+            } else {
+                // Host notifications only (git / script / SSH) — not threads, so
+                // the item wording stays.
+                title = attentionCount == 1
+                    ? "1 item ready"
+                    : "\(attentionCount) items ready"
+                statusLine = top.map { sanitize($0.title, fallback: title) } ?? title
+            }
         }
-
-        let statusLine = top.map { sanitize($0.title, fallback: title) } ?? title
+        // Description: the local-LLM sentence when available. It replaces the
+        // identity crumb list ("elephant - Claude - https://… · +7 more"), which
+        // repeated the subtitle instead of saying what happened.
         var previewParts: [String] = []
         if let detail = top.flatMap(\.detail) {
             previewParts.append(detail)
@@ -184,9 +287,8 @@ public enum PetLiveActivityCopy: Sendable {
         if extra > 0 {
             previewParts.append("+\(extra) more")
         }
-        let preview = previewParts.isEmpty
-            ? statusLine
-            : previewParts.joined(separator: " · ")
+        let preview = input.summary
+            ?? (previewParts.isEmpty ? statusLine : previewParts.joined(separator: " · "))
         let ids = top.map { routeIDs(from: $0.route) } ?? (workspaceId: nil, threadId: nil)
 
         return Output(
