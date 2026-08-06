@@ -3047,8 +3047,13 @@ public final class JSONRPCDispatcher {
                     return .init(id: id, result: cached)
                 }
                 try router.markAgentThreadRead(thread: tid)
+                // has_unread + unread: iOS accepts both; markAgentThreadRead also
+                // emits agent.thread.read. Keep updated for clients that only
+                // watch thread.updated for rail badges.
                 EventBus.shared.publish(kind: "agent.thread.updated", payload: .object([
                     "thread_id": .string(tid.value.uuidString),
+                    "has_unread": .bool(false),
+                    "hasUnread": .bool(false),
                     "unread": .bool(false)
                 ]))
                 let result = JSONValue.bool(true)
