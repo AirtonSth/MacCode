@@ -14844,6 +14844,15 @@ enum PromptComposerKeyAction: Equatable {
         }
     }
 
+    /// Whether the SwiftUI binding / cursor observers may sync from the NSTextView.
+    ///
+    /// WHY: publishing preedit/marked text into SwiftUI re-enters `updateNSView`,
+    /// which can replace `string` and abort dead-key composition (á/é/í, CJK).
+    /// Keep the text view as sole owner until `hasMarkedText` clears.
+    static func shouldSyncComposerBinding(hasMarkedText: Bool) -> Bool {
+        !hasMarkedText
+    }
+
     // macos:32: resolves a keystroke given whether the caret-anchored suggestion
     // popup is open. When the popup is CLOSED this ALWAYS defers to the existing
     // 2-arg `action(keyCode:modifiers:)` via `.passthrough`, so send/history
@@ -15183,7 +15192,13 @@ private struct PromptComposerEditor: NSViewRepresentable {
         textView.placeholderString = placeholder
         // Do not clobber an in-progress dead-key / IME composition: replacing
         // `string` while marked text is active aborts accents (ç/á/é) and CJK.
-        if textView.string != text, !textView.hasMarkedText() {
+        // Also refuse external apply while the coordinator still owns an active
+        // composition cycle (binding intentionally not synced mid-preedit).
+        let marked = textView.hasMarkedText()
+        if !marked { context.coordinator.isIMEComposing = false }
+        if textView.string != text,
+           PromptComposerKeyAction.shouldSyncComposerBinding(hasMarkedText: marked),
+           !context.coordinator.isIMEComposing {
             context.coordinator.applyExternalText(text, to: textView)
         }
         context.coordinator.recalculateHeight()
@@ -15215,6 +15230,9 @@ private struct PromptComposerEditor: NSViewRepresentable {
         let onCaretRectChanged: (CGRect) -> Void
         weak var textView: PromptComposerTextView?
         var appliedFocusTick: Int?
+        /// True while AppKit reports marked text (dead-key / IME preedit).
+        /// Blocks SwiftUI→NSTextView applies that would abort composition.
+        var isIMEComposing = false
         private var externallyAppliedText: String?
 
         init(
@@ -15233,6 +15251,15 @@ private struct PromptComposerEditor: NSViewRepresentable {
 
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
+            let marked = textView.hasMarkedText()
+            isIMEComposing = marked
+            // Hold the SwiftUI binding during preedit. Pushing marked/partial
+            // strings re-enters updateNSView and can wipe á/é/í composition.
+            guard PromptComposerKeyAction.shouldSyncComposerBinding(hasMarkedText: marked) else {
+                textView.needsDisplay = true
+                recalculateHeight()
+                return
+            }
             text = textView.string
             if textView.string == externallyAppliedText {
                 externallyAppliedText = nil
@@ -15246,8 +15273,13 @@ private struct PromptComposerEditor: NSViewRepresentable {
 
         // UX-XPLAT-009: selection changes (arrow keys, mouse click, etc.) must
         // also update the cursor offset so suggestions update immediately.
+        // Skip during IME preedit: cursor publishes on the parent VM and would
+        // rebuild the Agent App body mid-composition.
         func textViewDidChangeSelection(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
+            let marked = textView.hasMarkedText()
+            isIMEComposing = marked
+            guard PromptComposerKeyAction.shouldSyncComposerBinding(hasMarkedText: marked) else { return }
             reportCursor(for: textView)
         }
 
@@ -15292,6 +15324,9 @@ private struct PromptComposerEditor: NSViewRepresentable {
         }
 
         func applyExternalText(_ value: String, to textView: NSTextView) {
+            // Defense in depth: assigning `string` clears marked text and aborts accents.
+            guard PromptComposerKeyAction.shouldSyncComposerBinding(hasMarkedText: textView.hasMarkedText()) else { return }
+            isIMEComposing = false
             externallyAppliedText = value
             textView.string = value
             let endOffset = (value as NSString).length

@@ -278,6 +278,29 @@ final class ComposerSuggestionPopupTests: XCTestCase {
             ),
             "Command shortcuts must not be treated as text input"
         )
+        // Brazilian-Pro acute dead key is physical keyCode 39 (empty characters).
+        XCTAssertTrue(
+            PromptComposerKeyAction.shouldInterpretTextInput(
+                keyCode: 39,
+                modifiers: [],
+                characters: ""
+            ),
+            "Brazilian-Pro acute key (keycode 39) must use AppKit text input"
+        )
+    }
+
+    // WHY: syncing the SwiftUI binding (or cursor observers) while marked text is
+    // active re-enters updateNSView and can replace NSTextView.string, aborting
+    // dead-key composition so á/é/í never land in the Agent composer.
+    func testComposerBindingDoesNotSyncDuringMarkedText() {
+        XCTAssertFalse(
+            PromptComposerKeyAction.shouldSyncComposerBinding(hasMarkedText: true),
+            "marked-text preedit must not publish into the SwiftUI prompt binding"
+        )
+        XCTAssertTrue(
+            PromptComposerKeyAction.shouldSyncComposerBinding(hasMarkedText: false),
+            "committed text must sync into the SwiftUI prompt binding"
+        )
     }
 
     // MARK: - Key resolution when popup is CLOSED (the critical guarantees)
