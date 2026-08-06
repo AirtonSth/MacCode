@@ -42,6 +42,91 @@ final class ToolRowPresentationTests: XCTestCase {
         XCTAssertEqual(AgentTimelineItemPresentation.cappedDetail("short", limit: 6_000), "short")
     }
 
+    /// WHY: multi-byte graphemes can sit under the grapheme window while over the
+    /// UTF-8 budget — expanded tool detail must not over-truncate them.
+    func test_cappedDetail_preservesMultibyteUnderGraphemeLimit() {
+        let multibyte = "héllo" // 5 graphemes, >5 UTF-8 bytes
+        XCTAssertGreaterThan(multibyte.utf8.count, 5)
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.cappedDetail(multibyte, limit: 5),
+            multibyte,
+            "tool detail cap must stay grapheme-based for multi-byte text under the limit"
+        )
+        let emoji = "😀😀😀😀"
+        let capped = AgentTimelineItemPresentation.cappedDetail(emoji, limit: 2)
+        XCTAssertTrue(capped.hasPrefix("😀😀"))
+        XCTAssertTrue(capped.contains("truncated in view"))
+    }
+
+    /// Microbench: full-body `String.count` walk vs O(limit) index tool detail cap.
+    /// Simulates expanded tool-row paint re-capping a long command dump.
+    func test_microbench_cappedDetail_indexFasterThanFullGraphemeCount() {
+        let body = String(repeating: "x", count: 80_000)
+        let limit = 6_000
+        let iterations = 2_000
+        let warmup = 2
+        let samples = 5
+
+        func median(_ values: [Double]) -> Double {
+            let s = values.sorted()
+            return s[s.count / 2]
+        }
+
+        /// Legacy path retained only for A/B: stripANSI (shared) + O(n) grapheme count.
+        /// Must include stripANSI so both arms share the same fixed pre-work.
+        func timeLegacyCount() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for _ in 0..<iterations {
+                let clean = AgentTimelineItemPresentation.stripANSI(body)
+                if clean.count > limit {
+                    let head = clean.prefix(limit)
+                    let dropped = clean.count - head.count
+                    sink &+= dropped &+ head.count
+                } else {
+                    sink &+= clean.utf8.count
+                }
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        func timeIndexCap() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for _ in 0..<iterations {
+                // Product path: stripANSI + utf8/index cap (no full grapheme count).
+                let capped = AgentTimelineItemPresentation.cappedDetail(body, limit: limit)
+                sink &+= capped.utf8.count
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        for _ in 0..<warmup { _ = timeLegacyCount(); _ = timeIndexCap() }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            before.append(timeLegacyCount())
+            after.append(timeIndexCap())
+        }
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = (beforeMed - afterMed) / beforeMed * 100.0
+        NSLog("[perf-proof] cappedDetail legacy_count_ms=%@ index_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+              String(beforeMed), String(afterMed), improvement,
+              String(describing: before), String(describing: after))
+        XCTAssertGreaterThan(
+            improvement, 5.0,
+            "expanded tool detail cap must beat full grapheme count by ≥5% (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
+        )
+        let capped = AgentTimelineItemPresentation.cappedDetail(body, limit: limit)
+        XCTAssertTrue(capped.contains("truncated in view"))
+        XCTAssertTrue(capped.hasPrefix(String(body.prefix(limit))))
+    }
+
     func test_skillToolOutputIsNeverTruncatedEvenWhenLarge() {
         // WHY: skill content is a protected verbatim category. Ordinary tool output
         // still uses the generic cap; Skill must return complete bodies so the agent

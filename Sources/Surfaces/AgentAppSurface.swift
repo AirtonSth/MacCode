@@ -7720,14 +7720,26 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
     /// of them and they render as literal garbage in a Text view) and cap length so one noisy
     /// command can't blow up the transcript. Full text remains selectable / in the stored event.
     /// Skill tool output is never truncated in presentation — skill content must stay complete.
+    ///
+    /// PERF: expanded tool rows re-evaluate this on streaming paint. A full
+    /// `String.count` grapheme walk of multi-10k command dumps dominated body eval
+    /// the same way pre-F11 `cappedText` did. Use O(1) `utf8.count` under-limit
+    /// and O(limit) index arithmetic when over (same contract as
+    /// `AgentAppView.cappedVisibleText`). Dropped label uses UTF-8 residual.
     static func cappedDetail(_ text: String, limit: Int = 6_000, for item: AssistantItem? = nil) -> String {
         let clean = stripANSI(text)
         if let item, isSkillToolItem(item) {
             return clean
         }
-        guard clean.count > limit else { return clean }
-        let head = clean.prefix(limit)
-        let dropped = clean.count - head.count
+        let limit = max(0, limit)
+        guard limit > 0 else { return "" }
+        guard clean.utf8.count > limit else { return clean }
+        guard let end = clean.index(clean.startIndex, offsetBy: limit, limitedBy: clean.endIndex),
+              end < clean.endIndex else {
+            return clean
+        }
+        let head = clean[..<end]
+        let dropped = max(1, clean.utf8.count - head.utf8.count)
         return "\(head)\n… \(dropped) more characters truncated in view …"
     }
 
