@@ -4694,15 +4694,26 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard var t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
         let didMarkRead = t.hasUnread
         if didMarkRead {
-            t.hasUnread = false
+            // Cosmetic open/select must not rewrite activity time — rail "now"
+            // was jumping when mark-read upserts touched updatedAt.
+            let preservedUpdatedAt = t.updatedAt
+            t = AgentAppViewModel.applyingMarkReadPreservingActivity(t)
+            t.updatedAt = preservedUpdatedAt
             try ctx.threadRepo.upsert(t)
+            NSLog(
+                "[AgentOpen] mark_read wrote unread=false thread=%@ preservedUpdatedAt=%.0f",
+                String(thread.value.uuidString.prefix(8)),
+                preservedUpdatedAt.timeIntervalSince1970
+            )
         }
         // Marking a thread read must NOT select it. Previously this called
         // selectAgentThread, so an iOS client opening an old thread (which
         // auto-marks it read) force-switched every macOS agent tab to that
         // thread (the "iOS bugs macOS" report). Just refresh the rails so the
         // unread badge clears everywhere; selection stays per-surface.
-        if let wid = t.workspaceId {
+        // Only reload when unread actually changed — otherwise every soft
+        // reselect fan-out churned the rail for no reason.
+        if didMarkRead, let wid = t.workspaceId {
             AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(workspaceID: wid)
         }
         if didMarkRead {

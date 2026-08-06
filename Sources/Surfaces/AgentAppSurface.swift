@@ -1315,6 +1315,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // Full open path — only when the selected thread actually changes.
         selectThreadOpenGeneration &+= 1
         let openGeneration = selectThreadOpenGeneration
+        Self.agentOpenTrace(
+            "full open gen=\(openGeneration) thread=\(id.value.uuidString.prefix(8)) status=\(selectedThread.status.rawValue) markRead=\(markRead) hasUnread=\(selectedThread.hasUnread) updatedAt=\(selectedThread.updatedAt.timeIntervalSince1970)"
+        )
         // IMP-MAC_AGENT-011: stash the leaving thread's draft before swapping,
         // then restore the opened thread's draft.
         if let previous = selectedThreadId { persistComposerDraft(for: previous) }
@@ -1390,10 +1393,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // B6: the host owns the one throwing persistence + publication mutation.
         // Reflect success locally without re-querying; retain persisted rail state
         // when the mutation fails.
-        if markRead, let markThreadRead {
+        if markRead, selectedThread.hasUnread, let markThreadRead {
             do {
+                Self.agentOpenTrace("full open mark_read thread=\(id.value.uuidString.prefix(8))")
                 try markThreadRead(id)
                 if let idx = threads.firstIndex(where: { $0.id == id }) {
+                    // Preserve rail activity time — only clear unread in memory.
                     threads[idx].hasUnread = false
                 }
             } catch {
@@ -1435,10 +1440,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadCheckpoints()
         suppressPersistedFinalDuplicatedByTimeline()
         resetTimelineUpdateTick()
-        if Self.shouldReadProviderSnapshot(
-            hasRecoverableContext: selectedThreadHasRecoverableContext
-        ) {
-            let persistedItemCount = Self.renderableItemCount(persistedEvents)
+        let persistedItemCount = Self.renderableItemCount(persistedEvents)
+        let fetchSnapshot = Self.shouldFetchProviderSnapshotOnOpen(
+            hasRecoverableContext: selectedThreadHasRecoverableContext,
+            firstPaintItemCount: persistedItemCount,
+            threadStatus: selectedThread.status
+        )
+        Self.agentOpenTrace(
+            "full open firstPaint items=\(persistedItemCount) turns=\(timeline.turns.count) fetchSnapshot=\(fetchSnapshot) recoverable=\(selectedThreadHasRecoverableContext)"
+        )
+        if fetchSnapshot {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 do {
@@ -1446,12 +1457,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     // Drop if the user switched threads OR a newer full open
                     // superseded this task (soft reselect does not bump gen).
                     guard self.selectedThreadId == id,
-                          self.selectThreadOpenGeneration == openGeneration else { return }
+                          self.selectThreadOpenGeneration == openGeneration else {
+                        Self.agentOpenTrace("deferred snapshot dropped stale gen=\(openGeneration)")
+                        return
+                    }
                     let confirmedAt = Date()
                     self.providerThreadSnapshotConfirmedAtByThread[id] = confirmedAt
                     self.providerThreadSnapshotLastConfirmedAt = confirmedAt
                     self.providerThreadSnapshotStatusMessage = nil
-                    guard !snapshot.isEmpty else { return }
+                    guard !snapshot.isEmpty else {
+                        Self.agentOpenTrace("deferred snapshot empty thread=\(id.value.uuidString.prefix(8))")
+                        return
+                    }
                     let mergedSnapshot = self.mergePersistedContextTelemetry(
                         snapshot: snapshot,
                         persisted: persistedEvents
@@ -1461,15 +1478,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     // snapshots used to rebuild with a different event stream and
                     // blink the same completed thread multiple times.
                     let snapshotItemCount = Self.renderableItemCount(mergedSnapshot)
-                    guard Self.shouldApplyDeferredSnapshotReplay(
+                    let terminal = Self.isTerminalOpenStatus(selectedThread.status)
+                    let apply = Self.shouldApplyDeferredSnapshotReplay(
                         firstPaintItemCount: persistedItemCount,
-                        deferredSnapshotItemCount: snapshotItemCount
-                    ) else { return }
+                        deferredSnapshotItemCount: snapshotItemCount,
+                        threadIsTerminal: terminal
+                    )
+                    Self.agentOpenTrace(
+                        "deferred snapshot decide apply=\(apply) local=\(persistedItemCount) snap=\(snapshotItemCount) terminal=\(terminal) gen=\(openGeneration)"
+                    )
+                    guard apply else { return }
                     let replayEvents = Self.chooseReplayEvents(
                         persisted: persistedEvents,
                         snapshot: mergedSnapshot
                     )
                     // Single atomic publish: never assign an empty intermediate timeline.
+                    Self.agentOpenTrace("deferred snapshot APPLY timeline rebuild gen=\(openGeneration)")
                     self.timeline = Self.timelineByReplaying(replayEvents)
                     self.rehydrateDurableActiveState(threadId: id)
                     self.restoreQueuedFollowupTranscriptPresentation(threadId: id)
@@ -1918,6 +1942,70 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         !hasRecoverableContext
     }
 
+    /// Whether opening a thread should start a background provider snapshot fetch.
+    /// Terminal threads that already painted local history must not — the deferred
+    /// apply was the residual multipass blink after first paint had text.
+    nonisolated public static func shouldFetchProviderSnapshotOnOpen(
+        hasRecoverableContext: Bool,
+        firstPaintItemCount: Int,
+        threadStatus: AgentRunStatus
+    ) -> Bool {
+        guard shouldReadProviderSnapshot(hasRecoverableContext: hasRecoverableContext) else {
+            return false
+        }
+        if firstPaintItemCount > 0, isTerminalOpenStatus(threadStatus) {
+            return false
+        }
+        return true
+    }
+
+    nonisolated public static func isTerminalOpenStatus(_ status: AgentRunStatus) -> Bool {
+        switch status {
+        case .completed, .failed, .cancelled, .interrupted:
+            return true
+        case .pending, .running:
+            return false
+        }
+    }
+
+    /// Soft reselect may skip durable message page reload when the hot list
+    /// already shows this thread (avoids messages= swap flashing the open view).
+    nonisolated public static func shouldReloadMessagesOnSoftReselect(
+        selectedThreadId: AgentThreadID,
+        messagesThreadIds: [AgentThreadID]
+    ) -> Bool {
+        guard !messagesThreadIds.isEmpty else { return true }
+        // Any row from another thread means the list is stale for this selection.
+        if messagesThreadIds.contains(where: { $0 != selectedThreadId }) { return true }
+        return false
+    }
+
+    /// Mark-read must clear unread without rewriting activity time (rail "now").
+    nonisolated public static func applyingMarkReadPreservingActivity(_ thread: AgentThread) -> AgentThread {
+        var next = thread
+        next.hasUnread = false
+        // Explicit: do not touch updatedAt.
+        return next
+    }
+
+    /// Grep-friendly open-path diagnostics. Enable with env REMOTE_CODE_AGENT_OPEN_TRACE=1
+    /// or UserDefaults remotecode.agentOpenTrace. Always cheap to call when disabled.
+    nonisolated static var agentOpenTraceEnabled: Bool {
+        if ProcessInfo.processInfo.environment["REMOTE_CODE_AGENT_OPEN_TRACE"] == "1" { return true }
+        if UserDefaults.standard.bool(forKey: "remotecode.agentOpenTrace") { return true }
+        // Default ON in DEBUG so residual multipass is attributable during smoke.
+        #if DEBUG
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    nonisolated static func agentOpenTrace(_ message: String) {
+        guard agentOpenTraceEnabled else { return }
+        NSLog("[AgentOpen] %@", message)
+    }
+
     public func retryProviderThreadSnapshotRead() {
         guard let selectedThreadId else { return }
         selectThread(selectedThreadId, markRead: false)
@@ -2021,6 +2109,24 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         firstPaintItemCount: Int,
         deferredSnapshotItemCount: Int
     ) -> Bool {
+        shouldApplyDeferredSnapshotReplay(
+            firstPaintItemCount: firstPaintItemCount,
+            deferredSnapshotItemCount: deferredSnapshotItemCount,
+            threadIsTerminal: false
+        )
+    }
+
+    /// When the opened thread is already terminal and local history painted,
+    /// never rebuild from provider snapshot — that was the multipass flash and
+    /// correlated with unnecessary open work.
+    nonisolated static func shouldApplyDeferredSnapshotReplay(
+        firstPaintItemCount: Int,
+        deferredSnapshotItemCount: Int,
+        threadIsTerminal: Bool
+    ) -> Bool {
+        if threadIsTerminal, firstPaintItemCount > 0 {
+            return false
+        }
         guard deferredSnapshotItemCount > firstPaintItemCount else { return false }
         // Thin/empty local: any strictly richer snapshot is recovery.
         if firstPaintItemCount < 3 { return true }
@@ -2045,6 +2151,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// re-enter here; full open was causing 2–4 full reloads of the same thread.
     private func softReselectOpenThread(_ selectedThread: AgentThread, markRead: Bool) {
         let id = selectedThread.id
+        Self.agentOpenTrace(
+            "soft reselect thread=\(id.value.uuidString.prefix(8)) markRead=\(markRead) hasUnread=\(selectedThread.hasUnread) msgs=\(messages.count) turns=\(timeline.turns.count)"
+        )
         publishInterestedThreadId(id)
         reloadQueuedMessages()
         let routing = selectedThread.effectiveRoutingConfiguration
@@ -2078,7 +2187,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         normalizeInteractionModeForSelectedProvider()
         selectedThreadHasRecoverableContext = coordinator.hasRecoverableContext(threadId: id)
-        if markRead, let markThreadRead {
+        // Only invoke mark-read when unread — otherwise every soft reselect
+        // (rail re-click / host refresh) forced a coalesced rail reload for no reason.
+        if markRead, selectedThread.hasUnread, let markThreadRead {
             do {
                 try markThreadRead(id)
                 if let idx = threads.firstIndex(where: { $0.id == id }) {
@@ -2088,9 +2199,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 reloadThreads()
             }
         }
-        // Refresh durable messages without clearing the painted array first
-        // (loadAllMessages only clears on cross-thread id mismatch).
-        loadAllMessages(id)
+        // Skip durable page reload when hot messages already belong to this thread.
+        let messageThreadIds = messages.map(\.threadId)
+        if Self.shouldReloadMessagesOnSoftReselect(
+            selectedThreadId: id,
+            messagesThreadIds: messageThreadIds
+        ) {
+            Self.agentOpenTrace("soft reselect loadAllMessages thread=\(id.value.uuidString.prefix(8))")
+            loadAllMessages(id)
+        } else {
+            Self.agentOpenTrace("soft reselect skip loadAllMessages thread=\(id.value.uuidString.prefix(8))")
+        }
         reloadCheckpoints()
         refreshSubagentActivity()
         reloadTokenSaverThreadSavings()

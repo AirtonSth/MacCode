@@ -4980,6 +4980,90 @@ final class AgentAppViewModelTests: XCTestCase {
             ),
             "empty first paint still accepts any provider recovery"
         )
+        // Terminal + painted: never deferred rebuild (user residual multipass).
+        XCTAssertFalse(
+            AgentAppViewModel.shouldApplyDeferredSnapshotReplay(
+                firstPaintItemCount: 10,
+                deferredSnapshotItemCount: 200,
+                threadIsTerminal: true
+            ),
+            "completed thread with local text must not multipass-rebuild from provider"
+        )
+    }
+
+    /// WHY: background provider thread/read after open was the multipass flash on
+    /// completed threads that already painted local history.
+    func test_shouldFetchProviderSnapshotOnOpen_skipsTerminalWithLocalPaint() {
+        XCTAssertFalse(
+            AgentAppViewModel.shouldFetchProviderSnapshotOnOpen(
+                hasRecoverableContext: true,
+                firstPaintItemCount: 0,
+                threadStatus: .completed
+            ),
+            "recoverable interrupted sessions must not auto-read"
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.shouldFetchProviderSnapshotOnOpen(
+                hasRecoverableContext: false,
+                firstPaintItemCount: 12,
+                threadStatus: .completed
+            ),
+            "terminal + painted local history must not start deferred fetch"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldFetchProviderSnapshotOnOpen(
+                hasRecoverableContext: false,
+                firstPaintItemCount: 0,
+                threadStatus: .completed
+            ),
+            "empty local history still needs provider recovery even if terminal"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldFetchProviderSnapshotOnOpen(
+                hasRecoverableContext: false,
+                firstPaintItemCount: 5,
+                threadStatus: .running
+            ),
+            "live runs may still snapshot for recovery"
+        )
+    }
+
+    /// Soft reselect must not re-fetch the message page when it already shows
+    /// this thread — that async messages= swap was a visible multipass flash.
+    func test_shouldReloadMessagesOnSoftReselect_onlyWhenListStale() {
+        let tid = AgentThreadID()
+        let other = AgentThreadID()
+        XCTAssertTrue(
+            AgentAppViewModel.shouldReloadMessagesOnSoftReselect(
+                selectedThreadId: tid,
+                messagesThreadIds: []
+            )
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.shouldReloadMessagesOnSoftReselect(
+                selectedThreadId: tid,
+                messagesThreadIds: [tid, tid]
+            )
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldReloadMessagesOnSoftReselect(
+                selectedThreadId: tid,
+                messagesThreadIds: [tid, other]
+            )
+        )
+    }
+
+    /// Mark-read must clear unread without rewriting activity time (rail "now").
+    func test_applyingMarkReadPreservingActivity_clearsUnreadOnly() {
+        var thread = AgentThread(title: "Old", provider: .claude, model: "m", status: .completed)
+        thread.hasUnread = true
+        let past = Date(timeIntervalSince1970: 1_700_000_000)
+        thread.updatedAt = past
+        let marked = AgentAppViewModel.applyingMarkReadPreservingActivity(thread)
+        XCTAssertFalse(marked.hasUnread)
+        XCTAssertEqual(marked.updatedAt, past, "open/mark-read must not bump rail activity time")
+        XCTAssertEqual(thread.updatedAt, past, "input must not be mutated")
+        XCTAssertTrue(thread.hasUnread, "input must not be mutated")
     }
 
     func test_selectThread_sameThreadSoftReselectDoesNotClearTimeline() throws {

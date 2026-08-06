@@ -4451,6 +4451,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         guard let thread = try threadRepo.get(id: threadId) else {
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
+        // Terminal completed/failed/cancelled: never spin recovery on open/read.
+        // A stale provider_sessions resume_cursor after unclean shutdown used to
+        // re-start a recovery run and bump thread.updatedAt → rail date "now"
+        // while multipass-reloading the transcript. Interrupted keeps recovery
+        // for the explicit Continue path.
+        switch thread.status {
+        case .completed, .failed, .cancelled:
+            return
+        case .pending, .running, .interrupted:
+            break
+        }
         guard let session = try providerSessionRepo?.get(threadId: threadId),
               session.provider == thread.provider,
               let resumeCursor = session.resumeCursor,
