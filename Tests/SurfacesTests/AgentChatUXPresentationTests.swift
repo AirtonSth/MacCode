@@ -51,6 +51,44 @@ final class AgentChatUXPresentationTests: XCTestCase {
         XCTAssertNil(AgentWorkingStripPresentation.label(phase: .idle, elapsedSeconds: 10))
     }
 
+    func test_workingCatCopy_hasOneHundredEnglishActivities() {
+        // WHY: product asks for 100 kitten activities rotating every 15s.
+        XCTAssertEqual(AgentWorkingCatCopy.activities.count, 100)
+        XCTAssertEqual(Set(AgentWorkingCatCopy.activities).count, 100,
+                       "activities must be unique so rotation does not feel stuck")
+        XCTAssertEqual(AgentWorkingCatCopy.rotationSeconds, 15)
+        XCTAssertTrue(
+            AgentWorkingCatCopy.activities.allSatisfy {
+                !$0.isEmpty && $0.unicodeScalars.allSatisfy(\.isASCII)
+            },
+            "all phrases stay English ASCII for the strip"
+        )
+    }
+
+    func test_workingCatCopy_rotatesEveryFifteenSeconds() {
+        // WHY: same elapsed window must be stable; next window must advance.
+        XCTAssertEqual(AgentWorkingCatCopy.activity(elapsedSeconds: 0), "Working")
+        XCTAssertEqual(AgentWorkingCatCopy.activity(elapsedSeconds: 14), "Working")
+        XCTAssertEqual(
+            AgentWorkingCatCopy.activity(elapsedSeconds: 15),
+            AgentWorkingCatCopy.activities[1]
+        )
+        XCTAssertEqual(
+            AgentWorkingCatCopy.statusLabel(elapsedSeconds: 95),
+            "\(AgentWorkingCatCopy.activities[95 / 15]) for 1m 35s"
+        )
+        XCTAssertEqual(
+            AgentWorkingCatCopy.accessibilityLabel(elapsedSeconds: 95),
+            "Working for 1m 35s",
+            "VoiceOver / UITests keep a stable Working-for label"
+        )
+        XCTAssertEqual(
+            AgentWorkingCatCopy.activity(elapsedSeconds: 100 * 15),
+            AgentWorkingCatCopy.activities[0],
+            "deck wraps after 100 phrases"
+        )
+    }
+
     // MARK: Composer chrome
 
     func test_composerChrome_simpleHidesPermissionAndSource() {

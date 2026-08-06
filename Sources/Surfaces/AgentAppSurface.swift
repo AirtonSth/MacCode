@@ -11397,18 +11397,25 @@ public struct AgentAppView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    // "Working for 2m 21s" + hairline, while a run is in flight.
+    // Cat-themed "… for 2m 21s" + hairline, while a run is in flight.
+    // Activity phrase rotates every 15s (AgentWorkingCatCopy); a11y stays
+    // "Working for …" for VoiceOver / UI tests.
     private var workingStatus: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
             // PERF-MAC_AGENT-004: tick every second for the first minute, then
             // every 5 seconds, so a long run doesn't force 600 re-evaluations.
+            // Cat phrase only needs a change every 15s; the 1s/5s schedule still
+            // keeps the elapsed counter accurate.
             TimelineView(ElapsedTickSchedule(start: vm.runStartedAt ?? Date())) { _ in
+                let seconds = workingElapsedSeconds
                 HStack(spacing: DS.Space.sm) {
                     ProgressView()
                         .controlSize(.small)
                         .accessibilityLabel("Running")
-                    Text("Working for \(elapsedString)")
+                    Text(AgentWorkingCatCopy.statusLabel(elapsedSeconds: seconds))
                         .font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
+                        .accessibilityLabel(AgentWorkingCatCopy.accessibilityLabel(elapsedSeconds: seconds))
+                        .accessibilityIdentifier("agent.workingStatus")
                     // UX-MAC_AGENT-008: inline Stop where the user looks when a
                     // run is taking too long, plus the Esc hint.
                     let inlineState = AgentAppViewModel.stopButtonState(
@@ -11430,10 +11437,13 @@ public struct AgentAppView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var elapsedString: String {
+    private var workingElapsedSeconds: Int {
         let now = vm.currentTime()
-        let s = max(0, Int(now.timeIntervalSince(vm.runStartedAt ?? now)))
-        return s < 60 ? "\(s)s" : "\(s / 60)m \(s % 60)s"
+        return max(0, Int(now.timeIntervalSince(vm.runStartedAt ?? now)))
+    }
+
+    private var elapsedString: String {
+        AgentWorkingStripPresentation.formatElapsed(workingElapsedSeconds)
     }
 
     private func copyToPasteboard(_ s: String) {

@@ -201,6 +201,156 @@ public enum AgentWorkingStripPresentation {
     }
 }
 
+// MARK: - Cat working strip (pet parity)
+
+/// Rotating kitten activity verbs for the in-flight "… for Ns" strip.
+///
+/// WHY: Remote Code's pet is a cat — long runs feel friendlier when the
+/// working line cycles through cat-like activities instead of a static
+/// "Working for". Phrase is pure English; rotation is deterministic from
+/// elapsed seconds (no extra timers, no locale).
+public enum AgentWorkingCatCopy {
+    /// Seconds each activity stays on screen before the next.
+    public static let rotationSeconds: Int = 15
+
+    /// 100 English cat activities (gerund / short phrase). Order is stable —
+    /// index is `elapsed / rotationSeconds % count`.
+    public static let activities: [String] = [
+        "Working",
+        "Scratching the Sofa",
+        "Hunting Mice",
+        "Eating Kibble",
+        "Sleeping",
+        "Purring",
+        "Kneading the Blanket",
+        "Chasing Laser Dots",
+        "Staring Out the Window",
+        "Knocking Pens Off the Desk",
+        "Zooming Down the Hall",
+        "Guarding the Cardboard Box",
+        "Napping on the Keyboard",
+        "Batting Yarn Balls",
+        "Climbing the Cat Tree",
+        "Hiding Under the Bed",
+        "Watching Birds",
+        "Grooming Fur",
+        "Stretching in a Sunbeam",
+        "Meowing at the Fridge",
+        "Claiming the Warm Laptop",
+        "Pouncing on Dust Bunnies",
+        "Investigating the Grocery Bag",
+        "Sitting in the Empty Sink",
+        "Loafing on the Couch",
+        "Chirping at Squirrels",
+        "Stealing the Warm Seat",
+        "Batting Cap Lids",
+        "Inspecting the Suitcase",
+        "Rolling on the Rug",
+        "Headbutting the Monitor",
+        "Snoozing on Clean Laundry",
+        "Chasing the Red Dot",
+        "Perching on the Fridge",
+        "Burying Treats",
+        "Patrolling the Bookshelf",
+        "Licking a Paw",
+        "Fluffing the Cat Bed",
+        "Stalking Socks",
+        "Hiding in the Closet",
+        "Scratching the Post",
+        "Blinking Slowly",
+        "Begging for Tuna",
+        "Sitting on Open Mail",
+        "Chasing Tail",
+        "Guarding the Doorway",
+        "Sniffing the Shoes",
+        "Curling Up in a Circle",
+        "Watching the Fish Tank",
+        "Pawing the Curtain",
+        "Napping in a Box",
+        "Meowing at 3 AM",
+        "Claiming the Windowsill",
+        "Batting Ice Cubes",
+        "Investigating the Trash",
+        "Stretching Like a Yawn",
+        "Sitting on the Newspaper",
+        "Chasing Shadows",
+        "Grooming Whiskers",
+        "Loafing on the Desk",
+        "Hunting Crumbs",
+        "Purring on the Lap",
+        "Zooming at Midnight",
+        "Knocking Over Cups",
+        "Staring at Nothing",
+        "Claiming the Suitcase",
+        "Batting Phone Cords",
+        "Sleeping on the Router",
+        "Patrolling the Counter",
+        "Sniffing the Delivery Box",
+        "Kneading a Sweater",
+        "Chirping at Bugs",
+        "Guarding the Food Bowl",
+        "Rolling in Catnip",
+        "Climbing the Drapes",
+        "Hiding Behind the Curtain",
+        "Watching Raindrops",
+        "Pouncing on Toes",
+        "Sitting in the Laundry Basket",
+        "Meowing for Attention",
+        "Napping on the Printer",
+        "Batting Hair Ties",
+        "Inspecting the Keyboard",
+        "Stealing the Armchair",
+        "Chasing Moths",
+        "Stretching on the Carpet",
+        "Loafing by the Heater",
+        "Hunting String",
+        "Purring on the Pillow",
+        "Knocking Down Magnets",
+        "Claiming the Scanner Tray",
+        "Staring Into the Void",
+        "Grooming After Dinner",
+        "Zooming Across Tiles",
+        "Batting Bottle Caps",
+        "Sleeping on the Charger",
+        "Guarding the Mousepad",
+        "Sniffing the Coffee Cup",
+        "Kneading the Cushion",
+        "Watching the Cursor",
+    ]
+
+    /// Activity phrase for the current elapsed window (no " for" suffix).
+    public static func activity(
+        elapsedSeconds: Int,
+        activities: [String] = activities,
+        rotationSeconds: Int = rotationSeconds
+    ) -> String {
+        let list = activities.isEmpty ? ["Working"] : activities
+        let period = max(1, rotationSeconds)
+        let index = max(0, elapsedSeconds) / period % list.count
+        return list[index]
+    }
+
+    /// Display line: `"Purring for 20m 3s"`.
+    public static func statusLabel(
+        elapsedSeconds: Int,
+        activities: [String] = activities,
+        rotationSeconds: Int = rotationSeconds
+    ) -> String {
+        let phrase = activity(
+            elapsedSeconds: elapsedSeconds,
+            activities: activities,
+            rotationSeconds: rotationSeconds
+        )
+        return "\(phrase) for \(AgentWorkingStripPresentation.formatElapsed(elapsedSeconds))"
+    }
+
+    /// Stable VoiceOver / UITest label so assistive tech and tests still hear
+    /// "Working for …" while the visible line rotates cat activities.
+    public static func accessibilityLabel(elapsedSeconds: Int) -> String {
+        "Working for \(AgentWorkingStripPresentation.formatElapsed(elapsedSeconds))"
+    }
+}
+
 // MARK: - Composer chrome Simple / Power
 
 public enum AgentComposerChromeMode: String, Sendable, Equatable, CaseIterable {
