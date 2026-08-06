@@ -480,7 +480,36 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
         let workspaceId: String?
         let runStartDate: Double?
 
-        if let surface {
+        // Running projection always wins over attention-only pet surface so the
+        // Lock Screen cannot show "done/failed" while ActiveRunProjection still
+        // has host-owned runs (Ready for you vs LA split-brain).
+        if projection.activeRunCount > 0 {
+            phase = .running
+            count = projection.activeRunCount
+            if let surface, surface.activeThreadCount > 0 {
+                // Surface has live actives — keep its detail lines, but never
+                // let title bury the running count (most important LA signal).
+                title = count == 1 ? "1 agent running" : "\(count) agents running"
+                statusLine = surface.statusLine
+                preview = surface.preview
+                threadId = surface.threadId
+                workspaceId = surface.workspaceId
+                runStartDate = surface.runStartDate.map { $0.timeIntervalSince1970 }
+            } else {
+                // Projection knows runs; pet surface missing or attention-only.
+                threadId = count == 1 ? projection.runs.first?.threadId.value.uuidString : nil
+                workspaceId = nil
+                title = count == 1 ? "1 agent running" : "\(count) agents running"
+                if let surface {
+                    statusLine = surface.statusLine.isEmpty ? "Running" : surface.statusLine
+                    preview = surface.preview.isEmpty ? title : surface.preview
+                } else {
+                    statusLine = "Running"
+                    preview = title
+                }
+                runStartDate = nil
+            }
+        } else if let surface {
             title = surface.title
             statusLine = surface.statusLine
             preview = surface.preview
@@ -489,21 +518,6 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
             threadId = surface.threadId
             workspaceId = surface.workspaceId
             runStartDate = surface.runStartDate.map { $0.timeIntervalSince1970 }
-        } else if projection.activeRunCount > 0 {
-            phase = .running
-            count = projection.activeRunCount
-            threadId = count == 1 ? projection.runs.first?.threadId.value.uuidString : nil
-            workspaceId = nil
-            runStartDate = nil
-            if count == 1 {
-                title = "RemoteCode"
-                statusLine = "1 active run"
-                preview = "RemoteCode"
-            } else {
-                title = "\(count) active runs"
-                statusLine = "\(count) active runs"
-                preview = "\(count) agents running"
-            }
         } else {
             if case .finished(.completed) = cause {
                 phase = .completed

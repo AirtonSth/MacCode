@@ -161,6 +161,51 @@ final class TokenSaverSavingsRepositoryTests: XCTestCase {
                        "Week/report-window savings must include both calendar-day buckets")
     }
 
+    /// WHY: day-card amort used permanent thread totals, so one long thread's
+    /// lifetime 8M × 50 turns painted Today ~400M and Week ~999M. Inputs must
+    /// only sum savings delivered inside the requested window.
+    func test_threadCacheAmortizationInputs_areDayScopedNotPermanent() throws {
+        let db = try makeDB()
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let repo = TokenSaverSavingsRepository(db: db, retentionDays: 14, calendar: calendar)
+        let today = try XCTUnwrap(DateComponents(
+            calendar: calendar, timeZone: calendar.timeZone,
+            year: 2026, month: 8, day: 5, hour: 12
+        ).date)
+        let yesterday = try XCTUnwrap(DateComponents(
+            calendar: calendar, timeZone: calendar.timeZone,
+            year: 2026, month: 8, day: 4, hour: 12
+        ).date)
+        let thread = "THREAD-AMORT-1"
+        // Lifetime pile-up on the same thread (must NOT enter today's amort base).
+        _ = try repo.record(
+            provider: "codex", mode: "x", inputTokens: 8_000_000, outputTokens: 0,
+            attributability: "prompt_bound", delivered: true, threadID: thread, at: yesterday
+        )
+        _ = try repo.record(
+            provider: "codex", mode: "x", inputTokens: 100_000, outputTokens: 0,
+            attributability: "prompt_bound", delivered: true, threadID: thread, at: today
+        )
+        _ = try repo.record(
+            provider: "codex", mode: "x", inputTokens: 50_000, outputTokens: 0,
+            attributability: "prompt_bound", delivered: true, threadID: thread, at: today
+        )
+        let dayStart = Int64(calendar.startOfDay(for: today).timeIntervalSince1970 * 1000)
+        let dayEnd = dayStart + 86_400_000
+        let inputs = try repo.threadCacheAmortizationInputs(
+            dayStartMs: dayStart,
+            dayEndMsExclusive: dayEnd
+        )
+        XCTAssertEqual(inputs.count, 1)
+        let row = try XCTUnwrap(inputs.first)
+        XCTAssertEqual(row.threadID, thread)
+        XCTAssertEqual(row.savedTokens, 150_000,
+                       "must sum only today's delivered savings, not permanent 8.15M")
+        XCTAssertEqual(row.runs, 2, "run count is today's compress events only")
+        XCTAssertEqual(row.provider, "codex")
+    }
+
     /// The windowed reconciliation: per-(provider, day) buckets must sum to the
     /// collapsed daily bucket for the same day, so the scoped per-provider rows in
     /// the UI reconcile with the windowed headline (which reads the collapsed daily).

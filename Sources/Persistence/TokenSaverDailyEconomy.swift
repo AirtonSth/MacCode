@@ -62,9 +62,9 @@ public struct TokenSaverDailyEconomyRecord: Sendable, Equatable {
 /// Persists per-day credible totals so Week = Σ(day.total_credible).
 /// Does **not** backfill historical days; only upserts days that are recomputed going forward.
 public final class TokenSaverDailyEconomyRepository: @unchecked Sendable {
-    /// v5: v4 + multi-turn cache amortization from active threads (thread footer stack).
-    /// WHY: label mixed rows so they are never silently compared across formula revs.
-    public static let formulaVersion = "credible_v5"
+    /// v7: restore permanent thread totals × min(runs−1, 50) amort for the
+    /// Estimated save headline (product-trusted ~476M Today stack).
+    public static let formulaVersion = "credible_v7"
 
     private let db: SQLiteDB
     private let calendar: Calendar
@@ -189,16 +189,22 @@ public final class TokenSaverDailyEconomyRepository: @unchecked Sendable {
     }
 
     /// UI window total:
-    /// - days **with** economy rows → `total_credible` (full formula, going forward)
-    /// - days **without** rows (pre-feature) → measured pipes only (no retroactive rewrite)
+    /// - days with **current-formula** economy rows → `total_credible`
+    /// - days with only stale formula (or no row) → measured pipes only
+    ///
+    /// WHY ignore non-current formula: pre-v6 permanent-amort rows can still sit
+    /// at hundreds of millions; summing them paints Week ~999M until recompute
+    /// rewrites every day. Fail closed to measured rather than fantasy.
     public func windowTotalCredible(
         fromDayStartMs: Int64,
         toDayStartMs: Int64,
         toDayEndMsExclusive: Int64
     ) throws -> (total: Int, economyDays: Int, measuredOnlyDays: Int) {
         let economy = try records(fromDayStartMs: fromDayStartMs, toDayStartMs: toDayStartMs)
-        let economyDays = Set(economy.map(\.dayStartMs))
-        var total = economy.reduce(0) { $0 + $1.totalCredible }
+        let currentFormula = Self.formulaVersion
+        let currentEconomy = economy.filter { $0.formulaVersion == currentFormula }
+        let economyDays = Set(currentEconomy.map(\.dayStartMs))
+        var total = currentEconomy.reduce(0) { $0 + $1.totalCredible }
         let measuredByDay = try measuredPipesByDay(
             fromDayStartMs: fromDayStartMs,
             toDayEndMsExclusive: toDayEndMsExclusive
@@ -210,7 +216,7 @@ public final class TokenSaverDailyEconomyRepository: @unchecked Sendable {
                 measuredOnly += 1
             }
         }
-        return (total, economy.count, measuredOnly)
+        return (total, currentEconomy.count, measuredOnly)
     }
 
     private func write(_ record: TokenSaverDailyEconomyRecord) throws {

@@ -72,23 +72,24 @@ public enum PetLiveActivityCopy: Sendable {
         let count = active.count
         let attentionPreview = attentionPreviewLine(needsYou: input.needsYou, completed: input.completed)
 
+        // Title is always the running count — most important Lock Screen signal
+        // (iOS LiveActivityCopy.workingTitle parity). Thread identity stays on
+        // statusLine / preview so outcomes and progress never replace the count.
         if count == 1, let row = active.first {
-            let title = row.title == "Agent run in progress"
-                ? (detailThreadTitle(from: row.detail) ?? row.title)
-                : row.title
+            let title = "1 agent running"
             // Prefer pet detail (ws - provider - title - elapsed) on status when present.
-            let status = row.detail ?? "1 active run"
+            let status = row.detail ?? "Running"
             // Single-active description: latest material thread update (tools /
             // assistant) when known; identity detail only as fallback. Attention
             // still wins so "Needs you" stays visible.
             let preview = attentionPreview
                 ?? row.lastUpdatePreview
                 ?? row.detail
-                ?? title
+                ?? (detailThreadTitle(from: row.detail) ?? row.title)
             let ids = routeIDs(from: row.route)
             return Output(
-                title: sanitize(title, fallback: "Agent run in progress"),
-                statusLine: sanitize(status, fallback: "1 active run"),
+                title: title,
+                statusLine: sanitize(status, fallback: "Running"),
                 preview: sanitize(preview, fallback: title),
                 phase: .running,
                 activeThreadCount: 1,
@@ -99,7 +100,7 @@ public enum PetLiveActivityCopy: Sendable {
         }
 
         // Multi active: overview shape (parity with iOS multi-run card).
-        let title = "\(count) active runs"
+        let title = "\(count) agents running"
         let workspaces = unique(active.compactMap(\.workspaceName))
         let workspacePart: String?
         if workspaces.isEmpty {

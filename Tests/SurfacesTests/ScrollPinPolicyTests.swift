@@ -132,4 +132,21 @@ final class ScrollPinPolicyTests: XCTestCase {
             "gap <= slack(20) must re-pin even when gap is large"
         )
     }
+
+    /// WHY: every new message used force=true and re-pinned auditors mid-stream.
+    /// Programmatic follow must respect the pin; only FAB/send/open use force.
+    func testProgrammaticFollowRespectsAuditScrollUp() {
+        XCTAssertFalse(
+            ScrollPinPolicy.shouldProgrammaticFollow(pinned: false, force: false),
+            "stream/message ticks must not follow while user scrolled up to audit"
+        )
+        XCTAssertTrue(
+            ScrollPinPolicy.shouldProgrammaticFollow(pinned: true, force: false),
+            "still pinned: stream may follow"
+        )
+        XCTAssertTrue(
+            ScrollPinPolicy.shouldProgrammaticFollow(pinned: false, force: true),
+            "FAB / send / open may rejoin intentionally"
+        )
+    }
 }

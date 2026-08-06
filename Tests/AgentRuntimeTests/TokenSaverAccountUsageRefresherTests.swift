@@ -68,6 +68,39 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
         XCTAssertEqual(remaining?.weeklyWindowDurationMinutes, 10_080)
     }
 
+    /// WHY: Claude Code headless `/usage` switched to one-line copy
+    /// ("Current week (all models): 54% used"). Legacy weekly|subscription
+    /// patterns missed it, so Token Saver left Claude at Used 0% while Codex/Grok
+    /// rings updated and Claude Estimated save kept climbing.
+    func test_claudeUsageTextParsesModernHeadlessCurrentWeekAndSession() {
+        let output = """
+        You are currently using your subscription to power your Claude Code usage
+
+        Current session: 58% used · resets Aug 5 at 10:10pm (America/Asuncion)
+        Current week (all models): 54% used · resets Aug 9 at 11am (America/Asuncion)
+        Current week (Fable): 1% used · resets Aug 9 at 10:59am (America/Asuncion)
+        """
+        let usage = AssistantAccountUsageParser.claudeUsageText(output)
+        XCTAssertEqual(usage?.provider, .claude)
+        XCTAssertEqual(usage?.weeklyUsedPercent, 54,
+                       "must prefer Current week (all models), not Fable-only or subscription noise")
+        XCTAssertEqual(usage?.currentSessionUsedPercent, 58,
+                       "session % must populate Today ring; bare 0 painted 'no session data'")
+        XCTAssertEqual(usage?.weeklyWindowDurationMinutes, 10_080)
+    }
+
+    /// WHY: screen→text→screen recursion stack-overflowed the detached refresh
+    /// (signal 10) on empty / partial / remaining-only strings.
+    func test_claudeUsageParsersDoNotRecurseOnEmptyOrNoMatch() {
+        XCTAssertNil(AssistantAccountUsageParser.claudeUsageText(""))
+        XCTAssertNil(AssistantAccountUsageParser.claudeUsageScreen(""))
+        XCTAssertNil(AssistantAccountUsageParser.claudeUsageText("no percentages here"))
+        XCTAssertNil(AssistantAccountUsageParser.claudeUsageScreen("❯ waiting for input"))
+        // Remaining-only still matches loose patterns without re-entering screen.
+        let remaining = AssistantAccountUsageParser.claudeUsageText("Subscription usage 67% remaining")
+        XCTAssertEqual(remaining?.weeklyUsedPercent, 33)
+    }
+
     func test_grokBillingLogLineParsesCreditUsagePercent() {
         // WHY: Token Saver Grok ring was stuck on "No data" because account
         // refresh never read Grok's local billing snapshot (creditUsagePercent).

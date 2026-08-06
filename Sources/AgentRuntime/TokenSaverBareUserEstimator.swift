@@ -338,9 +338,15 @@ public enum TokenSaverBareUserEstimator {
 
     // MARK: - Cache amortization / Auto
 
-    /// Max extra turns that multiply measured tool-output into cache impact.
-    /// WHY: unbounded turn × measured would invent multi-million fantasy on long threads.
+    /// Max extra re-reads that multiply a thread's permanent saved chip into cache
+    /// impact. Product-trusted Today headline (~476M) uses lifetime thread totals ×
+    /// min(runs − 1, this). Keep high enough for long multi-turn threads (not 8).
     public static let cacheAmortizationMaxExtraTurns: Int = 50
+
+    /// Optional soft cap of total amort vs window measured (nil / very high = off).
+    /// WHY: the 3× measured cap under-counted the permanent stack the UI was
+    /// designed around; leave headroom so permanent thread amort can surface.
+    public static let cacheAmortizationMaxMultipleOfMeasured: Int = 200
 
     /// Fraction of measured pipes credited as Auto cheaper-model token-equivalent.
     public static let orchestrationShareOfMeasured: Double = 0.25
@@ -379,23 +385,40 @@ public enum TokenSaverBareUserEstimator {
     }
 
     /// Sum multi-turn cache impact across threads active in a day/week window.
-    /// Uses permanent thread `savedTokens` × activity (`runs` as turn proxy) so the
-    /// sidebar card matches the thread footer stack (Image 1 → Image 2).
+    /// Inputs are **permanent** thread saved/runs for threads with window activity
+    /// (see `threadCacheAmortizationInputs`). `runs` is treated as the turn count
+    /// for `saved × min(runs − 1, maxExtraTurns)` — matching the thread-footer stack
+    /// that produced the trusted ~476M Estimated save figure.
     public static func sumThreadCacheAmortization(
         savedTokens: Int,
         runs: Int
     ) -> Int {
-        // runs is compress-event count; treat as turn proxy (at least 1 when savings exist).
-        let turnProxy = max(runs, savedTokens > 0 ? 1 : 0)
+        let turnCount = max(0, runs)
         return estimateCacheAmortizationTokens(
             measured: savedTokens,
-            turnCount: turnProxy,
+            turnCount: turnCount,
             cacheReadInputTokens: 0
         )
     }
 
+    /// Map compress-event counts to a turn proxy (kept for tests / diagnostics).
+    /// Production amort uses raw `runs` as turn count (see sumThreadCacheAmortization).
+    public static func weakTurnProxy(fromCompressEventCount runs: Int, hasSavings: Bool) -> Int {
+        let r = max(0, runs)
+        if r <= 0 { return hasSavings ? 1 : 0 }
+        return min(r, cacheAmortizationMaxExtraTurns + 1)
+    }
+
     public static func sumThreadCacheAmortization(
         inputs: [(savedTokens: Int, runs: Int)]
+    ) -> Int {
+        sumThreadCacheAmortization(inputs: inputs, windowMeasuredTokens: nil)
+    }
+
+    /// Sum per-thread amort, optionally capped at `windowMeasured × maxMultiple`.
+    public static func sumThreadCacheAmortization(
+        inputs: [(savedTokens: Int, runs: Int)],
+        windowMeasuredTokens: Int?
     ) -> Int {
         var total = 0
         for row in inputs {
@@ -403,6 +426,10 @@ public enum TokenSaverBareUserEstimator {
                 savedTokens: row.savedTokens,
                 runs: row.runs
             ))
+        }
+        if let measured = windowMeasuredTokens, measured > 0 {
+            let cap = saturatingMul(measured, cacheAmortizationMaxMultipleOfMeasured)
+            return min(total, cap)
         }
         return total
     }
@@ -712,7 +739,7 @@ public enum TokenSaverBareUserEstimator {
     }
 
     /// Non-negative Int multiply that saturates at `Int.max`.
-    static func saturatingMul(_ a: Int, _ b: Int) -> Int {
+    public static func saturatingMul(_ a: Int, _ b: Int) -> Int {
         let x = max(0, a)
         let y = max(0, b)
         let (product, overflow) = x.multipliedReportingOverflow(by: y)

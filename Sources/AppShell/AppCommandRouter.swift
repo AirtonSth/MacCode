@@ -4557,13 +4557,24 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         ctx.coordinator.stopRun(threadId: thread)
     }
 
+    /// Host-owned active run for mirror / Live Activity.
+    ///
+    /// WHY: iOS `authoritativeActiveThreads` is fail-closed on non-empty
+    /// `active_run_id`. Emitting null when a real run exists (LaunchAgent /
+    /// durable row, or missing `startedAt`) drops every running agent from the
+    /// phone card and falls through to terminal inbox ("N done - M failed").
+    /// Match Agent App surfaces: in-memory id first, then `durableActiveRun`.
+    /// Never withhold identity just because the start clock is unavailable.
     public func activeAgentRun(thread: AgentThreadID) throws -> AgentActiveRunSnapshot? {
-        guard let ctx = context,
-              let runId = ctx.coordinator.activeRunId(threadId: thread),
-              let startedAt = try ctx.coordinator.runStartedAt(runId: runId) else {
-            return nil
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        if let runId = ctx.coordinator.activeRunId(threadId: thread) {
+            let startedAt = (try? ctx.coordinator.runStartedAt(runId: runId)) ?? Date()
+            return AgentActiveRunSnapshot(runId: runId, startedAt: startedAt)
         }
-        return AgentActiveRunSnapshot(runId: runId, startedAt: startedAt)
+        if let durable = try ctx.coordinator.durableActiveRun(threadId: thread) {
+            return AgentActiveRunSnapshot(runId: durable.id, startedAt: durable.startedAt)
+        }
+        return nil
     }
 
     /// UX-MAC_AGENT-CONTINUE parity for mirror clients: resume a

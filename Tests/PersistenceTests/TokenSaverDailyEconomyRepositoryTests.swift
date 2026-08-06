@@ -74,7 +74,7 @@ final class TokenSaverDailyEconomyRepositoryTests: XCTestCase {
         // Pre-feature day: only ledger pipes, no economy row.
         _ = try savings.record(provider: "claude", mode: "command-output (deterministic)", inputTokens: 1000, outputTokens: 100, at: dayOld) // 900
 
-        // Feature day: economy with full formula total.
+        // Feature day: economy with full formula total (current formula only).
         let newMs = Int64(cal.startOfDay(for: dayNew).timeIntervalSince1970 * 1000)
         _ = try repo.upsert(TokenSaverDailyEconomyRecord(
             dayStartMs: newMs,
@@ -83,7 +83,7 @@ final class TokenSaverDailyEconomyRepositoryTests: XCTestCase {
             graphifyTokens: 0,
             totalCredible: 1_250_000,
             windowUsageTokens: 100_000_000,
-            formulaVersion: "credible_v2",
+            formulaVersion: TokenSaverDailyEconomyRepository.formulaVersion,
             appliedOutputShare: 0.007,
             updatedAt: "t"
         ))
@@ -98,13 +98,47 @@ final class TokenSaverDailyEconomyRepositoryTests: XCTestCase {
         XCTAssertEqual(result.measuredOnlyDays, 1)
     }
 
+    /// WHY: pre-v6 permanent-amort rows at ~hundreds of millions must not paint
+    /// Week ~999M after a formula bump; stale rows fall back to measured pipes.
+    func test_windowTotal_ignoresStaleFormulaRowsAndUsesMeasured() throws {
+        let db = try makeDB()
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let repo = TokenSaverDailyEconomyRepository(db: db, calendar: cal)
+        let savings = TokenSaverSavingsRepository(db: db, calendar: cal)
+
+        let day = try XCTUnwrap(DateComponents(calendar: cal, timeZone: cal.timeZone, year: 2026, month: 8, day: 4, hour: 12).date)
+        _ = try savings.record(provider: "codex", mode: "x", inputTokens: 2_000_000, outputTokens: 0, at: day)
+        let dayMs = Int64(cal.startOfDay(for: day).timeIntervalSince1970 * 1000)
+        _ = try repo.upsert(TokenSaverDailyEconomyRecord(
+            dayStartMs: dayMs,
+            measuredTokens: 2_000_000,
+            dialectTokens: 0,
+            graphifyTokens: 0,
+            totalCredible: 383_000_000,
+            windowUsageTokens: 100_000_000,
+            formulaVersion: "credible_v5",
+            appliedOutputShare: 0.007,
+            updatedAt: "t"
+        ))
+        let end = dayMs + 86_400_000
+        let result = try repo.windowTotalCredible(
+            fromDayStartMs: dayMs,
+            toDayStartMs: dayMs,
+            toDayEndMsExclusive: end
+        )
+        XCTAssertEqual(result.total, 2_000_000, "stale fantasy total_credible must not win")
+        XCTAssertEqual(result.economyDays, 0)
+        XCTAssertEqual(result.measuredOnlyDays, 1)
+    }
+
     func test_v4_roundTripsDialectRawCapBindingAndFormulaVersion() throws {
         // WHY: collapse detection needs pre-cap legs + which bound applied; mixed
         // formula versions must be labelled (credible_v5), never silently compared.
         let db = try makeDB()
         let repo = TokenSaverDailyEconomyRepository(db: db)
         let dayMs = repo.dayStartMs()
-        XCTAssertEqual(TokenSaverDailyEconomyRepository.formulaVersion, "credible_v5")
+        XCTAssertEqual(TokenSaverDailyEconomyRepository.formulaVersion, "credible_v7")
         let record = TokenSaverDailyEconomyRecord(
             dayStartMs: dayMs,
             measuredTokens: 2,
@@ -126,7 +160,7 @@ final class TokenSaverDailyEconomyRepositoryTests: XCTestCase {
         XCTAssertEqual(loaded.graphifyRawTokens, 12_345)
         XCTAssertEqual(loaded.capBinding, "no_proof_allowance")
         XCTAssertEqual(loaded.windowUsageBilledUnits, 9_832_294.0, accuracy: 0.001)
-        XCTAssertEqual(loaded.formulaVersion, "credible_v5")
+        XCTAssertEqual(loaded.formulaVersion, "credible_v7")
         XCTAssertEqual(loaded.totalCredible, 10)
     }
 }

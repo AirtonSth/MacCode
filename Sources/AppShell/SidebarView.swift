@@ -638,7 +638,9 @@ public final class SidebarViewModel: ObservableObject {
             tokenSaverLocalUsageUpdate = nil
             return
         }
-        context.recomputeTokenSaverDailyEconomyToday()
+        // Recompute the retained week so pre-v6 permanent-amort rows do not
+        // keep painting a ~999M Week headline after the formula heal.
+        context.recomputeTokenSaverDailyEconomyWindow(dayCount: 7)
         let appSupport = context.appSupportDirectory
         let savingsRepo = context.tokenSaverSavingsRepo
         let economyRepo = context.tokenSaverDailyEconomyRepo
@@ -873,8 +875,9 @@ public final class SidebarViewModel: ObservableObject {
             tokenSaverProviderCacheAmortToday = [:]
             return
         }
-        // Keep today's economy row fresh so Week = Σ dailies stays aligned.
-        context.recomputeTokenSaverDailyEconomyToday()
+        // Heal last 7 days with current formula (day-scoped amort) so Week
+        // does not keep painting pre-v6 ~999M fantasy totals.
+        context.recomputeTokenSaverDailyEconomyWindow(dayCount: 7)
         let result = await Self.loadTokenSaverHeavy(
             appSupportDirectory: context.appSupportDirectory,
             savingsRepo: context.tokenSaverSavingsRepo,
@@ -925,15 +928,34 @@ public final class SidebarViewModel: ObservableObject {
                 dayStartMs: todayMs,
                 dayEndMsExclusive: dayEndMs
             )) ?? []
-            var byProvider: [String: Int] = [:]
-            for row in amortInputs {
-                let credit = TokenSaverBareUserEstimator.sumThreadCacheAmortization(
-                    savedTokens: row.savedTokens,
-                    runs: row.runs
+            // Cap provider amort map using today's measured so row totals stay
+            // reconcilable with the green headline (same multiple as estimator).
+            let todayMeasured = amortInputs.reduce(0) { $0 + max(0, $1.savedTokens) }
+            let rawCredits: [(String, Int)] = amortInputs.map { row in
+                (
+                    row.provider,
+                    TokenSaverBareUserEstimator.sumThreadCacheAmortization(
+                        savedTokens: row.savedTokens,
+                        runs: row.runs
+                    )
                 )
-                byProvider[row.provider, default: 0] = TokenSaverBareUserEstimator.saturatingAdd(
-                    byProvider[row.provider] ?? 0,
-                    credit
+            }
+            let rawTotal = rawCredits.reduce(0) {
+                TokenSaverBareUserEstimator.saturatingAdd($0, $1.1)
+            }
+            let cap = TokenSaverBareUserEstimator.saturatingMul(
+                todayMeasured,
+                TokenSaverBareUserEstimator.cacheAmortizationMaxMultipleOfMeasured
+            )
+            let scale: Double = (rawTotal > cap && rawTotal > 0)
+                ? Double(cap) / Double(rawTotal)
+                : 1.0
+            var byProvider: [String: Int] = [:]
+            for (provider, credit) in rawCredits {
+                let scaled = Int((Double(credit) * scale).rounded(.down))
+                byProvider[provider, default: 0] = TokenSaverBareUserEstimator.saturatingAdd(
+                    byProvider[provider] ?? 0,
+                    scaled
                 )
             }
             return (snapshot, summary, economyToday, weekTotal, byProvider)
@@ -3456,23 +3478,10 @@ public struct SidebarRootView: View {
             .labelsHidden()
             .accessibilityIdentifier("sidebar.tokenSaver.period")
 
+            // Chart only: rings + legend (Estimated save + provider % used).
+            // No provider breakdown rows / billing essay below — user wants the
+            // glanceable card from the design screenshot only.
             tokenSaverDetailsActivityChart
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: DS.Space.sm) {
-                // Same usage-desc order as the concentric rings (after Token Saver).
-                ForEach(tokenSaverProvidersByUsage(in: tokenSaverDetailsSnapshot, scope: tokenSaverDetailsScope), id: \.self) { provider in
-                    tokenSaverProviderRow(provider: provider)
-                }
-            }
-
-            Text(Self.tokenSaverBillingEvidenceDisclaimer)
-                .font(DS.Font.caption2)
-                .foregroundColor(DS.Palette.textTertiary)
-                .fixedSize(horizontal: false, vertical: true)
-                .accessibilityLabel(Self.tokenSaverBillingEvidenceDisclaimer)
-                .accessibilityIdentifier("sidebar.tokenSaver.billingEvidenceDisclaimer")
         }
         .padding(DS.Space.md)
         .frame(width: 350, alignment: .leading)

@@ -10338,13 +10338,15 @@ public struct AgentAppView: View {
                 }
             }
             .onChange(of: workDisclosureLayoutEpoch) { _ in
+                // Height change while following live output: re-assert bottom.
+                // force=false so a user who scrolled up to audit is never re-pinned.
                 guard timelineSticksToBottom else { return }
-                scheduleTimelineScrollToBottom(proxy, force: true)
+                scheduleTimelineScrollToBottom(proxy, force: false)
             }
             .onChange(of: vm.messages.last?.id) { _ in
-                // New user/assistant bubble identity — force pin without waiting
-                // for the next tick window.
-                scheduleTimelineScrollToBottom(proxy, force: true)
+                // New bubble: follow only when still pinned. force=true used to
+                // re-pin on every host append and yank auditors back to bottom.
+                scheduleTimelineScrollToBottom(proxy, force: false)
             }
             .onChange(of: vm.timeline.turns.count) { _ in
                 // PERF-MAC_AGENT-012: drop expansion ids for items that no longer
@@ -10952,7 +10954,12 @@ public struct AgentAppView: View {
     }
 
     private func scrollTimelineToBottom(_ proxy: ScrollViewProxy, force: Bool = false) {
-        guard force || timelineSticksToBottom else { return }
+        // force=true only for intentional rejoin (FAB, send focus, thread appear).
+        // Stream/message ticks must pass force=false so audit scroll-up is preserved.
+        guard ScrollPinPolicy.shouldProgrammaticFollow(
+            pinned: timelineSticksToBottom,
+            force: force
+        ) else { return }
         if force {
             timelineSticksToBottom = true
             showScrollDownButton = false
@@ -14916,6 +14923,11 @@ enum ScrollPinTransition {
 enum ScrollPinPolicy {
     /// Decide the pin-state transition that a clip-bounds change implies.
     ///
+    /// UX contract (Agent App iOS + macOS):
+    /// - Scroll **up** while away from bottom → unpin (audit mode; no auto-follow).
+    /// - Reach bottom (gap ≤ slack) → re-pin (auto-follow resumes).
+    /// - Content growth never changes origin.y, so it never unpins.
+    ///
     /// - Parameters:
     ///   - originDelta: newOriginY - lastOriginY (negative means the user scrolled up).
     ///   - gap: distance from the bottom of visible content to the bottom of the document.
@@ -14928,6 +14940,12 @@ enum ScrollPinPolicy {
             return .scrolledAway
         }
         return .unchanged
+    }
+
+    /// Programmatic stream/scroll must never re-pin an auditor.
+    /// force=true is reserved for FAB, send, and thread open.
+    nonisolated static func shouldProgrammaticFollow(pinned: Bool, force: Bool) -> Bool {
+        force || pinned
     }
 }
 

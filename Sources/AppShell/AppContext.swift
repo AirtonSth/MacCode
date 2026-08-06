@@ -4254,19 +4254,45 @@ public final class AppContext {
     }
 
     /// Persist today's credible total so Week = Σ(daily.total_credible).
-    /// Past days are never rewritten; only the current calendar day is upserted.
     public func recomputeTokenSaverDailyEconomyToday(now: Date = Date()) {
+        recomputeTokenSaverDailyEconomy(for: now, now: now)
+    }
+
+    /// Recompute the last `dayCount` calendar days (inclusive of today) so Week
+    /// totals heal after formula changes (e.g. v5 permanent-amort → v6 day-scoped).
+    /// Older formula rows would otherwise keep painting ~999M until each day ages out.
+    public func recomputeTokenSaverDailyEconomyWindow(dayCount: Int = 7, now: Date = Date()) {
+        let cal = Calendar.current
+        let todayStart = cal.startOfDay(for: now)
+        let count = max(1, min(dayCount, 14))
+        for offset in 0..<count {
+            guard let day = cal.date(byAdding: .day, value: -offset, to: todayStart) else { continue }
+            recomputeTokenSaverDailyEconomy(for: day, now: now)
+        }
+    }
+
+    /// Persist one calendar day's credible total (day-scoped amort + caps).
+    private func recomputeTokenSaverDailyEconomy(for day: Date, now: Date) {
         let settings = SettingsStore(db: db).load()
         let usage = TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).load()
-        let windowUsage = TokenSaverBareUserEstimator.todayProviderTokens(daily: usage.daily, now: now)
-        // WHY: fail-closed — pass known day billed only; never substitute raw windowUsage.
-        // nil keeps usage-anchored legs unavailable rather than re-inflating ~8×.
-        let windowBilled = TokenSaverBareUserEstimator.todayProviderBilledTokenUnits(
-            daily: usage.daily,
-            now: now
-        )
-        let dayStartMs = tokenSaverDailyEconomyRepo.dayStartMs(for: now)
-        let dayEndMs = tokenSaverDailyEconomyRepo.dayEndMsExclusive(for: now)
+        let cal = Calendar.current
+        let dayStart = cal.startOfDay(for: day)
+        let windowUsage = usage.daily
+            .filter { cal.isDate($0.dayStart, inSameDayAs: dayStart) }
+            .reduce(0) { $0 + max(0, $1.actualProviderTokens) }
+        // WHY: fail-closed — known day billed only; never substitute raw windowUsage.
+        let windowBilled: Double? = {
+            var total: Double = 0
+            var saw = false
+            for bucket in usage.daily where cal.isDate(bucket.dayStart, inSameDayAs: dayStart) {
+                saw = true
+                guard let billed = bucket.actualProviderBilledTokenUnits else { return nil }
+                total += max(0, billed)
+            }
+            return saw ? total : 0
+        }()
+        let dayStartMs = tokenSaverDailyEconomyRepo.dayStartMs(for: day)
+        let dayEndMs = tokenSaverDailyEconomyRepo.dayEndMsExclusive(for: day)
         do {
             let measured = try tokenSaverDailyEconomyRepo.measuredPipes(
                 dayStartMs: dayStartMs,
@@ -4280,15 +4306,18 @@ public final class AppContext {
                 nowMs: nowMs,
                 minSamples: TokenSaverBareUserEstimator.minSamplesForLiveShare
             )
-            try? graphifyUsageRepo.prune(nowMs: nowMs)
-            // Multi-turn cache impact: same stack as the Agent App thread footer so a
-            // 7.0M thread chip is reflected in the sidebar day card (not measured-only).
+            if cal.isDate(dayStart, inSameDayAs: cal.startOfDay(for: now)) {
+                try? graphifyUsageRepo.prune(nowMs: nowMs)
+            }
+            // Multi-turn cache impact from **day-window** savings only (not permanent
+            // thread totals). Cap vs day measured so Week cannot invent ~999M fantasy.
             let threadInputs = (try? tokenSaverSavingsRepo.threadCacheAmortizationInputs(
                 dayStartMs: dayStartMs,
                 dayEndMsExclusive: dayEndMs
             )) ?? []
             let threadCacheAmort = TokenSaverBareUserEstimator.sumThreadCacheAmortization(
-                inputs: threadInputs.map { (savedTokens: $0.savedTokens, runs: $0.runs) }
+                inputs: threadInputs.map { (savedTokens: $0.savedTokens, runs: $0.runs) },
+                windowMeasuredTokens: measured
             )
             let breakdown = TokenSaverBareUserEstimator.estimate(
                 measuredToolOutputSaved: measured,

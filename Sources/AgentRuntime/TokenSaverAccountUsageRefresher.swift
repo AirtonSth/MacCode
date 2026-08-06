@@ -79,9 +79,27 @@ public enum AssistantAccountUsageParser {
     }
 
     public static func claudeUsageText(_ text: String) -> AssistantAccountUsage? {
+        // Prefer the structured screen parser first: modern Claude Code headless
+        // `/usage` prints one-line "Current week (all models): 54% used" which the
+        // legacy weekly|subscription patterns miss, leaving Claude stuck at 0%.
+        // NEVER recurse into claudeUsageScreen → claudeUsageText: empty/partial
+        // probes would stack-overflow the detached refresh task.
+        if let fromScreen = claudeUsageScreen(text) {
+            return fromScreen
+        }
+        return claudeUsageLoosePatterns(text)
+    }
+
+    /// Non-recursive pattern pass used by both headless and screen parsers.
+    /// WHY separate: `claudeUsageScreen` used to fall back into `claudeUsageText`,
+    /// and after screen was preferred from text that became infinite recursion
+    /// (signal 10 crash on empty / partial / remaining-only strings).
+    private static func claudeUsageLoosePatterns(_ text: String) -> AssistantAccountUsage? {
         let patterns = [
+            // Modern one-line: "Current week (all models): 54% used · resets ..."
+            #"(?i)current\s*week\s*\(\s*all\s*models\s*\)[^\n\r%]{0,40}([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:used|utilized)"#,
             #"(?i)(?:weekly|subscription|usage)[^\n\r%]{0,80}([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:used|utilized)"#,
-            #"(?i)([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:used|utilized)[^\n\r]{0,80}(?:weekly|subscription|usage)"#,
+            #"(?i)([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:used|utilized)[^\n\r]{0,80}(?:weekly|subscription|usage|week)"#,
             #"(?i)(?:weekly|subscription|usage)[^\n\r%]{0,80}([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:remaining|left)"#
         ]
         for pattern in patterns {
@@ -91,7 +109,16 @@ public enum AssistantAccountUsageParser {
                   let percent = Double(matched[numberRange]) else { continue }
             let lower = matched.lowercased()
             let used = (lower.contains("remaining") || lower.contains("left")) ? max(0, 100 - percent) : percent
-            return AssistantAccountUsage(provider: .claude, weeklyUsedPercent: used, weeklyWindowDurationMinutes: 10_080)
+            // Also pick up session % when the modern one-liner is present.
+            let session = firstPercent(in: text, patterns: [
+                #"(?i)current\s*session[^\n\r%]{0,40}([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:used|utilized)"#
+            ])
+            return AssistantAccountUsage(
+                provider: .claude,
+                weeklyUsedPercent: used,
+                weeklyWindowDurationMinutes: 10_080,
+                currentSessionUsedPercent: session
+            )
         }
         return nil
     }
@@ -215,7 +242,8 @@ public enum AssistantAccountUsageParser {
         ]
         guard let weeklyUsed = firstPercent(in: normalized, patterns: weeklyPatterns)
             ?? firstPercent(in: compacted, patterns: compactedWeeklyPatterns) else {
-            return claudeUsageText(normalized)
+            // Loose patterns only — never claudeUsageText (would re-enter this path).
+            return claudeUsageLoosePatterns(normalized)
         }
         let currentSessionUsed = firstPercent(in: normalized, patterns: [
             #"(?is)Current\s*session.*?([0-9]+(?:\.[0-9]+)?)\s*%\s*used"#
@@ -411,6 +439,9 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
     private func fetchClaudeUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
         // Prefer the Process path (waitUntilExit) first — it never leaves PTY zombies.
         // Screen-capture PTY is fallback only when text /usage fails (plan-final W1).
+        // Parse with claudeUsageText (which prefers claudeUsageScreen patterns) so
+        // modern "Current week (all models): N% used" headless output is accepted
+        // without spawning an interactive PTY.
         if let result = run(
             binary: request.claudeBinary,
             arguments: [
@@ -422,7 +453,7 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
             ],
             cwd: request.cwd,
             environment: request.environment
-        ), result.status == 0,
+        ), result.status == 0 || !result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            let usage = AssistantAccountUsageParser.claudeUsageText(result.stdout) {
             return usage
         }

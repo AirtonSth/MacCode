@@ -56,8 +56,27 @@ final class TokenSaverBareUserEstimatorTests: XCTestCase {
         let fromCache = TokenSaverBareUserEstimator.estimateCacheAmortizationTokens(
             measured: measured, turnCount: 0, cacheReadInputTokens: 1_000_000
         )
-        // 0.1 × 1M = 100k, capped at measured × 50 = 250k → 100k
-        XCTAssertEqual(fromCache, 100_000)
+        // 0.1 × 1M = 100k, capped at measured × maxExtraTurns
+        let maxCap = measured * TokenSaverBareUserEstimator.cacheAmortizationMaxExtraTurns
+        XCTAssertEqual(fromCache, min(100_000, maxCap))
+    }
+
+    func test_sumThreadCacheAmortization_usesPermanentRunsCappedAtMaxExtraTurns() {
+        // WHY: product-trusted Estimated save (~476M) multiplies permanent thread
+        // chips by min(runs − 1, maxExtraTurns=50) — not a weak log proxy of 8.
+        let inputs = [
+            (savedTokens: 3_000_000, runs: 400),
+            (savedTokens: 2_000_000, runs: 200)
+        ]
+        let total = TokenSaverBareUserEstimator.sumThreadCacheAmortization(inputs: inputs)
+        let maxExtra = TokenSaverBareUserEstimator.cacheAmortizationMaxExtraTurns
+        let expected = 3_000_000 * maxExtra + 2_000_000 * maxExtra
+        XCTAssertEqual(total, expected)
+        let proxy = TokenSaverBareUserEstimator.weakTurnProxy(
+            fromCompressEventCount: 400,
+            hasSavings: true
+        )
+        XCTAssertEqual(proxy, maxExtra + 1)
     }
 
     func test_orchestration_shareOfMeasuredWhenActive() {

@@ -393,9 +393,15 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
         }
     }
 
-    /// Threads with delivered savings in `[dayStartMs, dayEndMsExclusive)` plus their
-    /// permanent totals/runs — used to fold multi-turn cache amortization into the
-    /// day/week Token Saver card (same stack as the thread footer).
+    /// Threads with activity in `[dayStartMs, dayEndMsExclusive)` plus their
+    /// **permanent** delivered totals/runs from `token_saver_thread_totals`.
+    ///
+    /// WHY permanent totals (not day-only SUM): the multi-turn cache stack that
+    /// produces the user-trusted "Estimated save ~476M" headline multiplies the
+    /// thread's lifetime saved chip by remaining re-reads (runs − 1). Day-scoped
+    /// SUM × weak proxy under-counted that stack by ~25× vs the thread footer.
+    /// Only threads with delivered savings inside the window are included so
+    /// idle historical threads do not contribute.
     public func threadCacheAmortizationInputs(
         dayStartMs: Int64,
         dayEndMsExclusive: Int64
@@ -406,27 +412,32 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
                        COALESCE(t.saved_tokens, 0),
                        COALESCE(t.runs, 0),
                        COALESCE((
-                           SELECT s.provider
-                           FROM token_saver_savings s
-                           WHERE s.thread_id = t.thread_id
-                             AND s.delivered = 1
-                             AND TRIM(s.thread_id) != ''
-                           ORDER BY s.created_at_ms DESC
+                           SELECT s2.provider
+                           FROM token_saver_savings s2
+                           WHERE s2.thread_id = t.thread_id
+                             AND s2.delivered = 1
+                             AND s2.created_at_ms >= ?
+                             AND s2.created_at_ms < ?
+                             AND TRIM(s2.thread_id) != ''
+                           ORDER BY s2.created_at_ms DESC
                            LIMIT 1
                        ), 'unknown')
                 FROM token_saver_thread_totals t
-                WHERE t.thread_id IN (
-                    SELECT DISTINCT thread_id
-                    FROM token_saver_savings
-                    WHERE delivered = 1
-                      AND created_at_ms >= ?
-                      AND created_at_ms < ?
-                      AND TRIM(thread_id) != ''
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM token_saver_savings s
+                    WHERE s.thread_id = t.thread_id
+                      AND s.delivered = 1
+                      AND s.created_at_ms >= ?
+                      AND s.created_at_ms < ?
+                      AND TRIM(s.thread_id) != ''
                 );
             """)
             defer { stmt.reset() }
             try stmt.bind(1, dayStartMs)
             try stmt.bind(2, dayEndMsExclusive)
+            try stmt.bind(3, dayStartMs)
+            try stmt.bind(4, dayEndMsExclusive)
             var rows: [TokenSaverThreadCacheAmortizationInput] = []
             while try stmt.step() {
                 let id = (stmt.columnText(0) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)

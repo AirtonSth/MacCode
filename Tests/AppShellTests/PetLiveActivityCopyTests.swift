@@ -27,12 +27,9 @@ final class PetLiveActivityCopyTests: XCTestCase {
         )) else { return XCTFail("expected single-active surface") }
         XCTAssertEqual(output.phase, .running)
         XCTAssertEqual(output.activeThreadCount, 1)
+        // Title is always the running count — most important Lock Screen signal.
+        XCTAssertEqual(output.title, "1 agent running")
         XCTAssertEqual(output.statusLine, active.detail)
-        XCTAssertTrue(
-            output.title.contains("ship")
-                || output.title == "Agent run in progress"
-                || (active.detail?.contains("ship") == true)
-        )
         XCTAssertEqual(output.threadId, threadA.value.uuidString)
         // No lastUpdatePreview → identity/detail fallback (legacy shape).
         XCTAssertEqual(output.preview, active.detail)
@@ -142,7 +139,7 @@ final class PetLiveActivityCopyTests: XCTestCase {
         guard let output = PetLiveActivityCopy.make(.init(
             active: [a, b], needsYou: [needs], completed: []
         )) else { return XCTFail("expected multi-active surface") }
-        XCTAssertEqual(output.title, "2 active runs")
+        XCTAssertEqual(output.title, "2 agents running")
         XCTAssertTrue(output.statusLine.contains("star") || output.statusLine.contains("elephant"))
         XCTAssertTrue(output.preview.hasPrefix("Needs you"))
         XCTAssertTrue(output.preview.contains("Approve: Run command"))
