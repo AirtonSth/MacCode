@@ -492,6 +492,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var streamApplyInFlight = false
     /// Set when append tried to flush while an apply was already running.
     private var streamFlushNeeded = false
+    /// Counts applied stream events since the last aggregate hot-text budget walk.
+    private var streamAggregateBudgetOps = 0
     /// Bumped on dispose / thread switch so stale detached applies drop their commit.
     private var streamApplyGeneration: UInt64 = 0
     /// True when the hot UI event queue refused at least one already-durable
@@ -741,6 +743,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         tokenSaverFooterEligibleCheck = nil
         tokenSaverGraphifyActiveCheck = nil
         streamApplyGeneration &+= 1
+        streamAggregateBudgetOps = 0
         streamApplyInFlight = false
         streamFlushNeeded = false
         _ = streamEventBatch.drain()
@@ -1394,6 +1397,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         streamApplyInFlight = false
         streamFlushNeeded = false
         streamUIBackpressured = false
+        streamAggregateBudgetOps = 0
         _ = streamEventBatch.drain()
         let persistedEvents = coordinator.latestStreamEvents(threadId: id)
         if coordinator.hotReplayIsPartial(threadId: id) {
@@ -4315,6 +4319,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         resetTimelineUpdateTick()
         _ = streamEventBatch.drain()
         streamUIBackpressured = false
+        streamAggregateBudgetOps = 0
         historyReplayNotice = nil
         sr1TranslatedMessageIds = []
         sr1OriginalTextsByMessageId = [:]
@@ -6159,7 +6164,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 hasProposedPlan = true
             }
         }
-        nextTimeline.enforceAggregateHotTextBudget()
+        // Budget walk is O(items). Pure reduce only flags when this quantum is
+        // large or structural; commitStreamQuantum coalesces cheap token quanta.
+        let quantumBytes = input.entries.reduce(0) { $0 + max(1, $1.event.estimatedHotQueueBytes) }
+        let forceBudget = quantumBytes >= 64 * 1024
+            || appliedEvents.contains { event in
+                switch event {
+                case .itemDelta: return false
+                case .itemProgress, .itemState, .tokenUsage: return false
+                default: return true
+                }
+            }
         if shouldAutoClearTransientTimelineError(
             errorAfterBatch: nextTimeline.error,
             appliedEvents: appliedEvents
@@ -6177,7 +6192,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             suppressStaleActivePlanUpdates: suppress,
             seedRunStartedAt: seedRunStartedAt,
             runThreadBindings: runThreadBindings,
-            hasProposedPlan: hasProposedPlan
+            hasProposedPlan: hasProposedPlan,
+            forceAggregateBudget: forceBudget,
+            appliedEventCount: appliedEvents.count
         )
     }
 
@@ -6199,7 +6216,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             liveBackgroundShellCount = reduced.liveBackgroundShellCount
         }
         timeline = reduced.timeline
-        refreshSR1TranslationStateFromTimeline()
+        // Coalesce full O(items) aggregate walks: pure token quanta skip until
+        // 16 applies or a structural/large quantum forces a check. 16 * 512 KiB
+        // drain ceiling << 96 MiB hot budget, so temporary overshoot is safe.
+        streamAggregateBudgetOps += max(1, reduced.appliedEventCount)
+        if reduced.forceAggregateBudget || streamAggregateBudgetOps >= 16 {
+            timeline.enforceAggregateHotTextBudget()
+            streamAggregateBudgetOps = 0
+        }
+        // Skip SR1 publish when both sides empty — common path on every token.
+        let hasTimelineSR1 = !timeline.sr1TranslationsByMessageId.isEmpty
+            || !timeline.sr1TranslationsByItemId.isEmpty
+        if hasTimelineSR1
+            || !sr1TranslatedMessageIds.isEmpty
+            || !sr1OriginalTextsByMessageId.isEmpty {
+            refreshSR1TranslationStateFromTimeline()
+        }
         scheduleTimelineUpdateTick()
         if reduced.hasProposedPlan {
             scheduleFullAccessPlanAutoImplementIfNeeded()
@@ -6798,6 +6830,10 @@ struct StreamQuantumReduceResult: Sendable {
     let seedRunStartedAt: Bool
     let runThreadBindings: [AgentRunID: AgentThreadID]
     let hasProposedPlan: Bool
+    /// True when this quantum should force an aggregate hot-text budget walk.
+    let forceAggregateBudget: Bool
+    /// Number of events applied into the timeline this quantum.
+    let appliedEventCount: Int
 }
 
 // PERF-MAC_AGENT-010: lock-protected buffer used by runCoordinator(_:didReceive:)
@@ -6867,7 +6903,8 @@ final class StreamEventBatch: @unchecked Sendable {
     }
 
     func appendBounded(event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID) -> AppendOutcome {
-        let eventBytes = (try? JSONEncoder().encode(event).count) ?? event.debugDescription.utf8.count
+        // PERF: never JSON-encode on the per-token admission path — estimate only.
+        let eventBytes = max(1, event.estimatedHotQueueBytes)
         let bytes = eventBytes + MemoryLayout<AgentRunID>.stride + MemoryLayout<AgentThreadID>.stride
         lock.lock()
         defer { lock.unlock() }

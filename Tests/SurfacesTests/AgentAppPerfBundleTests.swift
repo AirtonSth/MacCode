@@ -764,6 +764,101 @@ final class AgentAppPerfBundleTests: XCTestCase {
         XCTAssertEqual(state.activePlan?.steps.first?.status, .inProgress,
                        "memory eviction must preserve compact active-plan identity and status")
     }
+
+    // MARK: - PERF 2026-08-05 residual hot path
+
+    /// estimatedHotQueueBytes must be positive and never force a JSON encode.
+    /// WHY: StreamEventBatch admission previously allocated JSONEncoder per token.
+    func test_estimatedHotQueueBytes_coversItemDeltaAndLargeErrorWithoutEncode() {
+        let small = AssistantEvent.itemDelta(
+            itemId: "i", bodyAppend: "hello", outputAppend: nil, summary: nil
+        )
+        let large = AssistantEvent.error(
+            message: String(repeating: "x", count: 50_000), recoverable: true
+        )
+        XCTAssertGreaterThan(small.estimatedHotQueueBytes, 0)
+        XCTAssertGreaterThanOrEqual(
+            large.estimatedHotQueueBytes, 50_000,
+            "estimate must track payload so hard-ceiling saturation still fires"
+        )
+        // Estimate must be enough to admit tiny events under tiny budgets.
+        let batch = StreamEventBatch(limits: .init(
+            maxBufferedCount: 8,
+            maxBufferedBytes: 4_096,
+            drainCount: 8,
+            drainBytes: 4_096
+        ))
+        let tid = AgentThreadID()
+        let run = AgentRunID()
+        XCTAssertEqual(
+            batch.appendBounded(event: small, run: run, threadId: tid),
+            .scheduled
+        )
+    }
+
+    /// Microbench: admission sizing via estimate vs JSONEncoder (same machine, n=5).
+    /// Primary metric is wall time for 20_000 itemDelta size measurements.
+    func test_microbench_hotQueueSizing_estimateFasterThanJSONEncoder() throws {
+        let events: [AssistantEvent] = (0..<64).map { i in
+            .itemDelta(
+                itemId: "item",
+                bodyAppend: String(repeating: "a", count: 16 + (i % 8)),
+                outputAppend: nil,
+                summary: nil
+            )
+        }
+        let iterations = 20_000
+        let warmup = 2
+        let samples = 5
+
+        func median(_ values: [Double]) -> Double {
+            let s = values.sorted()
+            return s[s.count / 2]
+        }
+
+        func timeJSON() -> Double {
+            let encoder = JSONEncoder()
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for i in 0..<iterations {
+                let event = events[i % events.count]
+                sink &+= (try? encoder.encode(event).count) ?? 0
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0 // ms
+        }
+
+        func timeEstimate() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for i in 0..<iterations {
+                sink &+= events[i % events.count].estimatedHotQueueBytes
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        for _ in 0..<warmup { _ = timeJSON(); _ = timeEstimate() }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            before.append(timeJSON())
+            after.append(timeEstimate())
+        }
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = (beforeMed - afterMed) / beforeMed * 100.0
+        NSLog("[perf-proof] hotQueueSizing json_ms=%@ estimate_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+              String(beforeMed), String(afterMed), improvement,
+              String(describing: before), String(describing: after))
+        XCTAssertGreaterThan(
+            improvement, 50.0,
+            "estimate must be substantially faster than JSONEncoder sizing (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
+        )
+    }
+
 }
 
 private final class ReplayBenchmarkRunner: AgentProviderRunner, @unchecked Sendable {

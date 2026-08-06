@@ -583,26 +583,97 @@ final class AssistantTimelineTests: XCTestCase {
                         "translation for a retained turn's item must survive trimming")
     }
 
-    // F10: a single turn's `items` array stays bounded by `liveTurnItemLimit` (oldest
-    // dropped, newest kept) and dropped items' translations are pruned.
+    // F10: a single turn's `items` array stays bounded by `liveTurnItemLimit`.
+    // items[0] is the transcript sort anchor and is intentionally retained;
+    // oldest non-anchor items in the rest are dropped; newest kept; SR1 pruned.
     func test_trimTurnItems_boundsSingleTurnItemsAndPrunesTranslations() {
         var s = AssistantTimelineState()
         s.apply(.turnStarted(turnId: "t"))
-        s.apply(.itemStarted(item: AssistantItem(id: "first", turnId: "t", type: .tool, startedAtMs: 0)))
-        s.apply(.sr1Translation(AssistantSR1Translation(itemId: "first", originalText: "o", rewrittenText: "r")))
+        s.apply(.itemStarted(item: AssistantItem(id: "anchor", turnId: "t", type: .tool, startedAtMs: 0)))
+        s.apply(.itemStarted(item: AssistantItem(id: "victim", turnId: "t", type: .tool, startedAtMs: 1)))
+        s.apply(.sr1Translation(AssistantSR1Translation(itemId: "victim", originalText: "o", rewrittenText: "r")))
 
-        let total = AssistantTimelineState.liveTurnItemLimit + 1
-        for i in 1..<total {
-            s.apply(.itemStarted(item: AssistantItem(id: "item-\(i)", turnId: "t", type: .tool, startedAtMs: Int64(i))))
+        // anchor + victim + (limit - 1) more = limit + 1 → trims one non-anchor.
+        let extra = AssistantTimelineState.liveTurnItemLimit - 1
+        for i in 0..<extra {
+            s.apply(.itemStarted(item: AssistantItem(id: "item-\(i)", turnId: "t", type: .tool, startedAtMs: Int64(i + 2))))
         }
 
         XCTAssertEqual(s.turns[0].items.count, AssistantTimelineState.liveTurnItemLimit,
                        "one turn's items must stay bounded by liveTurnItemLimit")
-        XCTAssertFalse(s.turns[0].items.contains { $0.id == "first" },
-                       "the oldest item is trimmed when the per-turn cap is exceeded")
-        XCTAssertTrue(s.turns[0].items.contains { $0.id == "item-\(total - 1)" },
+        XCTAssertTrue(s.turns[0].items.contains { $0.id == "anchor" },
+                      "items[0] sort-anchor must survive trimTurnItems")
+        XCTAssertFalse(s.turns[0].items.contains { $0.id == "victim" },
+                       "oldest non-anchor item is trimmed when the per-turn cap is exceeded")
+        XCTAssertTrue(s.turns[0].items.contains { $0.id == "item-\(extra - 1)" },
                       "the newest item (the active streaming target) is always retained")
-        XCTAssertNil(s.sr1TranslationsByItemId["first"],
+        XCTAssertNil(s.sr1TranslationsByItemId["victim"],
                      "a trimmed item's translation must be pruned with it")
     }
+
+    // MARK: - PERF 2026-08-05 appendCapped
+
+    func test_appendCapped_matchesCappedPlusSemantics() {
+        var target = "hello"
+        AssistantTimelineState.appendCapped(&target, append: " world", limit: 80)
+        XCTAssertEqual(target, "hello world")
+
+        var over = String(repeating: "a", count: 8)
+        AssistantTimelineState.appendCapped(&over, append: "bbbb", limit: 8)
+        XCTAssertEqual(over, AssistantTimelineState.cappedText(String(repeating: "a", count: 8) + "bbbb", limit: 8))
+    }
+
+    /// Microbench: growing body via + vs appendCapped (n=5 medians).
+    func test_microbench_itemDeltaAppend_appendCappedFasterThanPlusRebuild() {
+        let token = String(repeating: "x", count: 32)
+        let deltas = 4_000
+        let warmup = 2
+        let samples = 5
+
+        func median(_ values: [Double]) -> Double {
+            let s = values.sorted()
+            return s[s.count / 2]
+        }
+
+        func timePlus() -> Double {
+            var body = ""
+            let start = DispatchTime.now().uptimeNanoseconds
+            for _ in 0..<deltas {
+                body = AssistantTimelineState.cappedText(body + token, limit: 200_000)
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertEqual(body.utf8.count, min(200_000, deltas * token.utf8.count))
+            return Double(end - start) / 1_000_000.0
+        }
+
+        func timeAppend() -> Double {
+            var body = ""
+            let start = DispatchTime.now().uptimeNanoseconds
+            for _ in 0..<deltas {
+                AssistantTimelineState.appendCapped(&body, append: token, limit: 200_000)
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertEqual(body.utf8.count, min(200_000, deltas * token.utf8.count))
+            return Double(end - start) / 1_000_000.0
+        }
+
+        for _ in 0..<warmup { _ = timePlus(); _ = timeAppend() }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            before.append(timePlus())
+            after.append(timeAppend())
+        }
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = (beforeMed - afterMed) / beforeMed * 100.0
+        NSLog("[perf-proof] itemDeltaAppend plus_ms=%@ append_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+              String(beforeMed), String(afterMed), improvement,
+              String(describing: before), String(describing: after))
+        XCTAssertGreaterThan(
+            improvement, 5.0,
+            "appendCapped must improve median wall time by ≥5% (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
+        )
+    }
+
 }

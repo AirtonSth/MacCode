@@ -3783,7 +3783,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         countLimit: Int = hotReplayEventCount,
         byteLimit: Int64 = hotReplayEventBytes
     ) -> [AssistantEvent] {
-        let encoder = JSONEncoder()
         var retained: [AssistantEvent] = []
         retained.reserveCapacity(min(events.count, max(1, countLimit)))
         var bytes: Int64 = 0
@@ -3792,7 +3791,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // recoverable "omitted" error — skip frames that cannot fit alone.
         for event in events.reversed() {
             guard retained.count < max(1, countLimit) else { break }
-            let eventBytes = Int64((try? encoder.encode(event).count) ?? event.debugDescription.utf8.count)
+            // PERF: estimatedHotQueueBytes avoids JSONEncoder per retained frame.
+            let eventBytes = Int64(max(1, event.estimatedHotQueueBytes))
             if eventBytes > max(1, byteLimit) {
                 // Pathological single frame larger than the whole window: keep
                 // walking older events rather than blocking the newest paint.
