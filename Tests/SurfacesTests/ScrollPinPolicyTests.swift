@@ -149,4 +149,124 @@ final class ScrollPinPolicyTests: XCTestCase {
             "FAB / send / open may rejoin intentionally"
         )
     }
+
+    // MARK: - ScrollBottomGeometry (flip-aware)
+
+    /// Flipped document: at bottom origin = content - visible, gap = 0.
+    func testFlippedGapAtBottomIsZero() {
+        let gap = ScrollBottomGeometry.gap(
+            documentHeight: 1000,
+            visibleOriginY: 200,
+            visibleHeight: 800,
+            isFlipped: true
+        )
+        XCTAssertEqual(gap, 0, accuracy: 0.001,
+                       "flipped at-bottom must report gap 0 so pin re-arms")
+    }
+
+    /// Flipped document: scrolled up leaves a positive gap.
+    func testFlippedGapWhenScrolledUp() {
+        let gap = ScrollBottomGeometry.gap(
+            documentHeight: 1000,
+            visibleOriginY: 0,
+            visibleHeight: 800,
+            isFlipped: true
+        )
+        XCTAssertEqual(gap, 200, accuracy: 0.001,
+                       "200pt above bottom must leave gap 200")
+    }
+
+    /// Non-flipped: origin 0 is bottom → gap 0.
+    func testNonFlippedGapAtBottomIsZero() {
+        let gap = ScrollBottomGeometry.gap(
+            documentHeight: 1000,
+            visibleOriginY: 0,
+            visibleHeight: 800,
+            isFlipped: false
+        )
+        XCTAssertEqual(gap, 0, accuracy: 0.001,
+                       "non-flipped origin 0 is document bottom")
+    }
+
+    /// Non-flipped: larger origin is farther from bottom.
+    func testNonFlippedGapWhenScrolledUp() {
+        let gap = ScrollBottomGeometry.gap(
+            documentHeight: 1000,
+            visibleOriginY: 200,
+            visibleHeight: 800,
+            isFlipped: false
+        )
+        XCTAssertEqual(gap, 200, accuracy: 0.001)
+    }
+
+    func testMaxScrollOriginYFlippedAndNot() {
+        XCTAssertEqual(
+            ScrollBottomGeometry.maxScrollOriginY(documentHeight: 1000, visibleHeight: 800, isFlipped: true),
+            200,
+            accuracy: 0.001,
+            "flipped bottom target is content - visible"
+        )
+        XCTAssertEqual(
+            ScrollBottomGeometry.maxScrollOriginY(documentHeight: 1000, visibleHeight: 800, isFlipped: false),
+            0,
+            accuracy: 0.001,
+            "non-flipped bottom target is origin 0"
+        )
+    }
+
+    /// Scroll toward top must produce a negative delta in both coordinate systems.
+    func testOriginDeltaTowardTopIsNegativeOnScrollUp() {
+        // Flipped: origin drops when scrolling up.
+        XCTAssertEqual(
+            ScrollBottomGeometry.originDeltaTowardTop(previousOriginY: 100, currentOriginY: 40, isFlipped: true),
+            -60,
+            accuracy: 0.001
+        )
+        // Non-flipped: origin rises when scrolling up.
+        XCTAssertEqual(
+            ScrollBottomGeometry.originDeltaTowardTop(previousOriginY: 40, currentOriginY: 100, isFlipped: false),
+            -60,
+            accuracy: 0.001
+        )
+    }
+
+    /// Sticky detach: stream body must not re-arm pin; force token and true bottom may.
+    func testShouldAcceptSwiftUIPinStickyDetach() {
+        XCTAssertFalse(
+            ScrollBottomGeometry.shouldAcceptSwiftUIPin(
+                localPinned: false,
+                swiftUIPinned: true,
+                forceTokenChanged: false,
+                geometricallyAtBottom: false
+            ),
+            "stale stream pinned:true must not re-arm a local detach"
+        )
+        XCTAssertTrue(
+            ScrollBottomGeometry.shouldAcceptSwiftUIPin(
+                localPinned: false,
+                swiftUIPinned: true,
+                forceTokenChanged: true,
+                geometricallyAtBottom: false
+            ),
+            "FAB / send / open force token must re-arm pin"
+        )
+        XCTAssertTrue(
+            ScrollBottomGeometry.shouldAcceptSwiftUIPin(
+                localPinned: false,
+                swiftUIPinned: true,
+                forceTokenChanged: false,
+                geometricallyAtBottom: true
+            ),
+            "user returned to bottom may re-arm from SwiftUI"
+        )
+        XCTAssertFalse(
+            ScrollBottomGeometry.shouldAcceptSwiftUIPin(
+                localPinned: false,
+                swiftUIPinned: false,
+                forceTokenChanged: false,
+                geometricallyAtBottom: true
+            ),
+            "SwiftUI detach always wins"
+        )
+    }
 }

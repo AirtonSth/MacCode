@@ -8256,6 +8256,8 @@ public enum ThreadMarkdownFormatter {
 private final class TimelineScrollScheduler {
     var scheduled = false
     var forcePending = false
+    /// Bumped on user unpin so in-flight async follows no-op (unless force).
+    var followGeneration = 0
 }
 
 private struct PendingSessionApprovalConfirmation {
@@ -8308,6 +8310,9 @@ public struct AgentAppView: View {
     @State private var draggingThreadId: AgentThreadID?
     @State private var timelineSticksToBottom = true
     @State private var showScrollDownButton = false
+    /// Increments on FAB / thread-open so TimelineScrollFollower re-arms pin
+    /// even when sticky detach would otherwise ignore a stale `pinned: true`.
+    @State private var timelinePinForceToken = 0
     // IMP-MAC_AGENT-010: highlights the transcript while a file drag hovers it.
     @State private var timelineDropTargeted = false
     @State private var timelineScrollScheduler = TimelineScrollScheduler()
@@ -10556,13 +10561,18 @@ public struct AgentAppView: View {
                             // `enclosingScrollView` resolves. Placing it on ScrollView's
                             // `.background` left the follower detached → pin never
                             // unpinned → auto-scroll stayed always-on (Ajuste 4).
+                            // 1×1 (not 0×0): zero-size probes can fail attach after
+                            // hosting rebuilds; non-zero keeps the NSView in hierarchy.
                             TimelineScrollFollower(
                                 slack: Self.timelineBottomRevealSlack,
                                 pinned: timelineSticksToBottom,
+                                pinForceToken: timelinePinForceToken,
                                 onScrolledAway: { onTimelineScrolledAway() },
                                 onReturnedToBottom: { onTimelineReturnedToBottom() }
                             )
-                            .frame(width: 0, height: 0)
+                            .frame(width: 1, height: 1)
+                            .opacity(0.001)
+                            .allowsHitTesting(false)
                             .accessibilityHidden(true)
 
                             if vm.messageHistoryIsPartial {
@@ -10681,7 +10691,7 @@ public struct AgentAppView: View {
                 }
                 if showScrollDownButton {
                     Button {
-                        scrollTimelineToBottom(proxy, force: true)
+                        rejoinTimelineBottom(proxy)
                     } label: {
                         Image(systemName: "arrow.down")
                             .font(.system(size: 15, weight: .semibold))
@@ -10701,12 +10711,12 @@ public struct AgentAppView: View {
                     .transition(.opacity.combined(with: .scale(scale: 0.94)))
                 }
             }
-            .onAppear { scheduleTimelineScrollToBottom(proxy) }
+            .onAppear { rejoinTimelineBottom(proxy) }
             .onChange(of: vm.focusTick) { _ in
                 // focusTick bumps on outgoing user send — collapse before the
                 // new turn paints so pending follow-ups do not keep prior expands.
                 collapseTranscriptForNewTurn()
-                scheduleTimelineScrollToBottom(proxy, force: true)
+                rejoinTimelineBottom(proxy)
             }
             // Prefer coalesced paint tick over raw message/turn counts so every
             // token delta does not schedule redundant scroll work.
@@ -10763,9 +10773,7 @@ public struct AgentAppView: View {
                 collapseAllWorkDisclosures()
                 knownFinishedWorkTurnIds = []
                 // Opening a thread: rejoin bottom (user expectation) and re-enable auto-follow.
-                timelineSticksToBottom = true
-                showScrollDownButton = false
-                scheduleTimelineScrollToBottom(proxy, force: true)
+                rejoinTimelineBottom(proxy)
             }
         }
     }
@@ -11329,14 +11337,26 @@ public struct AgentAppView: View {
     private func scheduleTimelineScrollToBottom(_ proxy: ScrollViewProxy, force: Bool = false) {
         let scheduler = timelineScrollScheduler
         scheduler.forcePending = scheduler.forcePending || force
+        // Capture generation at schedule time so a later user unpin cancels this follow.
+        let generation = scheduler.followGeneration
         guard !scheduler.scheduled else { return }
         scheduler.scheduled = true
         DispatchQueue.main.async {
             let shouldForce = scheduler.forcePending
             scheduler.forcePending = false
             scheduler.scheduled = false
+            // force (FAB / send / open) always runs; stream follows only if still same gen.
+            guard shouldForce || generation == scheduler.followGeneration else { return }
             scrollTimelineToBottom(proxy, force: shouldForce)
         }
+    }
+
+    /// Intentional rejoin: re-arm pin, invalidate sticky detach via force token, scroll.
+    private func rejoinTimelineBottom(_ proxy: ScrollViewProxy) {
+        timelineSticksToBottom = true
+        showScrollDownButton = false
+        timelinePinForceToken &+= 1
+        scheduleTimelineScrollToBottom(proxy, force: true)
     }
 
     private func scrollTimelineToBottom(_ proxy: ScrollViewProxy, force: Bool = false) {
@@ -11395,6 +11415,8 @@ public struct AgentAppView: View {
     }
 
     private func onTimelineScrolledAway() {
+        // Invalidate in-flight stream follows immediately (generation), then pin state.
+        timelineScrollScheduler.followGeneration &+= 1
         guard timelineSticksToBottom || !showScrollDownButton else { return }
         timelineSticksToBottom = false
         showScrollDownButton = true
@@ -15445,6 +15467,67 @@ private struct PromptComposerEditor: NSViewRepresentable {
     }
 }
 
+// MARK: - ScrollBottomGeometry (pure, testable)
+
+/// Flipped-aware bottom gap / max origin for NSScrollView clip math.
+/// WHY: hard-coded `content - (origin + visible)` assumes a flipped document;
+/// non-flipped AppKit hosts invert both gap and "scroll up" origin delta.
+enum ScrollBottomGeometry {
+    /// Distance from the visible rect to the reading-order bottom of the document.
+    /// 0 means flush at bottom (within floating error).
+    nonisolated static func gap(
+        documentHeight: CGFloat,
+        visibleOriginY: CGFloat,
+        visibleHeight: CGFloat,
+        isFlipped: Bool
+    ) -> CGFloat {
+        if isFlipped {
+            return documentHeight - (visibleOriginY + visibleHeight)
+        }
+        // Non-flipped: origin.y == 0 is the bottom of the document.
+        return visibleOriginY
+    }
+
+    /// Clip origin.y that places the reading-order bottom flush in the viewport.
+    nonisolated static func maxScrollOriginY(
+        documentHeight: CGFloat,
+        visibleHeight: CGFloat,
+        isFlipped: Bool
+    ) -> CGFloat {
+        if isFlipped {
+            return max(0, documentHeight - visibleHeight)
+        }
+        return 0
+    }
+
+    /// Negative when the user scrolls toward the top (older content).
+    /// Flipped: origin decreases on scroll-up. Non-flipped: origin increases.
+    nonisolated static func originDeltaTowardTop(
+        previousOriginY: CGFloat,
+        currentOriginY: CGFloat,
+        isFlipped: Bool
+    ) -> CGFloat {
+        if isFlipped {
+            return currentOriginY - previousOriginY
+        }
+        return previousOriginY - currentOriginY
+    }
+
+    /// Whether SwiftUI `configure(pinned:)` may re-arm a locally detached follower.
+    /// Force token change = FAB / send / thread open. Stale stream body must not re-pin.
+    nonisolated static func shouldAcceptSwiftUIPin(
+        localPinned: Bool,
+        swiftUIPinned: Bool,
+        forceTokenChanged: Bool,
+        geometricallyAtBottom: Bool
+    ) -> Bool {
+        if !swiftUIPinned { return false }
+        if localPinned { return true }
+        // Detached: only explicit force rejoin or user returned to bottom.
+        return forceTokenChanged || geometricallyAtBottom
+    }
+}
+
 // MARK: - ScrollPinPolicy (pure, testable)
 
 /// Pure pin/unpin decision extracted from TimelineScrollFollower for unit-testing.
@@ -15454,8 +15537,8 @@ private struct PromptComposerEditor: NSViewRepresentable {
 enum ScrollPinTransition {
     /// Gap has closed to <= slack: re-pin.
     case reachedBottom
-    /// Origin dropped by more than the noise threshold while NOT at the bottom:
-    /// a genuine user scroll-up.
+    /// Origin moved toward top by more than the noise threshold while NOT at the bottom:
+    /// a genuine user scroll-up (delta already normalized by ScrollBottomGeometry).
     case scrolledAway
     /// Neither condition: no state change.
     case unchanged
@@ -15470,7 +15553,7 @@ enum ScrollPinPolicy {
     /// - Content growth never changes origin.y, so it never unpins.
     ///
     /// - Parameters:
-    ///   - originDelta: newOriginY - lastOriginY (negative means the user scrolled up).
+    ///   - originDelta: flip-normalized delta; negative means the user scrolled toward top.
     ///   - gap: distance from the bottom of visible content to the bottom of the document.
     ///   - slack: tolerance in points; gap <= slack is treated as "at bottom".
     /// - Returns: The transition, if any.
@@ -15497,36 +15580,50 @@ enum ScrollPinPolicy {
 /// scroll-up during a fast stream was silently ignored, and the 0.4s guard could
 /// swallow a genuine scroll-away. Two AppKit facts make this version deterministic:
 ///
-///   • A user scroll-up is the ONLY thing that DECREASES the clip view's origin.y;
-///     content growing at the bottom never moves the origin. So origin.y dropping
-///     while we're away from the bottom is an unambiguous "user left the bottom".
+///   • A user scroll toward the top is the only origin change that produces a negative
+///     flip-normalized delta while away from the bottom; content growth does not.
 ///   • When pinned, we re-scroll the clip to the document's true bottom on every
 ///     content-growth notification (i.e. AFTER layout), so a stream always lands
 ///     exactly at the bottom instead of a frame short.
 ///
 /// Crucially this writes SwiftUI @State only on an actual pin<->unpin transition
 /// (never per streaming delta), so it cannot reintroduce the layout-storm freeze
-/// (PERF-MAC_AGENT-021).
+/// (PERF-MAC_AGENT-021). Sticky local detach prevents stream `updateNSView` from
+/// re-arming pin before geometry is at bottom (council T-002).
 private struct TimelineScrollFollower: NSViewRepresentable {
     let slack: CGFloat
     let pinned: Bool
+    let pinForceToken: Int
     let onScrolledAway: () -> Void
     let onReturnedToBottom: () -> Void
 
     func makeNSView(context: Context) -> FollowerView {
         let view = FollowerView()
-        view.configure(slack: slack, pinned: pinned, onScrolledAway: onScrolledAway, onReturnedToBottom: onReturnedToBottom)
+        view.configure(
+            slack: slack,
+            pinned: pinned,
+            pinForceToken: pinForceToken,
+            onScrolledAway: onScrolledAway,
+            onReturnedToBottom: onReturnedToBottom
+        )
         return view
     }
 
     func updateNSView(_ view: FollowerView, context: Context) {
-        view.configure(slack: slack, pinned: pinned, onScrolledAway: onScrolledAway, onReturnedToBottom: onReturnedToBottom)
+        view.configure(
+            slack: slack,
+            pinned: pinned,
+            pinForceToken: pinForceToken,
+            onScrolledAway: onScrolledAway,
+            onReturnedToBottom: onReturnedToBottom
+        )
         view.attach()
     }
 
     final class FollowerView: NSView {
         private var slack: CGFloat = 4
         private var pinned: Bool = true
+        private var lastPinForceToken: Int = 0
         private var onScrolledAway: (() -> Void)?
         private var onReturnedToBottom: (() -> Void)?
 
@@ -15539,18 +15636,56 @@ private struct TimelineScrollFollower: NSViewRepresentable {
         private var pendingBottomSnapWorkItem: DispatchWorkItem?
         private var lastBottomSnapAt: TimeInterval = 0
         private let minimumBottomSnapInterval: TimeInterval = 0.15
+        private var attachRetryCount = 0
+        private let maxAttachRetries = 8
+        #if DEBUG
+        private var didLogDetach = false
+        #endif
 
-        func configure(slack: CGFloat, pinned: Bool, onScrolledAway: @escaping () -> Void, onReturnedToBottom: @escaping () -> Void) {
+        func configure(
+            slack: CGFloat,
+            pinned: Bool,
+            pinForceToken: Int,
+            onScrolledAway: @escaping () -> Void,
+            onReturnedToBottom: @escaping () -> Void
+        ) {
             self.slack = slack
-            // SwiftUI @State is the source of truth; mirror it locally so a content-growth
-            // notification arriving before the next updateNSView still makes the right call.
-            self.pinned = pinned
             self.onScrolledAway = onScrolledAway
             self.onReturnedToBottom = onReturnedToBottom
+
+            let forceTokenChanged = pinForceToken != lastPinForceToken
+            if forceTokenChanged {
+                lastPinForceToken = pinForceToken
+            }
+
+            if !pinned {
+                // Always honor SwiftUI detach immediately; cancel any pending snap.
+                if self.pinned {
+                    cancelPendingSnap()
+                }
+                self.pinned = false
+            } else {
+                let atBottom = geometry()?.atBottom ?? false
+                let accept = ScrollBottomGeometry.shouldAcceptSwiftUIPin(
+                    localPinned: self.pinned,
+                    swiftUIPinned: true,
+                    forceTokenChanged: forceTokenChanged,
+                    geometricallyAtBottom: atBottom
+                )
+                if accept {
+                    self.pinned = true
+                    if forceTokenChanged {
+                        // FAB / send / open: snap now that pin is re-armed.
+                        scheduleScrollToBottom()
+                    }
+                }
+                // else: sticky detach — stream body still reports pinned:true
+            }
         }
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
+            attachRetryCount = 0
             DispatchQueue.main.async { [weak self] in self?.attach() }
         }
 
@@ -15561,7 +15696,22 @@ private struct TimelineScrollFollower: NSViewRepresentable {
         }
 
         func attach() {
-            guard let scroll = enclosingScrollView else { return }
+            guard let scroll = enclosingScrollView else {
+                // Hosting rebuild: retry a few frames so pin never silently detaches.
+                if attachRetryCount < maxAttachRetries {
+                    attachRetryCount += 1
+                    DispatchQueue.main.async { [weak self] in self?.attach() }
+                } else {
+                    #if DEBUG
+                    if !didLogDetach {
+                        didLogDetach = true
+                        NSLog("TimelineScrollFollower: enclosingScrollView nil after retries — auto-scroll pin inactive")
+                    }
+                    #endif
+                }
+                return
+            }
+            attachRetryCount = 0
             guard scroll !== scrollView else { return }
             if let clipObserver { NotificationCenter.default.removeObserver(clipObserver) }
             if let docObserver { NotificationCenter.default.removeObserver(docObserver) }
@@ -15581,21 +15731,39 @@ private struct TimelineScrollFollower: NSViewRepresentable {
             handleScroll()
         }
 
-        private func geometry() -> (origin: CGFloat, gap: CGFloat, atBottom: Bool)? {
+        private func geometry() -> (origin: CGFloat, gap: CGFloat, atBottom: Bool, isFlipped: Bool)? {
             guard let scroll = scrollView, let doc = scroll.documentView else { return nil }
+            // Post-layout height so Lazy materialization is reflected before gap math.
+            doc.layoutSubtreeIfNeeded()
             let origin = scroll.contentView.bounds.origin.y
             let visible = scroll.contentView.bounds.height
-            let content = doc.bounds.height
-            let gap = content - (origin + visible)
-            return (origin, gap, gap <= slack)
+            let content = max(doc.bounds.height, doc.frame.height)
+            let flipped = doc.isFlipped
+            let gap = ScrollBottomGeometry.gap(
+                documentHeight: content,
+                visibleOriginY: origin,
+                visibleHeight: visible,
+                isFlipped: flipped
+            )
+            return (origin, gap, gap <= slack, flipped)
         }
 
-        // The clip view moved. Reaching the bottom re-pins; origin dropping while still
-        // away from the bottom is a genuine user scroll-up (content growth never lowers it).
+        // The clip view moved. Reaching the bottom re-pins; origin moving toward top
+        // while still away from the bottom is a genuine user scroll-up.
         private func handleScroll() {
             guard let g = geometry() else { return }
+            let delta = ScrollBottomGeometry.originDeltaTowardTop(
+                previousOriginY: lastOriginY,
+                currentOriginY: g.origin,
+                isFlipped: g.isFlipped
+            )
             defer { lastOriginY = g.origin }
-            switch ScrollPinPolicy.evaluate(originDelta: g.origin - lastOriginY, gap: g.gap, slack: slack) {
+            // Ignore origin noise while a programmatic snap is in flight.
+            if pendingBottomSnap {
+                if g.atBottom { report(atBottom: true) }
+                return
+            }
+            switch ScrollPinPolicy.evaluate(originDelta: delta, gap: g.gap, slack: slack) {
             case .reachedBottom:  report(atBottom: true)
             case .scrolledAway:   report(atBottom: false)
             case .unchanged:      break
@@ -15613,6 +15781,12 @@ private struct TimelineScrollFollower: NSViewRepresentable {
             }
         }
 
+        private func cancelPendingSnap() {
+            pendingBottomSnapWorkItem?.cancel()
+            pendingBottomSnapWorkItem = nil
+            pendingBottomSnap = false
+        }
+
         private func scheduleScrollToBottom() {
             guard !pendingBottomSnap else { return }
             pendingBottomSnap = true
@@ -15625,6 +15799,10 @@ private struct TimelineScrollFollower: NSViewRepresentable {
                 guard self.pinned, let g = self.geometry() else { return }
                 if g.gap > self.slack {
                     self.scrollToBottom()
+                    // One bounded re-snap if layout grew again during the scroll.
+                    if let after = self.geometry(), after.gap > self.slack, self.pinned {
+                        self.scrollToBottom()
+                    }
                 } else if g.atBottom {
                     self.report(atBottom: true)
                 }
@@ -15635,7 +15813,14 @@ private struct TimelineScrollFollower: NSViewRepresentable {
 
         private func scrollToBottom() {
             guard let scroll = scrollView, let doc = scroll.documentView else { return }
-            let targetY = max(0, doc.bounds.height - scroll.contentView.bounds.height)
+            doc.layoutSubtreeIfNeeded()
+            let visible = scroll.contentView.bounds.height
+            let content = max(doc.bounds.height, doc.frame.height)
+            let targetY = ScrollBottomGeometry.maxScrollOriginY(
+                documentHeight: content,
+                visibleHeight: visible,
+                isFlipped: doc.isFlipped
+            )
             scroll.contentView.scroll(to: NSPoint(x: 0, y: targetY))
             scroll.reflectScrolledClipView(scroll.contentView)
             lastOriginY = targetY
@@ -15646,7 +15831,12 @@ private struct TimelineScrollFollower: NSViewRepresentable {
             guard atBottom != lastAtBottom else { return }
             lastAtBottom = atBottom
             pinned = atBottom
-            if atBottom { onReturnedToBottom?() } else { onScrolledAway?() }
+            if atBottom {
+                onReturnedToBottom?()
+            } else {
+                cancelPendingSnap()
+                onScrolledAway?()
+            }
         }
     }
 }
