@@ -624,6 +624,8 @@ final class AssistantTimelineTests: XCTestCase {
     }
 
     /// Microbench: growing body via + vs appendCapped (n=5 medians).
+    /// Covers both timeline itemDelta and coordinator SR1 provider-text buffer growth
+    /// (AgentRunCoordinator.interceptProviderTextEvent hold path).
     func test_microbench_itemDeltaAppend_appendCappedFasterThanPlusRebuild() {
         let token = String(repeating: "x", count: 32)
         let deltas = 4_000

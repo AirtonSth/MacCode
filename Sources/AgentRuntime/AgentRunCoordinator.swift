@@ -6425,7 +6425,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lock.lock()
             var runBuffers = bufferedProviderTextItems[runId] ?? [:]
             if var buffered = runBuffers[itemId] {
-                buffered.text = AssistantTimelineState.cappedText(buffered.text + delta)
+                // PERF: same O(n²) residual as timeline itemDelta — under the SR1
+                // hold lock, `cappedText(text + delta)` rebuilt the growing buffer
+                // on every token. appendCapped stays under liveTextLimit without
+                // reallocating the full body on the common path.
+                AssistantTimelineState.appendCapped(
+                    &buffered.text,
+                    append: delta,
+                    limit: AssistantTimelineState.liveTextLimit
+                )
                 runBuffers[itemId] = buffered
                 bufferedProviderTextItems[runId] = runBuffers
                 lock.unlock()
