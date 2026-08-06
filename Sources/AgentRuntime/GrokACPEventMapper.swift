@@ -332,10 +332,10 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         let fallback = lastNonEmptyAssistantPhase.trimmingCharacters(in: .whitespacesAndNewlines)
         var final: String? = !trailing.isEmpty ? currentAssistantPhase
             : (!fallback.isEmpty ? lastNonEmptyAssistantPhase : nil)
-        // Stamp only for a COMPLETED turn (end_turn). Never for failed/cancelled.
-        // Single stamp on finalAssistantMessage so both .turnCompleted here and
-        // adapter .finished (which reads the same property) see the marker once.
-        if stopReason == "end_turn", sawDetachedShellSpawn {
+        // Stamp only for COMPLETED-class stop reasons (end_turn, max_tokens, …).
+        // Never for failed/cancelled. Single stamp on finalAssistantMessage so both
+        // .turnCompleted here and adapter .finished see the marker once.
+        if GrokACPTerminalClassifier.isCompletedStopReason(stopReason), sawDetachedShellSpawn {
             final = BackgroundAwaitContinuation.prefixingAwaitingMarker(final)
         }
         finalAssistantMessage = final

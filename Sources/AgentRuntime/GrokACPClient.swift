@@ -356,6 +356,24 @@ struct GrokACPSessionOpenResult {
 }
 
 public enum GrokACPTerminalClassifier {
+    /// ACP session/prompt `stopReason` wire tokens (grok-build / xai-grok-pager).
+    /// Completed-class: end_turn, max_tokens, max_turn_requests, refusal.
+    public static func status(stopReason: String) -> AgentRunStatus {
+        switch stopReason {
+        case "end_turn", "max_tokens", "max_turn_requests", "refusal":
+            return .completed
+        case "cancelled":
+            return .cancelled
+        default:
+            return .failed
+        }
+    }
+
+    /// True for stop reasons that successfully complete the turn (not failed/cancelled).
+    public static func isCompletedStopReason(_ stopReason: String) -> Bool {
+        status(stopReason: stopReason) == .completed
+    }
+
     public static func status(
         promptResolved: Bool,
         cancelRequested: Bool,
@@ -542,8 +560,18 @@ public final class GrokACPClient: @unchecked Sendable {
         return try Self.openResult(result, fallbackSessionId: sessionId)
     }
 
-    func setModel(sessionId: String, modelId: String) async throws {
-        _ = try await requestJSONObject(method: "session/set_model", params: ["sessionId": sessionId, "modelId": modelId], timeout: 15)
+    /// `reasoningEffort` is the ACP `_meta.reasoningEffort` wire value (grok-build
+    /// `REASONING_EFFORT_META_KEY`). Omit when the host has nothing to bind.
+    func setModel(
+        sessionId: String,
+        modelId: String,
+        reasoningEffort: AgentReasoningEffort? = nil
+    ) async throws {
+        var params: JSONObject = ["sessionId": sessionId, "modelId": modelId]
+        if let reasoningEffort {
+            params["_meta"] = ["reasoningEffort": reasoningEffort.rawValue]
+        }
+        _ = try await requestJSONObject(method: "session/set_model", params: params, timeout: 15)
     }
 
     func setMode(sessionId: String, modeId: String) async throws {
@@ -806,7 +834,12 @@ public final class GrokACPClient: @unchecked Sendable {
     }
 
     private func write(_ object: JSONObject) throws {
-        let data = try JSONSerialization.data(withJSONObject: object)
+        // Foundation defaults escape `/` as `\/` (e.g. `session\/prompt`). grok-build
+        // documents that form as a historical ACP envelope hazard; emit canonical paths.
+        let data = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.withoutEscapingSlashes]
+        )
         var line = data
         line.append(0x0A)
         let toWrite: Data

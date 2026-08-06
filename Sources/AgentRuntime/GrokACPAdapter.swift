@@ -68,6 +68,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         let capabilities: GrokACPInitializeResult
         let mapper: GrokACPEventMapper
         var model: String
+        /// Last effort bound via `session/set_model` `_meta.reasoningEffort`.
+        var reasoningEffort: AgentReasoningEffort?
         let availableModeIDs: Set<String>
         let planModeID: String?
         var mode: String?
@@ -99,6 +101,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             capabilities: GrokACPInitializeResult,
             mapper: GrokACPEventMapper,
             model: String,
+            reasoningEffort: AgentReasoningEffort? = nil,
             availableModeIDs: Set<String>,
             planModeID: String?,
             mode: String?,
@@ -110,6 +113,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             self.capabilities = capabilities
             self.mapper = mapper
             self.model = model
+            self.reasoningEffort = reasoningEffort
             self.availableModeIDs = availableModeIDs
             self.planModeID = planModeID
             self.mode = mode
@@ -656,9 +660,20 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
 
         do {
             let model = request.model.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !model.isEmpty, model != session.model {
-                try await session.client.setModel(sessionId: session.providerThreadId, modelId: model)
-                synchronized { session.model = model }
+            let targetModel = model.isEmpty ? session.model : model
+            let targetEffort = request.reasoningEffort
+            let needsModelBind = !model.isEmpty && model != session.model
+            let needsEffortBind = targetEffort != session.reasoningEffort
+            if needsModelBind || needsEffortBind {
+                try await session.client.setModel(
+                    sessionId: session.providerThreadId,
+                    modelId: targetModel,
+                    reasoningEffort: targetEffort
+                )
+                synchronized {
+                    if needsModelBind { session.model = model }
+                    session.reasoningEffort = targetEffort
+                }
             }
             let requestedMode: String?
             if request.interactionMode == .plan {
@@ -846,12 +861,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         let metadata = response["_meta"] as? [String: Any]
         let usage = metadata?["usage"] as? [String: Any]
         for event in session.mapper.finishTurn(stopReason: stopReason, usage: usage) { emit(event, session: session) }
-        let status: AgentRunStatus
-        switch stopReason {
-        case "end_turn": status = .completed
-        case "cancelled": status = .cancelled
-        default: status = .failed
-        }
+        let status = GrokACPTerminalClassifier.status(stopReason: stopReason)
         if status == .failed {
             session.onEvent?(.error(GrokACPFailureTaxonomy.normalize(
                 diagnostic: "Grok ACP stopped: \(stopReason)",
