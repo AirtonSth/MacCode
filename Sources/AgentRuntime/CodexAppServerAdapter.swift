@@ -166,7 +166,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case mcpElicitation(requestedSchema: [String: Any]?)
     }
 
-    /// Server-to-client methods in the Codex 0.144.4 app-server schema. Keep the
+    /// Server-to-client methods in the Codex 0.146.0 app-server schema. Keep the
     /// inventory explicit so a protocol upgrade cannot silently fall through as
     /// an unknown callback with no ownership decision.
     static let currentServerRequestMethods: Set<String> = [
@@ -178,7 +178,6 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         "item/tool/call",
         "account/chatgptAuthTokens/refresh",
         "attestation/generate",
-        "currentTime/read",
         "applyPatchApproval",
         "execCommandApproval"
     ]
@@ -463,7 +462,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let providerResponse: [String: Any]
         switch pending.responseKind {
         case .legacyDecision:
-            payload["decision"] = Self.codexDecision(response)
+            let decision = Self.codexDecision(response, kind: pending.kind)
+            payload["decision"] = decision
             if response == .approveForSession {
                 do {
                     try await promoteSessionPermission(threadId: threadId, to: .fullAccess)
@@ -477,7 +477,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                     throw error
                 }
             }
-            providerResponse = ["decision": Self.codexDecision(response)]
+            providerResponse = ["decision": decision]
         case .permissions(let requested):
             providerResponse = Self.permissionsApprovalResponse(requested: requested, response: response)
             payload.merge(providerResponse) { _, new in new }
@@ -997,7 +997,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             return try await awaitApproval(method: method, payload: payload, threadId: threadId, kind: .exec)
         case "item/tool/requestUserInput", "item.tool.requestUserInput", "mcpServer/elicitation/request":
             return try await awaitUserInput(method: method, payload: payload, threadId: threadId)
-        case "item/tool/call", "account/chatgptAuthTokens/refresh", "attestation/generate", "currentTime/read":
+        case "item/tool/call", "account/chatgptAuthTokens/refresh", "attestation/generate":
             emit([runtimeEvent(method: method, payload: payload)], threadId: threadId)
             throw AgentProviderAdapterError.unsupported("Recognized Codex app-server request is not supported by this client: \(method)")
         default:
@@ -1020,7 +1020,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             if isPermissionsRequest, let requestedPermissions {
                 return ["permissions": requestedPermissions, "scope": "session"]
             }
-            return ["decision": "acceptForSession"]
+            // Session auto-approve must use the method's decision dialect
+            // (accept* vs ReviewDecision) or Codex 0.146 rejects the response.
+            return ["decision": Self.sessionAutoApproveDecision(for: kind)]
         }
         let requestId = UUID().uuidString
         let turnId = string(payload, "turnId")
@@ -2218,7 +2220,29 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         payload[key] as? String
     }
 
-    private static func codexDecision(_ response: AgentProviderRequestResponse) -> String {
+    /// Map a UI approval response to the Codex decision dialect for `kind`.
+    ///
+    /// Codex 0.146 splits dialects:
+    /// - `item/commandExecution|fileChange|fileRead/...` → accept/acceptForSession/decline/cancel
+    /// - legacy `applyPatchApproval` / `execCommandApproval` → ReviewDecision
+    ///   (`approved` / `approved_for_session` / `{denied:{rejection}}` / `abort`)
+    private static func codexDecision(_ response: AgentProviderRequestResponse, kind: AssistantRequestKind) -> Any {
+        if usesReviewDecisionDialect(kind) {
+            return reviewDecision(response)
+        }
+        return acceptDecision(response)
+    }
+
+    private static func usesReviewDecisionDialect(_ kind: AssistantRequestKind) -> Bool {
+        switch kind {
+        case .applyPatch, .exec:
+            return true
+        case .commandExecution, .fileRead, .fileChange, .toolUserInput, .dynamic, .authTokensRefresh:
+            return false
+        }
+    }
+
+    private static func acceptDecision(_ response: AgentProviderRequestResponse) -> String {
         switch response {
         case .approve:
             return "accept"
@@ -2231,7 +2255,25 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
     }
 
-    /// Codex 0.144.4 dynamic-permission callbacks do not accept the legacy
+    private static func reviewDecision(_ response: AgentProviderRequestResponse) -> Any {
+        switch response {
+        case .approve:
+            return "approved"
+        case .approveForSession:
+            return "approved_for_session"
+        case .decline(let reason):
+            return ["denied": ["rejection": reason ?? "declined"]]
+        case .cancel:
+            return "abort"
+        }
+    }
+
+    /// Full-access session auto-approve uses the same dialect as interactive decisions.
+    private static func sessionAutoApproveDecision(for kind: AssistantRequestKind) -> String {
+        usesReviewDecisionDialect(kind) ? "approved_for_session" : "acceptForSession"
+    }
+
+    /// Codex 0.146 dynamic-permission callbacks do not accept the legacy
     /// `{decision}` shape. Grant exactly the profile the provider requested;
     /// decline/cancel return an empty profile rather than widening the thread to
     /// full-access. Session approval is expressed by the protocol's own scope.
