@@ -76,7 +76,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         var activeTurnId: String?
         var threadStatusType: String?
         var pendingFinish: PendingFinish?
-        /// Watchdog that releases `pendingFinish` after absolute max wall clock.
+        /// Inactivity watchdog for a withheld finish (re-armed by live activity).
+        /// No absolute wall-clock max — continuous thread/status or process output
+        /// keeps the deferral alive; only true quiet flushes.
         var pendingFinishWatchdog: DispatchWorkItem?
         var status: AgentRunStatus
         var onEvent: (@Sendable (AgentRunEvent) -> Void)?
@@ -109,7 +111,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         /// `.finished` — including the deferred PendingFinish release path.
         /// We still do NOT defer the terminal for detached work (Codex never
         /// auto-resumes shell-detached children; withholding would hang until
-        /// thread status flips or the watchdog).
+        /// thread status flips idle).
         ///
         /// Accepted false-positive: a turn that backgrounds a long-lived process
         /// as the deliverable (e.g. starts a dev server) is marked awaiting once;
@@ -131,8 +133,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let finalMessage: String?
         let providerThreadId: String?
         let turnId: String?
-        /// Wall-clock when the finish was withheld waiting for thread idle.
-        /// Absolute max is measured from this and is not extended by later events.
+        /// Wall-clock when the finish was withheld waiting for thread idle
+        /// (forensics only; release is idle-driven, not absolute-max-driven).
         let deferredAt: Date
     }
 
@@ -195,10 +197,12 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     private let rollbackTimeout: TimeInterval
     /// Bounded resume retries after a desynchronized `thread/resume` timeout.
     private let threadResumeRetryPolicy: CodexThreadResumeRetryPolicy
-    /// Hard wall-clock cap for PendingFinish deferral (turn/completed while
-    /// thread still active). Matches Claude absolute max so Working cannot
-    /// stick for hours if `thread/status` never goes idle.
-    private let pendingFinishAbsoluteMaxTimeout: TimeInterval
+    /// Quiet bound for a withheld `.finished` while the thread is still active.
+    /// Fully re-armed by live notifications (status, process output, items).
+    /// There is no absolute wall-clock max — only true quiet flushes so goals
+    /// with continuous app-server activity can run long, while wedged deferrals
+    /// still release (and unblock follow-up sends).
+    private let pendingFinishInactivityTimeout: TimeInterval
 
     // Model-list cache (guarded by `lock`).
     private var cachedModels: [AgentModelDescriptor]? = nil
@@ -215,14 +219,14 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 modelListDiscovery: (@Sendable () async -> [AgentModelDescriptor])? = nil,
                 forkProtocolSupportOverride: CodexForkProtocolSupport? = nil,
                 threadResumeRetryPolicy: CodexThreadResumeRetryPolicy = .production,
-                pendingFinishAbsoluteMaxTimeout: TimeInterval = 900) {
+                pendingFinishInactivityTimeout: TimeInterval = 900) {
         self.binaryNameOverride = binaryNameOverride
         self.usesCustomClientFactory = clientFactory != nil
         self.forkProtocolSupportOverride = forkProtocolSupportOverride
         self.openTimeout = openTimeout
         self.rollbackTimeout = rollbackTimeout
         self.threadResumeRetryPolicy = threadResumeRetryPolicy
-        self.pendingFinishAbsoluteMaxTimeout = max(0.01, pendingFinishAbsoluteMaxTimeout)
+        self.pendingFinishInactivityTimeout = max(0.01, pendingFinishInactivityTimeout)
         self.modelCacheTTL = modelCacheTTL
         if let modelListDiscovery {
             self.modelListDiscovery = modelListDiscovery
@@ -357,6 +361,17 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         // follow-up turn is still allowed; only a true concurrent start is
         // rejected, instead of silently replacing the session via recordSession
         // and misrouting the prior turn's events.
+        //
+        // Wedged pendingFinish (idle missed, reconcile stuck) must not permanently
+        // block send: flush the withheld finish first (Claude new_turn parity),
+        // then re-evaluate in-flight. Still reject while the app-server reports
+        // the thread active.
+        flushPendingFinishIfStillDeferred(
+            threadId: request.threadId,
+            expectedTurnId: nil,
+            reason: "new_turn",
+            onlyIfThreadInactive: true
+        )
         lock.lock()
         let session = sessions[request.threadId]
         let hasInFlightTurn = session?.status == .running
@@ -1617,6 +1632,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             // PERF: use onEventCallback to avoid a second full-Session copy for the terminal event.
             SessionEventEmitter(onEvent: onEventCallback(threadId: threadId))
                 .broadcastEvent(finished)
+        } else {
+            // Live app-server activity while a finish is withheld re-arms the
+            // quiet bound so progressive nested work is not force-finished.
+            refreshPendingFinishWatchdog(threadId: threadId)
         }
     }
 
@@ -1849,28 +1868,49 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         return Self.isActiveThreadStatus(sessions[threadId]?.threadStatusType)
     }
 
+    /// Hold `.finished` until the thread reports idle, or until true quiet
+    /// exceeds `pendingFinishInactivityTimeout`. No absolute wall-clock max:
+    /// continuous app-server activity fully re-arms the quiet bound.
     private func recordPendingFinish(threadId: AgentThreadID, pending: PendingFinish) {
         lock.lock()
         sessions[threadId]?.pendingFinishWatchdog?.cancel()
         sessions[threadId]?.pendingFinish = pending
+        lock.unlock()
+        refreshPendingFinishWatchdog(threadId: threadId)
+    }
+
+    /// (Re)arm quiet bound for a withheld finish. No-op unless deferral is live.
+    private func refreshPendingFinishWatchdog(threadId: AgentThreadID) {
+        lock.lock()
+        guard sessions[threadId]?.pendingFinish != nil else {
+            lock.unlock()
+            return
+        }
+        sessions[threadId]?.pendingFinishWatchdog?.cancel()
+        let expectedTurnId = sessions[threadId]?.pendingFinish?.turnId
+        let delay = pendingFinishInactivityTimeout
         let item = DispatchWorkItem { [weak self] in
             self?.flushPendingFinishIfStillDeferred(
                 threadId: threadId,
-                expectedTurnId: pending.turnId,
-                reason: "pending_finish_absolute_max"
+                expectedTurnId: expectedTurnId,
+                reason: "pending_finish_inactivity",
+                onlyIfThreadInactive: false
             )
         }
         sessions[threadId]?.pendingFinishWatchdog = item
-        let delay = pendingFinishAbsoluteMaxTimeout
         lock.unlock()
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: item)
     }
 
-    /// Releases a withheld `.finished` when thread status never goes idle in time.
+    /// Releases a withheld `.finished` using the original pending payload.
+    /// - Parameter onlyIfThreadInactive: when true (new user turn), skip flush
+    ///   while the app-server still reports the thread active so concurrent work
+    ///   is not clobbered.
     private func flushPendingFinishIfStillDeferred(
         threadId: AgentThreadID,
         expectedTurnId: String?,
-        reason: String
+        reason: String,
+        onlyIfThreadInactive: Bool
     ) {
         lock.lock()
         guard var session = sessions[threadId],
@@ -1879,6 +1919,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             return
         }
         if let expectedTurnId, let pendingTurn = pending.turnId, expectedTurnId != pendingTurn {
+            lock.unlock()
+            return
+        }
+        if onlyIfThreadInactive, Self.isActiveThreadStatus(session.threadStatusType) {
             lock.unlock()
             return
         }
@@ -1897,7 +1941,6 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                     providerThreadId: pending.providerThreadId
                 )
             )
-        // Forensic marker (same class as Grok/Claude absolute flush).
         if let onEvent {
             let data = (try? JSONSerialization.data(
                 withJSONObject: ["reason": reason, "turnId": pending.turnId as Any],
@@ -1906,7 +1949,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             onEvent(.event(.providerRuntime(ProviderRuntimeEvent(
                 provider: .codex,
                 source: "codex.app-server",
-                method: "codex.pending_finish.absolute_max",
+                method: "codex.pending_finish.inactivity",
                 providerTurnId: pending.turnId,
                 providerItemId: nil,
                 payloadJSON: String(data: data, encoding: .utf8) ?? "{}",
@@ -2049,20 +2092,29 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             return false
         }
 
-        let bufferedFinal: String? = {
+        // Prefer the withheld pending payload (preserves [[RC_AWAITING]] stamps).
+        // When we deferred after turn/completed, turnCompleted was already
+        // emitted — do not duplicate it on reconcile release.
+        let release: (final: String?, skipTurnCompleted: Bool)? = {
             lock.lock(); defer { lock.unlock() }
             guard let live = sessions[threadId],
                   live.turnReconcileGeneration == generation,
-                  live.status == .running || live.activeTurnId != nil
+                  live.status == .running || live.activeTurnId != nil || live.pendingFinish != nil
             else { return nil }
-            return live.finalAssistantMessage
+            if let pending = live.pendingFinish {
+                return (pending.finalMessage, true)
+            }
+            let already = live.completedTurnIds.contains(turnId)
+            return (live.finalAssistantMessage.isEmpty ? nil : live.finalAssistantMessage, already)
         }()
-        guard let bufferedFinal else { return true }
+        guard let release else { return true }
 
         mergeCompletedTurnIds(threadId: threadId, turnIds: Self.turnIds(fromThreadReadResponse: response))
-        let final = Self.finalMessageFromThreadRead(response, turnId: turnId)
-            ?? (bufferedFinal.isEmpty ? nil : bufferedFinal)
-        emit([.turnCompleted(turnId: turnId, finalMessage: final)], threadId: threadId)
+        let final = release.final
+            ?? Self.finalMessageFromThreadRead(response, turnId: turnId)
+        if !release.skipTurnCompleted {
+            emit([.turnCompleted(turnId: turnId, finalMessage: final)], threadId: threadId)
+        }
         markFinished(threadId: threadId, status: .completed, turnId: turnId)
         SessionEventEmitter(onEvent: onEventCallback(threadId: threadId))
             .broadcastEvent(

@@ -2213,19 +2213,18 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                        "with no resumed turn to supersede it, the withheld finish is what settles the run")
     }
 
-    func test_deferredFinishAbsoluteMaxIgnoresStreamHeartbeats() async throws {
-        // WHY: every stream line used to reset only the inactivity timer. A CLI
-        // that heartbeats forever with sticky pending tasks kept Working for hours
-        // (incident: final answer painted, Working for 97m). Absolute max from
-        // deferredAt must flush regardless of later lines.
+    func test_deferredFinishDoesNotForceTerminalWhileStreamProgressContinues() async throws {
+        // WHY: real bg lifecycle progress must re-arm inactivity so long nested
+        // work is not force-finished. Generic status heartbeats must NOT re-arm
+        // (see test_deferredFinishStatusHeartbeatsDoNotReArmInactivity).
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("rc2-claude-absmax-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("rc2-claude-no-absmax-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         let script = tmp.appendingPathComponent("fake-claude")
         try """
         #!/usr/bin/env python3
         import json, sys, time
-        S = "claude-absmax-session"
+        S = "claude-no-absmax-session"
         def e(o):
             print(json.dumps(o), flush=True)
         e({"type":"system","subtype":"init","session_id":S})
@@ -2235,17 +2234,18 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
             e({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"T1","task_type":"local_bash"}],"session_id":S})
             e({"type":"assistant","message":{"content":[{"type":"text","text":"DONE_PREMATURE"}]},"session_id":S})
             e({"type":"result","subtype":"success","is_error":False,"result":"DONE_PREMATURE","session_id":S})
-            # Heartbeats that used to postpone inactivity forever:
-            for _ in range(40):
-                time.sleep(0.05)
-                e({"type":"system","subtype":"status","session_id":S,"message":"heartbeat"})
+            # Real bg lifecycle progress longer than a short inactivity window.
+            for i in range(12):
+                time.sleep(0.08)
+                e({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"T1","task_type":"local_bash","status":"running"}],"session_id":S})
+            # Quiet: inactivity may flush after this.
+            time.sleep(2)
         """.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
 
         let adapter = ClaudeStreamingCLIAdapter(
             binaryNameOverride: script.path,
-            deferredFinishInactivityTimeout: 30, // would never fire under heartbeats
-            deferredFinishAbsoluteMaxTimeout: 0.35,
+            deferredFinishInactivityTimeout: 0.3,
             deferredFinishPostIdleTimeout: 30
         )
         let threadId = AgentThreadID()
@@ -2259,16 +2259,76 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         )) { event in
             Task { await sink.record(event) }
         }
-        let deadline = Date().addingTimeInterval(3)
+        // During progress window (~1s), finish must not have been forced.
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        var finishes = Self.finishedPairs(await sink.snapshot())
+        XCTAssertEqual(finishes.count, 0,
+                       "bg lifecycle progress must re-arm inactivity — no absolute max force-finish")
+
+        let deadline = Date().addingTimeInterval(4)
         while Date() < deadline {
-            let finished = await sink.snapshot().contains { if case .finished = $0 { return true }; return false }
-            if finished { break }
+            finishes = Self.finishedPairs(await sink.snapshot())
+            if !finishes.isEmpty { break }
             try? await Task.sleep(nanoseconds: 30_000_000)
         }
-        let finishes = Self.finishedPairs(await sink.snapshot())
         XCTAssertEqual(finishes.count, 1,
-                       "absolute max must force terminal even while stream heartbeats keep firing")
+                       "true quiet after progress still flushes via inactivity")
         XCTAssertEqual(finishes.first?.1, "DONE_PREMATURE")
+        try? adapter.stopSession(threadId: threadId)
+    }
+
+    func test_deferredFinishStatusHeartbeatsDoNotReArmInactivity() async throws {
+        // WHY: sticky pending + system/status keepalives used to re-arm forever
+        // (97m Working). Heartbeats must not postpone inactivity flush.
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-hb-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let script = tmp.appendingPathComponent("fake-claude")
+        try """
+        #!/usr/bin/env python3
+        import json, sys, time
+        S = "claude-hb-session"
+        def e(o):
+            print(json.dumps(o), flush=True)
+        e({"type":"system","subtype":"init","session_id":S})
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            e({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"T1","task_type":"local_bash"}],"session_id":S})
+            e({"type":"assistant","message":{"content":[{"type":"text","text":"STANDING_BY"}]},"session_id":S})
+            e({"type":"result","subtype":"success","is_error":False,"result":"STANDING_BY","session_id":S})
+            for i in range(40):
+                time.sleep(0.05)
+                e({"type":"system","subtype":"status","session_id":S,"message":f"heartbeat {i}"})
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let adapter = ClaudeStreamingCLIAdapter(
+            binaryNameOverride: script.path,
+            deferredFinishInactivityTimeout: 0.35,
+            deferredFinishPostIdleTimeout: 30
+        )
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "sticky bg + heartbeats"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        let deadline = Date().addingTimeInterval(3)
+        var finishes: [(AgentRunStatus, String?)] = []
+        while Date() < deadline {
+            finishes = Self.finishedPairs(await sink.snapshot())
+            if !finishes.isEmpty { break }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+        XCTAssertEqual(finishes.count, 1,
+                       "status heartbeats must not re-arm inactivity — quiet flush must settle Working")
+        XCTAssertEqual(finishes.first?.1, "STANDING_BY")
         try? adapter.stopSession(threadId: threadId)
     }
 
@@ -2302,7 +2362,6 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         let adapter = ClaudeStreamingCLIAdapter(
             binaryNameOverride: script.path,
             deferredFinishInactivityTimeout: 30,
-            deferredFinishAbsoluteMaxTimeout: 30,
             deferredFinishPostIdleTimeout: 0.25
         )
         let threadId = AgentThreadID()

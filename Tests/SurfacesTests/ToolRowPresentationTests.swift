@@ -262,9 +262,10 @@ final class ToolRowPresentationTests: XCTestCase {
         XCTAssertEqual(AgentTimelineItemPresentation.toolDurationLabel(for: item), "12s")
     }
 
-    func test_toolDurationLabel_streamingStaysNilInV1() {
-        // WHY: per-row live clocks are a known transcript perf trap; "Working for Xs"
-        // already covers the active run. Streaming must not paint a duration.
+    func test_toolDurationLabel_ordinaryStreamingStaysNil() {
+        // WHY: per-row live clocks are a known transcript perf trap for ordinary tools;
+        // "Working for Xs" already covers the active run. Only background / task-wait
+        // streaming rows opt into live elapsed (with nowMs).
         let item = AssistantItem(
             id: "i", turnId: "t", type: .tool, state: .streaming,
             summary: "Bash", body: #"{"command":"sleep 1"}"#,
@@ -272,6 +273,168 @@ final class ToolRowPresentationTests: XCTestCase {
         )
         XCTAssertNil(AgentTimelineItemPresentation.toolDurationLabel(for: item))
         XCTAssertNil(AgentTimelineItemPresentation.toolDurationLabel(for: item, nowMs: 90_000))
+        XCTAssertFalse(AgentTimelineItemPresentation.showsLiveToolElapsed(for: item))
+    }
+
+    func test_toolDurationLabel_backgroundStreamingShowsLiveElapsed() {
+        // WHY: background shells can run for minutes with an empty body — without a
+        // live chip the row looks frozen even though the host is fine.
+        let item = AssistantItem(
+            id: "i", turnId: "t", type: .tool, state: .streaming,
+            summary: "[bg] long job",
+            body: #"{"command":"sleep 600","background":true}"#,
+            startedAtMs: 1_000
+        )
+        XCTAssertTrue(AgentTimelineItemPresentation.showsLiveToolElapsed(for: item))
+        XCTAssertNil(AgentTimelineItemPresentation.toolDurationLabel(for: item),
+                     "without nowMs the pure helper must not invent a wall clock")
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.toolDurationLabel(for: item, nowMs: 1_000 + 113_000),
+            "1m 53s"
+        )
+        XCTAssertNil(
+            AgentTimelineItemPresentation.toolDurationLabel(for: item, nowMs: 1_400),
+            "sub-second live elapsed stays suppressed to avoid first-paint flicker"
+        )
+    }
+
+    func test_taskWaitTool_liveStatusAndActivityHint() {
+        // WHY: Get task output is the primary "looks stuck" surface — Waiting + hint
+        // must work from task_ids payloads even when stdout is empty.
+        let item = AssistantItem(
+            id: "i", turnId: "t", type: .tool, state: .streaming,
+            summary: "Get task output: call-3566c18b-b595-4299-91fe-088abdba8159-25",
+            body: #"{"task_ids":[1],"timeout_ms":600000}"#,
+            startedAtMs: 10_000
+        )
+        XCTAssertTrue(AgentTimelineItemPresentation.isTaskWaitTool(for: item))
+        XCTAssertTrue(AgentTimelineItemPresentation.showsLiveToolElapsed(for: item))
+        XCTAssertEqual(AgentTimelineItemPresentation.toolStreamingStatusLabel(for: item), "Waiting")
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.make(for: item).verb, "Waiting",
+            "L1 verb must match Waiting so the row never reads Running…Waiting"
+        )
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.toolActivityHint(for: item, hasOutput: false),
+            "No output yet · background task still running"
+        )
+        XCTAssertNil(
+            AgentTimelineItemPresentation.toolActivityHint(for: item, hasOutput: true),
+            "once output arrives the empty-wait strip must hide"
+        )
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.toolDurationLabel(for: item, nowMs: 10_000 + 12_000),
+            "12s"
+        )
+        XCTAssertTrue(AgentTimelineItemPresentation.toolCanExpandWithoutOutput(for: item))
+
+        let a11y = AgentTimelineItemPresentation.toolAccessibilityLabel(for: item, nowMs: 10_000 + 12_000)
+        XCTAssertTrue(a11y.localizedCaseInsensitiveContains("waiting"))
+        XCTAssertTrue(a11y.contains("12s"))
+        XCTAssertTrue(a11y.localizedCaseInsensitiveContains("no output yet"))
+    }
+
+    func test_taskWaitTool_completedDoesNotExpandOrClaimWaiting() {
+        // WHY: dead chevron + VO "waiting" after a finished empty poll is a false liveness claim.
+        let item = AssistantItem(
+            id: "i", turnId: "t", type: .tool, state: .completed,
+            summary: "Get task output",
+            body: #"{"task_ids":[1],"timeout_ms":600000}"#,
+            startedAtMs: 10_000, finishedAtMs: 40_000
+        )
+        XCTAssertTrue(AgentTimelineItemPresentation.isTaskWaitTool(for: item))
+        XCTAssertFalse(AgentTimelineItemPresentation.showsLiveToolElapsed(for: item))
+        XCTAssertFalse(AgentTimelineItemPresentation.toolCanExpandWithoutOutput(for: item))
+        let a11y = AgentTimelineItemPresentation.toolAccessibilityLabel(for: item)
+        XCTAssertFalse(
+            a11y.localizedCaseInsensitiveContains("waiting for task output"),
+            "completed task-wait must not keep the active-wait a11y fragment; got \(a11y)"
+        )
+        XCTAssertTrue(a11y.localizedCaseInsensitiveContains("ran"))
+    }
+
+    func test_isTaskWaitTool_doesNotMisclassifyShellWithTaskIdNoise() {
+        let shell = toolItem(
+            body: #"{"command":"echo hi","task_id":"x"}"#,
+            summary: "Bash"
+        )
+        XCTAssertFalse(AgentTimelineItemPresentation.isTaskWaitTool(for: shell))
+        XCTAssertEqual(AgentTimelineItemPresentation.toolStreamingStatusLabel(for: AssistantItem(
+            id: "i", turnId: "t", type: .tool, state: .streaming,
+            summary: "Bash", body: #"{"command":"echo"}"#, startedAtMs: 0
+        )), "Running")
+    }
+
+    func test_isTaskWaitTool_classifiesClaudeBashOutput() {
+        // WHY: Claude collects bg shell via BashOutput / bash_id — same freeze feel as Grok polls.
+        let bySummary = AssistantItem(
+            id: "i", turnId: "t", type: .tool, state: .streaming,
+            summary: "BashOutput", body: #"{"bash_id":"b1"}"#, startedAtMs: 0
+        )
+        XCTAssertTrue(AgentTimelineItemPresentation.isTaskWaitTool(for: bySummary))
+        XCTAssertTrue(AgentTimelineItemPresentation.showsLiveToolElapsed(for: bySummary))
+        let byKey = AssistantItem(
+            id: "j", turnId: "t", type: .tool, state: .streaming,
+            summary: "Tool", body: #"{"bash_id":"abc-123"}"#, startedAtMs: 0
+        )
+        XCTAssertTrue(AgentTimelineItemPresentation.isTaskWaitTool(for: byKey))
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.toolCommandPreview(for: byKey),
+            "bash abc-123"
+        )
+    }
+
+    func test_liveWaitToolsStayUngroupedSoPhaseAIsVisible() {
+        // WHY: collapsed "Running 2 commands…" hides Waiting + elapsed; bg + Get task output
+        // must stay inline so the freeze-fix UI mounts without expand.
+        let bg = AssistantItem(
+            id: "bg", turnId: "t", type: .tool, state: .completed,
+            summary: "[bg] sleep", body: #"{"command":"sleep 600","background":true}"#,
+            startedAtMs: 1_000, finishedAtMs: 1_100
+        )
+        let wait = AssistantItem(
+            id: "wait", turnId: "t", type: .tool, state: .streaming,
+            summary: "Get task output",
+            body: #"{"task_ids":[1],"timeout_ms":600000}"#,
+            startedAtMs: 1_200
+        )
+        XCTAssertTrue(AgentTimelineItemPresentation.mustKeepToolsUngrouped([bg, wait]))
+        let blocks = AgentAppView.turnRenderBlocks([bg, wait])
+        XCTAssertEqual(blocks.count, 2, "live wait pair must not fold into one group")
+        XCTAssertFalse(isGroup(blocks[0]))
+        XCTAssertFalse(isGroup(blocks[1]))
+        XCTAssertEqual(AgentAppView.turnRenderBlockCount([bg, wait]), 2)
+
+        // Ordinary completed burst still groups (density invariant).
+        let ordinary = (0..<3).map {
+            AssistantItem(
+                id: "m\($0)", turnId: "t", type: .mcpToolCall, state: .completed,
+                summary: "MCP", body: "{}", startedAtMs: 0, finishedAtMs: 1
+            )
+        }
+        XCTAssertFalse(AgentTimelineItemPresentation.mustKeepToolsUngrouped(ordinary))
+        XCTAssertEqual(AgentAppView.turnRenderBlocks(ordinary).count, 1)
+        XCTAssertEqual(AgentAppView.turnRenderBlockCount(ordinary), 1)
+    }
+
+    func test_toolGroupSummary_usesWaitingWhenLiveTaskWaitPresent() {
+        let wait = AssistantItem(
+            id: "wait", turnId: "t", type: .tool, state: .streaming,
+            summary: "Get task output",
+            body: #"{"task_ids":[1]}"#,
+            startedAtMs: 0
+        )
+        let other = AssistantItem(
+            id: "x", turnId: "t", type: .tool, state: .completed,
+            summary: "Bash", body: #"{"command":"echo"}"#,
+            startedAtMs: 0, finishedAtMs: 1
+        )
+        XCTAssertEqual(
+            AgentAppView.toolGroupSummary([other, wait]),
+            "Waiting 2 commands…",
+            "defense path if a group still contains a live wait"
+        )
+        XCTAssertEqual(AgentAppView.liveElapsedAnchor(in: [other, wait])?.id, "wait")
     }
 
     func test_toolDurationLabel_suppressesSubSecondFinished() {

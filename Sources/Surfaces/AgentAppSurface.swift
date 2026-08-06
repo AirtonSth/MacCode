@@ -7541,6 +7541,75 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         return false
     }
 
+    /// True when this tool is a wait/poll on background task output
+    /// (Grok `Get task output`, Claude `BashOutput` / `bash_id`, task_ids + timeout, etc.).
+    /// These rows are the ones that feel "stuck" without a live heartbeat.
+    static func isTaskWaitTool(for item: AssistantItem) -> Bool {
+        let summary = (item.summary ?? "").lowercased()
+        if summary.contains("get task output")
+            || summary.contains("task output")
+            || summary.contains("await task")
+            || summary.contains("wait for task")
+            || summary.contains("bashoutput")
+            || summary.contains("bash output")
+            || summary.contains("bash_output") {
+            return true
+        }
+        guard let obj = toolInputObject(for: item) else { return false }
+        let hasWaitKey = obj["task_ids"] != nil
+            || obj["task_id"] != nil
+            || obj["bash_id"] != nil
+        guard hasWaitKey else { return false }
+        // Shell tools can also carry ids; only treat as wait when there is no command body.
+        for key in ["command", "cmd", "script"] {
+            if let value = (obj[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !value.isEmpty {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Live per-row clocks are reserved for wait/background tools only.
+    /// Ordinary foreground tools stay off the tick path (perf + "Working for" covers them).
+    static func showsLiveToolElapsed(for item: AssistantItem) -> Bool {
+        guard item.state == .streaming else { return false }
+        return isBackgroundTool(for: item) || isTaskWaitTool(for: item)
+    }
+
+    /// True when a consecutive tool run must stay ungrouped so live wait UI is not buried
+    /// under a collapsed "Running N commands…" header.
+    static func mustKeepToolsUngrouped(_ items: [AssistantItem]) -> Bool {
+        items.contains { showsLiveToolElapsed(for: $0) }
+    }
+
+    /// Leading/trailing streaming status — "Waiting" for task polls so color is not the only signal.
+    static func toolStreamingStatusLabel(for item: AssistantItem) -> String {
+        if isTaskWaitTool(for: item) { return "Waiting" }
+        return "Running"
+    }
+
+    /// Collapsed liveness copy when a long wait has not produced tool output yet.
+    /// WHY: without this, Background / Get task output rows look frozen for minutes.
+    static func toolActivityHint(for item: AssistantItem, hasOutput: Bool) -> String? {
+        guard item.state == .streaming, !hasOutput else { return nil }
+        if isTaskWaitTool(for: item) {
+            return "No output yet · background task still running"
+        }
+        if isBackgroundTool(for: item) {
+            return "No output yet · command still running in background"
+        }
+        return nil
+    }
+
+    /// Expand affordance for *streaming* wait rows before stdout arrives (timeout / status).
+    /// Completed/failed waits must not keep a dead chevron or "waiting" a11y claim.
+    static func toolCanExpandWithoutOutput(for item: AssistantItem) -> Bool {
+        guard item.state == .streaming else { return false }
+        if isTaskWaitTool(for: item) { return true }
+        return showsLiveToolElapsed(for: item)
+    }
+
     /// Token Saver distill wrapper was present on the command (display chip only).
     static func toolCommandWasDistilled(for item: AssistantItem) -> Bool {
         guard let raw = rawShellCommand(for: item) ?? toolCommandPreview(for: item) else { return false }
@@ -7553,13 +7622,16 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         return formatDurationMs(elapsedMs)
     }
 
-    /// Duration for finished timeline items only (≥1s). Streaming stays nil in v1 —
-    /// no per-row live clock (perf + "Working for Xs" already covers the active run).
+    /// Duration label for finished tools (≥1s), plus live elapsed for background/task-wait
+    /// streaming tools when `nowMs` is supplied by an `ElapsedTickSchedule` TimelineView.
     static func toolDurationLabel(for item: AssistantItem, nowMs: Int64? = nil) -> String? {
-        _ = nowMs // reserved for a future ElapsedTickSchedule path
         switch item.state {
         case .streaming:
-            return nil
+            guard showsLiveToolElapsed(for: item), let nowMs else { return nil }
+            let elapsedMs = max(0, Int(nowMs - item.startedAtMs))
+            // Match finished-row floor: avoid "0s" / sub-second flicker on first paint.
+            guard elapsedMs >= 1_000 else { return nil }
+            return formatDurationMs(elapsedMs)
         case .completed, .failed, .cancelled:
             guard let finished = item.finishedAtMs else { return nil }
             let elapsedMs = max(0, Int(finished - item.startedAtMs))
@@ -7571,14 +7643,29 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
 
     /// Accessibility label: status + tool name + optional summary + duration (not color-only).
     static func toolAccessibilityLabel(for item: AssistantItem, nowMs: Int64? = nil) -> String {
-        var parts: [String] = [verb(for: item), toolDisplayLabel(for: item)]
+        var parts: [String] = []
+        if item.state == .streaming {
+            parts.append(toolStreamingStatusLabel(for: item))
+        } else {
+            parts.append(verb(for: item))
+        }
+        parts.append(toolDisplayLabel(for: item))
         if isBackgroundTool(for: item) { parts.append("background") }
+        // Only claim active wait while streaming — completed polls must not say "waiting".
+        if item.state == .streaming, isTaskWaitTool(for: item) {
+            parts.append("waiting for task output")
+        }
         if toolCommandWasDistilled(for: item) { parts.append("distilled") }
         if let summary = toolCommandSummary(for: item), !summary.isEmpty {
             parts.append(summary)
         }
         if let duration = toolDurationLabel(for: item, nowMs: nowMs) {
             parts.append(duration)
+        }
+        let detail = detailText(for: item)
+        let hasOutput = (detail?.isEmpty == false)
+        if let hint = toolActivityHint(for: item, hasOutput: hasOutput) {
+            parts.append(hint)
         }
         return parts.joined(separator: ", ")
     }
@@ -7597,8 +7684,12 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
                 parts.append("timeout \(label)")
             }
         }
+        if let bashId = obj["bash_id"] {
+            let text = shortValue(bashId)
+            if !text.isEmpty, text != "—" { parts.append("bash \(text)") }
+        }
         // Only claim this path when we humanized the noisy keys providers dump by default.
-        let noisyKeys: Set<String> = ["task_ids", "task_id", "timeout_ms", "timeout", "call_id", "id"]
+        let noisyKeys: Set<String> = ["task_ids", "task_id", "bash_id", "timeout_ms", "timeout", "call_id", "id"]
         let otherKeys = obj.keys.filter { !noisyKeys.contains($0) }
         guard !parts.isEmpty, otherKeys.isEmpty || otherKeys.count <= 1 else { return nil }
         return parts.joined(separator: " · ")
@@ -7864,7 +7955,9 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
 
     private static func verb(for item: AssistantItem) -> String {
         switch item.state {
-        case .streaming: return "Running"
+        case .streaming:
+            // Align L1 with trailing wait semantics — avoid "Running … Waiting".
+            return toolStreamingStatusLabel(for: item)
         case .failed: return "Failed"
         case .cancelled: return "Cancelled"
         case .completed:
@@ -8435,7 +8528,10 @@ public struct AgentAppView: View {
         var run: [AssistantItem] = []
         func flushRun() {
             guard !run.isEmpty else { return }
-            if run.count >= groupThreshold {
+            // Live background/task-wait rows must stay inline: collapsed groups hide
+            // Waiting + elapsed + activity strip and reintroduce the "stuck" feel.
+            if run.count >= groupThreshold,
+               !AgentTimelineItemPresentation.mustKeepToolsUngrouped(run) {
                 blocks.append(.toolGroup(id: run[0].id, items: run))
             } else {
                 blocks.append(contentsOf: run.map { .item($0) })
@@ -8626,18 +8722,23 @@ public struct AgentAppView: View {
         )
     }
 
-    /// Count-only twin of `turnRenderBlocks` — same grouping rules, no block allocs.
+    /// Count twin of `turnRenderBlocks` — same grouping + live-wait ungroup rules.
     static func turnRenderBlockCount(_ items: [AssistantItem], groupThreshold: Int = 2) -> Int {
         var count = 0
-        var run = 0
+        var run: [AssistantItem] = []
         func flushRun() {
-            guard run > 0 else { return }
-            count += run >= groupThreshold ? 1 : run
-            run = 0
+            guard !run.isEmpty else { return }
+            if run.count >= groupThreshold,
+               !AgentTimelineItemPresentation.mustKeepToolsUngrouped(run) {
+                count += 1
+            } else {
+                count += run.count
+            }
+            run.removeAll(keepingCapacity: true)
         }
         for item in items {
             if isGroupableTool(item.type) {
-                run += 1
+                run.append(item)
             } else {
                 flushRun()
                 count += 1
@@ -8672,14 +8773,26 @@ public struct AgentAppView: View {
 
     /// Collapsed-group header text: count-aware verb + noun, e.g. "Ran 4 commands",
     /// "Changed 3 files", or "Running 2 commands…" while any member is still streaming.
+    /// Task-wait members use "Waiting…" so color is not the only live signal.
     static func toolGroupSummary(_ items: [AssistantItem]) -> String {
         let noun = toolGroupNoun(items)
+        if items.contains(where: { AgentTimelineItemPresentation.showsLiveToolElapsed(for: $0)
+            && AgentTimelineItemPresentation.isTaskWaitTool(for: $0) }) {
+            return "Waiting \(items.count) \(noun)…"
+        }
         if items.contains(where: { $0.state == .streaming }) {
             return "Running \(items.count) \(noun)…"
         }
         let verbs = Set(items.map { AgentTimelineItemPresentation.make(for: $0).verb })
         let verb = verbs.count == 1 ? (verbs.first ?? "Ran") : "Ran"
         return "\(verb) \(items.count) \(noun)"
+    }
+
+    /// Earliest live wait/background member for group-header elapsed (defense in depth).
+    static func liveElapsedAnchor(in items: [AssistantItem]) -> AssistantItem? {
+        items
+            .filter { AgentTimelineItemPresentation.showsLiveToolElapsed(for: $0) }
+            .min(by: { $0.startedAtMs < $1.startedAtMs })
     }
 
     static func toolGroupNoun(_ items: [AssistantItem]) -> String {
@@ -12205,6 +12318,21 @@ public struct AgentAppView: View {
 
     @ViewBuilder
     private func standardToolRow(_ item: AssistantItem) -> some View {
+        // Live clocks only on background / task-wait streaming rows (1s then 5s cadence).
+        // Ordinary tools keep the v1 path: no per-row TimelineView.
+        if AgentTimelineItemPresentation.showsLiveToolElapsed(for: item) {
+            let start = Date(timeIntervalSince1970: TimeInterval(item.startedAtMs) / 1000.0)
+            TimelineView(ElapsedTickSchedule(start: start)) { context in
+                let nowMs = Int64(context.date.timeIntervalSince1970 * 1000)
+                standardToolRowBody(item, nowMs: nowMs)
+            }
+        } else {
+            standardToolRowBody(item, nowMs: nil)
+        }
+    }
+
+    @ViewBuilder
+    private func standardToolRowBody(_ item: AssistantItem, nowMs: Int64?) -> some View {
         let presentation = AgentTimelineItemPresentation.make(for: item)
         let displayLabel = AgentTimelineItemPresentation.toolDisplayLabel(for: item)
         // Prefer uncapped raw shell for expand/copy so live body caps cannot mangle JSON.
@@ -12213,15 +12341,18 @@ public struct AgentAppView: View {
         let commandSummary = AgentTimelineItemPresentation.toolCommandSummary(for: item)
         let isBackground = AgentTimelineItemPresentation.isBackgroundTool(for: item)
         let wasDistilled = AgentTimelineItemPresentation.toolCommandWasDistilled(for: item)
-        // v1: finished rows only (≥1s). Live elapsed stays on the transcript "Working for" line.
-        let duration = AgentTimelineItemPresentation.toolDurationLabel(for: item)
+        let duration = AgentTimelineItemPresentation.toolDurationLabel(for: item, nowMs: nowMs)
         let output = presentation.detail
         let hasOutput = (output?.isEmpty == false)
+        let activityHint = AgentTimelineItemPresentation.toolActivityHint(for: item, hasOutput: hasOutput)
+        let liveElapsed = AgentTimelineItemPresentation.showsLiveToolElapsed(for: item)
         let fullDiffersFromSummary = (commandFull != nil && commandFull != commandSummary)
-        // Expand when there is output, a longer full command, or multi-line input.
+        // Expand when there is output, a longer full command, multi-line input,
+        // or a *streaming* wait row that needs status details before stdout arrives.
         let canExpand = hasOutput
             || fullDiffersFromSummary
             || (commandFull.map { $0.count > 96 || $0.contains("\n") } ?? false)
+            || AgentTimelineItemPresentation.toolCanExpandWithoutOutput(for: item)
         let expanded = expandedTools.contains(item.id)
         let statusColor: Color = {
             switch item.state {
@@ -12231,6 +12362,7 @@ public struct AgentAppView: View {
             case .completed: return DS.Palette.textSecondary
             }
         }()
+        let streamingStatus = AgentTimelineItemPresentation.toolStreamingStatusLabel(for: item)
         VStack(alignment: .leading, spacing: DS.Space.xs) {
             Button {
                 guard canExpand else { return }
@@ -12241,6 +12373,7 @@ public struct AgentAppView: View {
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundColor(statusColor)
                         .frame(width: 12)
+                        .accessibilityHidden(true)
                     (Text("\(presentation.verb) ")
                         .font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
                      + Text(displayLabel)
@@ -12267,7 +12400,20 @@ public struct AgentAppView: View {
                             .accessibilityLabel("Distilled")
                     }
                     Spacer(minLength: 0)
-                    if item.state == .streaming {
+                    // Single status word on L1 (verb). Trailing: elapsed for live waits,
+                    // plain "Running" for ordinary streaming, Failed/duration for finished.
+                    if liveElapsed {
+                        if let duration {
+                            Text(duration)
+                                .font(DS.Font.caption2.monospacedDigit().weight(.medium))
+                                .foregroundColor(DS.Palette.accent)
+                                .accessibilityLabel("elapsed \(duration)")
+                        } else {
+                            Text(streamingStatus)
+                                .font(DS.Font.caption2.weight(.semibold))
+                                .foregroundColor(DS.Palette.accent)
+                        }
+                    } else if item.state == .streaming {
                         Text("Running")
                             .font(DS.Font.caption2.weight(.semibold))
                             .foregroundColor(DS.Palette.accent)
@@ -12283,15 +12429,23 @@ public struct AgentAppView: View {
                     if canExpand {
                         Image(systemName: expanded ? "chevron.down" : "chevron.right")
                             .font(.system(size: 8)).foregroundColor(DS.Palette.textTertiary)
+                            .accessibilityHidden(true)
                     }
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help(canExpand ? (expanded ? "Hide details" : "Show command and output") : "No further detail")
+            .help(canExpand
+                  ? (expanded
+                     ? "Hide details"
+                     : (hasOutput ? "Show command and output" : "Show status and details"))
+                  : "No further detail")
             .accessibilityLabel(
-                AgentTimelineItemPresentation.toolAccessibilityLabel(for: item)
+                AgentTimelineItemPresentation.toolAccessibilityLabel(for: item, nowMs: nowMs)
             )
+            .accessibilityHint(canExpand
+                               ? (expanded ? "Collapse tool details" : "Expand tool details")
+                               : "")
 
             // L2: collapsed command summary (not the full cd && … | distill pipeline).
             // UX-MAC_AGENT-OPEN-SPLIT: file/URL tools keep an open-in-split affordance.
@@ -12346,6 +12500,27 @@ public struct AgentAppView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
             }
 
+            // Liveness strip: one "not frozen" line (no second elapsed — trailing owns the clock).
+            if let activityHint {
+                HStack(alignment: .center, spacing: DS.Space.sm) {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .accessibilityHidden(true)
+                    Text(activityHint)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal, DS.Space.sm)
+                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(DS.Palette.accent.opacity(0.06))
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(activityHint)
+                .accessibilityIdentifier("agent.tool.activityHint.\(item.id)")
+            }
+
             // Expanded: full command (when longer/different than the summary) + output.
             if expanded, let full = commandFull, fullDiffersFromSummary, !full.isEmpty {
                 Text(full)
@@ -12380,10 +12555,12 @@ public struct AgentAppView: View {
     // expandable to the individual tool rows (each still independently expandable for
     // output). While any member streams, the header goes live ("Running N…") and a muted
     // subtitle shows the most-recent command so progress stays legible without expanding.
+    // Defense: if a live wait somehow remains grouped, show Waiting + elapsed on the header.
     @ViewBuilder
     private func toolGroupRow(id: String, items: [AssistantItem]) -> some View {
         let streaming = items.contains { $0.state == .streaming }
         let failed = items.contains { $0.state == .failed }
+        let liveAnchor = AgentAppView.liveElapsedAnchor(in: items)
         let expanded = expandedToolGroups.contains(id)
         let imageOnly = !items.isEmpty && items.allSatisfy { $0.type == .imageView }
         let imagePresentations = AgentImageViewPresentation.presentations(in: items)
@@ -12409,7 +12586,9 @@ public struct AgentAppView: View {
                         .foregroundColor(DS.Palette.textSecondary)
                         .lineLimit(1)
                     Spacer(minLength: 0)
-                    if !expanded {
+                    if let liveAnchor {
+                        toolGroupLiveElapsedChip(liveAnchor)
+                    } else if !expanded {
                         Text("\(items.count)")
                             .font(DS.Font.caption2.weight(.semibold).monospacedDigit())
                             .foregroundColor(DS.Palette.textTertiary)
@@ -12446,6 +12625,19 @@ public struct AgentAppView: View {
                         .truncationMode(.tail)
                         .padding(.leading, 20)
                 }
+                if let liveAnchor,
+                   let hint = AgentTimelineItemPresentation.toolActivityHint(
+                    for: liveAnchor,
+                    hasOutput: liveAnchor.output?.isEmpty == false
+                   ) {
+                    Text(hint)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .padding(.leading, 20)
+                        .accessibilityIdentifier("agent.toolGroup.activityHint.\(id)")
+                }
             }
 
             if expanded {
@@ -12472,6 +12664,30 @@ public struct AgentAppView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("agent.toolGroup.\(id)")
+    }
+
+    @ViewBuilder
+    private func toolGroupLiveElapsedChip(_ item: AssistantItem) -> some View {
+        let start = Date(timeIntervalSince1970: TimeInterval(item.startedAtMs) / 1000.0)
+        TimelineView(ElapsedTickSchedule(start: start)) { context in
+            let nowMs = Int64(context.date.timeIntervalSince1970 * 1000)
+            let duration = AgentTimelineItemPresentation.toolDurationLabel(for: item, nowMs: nowMs)
+            let status = AgentTimelineItemPresentation.toolStreamingStatusLabel(for: item)
+            HStack(spacing: DS.Space.xs) {
+                if let duration {
+                    Text(duration)
+                        .font(DS.Font.caption2.monospacedDigit().weight(.medium))
+                        .foregroundColor(DS.Palette.accent)
+                } else {
+                    Text(status)
+                        .font(DS.Font.caption2.weight(.semibold))
+                        .foregroundColor(DS.Palette.accent)
+                }
+            }
+            .accessibilityLabel(
+                duration.map { "\(status), elapsed \($0)" } ?? status
+            )
+        }
     }
 
     // MARK: Composer

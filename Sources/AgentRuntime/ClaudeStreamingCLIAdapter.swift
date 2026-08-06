@@ -20,10 +20,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         let finalMessage: String?
         let providerThreadId: String?
         let runId: AgentRunID?
-        /// Wall-clock when the finish was first withheld. Absolute max is measured
-        /// from this instant and is **not** reset by later stream lines (those only
-        /// refresh the inactivity timer). Prevents "Working forever" when the CLI
-        /// keeps heartbeating while pending tasks never clear.
+        /// Wall-clock when the finish was first withheld (forensics / logs only).
         let deferredAt: Date
     }
 
@@ -133,14 +130,13 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     // Cleared when sendTurn begins a new session for that thread. Guarded by `lock`.
     private var interruptedThreadIds: Set<AgentThreadID> = []
 
-    /// CLAUDE-BG-LIFECYCLE: inactivity bound for a withheld finish, reset by stream
-    /// lines. Quiet background jobs emit nothing until they end; on expiry the run
-    /// still reaches a terminal state. Injectable so tests can drive it in ms.
+    /// CLAUDE-BG-LIFECYCLE: inactivity bound for a withheld finish, fully reset
+    /// by stream lines. Quiet background jobs emit nothing until they end; on
+    /// expiry the run still reaches a terminal state. There is intentionally
+    /// **no** absolute wall-clock max: long goals / long background work that
+    /// keep streaming progress must not be force-finished mid-flight.
+    /// Injectable so tests can drive it in ms.
     private let deferredFinishInactivityTimeout: TimeInterval
-    /// Hard wall-clock cap from `DeferredFinish.deferredAt` — **not** reset by
-    /// stream lines. Stops runs from hanging for hours when the CLI keeps
-    /// emitting heartbeats (or noise) while `pendingBackgroundTaskIds` never empties.
-    private let deferredFinishAbsoluteMaxTimeout: TimeInterval
     /// After the CLI reports idle pending tasks, wait briefly for a resume `result`
     /// (happy path). If none arrives, flush the withheld finish so Working ends.
     private let deferredFinishPostIdleTimeout: TimeInterval
@@ -151,7 +147,6 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         transcriptStore: ClaudeTranscriptStore = ClaudeTranscriptStore(),
         interruptGracePeriod: TimeInterval = 2,
         deferredFinishInactivityTimeout: TimeInterval = 900,
-        deferredFinishAbsoluteMaxTimeout: TimeInterval = 900,
         deferredFinishPostIdleTimeout: TimeInterval = 45
     ) {
         self.binaryNameOverride = binaryNameOverride
@@ -159,7 +154,6 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         self.transcriptStore = transcriptStore
         self.interruptGracePeriod = max(0, interruptGracePeriod)
         self.deferredFinishInactivityTimeout = max(0.01, deferredFinishInactivityTimeout)
-        self.deferredFinishAbsoluteMaxTimeout = max(0.01, deferredFinishAbsoluteMaxTimeout)
         self.deferredFinishPostIdleTimeout = max(0.01, deferredFinishPostIdleTimeout)
     }
 
@@ -653,16 +647,25 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             lock.unlock()
         }
         var armedPostIdleFlush = false
+        var isBackgroundLifecycle = false
         if let rawObject {
             // CLAUDE-BG-LIFECYCLE: keep the pending-background-work view current
             // BEFORE the parser's turn events are processed below, so a `result`
             // in this same batch is judged against the up-to-date set.
             armedPostIdleFlush = trackBackgroundWork(in: rawObject, session: session)
+            isBackgroundLifecycle = Self.isBackgroundLifecycleLine(rawObject)
         }
-        // Any stream line is liveness — but do not clobber a post-idle short flush
-        // that trackBackgroundWork just armed when pending became empty.
+        // Re-arm deferred-finish inactivity only on real progress (bg lifecycle
+        // or model/tool content). Generic system/status heartbeats must NOT
+        // re-arm — that was the 97m "Working forever" class when sticky pending
+        // tasks paired with periodic keepalives (absolute max used to bound it).
+        // Do not clobber a post-idle short flush trackBackgroundWork just armed.
         if !armedPostIdleFlush {
-            refreshDeferralWatchdog(session: session)
+            let isProgress = isBackgroundLifecycle
+                || Self.isDeferralProgressLine(rawObject)
+            if isProgress {
+                refreshDeferralWatchdog(session: session)
+            }
         }
         if let rawObject,
            let runtimeEvent = ProviderRuntimeEvent.fromJSONObject(rawObject, provider: .claude, source: "claude.stream-json") {
@@ -861,47 +864,64 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         )
     }
 
-    /// (Re)arms the deferral liveness bound. No-op unless a finish is withheld.
-    /// Stream lines refresh the *inactivity* timer only; the absolute max from
-    /// `deferredAt` is always respected so heartbeats cannot postpone terminal forever.
+    /// (Re)arms the deferral inactivity bound. No-op unless a finish is withheld.
+    /// Only real progress lines re-arm (see call site); pure status heartbeats
+    /// do not. True quiet still flushes (no absolute wall-clock max).
     private func refreshDeferralWatchdog(
         session: Session,
         inactivityOverride: TimeInterval? = nil
     ) {
         lock.lock()
-        guard let deferred = session.deferredFinish else {
+        guard session.deferredFinish != nil else {
             lock.unlock()
-            return
-        }
-        let elapsed = Date().timeIntervalSince(deferred.deferredAt)
-        let absoluteRemaining = deferredFinishAbsoluteMaxTimeout - elapsed
-        if absoluteRemaining <= 0 {
-            session.deferralWatchdog?.cancel()
-            session.deferralWatchdog = nil
-            lock.unlock()
-            flushDeferredFinish(session: session, reason: "watchdog_absolute_max")
             return
         }
         session.deferralWatchdog?.cancel()
         let inactivity = inactivityOverride ?? deferredFinishInactivityTimeout
-        let delay = min(max(0.01, inactivity), absoluteRemaining)
+        let delay = max(0.01, inactivity)
         let item = DispatchWorkItem { [weak self, weak session] in
             guard let self, let session else { return }
-            // Re-check absolute max at fire time (clock can advance past inactivity).
-            self.lock.lock()
-            let stillDeferred = session.deferredFinish
-            let elapsedNow = stillDeferred.map { Date().timeIntervalSince($0.deferredAt) } ?? 0
-            let hitAbsolute = stillDeferred != nil
-                && elapsedNow >= self.deferredFinishAbsoluteMaxTimeout
-            self.lock.unlock()
-            self.flushDeferredFinish(
-                session: session,
-                reason: hitAbsolute ? "watchdog_absolute_max" : "watchdog_inactivity"
-            )
+            self.flushDeferredFinish(session: session, reason: "watchdog_inactivity")
         }
         session.deferralWatchdog = item
         lock.unlock()
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    /// CLI background-task lifecycle lines that prove nested work is still live.
+    private static func isBackgroundLifecycleLine(_ obj: [String: Any]?) -> Bool {
+        guard let obj,
+              (obj["type"] as? String) == "system",
+              let subtype = obj["subtype"] as? String else { return false }
+        switch subtype {
+        case "background_tasks_changed", "task_started", "task_updated", "task_notification":
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Model/tool content that should keep a deferred finish alive. Excludes
+    /// generic system/status keepalives and empty noise.
+    private static func isDeferralProgressLine(_ obj: [String: Any]?) -> Bool {
+        guard let obj, let type = obj["type"] as? String else { return false }
+        switch type {
+        case "assistant", "user", "content_block_start", "content_block_delta",
+             "content_block_stop", "tool_progress", "tool_result", "stream_event":
+            return true
+        case "system":
+            // init / status / heartbeat are not progress.
+            let subtype = obj["subtype"] as? String
+            if subtype == "status" || subtype == "heartbeat" { return false }
+            // Other system subtypes (except bg lifecycle, handled separately)
+            // do not re-arm by themselves.
+            return false
+        case "result":
+            // A later result may supersede; count as progress.
+            return true
+        default:
+            return false
+        }
     }
 
     /// Updates the pending-background-work set from one raw stream line.

@@ -54,33 +54,79 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
                        "exactly one .finished — late prompt result must not double-terminate")
     }
 
-    /// WHY: crash 2026-08-06 (RemoteCode 2.0.37) — EXC_BAD_ACCESS / SIGBUS on
-    /// stack guard while EventLog prune ran under nested EventBus publishes.
-    /// Production defaults set both inactivity and absolute max to 900s, so when
-    /// the inactivity timer fires the absolute budget is already spent.
-    /// fire→emit→refresh used to call fire again synchronously and recurse until
-    /// the process died. Equal short timeouts force that co-expiry path.
-    func test_turnWatchdogCoExpiryDoesNotRecurseWhenAbsoluteMaxAlsoSpent() async throws {
-        let peer = try FakeGrokACPPeer(mode: .hangAfterFinal)
+    /// WHY: field 2026-08-06 — fixed absolute-max (900s) false-completed a
+    /// long starsac CI goal mid-Cloud-Build while tools were still progressing.
+    /// There must be no wall-clock max: continuous stream/tool activity fully
+    /// re-arms inactivity so goals can run for hours. Only true quiet synthesizes.
+    func test_turnInactivityWatchdogDoesNotFireWhileStreamEventsContinue() async throws {
+        let peer = try FakeGrokACPPeer(mode: .heartbeatThenHangAfterFinal)
         defer { peer.remove() }
         let adapter = GrokACPAdapter(
             binaryNameOverride: peer.path,
             cancellationGracePeriod: 0.05,
-            turnInactivityTimeout: 0.15,
-            turnInactivityAbsoluteMaxTimeout: 0.15
+            turnInactivityTimeout: 0.25
+        )
+        let request = makeRequest()
+        let box = GrokACPEventBox()
+        _ = try await adapter.startSession(request) { box.append($0) }
+
+        // Heartbeats span > inactivity window; turn must still be open.
+        try await Task.sleep(nanoseconds: 700_000_000)
+        XCTAssertEqual(box.finishedCount, 0,
+                       "active stream must re-arm inactivity — no absolute max may force completed")
+
+        let finished = try await box.waitFinished(timeout: 4)
+        XCTAssertEqual(finished.status, .completed)
+        XCTAssertTrue(box.hasWatchdogSynthesizedMarker,
+                      "only post-quiet inactivity synthesizes the terminal")
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(box.finishedCount, 1,
+                       "synthesis must not double-terminate")
+    }
+
+    /// WHY: quiet mid long tool after speakable preamble used to synthesize
+    /// `.completed` (false green goal). Open tool_call must force interrupted.
+    func test_turnInactivityWatchdogInterruptsWhenToolCallStillOpen() async throws {
+        let peer = try FakeGrokACPPeer(mode: .hangAfterOpenTool)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(
+            binaryNameOverride: peer.path,
+            cancellationGracePeriod: 0.05,
+            turnInactivityTimeout: 0.25
         )
         let request = makeRequest()
         let box = GrokACPEventBox()
         _ = try await adapter.startSession(request) { box.append($0) }
 
         let finished = try await box.waitFinished(timeout: 4)
-        XCTAssertEqual(finished.status, .completed,
-                       "co-expired absolute max must still synthesize a single completed terminal")
-        XCTAssertTrue(box.hasWatchdogSynthesizedMarker,
-                      "watchdog marker must still land once for forensics")
+        XCTAssertEqual(finished.status, .interrupted,
+                       "open tool_call + quiet must not paint completed")
+        XCTAssertTrue(box.hasWatchdogSynthesizedMarker)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(box.finishedCount, 1)
+    }
+
+    /// WHY: crash 2026-08-06 — fire→emit→refresh re-entered fire mid-synthesis
+    /// and overflowed the stack. Synthesis flag must still serialize that path
+    /// even without absolute max.
+    func test_turnWatchdogSynthesisDoesNotRecurseOnEmitReentry() async throws {
+        let peer = try FakeGrokACPPeer(mode: .hangAfterFinal)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(
+            binaryNameOverride: peer.path,
+            cancellationGracePeriod: 0.05,
+            turnInactivityTimeout: 0.15
+        )
+        let request = makeRequest()
+        let box = GrokACPEventBox()
+        _ = try await adapter.startSession(request) { box.append($0) }
+
+        let finished = try await box.waitFinished(timeout: 4)
+        XCTAssertEqual(finished.status, .completed)
+        XCTAssertTrue(box.hasWatchdogSynthesizedMarker)
         try await Task.sleep(nanoseconds: 400_000_000)
         XCTAssertEqual(box.finishedCount, 1,
-                       "co-expiry must not double-terminate or re-enter fire after synthesis")
+                       "emit during synthesis must not re-enter fire / double-terminate")
     }
 
     func test_foreignRunAsDoesNotRecordTokenSaverCensus() async throws {
@@ -1046,6 +1092,13 @@ private final class FakeGrokACPPeer {
         /// field shape of the 70m Grok Working zombie. The turn-inactivity
         /// watchdog must synthesize a single terminal.
         case hangAfterFinal
+        /// Streams final + continuous tool updates for longer than a short
+        /// inactivity window, then hangs. Proves there is no absolute max —
+        /// only quiet inactivity may synthesize.
+        case heartbeatThenHangAfterFinal
+        /// Streams speakable text + open tool_call, then hangs without terminal
+        /// tool status — inactivity must synthesize interrupted, not completed.
+        case hangAfterOpenTool
     }
     let root: URL
     let path: String
@@ -1149,6 +1202,29 @@ private final class FakeGrokACPPeer {
                 # release Working via the turn-inactivity watchdog.
                 printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"**COMPLETE** residual note"}}}}\n'
                 printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"available_commands_update","availableCommands":[]}}}\n'
+                prompt_id="$id"
+                continue
+              fi
+              if [ "$mode" = heartbeatThenHangAfterFinal ]; then
+                printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"**COMPLETE** residual note"}}}}\n'
+                printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"tool_call","toolCallId":"tool-hb","title":"working","rawInput":{"command":"echo hb"}}}}\n'
+                # Keep emitting tool progress longer than a short inactivity window
+                # so absolute-max regressions would fire mid-heartbeat incorrectly.
+                i=0
+                while [ "$i" -lt 10 ]; do
+                  printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"tool_call_update","toolCallId":"tool-hb","status":"in_progress","title":"working","content":[{"type":"content","content":{"type":"text","text":"hb %s"}}]}}}\n' "$i"
+                  sleep 0.08
+                  i=$((i + 1))
+                done
+                # Close the tool so post-quiet synthesis can be completed (not interrupted).
+                printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"tool_call_update","toolCallId":"tool-hb","status":"completed","title":"working","content":[{"type":"content","content":{"type":"text","text":"done"}}]}}}\n'
+                prompt_id="$id"
+                continue
+              fi
+              if [ "$mode" = hangAfterOpenTool ]; then
+                printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"starting long CI"}}}}\n'
+                printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"tool_call","toolCallId":"tool-open","title":"run_terminal_command","rawInput":{"command":"sleep 999"}}}}\n'
+                # Never complete the tool and never resolve session/prompt.
                 prompt_id="$id"
                 continue
               fi

@@ -438,6 +438,108 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTFail("idle Codex thread status must release the deferred completed turn")
     }
 
+    func test_pendingFinishInactivityFlushesWhenThreadNeverGoesIdle() async throws {
+        // WHY: removing absolute max left wedged pendingFinish with no exit if
+        // idle never arrives. Quiet inactivity must flush the withheld finish
+        // while continuous process output re-arms (see progress test).
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter(
+            clientFactory: { _, notificationHandler, _ in
+                client.notificationHandler = notificationHandler
+                return client
+            },
+            pendingFinishInactivityTimeout: 0.3
+        )
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        let request = AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "wedged active"
+        )
+        _ = try await adapter.sendTurn(request) { event in
+            Task { await sink.record(event) }
+        }
+        client.notificationHandler?("thread/status/changed", [
+            "threadId": "codex-thread-1",
+            "status": ["type": "active", "activeFlags": ["runningCommand"]]
+        ])
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "finalMessage": "done-but-stuck"
+        ])
+        // No idle, no further activity — inactivity must flush.
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if let finish = await sink.finish {
+                XCTAssertEqual(finish.0, .completed)
+                XCTAssertEqual(finish.1, "done-but-stuck")
+                return
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail("pendingFinish inactivity must release a wedged active deferral")
+    }
+
+    func test_pendingFinishInactivityReArmsOnProcessOutput() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter(
+            clientFactory: { _, notificationHandler, _ in
+                client.notificationHandler = notificationHandler
+                return client
+            },
+            pendingFinishInactivityTimeout: 0.35
+        )
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        let request = AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "long nested"
+        )
+        _ = try await adapter.sendTurn(request) { event in
+            Task { await sink.record(event) }
+        }
+        client.notificationHandler?("thread/status/changed", [
+            "threadId": "codex-thread-1",
+            "status": ["type": "active"]
+        ])
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "finalMessage": "still going"
+        ])
+        // Keep re-arming past the first inactivity window.
+        for i in 0..<8 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            client.notificationHandler?("process/outputDelta", [
+                "processHandle": "proc-\(i)",
+                "stream": "stdout",
+                "delta": "tick \(i)\n"
+            ])
+            if await sink.finish != nil {
+                XCTFail("process output must re-arm pendingFinish inactivity")
+                return
+            }
+        }
+        // Stop activity; quiet should flush.
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if let finish = await sink.finish {
+                XCTAssertEqual(finish.0, .completed)
+                XCTAssertEqual(finish.1, "still going")
+                return
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail("quiet after process progress must flush pendingFinish")
+    }
+
     func test_adapterInterruptUsesActiveAppServerTurn() async throws {
         let client = MockCodexAppServerClient(autoComplete: false, interruptDelayNanoseconds: 200_000_000)
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in

@@ -83,14 +83,9 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         /// previous one (or the user started a follow-up).
         var promptGeneration: UInt64 = 0
         var turnWatchdog: DispatchWorkItem?
-        /// Wall-clock when the turn inactivity watchdog was first armed for the
-        /// current prompt generation. Absolute max is measured from this and is
-        /// **not** reset by later stream events (those only refresh inactivity).
-        var turnWatchdogArmedAt: Date?
         /// True while `fireTurnInactivityWatchdog` is synthesizing a terminal.
-        /// Blocks emit→refresh→fire re-entry: when inactivity and absolute max
-        /// both expire (~same default 900s), refresh used to call fire
-        /// synchronously from emit and recurse until SIGBUS (stack guard).
+        /// Blocks emit→refresh→fire re-entry: finishTurn/emit used to re-arm the
+        /// inactivity timer mid-synthesis and recurse until SIGBUS (stack guard).
         var turnWatchdogSynthesisInProgress = false
         var promptWritePermit = AgentRunAcceptancePermit()
         var onEvent: (@Sendable (AgentRunEvent) -> Void)?
@@ -131,15 +126,13 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     private let binaryNameOverride: String?
     private let cancellationGracePeriod: TimeInterval
     /// Inactivity bound while a prompt is in flight. Re-armed on every emitted
-    /// turn event. When `session/prompt` never returns after the model has
-    /// finished streaming, this synthesizes the terminal so Working cannot
-    /// stick forever (field: 70m Grok zombie with full **COMPLETE** final).
-    /// Matches Claude's deferred-finish inactivity default (900s).
+    /// turn event (tools, stream deltas). When `session/prompt` never returns
+    /// after the model has finished streaming *and* events stop, this
+    /// synthesizes the terminal so Working cannot stick forever (field: 70m
+    /// Grok zombie with full **COMPLETE** final). There is intentionally **no**
+    /// absolute wall-clock max: long goals with continuous tool progress must
+    /// not be cut mid-work (field: 15m false `completed` on starsac CI goal).
     private let turnInactivityTimeout: TimeInterval
-    /// Hard wall-clock cap from first arm of the turn watchdog — **not** reset
-    /// by later stream events. Stops heartbeats from postponing terminal forever
-    /// (same class of hang as Claude deferred-finish absolute max).
-    private let turnInactivityAbsoluteMaxTimeout: TimeInterval
     private let discoveryCwd: String
     private let discoveryEnvironment: [String: String]
     private let modelCacheTTL: TimeInterval
@@ -159,7 +152,6 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         binaryNameOverride: String? = nil,
         cancellationGracePeriod: TimeInterval = 2,
         turnInactivityTimeout: TimeInterval = 900,
-        turnInactivityAbsoluteMaxTimeout: TimeInterval = 900,
         discoveryCwd: String = FileManager.default.temporaryDirectory.path,
         discoveryEnvironment: [String: String] = [:],
         modelCacheTTL: TimeInterval = 300
@@ -167,7 +159,6 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         self.binaryNameOverride = binaryNameOverride
         self.cancellationGracePeriod = max(0.01, cancellationGracePeriod)
         self.turnInactivityTimeout = max(0.01, turnInactivityTimeout)
-        self.turnInactivityAbsoluteMaxTimeout = max(0.01, turnInactivityAbsoluteMaxTimeout)
         self.discoveryCwd = discoveryCwd
         self.discoveryEnvironment = discoveryEnvironment
         self.modelCacheTTL = max(0, modelCacheTTL)
@@ -941,8 +932,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     }
 
     /// (Re)arm the in-flight turn inactivity bound. No-op when the turn is no
-    /// longer open. Stream events extend the *inactivity* deadline so long tools
-    /// stay live; absolute max from first arm is never extended by heartbeats.
+    /// longer open. Stream/tool events fully reset the deadline so long-running
+    /// goals stay live for as long as the provider keeps producing activity.
     private func refreshTurnWatchdog(session: Session, generation: UInt64) {
         lock.lock()
         guard sessions[session.threadId] === session,
@@ -955,27 +946,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             lock.unlock()
             return
         }
-        if session.turnWatchdogArmedAt == nil {
-            session.turnWatchdogArmedAt = Date()
-        }
-        let armedAt = session.turnWatchdogArmedAt ?? Date()
-        let elapsed = Date().timeIntervalSince(armedAt)
-        let absoluteRemaining = turnInactivityAbsoluteMaxTimeout - elapsed
-        if absoluteRemaining <= 0 {
-            session.turnWatchdog?.cancel()
-            session.turnWatchdog = nil
-            lock.unlock()
-            // Absolute max already elapsed. Never call fire synchronously here:
-            // emit→refresh→fire→emit would recurse when inactivity and absolute
-            // max land together (production defaults are both 900s).
-            DispatchQueue.global(qos: .utility).async { [weak self, weak session] in
-                guard let self, let session else { return }
-                self.fireTurnInactivityWatchdog(session: session, generation: generation)
-            }
-            return
-        }
         session.turnWatchdog?.cancel()
-        let delay = min(turnInactivityTimeout, absoluteRemaining)
+        let delay = turnInactivityTimeout
         let item = DispatchWorkItem { [weak self, weak session] in
             guard let self, let session else { return }
             self.fireTurnInactivityWatchdog(session: session, generation: generation)
@@ -988,11 +960,11 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     private func cancelTurnWatchdogLocked(session: Session) {
         session.turnWatchdog?.cancel()
         session.turnWatchdog = nil
-        session.turnWatchdogArmedAt = nil
     }
 
-    /// When `session/prompt` never returns after the model finished streaming,
-    /// synthesize a terminal so coordinator ownership / Working release.
+    /// When `session/prompt` never returns after the model finished streaming
+    /// *and* no further events arrive within the inactivity window, synthesize a
+    /// terminal so coordinator ownership / Working release.
     /// Prefer `.completed` when the mapper already has speakable final text.
     private func fireTurnInactivityWatchdog(session: Session, generation: UInt64) {
         lock.lock()
@@ -1007,17 +979,30 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             return
         }
         // Claim synthesis before any emit. emit re-arms the watchdog; without
-        // this flag that re-arm can re-enter fire while absolute max is already
-        // spent and overflow the GCD worker stack (crash: RemoteCode.SQLiteDB
-        // stack guard via EventBus during nested publishes).
+        // this flag that re-arm can re-enter fire and overflow the GCD worker
+        // stack (crash: RemoteCode.SQLiteDB stack guard via EventBus).
         session.turnWatchdogSynthesisInProgress = true
         cancelTurnWatchdogLocked(session: session)
         lock.unlock()
+        // Open tools mean quiet ≠ goal success — synthesize interrupted so the
+        // host does not paint a green completed goal mid long silent shell/CI.
+        // Speakable text alone is only enough when no tool_call is still open.
+        let hasOpenTools = session.mapper.hasOpenToolCalls
         let hasFinal = session.mapper.hasSpeakableFinalContent
-        let status: AgentRunStatus = hasFinal ? .completed : .failed
-        let stopReason = hasFinal ? "end_turn" : "failed"
+        let status: AgentRunStatus
+        let stopReason: String
+        if hasOpenTools {
+            status = .interrupted
+            stopReason = "interrupted"
+        } else if hasFinal {
+            status = .completed
+            stopReason = "end_turn"
+        } else {
+            status = .failed
+            stopReason = "failed"
+        }
         grokAcpLog.info(
-            "grok.turn.watchdog.synthesized thread=\(session.threadId.value.uuidString, privacy: .public) status=\(status.rawValue, privacy: .public) generation=\(generation, privacy: .public)"
+            "grok.turn.watchdog.synthesized thread=\(session.threadId.value.uuidString, privacy: .public) status=\(status.rawValue, privacy: .public) generation=\(generation, privacy: .public) openTools=\(hasOpenTools, privacy: .public)"
         )
         // Distinct runtime marker so field forensics can separate inferred
         // terminals from real session/prompt stopReason frames.
@@ -1028,7 +1013,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                     "sessionId": session.providerThreadId,
                     "status": status.rawValue,
                     "stopReason": stopReason,
-                    "hasSpeakableFinalContent": hasFinal
+                    "hasSpeakableFinalContent": hasFinal,
+                    "hasOpenToolCalls": hasOpenTools
                 ]
             ),
             session: session
@@ -1036,9 +1022,11 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         for event in session.mapper.finishTurn(stopReason: stopReason, usage: nil) {
             emit(event, session: session)
         }
-        if status == .failed {
+        if status == .failed || status == .interrupted {
             session.onEvent?(.error(GrokACPFailureTaxonomy.normalize(
-                diagnostic: "Grok ACP turn inactivity watchdog synthesized terminal (session/prompt never returned)",
+                diagnostic: hasOpenTools
+                    ? "Grok ACP turn inactivity watchdog: open tool_call with no further events (session/prompt never returned)"
+                    : "Grok ACP turn inactivity watchdog synthesized terminal (session/prompt never returned)",
                 context: .turn
             ).message))
         }

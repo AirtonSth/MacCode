@@ -29,6 +29,10 @@ public final class GrokACPEventMapper: @unchecked Sendable {
     /// + auto-nudge. Grok has no provider deferral; this stamp is the only
     /// protection. Reset per turn.
     private var sawDetachedShellSpawn = false
+    /// Open ACP tool_call ids that have not yet reached a terminal status.
+    /// Used by the turn-inactivity watchdog to avoid false `.completed` while
+    /// a long quiet tool is still in flight (starsac-class mid-CI cut).
+    private var openToolCallIds = Set<String>()
     private let lock = NSLock()
 
     public init(sessionId: String) { self.sessionId = sessionId }
@@ -47,7 +51,8 @@ public final class GrokACPEventMapper: @unchecked Sendable {
 
     /// True when the open turn has already produced speakable assistant text.
     /// Used by the turn-inactivity watchdog to prefer `.completed` over `.failed`
-    /// when synthesizing a terminal after `session/prompt` never returns.
+    /// when synthesizing a terminal after `session/prompt` never returns — but
+    /// only when no tool_call is still open (see `hasOpenToolCalls`).
     public var hasSpeakableFinalContent: Bool {
         lock.lock(); defer { lock.unlock() }
         if let final = finalAssistantMessage?
@@ -63,6 +68,12 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         return false
     }
 
+    /// True while at least one tool_call lacks a terminal tool_call_update.
+    public var hasOpenToolCalls: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !openToolCallIds.isEmpty
+    }
+
     public func beginTurn() -> [AssistantEvent] {
         lock.lock(); defer { lock.unlock() }
         var events: [AssistantEvent] = []
@@ -75,6 +86,7 @@ public final class GrokACPEventMapper: @unchecked Sendable {
             lastNonEmptyAssistantPhase = ""
             finalAssistantMessage = nil
             sawDetachedShellSpawn = false
+            openToolCallIds.removeAll(keepingCapacity: false)
             events.append(.turnStarted(turnId: id))
         }
         return events
@@ -96,6 +108,7 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         lastNonEmptyAssistantPhase = ""
         finalAssistantMessage = nil
         sawDetachedShellSpawn = false
+        openToolCallIds.removeAll(keepingCapacity: false)
     }
 
     public func consumeSessionUpdate(_ update: [String: Any]) -> [AssistantEvent] {
@@ -151,6 +164,7 @@ public final class GrokACPEventMapper: @unchecked Sendable {
             currentAssistantPhase = ""
             let id = update["toolCallId"] as? String ?? UUID().uuidString
             let title = update["title"] as? String ?? "Grok tool"
+            openToolCallIds.insert(id)
             trackDetachedShellSpawn(in: update["rawInput"])
             events.append(.itemStarted(item: AssistantItem(
                 id: id,
@@ -172,7 +186,17 @@ public final class GrokACPEventMapper: @unchecked Sendable {
                 events.append(.itemDelta(itemId: id, bodyAppend: nil, outputAppend: output, summary: title))
             }
             if let status = update["status"] as? String {
-                events.append(.itemCompleted(itemId: id, finalState: Self.itemState(status)))
+                switch status {
+                case "completed", "cancelled", "failed":
+                    openToolCallIds.remove(id)
+                    events.append(.itemCompleted(itemId: id, finalState: Self.itemState(status)))
+                case "in_progress", "pending", "running":
+                    openToolCallIds.insert(id)
+                    // Keep item streaming — do not mark completed on progress status.
+                default:
+                    openToolCallIds.remove(id)
+                    events.append(.itemCompleted(itemId: id, finalState: Self.itemState(status)))
+                }
             }
 
         case "plan":
@@ -320,6 +344,7 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         currentAssistantPhase = ""
         lastNonEmptyAssistantPhase = ""
         sawDetachedShellSpawn = false
+        openToolCallIds.removeAll(keepingCapacity: false)
         return events
     }
 
