@@ -28,17 +28,18 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                        "a Codex release without threadSource cannot reconcile a lost fork response and must fail closed")
     }
 
-    func test_currentServerRequestInventoryMatchesGeneratedCodexSchema_0_144_4() throws {
+    func test_currentServerRequestInventoryMatchesGeneratedCodexSchema_0_146_0() throws {
         // WHY: a hand-copied expectation can drift in lockstep with the switch.
         // Read the checked-in projection generated from ServerRequest.json so a
         // schema upgrade introduces a failing ownership decision by default.
+        // 0.146 drops currentTime/read from ServerRequest; inventory must not list it.
         let fixture = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
-            .appendingPathComponent("Fixtures/CodexAppServer/ServerRequestMethods-0.144.4.json")
+            .appendingPathComponent("Fixtures/CodexAppServer/ServerRequestMethods-0.146.0.json")
         let data = try Data(contentsOf: fixture)
         let schema = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual(schema["generatedBy"] as? String,
-                       "codex-cli 0.144.4 app-server generate-json-schema --experimental")
+                       "codex-cli 0.146.0 app-server generate-json-schema --experimental")
         let variants = try XCTUnwrap(schema["oneOf"] as? [[String: Any]])
         let schemaMethods = Set(variants.compactMap { variant -> String? in
             let properties = variant["properties"] as? [String: Any]
@@ -48,6 +49,8 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
 
         XCTAssertEqual(schemaMethods.count, variants.count,
                        "every generated ServerRequest variant must expose exactly one method discriminator")
+        XCTAssertFalse(schemaMethods.contains("currentTime/read"),
+                       "0.146 ServerRequest no longer includes currentTime/read")
         XCTAssertEqual(CodexAppServerAdapter.currentServerRequestMethods, schemaMethods,
                        "upgrading the Codex app-server schema must force an explicit ownership decision for every server request")
     }
@@ -66,7 +69,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
 
         let version = try runCodex(codex, arguments: ["--version"])
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        XCTAssertEqual(version, "codex-cli 0.144.4",
+        XCTAssertEqual(version, "codex-cli 0.146.0",
                        "the checked-in projection must be regenerated deliberately when the release Codex version changes")
         _ = try runCodex(codex, arguments: [
             "app-server", "generate-json-schema", "--experimental", "--out", output.path
@@ -1351,6 +1354,142 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(openedRequests.map(\.id), [request.id])
     }
 
+    func test_applyPatchApprovalUsesReviewDecisionDialect() async throws {
+        // WHY: applyPatchApproval / execCommandApproval use ReviewDecision
+        // (approved|approved_for_session|{denied}|abort), not the accept dialect.
+        // Sending accept* makes Codex 0.146 reject the JSON-RPC result.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "patch"
+        )) { event in Task { await sink.record(event) } }
+
+        var seenRequestIds = Set<String>()
+        func decision(
+            method: String,
+            response: AgentProviderRequestResponse,
+            itemId: String
+        ) async throws -> [String: Any] {
+            let responseTask = Task {
+                try await client.serverRequestHandler?(method, [
+                    "threadId": "codex-thread-1",
+                    "turnId": "turn-app-server-1",
+                    "itemId": itemId,
+                    "command": "apply_patch"
+                ])
+            }
+            // waitForApproval always returns the first opened card; skip already-handled ids.
+            let request: AssistantPendingRequest = try await {
+                let deadline = Date().addingTimeInterval(3)
+                while Date() < deadline {
+                    let events = await sink.snapshot()
+                    if let request = events.compactMap({
+                        if case .requestOpened(let request) = $0 { return request }
+                        return nil
+                    }).first(where: { !seenRequestIds.contains($0.id) }) {
+                        return request
+                    }
+                    try await Task.sleep(nanoseconds: 20_000_000)
+                }
+                throw CodexAdapterTestWaitError.timedOut("approval request \(itemId)")
+            }()
+            seenRequestIds.insert(request.id)
+            try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: response)
+            let raw = try await responseTask.value
+            return try XCTUnwrap(raw as? [String: Any])
+        }
+
+        // Interactive decisions first (before Approve Session promotes fullAccess).
+        let approved = try await decision(method: "applyPatchApproval", response: .approve, itemId: "patch-approve")
+        XCTAssertEqual(approved["decision"] as? String, "approved")
+
+        let declined = try await decision(
+            method: "applyPatchApproval",
+            response: .decline("not this path"),
+            itemId: "patch-decline"
+        )
+        let denied = try XCTUnwrap(declined["decision"] as? [String: Any])
+        let rejection = try XCTUnwrap(denied["denied"] as? [String: Any])
+        XCTAssertEqual(rejection["rejection"] as? String, "not this path")
+
+        let declinedDefault = try await decision(
+            method: "execCommandApproval",
+            response: .decline(nil),
+            itemId: "exec-decline"
+        )
+        let deniedDefault = try XCTUnwrap(declinedDefault["decision"] as? [String: Any])
+        let rejectionDefault = try XCTUnwrap(deniedDefault["denied"] as? [String: Any])
+        XCTAssertEqual(rejectionDefault["rejection"] as? String, "declined")
+
+        let aborted = try await decision(method: "execCommandApproval", response: .cancel, itemId: "exec-cancel")
+        XCTAssertEqual(aborted["decision"] as? String, "abort")
+
+        let approvedSession = try await decision(
+            method: "applyPatchApproval",
+            response: .approveForSession,
+            itemId: "patch-session"
+        )
+        XCTAssertEqual(approvedSession["decision"] as? String, "approved_for_session")
+
+        // After Approve Session, fullAccess auto-approve must also use ReviewDecision.
+        let autoPatch = try await client.serverRequestHandler?("applyPatchApproval", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "itemId": "patch-auto",
+            "command": "apply_patch"
+        ])
+        let autoPatchDecision = try XCTUnwrap(autoPatch as? [String: Any])
+        XCTAssertEqual(autoPatchDecision["decision"] as? String, "approved_for_session",
+                       "fullAccess auto-approve for applyPatch must use approved_for_session, not acceptForSession")
+
+        let autoExec = try await client.serverRequestHandler?("execCommandApproval", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "itemId": "exec-auto",
+            "command": "ls"
+        ])
+        let autoExecDecision = try XCTUnwrap(autoExec as? [String: Any])
+        XCTAssertEqual(autoExecDecision["decision"] as? String, "approved_for_session")
+    }
+
+    func test_commandExecutionApprovalStillUsesAcceptDialect() async throws {
+        // WHY: item/* requestApproval methods keep accept|acceptForSession|decline|cancel.
+        // ReviewDecision must not leak into the modern path.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "cmd"
+        )) { event in Task { await sink.record(event) } }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("item/commandExecution/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "cmd-accept",
+                "command": "swift test"
+            ])
+        }
+        let request = try await waitForApproval(in: sink)
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approve)
+        let raw = try await responseTask.value
+        let response = try XCTUnwrap(raw as? [String: Any])
+        XCTAssertEqual(response["decision"] as? String, "accept")
+    }
+
     func test_approveForSessionSettingsFailureSettlesProviderContinuation() async throws {
         let client = MockCodexAppServerClient(
             autoComplete: false,
@@ -1412,7 +1551,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .decline(nil))
         let rawResponse = try await responseTask.value
         let response = try XCTUnwrap(rawResponse as? [String: Any])
-        XCTAssertNil(response["decision"], "Codex 0.144.4 rejects the legacy decision shape")
+        XCTAssertNil(response["decision"], "Codex 0.146 rejects the legacy decision shape for permissions")
         XCTAssertEqual(response["scope"] as? String, "turn")
         XCTAssertEqual((response["permissions"] as? [String: Any])?.count, 0,
                        "decline grants an empty permission profile")

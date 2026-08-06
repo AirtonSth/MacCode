@@ -507,6 +507,9 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual(input.count, 3, "app-server turns must send image attachments and file mentions through native protocol input items")
         XCTAssertEqual(input[0]["type"] as? String, "text")
         XCTAssertEqual(input[0]["text"] as? String, "draft a plan")
+        let textElements = try XCTUnwrap(input[0]["text_elements"] as? [Any],
+                                         "Codex 0.146 UserInput text requires text_elements")
+        XCTAssertTrue(textElements.isEmpty, "unused text spans must still be sent as an empty array")
         XCTAssertEqual(input[1]["type"] as? String, "localImage")
         XCTAssertEqual(input[1]["path"] as? String, "/tmp/screenshot.png")
         XCTAssertNil(input[1]["url"], "local images must use the app-server localImage/path contract, never a file:// remote-image URL")
@@ -658,6 +661,9 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         let sandboxPolicy = try XCTUnwrap(params["sandboxPolicy"] as? [String: Any])
         XCTAssertEqual(sandboxPolicy["type"] as? String, "workspaceWrite")
         XCTAssertEqual(sandboxPolicy["networkAccess"] as? Bool, true)
+        XCTAssertEqual(sandboxPolicy["writableRoots"] as? [String], [])
+        XCTAssertEqual(sandboxPolicy["excludeTmpdirEnvVar"] as? Bool, false)
+        XCTAssertEqual(sandboxPolicy["excludeSlashTmp"] as? Bool, false)
     }
 
     func test_startTurnTokenSaverActiveFullAccessNeverGetsNetworkAccessKey() async throws {
@@ -693,43 +699,91 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual(sandboxPolicy.count, 1, "dangerFullAccess sandbox policy must stay exactly {type} even with Token Saver active")
     }
 
-    func test_startTurnTokenSaverInactiveNeverGetsNetworkAccessKeyRegardlessOfPermissionMode() async throws {
-        // WHY: this is the fail-open baseline required by AGENTS.md — Token Saver must not
-        // change any behavior while it is off, for ANY permission mode, regardless of whether
-        // the run is a primary agent, a subagent, or a cross-provider nested run (none of
-        // those carry RC_TOKEN_SAVER_DISTILL_HINT=1 here, matching a Token-Saver-disabled run).
-        let script = try makeFakeAppServerPeer()
-        let client = try CodexAppServerClient(
-            binary: script,
-            arguments: [],
-            cwd: FileManager.default.temporaryDirectory.path
-        )
-        defer { client.stop() }
-
-        _ = try await client.initialize()
-        for mode: AgentPermissionMode in [.supervised, .autoAcceptEdits, .fullAccess] {
-            let response = try await client.startTurn(
+    func test_turnStartParams_sandboxPolicyIsCompleteWithAndWithoutTokenSaver() throws {
+        // WHY: Codex 0.146 SandboxPolicy requires complete objects (networkAccess on
+        // readOnly; writableRoots/networkAccess/exclude* on workspaceWrite). Token Saver
+        // only flips networkAccess true/false — it must not omit required keys when off.
+        // Uses static turnStartParams so this is independent of the fake peer process.
+        func policy(mode: AgentPermissionMode, tokenSaver: Bool) throws -> [String: Any] {
+            var env: [String: String] = ["RC_REMOTE_CODE_SUBAGENT_THREAD_ID": UUID().uuidString]
+            if tokenSaver { env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1" }
+            let params = CodexAppServerClient.turnStartParams(
                 providerThreadId: "thread-app-server-1",
                 for: AgentRunRequest(
                     threadId: AgentThreadID(),
                     provider: .codex,
                     model: "gpt-5.5",
                     cwd: "/tmp/remotecode-app-server-test",
-                    prompt: "token saver inactive \(mode)",
+                    prompt: "sandbox \(mode) ts=\(tokenSaver)",
                     permissionMode: mode,
-                    // Deliberately includes a subagent-parent-telemetry marker (present on
-                    // real primary AND subagent runs alike) to prove that marker alone must
-                    // never grant networkAccess — only RC_TOKEN_SAVER_DISTILL_HINT does.
-                    environment: ["RC_REMOTE_CODE_SUBAGENT_THREAD_ID": UUID().uuidString]
+                    environment: env
                 )
             )
-            let params = try XCTUnwrap(response["lastParams"] as? [String: Any])
-            let sandboxPolicy = try XCTUnwrap(params["sandboxPolicy"] as? [String: Any])
-            XCTAssertNil(
-                sandboxPolicy["networkAccess"],
-                "Token-Saver-inactive run in \(mode) must never carry networkAccess"
-            )
+            return try XCTUnwrap(params["sandboxPolicy"] as? [String: Any])
         }
+
+        // Token Saver off — complete policies with networkAccess: false.
+        let supervisedOff = try policy(mode: .supervised, tokenSaver: false)
+        XCTAssertEqual(supervisedOff["type"] as? String, "readOnly")
+        XCTAssertEqual(supervisedOff["networkAccess"] as? Bool, false,
+                       "TS off: networkAccess must be explicit false, not omitted")
+
+        let workspaceOff = try policy(mode: .autoAcceptEdits, tokenSaver: false)
+        XCTAssertEqual(workspaceOff["type"] as? String, "workspaceWrite")
+        XCTAssertEqual(workspaceOff["networkAccess"] as? Bool, false)
+        XCTAssertEqual(workspaceOff["writableRoots"] as? [String], [])
+        XCTAssertEqual(workspaceOff["excludeTmpdirEnvVar"] as? Bool, false)
+        XCTAssertEqual(workspaceOff["excludeSlashTmp"] as? Bool, false)
+
+        let fullOff = try policy(mode: .fullAccess, tokenSaver: false)
+        XCTAssertEqual(fullOff["type"] as? String, "dangerFullAccess")
+        XCTAssertNil(fullOff["networkAccess"])
+        XCTAssertEqual(fullOff.count, 1)
+
+        // Token Saver on — same complete shape, networkAccess true for sandboxed modes.
+        let supervisedOn = try policy(mode: .supervised, tokenSaver: true)
+        XCTAssertEqual(supervisedOn["type"] as? String, "readOnly")
+        XCTAssertEqual(supervisedOn["networkAccess"] as? Bool, true)
+
+        let workspaceOn = try policy(mode: .autoAcceptEdits, tokenSaver: true)
+        XCTAssertEqual(workspaceOn["type"] as? String, "workspaceWrite")
+        XCTAssertEqual(workspaceOn["networkAccess"] as? Bool, true)
+        XCTAssertEqual(workspaceOn["writableRoots"] as? [String], [])
+        XCTAssertEqual(workspaceOn["excludeTmpdirEnvVar"] as? Bool, false)
+        XCTAssertEqual(workspaceOn["excludeSlashTmp"] as? Bool, false)
+
+        let fullOn = try policy(mode: .fullAccess, tokenSaver: true)
+        XCTAssertEqual(fullOn["type"] as? String, "dangerFullAccess")
+        XCTAssertNil(fullOn["networkAccess"])
+        XCTAssertEqual(fullOn.count, 1)
+    }
+
+    func test_turnStartParams_textInputIncludesEmptyTextElements() throws {
+        // WHY: Codex 0.146 UserInput text requires text_elements (empty when unused).
+        let params = CodexAppServerClient.turnStartParams(
+            providerThreadId: "thread-app-server-1",
+            for: AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: "/tmp/remotecode-app-server-test",
+                prompt: "hello text elements"
+            )
+        )
+        let input = try XCTUnwrap(params["input"] as? [[String: Any]])
+        XCTAssertEqual(input.first?["type"] as? String, "text")
+        XCTAssertEqual(input.first?["text"] as? String, "hello text elements")
+        let textElements = try XCTUnwrap(input.first?["text_elements"] as? [Any])
+        XCTAssertTrue(textElements.isEmpty)
+    }
+
+    func test_initializeCapabilities_includesRequestAttestationFalse() throws {
+        // WHY: InitializeCapabilities requires requestAttestation. RemoteCode does not
+        // implement attestation/generate, so it must negotiate false explicitly.
+        let capabilities = CodexAppServerClient.initializeCapabilities()
+        XCTAssertEqual(capabilities["experimentalApi"] as? Bool, true)
+        XCTAssertEqual(capabilities["requestAttestation"] as? Bool, false,
+                       "must refuse attestation opt-in so Codex does not send attestation/generate")
     }
 
     func test_tokenSaverHint_drivesFullDistillSpecInDeveloperInstructions() async throws {
@@ -933,11 +987,16 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         import sys
 
         last_thread_settings_update = {}
+        last_initialize = {}
         forked_threads = []
         for line in sys.stdin:
             msg = json.loads(line)
             method = msg.get("method")
             if method == "initialize":
+                last_initialize = {
+                    "lastMethod": method,
+                    "lastParams": msg.get("params", {})
+                }
                 print(json.dumps({
                     "method": "item/agentMessage/delta",
                     "params": {
@@ -1123,6 +1182,11 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                 print(json.dumps({
                     "id": msg["id"],
                     "result": last_thread_settings_update
+                }), flush=True)
+            elif method == "test/lastInitialize":
+                print(json.dumps({
+                    "id": msg["id"],
+                    "result": last_initialize
                 }), flush=True)
             elif method == "test/stringIdRequest":
                 print(json.dumps({

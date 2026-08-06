@@ -298,6 +298,16 @@ public final class CodexAppServerClient: @unchecked Sendable {
         stop()
     }
 
+    /// Codex 0.146 InitializeCapabilities: always send both required booleans.
+    /// `requestAttestation` stays false — RemoteCode does not implement attestation/generate.
+    public static func initializeCapabilities() -> JSONObject {
+        [
+            "experimentalApi": true,
+            "requestAttestation": false,
+            "optOutNotificationMethods": NSNull()
+        ]
+    }
+
     public func initialize(
         clientName: String = "remotecode",
         clientTitle: String = "RemoteCode",
@@ -311,10 +321,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
                     "title": clientTitle,
                     "version": clientVersion
                 ],
-                "capabilities": [
-                    "experimentalApi": true,
-                    "optOutNotificationMethods": NSNull()
-                ]
+                "capabilities": Self.initializeCapabilities()
             ]
         )
         try notify(method: "initialized")
@@ -721,7 +728,8 @@ public final class CodexAppServerClient: @unchecked Sendable {
         var input: [JSONObject] = []
         let prompt = request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         if !prompt.isEmpty {
-            input.append(["type": "text", "text": prompt])
+            // Codex 0.146 UserInput text requires text_elements (empty when unused).
+            input.append(["type": "text", "text": prompt, "text_elements": [Any]()])
         }
         for attachment in request.attachments where attachment.kind == .image {
             input.append([
@@ -892,24 +900,28 @@ public final class CodexAppServerClient: @unchecked Sendable {
         }
     }
 
-    /// When Token Saver is active for this run, `networkAccess: true` is added to the
-    /// readOnly/workspaceWrite sandbox policy so the local Token Saver ledger POST is not
-    /// blocked by the seatbelt's default network denial. This only lifts network —
-    /// filesystem restrictions from the underlying mode are unchanged. Full Access is
-    /// untouched (already unsandboxed). Applies uniformly to every Codex run (primary,
-    /// subagent, or cross-provider nested) — see AGENTS.md "Token Saver / Distill rules":
-    /// this must fail open (no networkAccess) whenever Token Saver is off, and must not be
-    /// scoped to one run kind when the underlying capability is provider-wide.
+    /// Complete Codex 0.146 SandboxPolicy objects for turn/start and
+    /// thread/settings/update. Token Saver only flips `networkAccess` so the
+    /// local ledger POST is not blocked; filesystem restrictions of the mode
+    /// are unchanged. Full Access stays `{type: dangerFullAccess}` only.
+    /// Applies uniformly to every Codex run (primary, subagent, or nested) —
+    /// see AGENTS.md Token Saver rules. When Token Saver is off,
+    /// `networkAccess` is explicitly `false` (fail-open: no network lift).
     private static func sandboxPolicy(for mode: AgentPermissionMode, tokenSaverActive: Bool = false) -> JSONObject {
         switch mode {
         case .supervised:
-            var policy: JSONObject = ["type": "readOnly"]
-            if tokenSaverActive { policy["networkAccess"] = true }
-            return policy
+            return [
+                "type": "readOnly",
+                "networkAccess": tokenSaverActive
+            ]
         case .autoAcceptEdits:
-            var policy: JSONObject = ["type": "workspaceWrite"]
-            if tokenSaverActive { policy["networkAccess"] = true }
-            return policy
+            return [
+                "type": "workspaceWrite",
+                "writableRoots": [String](),
+                "networkAccess": tokenSaverActive,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            ]
         case .fullAccess:
             return ["type": "dangerFullAccess"]
         }
