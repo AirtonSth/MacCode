@@ -2213,6 +2213,72 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                        "with no resumed turn to supersede it, the withheld finish is what settles the run")
     }
 
+    func test_selfDeclaredRCAwaitingDoesNotDeferFinishWhileStickyBackgroundTasks() async throws {
+        // WHY: field Elephant Task 1 2026-08-06 — model ended with
+        // `[[RC_AWAITING]]\n## Done — PR #2402` while CLI still listed sticky
+        // local_bash CI waiters. Deferral withheld `.finished`, so auto-nudge
+        // and Continue (both need `.completed`) never ran — Working forever.
+        // Self-declared marker is the "nudge me" contract: finish promptly.
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-rc-await-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let script = tmp.appendingPathComponent("fake-claude")
+        let marker = "[[RC_AWAITING]]"
+        let final = "\(marker)\\n\\n## Done — PR #2402, Linear updated."
+        try """
+        #!/usr/bin/env python3
+        import json, sys, time
+        S = "claude-rc-await-session"
+        def e(o):
+            print(json.dumps(o), flush=True)
+        e({"type":"system","subtype":"init","session_id":S})
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            e({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b93ce913v","task_type":"local_bash","description":"Wait for CI"}],"session_id":S})
+            e({"type":"assistant","message":{"content":[{"type":"text","text":"\(final)"}]},"session_id":S})
+            e({"type":"result","subtype":"success","is_error":False,"result":"\(final)","session_id":S})
+            # Sticky tasks never clear — must still finish promptly (not wait 900s).
+            time.sleep(2)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let adapter = ClaudeStreamingCLIAdapter(
+            binaryNameOverride: script.path,
+            deferredFinishInactivityTimeout: 30 // would hang the test if we wrongly deferred
+        )
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "finish with marker"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        let deadline = Date().addingTimeInterval(2)
+        var finishes: [(AgentRunStatus, String?)] = []
+        while Date() < deadline {
+            finishes = Self.finishedPairs(await sink.snapshot())
+            if !finishes.isEmpty { break }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(finishes.count, 1,
+                       "[[RC_AWAITING]] final must not defer while sticky bg tasks remain")
+        XCTAssertEqual(finishes.first?.0, .completed)
+        XCTAssertTrue(
+            (finishes.first?.1 ?? "").contains(marker),
+            "terminal final must preserve the marker for auto-nudge / Continue"
+        )
+        XCTAssertTrue(
+            (finishes.first?.1 ?? "").contains("Done — PR #2402"),
+            "terminal must carry the Done body, not drop it"
+        )
+        try? adapter.stopSession(threadId: threadId)
+    }
+
     func test_deferredFinishDoesNotForceTerminalWhileStreamProgressContinues() async throws {
         // WHY: real bg lifecycle progress must re-arm inactivity so long nested
         // work is not force-finished. Generic status heartbeats must NOT re-arm

@@ -790,7 +790,17 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         let providerThreadId = session.providerThreadId
         let pending = session.pendingBackgroundTaskIds
         let runId = session.inFlightRunId
-        let shouldDefer = allowDeferral && status == .completed && !pending.isEmpty
+        // Field 2026-08-06 (Elephant Task 1): model ended with [[RC_AWAITING]] +
+        // "Done" while CLI still listed sticky local_bash (CI wait). Deferral
+        // withheld `.finished`, so auto-nudge + Continue (both need `.completed`)
+        // never ran — Working + Awaiting forever until quiet inactivity. The
+        // marker is the agent's self-declared "nudge me" contract; do not block
+        // that recovery path by also deferring.
+        let selfDeclaredAwaiting = Self.finalMessageSelfDeclaresAwaiting(finalMessage)
+        let shouldDefer = allowDeferral
+            && status == .completed
+            && !pending.isEmpty
+            && !selfDeclaredAwaiting
         if shouldDefer {
             // Keep the earliest deferredAt if we re-arm on a later premature result.
             let deferredAt = session.deferredFinish?.deferredAt ?? Date()
@@ -814,7 +824,22 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             refreshDeferralWatchdog(session: session)
             return
         }
+        if selfDeclaredAwaiting && !pending.isEmpty {
+            claudeStreamLog.info(
+                "claude.turn.not_deferred self_declared_awaiting pendingTasks=\(pending.count, privacy: .public)"
+            )
+        }
         emitTerminal(status: status, finalMessage: finalMessage, providerThreadId: providerThreadId, session: session)
+    }
+
+    /// True when the final message carries the background-await protocol marker.
+    private static func finalMessageSelfDeclaresAwaiting(_ finalMessage: String?) -> Bool {
+        guard let text = finalMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else { return false }
+        return text.range(
+            of: BackgroundAwaitContinuation.awaitingMarker,
+            options: .caseInsensitive
+        ) != nil
     }
 
     /// Emits the run's single terminal pair and releases per-run session state.
