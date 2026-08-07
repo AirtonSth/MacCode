@@ -94,14 +94,10 @@ enum PetPopoverSizing {
 }
 
 enum PetScreenGeometry {
-    static func petPlacementFrame(screenFrame: CGRect, visibleFrame: CGRect) -> CGRect {
-        let topEdge = min(screenFrame.maxY, max(screenFrame.minY, visibleFrame.maxY))
-        return CGRect(
-            x: screenFrame.minX,
-            y: screenFrame.minY,
-            width: screenFrame.width,
-            height: topEdge - screenFrame.minY
-        )
+    /// Usable desktop rect for the pet: inside `visibleFrame` so Dock and menu bar stay clear.
+    /// `screenFrame` is kept for API stability at call sites; placement bounds come from `visibleFrame`.
+    static func petPlacementFrame(screenFrame _: CGRect, visibleFrame: CGRect) -> CGRect {
+        visibleFrame
     }
 
     static func largestPositiveIntersectionIndex(

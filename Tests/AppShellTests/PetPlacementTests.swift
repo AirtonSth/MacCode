@@ -4,7 +4,7 @@ import XCTest
 final class PetPlacementTests: XCTestCase {
     private let visibleFrame = CGRect(x: 100, y: 100, width: 1_000, height: 700)
 
-    func test_petScreenFrameUsesPhysicalSideAndBottomEdgesButKeepsMenuBarClear() {
+    func test_petScreenFrameRespectsDockAndMenuBarVisibleBounds() {
         let screenFrame = CGRect(x: 0, y: 0, width: 1_000, height: 800)
         let dockAndMenuVisibleFrame = CGRect(x: 80, y: 60, width: 840, height: 710)
 
@@ -13,19 +13,20 @@ final class PetPlacementTests: XCTestCase {
                 screenFrame: screenFrame,
                 visibleFrame: dockAndMenuVisibleFrame
             ),
-            CGRect(x: 0, y: 0, width: 1_000, height: 770),
-            "the pet may occupy Dock-reserved side/bottom space, but must remain below the menu bar"
+            dockAndMenuVisibleFrame,
+            "the pet must stay inside usable desktop bounds (Dock side/bottom and menu bar clear)"
         )
     }
 
     func test_petScreenFramePreservesOffsetDisplayCoordinates() {
+        let visible = CGRect(x: 3_400, y: 218, width: 1_600, height: 1_025)
         XCTAssertEqual(
             PetScreenGeometry.petPlacementFrame(
                 screenFrame: CGRect(x: 3_337, y: 158, width: 1_728, height: 1_117),
-                visibleFrame: CGRect(x: 3_400, y: 218, width: 1_600, height: 1_025)
+                visibleFrame: visible
             ),
-            CGRect(x: 3_337, y: 158, width: 1_728, height: 1_085),
-            "secondary-display offsets must not become artificial margins"
+            visible,
+            "secondary-display visibleFrame offsets must be preserved as the placement rect"
         )
     }
 
