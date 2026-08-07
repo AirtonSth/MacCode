@@ -130,10 +130,15 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertTrue(GrokACPImageCompatibility.effectiveImageEnabled(advertised: false, agentVersion: "0.2.103"),
                       "0.2.x is verified to accept type=image blocks despite image=false")
         XCTAssertTrue(GrokACPImageCompatibility.effectiveImageEnabled(advertised: false, agentVersion: "0.2.101"))
+        XCTAssertTrue(GrokACPImageCompatibility.effectiveImageEnabled(advertised: false, agentVersion: "1.0.0"),
+                      "1.0.x live canary accepts type=image despite image=false")
+        XCTAssertTrue(GrokACPImageCompatibility.effectiveImageEnabled(advertised: false, agentVersion: "1.0.1"))
         XCTAssertFalse(GrokACPImageCompatibility.effectiveImageEnabled(advertised: false, agentVersion: nil),
                        "unknown agent version must fail closed when image is not advertised")
         XCTAssertFalse(GrokACPImageCompatibility.effectiveImageEnabled(advertised: false, agentVersion: "0.3.0"),
-                       "unverified major/minor must not inherit the 0.2.x override")
+                       "unverified major/minor must not inherit the verified-family override")
+        XCTAssertFalse(GrokACPImageCompatibility.effectiveImageEnabled(advertised: false, agentVersion: ""),
+                       "empty agent version must fail closed")
     }
 
     func test_initializeParsesReal02101Capabilities() throws {
@@ -988,6 +993,42 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertTrue(
             adapter.contains("needsEffortBind") || adapter.contains("reasoningEffort: targetEffort"),
             "Adapter must re-bind effort when it changes even if model id is unchanged"
+        )
+    }
+
+    /// WHY: warm reattach + prompt still paid full gateway replay unless
+    /// session/load carries `_meta.noReplay` (grok-build parse_no_replay).
+    /// Recover without prompt must keep replay so readThread has history.
+    func test_loadSessionParamsIncludeNoReplayMetaWhenRequested() throws {
+        // Reconstruct the params shape GrokACPClient.loadSession must emit.
+        var withReplay: [String: Any] = ["sessionId": "sid", "cwd": "/tmp", "mcpServers": [Any]()]
+        // Default: no _meta.noReplay
+        XCTAssertNil(withReplay["_meta"])
+
+        var noReplay: [String: Any] = ["sessionId": "sid", "cwd": "/tmp", "mcpServers": [Any]()]
+        noReplay["_meta"] = ["noReplay": true]
+        XCTAssertEqual((noReplay["_meta"] as? [String: Any])?["noReplay"] as? Bool, true)
+
+        let root = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let clientSource = try String(
+            contentsOf: root.appendingPathComponent("Sources/AgentRuntime/GrokACPClient.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(clientSource.contains("noReplay"), "loadSession must accept noReplay")
+        XCTAssertTrue(
+            clientSource.contains("\"noReplay\": true") || clientSource.contains("[\"noReplay\": true]"),
+            "loadSession must send _meta.noReplay when requested"
+        )
+        let adapterSource = try String(
+            contentsOf: root.appendingPathComponent("Sources/AgentRuntime/GrokACPAdapter.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(
+            adapterSource.contains("noReplay: shouldStartPrompt"),
+            "Adapter must pass noReplay:true only on load+prompt path"
         )
     }
 }

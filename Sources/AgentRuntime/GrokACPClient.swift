@@ -197,8 +197,8 @@ public enum GrokACPRequestID: Hashable, Sendable {
     }
 }
 
-/// Grok agent stdio 0.2.x advertises `promptCapabilities.image=false` but still
-/// accepts `type=image` prompt blocks end-to-end (live canary on 0.2.103).
+/// Grok agent stdio advertises `promptCapabilities.image=false` but still
+/// accepts `type=image` prompt blocks end-to-end (live canary: 0.2.x and 1.0.x).
 /// Use one effective gate for both capability advertisement and prompt embedding
 /// so iOS Camera/Photos stay aligned with the wire path.
 public enum GrokACPImageCompatibility {
@@ -212,8 +212,8 @@ public enum GrokACPImageCompatibility {
         if advertised { return true }
         let version = agentVersion?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !version.isEmpty else { return false }
-        // Verified family: 0.2.x accepts image blocks despite image=false.
-        return version.hasPrefix("0.2.")
+        // Verified families: 0.2.x and 1.0.x accept image blocks despite image=false.
+        return version.hasPrefix("0.2.") || version.hasPrefix("1.0.")
     }
 }
 
@@ -551,10 +551,21 @@ public final class GrokACPClient: @unchecked Sendable {
         return try Self.openResult(result, fallbackSessionId: nil)
     }
 
-    func loadSession(sessionId: String, cwd: String) async throws -> GrokACPSessionOpenResult {
+    /// When `noReplay` is true, params include `_meta.noReplay` (grok-build
+    /// mvp_agent `parse_no_replay`) so the agent skips gateway history replay.
+    /// Default false preserves full replay for recover/readThread paths.
+    func loadSession(
+        sessionId: String,
+        cwd: String,
+        noReplay: Bool = false
+    ) async throws -> GrokACPSessionOpenResult {
+        var params: JSONObject = ["sessionId": sessionId, "cwd": cwd, "mcpServers": []]
+        if noReplay {
+            params["_meta"] = ["noReplay": true]
+        }
         let result = try await requestJSONObject(
             method: "session/load",
-            params: ["sessionId": sessionId, "cwd": cwd, "mcpServers": []],
+            params: params,
             timeout: 60
         )
         return try Self.openResult(result, fallbackSessionId: sessionId)
