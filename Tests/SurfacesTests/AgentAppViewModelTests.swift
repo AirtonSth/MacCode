@@ -5053,6 +5053,39 @@ final class AgentAppViewModelTests: XCTestCase {
         )
     }
 
+    /// WHY: soft reselect + 2s poll reassigned identical subagent snapshots,
+    /// republishing nested-worker chrome with no state change.
+    func test_shouldPublishSubagentActivity_skipsEqualSnapshot() {
+        XCTAssertFalse(
+            AgentAppViewModel.shouldPublishSubagentActivity(
+                current: .empty,
+                next: .empty
+            ),
+            "identical empty snapshot must not re-publish"
+        )
+        // Different bound forces inequality without inventing activity rows.
+        let changed = SubagentActivitySnapshot(
+            active: [],
+            done: [],
+            unknown: [],
+            completedBound: SubagentActivityProjection.defaultCompletedBound + 1
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldPublishSubagentActivity(
+                current: .empty,
+                next: changed
+            ),
+            "changed snapshot must publish"
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.shouldPublishSubagentActivity(
+                current: changed,
+                next: changed
+            ),
+            "identical non-empty-bound snapshot must not re-publish"
+        )
+    }
+
     /// WHY: soft reselect always reassigned the queue array even when unchanged,
     /// republishing composer queue chrome on every host refresh / rail re-click.
     func test_shouldPublishQueuedMessagesReload_skipsEqualListAndStatus() {

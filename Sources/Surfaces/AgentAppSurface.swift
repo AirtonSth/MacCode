@@ -987,7 +987,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func refreshSubagentActivity() {
         guard !isDisposed else { return }
         guard let selectedThreadId else {
-            if subagentActivity != .empty {
+            if Self.shouldPublishSubagentActivity(current: subagentActivity, next: .empty) {
                 subagentActivity = .empty
             }
             return
@@ -1006,12 +1006,24 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 coordinator.activeRunId(threadId: threadId)
             }
         )
-        subagentActivity = SubagentActivityProjection.project(
+        let next = SubagentActivityProjection.project(
             receipts: receipts,
             threadIds: [selectedThreadId],
             activeRunIds: activeRunIds,
             now: clock()
         )
+        // Soft reselect + the 2s poll re-enter here constantly. Re-assigning an
+        // identical snapshot republishes @Published subagent chrome for no reason.
+        guard Self.shouldPublishSubagentActivity(current: subagentActivity, next: next) else { return }
+        subagentActivity = next
+    }
+
+    /// Skip equal subagent snapshot reloads (soft reselect / idle poll multipass).
+    nonisolated public static func shouldPublishSubagentActivity(
+        current: SubagentActivitySnapshot,
+        next: SubagentActivitySnapshot
+    ) -> Bool {
+        current != next
     }
 
     /// Drop surface `runThreads` entries that no longer match a live coordinator
