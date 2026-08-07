@@ -5028,6 +5028,43 @@ final class AgentAppViewModelTests: XCTestCase {
         )
     }
 
+    /// WHY: soft reselect reassigned identical chrome fields and multipass-
+    /// churned the open Agent App body on every host refresh / rail re-click.
+    func test_shouldAssignIfChanged_onlyWhenValueDiffers() {
+        XCTAssertFalse(
+            AgentAppViewModel.shouldAssignIfChanged(current: "m", next: "m"),
+            "identical values must not re-publish"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldAssignIfChanged(current: "m", next: "n"),
+            "changed values must assign"
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.shouldAssignIfChanged(
+                current: Optional<String>.none,
+                next: Optional<String>.none
+            )
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldAssignIfChanged(
+                current: Optional<String>.none,
+                next: Optional("x")
+            )
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.shouldAssignIfChanged(
+                current: AgentRunStatus.completed,
+                next: .completed
+            )
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldAssignIfChanged(
+                current: AgentRunStatus.running,
+                next: .completed
+            )
+        )
+    }
+
     /// Soft reselect must not re-fetch the message page when it already shows
     /// this thread — that async messages= swap was a visible multipass flash.
     func test_shouldReloadMessagesOnSoftReselect_onlyWhenListStale() {

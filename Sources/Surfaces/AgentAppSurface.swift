@@ -2075,6 +2075,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return false
     }
 
+    /// Soft reselect chrome: only write @Published when the value actually changes.
+    /// WHY: host refresh / rail re-click re-entered soft reselect and reassigned
+    /// identical provider/model/status fields, multipass-churning the open body.
+    nonisolated public static func shouldAssignIfChanged<T: Equatable>(
+        current: T,
+        next: T
+    ) -> Bool {
+        current != next
+    }
+
     /// Mark-read must clear unread without rewriting activity time (rail "now").
     nonisolated public static func applyingMarkReadPreservingActivity(_ thread: AgentThread) -> AgentThread {
         var next = thread
@@ -2252,25 +2262,59 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         publishInterestedThreadId(id)
         reloadQueuedMessages()
         let routing = selectedThread.effectiveRoutingConfiguration
-        routingMode = routing.mode
         let manual = routing.manualSelection
-        provider = manual.provider
-        providerInstanceId = routing.manualProviderInstanceId ?? manual.provider.rawValue
-        runAsUser = selectedThread.runAsUser ?? AgentRunAsUser.current()
-        model = manual.effectiveModel
-        permissionMode = selectedThread.permissionMode
-        reasoningEffort = manual.reasoningEffort
-        serviceTier = manual.serviceTier
-        executionMode = selectedThread.executionMode
-        baseBranch = selectedThread.baseBranch ?? gitBranch ?? "main"
-        worktreePath = selectedThread.worktreePath
-        status = selectedThread.status
+        // Assign-if-changed: soft reselect re-entered on every host refresh / rail
+        // re-click and re-published identical chrome (multipass SwiftUI body churn).
+        if Self.shouldAssignIfChanged(current: routingMode, next: routing.mode) {
+            routingMode = routing.mode
+        }
+        if Self.shouldAssignIfChanged(current: provider, next: manual.provider) {
+            provider = manual.provider
+        }
+        let nextProviderInstanceId = routing.manualProviderInstanceId ?? manual.provider.rawValue
+        if Self.shouldAssignIfChanged(current: providerInstanceId, next: nextProviderInstanceId) {
+            providerInstanceId = nextProviderInstanceId
+        }
+        let nextRunAsUser = selectedThread.runAsUser ?? AgentRunAsUser.current()
+        if Self.shouldAssignIfChanged(current: runAsUser, next: nextRunAsUser) {
+            runAsUser = nextRunAsUser
+        }
+        if Self.shouldAssignIfChanged(current: model, next: manual.effectiveModel) {
+            model = manual.effectiveModel
+        }
+        if Self.shouldAssignIfChanged(current: permissionMode, next: selectedThread.permissionMode) {
+            permissionMode = selectedThread.permissionMode
+        }
+        if Self.shouldAssignIfChanged(current: reasoningEffort, next: manual.reasoningEffort) {
+            reasoningEffort = manual.reasoningEffort
+        }
+        if Self.shouldAssignIfChanged(current: serviceTier, next: manual.serviceTier) {
+            serviceTier = manual.serviceTier
+        }
+        if Self.shouldAssignIfChanged(current: executionMode, next: selectedThread.executionMode) {
+            executionMode = selectedThread.executionMode
+        }
+        let nextBaseBranch = selectedThread.baseBranch ?? gitBranch ?? "main"
+        if Self.shouldAssignIfChanged(current: baseBranch, next: nextBaseBranch) {
+            baseBranch = nextBaseBranch
+        }
+        if Self.shouldAssignIfChanged(current: worktreePath, next: selectedThread.worktreePath) {
+            worktreePath = selectedThread.worktreePath
+        }
+        if Self.shouldAssignIfChanged(current: status, next: selectedThread.status) {
+            status = selectedThread.status
+        }
         if let trackedRunId = trackedRunId(for: id) {
-            runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
+            let nextStarted = AgentAppViewModel.resolvedRunStartedAt(
                 current: runStartedAt,
                 persisted: try? coordinator.runStartedAt(threadId: id)
             )
-            currentRunId = trackedRunId
+            if Self.shouldAssignIfChanged(current: runStartedAt, next: nextStarted) {
+                runStartedAt = nextStarted
+            }
+            if Self.shouldAssignIfChanged(current: currentRunId, next: trackedRunId) {
+                currentRunId = trackedRunId
+            }
             stopScheduledLivePoll()
         } else if isScheduledThreadRunning?(id) == true {
             bindScheduledOwnedRun(threadId: id)
@@ -2281,7 +2325,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             stopScheduledLivePoll()
         }
         normalizeInteractionModeForSelectedProvider()
-        selectedThreadHasRecoverableContext = coordinator.hasRecoverableContext(threadId: id)
+        let nextRecoverable = coordinator.hasRecoverableContext(threadId: id)
+        if Self.shouldAssignIfChanged(
+            current: selectedThreadHasRecoverableContext,
+            next: nextRecoverable
+        ) {
+            selectedThreadHasRecoverableContext = nextRecoverable
+        }
         // Only invoke mark-read when unread — otherwise every soft reselect
         // (rail re-click / host refresh) forced a coalesced rail reload for no reason.
         if markRead, selectedThread.hasUnread, let markThreadRead {
