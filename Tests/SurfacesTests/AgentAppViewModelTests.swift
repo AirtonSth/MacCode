@@ -5053,6 +5053,58 @@ final class AgentAppViewModelTests: XCTestCase {
         )
     }
 
+    /// WHY: soft reselect always reassigned the queue array even when unchanged,
+    /// republishing composer queue chrome on every host refresh / rail re-click.
+    func test_shouldPublishQueuedMessagesReload_skipsEqualListAndStatus() {
+        let tid = AgentThreadID()
+        let msg = AgentQueuedMessage(
+            id: AgentQueuedMessageID(),
+            threadId: tid,
+            text: "follow up",
+            attachments: [],
+            interactionMode: .default,
+            position: 1,
+            createdAt: Date(timeIntervalSince1970: 1),
+            updatedAt: Date(timeIntervalSince1970: 1)
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.shouldPublishQueuedMessagesReload(
+                current: [msg],
+                next: [msg],
+                currentStatus: nil,
+                nextStatus: nil
+            ),
+            "identical queue + status must not re-publish"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldPublishQueuedMessagesReload(
+                current: [msg],
+                next: [msg],
+                currentStatus: nil,
+                nextStatus: "busy"
+            ),
+            "status-only change must publish"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldPublishQueuedMessagesReload(
+                current: [],
+                next: [msg],
+                currentStatus: nil,
+                nextStatus: nil
+            ),
+            "new queue rows must publish"
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.shouldPublishQueuedMessagesReload(
+                current: [],
+                next: [],
+                currentStatus: nil,
+                nextStatus: nil
+            ),
+            "empty→empty must not clear/publish again"
+        )
+    }
+
     /// WHY: soft reselect always called reloadCheckpoints, re-assigning the same
     /// list and re-selecting the same checkpoint (diff preview multipass publish).
     func test_shouldPublishCheckpointReload_skipsEqualListWithValidSelection() {

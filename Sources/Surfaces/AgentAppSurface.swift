@@ -1568,18 +1568,45 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func reloadQueuedMessages() {
         guard let selectedThreadId, let queuedMessageRepo else {
+            guard Self.shouldPublishQueuedMessagesReload(
+                current: queuedMessages,
+                next: [],
+                currentStatus: queueStatusMessage,
+                nextStatus: nil
+            ) else { return }
             queuedMessages = []
             queueStatusMessage = nil
             return
         }
-        queuedMessages = (try? queuedMessageRepo.list(threadId: selectedThreadId)) ?? []
+        let next = (try? queuedMessageRepo.list(threadId: selectedThreadId)) ?? []
+        let nextStatus: String?
         if let status = queueStatusByThread[selectedThreadId] {
-            queueStatusMessage = status
-        } else if queuedMessages.first?.durableState == .prepared {
-            queueStatusMessage = Self.preparedQueueStatusMessage
+            nextStatus = status
+        } else if next.first?.durableState == .prepared {
+            nextStatus = Self.preparedQueueStatusMessage
         } else {
-            queueStatusMessage = nil
+            nextStatus = nil
         }
+        // Soft reselect / host refresh re-enters here constantly. Re-assigning an
+        // identical queue list republishes @Published queue chrome for no reason.
+        guard Self.shouldPublishQueuedMessagesReload(
+            current: queuedMessages,
+            next: next,
+            currentStatus: queueStatusMessage,
+            nextStatus: nextStatus
+        ) else { return }
+        queuedMessages = next
+        queueStatusMessage = nextStatus
+    }
+
+    /// Skip equal queue + status reloads (soft reselect multipass publish).
+    nonisolated public static func shouldPublishQueuedMessagesReload(
+        current: [AgentQueuedMessage],
+        next: [AgentQueuedMessage],
+        currentStatus: String?,
+        nextStatus: String?
+    ) -> Bool {
+        current != next || currentStatus != nextStatus
     }
 
     private static let preparedQueueStatusMessage =
