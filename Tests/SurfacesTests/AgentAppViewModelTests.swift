@@ -5053,6 +5053,44 @@ final class AgentAppViewModelTests: XCTestCase {
         )
     }
 
+    /// WHY: soft reselect restarts token-saver work and reassigned identical
+    /// footer numbers, multipass-repainting the thread footer chrome.
+    func test_shouldPublishTokenSaverFooter_skipsEqualValues() {
+        XCTAssertFalse(
+            AgentAppViewModel.shouldPublishTokenSaverFooter(
+                currentEnabled: true,
+                nextEnabled: true,
+                currentMeasured: 10,
+                nextMeasured: 10,
+                currentDisplay: 12,
+                nextDisplay: 12
+            ),
+            "identical footer must not re-publish"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldPublishTokenSaverFooter(
+                currentEnabled: true,
+                nextEnabled: true,
+                currentMeasured: 10,
+                nextMeasured: 11,
+                currentDisplay: 12,
+                nextDisplay: 12
+            ),
+            "measured change must publish"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldPublishTokenSaverFooter(
+                currentEnabled: false,
+                nextEnabled: true,
+                currentMeasured: 0,
+                nextMeasured: 0,
+                currentDisplay: 0,
+                nextDisplay: 0
+            ),
+            "eligibility change must publish"
+        )
+    }
+
     /// WHY: soft reselect + 2s poll reassigned identical subagent snapshots,
     /// republishing nested-worker chrome with no state change.
     func test_shouldPublishSubagentActivity_skipsEqualSnapshot() {

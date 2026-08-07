@@ -1277,11 +1277,35 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             )
             await MainActor.run { [weak self] in
                 guard let self, !self.isDisposed, !Task.isCancelled else { return }
+                // Soft reselect / stream ticks re-enter constantly. Skip identical
+                // footer assigns so @Published chrome does not multipass-repaint.
+                guard Self.shouldPublishTokenSaverFooter(
+                    currentEnabled: self.tokenSaverFooterEnabled,
+                    nextEnabled: eligible,
+                    currentMeasured: self.tokenSaverThreadMeasuredTokens,
+                    nextMeasured: measured,
+                    currentDisplay: self.tokenSaverThreadSavedTokens,
+                    nextDisplay: display
+                ) else { return }
                 self.tokenSaverFooterEnabled = eligible
                 self.tokenSaverThreadMeasuredTokens = measured
                 self.tokenSaverThreadSavedTokens = display
             }
         }
+    }
+
+    /// Skip equal token-saver footer publishes (soft reselect / idle multipass).
+    nonisolated public static func shouldPublishTokenSaverFooter(
+        currentEnabled: Bool,
+        nextEnabled: Bool,
+        currentMeasured: Int,
+        nextMeasured: Int,
+        currentDisplay: Int,
+        nextDisplay: Int
+    ) -> Bool {
+        currentEnabled != nextEnabled
+            || currentMeasured != nextMeasured
+            || currentDisplay != nextDisplay
     }
 
     /// Bumped on every full thread open so deferred provider-snapshot tasks for
