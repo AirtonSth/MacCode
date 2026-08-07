@@ -538,7 +538,13 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 guard capabilities.loadSession, let providerThreadId = request.providerThreadId, !providerThreadId.isEmpty else {
                     throw AgentProviderAdapterError.unsupported("Grok ACP session/load is not negotiated")
                 }
-                opened = try await client.loadSession(sessionId: providerThreadId, cwd: request.cwd)
+                // Warm reattach + prompt: skip gateway replay cost (hydrate is local-only).
+                // Recover without prompt: keep full replay so readThread has history.
+                opened = try await client.loadSession(
+                    sessionId: providerThreadId,
+                    cwd: request.cwd,
+                    noReplay: shouldStartPrompt
+                )
             } else {
                 opened = try await client.newSession(cwd: request.cwd)
             }
