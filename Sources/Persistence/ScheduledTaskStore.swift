@@ -216,8 +216,8 @@ public final class ScheduledTaskStore: @unchecked Sendable {
         leaseDuration: TimeInterval = 6 * 60 * 60
     ) throws -> [ScheduledTaskClaim] {
         try db.transaction {
-            let active = try activeRunCount()
-            let available = max(0, min(limit, 2 - active))
+            // `limit` is per-poll batch size only — no global active-run ceiling.
+            let available = max(0, limit)
             guard available > 0 else { return [] }
             let query = try db.prepare(Self.taskSelect + """
                  WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?
@@ -275,9 +275,6 @@ public final class ScheduledTaskStore: @unchecked Sendable {
 
     public func claimManual(taskID: UUID, now: Date = Date(), owner: String, leaseDuration: TimeInterval = 6 * 60 * 60) throws -> ScheduledTaskClaim {
         try db.transaction {
-            guard try activeRunCount() < 2 else {
-                throw ScheduledTaskStoreError.invalidRow("Two scheduled task runs are already active.")
-            }
             guard let task = try get(id: taskID) else { throw ScheduledTaskStoreError.missingTask(taskID) }
             let sameTask = try db.prepare("SELECT COUNT(*) FROM scheduled_task_runs WHERE task_id = ? AND status IN ('queued', 'running');")
             defer { sameTask.reset() }
@@ -447,13 +444,6 @@ public final class ScheduledTaskStore: @unchecked Sendable {
             try task.bind(4, runID.uuidString.lowercased())
             _ = try task.step()
         }
-    }
-
-    private func activeRunCount() throws -> Int {
-        let statement = try db.prepare("SELECT COUNT(*) FROM scheduled_task_runs WHERE status IN ('queued', 'running');")
-        defer { statement.reset() }
-        guard try statement.step() else { return 0 }
-        return Int(statement.columnInt64(0))
     }
 
     private func insertRunIfNew(_ run: ScheduledTaskRun) throws -> Bool {

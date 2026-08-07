@@ -29,7 +29,7 @@ final class ScheduledTaskStoreTests: XCTestCase {
         // LocalizedError the UI only saw "Persistence.ScheduledTaskStoreError error 0".
         let missing = UUID(uuidString: "00000000-0000-4000-8000-000000000001")!
         let cases: [ScheduledTaskStoreError] = [
-            .invalidRow("Two scheduled task runs are already active."),
+            .invalidRow("This scheduled task already has an active run."),
             .missingTask(missing),
         ]
         for error in cases {
@@ -86,12 +86,31 @@ final class ScheduledTaskStoreTests: XCTestCase {
         XCTAssertEqual(try store.listRuns().count, 1)
     }
 
-    func test_globalConcurrencyAllowsOnlyTwoClaims_becauseProvidersMustStayBounded() throws {
+    func test_globalConcurrencyAllowsMoreThanTwoClaims_becauseNoHardActiveCap() throws {
+        // WHY: a global active-run ceiling of 2 blocked Run Now / due claims when
+        // unrelated tasks were already running. Batch `limit` is not a global cap.
         for offset in 0..<3 {
             try store.save(makeTask(id: UUID(), title: "Task \(offset)", nextRunAt: Date(timeIntervalSince1970: 100)))
         }
 
-        XCTAssertEqual(try store.claimDue(now: Date(timeIntervalSince1970: 101), owner: "agent", limit: 3).count, 2)
+        XCTAssertEqual(try store.claimDue(now: Date(timeIntervalSince1970: 101), owner: "agent", limit: 3).count, 3)
+    }
+
+    func test_manualRunAllowsThirdDistinctTaskWhileOthersActive_becauseGlobalCapWasRemoved() throws {
+        // WHY: the user-visible alert "Two scheduled task runs are already active"
+        // came from claimManual's global activeRunCount < 2 guard.
+        let first = makeTask(id: UUID(), title: "First", nextRunAt: Date(timeIntervalSince1970: 100))
+        let second = makeTask(id: UUID(), title: "Second", nextRunAt: Date(timeIntervalSince1970: 100))
+        let third = makeTask(id: UUID(), title: "Third", nextRunAt: Date(timeIntervalSince1970: 100))
+        try store.save(first)
+        try store.save(second)
+        try store.save(third)
+        _ = try store.claimManual(taskID: first.id, now: Date(timeIntervalSince1970: 101), owner: "agent-a")
+        _ = try store.claimManual(taskID: second.id, now: Date(timeIntervalSince1970: 102), owner: "agent-b")
+
+        let thirdClaim = try store.claimManual(taskID: third.id, now: Date(timeIntervalSince1970: 103), owner: "agent-c")
+        XCTAssertEqual(thirdClaim.task.id, third.id)
+        XCTAssertEqual(try store.listActiveRuns().count, 3)
     }
 
     func test_recoverStaleLeaseMarksFailedAndPermitsFutureClaim_becauseProcessDeathMustSelfHeal() throws {

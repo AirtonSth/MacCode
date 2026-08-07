@@ -101,7 +101,7 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         // WHY: without LocalizedError, NSError bridging surfaces
         // "AppShell.ScheduledTaskPreflightError error 0" and hides the payload.
         let cases: [ScheduledTaskPreflightError] = [
-            .invalidTask("Two scheduled task runs are already active."),
+            .invalidTask("This scheduled task already has an active run."),
             .missingWorkspace,
             .inaccessibleWorkspace("/tmp/ws"),
             .ineligibleUser("nobody"),
