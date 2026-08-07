@@ -279,11 +279,13 @@ final class ScrollPinPolicyTests: XCTestCase {
         XCTAssertEqual(targets, ["BOTTOM"])
     }
 
-    func test_programmaticScrollTargets_forceMayLeadWithContentThenBottom() {
-        // Empty messages/turns → still BOTTOM only.
+    /// WHY: force rejoin (open/FAB/send) used content+BOTTOM dual scrollTo and
+    /// multipass-jumped the viewport the same way stream did; single BOTTOM only.
+    func test_programmaticScrollTargets_forceAlsoBottomOnly() {
         XCTAssertEqual(
             AgentAppView.programmaticScrollTargets(messages: [], turns: [], force: true),
-            ["BOTTOM"]
+            ["BOTTOM"],
+            "force rejoin must not dual-target content then BOTTOM"
         )
     }
 

@@ -11650,10 +11650,11 @@ public struct AgentAppView: View {
         // layout pass + animation churn on every delta); only animate on settle
         // (idle, or an explicit forced scroll). TimelineScrollFollower re-pins to the
         // exact post-layout bottom on its own; this is the discrete-event re-assert.
-        // Prefer BOTTOM for stream/follow. Dual scrollTo(latest)+BOTTOM multipass-
-        // jumped the viewport (wrong size / flash). AppKit TimelineScrollFollower
-        // already snaps to true post-layout bottom while pinned; SwiftUI only
-        // re-asserts the sentinel. On force rejoin, scroll latest then BOTTOM once.
+        // Always a single BOTTOM sentinel. Dual scrollTo(latest)+BOTTOM multipass-
+        // jumped the viewport on stream *and* force rejoin (open/FAB/send) —
+        // wrong size, flash, and measured settle loops amplified it. AppKit
+        // TimelineScrollFollower snaps true post-layout bottom while pinned;
+        // SwiftUI only re-asserts the sentinel once per pass.
         let targets = Self.programmaticScrollTargets(
             messages: vm.messages,
             turns: vm.timeline.turns,
@@ -11672,31 +11673,17 @@ public struct AgentAppView: View {
     }
 
     /// Ordered scroll ids for one programmatic rejoin/follow pass.
-    /// Stream/follow: BOTTOM only. Force: optional latest content id then BOTTOM.
+    /// Always BOTTOM only — dual content+BOTTOM multipass-jumped open and stream.
     nonisolated static func programmaticScrollTargets(
         messages: [AgentMessage],
         turns: [AssistantTurnSnapshot],
         force: Bool
     ) -> [String] {
-        if force, let latest = latestScrollTargetId(messages: messages, turns: turns),
-           latest != "BOTTOM" {
-            return [latest, "BOTTOM"]
-        }
+        // Keep signature stable for call sites/tests; force no longer dual-targets.
+        _ = messages
+        _ = turns
+        _ = force
         return ["BOTTOM"]
-    }
-
-    /// Prefer last message or turn id for scroll anchoring (stable across work expand).
-    nonisolated static func latestScrollTargetId(
-        messages: [AgentMessage],
-        turns: [AssistantTurnSnapshot]
-    ) -> String? {
-        if let lastMsg = messages.last {
-            return "message-\(lastMsg.id.value.uuidString)"
-        }
-        if let lastTurn = turns.last {
-            return "turn-\(lastTurn.turnId)"
-        }
-        return nil
     }
 
     // TimelineScrollFollower reports pin transitions from real AppKit geometry — these
