@@ -1571,61 +1571,94 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 finishedAtMs: now
             )))
         case "turn/completed", "turn.completed":
-            let turnId = string(payload, "turnId") ?? (payload["turn"] as? [String: Any]).flatMap({ string($0, "id") }) ?? activeTurnId(threadId: threadId) ?? ""
-            var final = Self.turnCompletedFinalMessage(from: payload) ?? finalMessage(threadId: threadId)
-            if let markdown = Self.proposedPlanMarkdown(in: final) ?? planModeFinalMarkdown(threadId: threadId, final: final) {
-                let planId = "plan-\(turnId)"
-                if markProposedPlanEmitted(threadId: threadId, planId: planId) {
-                    events.append(.proposedPlan(AssistantProposedPlan(id: planId, turnId: turnId.isEmpty ? nil : turnId, markdown: markdown)))
-                }
-            }
-            // Stamp [[RC_AWAITING]] whenever this turn observed shell-detached work.
-            // PendingFinish deferral (thread still active) and detach evidence are
-            // orthogonal: deferral answers "is the app-server THREAD still active?";
-            // the marker answers "did the agent leave shell work the app-server
-            // never tracks?". Both can be true. Stamp the one canonical `final` so
-            // the marker rides both `.turnCompleted` and the later deferred
-            // `.finished` release (which does not re-emit turnCompleted). Still do
-            // NOT add deferral for detached work — Codex never auto-resumes a
-            // detached process; withholding the terminal would hang until idle/
-            // watchdog. Accepted false-positive: process already exited before
-            // turn end still stamps; during deferral the UI may show awaiting
-            // while Codex is still active (same class as non-deferred; bounded
-            // nudge self-corrects on the next unmarked completion).
-            let deferring = shouldDeferFinishUntilIdle(threadId: threadId)
-            if sawDetachedShellSpawn(threadId: threadId) {
-                if let marked = BackgroundAwaitContinuation.prefixingAwaitingMarker(final.isEmpty ? nil : final) {
-                    final = marked
-                }
-            }
-            events.append(.turnCompleted(turnId: turnId, finalMessage: final.isEmpty ? nil : final))
-            let pending = PendingFinish(
-                status: .completed,
-                finalMessage: final.isEmpty ? nil : final,
-                providerThreadId: providerThreadId(threadId: threadId),
-                turnId: turnId,
-                deferredAt: Date()
-            )
-            if deferring {
-                recordPendingFinish(threadId: threadId, pending: pending)
-                // Ensure reconcile loop is armed even without command_execution /
-                // final_answer paths that normally schedule it.
-                scheduleTurnReconciliation(threadId: threadId, turnId: turnId)
+            // Upstream (openai/codex app-server) emits only `turn/completed` for
+            // terminal turns. Outcome lives on `turn.status` (wire camelCase:
+            // completed|failed|interrupted|inProgress). Failed carries
+            // `turn.error.message`. Do not treat failed/interrupted as success.
+            let turn = payload["turn"] as? [String: Any]
+            let turnId = string(payload, "turnId")
+                ?? turn.flatMap({ string($0, "id") })
+                ?? activeTurnId(threadId: threadId)
+                ?? ""
+            let wireStatus = Self.turnCompletedWireStatus(from: payload)
+            if Self.isFailedTurnStatus(wireStatus) {
+                let error = Self.turnFailedErrorPayload(from: payload)
+                finished = finishTurnAsFailed(
+                    threadId: threadId,
+                    turnId: turnId,
+                    payload: payload,
+                    error: error,
+                    eventKind: "turn/completed-failed",
+                    events: &events
+                )
+            } else if Self.isInterruptedTurnStatus(wireStatus) {
+                // Same terminal as the user-stop cancel path: cancelled, no final.
+                finished = .finished(
+                    .cancelled,
+                    finalMessage: nil,
+                    providerThreadId: providerThreadId(threadId: threadId)
+                )
+                markFinished(threadId: threadId, status: .cancelled, turnId: turnId.isEmpty ? nil : turnId)
             } else {
-                finished = .finished(pending.status, finalMessage: pending.finalMessage, providerThreadId: pending.providerThreadId)
-                markFinished(threadId: threadId, status: pending.status, turnId: pending.turnId)
+                // completed, missing status (back-compat), or other non-terminal
+                // labels keep the existing success / PendingFinish deferral path.
+                var final = Self.turnCompletedFinalMessage(from: payload) ?? finalMessage(threadId: threadId)
+                if let markdown = Self.proposedPlanMarkdown(in: final) ?? planModeFinalMarkdown(threadId: threadId, final: final) {
+                    let planId = "plan-\(turnId)"
+                    if markProposedPlanEmitted(threadId: threadId, planId: planId) {
+                        events.append(.proposedPlan(AssistantProposedPlan(id: planId, turnId: turnId.isEmpty ? nil : turnId, markdown: markdown)))
+                    }
+                }
+                // Stamp [[RC_AWAITING]] whenever this turn observed shell-detached work.
+                // PendingFinish deferral (thread still active) and detach evidence are
+                // orthogonal: deferral answers "is the app-server THREAD still active?";
+                // the marker answers "did the agent leave shell work the app-server
+                // never tracks?". Both can be true. Stamp the one canonical `final` so
+                // the marker rides both `.turnCompleted` and the later deferred
+                // `.finished` release (which does not re-emit turnCompleted). Still do
+                // NOT add deferral for detached work — Codex never auto-resumes a
+                // detached process; withholding the terminal would hang until idle/
+                // watchdog. Accepted false-positive: process already exited before
+                // turn end still stamps; during deferral the UI may show awaiting
+                // while Codex is still active (same class as non-deferred; bounded
+                // nudge self-corrects on the next unmarked completion).
+                let deferring = shouldDeferFinishUntilIdle(threadId: threadId)
+                if sawDetachedShellSpawn(threadId: threadId) {
+                    if let marked = BackgroundAwaitContinuation.prefixingAwaitingMarker(final.isEmpty ? nil : final) {
+                        final = marked
+                    }
+                }
+                events.append(.turnCompleted(turnId: turnId, finalMessage: final.isEmpty ? nil : final))
+                let pending = PendingFinish(
+                    status: .completed,
+                    finalMessage: final.isEmpty ? nil : final,
+                    providerThreadId: providerThreadId(threadId: threadId),
+                    turnId: turnId,
+                    deferredAt: Date()
+                )
+                if deferring {
+                    recordPendingFinish(threadId: threadId, pending: pending)
+                    // Ensure reconcile loop is armed even without command_execution /
+                    // final_answer paths that normally schedule it.
+                    scheduleTurnReconciliation(threadId: threadId, turnId: turnId)
+                } else {
+                    finished = .finished(pending.status, finalMessage: pending.finalMessage, providerThreadId: pending.providerThreadId)
+                    markFinished(threadId: threadId, status: pending.status, turnId: pending.turnId)
+                }
             }
         case "turn/failed", "turn.failed":
+            // Legacy / non-wire path kept for peers that still emit turn/failed.
+            // Live openai/codex 0.146+ uses turn/completed + turn.status only.
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? (payload["turn"] as? [String: Any]).flatMap({ string($0, "id") }) ?? activeTurnId(threadId: threadId) ?? ""
-            let error = payload["error"] as? [String: Any] ?? payload
-            let message = string(error, "message") ?? string(payload, "message") ?? Self.jsonString(error) ?? "Codex turn failed"
-            let outcome = Self.classifyFatalOutcome(eventKind: "turn/failed", willRetry: false, errorCode: Self.errorCode(from: payload, error: error)) ?? .failed(isAuth: false)
-            events.append(.error(message: message, recoverable: false))
-            if case .failed(let isAuth) = outcome, isAuth {
-                events.append(runtimeEvent(method: "remotecode/authRequired", payload: Self.authActionMetadata))
-            }
-            finished = Self.failedEvent(for: outcome, message: message, providerThreadId: providerThreadId(threadId: threadId))
-            markFinished(threadId: threadId, status: .failed, turnId: turnId.isEmpty ? nil : turnId)
+            let error = Self.turnFailedErrorPayload(from: payload)
+            finished = finishTurnAsFailed(
+                threadId: threadId,
+                turnId: turnId,
+                payload: payload,
+                error: error,
+                eventKind: "turn/failed",
+                events: &events
+            )
         default:
             break
         }
@@ -2129,6 +2162,36 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         return true
     }
 
+    /// Shared fatal-turn finish path for live `turn/completed`+failed and legacy `turn/failed`.
+    private func finishTurnAsFailed(
+        threadId: AgentThreadID,
+        turnId: String,
+        payload: [String: Any],
+        error: [String: Any],
+        eventKind: String,
+        events: inout [AssistantEvent]
+    ) -> AgentRunEvent {
+        let message = string(error, "message")
+            ?? string(payload, "message")
+            ?? Self.jsonString(error)
+            ?? "Codex turn failed"
+        let outcome = Self.classifyFatalOutcome(
+            eventKind: eventKind,
+            willRetry: false,
+            errorCode: Self.errorCode(from: payload, error: error)
+        ) ?? .failed(isAuth: false)
+        events.append(.error(message: message, recoverable: false))
+        if case .failed(let isAuth) = outcome, isAuth {
+            events.append(runtimeEvent(method: "remotecode/authRequired", payload: Self.authActionMetadata))
+        }
+        markFinished(threadId: threadId, status: .failed, turnId: turnId.isEmpty ? nil : turnId)
+        return Self.failedEvent(
+            for: outcome,
+            message: message,
+            providerThreadId: providerThreadId(threadId: threadId)
+        )
+    }
+
     private func markFinished(threadId: AgentThreadID, status: AgentRunStatus, turnId: String?) {
         lock.lock()
         sessions[threadId]?.status = status
@@ -2463,7 +2526,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
 
     static func classifyFatalOutcome(eventKind: String, willRetry: Bool, errorCode: String?) -> RunOutcome? {
         switch eventKind {
-        case "turn/failed", "turn.failed":
+        case "turn/failed", "turn.failed",
+             "turn/completed-failed", "turn.completed-failed":
+            // `turn/completed-failed` is the live wire path: app-server emits
+            // turn/completed with turn.status=failed (not a separate method).
             return .failed(isAuth: isAuthErrorCode(errorCode))
         case "error":
             // Retry-able errors keep the run alive; the adapter still emits a
@@ -2473,6 +2539,40 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         default:
             return nil
         }
+    }
+
+    /// Wire status on `turn/completed`: nested `turn.status` preferred, else top-level `status`.
+    static func turnCompletedWireStatus(from payload: [String: Any]) -> String? {
+        if let turn = payload["turn"] as? [String: Any],
+           let status = string(turn, "status")?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !status.isEmpty {
+            return status
+        }
+        if let status = string(payload, "status")?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !status.isEmpty {
+            return status
+        }
+        return nil
+    }
+
+    static func isFailedTurnStatus(_ status: String?) -> Bool {
+        status?.caseInsensitiveCompare("failed") == .orderedSame
+    }
+
+    static func isInterruptedTurnStatus(_ status: String?) -> Bool {
+        status?.caseInsensitiveCompare("interrupted") == .orderedSame
+    }
+
+    /// Prefer nested `turn.error`, then top-level `error`, else the whole payload.
+    static func turnFailedErrorPayload(from payload: [String: Any]) -> [String: Any] {
+        if let turn = payload["turn"] as? [String: Any],
+           let error = turn["error"] as? [String: Any] {
+            return error
+        }
+        if let error = payload["error"] as? [String: Any] {
+            return error
+        }
+        return payload
     }
 
     static func errorCode(from payload: [String: Any], error: [String: Any]) -> String? {
