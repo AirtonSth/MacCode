@@ -1,6 +1,7 @@
 import XCTest
 @testable import AgentRuntime
 import CoreModel
+@testable import Persistence
 
 // PERF-MAC_AGENT-007: fast provider streaming was issuing 2-3 synchronous SQLite
 // writes per stream event (appendStreamEvent + appendProviderEventLog +
@@ -214,5 +215,149 @@ final class StreamEventFlushCadenceTests: XCTestCase {
         let drained = buffer.drain()
         XCTAssertEqual(drained.last?.kind, "last",
                        "coalesced diagnostics must use the most recent event kind in the flushed batch")
+    }
+
+    // MARK: - Soft truncate (UTF-8 index, Character-safe)
+
+    func test_softTruncateUTF8Payload_underLimitIsIdentity() {
+        let small = String(repeating: "a", count: 100)
+        XCTAssertEqual(
+            AgentRunCoordinator.softTruncateUTF8Payload(small, byteLimit: 1_000),
+            small
+        )
+    }
+
+    func test_softTruncateUTF8Payload_preservesTrailerAndNeverSplitsMultibyte() {
+        // "é" is 2 UTF-8 bytes; head budget must not land mid-scalar.
+        let payload = String(repeating: "é", count: 50_000)
+        let limit = 1_024
+        let bounded = AgentRunCoordinator.softTruncateUTF8Payload(payload, byteLimit: limit)
+        XCTAssertLessThanOrEqual(bounded.utf8.count, limit)
+        XCTAssertTrue(bounded.contains("truncated"), "trailer must report original→limit")
+        XCTAssertTrue(bounded.hasPrefix("é") || bounded.hasPrefix("…"),
+                      "head must start on a Character boundary")
+        // No broken UTF-8: re-roundtrip via Data.
+        XCTAssertEqual(String(data: Data(bounded.utf8), encoding: .utf8), bounded)
+
+        let emojiPayload = String(repeating: "😀", count: 10_000)
+        let emojiBounded = AgentRunCoordinator.softTruncateUTF8Payload(emojiPayload, byteLimit: 2_048)
+        XCTAssertLessThanOrEqual(emojiBounded.utf8.count, 2_048)
+        XCTAssertEqual(String(data: Data(emojiBounded.utf8), encoding: .utf8), emojiBounded)
+        XCTAssertTrue(emojiBounded.contains("truncated"))
+    }
+
+    func test_softTruncateUTF8Payload_repoMatchesCoordinatorSemantics() {
+        let payload = String(repeating: "x", count: 10_000) + "ééé"
+        let limit = 4_096
+        let a = AgentRunCoordinator.softTruncateUTF8Payload(payload, byteLimit: limit)
+        let b = AgentRunRepository.softTruncateUTF8Payload(payload, byteLimit: limit)
+        XCTAssertEqual(a, b, "persist + buffer must share one truncation policy")
+        XCTAssertLessThanOrEqual(a.utf8.count, limit)
+    }
+
+    /// Microbench: Character-index walk vs UTF-8 index soft-truncate.
+    /// Named metric: wall time for N truncations of a payload over the limit.
+    func test_microbench_softTruncate_utf8FasterThanCharacterWalk() {
+        // ~2 MiB ASCII body slightly over a 1 MiB limit — Character walk pays
+        // grapheme-index overhead on the admitted head; UTF-8 index does not.
+        let payload = String(repeating: "x", count: 2 * 1_024 * 1_024)
+        let limit = 1 * 1_024 * 1_024
+        let iterations = 8
+        let warmup = 2
+        let samples = 5
+
+        func median(_ values: [Double]) -> Double {
+            let s = values.sorted()
+            return s[s.count / 2]
+        }
+
+        /// Legacy Character walk retained only for A/B (mirrors pre-fix body).
+        func legacyCharacterWalk(_ payloadJSON: String, byteLimit: Int) -> String {
+            let limit = max(1, byteLimit)
+            let originalBytes = payloadJSON.utf8.count
+            guard originalBytes > limit else { return payloadJSON }
+            let trailer = "…[truncated \(originalBytes)→\(limit) bytes]"
+            let headBudget = max(0, limit - trailer.utf8.count)
+            var consumed = 0
+            var end = payloadJSON.startIndex
+            for index in payloadJSON.indices {
+                let step = String(payloadJSON[index]).utf8.count
+                if consumed + step > headBudget { break }
+                consumed += step
+                end = payloadJSON.index(after: index)
+            }
+            return String(payloadJSON[..<end]) + trailer
+        }
+
+        func timeLegacy() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for _ in 0..<iterations {
+                sink &+= legacyCharacterWalk(payload, byteLimit: limit).utf8.count
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        func timeUTF8() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for _ in 0..<iterations {
+                sink &+= AgentRunCoordinator.softTruncateUTF8Payload(payload, byteLimit: limit).utf8.count
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        for _ in 0..<warmup { _ = timeLegacy(); _ = timeUTF8() }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            before.append(timeLegacy())
+            after.append(timeUTF8())
+        }
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = (beforeMed - afterMed) / beforeMed * 100.0
+        NSLog("[perf-proof] softTruncate character_ms=%@ utf8_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+              String(beforeMed), String(afterMed), improvement,
+              String(describing: before), String(describing: after))
+        XCTAssertGreaterThan(
+            improvement, 5.0,
+            "softTruncate UTF-8 path must beat Character walk by ≥5% (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
+        )
+        // Functional pin: product path still under the limit with trailer.
+        let sample = AgentRunCoordinator.softTruncateUTF8Payload(payload, byteLimit: limit)
+        XCTAssertLessThanOrEqual(sample.utf8.count, limit)
+        XCTAssertTrue(sample.contains("truncated"))
+    }
+
+    // MARK: - StreamWriteBatch running encodedByteCount (R3)
+
+    func test_streamWriteBatch_encodedByteCountTracksAppendAcknowledgeDrain() {
+        var batch = AgentRunCoordinator.StreamWriteBatch()
+        XCTAssertEqual(batch.encodedByteCount, 0)
+
+        let a = AgentRunCoordinator.StreamWriteItem(
+            seq: 1, kind: "a", payloadJSON: "{\"i\":1}", providerEvent: nil
+        )
+        let b = AgentRunCoordinator.StreamWriteItem(
+            seq: 2, kind: "b", payloadJSON: "{\"i\":22}", providerEvent: nil
+        )
+        batch.append(a)
+        XCTAssertEqual(batch.encodedByteCount, a.encodedByteCount)
+        batch.append(b)
+        XCTAssertEqual(batch.encodedByteCount, a.encodedByteCount + b.encodedByteCount,
+                       "running total must match sum without re-reduce")
+
+        XCTAssertTrue(batch.acknowledge([a]))
+        XCTAssertEqual(batch.encodedByteCount, b.encodedByteCount)
+        XCTAssertEqual(batch.count, 1)
+
+        _ = batch.drain()
+        XCTAssertEqual(batch.encodedByteCount, 0)
+        XCTAssertTrue(batch.isEmpty)
     }
 }

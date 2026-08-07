@@ -3969,9 +3969,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         ensureScheduledLivePoll(for: threadId)
     }
 
+    /// Pure change-detection for LaunchAgent live poll. Rebuild only when the
+    /// durable stream event count moves (growth or prune). Unit-testable without
+    /// decoding payloads.
+    nonisolated static func shouldRebuildScheduledLiveTimeline(
+        previousCount: Int,
+        currentCount: Int
+    ) -> Bool {
+        previousCount != currentCount
+    }
+
     private func ensureScheduledLivePoll(for threadId: AgentThreadID) {
         guard scheduledLivePollTask == nil else { return }
-        scheduledLiveStreamCount = coordinator.latestStreamEvents(threadId: threadId).count
+        // COUNT(*) only — do not decode hot-replay payloads just to seed the baseline.
+        scheduledLiveStreamCount = coordinator.countStreamEvents(threadId: threadId)
         scheduledLivePollTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 // 2s is enough for LaunchAgent-owned progress; 1s doubled MainActor work.
@@ -3999,9 +4010,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             selectThread(id, markRead: false)
             return
         }
-        let events = coordinator.latestStreamEvents(threadId: id)
-        if events.count != scheduledLiveStreamCount {
-            scheduledLiveStreamCount = events.count
+        // Idle polls: cheap COUNT(*) first. Full latestStreamEvents decode only when count moves.
+        let count = coordinator.countStreamEvents(threadId: id)
+        if Self.shouldRebuildScheduledLiveTimeline(
+            previousCount: scheduledLiveStreamCount,
+            currentCount: count
+        ) {
+            scheduledLiveStreamCount = count
+            let events = coordinator.latestStreamEvents(threadId: id)
             timeline = AssistantTimelineState()
             for event in events {
                 timeline.apply(event)
