@@ -40,6 +40,36 @@ final class CodexAppServerFatalOutcomeTests: XCTestCase {
         XCTAssertEqual(outcome, .failed(isAuth: false), "turn/failed must terminate as .failed")
     }
 
+    func test_turnCompletedFailedAlwaysFailsRun() {
+        // WHY: live app-server uses turn/completed + status=failed; the adapter
+        // classifies that path as turn/completed-failed and must still terminate.
+        let outcome = CodexAppServerAdapter.classifyFatalOutcome(
+            eventKind: "turn/completed-failed",
+            willRetry: false,
+            errorCode: nil
+        )
+        XCTAssertEqual(outcome, .failed(isAuth: false), "turn/completed-failed must terminate as .failed")
+    }
+
+    func test_turnCompletedWireStatusPrefersNestedTurnStatus() {
+        // WHY: wire contract puts status on turn.status; top-level is fallback only.
+        XCTAssertEqual(
+            CodexAppServerAdapter.turnCompletedWireStatus(from: [
+                "status": "completed",
+                "turn": ["id": "t1", "status": "failed"]
+            ]),
+            "failed"
+        )
+        XCTAssertEqual(
+            CodexAppServerAdapter.turnCompletedWireStatus(from: ["status": "interrupted"]),
+            "interrupted"
+        )
+        XCTAssertNil(CodexAppServerAdapter.turnCompletedWireStatus(from: ["turnId": "t1"]))
+        XCTAssertTrue(CodexAppServerAdapter.isFailedTurnStatus("Failed"))
+        XCTAssertTrue(CodexAppServerAdapter.isInterruptedTurnStatus("INTERRUPTED"))
+        XCTAssertFalse(CodexAppServerAdapter.isFailedTurnStatus("completed"))
+    }
+
     func test_authClassErrorFailsRunFlaggedAuth() {
         // WHY: an auth death must terminate AND be flagged auth so the UI can
         // show a 'Sign in' CTA instead of a generic error banner.
