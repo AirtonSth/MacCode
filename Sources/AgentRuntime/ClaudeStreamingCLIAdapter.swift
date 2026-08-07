@@ -283,9 +283,13 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     /// Builds the newline-terminated stream-json control interrupt payload.
     /// Pure builder — no I/O, no actor isolation. Extracted for unit testing.
     nonisolated static func controlInterruptLine() -> Data {
-        // Claude CLI stream-json protocol: sending {"type":"control","action":"interrupt"}
-        // over stdin requests a clean turn abort without killing the process.
-        let payload: [String: Any] = ["type": "control", "action": "interrupt"]
+        // Claude CLI stream-json / Agent SDK control channel:
+        // {"type":"control_request","request_id":"<uuid>","request":{"subtype":"interrupt"}}
+        let payload: [String: Any] = [
+            "type": "control_request",
+            "request_id": UUID().uuidString,
+            "request": ["subtype": "interrupt"]
+        ]
         var data = (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
         data.append(0x0A) // newline delimiter
         return data
@@ -1179,18 +1183,48 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         }
     }
 
-    private func sendPermissionResponse(requestId: String, response: AgentProviderRequestResponse, to session: Session) throws {
-        var payload: [String: Any] = [
-            "type": "permission_response",
-            "request_id": requestId,
-            "decision": Self.permissionDecision(for: response)
-        ]
-        if case .decline(let reason) = response, let reason, !reason.isEmpty {
-            payload["message"] = reason
+    /// Builds the newline-terminated CLI control_response for a tool approval.
+    /// Pure builder — no I/O. Agent SDK PermissionResult wire:
+    /// allow → behavior "allow"; deny/cancel → behavior "deny" + message.
+    nonisolated static func controlPermissionResponseLine(
+        requestId: String,
+        response: AgentProviderRequestResponse
+    ) throws -> Data {
+        let behavior: String
+        let denyMessage: String?
+        switch response {
+        case .approve, .approveForSession:
+            behavior = "allow"
+            denyMessage = nil
+        case .decline(let reason):
+            behavior = "deny"
+            denyMessage = (reason?.isEmpty == false) ? reason : "Permission denied"
+        case .cancel:
+            behavior = "deny"
+            denyMessage = "Cancelled"
         }
-        let data = try JSONSerialization.data(withJSONObject: payload)
-        var line = data
+        var permissionResult: [String: Any] = ["behavior": behavior]
+        if let denyMessage {
+            permissionResult["message"] = denyMessage
+        }
+        let payload: [String: Any] = [
+            "type": "control_response",
+            "response": [
+                "subtype": "success",
+                "request_id": requestId,
+                "response": permissionResult
+            ] as [String: Any]
+        ]
+        var line = try JSONSerialization.data(withJSONObject: payload)
         line.append(0x0A)
+        return line
+    }
+
+    private func sendPermissionResponse(requestId: String, response: AgentProviderRequestResponse, to session: Session) throws {
+        // CLI stream-json control channel (Agent SDK PermissionResult shape):
+        // allow:  {"type":"control_response","response":{"subtype":"success","request_id":"…","response":{"behavior":"allow"}}}
+        // deny:   same envelope with behavior "deny" + required message string
+        let line = try Self.controlPermissionResponseLine(requestId: requestId, response: response)
         try session.writeQueue.sync {
             try GuardedStdinWrite.write(line,
                                         to: session.stdinPipe.fileHandleForWriting,
@@ -1514,18 +1548,6 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         }
     }
 
-    private static func permissionDecision(for response: AgentProviderRequestResponse) -> String {
-        switch response {
-        case .approve:
-            return "approve"
-        case .approveForSession:
-            return "approveForSession"
-        case .decline:
-            return "decline"
-        case .cancel:
-            return "cancel"
-        }
-    }
 }
 
 private extension AgentRunRequest {

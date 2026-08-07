@@ -800,9 +800,11 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
             print(json.dumps({"type":"canUseTool/request","request_id":"perm-1","tool_name":"Bash","input":{"command":"swift test"}}), flush=True)
         response_line = sys.stdin.readline()
         response_path.write_text(response_line)
-        decision = json.loads(response_line)["decision"]
-        print(json.dumps({"type":"assistant","message":{"content":[{"type":"text","text":"PERMISSION_" + decision}]},"session_id":session}), flush=True)
-        print(json.dumps({"type":"result","subtype":"success","is_error":False,"result":"PERMISSION_" + decision,"session_id":session}), flush=True)
+        payload = json.loads(response_line)
+        assert payload.get("type") == "control_response", payload
+        behavior = payload["response"]["response"]["behavior"]
+        print(json.dumps({"type":"assistant","message":{"content":[{"type":"text","text":"PERMISSION_" + behavior}]},"session_id":session}), flush=True)
+        print(json.dumps({"type":"result","subtype":"success","is_error":False,"result":"PERMISSION_" + behavior,"session_id":session}), flush=True)
         for _ in sys.stdin:
             pass
         """.write(to: script, atomically: true, encoding: .utf8)
@@ -825,13 +827,20 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         try await waitForRequest(in: sink, requestId: "perm-1")
         try await adapter.respondToRequest(threadId: threadId, requestId: "perm-1", response: .approveForSession)
         try await waitForRequestResolution(in: sink, requestId: "perm-1", state: .approved)
-        try await waitForFinish(in: sink, expected: "PERMISSION_approveForSession")
+        try await waitForFinish(in: sink, expected: "PERMISSION_allow")
 
         let response = try String(contentsOf: responsePath, encoding: .utf8)
-        XCTAssertTrue(response.contains(#""type": "permission_response""#) || response.contains(#""type":"permission_response""#))
-        XCTAssertTrue(response.contains(#""request_id": "perm-1""#) || response.contains(#""request_id":"perm-1""#))
-        XCTAssertTrue(response.contains("approveForSession"),
-                      "Claude SDK-shaped permission approvals must be written back to the live provider stream")
+        let responseObject = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(response.trimmingCharacters(in: .whitespacesAndNewlines).utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(responseObject["type"] as? String, "control_response",
+                       "CLI stream-json approvals must use control_response, not invented permission_response")
+        let envelope = try XCTUnwrap(responseObject["response"] as? [String: Any])
+        XCTAssertEqual(envelope["subtype"] as? String, "success")
+        XCTAssertEqual(envelope["request_id"] as? String, "perm-1")
+        let permissionResult = try XCTUnwrap(envelope["response"] as? [String: Any])
+        XCTAssertEqual(permissionResult["behavior"] as? String, "allow",
+                       "approve/approveForSession map to PermissionResult behavior allow")
         try adapter.stopSession(threadId: threadId)
     }
 

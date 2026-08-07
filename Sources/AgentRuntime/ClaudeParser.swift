@@ -332,6 +332,20 @@ public final class ClaudeParser {
             }
         case "compact_boundary", "context_compaction":
             out.append(contentsOf: compactionEvents(from: obj, now: now))
+        case "control_request":
+            // CLI stream-json control channel (Agent SDK 0.3.x / claude CLI):
+            // {"type":"control_request","request_id":"…","request":{"subtype":"can_use_tool",…}}
+            // Host approvals must key on the envelope request_id (not tool_use_id).
+            if let inner = obj["request"] as? [String: Any],
+               stringValue(inner["subtype"]) == "can_use_tool" {
+                var flattened = inner
+                if let rid = stringValue(obj["request_id"]) ?? stringValue(obj["requestId"]) {
+                    flattened["request_id"] = rid
+                }
+                if let request = permissionRequest(from: flattened, now: now) {
+                    out.append(.requestOpened(request))
+                }
+            }
         case "permission_request", "request.opened", "canUseTool/request":
             if let request = permissionRequest(from: obj, now: now) {
                 out.append(.requestOpened(request))

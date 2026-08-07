@@ -529,6 +529,26 @@ final class ClaudeParserCLITests: XCTestCase {
             "distinct assistant blocks must each render once; dedup must suppress only true duplicates")
     }
 
+    func test_controlRequestCanUseToolOpensApprovalWithEnvelopeRequestId() {
+        // WHY: live CLI stream-json emits control_request / can_use_tool with the
+        // correlation id on the envelope (request_id), while tool_use_id lives only
+        // inside request. Approvals must open under the envelope id so the host
+        // control_response can complete the round-trip.
+        let line = #"{"type":"control_request","request_id":"req-ctrl-1","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"toolu-xyz","input":{"command":"ls -la"}}}"#
+        let evs = ClaudeParser().parseLine(line)
+        let opened = evs.compactMap { event -> AssistantPendingRequest? in
+            if case .requestOpened(let request) = event { return request }
+            return nil
+        }.first
+        XCTAssertEqual(opened?.id, "req-ctrl-1",
+                       "control_request approvals must use envelope request_id, not tool_use_id")
+        XCTAssertNotEqual(opened?.id, "toolu-xyz")
+        XCTAssertEqual(opened?.title, "Bash")
+        XCTAssertEqual(opened?.kind, .commandExecution)
+        XCTAssertTrue(opened?.detail?.contains("ls -la") == true,
+                      "can_use_tool input must surface in approval detail for review")
+    }
+
     func test_sdkElicitationPreservesObjectPropertyNamesTypesAndSecretPresentation() throws {
         let parser = ClaudeParser()
         let events = parser.parseLine(#"{"type":"user_input_request","request_id":"elicitation-typed","prompt":"Configure deployment","requested_schema":{"type":"object","required":["environment","replicas","dryRun","token"],"properties":{"environment":{"type":"string","title":"Environment","enum":["staging","production"]},"replicas":{"type":"integer","title":"Replicas"},"dryRun":{"type":"boolean","title":"Dry run"},"token":{"type":"string","title":"Token","format":"password"}}}}"#)

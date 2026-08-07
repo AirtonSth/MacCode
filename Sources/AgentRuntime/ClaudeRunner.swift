@@ -168,6 +168,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--verbose",
+            "--include-partial-messages",
             "--replay-user-messages",
             // Load the SAME filesystem settings an interactive `claude` session
             // does: user + project + local. Without this, `--print` mode ignores
