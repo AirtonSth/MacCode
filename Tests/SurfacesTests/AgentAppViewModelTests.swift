@@ -5053,6 +5053,62 @@ final class AgentAppViewModelTests: XCTestCase {
         )
     }
 
+    /// WHY: soft reselect always called reloadCheckpoints, re-assigning the same
+    /// list and re-selecting the same checkpoint (diff preview multipass publish).
+    func test_shouldPublishCheckpointReload_skipsEqualListWithValidSelection() {
+        let tid = AgentThreadID()
+        let run = AgentRunID()
+        let cp = AgentTurnCheckpointSummary(
+            threadId: tid,
+            runId: run,
+            turnId: "t1",
+            checkpointTurnCount: 1,
+            checkpointRef: "ref",
+            status: .ready,
+            files: []
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.shouldPublishCheckpointReload(
+                current: [cp],
+                next: [cp],
+                selectedTurnCount: 1
+            ),
+            "identical checkpoint list with valid selection must not re-publish"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldPublishCheckpointReload(
+                current: [cp],
+                next: [cp],
+                selectedTurnCount: nil
+            ),
+            "non-empty equal list with no selection still needs default select"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldPublishCheckpointReload(
+                current: [],
+                next: [cp],
+                selectedTurnCount: nil
+            ),
+            "new checkpoints after a run must publish"
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.shouldPublishCheckpointReload(
+                current: [],
+                next: [],
+                selectedTurnCount: nil
+            ),
+            "empty→empty must not clear/publish again"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldPublishCheckpointReload(
+                current: [],
+                next: [],
+                selectedTurnCount: 3
+            ),
+            "empty list with stale selection must clear selection"
+        )
+    }
+
     /// Mark-read must clear unread without rewriting activity time (rail "now").
     func test_applyingMarkReadPreservingActivity_clearsUnreadOnly() {
         var thread = AgentThread(title: "Old", provider: .claude, model: "m", status: .completed)

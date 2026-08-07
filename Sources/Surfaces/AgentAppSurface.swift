@@ -1805,6 +1805,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func reloadCheckpoints() {
         guard let selectedThreadId, let checkpointRepo else {
+            guard Self.shouldPublishCheckpointReload(
+                current: checkpoints,
+                next: [],
+                selectedTurnCount: selectedCheckpointTurnCount
+            ) else { return }
             checkpoints = []
             selectedCheckpointTurnCount = nil
             selectedCheckpointPath = nil
@@ -1812,7 +1817,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return
         }
         let loaded = (try? checkpointRepo.list(threadId: selectedThreadId)) ?? []
-        checkpoints = loaded.reversed()
+        let next = Array(loaded.reversed())
+        // Soft reselect / host refresh re-enters here every time. Re-assigning an
+        // identical list re-selected the same checkpoint and rewrote the diff
+        // preview string — unnecessary @Published churn on an already-open thread.
+        guard Self.shouldPublishCheckpointReload(
+            current: checkpoints,
+            next: next,
+            selectedTurnCount: selectedCheckpointTurnCount
+        ) else { return }
+        checkpoints = next
         if let selected = selectedCheckpointTurnCount,
            let checkpoint = checkpoints.first(where: { $0.checkpointTurnCount == selected }) {
             selectCheckpoint(checkpoint, path: selectedCheckpointPath)
@@ -1823,6 +1837,24 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             selectedCheckpointPath = nil
             checkpointDiffPreview = ""
         }
+    }
+
+    /// Whether a checkpoint reload must publish. Equal lists with a still-valid
+    /// selection (or both empty) skip — soft reselect must not multipass-repaint.
+    nonisolated public static func shouldPublishCheckpointReload(
+        current: [AgentTurnCheckpointSummary],
+        next: [AgentTurnCheckpointSummary],
+        selectedTurnCount: Int?
+    ) -> Bool {
+        if next != current { return true }
+        if next.isEmpty {
+            return selectedTurnCount != nil
+        }
+        guard let selected = selectedTurnCount else {
+            // Non-empty list with no selection needs a default select.
+            return true
+        }
+        return !next.contains(where: { $0.checkpointTurnCount == selected })
     }
 
     public func selectCheckpoint(_ checkpoint: AgentTurnCheckpointSummary, path: String?) {
