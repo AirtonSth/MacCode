@@ -8710,8 +8710,8 @@ public struct AgentAppView: View {
         let offersRetry: Bool
     }
 
-    private static let threadRailWidthRange: ClosedRange<CGFloat> = 180...360
-    private static let threadRailIdealWidth: CGFloat = 220
+    private static let threadRailWidthRange: ClosedRange<CGFloat> = 320...360
+    private static let threadRailIdealWidth: CGFloat = 320
     private static let conversationMinimumWidth: CGFloat = 560
     private static let planSidebarIdealWidth: CGFloat = 300
     private static let timelineBottomRevealSlack: CGFloat = 4
