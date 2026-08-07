@@ -16,7 +16,7 @@ final class ScrollPinPolicyTests: XCTestCase {
     /// gap == 0: flush at the bottom => must re-pin.
     func testExactlyAtBottomPins() {
         XCTAssertEqual(
-            ScrollPinPolicy.evaluate(originDelta: 0, gap: 0, slack: 4),
+            ScrollPinPolicy.evaluate(originDelta: 0, gap: 0, slack: 4, userOwned: false),
             .reachedBottom,
             "gap=0 is inside slack(4); must re-pin so streaming content stays visible"
         )
@@ -25,7 +25,7 @@ final class ScrollPinPolicyTests: XCTestCase {
     /// gap == slack: boundary case - still within tolerance => must re-pin.
     func testGapEqualsSlackPins() {
         XCTAssertEqual(
-            ScrollPinPolicy.evaluate(originDelta: 0, gap: 4, slack: 4),
+            ScrollPinPolicy.evaluate(originDelta: 0, gap: 4, slack: 4, userOwned: true),
             .reachedBottom,
             "gap <= slack is the at-bottom definition; boundary must re-pin"
         )
@@ -34,7 +34,7 @@ final class ScrollPinPolicyTests: XCTestCase {
     /// gap < slack: anywhere inside the slack band => must re-pin.
     func testGapBelowSlackPins() {
         XCTAssertEqual(
-            ScrollPinPolicy.evaluate(originDelta: 0, gap: 2, slack: 4),
+            ScrollPinPolicy.evaluate(originDelta: 0, gap: 2, slack: 4, userOwned: false),
             .reachedBottom,
             "gap inside slack band must re-pin regardless of originDelta"
         )
@@ -44,7 +44,7 @@ final class ScrollPinPolicyTests: XCTestCase {
     /// forced origin up while content also grew enough to close the gap).
     func testReachedBottomTakesPriorityOverOriginDrop() {
         XCTAssertEqual(
-            ScrollPinPolicy.evaluate(originDelta: -10, gap: 1, slack: 4),
+            ScrollPinPolicy.evaluate(originDelta: -10, gap: 1, slack: 4, userOwned: true),
             .reachedBottom,
             "atBottom wins over originDelta<0; reaching bottom always re-pins"
         )
@@ -52,21 +52,40 @@ final class ScrollPinPolicyTests: XCTestCase {
 
     // MARK: - scrolledAway
 
-    /// Origin dropped by more than 0.5pt while away from the bottom: genuine user scroll-up.
-    func testOriginDropAboveThresholdScrollsAway() {
+    /// User-owned origin drop while away from the bottom: genuine audit scroll-up.
+    func testUserOwnedOriginDropScrollsAway() {
         XCTAssertEqual(
-            ScrollPinPolicy.evaluate(originDelta: -1, gap: 200, slack: 4),
+            ScrollPinPolicy.evaluate(originDelta: -1, gap: 200, slack: 4, userOwned: true),
             .scrolledAway,
-            "originDelta < -0.5 while gap > slack is the ONLY signal of a user scroll-up"
+            "userOwned + originDelta < -0.5 while gap > slack is the ONLY unpin signal"
         )
     }
 
-    /// Larger origin drop: still scrolledAway (not a different case).
-    func testLargeOriginDropScrollsAway() {
+    /// Larger user-owned origin drop: still scrolledAway (not a different case).
+    func testLargeUserOwnedOriginDropScrollsAway() {
         XCTAssertEqual(
-            ScrollPinPolicy.evaluate(originDelta: -100, gap: 500, slack: 4),
+            ScrollPinPolicy.evaluate(originDelta: -100, gap: 500, slack: 4, userOwned: true),
             .scrolledAway,
             "magnitude of drop does not change the decision; any drop > 0.5pt while away = scrolledAway"
+        )
+    }
+
+    /// WHY: stream growth / Lazy materialize / programmatic snap move origin without
+    /// a user gesture. Origin-only unpin false-fired the FAB mid-shell stream.
+    func testNonUserOwnedOriginDropDoesNotUnpin() {
+        XCTAssertEqual(
+            ScrollPinPolicy.evaluate(originDelta: -100, gap: 500, slack: 4, userOwned: false),
+            .unchanged,
+            "layout/programmatic origin jitter must not clear pin or show FAB"
+        )
+    }
+
+    /// Programmatic follow lag (gap open, origin flat, not user-owned): stay pinned.
+    func testContentGrowthGapWithoutUserOwnedIsUnchanged() {
+        XCTAssertEqual(
+            ScrollPinPolicy.evaluate(originDelta: 0, gap: 80, slack: 4, userOwned: false),
+            .unchanged,
+            "follow lag while pinned is AppKit snap work, not an audit unpin"
         )
     }
 
@@ -76,7 +95,7 @@ final class ScrollPinPolicyTests: XCTestCase {
     /// sub-pixel layout jitter being misread as a user scroll).
     func testOriginDropAtNoiseThresholdIsUnchanged() {
         XCTAssertEqual(
-            ScrollPinPolicy.evaluate(originDelta: -0.5, gap: 200, slack: 4),
+            ScrollPinPolicy.evaluate(originDelta: -0.5, gap: 200, slack: 4, userOwned: true),
             .unchanged,
             "originDelta == -0.5 is the noise floor; must not trigger scrolledAway (< -0.5 required)"
         )
@@ -85,7 +104,7 @@ final class ScrollPinPolicyTests: XCTestCase {
     /// Origin unchanged, away from bottom: no transition (content grew but user did not scroll).
     func testNoMovementAwayFromBottomIsUnchanged() {
         XCTAssertEqual(
-            ScrollPinPolicy.evaluate(originDelta: 0, gap: 50, slack: 4),
+            ScrollPinPolicy.evaluate(originDelta: 0, gap: 50, slack: 4, userOwned: true),
             .unchanged,
             "content growth without origin change must not alter pin state"
         )
@@ -94,7 +113,7 @@ final class ScrollPinPolicyTests: XCTestCase {
     /// Origin increased (scroll view grew its document upward, rare): not a user scroll-up.
     func testPositiveOriginDeltaIsUnchanged() {
         XCTAssertEqual(
-            ScrollPinPolicy.evaluate(originDelta: 5, gap: 100, slack: 4),
+            ScrollPinPolicy.evaluate(originDelta: 5, gap: 100, slack: 4, userOwned: true),
             .unchanged,
             "origin increasing while away from bottom is not a user scroll-up; no state change"
         )
@@ -103,7 +122,7 @@ final class ScrollPinPolicyTests: XCTestCase {
     /// Small sub-threshold drop while away: noise, must be unchanged.
     func testSubThresholdDropIsUnchanged() {
         XCTAssertEqual(
-            ScrollPinPolicy.evaluate(originDelta: -0.3, gap: 100, slack: 4),
+            ScrollPinPolicy.evaluate(originDelta: -0.3, gap: 100, slack: 4, userOwned: true),
             .unchanged,
             "drop < 0.5pt is within pixel-rounding noise; must not fire scrolledAway"
         )
@@ -114,11 +133,11 @@ final class ScrollPinPolicyTests: XCTestCase {
     /// Custom slack of 0: only gap==0 counts as atBottom.
     func testZeroSlackOnlyExactFlush() {
         XCTAssertEqual(
-            ScrollPinPolicy.evaluate(originDelta: 0, gap: 0, slack: 0),
+            ScrollPinPolicy.evaluate(originDelta: 0, gap: 0, slack: 0, userOwned: false),
             .reachedBottom
         )
         XCTAssertEqual(
-            ScrollPinPolicy.evaluate(originDelta: 0, gap: 1, slack: 0),
+            ScrollPinPolicy.evaluate(originDelta: 0, gap: 1, slack: 0, userOwned: false),
             .unchanged,
             "gap=1 with slack=0 is outside atBottom; no pin"
         )
@@ -127,7 +146,7 @@ final class ScrollPinPolicyTests: XCTestCase {
     /// Large slack: 20pt gap still inside tolerance => re-pin.
     func testLargeSlackIncludesWiderGap() {
         XCTAssertEqual(
-            ScrollPinPolicy.evaluate(originDelta: 0, gap: 20, slack: 20),
+            ScrollPinPolicy.evaluate(originDelta: 0, gap: 20, slack: 20, userOwned: false),
             .reachedBottom,
             "gap <= slack(20) must re-pin even when gap is large"
         )

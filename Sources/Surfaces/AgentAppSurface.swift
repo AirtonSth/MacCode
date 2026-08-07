@@ -15973,19 +15973,28 @@ enum ScrollPinPolicy {
     /// Decide the pin-state transition that a clip-bounds change implies.
     ///
     /// UX contract (Agent App iOS + macOS):
-    /// - Scroll **up** while away from bottom → unpin (audit mode; no auto-follow).
+    /// - **User-owned** scroll **up** while away from bottom → unpin (audit mode).
     /// - Reach bottom (gap ≤ slack) → re-pin (auto-follow resumes).
-    /// - Content growth never changes origin.y, so it never unpins.
+    /// - Content growth, Lazy materialize, and programmatic snaps move origin too —
+    ///   they must NOT unpin (iOS `AgentScrollPinPolicy.userOwned` parity). Origin-only
+    ///   unpin false-fired the FAB mid-stream when layout jitter exceeded 0.5pt.
     ///
     /// - Parameters:
-    ///   - originDelta: flip-normalized delta; negative means the user scrolled toward top.
+    ///   - originDelta: flip-normalized delta; negative means motion toward top.
     ///   - gap: distance from the bottom of visible content to the bottom of the document.
     ///   - slack: tolerance in points; gap <= slack is treated as "at bottom".
+    ///   - userOwned: true only for live user scroll (trackpad/wheel/scrollbar), never
+    ///     for programmatic `scrollTo` / AppKit snaps / content-frame growth.
     /// - Returns: The transition, if any.
-    nonisolated static func evaluate(originDelta: CGFloat, gap: CGFloat, slack: CGFloat) -> ScrollPinTransition {
+    nonisolated static func evaluate(
+        originDelta: CGFloat,
+        gap: CGFloat,
+        slack: CGFloat,
+        userOwned: Bool
+    ) -> ScrollPinTransition {
         if gap <= slack {
             return .reachedBottom
-        } else if originDelta < -0.5 {
+        } else if userOwned && originDelta < -0.5 {
             return .scrolledAway
         }
         return .unchanged
@@ -16005,8 +16014,10 @@ enum ScrollPinPolicy {
 /// scroll-up during a fast stream was silently ignored, and the 0.4s guard could
 /// swallow a genuine scroll-away. Two AppKit facts make this version deterministic:
 ///
-///   • A user scroll toward the top is the only origin change that produces a negative
-///     flip-normalized delta while away from the bottom; content growth does not.
+///   • Unpin only when the scroll is **user-owned** (live scroll / wheel) AND the
+///     flip-normalized origin moves toward top while away from bottom. Content
+///     growth, Lazy height jumps, and programmatic snaps also move origin — those
+///     must not clear the pin (matches iOS `userOwnedScrollPhase`).
 ///   • When pinned, we re-scroll the clip to the document's true bottom on every
 ///     content-growth notification (i.e. AFTER layout), so a stream always lands
 ///     exactly at the bottom instead of a frame short.
@@ -16055,12 +16066,20 @@ private struct TimelineScrollFollower: NSViewRepresentable {
         private weak var scrollView: NSScrollView?
         private var clipObserver: NSObjectProtocol?
         private var docObserver: NSObjectProtocol?
+        private var liveScrollStartObserver: NSObjectProtocol?
+        private var liveScrollEndObserver: NSObjectProtocol?
+        /// True between willStartLiveScroll and didEndLiveScroll (user gesture).
+        private var userOwnedLiveScroll = false
         private var lastOriginY: CGFloat = 0
         private var lastAtBottom: Bool?
         private var pendingBottomSnap = false
         private var pendingBottomSnapWorkItem: DispatchWorkItem?
+        /// Growth arrived while a snap was already queued — run another pass after.
+        private var snapDirty = false
         private var lastBottomSnapAt: TimeInterval = 0
-        private let minimumBottomSnapInterval: TimeInterval = 0.15
+        /// ~1 frame at 60Hz: keep follow tight on dense shell streams without
+        /// hammering layout every token.
+        private let minimumBottomSnapInterval: TimeInterval = 0.05
         private var attachRetryCount = 0
         private let maxAttachRetries = 8
         #if DEBUG
@@ -16115,9 +16134,23 @@ private struct TimelineScrollFollower: NSViewRepresentable {
         }
 
         deinit {
+            removeObservers()
+            pendingBottomSnapWorkItem?.cancel()
+        }
+
+        private func removeObservers() {
             if let clipObserver { NotificationCenter.default.removeObserver(clipObserver) }
             if let docObserver { NotificationCenter.default.removeObserver(docObserver) }
-            pendingBottomSnapWorkItem?.cancel()
+            if let liveScrollStartObserver {
+                NotificationCenter.default.removeObserver(liveScrollStartObserver)
+            }
+            if let liveScrollEndObserver {
+                NotificationCenter.default.removeObserver(liveScrollEndObserver)
+            }
+            clipObserver = nil
+            docObserver = nil
+            liveScrollStartObserver = nil
+            liveScrollEndObserver = nil
         }
 
         func attach() {
@@ -16138,8 +16171,7 @@ private struct TimelineScrollFollower: NSViewRepresentable {
             }
             attachRetryCount = 0
             guard scroll !== scrollView else { return }
-            if let clipObserver { NotificationCenter.default.removeObserver(clipObserver) }
-            if let docObserver { NotificationCenter.default.removeObserver(docObserver) }
+            removeObservers()
             scrollView = scroll
             let clip = scroll.contentView
             clip.postsBoundsChangedNotifications = true
@@ -16152,8 +16184,38 @@ private struct TimelineScrollFollower: NSViewRepresentable {
                     forName: NSView.frameDidChangeNotification, object: doc, queue: .main
                 ) { [weak self] _ in self?.handleContentGrowth() }
             }
+            // User-owned scroll phase (iOS parity). Programmatic scroll(to:) and
+            // content growth do not post these — so layout jitter cannot unpin.
+            liveScrollStartObserver = NotificationCenter.default.addObserver(
+                forName: NSScrollView.willStartLiveScrollNotification,
+                object: scroll,
+                queue: .main
+            ) { [weak self] _ in self?.userOwnedLiveScroll = true }
+            liveScrollEndObserver = NotificationCenter.default.addObserver(
+                forName: NSScrollView.didEndLiveScrollNotification,
+                object: scroll,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                self.userOwnedLiveScroll = false
+                // Settle: user may have dragged back to bottom — re-evaluate pin.
+                self.handleScroll()
+            }
             lastOriginY = clip.bounds.origin.y
             handleScroll()
+        }
+
+        /// True when the current bounds change is attributable to the user
+        /// (trackpad/wheel live scroll or in-flight scroll-wheel event).
+        private var isUserOwnedScroll: Bool {
+            if userOwnedLiveScroll { return true }
+            guard let event = NSApp.currentEvent else { return false }
+            switch event.type {
+            case .scrollWheel, .magnify:
+                return true
+            default:
+                return false
+            }
         }
 
         private func geometry() -> (origin: CGFloat, gap: CGFloat, atBottom: Bool, isFlipped: Bool)? {
@@ -16173,8 +16235,8 @@ private struct TimelineScrollFollower: NSViewRepresentable {
             return (origin, gap, gap <= slack, flipped)
         }
 
-        // The clip view moved. Reaching the bottom re-pins; origin moving toward top
-        // while still away from the bottom is a genuine user scroll-up.
+        // The clip view moved. Reaching the bottom re-pins; only a *user-owned*
+        // origin move toward top while away from bottom unpins (audit mode).
         private func handleScroll() {
             guard let g = geometry() else { return }
             let delta = ScrollBottomGeometry.originDeltaTowardTop(
@@ -16188,7 +16250,12 @@ private struct TimelineScrollFollower: NSViewRepresentable {
                 if g.atBottom { report(atBottom: true) }
                 return
             }
-            switch ScrollPinPolicy.evaluate(originDelta: delta, gap: g.gap, slack: slack) {
+            switch ScrollPinPolicy.evaluate(
+                originDelta: delta,
+                gap: g.gap,
+                slack: slack,
+                userOwned: isUserOwnedScroll
+            ) {
             case .reachedBottom:  report(atBottom: true)
             case .scrolledAway:   report(atBottom: false)
             case .unchanged:      break
@@ -16210,9 +16277,13 @@ private struct TimelineScrollFollower: NSViewRepresentable {
             pendingBottomSnapWorkItem?.cancel()
             pendingBottomSnapWorkItem = nil
             pendingBottomSnap = false
+            snapDirty = false
         }
 
         private func scheduleScrollToBottom() {
+            // Mark dirty so continuous stream growth while a snap is queued still
+            // lands a trailing pass (old `guard !pending` dropped mid-burst growth).
+            snapDirty = true
             guard !pendingBottomSnap else { return }
             pendingBottomSnap = true
             let now = ProcessInfo.processInfo.systemUptime
@@ -16221,7 +16292,13 @@ private struct TimelineScrollFollower: NSViewRepresentable {
                 guard let self else { return }
                 self.pendingBottomSnap = false
                 self.pendingBottomSnapWorkItem = nil
-                guard self.pinned, let g = self.geometry() else { return }
+                guard self.pinned else {
+                    self.snapDirty = false
+                    return
+                }
+                let hadWork = self.snapDirty
+                self.snapDirty = false
+                guard hadWork, let g = self.geometry() else { return }
                 if g.gap > self.slack {
                     self.scrollToBottom()
                     // One bounded re-snap if layout grew again during the scroll.
@@ -16230,6 +16307,10 @@ private struct TimelineScrollFollower: NSViewRepresentable {
                     }
                 } else if g.atBottom {
                     self.report(atBottom: true)
+                }
+                // Growth arrived while we were snapping — schedule another pass.
+                if self.snapDirty && self.pinned {
+                    self.scheduleScrollToBottom()
                 }
             }
             pendingBottomSnapWorkItem = workItem
