@@ -10999,12 +10999,10 @@ public struct AgentAppView: View {
             // token delta does not schedule redundant scroll work.
             .onChange(of: vm.timelineUpdateTick) { _ in
                 collapseAllCompletedWorkOnFinalIfNeeded()
-                // Double-pass: first tick after layout of streamed rows, second
-                // after work-disclosure height settles (LazyVStack materialize).
-                scheduleTimelineScrollToBottom(proxy)
-                DispatchQueue.main.async {
-                    scheduleTimelineScrollToBottom(proxy)
-                }
+                // One coalesced schedule. A second async pass raced TimelineScrollFollower
+                // post-layout snaps and multipass-jumped the viewport during streams.
+                // Follower handleContentGrowth re-snaps after Lazy materialize.
+                scheduleTimelineScrollToBottom(proxy, force: false)
             }
             .onChange(of: workDisclosureLayoutEpoch) { _ in
                 // Height change while following live output: re-assert bottom.
@@ -11652,21 +11650,39 @@ public struct AgentAppView: View {
         // layout pass + animation churn on every delta); only animate on settle
         // (idle, or an explicit forced scroll). TimelineScrollFollower re-pins to the
         // exact post-layout bottom on its own; this is the discrete-event re-assert.
-        // Prefer concrete latest content id when available — BOTTOM alone can stick
-        // one lazy work-row above the true end after Work so far height jumps.
-        let target = Self.latestScrollTargetId(
+        // Prefer BOTTOM for stream/follow. Dual scrollTo(latest)+BOTTOM multipass-
+        // jumped the viewport (wrong size / flash). AppKit TimelineScrollFollower
+        // already snaps to true post-layout bottom while pinned; SwiftUI only
+        // re-asserts the sentinel. On force rejoin, scroll latest then BOTTOM once.
+        let targets = Self.programmaticScrollTargets(
             messages: vm.messages,
-            turns: vm.timeline.turns
-        ) ?? "BOTTOM"
-        if vm.status == .running && !force {
-            proxy.scrollTo(target, anchor: .bottom)
-            proxy.scrollTo("BOTTOM", anchor: .bottom)
-        } else {
-            withAnimation(DS.Motion.micro) {
-                proxy.scrollTo(target, anchor: .bottom)
-                proxy.scrollTo("BOTTOM", anchor: .bottom)
+            turns: vm.timeline.turns,
+            force: force
+        )
+        let apply: () -> Void = {
+            for id in targets {
+                proxy.scrollTo(id, anchor: .bottom)
             }
         }
+        if vm.status == .running && !force {
+            apply()
+        } else {
+            withAnimation(DS.Motion.micro, apply)
+        }
+    }
+
+    /// Ordered scroll ids for one programmatic rejoin/follow pass.
+    /// Stream/follow: BOTTOM only. Force: optional latest content id then BOTTOM.
+    nonisolated static func programmaticScrollTargets(
+        messages: [AgentMessage],
+        turns: [AssistantTurnSnapshot],
+        force: Bool
+    ) -> [String] {
+        if force, let latest = latestScrollTargetId(messages: messages, turns: turns),
+           latest != "BOTTOM" {
+            return [latest, "BOTTOM"]
+        }
+        return ["BOTTOM"]
     }
 
     /// Prefer last message or turn id for scroll anchoring (stable across work expand).

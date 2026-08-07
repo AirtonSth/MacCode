@@ -269,4 +269,22 @@ final class ScrollPinPolicyTests: XCTestCase {
             "SwiftUI detach always wins"
         )
     }
+    /// Stream follow must not dual-scroll content+BOTTOM (multipass jump).
+    func test_programmaticScrollTargets_streamUsesBottomOnly() {
+        let targets = AgentAppView.programmaticScrollTargets(
+            messages: [],
+            turns: [],
+            force: false
+        )
+        XCTAssertEqual(targets, ["BOTTOM"])
+    }
+
+    func test_programmaticScrollTargets_forceMayLeadWithContentThenBottom() {
+        // Empty messages/turns → still BOTTOM only.
+        XCTAssertEqual(
+            AgentAppView.programmaticScrollTargets(messages: [], turns: [], force: true),
+            ["BOTTOM"]
+        )
+    }
+
 }
