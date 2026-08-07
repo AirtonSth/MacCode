@@ -971,7 +971,7 @@ final class GrokACPProtocolTests: XCTestCase {
         // Reconstruct the params shape GrokACPClient.setModel must emit.
         let effort = AgentReasoningEffort.high
         var params: [String: Any] = ["sessionId": "sid", "modelId": "grok-4.5"]
-        params["_meta"] = ["reasoningEffort": effort.rawValue]
+        params["_meta"] = ["reasoningEffort": GrokACPClient.wireReasoningEffort(effort)]
         XCTAssertEqual((params["_meta"] as? [String: Any])?["reasoningEffort"] as? String, "high")
         let root = URL(fileURLWithPath: #file)
             .deletingLastPathComponent()
@@ -986,6 +986,10 @@ final class GrokACPProtocolTests: XCTestCase {
             source.contains("_meta") && source.contains("reasoningEffort"),
             "setModel must send _meta.reasoningEffort"
         )
+        XCTAssertTrue(
+            source.contains("wireReasoningEffort"),
+            "setModel must map effort via wireReasoningEffort before the wire call"
+        )
         let adapter = try String(
             contentsOf: root.appendingPathComponent("Sources/AgentRuntime/GrokACPAdapter.swift"),
             encoding: .utf8
@@ -994,6 +998,18 @@ final class GrokACPProtocolTests: XCTestCase {
             adapter.contains("needsEffortBind") || adapter.contains("reasoningEffort: targetEffort"),
             "Adapter must re-bind effort when it changes even if model id is unchanged"
         )
+    }
+
+    /// WHY: ultracode is Claude-only; Grok agent parse_reasoning_effort_meta ignores
+    /// it. Map to high (same as GrokRunner CLI) so set_model meta is accepted (GROK-ACP-007).
+    func test_wireReasoningEffortMapsUltracodeToHigh() {
+        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.ultracode), "high")
+        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.minimal), "minimal")
+        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.low), "low")
+        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.medium), "medium")
+        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.high), "high")
+        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.xhigh), "xhigh")
+        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.max), "max")
     }
 
     /// WHY: warm reattach + prompt still paid full gateway replay unless
