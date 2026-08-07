@@ -1046,6 +1046,34 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
     }
 
+    // MARK: - Scheduled live poll count-gate (R1)
+
+    /// WHY: LaunchAgent-owned runs poll every 2s. Decoding the full hot-replay
+    /// window just to compare `.count` burns CPU/memory when nothing changed.
+    /// Pure helper pins growth + prune both rebuild; equal count does not.
+    func test_shouldRebuildScheduledLiveTimeline_onlyWhenCountChanges() {
+        XCTAssertFalse(
+            AgentAppViewModel.shouldRebuildScheduledLiveTimeline(previousCount: 0, currentCount: 0),
+            "idle equal counts must not rebuild"
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.shouldRebuildScheduledLiveTimeline(previousCount: 42, currentCount: 42),
+            "unchanged count must not rebuild"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldRebuildScheduledLiveTimeline(previousCount: 10, currentCount: 11),
+            "growth must rebuild"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldRebuildScheduledLiveTimeline(previousCount: 10, currentCount: 7),
+            "prune (count down) must rebuild"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldRebuildScheduledLiveTimeline(previousCount: 0, currentCount: 1),
+            "first event must rebuild"
+        )
+    }
+
     // MARK: - Coalesced aggregate hot-text budget walk
 
     private func streamInput(

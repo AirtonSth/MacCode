@@ -4194,6 +4194,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         )) ?? []
     }
 
+    /// Cheap COUNT(*) for UI change detection. Prefer this over
+    /// `latestStreamEvents(...).count` so idle live-polls avoid full payload decode.
+    public func countStreamEvents(threadId: AgentThreadID) -> Int {
+        (try? runRepo.countStreamEvents(threadId: threadId)) ?? 0
+    }
+
     public func hotReplayIsPartial(threadId: AgentThreadID) -> Bool {
         ((try? runRepo.streamHistoryWasPruned(threadId: threadId)) ?? false)
             || ((try? runRepo.countStreamEvents(threadId: threadId)) ?? 0) > Self.hotReplayEventCount
@@ -6800,14 +6806,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     struct StreamWriteBatch {
         private var items: [StreamWriteItem] = []
+        /// Running total so flush decisions do not re-reduce utf8 lengths each tick.
+        private(set) var encodedByteCount: Int = 0
 
         var isEmpty: Bool { items.isEmpty }
         var count: Int { items.count }
-        var encodedByteCount: Int { items.reduce(0) { $0 + $1.encodedByteCount } }
         var highestSeq: Int { items.map(\.seq).max() ?? 0 }
 
         mutating func append(_ item: StreamWriteItem) {
             items.append(item)
+            encodedByteCount += item.encodedByteCount
         }
 
         func snapshot() -> [StreamWriteItem] {
@@ -6826,13 +6834,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     return false
                 }
             }
+            for item in items.prefix(committed.count) {
+                encodedByteCount -= item.encodedByteCount
+            }
             items.removeFirst(committed.count)
+            if items.isEmpty { encodedByteCount = 0 }
             return true
         }
 
         mutating func drain() -> [StreamWriteItem] {
             let snapshot = items
             items.removeAll(keepingCapacity: true)
+            encodedByteCount = 0
             return snapshot
         }
     }
@@ -6939,6 +6952,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// Soft-truncate an encoded payload at a Character-safe boundary. Prefer the
     /// head of the frame so partial tool output remains useful; never emit a
     /// recoverable user-facing error for size pressure.
+    ///
+    /// Hot path uses UTF-8 index arithmetic (O(headBudget) bytes + small boundary
+    /// walk-back) instead of iterating Character indices across the admitted head.
     nonisolated static func softTruncateUTF8Payload(
         _ payloadJSON: String,
         byteLimit: Int
@@ -6948,15 +6964,20 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         guard originalBytes > limit else { return payloadJSON }
         let trailer = "…[truncated \(originalBytes)→\(limit) bytes]"
         let headBudget = max(0, limit - trailer.utf8.count)
-        var consumed = 0
-        var end = payloadJSON.startIndex
-        for index in payloadJSON.indices {
-            let step = String(payloadJSON[index]).utf8.count
-            if consumed + step > headBudget { break }
-            consumed += step
-            end = payloadJSON.index(after: index)
+        guard headBudget > 0 else { return trailer }
+        var utf8End = payloadJSON.utf8.index(
+            payloadJSON.utf8.startIndex,
+            offsetBy: headBudget,
+            limitedBy: payloadJSON.utf8.endIndex
+        ) ?? payloadJSON.utf8.endIndex
+        // Align to a Character boundary so multi-byte sequences are never split.
+        while utf8End > payloadJSON.utf8.startIndex {
+            if let end = utf8End.samePosition(in: payloadJSON) {
+                return String(payloadJSON[..<end]) + trailer
+            }
+            payloadJSON.utf8.formIndex(before: &utf8End)
         }
-        return String(payloadJSON[..<end]) + trailer
+        return trailer
     }
 
     /// FIFO-set helper for correctness identifiers stored in the compact runtime

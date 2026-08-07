@@ -3212,7 +3212,8 @@ public final class AgentRunRepository: @unchecked Sendable {
     }
 
     /// Character-safe soft truncate. Shared with coordinator so persist + buffer
-    /// share one admission policy.
+    /// share one admission policy. UTF-8 index arithmetic (O(headBudget)) instead
+    /// of Character-index walks over the admitted head.
     nonisolated static func softTruncateUTF8Payload(
         _ payloadJSON: String,
         byteLimit: Int
@@ -3222,15 +3223,19 @@ public final class AgentRunRepository: @unchecked Sendable {
         guard originalBytes > limit else { return payloadJSON }
         let trailer = "…[truncated \(originalBytes)→\(limit) bytes]"
         let headBudget = max(0, limit - trailer.utf8.count)
-        var consumed = 0
-        var end = payloadJSON.startIndex
-        for index in payloadJSON.indices {
-            let step = String(payloadJSON[index]).utf8.count
-            if consumed + step > headBudget { break }
-            consumed += step
-            end = payloadJSON.index(after: index)
+        guard headBudget > 0 else { return trailer }
+        var utf8End = payloadJSON.utf8.index(
+            payloadJSON.utf8.startIndex,
+            offsetBy: headBudget,
+            limitedBy: payloadJSON.utf8.endIndex
+        ) ?? payloadJSON.utf8.endIndex
+        while utf8End > payloadJSON.utf8.startIndex {
+            if let end = utf8End.samePosition(in: payloadJSON) {
+                return String(payloadJSON[..<end]) + trailer
+            }
+            payloadJSON.utf8.formIndex(before: &utf8End)
         }
-        return String(payloadJSON[..<end]) + trailer
+        return trailer
     }
 
     public func upsert(_ r: AgentRun) throws {
