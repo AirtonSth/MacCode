@@ -277,6 +277,18 @@ public final class AgentThreadRepository {
     }
 
     let db: SQLiteDB
+    // PERF: prepareForkIntent / getForkIntent allocated JSONEncoder (sortedKeys)
+    // and JSONDecoder per fork admission/load. Shared pair under a short lock
+    // (codecs are not thread-safe); sortedKeys formatting unchanged for wire
+    // child/source-message snapshots.
+    private let forkCodecLock = NSLock()
+    private let forkDecoder = JSONDecoder()
+    private let forkEncoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
+
     public init(db: SQLiteDB) { self.db = db }
 
     /// Live Agent App bindings are process state, not a new persistence model.
@@ -933,9 +945,7 @@ public final class AgentThreadRepository {
         guard sourceThreadId != childThread.id else {
             throw AgentThreadForkPersistenceError.intentConflict
         }
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        let childJSON = String(decoding: try encoder.encode(childThread), as: UTF8.self)
+        let childJSON = String(decoding: try encodeForkPayload(childThread), as: UTF8.self)
         return try db.performSync { database in
             try database.transaction {
                 guard try get(id: sourceThreadId) != nil else {
@@ -979,7 +989,7 @@ public final class AgentThreadRepository {
                 }
 
                 let sourceMessages = try AgentMessageRepository(db: database).list(threadId: sourceThreadId)
-                let sourceMessagesJSON = String(decoding: try encoder.encode(sourceMessages), as: UTF8.self)
+                let sourceMessagesJSON = String(decoding: try encodeForkPayload(sourceMessages), as: UTF8.self)
                 let insert = try database.prepare("""
                     INSERT INTO agent_thread_fork_intents(
                         child_thread_id, source_thread_id, provider, idempotency_key,
@@ -1017,9 +1027,14 @@ public final class AgentThreadRepository {
               let provider = AgentProvider(rawValue: statement.columnText(1) ?? ""),
               let state = AgentThreadForkIntentState(rawValue: statement.columnText(3) ?? ""),
               let childJSON = statement.columnText(4)?.data(using: .utf8),
-              let sourceMessagesJSON = statement.columnText(5)?.data(using: .utf8),
-              let childThread = try? JSONDecoder().decode(AgentThread.self, from: childJSON),
-              let sourceMessages = try? JSONDecoder().decode([AgentMessage].self, from: sourceMessagesJSON) else {
+              let sourceMessagesJSON = statement.columnText(5)?.data(using: .utf8) else {
+            throw AgentThreadForkPersistenceError.corruptIntent
+        }
+        forkCodecLock.lock()
+        let childThread = try? forkDecoder.decode(AgentThread.self, from: childJSON)
+        let sourceMessages = try? forkDecoder.decode([AgentMessage].self, from: sourceMessagesJSON)
+        forkCodecLock.unlock()
+        guard let childThread, let sourceMessages else {
             throw AgentThreadForkPersistenceError.corruptIntent
         }
         return AgentThreadForkIntent(
@@ -1035,6 +1050,12 @@ public final class AgentThreadRepository {
             createdAt: parseDate(statement.columnText(8)),
             updatedAt: parseDate(statement.columnText(9))
         )
+    }
+
+    private func encodeForkPayload<T: Encodable>(_ value: T) throws -> Data {
+        forkCodecLock.lock()
+        defer { forkCodecLock.unlock() }
+        return try forkEncoder.encode(value)
     }
 
     public func listRecoverableForkIntents() throws -> [AgentThreadForkIntent] {
