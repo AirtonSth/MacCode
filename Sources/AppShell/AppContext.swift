@@ -3576,9 +3576,15 @@ public final class AppContext {
         return "English"
     }
 
+    // PERF: language sniff for SR1/Live Activity recompiled character-class
+    // regexes per call. CharacterSet membership is O(n) over scalars without
+    // regex compile (same accent/marker contract as before).
+    private static let portugueseAccentScalars = CharacterSet(charactersIn: "áàâãçéêíóôõú")
+    private static let spanishMarkerScalars = CharacterSet(charactersIn: "¿¡ñ")
+
     private static func looksPortuguese(_ text: String) -> Bool {
         let lower = " " + text.lowercased() + " "
-        if lower.range(of: #"[áàâãçéêíóôõú]"#, options: .regularExpression) != nil {
+        if lower.unicodeScalars.contains(where: { portugueseAccentScalars.contains($0) }) {
             return true
         }
         let markers = [
@@ -3592,7 +3598,7 @@ public final class AppContext {
 
     private static func looksSpanish(_ text: String) -> Bool {
         let lower = " " + text.lowercased() + " "
-        if lower.range(of: #"[¿¡ñ]"#, options: .regularExpression) != nil {
+        if lower.unicodeScalars.contains(where: { spanishMarkerScalars.contains($0) }) {
             return true
         }
         let markers = [" por favor ", " gracias ", " respuesta ", " usuario ", " prueba "]
