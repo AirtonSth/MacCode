@@ -57,8 +57,19 @@ private func parseDate(_ s: String?) -> Date {
     return Date()
 }
 
+// PERF: agent-thread model selection / run-as-user / routing row fields each
+// allocated JSONDecoder/JSONEncoder on every list/get/upsert. Shared process-
+// wide pair under a short lock (codecs are not thread-safe); wire JSON
+// formatting unchanged.
+private let agentThreadJSONCodecLock = NSLock()
+private let agentThreadJSONDecoder = JSONDecoder()
+private let agentThreadJSONEncoder = JSONEncoder()
+
 private func encodeModelSelection(_ selection: AgentModelSelection) -> String? {
-    guard let data = try? JSONEncoder().encode(selection) else { return nil }
+    agentThreadJSONCodecLock.lock()
+    let data = try? agentThreadJSONEncoder.encode(selection)
+    agentThreadJSONCodecLock.unlock()
+    guard let data else { return nil }
     return String(data: data, encoding: .utf8)
 }
 
@@ -70,9 +81,11 @@ private func decodeModelSelection(
     serviceTier: AgentServiceTier
 ) -> AgentModelSelection {
     if let json,
-       let data = json.data(using: .utf8),
-       let selection = try? JSONDecoder().decode(AgentModelSelection.self, from: data) {
-        return selection
+       let data = json.data(using: .utf8) {
+        agentThreadJSONCodecLock.lock()
+        let selection = try? agentThreadJSONDecoder.decode(AgentModelSelection.self, from: data)
+        agentThreadJSONCodecLock.unlock()
+        if let selection { return selection }
     }
     return AgentModelSelection(
         provider: provider,
@@ -84,21 +97,28 @@ private func decodeModelSelection(
 
 private func encodeRunAsUser(_ user: AgentRunAsUser?) -> String? {
     guard let user else { return nil }
-    guard let data = try? JSONEncoder().encode(user) else { return nil }
+    agentThreadJSONCodecLock.lock()
+    let data = try? agentThreadJSONEncoder.encode(user)
+    agentThreadJSONCodecLock.unlock()
+    guard let data else { return nil }
     return String(data: data, encoding: .utf8)
 }
 
 private func decodeRunAsUser(_ json: String?) -> AgentRunAsUser? {
     guard let json,
-          let data = json.data(using: .utf8),
-          let user = try? JSONDecoder().decode(AgentRunAsUser.self, from: data) else {
+          let data = json.data(using: .utf8) else {
         return nil
     }
+    agentThreadJSONCodecLock.lock()
+    let user = try? agentThreadJSONDecoder.decode(AgentRunAsUser.self, from: data)
+    agentThreadJSONCodecLock.unlock()
     return user
 }
 
 private func encodeRoutingConfiguration(_ configuration: AgentRoutingConfiguration) throws -> String {
-    let data = try JSONEncoder().encode(configuration)
+    agentThreadJSONCodecLock.lock()
+    defer { agentThreadJSONCodecLock.unlock() }
+    let data = try agentThreadJSONEncoder.encode(configuration)
     guard let json = String(data: data, encoding: .utf8) else {
         throw AgentRoutingPersistenceError.invalidConfigurationJSON
     }
@@ -111,8 +131,13 @@ private func decodeRoutingConfiguration(
     storedRevision: Int?
 ) throws -> AgentRoutingConfiguration {
     guard let json,
-          let data = json.data(using: .utf8),
-          let configuration = try? JSONDecoder().decode(AgentRoutingConfiguration.self, from: data) else {
+          let data = json.data(using: .utf8) else {
+        throw AgentRoutingPersistenceError.invalidConfigurationJSON
+    }
+    agentThreadJSONCodecLock.lock()
+    let configuration = try? agentThreadJSONDecoder.decode(AgentRoutingConfiguration.self, from: data)
+    agentThreadJSONCodecLock.unlock()
+    guard let configuration else {
         throw AgentRoutingPersistenceError.invalidConfigurationJSON
     }
     guard let storedMode else { return configuration }
