@@ -440,6 +440,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public let queuedMessageRepo: AgentQueuedMessageRepository?
     public let providerSessionRepo: ProviderSessionRuntimeRepository?
     public let pendingCallbackRepo: ProviderPendingCallbackRepository?
+    // PERF: rehydratePendingCallbacks allocated JSONDecoder on every thread
+    // switch / timeline rehydrate. MainActor VM — share one decoder (codecs are
+    // not thread-safe; isolation keeps access serial).
+    private let pendingCallbackDecoder = JSONDecoder()
     public let proposedPlanRepo: AgentProposedPlanRepository?
     public let checkpointRepo: AgentTurnCheckpointRepository?
     public let promptHistoryStore: PromptHistoryStore?
@@ -2373,17 +2377,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private func rehydratePendingCallbacks(threadId: AgentThreadID) {
         guard let pendingCallbackRepo,
               let callbacks = try? pendingCallbackRepo.listVisible(threadId: threadId) else { return }
-        let decoder = JSONDecoder()
         for callback in callbacks {
             guard let data = callback.payloadJSON.data(using: .utf8) else { continue }
             switch callback.kind {
             case .approval:
-                guard var request = try? decoder.decode(AssistantPendingRequest.self, from: data) else { continue }
+                guard var request = try? pendingCallbackDecoder.decode(
+                    AssistantPendingRequest.self,
+                    from: data
+                ) else { continue }
                 request.state = callback.state
                 request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
                 timeline.apply(.requestOpened(request))
             case .userInput:
-                guard var request = try? decoder.decode(AssistantUserInputRequest.self, from: data) else { continue }
+                guard var request = try? pendingCallbackDecoder.decode(
+                    AssistantUserInputRequest.self,
+                    from: data
+                ) else { continue }
                 request.state = callback.state
                 request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
                 timeline.apply(.userInputRequested(request))
