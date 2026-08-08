@@ -32,12 +32,19 @@ public enum TokenSaverSidecarLeaseProbe {
         }
     }
 
+    // PERF: admission / isHealthy paths allocated JSONDecoder per lease read.
+    // Nested proxies and host controllers probe frequently — reuse one decoder
+    // under a short lock (JSONDecoder is not thread-safe).
+    private static let decodeLock = NSLock()
+    private static let decoder = JSONDecoder()
+
     /// Decode a lease from raw DistillCLIState.json bytes. Returns nil when the
     /// payload is missing, malformed, or lacks a usable pid / URL / token.
     public static func readLease(from data: Data) -> Lease? {
-        guard let decoded = try? JSONDecoder().decode(StateFile.self, from: data) else {
-            return nil
-        }
+        decodeLock.lock()
+        let decoded = try? decoder.decode(StateFile.self, from: data)
+        decodeLock.unlock()
+        guard let decoded else { return nil }
         let base = decoded.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let token = decoded.authToken.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !base.isEmpty,
