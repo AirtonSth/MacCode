@@ -499,10 +499,9 @@ public enum AgentCheckpointListContract: Sendable {
             || errorMessage.truncated
             || (listMetadata?.metadataUnavailable ?? false)
 
-        // PERF: freeze may re-encode while trimming files until under budget;
-        // reuse one encoder across iterations (JSONEncoder is not thread-safe,
-        // but this path is single-threaded per freezeItem call).
-        let encoder = JSONEncoder()
+        // PERF: freeze may re-encode while trimming files until under budget.
+        // Reuse the locked sizeCheckEncoder (same default formatting as a fresh
+        // JSONEncoder) instead of allocating one encoder per freezeItem call.
         func makeItem(files: [AgentTurnCheckpointFile], filesTruncated: Bool) throws -> (JSONValue, Data) {
             let stripped = AgentTurnCheckpointSummary(
                 threadId: summary.threadId,
@@ -520,7 +519,7 @@ public enum AgentCheckpointListContract: Sendable {
                 completedAt: summary.completedAt
             )
             freezeItemBodyEncodeCountForTesting += 1
-            let baseData = try encoder.encode(stripped)
+            let baseData = try encodeForSizeCheck(stripped)
             guard var object = try JSONSerialization.jsonObject(with: baseData) as? [String: Any] else {
                 throw JSONRPCError.internalError
             }
