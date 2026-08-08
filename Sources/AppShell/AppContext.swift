@@ -2872,9 +2872,18 @@ public final class AppContext {
         // NetPositiveGate (G3): there is no app-side cached prefix to preserve (resume sends
         // the full wrapped prompt), so this is a numeric decision — compress the new-turn
         // argv only when it is large enough AND the session is not a warm follow-up.
-        let gate = NetPositiveGate(floorCharacters: Self.tokenSaverMinCompressChars, warmResumeTTLSeconds: 300)
+        // PERF: Character.count is O(n). Use utf8.count (O(1)) for definitive under-floor
+        // skips and for sizes where Character count is guaranteed ≥ floor (UTF-8 ≤ 4
+        // bytes/scalar). Only walk graphemes in the floor…4×floor boundary band.
+        let floor = Self.tokenSaverMinCompressChars
+        let utf8Count = prompt.utf8.count
+        if utf8Count < floor {
+            return prompt
+        }
+        let gate = NetPositiveGate(floorCharacters: floor, warmResumeTTLSeconds: 300)
         let secondsSinceLastTurn = secondsSinceLastTurn(threadId: threadId)
-        guard gate.shouldCompress(inputCharacters: prompt.count, secondsSinceLastTurn: secondsSinceLastTurn) else {
+        let inputCharacters = utf8Count >= floor * 4 ? utf8Count : prompt.count
+        guard gate.shouldCompress(inputCharacters: inputCharacters, secondsSinceLastTurn: secondsSinceLastTurn) else {
             return prompt
         }
         let semanticObservation = tokenSaverProjectObservation(threadId: threadId, lane: "semantic_prose")

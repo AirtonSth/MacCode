@@ -53,12 +53,24 @@ enum CommandWrapRunner {
         }
 
         let text = String(data: captured.stdout, encoding: .utf8)
+        let byteCount = captured.stdout.count
+        // PERF: `decide` only needs lineCount when the byte gate fails. Multi-MB
+        // captures that already clear minBytes must not full-split into Substrings.
+        let minBytes = CommandWrapPolicy.minBytes(environment: env)
+        let lineCount: Int
+        if byteCount > minBytes {
+            lineCount = 0
+        } else if let text {
+            lineCount = Self.lineCount(text, exceeding: CommandWrapPolicy.minLines(environment: env))
+        } else {
+            lineCount = 0
+        }
         let action = CommandWrapPolicy.decide(
             command: command,
             isTerminalToAgent: WrapPipeInspector.isTerminalToAgent(),
             outputIsValidUTF8: text != nil,
-            byteCount: captured.stdout.count,
-            lineCount: text.map(Self.lineCount) ?? 0,
+            byteCount: byteCount,
+            lineCount: lineCount,
             environment: env
         )
 
@@ -96,8 +108,22 @@ enum CommandWrapRunner {
         return (emitted.bytes, emitted.deferredSideEffect)
     }
 
-    private static func lineCount(_ text: String) -> Int {
-        text.isEmpty ? 0 : text.split(separator: "\n", omittingEmptySubsequences: false).count
+    /// Line-component count for the wrap size gate (`lineCount > minLines`).
+    ///
+    /// Empty → 0 (same as prior). Non-empty matches
+    /// `split(separator: "\n", omittingEmptySubsequences: false).count`.
+    /// PERF: UTF-8 LF scan with early exit once components exceed `threshold`
+    /// (no `Array` of `Substring` for medium dumps that failed the byte gate).
+    private static func lineCount(_ text: String, exceeding threshold: Int) -> Int {
+        if text.isEmpty { return 0 }
+        // components = newlines + 1; components > threshold ⇔ newlines >= threshold
+        var newlines = 0
+        let stopAt = max(1, threshold)
+        for byte in text.utf8 where byte == 0x0A {
+            newlines += 1
+            if newlines >= stopAt { return stopAt + 1 }
+        }
+        return newlines + 1
     }
 
     // MARK: - real-binary resolution
