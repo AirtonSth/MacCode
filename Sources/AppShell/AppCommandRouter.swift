@@ -308,6 +308,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     // PERF: publishQueuedMessage + notificationList constructed ISO8601DateFormatter
     // per date field. Construction is expensive; share one MainActor-isolated formatter.
     private let iso8601Formatter = ISO8601DateFormatter()
+    // PERF: jsonValue converts attachments/model selection/surface payloads on
+    // MainActor event publish paths — avoid allocating JSONEncoder per call.
+    private let jsonValueEncoder = JSONEncoder()
     private var providerProbeCache: [ProviderProbeCacheKey: ProviderProbeCapabilities] = [:]
     private var providerUpdateLocks = Set<ProviderProbeCacheKey>()
     private let providerProbeCacheTTL: TimeInterval = 30
@@ -503,8 +506,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private func jsonValue<T: Encodable>(_ value: T) -> JSONValue {
         // PERF: encode once, then JSONSerialization + JSONValue.from — avoids a
         // second full Codable walk via JSONDecoder (same as connectionSnapshotJSON /
-        // workspaceCreatedPayload).
-        guard let data = try? JSONEncoder().encode(value),
+        // workspaceCreatedPayload). Reuse jsonValueEncoder (MainActor-isolated).
+        guard let data = try? jsonValueEncoder.encode(value),
               let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
             return .null
         }
@@ -6871,7 +6874,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private func encodeFilesState(_ state: [String: JSONValue]) -> String? {
-        guard let data = try? JSONEncoder().encode(JSONValue.object(state)) else { return nil }
+        guard let data = try? jsonValueEncoder.encode(JSONValue.object(state)) else { return nil }
         return String(data: data, encoding: .utf8)
     }
 
