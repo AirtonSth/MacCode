@@ -1,6 +1,23 @@
 import Foundation
 
 public enum TestReportCrusher {
+    // PERF: compile once — looksLike/crush filter every line of multi-KB pytest
+    // dumps; range(of:options:.regularExpression) recompiled per line.
+    private static let pytestPassedLineRegex = try! NSRegularExpression(
+        pattern: #"::[^\s]+.*\bPASSED\b"#
+    )
+    private static let pytestFailureLineRegex = try! NSRegularExpression(
+        pattern: #"::[^\s]+.*\b(FAILED|ERROR)\b"#
+    )
+    private static let passedCountRegex = try! NSRegularExpression(
+        pattern: #"([0-9]+)\s+passed\b"#,
+        options: [.caseInsensitive]
+    )
+    private static let failedCountRegex = try! NSRegularExpression(
+        pattern: #"([0-9]+)\s+failed\b"#,
+        options: [.caseInsensitive]
+    )
+
     public static func looksLikeTestReport(_ text: String) -> Bool {
         let lines = text.split(whereSeparator: \.isNewline).map(String.init)
         return pytestSummary(in: lines) != nil && lines.contains(where: isPytestPassedLine)
@@ -31,8 +48,8 @@ public enum TestReportCrusher {
         for line in lines.reversed() {
             let lower = line.lowercased()
             guard lower.contains(" passed"), lower.contains("=") else { continue }
-            let passed = firstInt(in: lower, before: "passed")
-            let failed = firstInt(in: lower, before: "failed") ?? 0
+            let passed = firstInt(in: lower, using: passedCountRegex)
+            let failed = firstInt(in: lower, using: failedCountRegex) ?? 0
             if let passed {
                 return (line, failed, passed)
             }
@@ -40,9 +57,9 @@ public enum TestReportCrusher {
         return nil
     }
 
-    private static func firstInt(in text: String, before word: String) -> Int? {
-        let pattern = #"([0-9]+)\s+"# + NSRegularExpression.escapedPattern(for: word) + #"\b"#
-        guard let match = regex(pattern, in: text).first,
+    private static func firstInt(in text: String, using regex: NSRegularExpression) -> Int? {
+        let full = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: full),
               match.numberOfRanges >= 2,
               let range = Range(match.range(at: 1), in: text) else {
             return nil
@@ -51,15 +68,15 @@ public enum TestReportCrusher {
     }
 
     private static func isPytestPassedLine(_ line: String) -> Bool {
-        line.range(of: #"::[^\s]+.*\bPASSED\b"#, options: .regularExpression) != nil
+        matches(pytestPassedLineRegex, in: line)
     }
 
     private static func isFailureLine(_ line: String) -> Bool {
-        line.range(of: #"::[^\s]+.*\b(FAILED|ERROR)\b"#, options: .regularExpression) != nil
+        matches(pytestFailureLineRegex, in: line)
     }
 
-    private static func regex(_ pattern: String, in text: String) -> [NSTextCheckingResult] {
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
-        return regex.matches(in: text, range: NSRange(text.startIndex..<text.endIndex, in: text))
+    private static func matches(_ regex: NSRegularExpression, in text: String) -> Bool {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.firstMatch(in: text, options: [], range: range) != nil
     }
 }

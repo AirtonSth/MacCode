@@ -48,10 +48,17 @@ public enum StackTraceCrusher {
         return output.utf8.count < input.utf8.count ? output : nil
     }
 
+    // PERF: compile once — looksLike/crush classify every line of multi-KB dumps.
+    private static let numberedFrameRegex = try! NSRegularExpression(
+        pattern: #"^\d+\s+[\w.$<>]+\("#
+    )
+
     private static func isStackFrame(_ line: String) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
-        return trimmed.hasPrefix("at ") ||
-            trimmed.hasPrefix("File \"") ||
-            trimmed.range(of: #"^\d+\s+[\w.$<>]+\("#, options: .regularExpression) != nil
+        if trimmed.hasPrefix("at ") || trimmed.hasPrefix("File \"") {
+            return true
+        }
+        let range = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+        return numberedFrameRegex.firstMatch(in: trimmed, options: [], range: range) != nil
     }
 }

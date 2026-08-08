@@ -238,12 +238,26 @@ public enum TokenSaverTypedCrushers {
 
     // MARK: - Helpers
 
+    // PERF: compile once — collapse/frame classify walks every line of multi-KB
+    // stack dumps; parsePytestFailedCount runs on tool summaries.
+    private static let pytestFailedCountRegex = try! NSRegularExpression(
+        pattern: #"(\d+)\s+failed"#,
+        options: [.caseInsensitive]
+    )
+    private static let atFrameRegex = try! NSRegularExpression(
+        pattern: #"^\s*at\s+\S+"#
+    )
+    private static let pythonFileFrameRegex = try! NSRegularExpression(
+        pattern: #"^File \"[^\"]+\", line \d+"#
+    )
+
     /// Parse trailing `N failed` from pytest summary (last match wins).
     public static func parsePytestFailedCount(_ text: String) -> Int? {
-        let pattern = #"(\d+)\s+failed"#
-        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
         let ns = text as NSString
-        let matches = re.matches(in: text, range: NSRange(location: 0, length: ns.length))
+        let matches = pytestFailedCountRegex.matches(
+            in: text,
+            range: NSRange(location: 0, length: ns.length)
+        )
         guard let last = matches.last, last.numberOfRanges >= 2 else { return nil }
         return Int(ns.substring(with: last.range(at: 1)))
     }
@@ -253,8 +267,9 @@ public enum TokenSaverTypedCrushers {
         let t = line.trimmingCharacters(in: .whitespaces)
         if t.hasPrefix("at ") { return true }
         if t.hasPrefix("File \"") { return true }
-        if t.range(of: #"^\s*at\s+\S+"#, options: .regularExpression) != nil { return true }
-        if t.range(of: #"^File \"[^\"]+\", line \d+"#, options: .regularExpression) != nil { return true }
+        let range = NSRange(t.startIndex..<t.endIndex, in: t)
+        if atFrameRegex.firstMatch(in: t, options: [], range: range) != nil { return true }
+        if pythonFileFrameRegex.firstMatch(in: t, options: [], range: range) != nil { return true }
         return false
     }
 
