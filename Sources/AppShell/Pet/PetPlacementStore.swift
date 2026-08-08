@@ -15,6 +15,11 @@ public struct PetStoredPlacement: Codable, Sendable, Equatable {
 public final class PetPlacementStore {
     private let repository: SettingsRepository
     private let key = "pet.placement.v1"
+    // PERF: load/save allocated JSONDecoder/JSONEncoder on every placement
+    // restore and drag persist. MainActor store — share one pair (codecs are
+    // not thread-safe; isolation keeps access serial).
+    private let decoder = JSONDecoder()
+    private let encoder = JSONEncoder()
 
     public init(repository: SettingsRepository) {
         self.repository = repository
@@ -23,11 +28,11 @@ public final class PetPlacementStore {
     public func load() -> PetStoredPlacement? {
         guard let raw = try? repository.get(key),
               let data = raw.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(PetStoredPlacement.self, from: data)
+        return try? decoder.decode(PetStoredPlacement.self, from: data)
     }
 
     public func save(_ placement: PetStoredPlacement) {
-        guard let data = try? JSONEncoder().encode(placement),
+        guard let data = try? encoder.encode(placement),
               let raw = String(data: data, encoding: .utf8) else { return }
         try? repository.set(key, raw)
     }
