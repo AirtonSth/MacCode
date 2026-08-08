@@ -683,10 +683,21 @@ public final class AttachmentUploadV3Store: @unchecked Sendable {
             }
     }
 
+    /// PERF: nibble table instead of per-byte `String(format:)` so chunk /
+    /// sealed / plaintext digest finalize avoids 32 formatter calls while
+    /// keeping the same CryptoKit lowercase hex contract.
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
     private static func hexDigest<D: Sequence>(
         _ digest: D
     ) -> String where D.Element == UInt8 {
-        digest.map { String(format: "%02x", $0) }.joined()
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 
     private static func constantTimeEqual(_ lhs: Data, _ rhs: Data?) -> Bool {
