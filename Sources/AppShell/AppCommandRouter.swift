@@ -1206,9 +1206,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // Mirrors Dispatcher's `encode(ws)` byte-for-byte: JSONEncoder ->
         // JSONSerialization -> JSONValue.from (NOT JSONValue's own Decodable,
         // which structures the object differently and dropped the top-level id).
-        guard let data = try? JSONEncoder().encode(workspace),
-              let any = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else { return .null }
-        return JSONValue.from(any)
+        // PERF: same encode path as connectionSnapshotJSON — reuse the locked
+        // shared encoder instead of allocating per workspace.created publish.
+        return connectionSnapshotJSON(workspace)
     }
 
     nonisolated static func workspaceRenamedPayload(id: WorkspaceID, name: String) -> JSONValue {
