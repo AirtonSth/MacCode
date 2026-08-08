@@ -5141,13 +5141,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 lines.append("")
             }
         }
+        // PERF: exportThreadMarkdown rebuilt the path-unsafe CharacterSet on
+        // every export. Share one set for title → filename sanitization.
         let safeName = thread.title
-            .components(separatedBy: CharacterSet(charactersIn: "/\\:?%*|\"<>"))
+            .components(separatedBy: Self.exportThreadFilenameSeparators)
             .joined(separator: "-")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let fileName = (safeName.isEmpty ? "agent-thread" : safeName) + ".md"
         return (fileName, lines.joined(separator: "\n"))
     }
+
+    private static let exportThreadFilenameSeparators = CharacterSet(charactersIn: "/\\:?%*|\"<>")
 
     private func systemNote(_ text: String) {
         guard let tid = selectedThreadId else { return }
