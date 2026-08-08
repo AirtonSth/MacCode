@@ -320,11 +320,24 @@ public struct TokenSaverExecutionReceipt: Codable, Sendable, Equatable {
         case waveLive = "wave_live"
     }
 
-    public func encodedJSONString() -> String? {
-        guard TokenSaverExecutionReceiptSeam.isValid(self) else { return nil }
+    // PERF: every admitted Token Saver run encodes the receipt into provider
+    // env (and tests re-decode). JSONEncoder/Decoder are not thread-safe —
+    // share one sortedKeys encoder + decoder under a short lock so concurrent
+    // run starts avoid per-call codec allocation (wire JSON unchanged).
+    private static let codecLock = NSLock()
+    private static let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        guard let data = try? encoder.encode(self),
+        return encoder
+    }()
+    private static let decoder = JSONDecoder()
+
+    public func encodedJSONString() -> String? {
+        guard TokenSaverExecutionReceiptSeam.isValid(self) else { return nil }
+        Self.codecLock.lock()
+        let data = try? Self.encoder.encode(self)
+        Self.codecLock.unlock()
+        guard let data,
               data.count <= TokenSaverExecutionReceiptSeam.maximumEncodedBytes,
               let text = String(data: data, encoding: .utf8),
               !TokenSaverExecutionReceiptSeam.containsDisallowedContent(text) else {
@@ -337,9 +350,13 @@ public struct TokenSaverExecutionReceipt: Codable, Sendable, Equatable {
         guard let data = json.data(using: .utf8),
               data.count <= TokenSaverExecutionReceiptSeam.maximumEncodedBytes,
               !TokenSaverExecutionReceiptSeam.containsDisallowedContent(json),
-              TokenSaverExecutionReceiptSeam.hasOnlyReceiptKeys(data),
-              let receipt = try? JSONDecoder().decode(TokenSaverExecutionReceipt.self, from: data),
-              TokenSaverExecutionReceiptSeam.isValid(receipt) else {
+              TokenSaverExecutionReceiptSeam.hasOnlyReceiptKeys(data) else {
+            return nil
+        }
+        codecLock.lock()
+        let receipt = try? decoder.decode(TokenSaverExecutionReceipt.self, from: data)
+        codecLock.unlock()
+        guard let receipt, TokenSaverExecutionReceiptSeam.isValid(receipt) else {
             return nil
         }
         return receipt
