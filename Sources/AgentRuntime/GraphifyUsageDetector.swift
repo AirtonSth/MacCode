@@ -98,7 +98,7 @@ public enum GraphifyUsageDetector {
         let command = commandText(fromBody: text)
         // Split on common shell separators so `cd x && graphify query` still matches.
         let segments = command
-            .components(separatedBy: CharacterSet(charactersIn: "\n;|&"))
+            .components(separatedBy: shellSegmentSeparators)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
 
@@ -125,6 +125,9 @@ public enum GraphifyUsageDetector {
         pattern: #"^(?:/usr/bin/env\s+)?(?:\S+/)?graphify(?:y)?\s+(query|path|explain)(?:\s|$)"#,
         options: [.caseInsensitive]
     )
+    // PERF: detect() allocated CharacterSet(charactersIn: "\n;|&") per tool body
+    // when scanning for graphify query/path/explain usage.
+    private static let shellSegmentSeparators = CharacterSet(charactersIn: "\n;|&")
 
     /// Segment must start with optional env/path then graphify + allowed subcommand.
     static func matchSegment(_ segment: String) -> String? {
