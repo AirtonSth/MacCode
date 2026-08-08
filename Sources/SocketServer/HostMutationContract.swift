@@ -505,13 +505,27 @@ public enum HostMutationContract {
         params.filter { !transportParamKeys.contains($0.key) }
     }
 
+    // PERF: every admitted host mutation hashes params. JSONEncoder is not
+    // thread-safe — serialize concurrent hashes under a short lock and reuse
+    // one encoder (sortedKeys + withoutEscapingSlashes match the prior
+    // per-call setup so receipt idempotency digests stay identical).
+    private static let paramsHashEncodeLock = NSLock()
+    private static let paramsHashEncoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return encoder
+    }()
+
     public static func paramsHash(
         method: String,
         _ params: [String: JSONValue]
     ) throws -> String {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let encoded = try encoder.encode(JSONValue.object(businessParams(params)))
+        let business = JSONValue.object(businessParams(params))
+        let encoded: Data = try {
+            paramsHashEncodeLock.lock()
+            defer { paramsHashEncodeLock.unlock() }
+            return try paramsHashEncoder.encode(business)
+        }()
         var input = Data("rc-command-v1\u{0}\(method)\u{0}".utf8)
         input.append(encoded)
         return hexDigest(SHA256.hash(data: input))
