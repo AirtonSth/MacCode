@@ -1394,9 +1394,13 @@ public enum AgentThreadTitle {
         return normalized.hasPrefix(subagentTitlePrefix)
     }
 
+    // PERF: titleFromFirstMessage trims list/heading noise on every new-thread
+    // title derivation (composer send + host repair paths). Share one set.
+    private static let firstMessageTitleTrimSet = CharacterSet(charactersIn: " \t.-:#*")
+
     public static func titleFromFirstMessage(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let stripped = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: " \t.-:#*"))
+        let stripped = trimmed.trimmingCharacters(in: firstMessageTitleTrimSet)
         return stripped.isEmpty ? defaultTitle : stripped
     }
 
