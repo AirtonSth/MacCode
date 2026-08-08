@@ -184,9 +184,20 @@ public struct TokenSaverBindingID: Sendable, Hashable, Equatable {
         return Data(lines.joined(separator: "\n").utf8)
     }
 
+    /// PERF: nibble table instead of per-byte `String(format:)` so binding
+    /// digests avoid 32 formatter calls while keeping the same CryptoKit
+    /// lowercase hex contract for census/ledger/promotion identity.
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
     private static func digestHex(for data: Data) -> String {
         let digest = SHA256.hash(data: data)
-        return digest.map { String(format: "%02x", $0) }.joined()
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 }
 
