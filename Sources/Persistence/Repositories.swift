@@ -6758,6 +6758,12 @@ private final class TerminalHistoryFailureLedger: @unchecked Sendable {
 public final class TerminalOutputRepository {
     let db: SQLiteDB
     private let failureLedger: TerminalHistoryFailureLedger?
+    // PERF: partial/dirty history state load/merge allocated JSONDecoder/JSONEncoder
+    // on every terminal chunk durability write. Shared process-wide pair under a
+    // short lock (codecs are not thread-safe); wire JSON formatting unchanged.
+    private static let partialStateCodecLock = NSLock()
+    private static let partialStateDecoder = JSONDecoder()
+    private static let partialStateEncoder = JSONEncoder()
 
     public init(db: SQLiteDB) {
         self.db = db
@@ -7527,8 +7533,13 @@ public final class TerminalOutputRepository {
         database: SQLiteDB
     ) throws -> TerminalHistoryPartialState? {
         guard let value = try settingValue(key: key, database: database) else { return nil }
-        guard let data = value.data(using: .utf8),
-              let state = try? JSONDecoder().decode(TerminalHistoryPartialState.self, from: data) else {
+        guard let data = value.data(using: .utf8) else {
+            throw SQLiteError.execute("Corrupt terminal history state for key \(key).")
+        }
+        partialStateCodecLock.lock()
+        let state = try? partialStateDecoder.decode(TerminalHistoryPartialState.self, from: data)
+        partialStateCodecLock.unlock()
+        guard let state else {
             throw SQLiteError.execute("Corrupt terminal history state for key \(key).")
         }
         return state
@@ -7564,7 +7575,11 @@ public final class TerminalOutputRepository {
             reason: existing?.reason ?? incoming.reason,
             nextChunkIndex: max(existing?.nextChunkIndex ?? 1, incoming.nextChunkIndex)
         )
-        let encoded = try JSONEncoder().encode(state)
+        let encoded: Data = try {
+            partialStateCodecLock.lock()
+            defer { partialStateCodecLock.unlock() }
+            return try partialStateEncoder.encode(state)
+        }()
         guard let value = String(data: encoded, encoding: .utf8) else {
             throw SQLiteError.execute("Could not encode terminal history state for key \(key).")
         }
