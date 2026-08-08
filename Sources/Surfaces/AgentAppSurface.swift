@@ -8383,12 +8383,34 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
 
     /// Remove ANSI/VT control sequences (SGR colors, cursor moves, OSC) so command output is
     /// readable instead of showing literal escape codes. Cheap fast-path when none present.
+    ///
+    /// PERF: compile CSI/OSC/lone-escape patterns once. `cappedDetail` calls this on every
+    /// expanded-tool / streaming paint for Bash dumps; `replacingOccurrences(options:
+    /// .regularExpression)` recompiled all three patterns per call and dominated strip
+    /// cost on multi-10k CSI-heavy command output.
+    private static let ansiCSIRegex = try! NSRegularExpression(
+        pattern: "\u{001B}\\[[0-9;?]*[ -/]*[@-~]"
+    )
+    private static let ansiOSCRegex = try! NSRegularExpression(
+        pattern: "\u{001B}\\][^\u{0007}\u{001B}]*(?:\u{0007}|\u{001B}\\\\)"
+    )
+    private static let ansiLoneEscapeRegex = try! NSRegularExpression(
+        pattern: "\u{001B}[@-Z\\\\-_]"
+    )
+
     static func stripANSI(_ text: String) -> String {
         guard text.contains("\u{001B}") else { return text }
-        return text
-            .replacingOccurrences(of: "\u{001B}\\[[0-9;?]*[ -/]*[@-~]", with: "", options: .regularExpression) // CSI (incl. SGR)
-            .replacingOccurrences(of: "\u{001B}\\][^\u{0007}\u{001B}]*(?:\u{0007}|\u{001B}\\\\)", with: "", options: .regularExpression) // OSC
-            .replacingOccurrences(of: "\u{001B}[@-Z\\\\-_]", with: "", options: .regularExpression) // lone escapes
+        var result = text
+        for regex in [ansiCSIRegex, ansiOSCRegex, ansiLoneEscapeRegex] {
+            let range = NSRange(result.startIndex..<result.endIndex, in: result)
+            result = regex.stringByReplacingMatches(
+                in: result,
+                options: [],
+                range: range,
+                withTemplate: ""
+            )
+        }
+        return result
     }
 
     private static func verb(for item: AssistantItem) -> String {
