@@ -201,8 +201,18 @@ public struct ManagedRetrieveMCP: Sendable {
         return text // single line (no embedded newlines from JSONSerialization default)
     }
 
+    // PERF: rc_stats/rc_search replies encoded Encodable tool payloads with a
+    // fresh JSONEncoder on every MCP request. Share one under a short lock
+    // (JSONEncoder is not thread-safe; concurrent MCP stdio clients may share
+    // a process) so wire JSON stays default-formatted without per-call alloc.
+    private static let encodeLock = NSLock()
+    private static let encoder = JSONEncoder()
+
     private func encodeJSON<T: Encodable>(_ value: T) -> String? {
-        guard let data = try? JSONEncoder().encode(value) else { return nil }
+        Self.encodeLock.lock()
+        let data = try? Self.encoder.encode(value)
+        Self.encodeLock.unlock()
+        guard let data else { return nil }
         return String(data: data, encoding: .utf8)
     }
 }
