@@ -704,6 +704,11 @@ public enum AgentCheckpointListContract: Sendable {
         return (kept, kept.count < files.count)
     }
 
+    // PERF: packPage encodes the JSON-RPC id on every agent.checkpoint.list
+    // page; a nil id used to allocate Data("null".utf8) each time. Share static
+    // bytes (wire text unchanged).
+    private static let nullJSONIDData = Data([0x6e, 0x75, 0x6c, 0x6c]) // "null"
+
     private static func encodeID(
         _ id: JSONRPCID?,
         encoder: JSONEncoder
@@ -711,7 +716,7 @@ public enum AgentCheckpointListContract: Sendable {
         if let id {
             return try encoder.encode(id)
         }
-        return Data("null".utf8)
+        return nullJSONIDData
     }
 
     private static func encodeCursor(
