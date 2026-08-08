@@ -2956,12 +2956,25 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         reservationLock.unlock()
     }
 
-    private static func capabilitySnapshotID(_ snapshot: AgentProviderSnapshot) -> String {
-        let modelIDs = snapshot.models.map(\.id).joined(separator: ",")
+    // PERF: Auto/orchestrate route builds fingerprint `effectiveCapabilities`
+    // on every makeRoute. JSONEncoder is not thread-safe — share one sortedKeys
+    // encoder under a short lock so concurrent route resolution avoids per-call
+    // codec allocation (capabilitySnapshotId digests stay identical).
+    private static let capabilityFingerprintEncodeLock = NSLock()
+    private static let capabilityFingerprintEncoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        let capabilityFingerprint = (try? encoder.encode(snapshot.effectiveCapabilities))
-            .flatMap { String(data: $0, encoding: .utf8) } ?? "unavailable"
+        return encoder
+    }()
+
+    private static func capabilitySnapshotID(_ snapshot: AgentProviderSnapshot) -> String {
+        let modelIDs = snapshot.models.map(\.id).joined(separator: ",")
+        let capabilityFingerprint: String = {
+            capabilityFingerprintEncodeLock.lock()
+            defer { capabilityFingerprintEncodeLock.unlock() }
+            return (try? capabilityFingerprintEncoder.encode(snapshot.effectiveCapabilities))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "unavailable"
+        }()
         let discoverySource = snapshot.modelDiscoverySource?.rawValue ?? "unknown"
         return sha256Hex(
             "\(snapshot.id)|\(snapshot.driverKind.rawValue)|\(snapshot.version ?? "")|\(modelIDs)|\(snapshot.modelDiscoveryCacheKey ?? "")|\(discoverySource)|\(capabilityFingerprint)"
