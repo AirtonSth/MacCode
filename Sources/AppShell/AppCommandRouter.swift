@@ -113,6 +113,10 @@ public final class AgentAppReadGateway: @unchecked Sendable {
 
     private let db: SQLiteDB
     private let queue: DispatchQueue
+    // PERF: listPendingCallbacks allocated JSONDecoder per off-MainActor poll.
+    // Gateway work is serial on `queue`, so one instance decoder is safe and
+    // avoids per-call codec construction while decode behavior is unchanged.
+    private let pendingCallbackDecoder = JSONDecoder()
 
     public init(db: SQLiteDB) {
         self.db = db
@@ -187,14 +191,16 @@ public final class AgentAppReadGateway: @unchecked Sendable {
 
     public func listPendingCallbacks(threadId: AgentThreadID) async throws -> AssistantPendingCallbacksSnapshot {
         try await execute {
-            let decoder = JSONDecoder()
             var requests: [AssistantPendingRequest] = []
             var userInputs: [AssistantUserInputRequest] = []
             for callback in try ProviderPendingCallbackRepository(db: self.db).listVisible(threadId: threadId) {
                 guard let data = callback.payloadJSON.data(using: .utf8) else { continue }
                 switch callback.kind {
                 case .approval:
-                    guard var request = try? decoder.decode(AssistantPendingRequest.self, from: data) else { continue }
+                    guard var request = try? self.pendingCallbackDecoder.decode(
+                        AssistantPendingRequest.self,
+                        from: data
+                    ) else { continue }
                     request.state = callback.state
                     request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
                     if callback.state == .stale, let reason = callback.staleReason {
@@ -202,7 +208,10 @@ public final class AgentAppReadGateway: @unchecked Sendable {
                     }
                     requests.append(request)
                 case .userInput:
-                    guard var input = try? decoder.decode(AssistantUserInputRequest.self, from: data) else { continue }
+                    guard var input = try? self.pendingCallbackDecoder.decode(
+                        AssistantUserInputRequest.self,
+                        from: data
+                    ) else { continue }
                     input.state = callback.state
                     input.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
                     if callback.state == .stale, let reason = callback.staleReason, input.answer == nil {
