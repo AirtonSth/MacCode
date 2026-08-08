@@ -1136,14 +1136,25 @@ public enum AgentFileEditDiffPresentation {
         return nil
     }
 
+    // PERF: compile once — pathCandidate/parseHunkHeader run on tool-detail paint
+    // (path summary + every @@ hunk line of multi-KB diffs).
+    private static let pathCandidateRegex = try! NSRegularExpression(
+        pattern: #"(/[^\s]+|\S+\.\w{1,8})"#
+    )
+    private static let hunkHeaderRegex = try! NSRegularExpression(
+        pattern: #"@@\s*-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s*@@"#
+    )
+
     private static func pathCandidate(in text: String) -> String? {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard t.contains("/") || t.contains(".") else { return nil }
         // "Changed path/to/file.swift" / "1 file change · foo.ts"
-        if let range = t.range(of: #"(/[^\s]+|\S+\.\w{1,8})"#, options: .regularExpression) {
-            return String(t[range])
+        let full = NSRange(t.startIndex..<t.endIndex, in: t)
+        guard let match = pathCandidateRegex.firstMatch(in: t, options: [], range: full),
+              let range = Range(match.range, in: t) else {
+            return nil
         }
-        return nil
+        return String(t[range])
     }
 
     private static func pathFromDiffGitLine(_ line: String) -> String? {
@@ -1170,11 +1181,12 @@ public enum AgentFileEditDiffPresentation {
 
     private static func parseHunkHeader(_ line: String) -> (Int, Int)? {
         // @@ -12,4 +12,10 @@
-        guard let re = try? NSRegularExpression(pattern: #"@@\s*-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s*@@"#) else {
-            return nil
-        }
         let ns = line as NSString
-        guard let match = re.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)),
+        guard let match = hunkHeaderRegex.firstMatch(
+            in: line,
+            options: [],
+            range: NSRange(location: 0, length: ns.length)
+        ),
               match.numberOfRanges >= 3,
               let oldR = Range(match.range(at: 1), in: line),
               let newR = Range(match.range(at: 2), in: line),
