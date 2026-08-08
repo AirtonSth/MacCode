@@ -1,5 +1,7 @@
 import XCTest
 import CoreModel
+import CryptoKit
+import Foundation
 @testable import SocketServer
 
 final class WorkspaceFileServiceTests: XCTestCase {
@@ -348,5 +350,22 @@ final class WorkspaceFileServiceTests: XCTestCase {
         }
         let conflict = try XCTUnwrap(events.first { $0.kind == "files.edit.conflict" })
         XCTAssertEqual(conflict.payload.objectValue?["reason"], .string("disk_changed"))
+    }
+
+    /// WHY: file-edit CAS digests must stay CryptoKit-identical after the
+    /// nibble-table path; a case drift would false-positive disk_changed or
+    /// accept a silent overwrite.
+    func test_workspaceFileSHA256Hex_matchesCryptoKitLowercase() {
+        let samples: [Data] = [
+            Data(),
+            Data("hello".utf8),
+            Data((0..<8_192).map { UInt8($0 & 0xff) }),
+        ]
+        for sample in samples {
+            let expected = SHA256.hash(data: sample)
+                .map { String(format: "%02x", $0) }
+                .joined()
+            XCTAssertEqual(workspaceFileSHA256Hex(sample), expected)
+        }
     }
 }

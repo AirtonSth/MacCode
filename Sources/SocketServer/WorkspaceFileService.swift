@@ -898,8 +898,27 @@ private func encodeText(_ text: String, encoding: String) -> Data {
     }
 }
 
+/// Lowercase SHA-256 hex used for file-edit CAS (`baseHash` / `disk_hash`).
+///
+/// PERF: nibble table instead of per-byte `String(format:)` so multi-MB open /
+/// save / conflict checks avoid 32 formatter calls per digest while keeping
+/// the same CryptoKit lowercase hex contract.
+func workspaceFileSHA256Hex(_ data: Data) -> String {
+    let digest = SHA256.hash(data: data)
+    var out: [UInt8] = []
+    out.reserveCapacity(64)
+    let alphabet = workspaceFileHexNibbleAlphabet
+    for byte in digest {
+        out.append(alphabet[Int(byte >> 4)])
+        out.append(alphabet[Int(byte & 0x0f)])
+    }
+    return String(bytes: out, encoding: .utf8) ?? ""
+}
+
+private let workspaceFileHexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
 private func hash(_ data: Data) -> String {
-    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    workspaceFileSHA256Hex(data)
 }
 
 private func atomicWrite(_ data: Data, to url: URL) throws {
