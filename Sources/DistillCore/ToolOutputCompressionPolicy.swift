@@ -244,10 +244,14 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
         return Self.shellCommandLooksExactOutput(command)
     }
 
+    // PERF: shellCommandLooksExactOutput runs on every bash/shell compress
+    // decision and allocated CharacterSet(charactersIn: "|&;\n") per call.
+    private static let shellSegmentSeparators = CharacterSet(charactersIn: "|&;\n")
+
     /// Segment-aware check shared with wrapper intent: pipes/and chains may mix tools.
     public static func shellCommandLooksExactOutput(_ command: String) -> Bool {
         let segments = command
-            .components(separatedBy: CharacterSet(charactersIn: "|&;\n"))
+            .components(separatedBy: shellSegmentSeparators)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         for segment in segments {
