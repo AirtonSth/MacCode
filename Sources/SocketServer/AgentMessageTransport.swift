@@ -529,9 +529,13 @@ public enum AgentMessageTransport {
         var result: [AgentAttachment] = []
         var encodedBytes = 2
         for attachment in source.prefix(attachmentCountLimit) {
-            guard let reference = AgentAttachmentReference(attachment),
-                  let bytes = try? JSONEncoder().encode(reference).count,
-                  encodedBytes + bytes + 1 <= attachmentWireMaxBytes else {
+            guard let reference = AgentAttachmentReference(attachment) else {
+                continue
+            }
+            // Measure the same wire object clients receive (not a second
+            // Codable encoding of the reference that is later re-encoded).
+            let bytes = encodedValueBytes(attachmentReferenceValue(reference))
+            guard encodedBytes + bytes + 1 <= attachmentWireMaxBytes else {
                 break
             }
             result.append(attachment)
@@ -544,16 +548,32 @@ public enum AgentMessageTransport {
         _ attachments: [AgentAttachment]
     ) -> JSONValue {
         .array(attachments.compactMap { attachment in
-            guard let reference = AgentAttachmentReference(attachment),
-                  let data = try? JSONEncoder().encode(reference),
-                  let value = try? JSONDecoder().decode(
-                    JSONValue.self,
-                    from: data
-                  ) else {
+            guard let reference = AgentAttachmentReference(attachment) else {
                 return nil
             }
-            return value
+            return attachmentReferenceValue(reference)
         })
+    }
+
+    /// Path-free attachment reference as wire JSON — same keys as default
+    /// `AgentAttachmentReference` Codable (optional `mimeType` omitted when nil).
+    ///
+    /// PERF: avoids encode→decode of each reference on every message event/list
+    /// envelope that projects attachments.
+    private static func attachmentReferenceValue(
+        _ reference: AgentAttachmentReference
+    ) -> JSONValue {
+        var object: [String: JSONValue] = [
+            "id": .string(reference.id),
+            "displayName": .string(reference.displayName),
+            "kind": .string(reference.kind.rawValue),
+            "sha256": .string(reference.sha256),
+            "sizeBytes": .number(Double(reference.sizeBytes)),
+        ]
+        if let mimeType = reference.mimeType {
+            object["mimeType"] = .string(mimeType)
+        }
+        return .object(object)
     }
 
     private static func messageWireObject(
