@@ -1436,11 +1436,21 @@ public struct TokenSaverInputComponentParetoRow: Sendable, Equatable {
 
 public final class TokenSaverAttemptLedger: @unchecked Sendable {
     private let db: SQLiteDB
+    // PERF: begin/attempt allocated JSONEncoder/JSONDecoder for unavailableFields
+    // on every Token Saver attempt open/load. Shared pair under a short lock
+    // (codecs are not thread-safe); wire JSON formatting unchanged.
+    private let codecLock = NSLock()
+    private let decoder = JSONDecoder()
+    private let encoder = JSONEncoder()
 
     public init(db: SQLiteDB) { self.db = db }
 
     public func begin(_ attempt: TokenSaverAttemptRecord, now: Date = Date()) throws {
-        let unavailableData = try JSONEncoder().encode(attempt.unavailableFields)
+        let unavailableData: Data = try {
+            codecLock.lock()
+            defer { codecLock.unlock() }
+            return try encoder.encode(attempt.unavailableFields)
+        }()
         let unavailableJSON = String(data: unavailableData, encoding: .utf8) ?? "[]"
         try db.performSync { database in
             let statement = try database.prepare("""
@@ -1462,7 +1472,14 @@ public final class TokenSaverAttemptLedger: @unchecked Sendable {
     }
 
     public func attempt(id: String) throws -> TokenSaverAttemptRecord? {
-        try db.performSync { database in
+        // Read row under the DB lock, then decode unavailableFields outside so we
+        // never hold codecLock while performSync is held (begin takes codec then DB).
+        let row: (
+            id: String, runID: String, provider: String, adapterVersion: String,
+            providerVersion: String, model: String, cacheState: String, language: String,
+            hardwareClass: String, workload: String, taskClass: String, evidenceLevel: String,
+            unavailableJSON: String
+        )? = try db.performSync { database in
             let statement = try database.prepare("""
                 SELECT id, run_id, provider, adapter_version, provider_version, model,
                        cache_state, language, hardware_class, workload, task_class,
@@ -1472,9 +1489,7 @@ public final class TokenSaverAttemptLedger: @unchecked Sendable {
             defer { statement.reset() }
             try statement.bind(1, id)
             guard try statement.step() else { return nil }
-            let unavailableData = Data((statement.columnText(12) ?? "[]").utf8)
-            let unavailableFields = (try? JSONDecoder().decode([String].self, from: unavailableData)) ?? []
-            return TokenSaverAttemptRecord(
+            return (
                 id: statement.columnText(0) ?? "",
                 runID: statement.columnText(1) ?? "",
                 provider: statement.columnText(2) ?? "",
@@ -1487,9 +1502,29 @@ public final class TokenSaverAttemptLedger: @unchecked Sendable {
                 workload: statement.columnText(9) ?? "",
                 taskClass: statement.columnText(10) ?? "",
                 evidenceLevel: statement.columnText(11) ?? "",
-                unavailableFields: unavailableFields
+                unavailableJSON: statement.columnText(12) ?? "[]"
             )
         }
+        guard let row else { return nil }
+        let unavailableData = Data(row.unavailableJSON.utf8)
+        codecLock.lock()
+        let unavailableFields = (try? decoder.decode([String].self, from: unavailableData)) ?? []
+        codecLock.unlock()
+        return TokenSaverAttemptRecord(
+            id: row.id,
+            runID: row.runID,
+            provider: row.provider,
+            adapterVersion: row.adapterVersion,
+            providerVersion: row.providerVersion,
+            model: row.model,
+            cacheState: row.cacheState,
+            language: row.language,
+            hardwareClass: row.hardwareClass,
+            workload: row.workload,
+            taskClass: row.taskClass,
+            evidenceLevel: row.evidenceLevel,
+            unavailableFields: unavailableFields
+        )
     }
 
     public func appendEvent(attemptID: String, kind: String, payloadJSON: String, now: Date = Date()) throws {
