@@ -1523,21 +1523,31 @@ public enum AgentTurnCheckpointWireIdentity {
         return true
     }
 
+    /// SHA-256 lowercase hex of `raw` UTF-8.
+    ///
+    /// PERF: hashes contiguous UTF-8 storage (no per-4KiB `Array`/`Data` chunking)
+    /// and formats hex with a nibble table. Oversized turn ids / error messages on
+    /// checkpoint capture can be multi-KiB–MiB; the prior byte loop + `String(format:)`
+    /// paid a full-body copy and 32 formatter calls per digest.
     public static func sha256(_ raw: String) -> String {
         var hasher = SHA256()
-        var chunk: [UInt8] = []
-        chunk.reserveCapacity(4 * 1_024)
-        for byte in raw.utf8 {
-            chunk.append(byte)
-            if chunk.count == chunk.capacity {
-                hasher.update(data: Data(chunk))
-                chunk.removeAll(keepingCapacity: true)
-            }
+        var copy = raw
+        copy.withUTF8 { buffer in
+            hasher.update(bufferPointer: UnsafeRawBufferPointer(buffer))
         }
-        if !chunk.isEmpty {
-            hasher.update(data: Data(chunk))
+        return hexDigest(hasher.finalize())
+    }
+
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+    private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
         }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 
     /// Exact byte count produced by the repository's default JSONEncoder for a
@@ -1545,18 +1555,23 @@ public enum AgentTurnCheckpointWireIdentity {
     public static func encodedJSONStringByteCount(_ raw: String) -> Int {
         var count = 2 // surrounding quotes
         for scalar in raw.unicodeScalars {
-            switch scalar.value {
-            case 0x08, 0x09, 0x0A, 0x0C, 0x0D:
-                count += 2
-            case 0x00...0x1F:
-                count += 6
-            case 0x22, 0x2F, 0x5C:
-                count += 2
-            default:
-                count += scalar.utf8.count
-            }
+            count += encodedJSONScalarCost(scalar)
         }
         return count
+    }
+
+    /// JSON-string encoded UTF-8 cost of one scalar (content only, no quotes).
+    public static func encodedJSONScalarCost(_ scalar: Unicode.Scalar) -> Int {
+        switch scalar.value {
+        case 0x08, 0x09, 0x0A, 0x0C, 0x0D:
+            return 2
+        case 0x00...0x1F:
+            return 6
+        case 0x22, 0x2F, 0x5C:
+            return 2
+        default:
+            return scalar.utf8.count
+        }
     }
 }
 
@@ -1659,8 +1674,28 @@ public enum AgentTurnCheckpointListWireProjection {
                 truncated: false
             )
         }
-        let totalEncodedBytes =
-            AgentTurnCheckpointWireIdentity.encodedJSONStringByteCount(raw)
+        // Single Character walk: total encoded size + Character-safe preview under
+        // budget. Prior path re-scanned the growing prefix with
+        // `encodedJSONStringByteCount` on every Character (O(preview²)) and
+        // allocated `preview + String(character)` each step — expensive when an
+        // error_message / checkpoint_ref is multi-KiB and only the head is kept.
+        var totalEncodedBytes = 2 // surrounding quotes
+        var previewEncoded = 2
+        var previewEnd = raw.startIndex
+        var index = raw.startIndex
+        while index < raw.endIndex {
+            let next = raw.index(after: index)
+            var charCost = 0
+            for scalar in raw[index].unicodeScalars {
+                charCost += AgentTurnCheckpointWireIdentity.encodedJSONScalarCost(scalar)
+            }
+            totalEncodedBytes += charCost
+            if previewEncoded + charCost <= maximumEncodedBytes {
+                previewEncoded += charCost
+                previewEnd = next
+            }
+            index = next
+        }
         guard totalEncodedBytes > maximumEncodedBytes else {
             return Field(
                 value: raw,
@@ -1669,17 +1704,8 @@ public enum AgentTurnCheckpointListWireProjection {
                 truncated: false
             )
         }
-        var preview = ""
-        for character in raw {
-            let candidate = preview + String(character)
-            guard AgentTurnCheckpointWireIdentity.encodedJSONStringByteCount(candidate)
-                    <= maximumEncodedBytes else {
-                break
-            }
-            preview = candidate
-        }
         return Field(
-            value: preview,
+            value: String(raw[..<previewEnd]),
             totalEncodedBytes: totalEncodedBytes,
             sha256: AgentTurnCheckpointWireIdentity.sha256(raw),
             truncated: true
