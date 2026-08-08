@@ -5591,15 +5591,24 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
+    // PERF: compile once — was recompiled via range(of:options:.regularExpression)
+    // on every attachment upload metadata validate (same contract as
+    // AgentAttachmentStore / AttachmentUploadV2).
+    private static let uploadAttachmentMIMETypeRegex = try! NSRegularExpression(
+        pattern: #"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$"#
+    )
+
     private static func uploadAttachmentMetadata(filename: String, mimeType: String?) throws -> (kind: AgentAttachmentKind, mimeType: String?) {
         let ext = URL(fileURLWithPath: filename).pathExtension.lowercased()
         let imageExtensions = Set(["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "heic", "webp", "svg", "avif"])
         let inferredImage = imageExtensions.contains(ext)
         let normalized = mimeType?.split(separator: ";", maxSplits: 1).first.map(String.init)?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if let normalized,
-           normalized.range(of: #"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$"#, options: .regularExpression) == nil {
-            throw JSONRPCError(code: -32602, message: "Invalid attachment media type.")
+        if let normalized {
+            let full = NSRange(location: 0, length: (normalized as NSString).length)
+            if uploadAttachmentMIMETypeRegex.firstMatch(in: normalized, options: [], range: full) == nil {
+                throw JSONRPCError(code: -32602, message: "Invalid attachment media type.")
+            }
         }
         let declaredImage = normalized?.hasPrefix("image/") == true
         guard normalized == nil || inferredImage == declaredImage else {
