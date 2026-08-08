@@ -160,8 +160,23 @@ public enum TokenSaverTypedCrushers {
         store is MemoryStore
     }
 
+    /// PERF: nibble table instead of per-byte `String(format:)` so store-before-
+    /// loss handle digests avoid 32 formatter calls while keeping the same
+    /// CryptoKit lowercase hex contract for `[[rc:handle]]` recovery.
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+    private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
+    }
+
     public static func handleID(for data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        hexDigest(SHA256.hash(data: data))
     }
 
     /// Store-before-loss with verified byte-exact readback. Returns nil on any failure.
