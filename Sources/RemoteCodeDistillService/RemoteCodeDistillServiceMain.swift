@@ -98,11 +98,19 @@ private final class LiveTokenSaverDistillAdmission: @unchecked Sendable {
         return settingsStore.reload().tokenSaverEnabled && hasActiveSubscription()
     }
 
+    // PERF: admission re-reads DistillCLIState.json on every /v1/distill gate.
+    // JSONDecoder is not thread-safe — share one under a short lock instead of
+    // allocating per probe (lease wire decode unchanged).
+    private static let leaseDecodeLock = NSLock()
+    private static let leaseDecoder = JSONDecoder()
+
     private static func readLease(_ url: URL) -> StateLease? {
         guard let data = try? Data(contentsOf: url, options: [.uncached]) else {
             return nil
         }
-        return try? JSONDecoder().decode(StateLease.self, from: data)
+        leaseDecodeLock.lock()
+        defer { leaseDecodeLock.unlock() }
+        return try? leaseDecoder.decode(StateLease.self, from: data)
     }
 
     private static func makeSettingsStores(
@@ -560,6 +568,18 @@ struct RemoteCodeDistillServiceMain {
         Darwin.exit(exitCode)
     }
 
+    // PERF: MCP stats/compress (and concurrent tool calls) allocated
+    // JSONDecoder/JSONEncoder per request. Share process-wide codecs under a
+    // short lock; sortedKeys on compress bodies keeps recovery operation
+    // digests identical to the prior per-call encoder.
+    private static let mcpCodecLock = NSLock()
+    private static let mcpDecoder = JSONDecoder()
+    private static let mcpSortedEncoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
+
     /// Token Saver MCP server (P3-T5): newline-delimited JSON-RPC 2.0 over stdio.
     /// Exposes retrieve/search/stats plus gated rc_compress through the local sidecar.
     /// Fail-soft: an unavailable service yields an MCP error result, never a crash.
@@ -595,7 +615,9 @@ struct RemoteCodeDistillServiceMain {
                       (response as? HTTPURLResponse)?.statusCode == 200 else {
                     return nil
                 }
-                return try? JSONDecoder().decode(DistillStatsSnapshot.self, from: data)
+                mcpCodecLock.lock()
+                defer { mcpCodecLock.unlock() }
+                return try? mcpDecoder.decode(DistillStatsSnapshot.self, from: data)
             },
             compress: { distillRequest in
                 guard admission?.isAdmitted() == true else { return nil }
@@ -605,9 +627,9 @@ struct RemoteCodeDistillServiceMain {
                 request.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 applyRecoveryHeaders(to: &request, environment: environment)
-                let encoder = JSONEncoder()
-                encoder.outputFormatting = [.sortedKeys]
-                request.httpBody = try? encoder.encode(distillRequest)
+                mcpCodecLock.lock()
+                request.httpBody = try? mcpSortedEncoder.encode(distillRequest)
+                mcpCodecLock.unlock()
                 if let body = request.httpBody {
                     request.setValue(distillRequest.id.uuidString.lowercased(), forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
                     request.setValue(ManagedDistillCLI.recoveryOperationID(kind: "distill", canonicalPayload: body), forHTTPHeaderField: "X-RemoteCode-Operation-ID")
@@ -617,7 +639,9 @@ struct RemoteCodeDistillServiceMain {
                       (response as? HTTPURLResponse)?.statusCode == 200 else {
                     return nil
                 }
-                return try? JSONDecoder().decode(DistillResponse.self, from: data)
+                mcpCodecLock.lock()
+                defer { mcpCodecLock.unlock() }
+                return try? mcpDecoder.decode(DistillResponse.self, from: data)
             },
             scopedRecoveryAvailable: hasCompleteRecoveryScope(environment: environment)
         )
