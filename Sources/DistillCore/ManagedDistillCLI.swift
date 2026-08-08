@@ -28,6 +28,18 @@ public struct ManagedDistillCLI: Sendable {
     /// distill calls; if any chunk fails, the CLI emits the original stdin verbatim.
     public static let stdinCapBytes: Int = 512 * 1_024
 
+    // PERF: PostToolUse fail-open returns `{}` on every admission/malformed/skip
+    // path (many times per Claude tool turn). Share static empty-object bytes.
+    // Fixed retrieve/stats error bodies reuse the same pattern as HTTP rejects.
+    private static let emptyJSONObjectData = Data([0x7b, 0x7d]) // {}
+    private static let emptyJSONOK = RunResult(stdout: emptyJSONObjectData, exitCode: 0)
+    private static let retrieveMissingHandleBody = Data("distill retrieve: missing handle or service\n".utf8)
+    private static let retrieveUnavailableBody = Data("distill retrieve: original unavailable\n".utf8)
+    private static let statsServiceUnavailableBody = Data("distill stats: service unavailable\n".utf8)
+    private static let statsUnavailableBody = Data("distill stats: stats unavailable\n".utf8)
+    private static let dslReservedBody = Data("distill dsl: reserved subcommand is not implemented by this managed CLI\n".utf8)
+    private static let dslNoTranscriptBody = Data("distill dsl learn-thread: no transcript on stdin\n".utf8)
+
     /// Pure seam: returns true when `byteCount` exceeds `cap`. Extracted so tests can
     /// verify cap logic without constructing a full CLI instance or any I/O.
     public static func exceedsStdinCap(byteCount: Int, cap: Int) -> Bool {
@@ -197,10 +209,10 @@ public struct ManagedDistillCLI: Sendable {
     private func dsl(arguments: [String]) -> (Data, Int32) {
         guard arguments.first == "learn-thread",
               arguments.dropFirst().contains("--stdin") else {
-            return (Data("distill dsl: reserved subcommand is not implemented by this managed CLI\n".utf8), 1)
+            return (Self.dslReservedBody, 1)
         }
         guard !stdin.isEmpty else {
-            return (Data("distill dsl learn-thread: no transcript on stdin\n".utf8), 1)
+            return (Self.dslNoTranscriptBody, 1)
         }
         let message = "distill dsl learn-thread: accepted \(stdin.count) bytes\n"
         return (Data(message.utf8), 0)
@@ -220,7 +232,7 @@ public struct ManagedDistillCLI: Sendable {
     /// stdout first (via `runResult`) never wait on the sidecar RTT for bytes they
     /// already hold.
     private func hook(arguments: [String]) async -> RunResult {
-        let emptyOK = RunResult(stdout: Data("{}".utf8), exitCode: 0)
+        let emptyOK = Self.emptyJSONOK
         guard arguments.first == "post-tool-use" else { return emptyOK }
 
         guard let envelope = try? JSONSerialization.jsonObject(with: stdin) as? [String: Any] else {
@@ -652,7 +664,7 @@ public struct ManagedDistillCLI: Sendable {
 
     private func retrieve(handle: String) async -> (Data, Int32) {
         guard !handle.isEmpty, let state, let url = URL(string: state.baseURL + "/v1/retrieve/\(handle)") else {
-            return (Data("distill retrieve: missing handle or service\n".utf8), 1)
+            return (Self.retrieveMissingHandleBody, 1)
         }
         var urlRequest = URLRequest(url: url)
         urlRequest.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
@@ -662,20 +674,20 @@ public struct ManagedDistillCLI: Sendable {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               (obj["found"] as? Bool) == true,
               let original = obj["original"] as? String else {
-            return (Data("distill retrieve: original unavailable\n".utf8), 1)
+            return (Self.retrieveUnavailableBody, 1)
         }
         return (Data(original.utf8), 0)
     }
 
     private func stats() async -> (Data, Int32) {
         guard let state, let url = URL(string: state.baseURL + "/v1/stats") else {
-            return (Data("distill stats: service unavailable\n".utf8), 1)
+            return (Self.statsServiceUnavailableBody, 1)
         }
         var urlRequest = URLRequest(url: url)
         urlRequest.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
         guard let (data, status) = await transport(urlRequest), status == 200,
               let snapshot = try? JSONDecoder().decode(DistillStatsSnapshot.self, from: data) else {
-            return (Data("distill stats: stats unavailable\n".utf8), 1)
+            return (Self.statsUnavailableBody, 1)
         }
         return (Data(Self.formatStats(snapshot).utf8), 0)
     }
