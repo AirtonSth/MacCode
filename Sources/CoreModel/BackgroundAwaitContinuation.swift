@@ -145,6 +145,19 @@ public enum BackgroundAwaitContinuation {
         return backgroundNouns.contains(where: { text.contains($0) })
     }
 
+    // PERF: compile once — strippingAwaitingMarker runs on every rendered
+    // assistant message; range(of:options:.regularExpression) recompiled.
+    private static let awaitingMarkerRegex = try! NSRegularExpression(
+        pattern: NSRegularExpression.escapedPattern(for: awaitingMarker),
+        options: [.caseInsensitive]
+    )
+    private static let trailingSpacesBeforeNewlineRegex = try! NSRegularExpression(
+        pattern: #"[ \t]+\n"#
+    )
+    private static let multiNewlineCollapseRegex = try! NSRegularExpression(
+        pattern: #"\n{3,}"#
+    )
+
     /// Removes host-internal incomplete-turn markers from user-facing text.
     /// Detection keys on the markers, but the transcript must never show them —
     /// mirrors `RetrieveHandleSanitizer`.
@@ -163,11 +176,13 @@ public enum BackgroundAwaitContinuation {
         guard hasAwaiting || hasUncalled else { return text }
         var stripped = text
         if hasAwaiting {
-            let pattern = NSRegularExpression.escapedPattern(for: awaitingMarker)
-            if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
-                let range = NSRange(stripped.startIndex..<stripped.endIndex, in: stripped)
-                stripped = regex.stringByReplacingMatches(in: stripped, range: range, withTemplate: "")
-            }
+            let range = NSRange(stripped.startIndex..<stripped.endIndex, in: stripped)
+            stripped = awaitingMarkerRegex.stringByReplacingMatches(
+                in: stripped,
+                options: [],
+                range: range,
+                withTemplate: ""
+            )
         }
         if hasUncalled {
             stripped = AssistantToolMarkupSanitizer.strippingUncalledToolMarker(stripped)
@@ -175,10 +190,24 @@ public enum BackgroundAwaitContinuation {
             // only when awaiting was absent.
             if !hasAwaiting { return stripped }
         }
-        return stripped
-            .replacingOccurrences(of: #"[ \t]+\n"#, with: "\n", options: .regularExpression)
-            .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return tidyWhitespace(stripped)
+    }
+
+    private static func tidyWhitespace(_ text: String) -> String {
+        var result = text
+        for (regex, template) in [
+            (trailingSpacesBeforeNewlineRegex, "\n"),
+            (multiNewlineCollapseRegex, "\n\n")
+        ] {
+            let range = NSRange(result.startIndex..<result.endIndex, in: result)
+            result = regex.stringByReplacingMatches(
+                in: result,
+                options: [],
+                range: range,
+                withTemplate: template
+            )
+        }
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Whether the host should auto-nudge a just-finished run to resume.
