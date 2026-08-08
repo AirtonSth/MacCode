@@ -302,6 +302,16 @@ public enum ProviderCLIProbe {
         return nil
     }
 
+    // PERF: auth text fallbacks recompiled these patterns via
+    // range(of:options:.regularExpression) on every provider snapshot /
+    // scheduled-task preflight. Compile once; match semantics unchanged.
+    private static let accountLabelPatterns: [NSRegularExpression] = [
+        try! NSRegularExpression(pattern: #"logged in as\s+([^\s<>()]+@[^\s<>()]+)"#, options: [.caseInsensitive]),
+        try! NSRegularExpression(pattern: #"authenticated as\s+([^\s<>()]+@[^\s<>()]+)"#, options: [.caseInsensitive]),
+        try! NSRegularExpression(pattern: #""email"\s*:\s*"([^"]+)""#, options: [.caseInsensitive]),
+    ]
+    private static let emailInMatchRegex = try! NSRegularExpression(pattern: #"[^\s<>()"]+@[^\s<>()"]+"#)
+
     private static func accountLabel(from text: String) -> String? {
         if let data = text.data(using: .utf8),
            let object = try? JSONSerialization.jsonObject(with: data),
@@ -309,16 +319,15 @@ public enum ProviderCLIProbe {
             return label
         }
 
-        let patterns = [
-            #"(?i)logged in as\s+([^\s<>()]+@[^\s<>()]+)"#,
-            #"(?i)authenticated as\s+([^\s<>()]+@[^\s<>()]+)"#,
-            #"(?i)"email"\s*:\s*"([^"]+)""#
-        ]
-        for pattern in patterns {
-            guard let match = text.range(of: pattern, options: .regularExpression) else { continue }
-            let matched = String(text[match])
-            if let email = matched.range(of: #"[^\s<>()"]+@[^\s<>()"]+"#, options: .regularExpression) {
-                return String(matched[email])
+        let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        for regex in accountLabelPatterns {
+            guard let match = regex.firstMatch(in: text, options: [], range: fullRange),
+                  let matchedRange = Range(match.range, in: text) else { continue }
+            let matched = String(text[matchedRange])
+            let emailNSRange = NSRange(matched.startIndex..<matched.endIndex, in: matched)
+            if let emailMatch = emailInMatchRegex.firstMatch(in: matched, options: [], range: emailNSRange),
+               let emailRange = Range(emailMatch.range, in: matched) {
+                return String(matched[emailRange])
             }
         }
         return nil
@@ -349,6 +358,23 @@ public enum ProviderCLIProbe {
         return nil
     }
 
+    // PERF: same compile-once contract as accountLabel for "Logged in using …"
+    // and authMethod JSON text fallbacks on every auth probe.
+    private static let accountAuthMethodPatterns: [NSRegularExpression] = [
+        try! NSRegularExpression(pattern: #"logged in using\s+([A-Za-z0-9_. -]+)"#, options: [.caseInsensitive]),
+        try! NSRegularExpression(pattern: #"authenticated using\s+([A-Za-z0-9_. -]+)"#, options: [.caseInsensitive]),
+        try! NSRegularExpression(pattern: #""authMethod"\s*:\s*"([^"]+)""#, options: [.caseInsensitive]),
+    ]
+    private static let quotedValueAtEndRegex = try! NSRegularExpression(pattern: #"(?<=")[^"]+(?="$)"#)
+    private static let stripLoggedInUsingRegex = try! NSRegularExpression(
+        pattern: #"logged in using"#,
+        options: [.caseInsensitive]
+    )
+    private static let stripAuthenticatedUsingRegex = try! NSRegularExpression(
+        pattern: #"authenticated using"#,
+        options: [.caseInsensitive]
+    )
+
     private static func accountAuthMethod(from text: String) -> String? {
         if let data = text.data(using: .utf8),
            let object = try? JSONSerialization.jsonObject(with: data),
@@ -356,21 +382,24 @@ public enum ProviderCLIProbe {
             return method
         }
 
-        let patterns = [
-            #"(?i)logged in using\s+([A-Za-z0-9_. -]+)"#,
-            #"(?i)authenticated using\s+([A-Za-z0-9_. -]+)"#,
-            #"(?i)"authMethod"\s*:\s*"([^"]+)""#
-        ]
-        for pattern in patterns {
-            guard let match = text.range(of: pattern, options: .regularExpression) else { continue }
-            let matched = String(text[match])
-            if let quoted = matched.range(of: #"(?<=")[^"]+(?="$)"#, options: .regularExpression) {
-                return String(matched[quoted]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        for regex in accountAuthMethodPatterns {
+            guard let match = regex.firstMatch(in: text, options: [], range: fullRange),
+                  let matchedRange = Range(match.range, in: text) else { continue }
+            let matched = String(text[matchedRange])
+            let matchedNSRange = NSRange(matched.startIndex..<matched.endIndex, in: matched)
+            if let quotedMatch = quotedValueAtEndRegex.firstMatch(in: matched, options: [], range: matchedNSRange),
+               let quotedRange = Range(quotedMatch.range, in: matched) {
+                return String(matched[quotedRange]).trimmingCharacters(in: .whitespacesAndNewlines)
             }
-            let cleaned = matched
-                .replacingOccurrences(of: #"(?i)logged in using"#, with: "", options: .regularExpression)
-                .replacingOccurrences(of: #"(?i)authenticated using"#, with: "", options: .regularExpression)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            var cleaned = matched
+            cleaned = stripLoggedInUsingRegex.stringByReplacingMatches(
+                in: cleaned, options: [], range: NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned), withTemplate: ""
+            )
+            cleaned = stripAuthenticatedUsingRegex.stringByReplacingMatches(
+                in: cleaned, options: [], range: NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned), withTemplate: ""
+            )
+            cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
             if !cleaned.isEmpty { return cleaned }
         }
         return nil
