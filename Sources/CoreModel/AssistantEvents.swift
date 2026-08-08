@@ -418,6 +418,11 @@ public struct AssistantProposedPlan: Codable, Sendable, Equatable, Identifiable 
     private static let exportBulletPrefixRegex = try! NSRegularExpression(pattern: #"^[-*]\s*"#)
     private static let exportWhitespaceCollapseRegex = try! NSRegularExpression(pattern: #"\s+"#)
     private static let exportHyphenCollapseRegex = try! NSRegularExpression(pattern: #"-+"#)
+    // PERF: exportFileName also allocated CharacterSet.union / charactersIn on
+    // every card body evaluation for filename sanitization.
+    private static let exportFileNameAllowedScalars = CharacterSet.alphanumerics
+        .union(CharacterSet(charactersIn: "-_ "))
+    private static let exportFileNameEdgeTrimSet = CharacterSet(charactersIn: "-_ ")
 
     private static func replaceAll(
         _ regex: NSRegularExpression,
@@ -450,15 +455,14 @@ public struct AssistantProposedPlan: Codable, Sendable, Equatable, Identifiable 
     }
 
     public static func exportFileName(for markdown: String) -> String {
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_ "))
         let title = exportTitle(for: markdown).unicodeScalars.map { scalar -> Character in
-            allowed.contains(scalar) ? Character(scalar) : "-"
+            exportFileNameAllowedScalars.contains(scalar) ? Character(scalar) : "-"
         }
         var collapsed = String(title)
         collapsed = replaceAll(exportWhitespaceCollapseRegex, in: collapsed, with: "-")
         collapsed = replaceAll(exportHyphenCollapseRegex, in: collapsed, with: "-")
         collapsed = collapsed
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-_ "))
+            .trimmingCharacters(in: exportFileNameEdgeTrimSet)
             .lowercased()
         return "\(collapsed.isEmpty ? "proposed-plan" : String(collapsed.prefix(64))).md"
     }
