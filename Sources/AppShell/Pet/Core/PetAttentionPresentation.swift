@@ -207,18 +207,33 @@ public enum PetActiveThreadCountFormatter {
 public enum PetAttentionRedactor {
     public static let maximumContextCharacters = 80
 
+    // PERF: safeContextLabel runs on pet attention / live-activity paint paths
+    // and recompiled two redaction regexes via replacingOccurrences each call.
+    private static let bearerTokenRegex = try! NSRegularExpression(
+        pattern: #"(?i)\bbearer\s+[^\s,;]+"#
+    )
+    private static let secretAssignmentRegex = try! NSRegularExpression(
+        pattern: #"(?i)\b(password|passwd|(?:(?:access|refresh|id)[_-]?)?token|client[_-]?secret|secret|api[_-]?key|private[_-]?key|authorization|cookie)\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"#
+    )
+
+    private static func replaceAll(
+        _ regex: NSRegularExpression,
+        in text: String,
+        with template: String
+    ) -> String {
+        let range = NSRange(location: 0, length: (text as NSString).length)
+        return regex.stringByReplacingMatches(
+            in: text,
+            options: [],
+            range: range,
+            withTemplate: template
+        )
+    }
+
     public static func safeContextLabel(_ raw: String?) -> String? {
         guard let raw else { return nil }
-        var value = raw.replacingOccurrences(
-            of: #"(?i)\bbearer\s+[^\s,;]+"#,
-            with: "Bearer [redacted]",
-            options: .regularExpression
-        )
-        value = value.replacingOccurrences(
-            of: #"(?i)\b(password|passwd|(?:(?:access|refresh|id)[_-]?)?token|client[_-]?secret|secret|api[_-]?key|private[_-]?key|authorization|cookie)\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"#,
-            with: "$1=[redacted]",
-            options: .regularExpression
-        )
+        var value = replaceAll(bearerTokenRegex, in: raw, with: "Bearer [redacted]")
+        value = replaceAll(secretAssignmentRegex, in: value, with: "$1=[redacted]")
         value = value
             .split(whereSeparator: \Character.isWhitespace)
             .joined(separator: " ")
