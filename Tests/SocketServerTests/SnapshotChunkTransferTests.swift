@@ -106,6 +106,26 @@ final class SnapshotChunkTransferTests: XCTestCase {
         XCTAssertEqual(chunks.dropLast().allSatisfy { $0.count == 64 * 1024 }, true)
     }
 
+    /// WHY: sequential chunk fetch must report O(1) offsets matching the sum of
+    /// prior window sizes; a drift breaks client reassembly ranges.
+    func test_byteOffset_matchesPrefixSumOfUniformWindows() throws {
+        let chunkBytes = 8_192
+        let payload = Data((0..<50_000).map { UInt8($0 % 251) })
+        let chunks = SnapshotChunkCodec.split(payload, chunkBytes: chunkBytes)
+        var expected = 0
+        for (index, chunk) in chunks.enumerated() {
+            let o1 = SnapshotChunkTransferRecord.byteOffset(
+                forChunkIndex: index,
+                chunkBytes: chunkBytes
+            )
+            XCTAssertEqual(o1, expected, "index \(index) offset must match prefix sum")
+            XCTAssertEqual(o1, index * chunkBytes)
+            expected += chunk.count
+        }
+        // End of last chunk lands on totalBytes.
+        XCTAssertEqual(expected, payload.count)
+    }
+
     func test_adaptivePreference_stableProgressIncreasesWithinBounds() {
         // WHY: client next-transfer growth must raise preferred gradually and
         // never escape host negotiate clamps (no unbounded payload growth).

@@ -226,7 +226,10 @@ struct SnapshotChunkTransferRecord: Sendable {
             throw SnapshotChunkTransferFailure.chunkOutOfRange
         }
         let payload = chunks[index]
-        let offset = chunks.prefix(index).reduce(0) { $0 + $1.count }
+        // Split windows are uniform at `chunkBytes` except possibly the last,
+        // so offset is O(1). Avoid O(index) prefix reduce on sequential fetch
+        // of large multi-chunk snapshots (PERF).
+        let offset = Self.byteOffset(forChunkIndex: index, chunkBytes: chunkBytes)
         return SnapshotChunkResponse(
             transferId: transferId,
             chunkIndex: index,
@@ -234,6 +237,11 @@ struct SnapshotChunkTransferRecord: Sendable {
             byteCount: payload.count,
             payloadBase64: payload.base64EncodedString()
         )
+    }
+
+    /// Byte offset of chunk `index` when prior windows are full `chunkBytes` slices.
+    nonisolated static func byteOffset(forChunkIndex index: Int, chunkBytes: Int) -> Int {
+        max(0, index) * max(0, chunkBytes)
     }
 }
 
