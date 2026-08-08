@@ -108,6 +108,27 @@ enum LiveActivitySummary {
 
     // MARK: - Output guard
 
+    // PERF: sanitized runs on every accepted model caption before Lock Screen
+    // publish and recompiled whitespace + dialect-prefix patterns each call.
+    private static let multiWhitespaceRegex = try! NSRegularExpression(pattern: #"\s+"#)
+    private static let compressedDialectPrefixRegex = try! NSRegularExpression(
+        pattern: #"^[SCDRONP]\s"#
+    )
+
+    private static func replaceAll(
+        _ regex: NSRegularExpression,
+        in text: String,
+        with template: String
+    ) -> String {
+        let range = NSRange(location: 0, length: (text as NSString).length)
+        return regex.stringByReplacingMatches(
+            in: text,
+            options: [],
+            range: range,
+            withTemplate: template
+        )
+    }
+
     /// Accepts a model line only when it is actually a usable sentence.
     ///
     /// The sidecar can hand back the verbatim input (its store-before-loss
@@ -125,9 +146,7 @@ enum LiveActivitySummary {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
             .joined(separator: " ")
-        line = line.replacingOccurrences(
-            of: #"\s+"#, with: " ", options: .regularExpression
-        )
+        line = replaceAll(multiWhitespaceRegex, in: line, with: " ")
         guard !line.isEmpty else { return nil }
 
         // Verbatim passthrough means the model never ran (or was bypassed).
@@ -138,7 +157,10 @@ enum LiveActivitySummary {
         for marker in ["sr1_response", "target_language", "user_facing_rules", "<think>", "output:", "dict:"] {
             if lowered.contains(marker) { return nil }
         }
-        if line.range(of: #"^[SCDRONP]\s"#, options: .regularExpression) != nil { return nil }
+        let lineRange = NSRange(location: 0, length: (line as NSString).length)
+        if compressedDialectPrefixRegex.firstMatch(in: line, options: [], range: lineRange) != nil {
+            return nil
+        }
 
         // Strip wrapping quotes the model sometimes adds despite the rules.
         if line.count > 1, line.hasPrefix("\""), line.hasSuffix("\"") {
