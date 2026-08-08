@@ -6321,6 +6321,11 @@ private final class TerminalHistoryFailureLedger: @unchecked Sendable {
     let rootURL: URL
     private let fileManager = FileManager.default
     private let processLock: NSLock
+    // PERF: record/decode of failure anchors and pending-delete tombstones each
+    // allocated JSONDecoder/JSONEncoder. Mutations run under withLedgerLock, so
+    // one pair is safe and avoids per-mutation codec construction.
+    private let decoder = JSONDecoder()
+    private let encoder = JSONEncoder()
     private let descriptorOpenedForTesting: (@Sendable (String, Int32) -> Void)?
 
     init(
@@ -6367,7 +6372,7 @@ private final class TerminalHistoryFailureLedger: @unchecked Sendable {
                     incoming.minimumNextChunkIndex
                 )
             )
-            try atomicWrite(JSONEncoder().encode(anchor), to: url)
+            try atomicWrite(try encoder.encode(anchor), to: url)
         }
     }
 
@@ -6449,7 +6454,7 @@ private final class TerminalHistoryFailureLedger: @unchecked Sendable {
                 disposition: disposition
             )
             try atomicWrite(
-                JSONEncoder().encode(pending),
+                try encoder.encode(pending),
                 to: try pendingDeleteURL(surfaceID: surfaceID, id: pending.id)
             )
             return pending
@@ -6488,7 +6493,7 @@ private final class TerminalHistoryFailureLedger: @unchecked Sendable {
             }
             guard current.phase != .finished else { return }
             try atomicWrite(
-                JSONEncoder().encode(TerminalHistoryPendingDelete(
+                try encoder.encode(TerminalHistoryPendingDelete(
                     id: id,
                     surfaceID: surfaceID,
                     expectedWriterGeneration: current.expectedWriterGeneration,
@@ -6579,7 +6584,7 @@ private final class TerminalHistoryFailureLedger: @unchecked Sendable {
 
     private func decodeAnchor(at url: URL) throws -> TerminalHistoryFailureAnchor {
         let data = try Data(contentsOf: url)
-        guard let anchor = try? JSONDecoder().decode(
+        guard let anchor = try? decoder.decode(
             TerminalHistoryFailureAnchor.self,
             from: data
         ),
@@ -6603,7 +6608,7 @@ private final class TerminalHistoryFailureLedger: @unchecked Sendable {
 
     private func decodePendingDelete(at url: URL) throws -> TerminalHistoryPendingDelete {
         let data = try Data(contentsOf: url)
-        guard let pending = try? JSONDecoder().decode(
+        guard let pending = try? decoder.decode(
             TerminalHistoryPendingDelete.self,
             from: data
         ),
