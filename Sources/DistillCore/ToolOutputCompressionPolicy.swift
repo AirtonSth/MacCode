@@ -55,6 +55,12 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
         "NotebookEdit"
     ]
 
+    /// PERF: pre-normalized membership set so every tool-output decision does an
+    /// O(1) `Set.contains` instead of mapping/normalizing the whole exclude list.
+    private static let normalizedExcludedTools: Set<String> = Set(
+        defaultExcludedTools.map(Self.normalizeToolName)
+    )
+
     public static let defaultAllowlistedTools: Set<String> = [
         "Bash",
         "Grep",
@@ -150,11 +156,13 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
     }
 
     public func isExcluded(_ toolName: String) -> Bool {
-        Self.defaultExcludedTools.map(normalize).contains(normalize(toolName))
+        Self.normalizedExcludedTools.contains(normalize(toolName))
     }
 
     public func meetsSizeThreshold(_ output: String) -> Bool {
-        output.utf8.count > minBytes || lineCount(output) > minLines
+        // Short-circuit on bytes first so multi-MB dumps never scan for lines.
+        if output.utf8.count > minBytes { return true }
+        return lineComponentCountExceeds(output, minLines)
     }
 
     private func contractQuestion(
@@ -185,11 +193,27 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
         }
     }
 
-    private func lineCount(_ output: String) -> Int {
-        output.split(separator: "\n", omittingEmptySubsequences: false).count
+    /// True when `split(separator: "\n", omittingEmptySubsequences: false).count > threshold`.
+    ///
+    /// PERF: UTF-8 LF scan with early exit — no `Array` of `Substring` for medium
+    /// tool dumps that already failed the byte gate. Component count is
+    /// `newlineCount + 1` for this split form.
+    private func lineComponentCountExceeds(_ output: String, _ threshold: Int) -> Bool {
+        // components > threshold ⇔ newlines >= threshold
+        guard threshold > 0 else { return true }
+        var newlines = 0
+        for byte in output.utf8 where byte == 0x0A {
+            newlines += 1
+            if newlines >= threshold { return true }
+        }
+        return false
     }
 
     private func normalize(_ toolName: String) -> String {
+        Self.normalizeToolName(toolName)
+    }
+
+    private static func normalizeToolName(_ toolName: String) -> String {
         toolName
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "-", with: "")
