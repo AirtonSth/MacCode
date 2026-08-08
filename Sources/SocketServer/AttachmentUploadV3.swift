@@ -215,6 +215,15 @@ public final class AttachmentUploadV3Store: @unchecked Sendable {
     public let plaintextStore: AttachmentUploadV2Store
     private let fileManager: FileManager
     private var didReconcileAbandonedManifestTemps = false
+    // PERF: protected manifest load/persist allocated JSONDecoder/JSONEncoder
+    // per call. Public API serializes per-root via withLock, so one sorted-keys
+    // pair is safe and avoids per-mutation codec construction.
+    private let decoder = JSONDecoder()
+    private let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
 
     public init(
         root: URL,
@@ -868,7 +877,7 @@ public final class AttachmentUploadV3Store: @unchecked Sendable {
                     "protected manifest changed or exceeded its bound"
                 )
             }
-            let manifest = try JSONDecoder().decode(Manifest.self, from: data)
+            let manifest = try decoder.decode(Manifest.self, from: data)
             guard manifest.schemaVersion == 1,
                   manifest.uploadId == uploadId else {
                 throw AttachmentUploadV3Error.storageFailure(
@@ -900,8 +909,6 @@ public final class AttachmentUploadV3Store: @unchecked Sendable {
     private func persistManifest(_ manifest: Manifest) throws {
         let data: Data
         do {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
             data = try encoder.encode(manifest)
         } catch {
             throw AttachmentUploadV3Error.storageFailure(
