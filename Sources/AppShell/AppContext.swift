@@ -157,9 +157,18 @@ public struct TokenSaverGovernanceSnapshot: Sendable, Equatable, Codable {
         case governedWrite = "governed_write"
     }
 
+    // PERF: every Token Saver savings row encodes this snapshot. JSONEncoder is
+    // not thread-safe — share one process-wide encoder under a short lock so
+    // concurrent compress/savings paths avoid per-call codec construction
+    // (default formatting unchanged for governance JSON columns).
+    private static let encodeLock = NSLock()
+    private static let encoder = JSONEncoder()
+
     public func jsonString() -> String {
-        let encoder = JSONEncoder()
-        guard let data = try? encoder.encode(self),
+        Self.encodeLock.lock()
+        let data = try? Self.encoder.encode(self)
+        Self.encodeLock.unlock()
+        guard let data,
               let text = String(data: data, encoding: .utf8) else {
             return "{}"
         }
