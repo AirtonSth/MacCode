@@ -74,4 +74,34 @@ final class GhosttyIMEPreeditTests: XCTestCase {
                        "marked range length must match NSString (UTF-16) length, not Character count")
         XCTAssertEqual(r.length, 2, "a single emoji is 2 UTF-16 code units")
     }
+
+    // MARK: UTF-8 feed (paste / typed / preedit)
+
+    /// WHY: empty paste/preedit must not call into Ghostty with a non-zero length
+    /// (would send garbage). withUTF8Bytes is a pure no-op for empty input.
+    func test_withUTF8Bytes_emptyIsNoOp() {
+        var called = false
+        GhosttyTerminalView.withUTF8Bytes("") { _, _ in called = true }
+        XCTAssertFalse(called, "empty text must not invoke the body")
+    }
+
+    /// WHY: length must be true UTF-8 byte count (not Character count, not strlen)
+    /// so multi-byte glyphs and embedded NULs survive paste into the surface.
+    func test_withUTF8Bytes_reportsTrueUTF8ByteCountIncludingNUL() {
+        let multi = "café" // é is 2 UTF-8 bytes → total 5
+        var multiCount = 0
+        GhosttyTerminalView.withUTF8Bytes(multi) { _, count in multiCount = count }
+        XCTAssertEqual(multiCount, multi.utf8.count)
+        XCTAssertEqual(multiCount, 5)
+
+        // Embedded NUL must not truncate the feed (prior Array path contract).
+        let withNul = "ab\0cd"
+        var nulBytes: [UInt8] = []
+        GhosttyTerminalView.withUTF8Bytes(withNul) { ptr, count in
+            nulBytes = (0..<count).map { UInt8(bitPattern: ptr[$0]) }
+        }
+        XCTAssertEqual(nulBytes, Array(withNul.utf8))
+        XCTAssertEqual(nulBytes.count, 5)
+        XCTAssertTrue(nulBytes.contains(0), "embedded NUL must be present in the fed buffer")
+    }
 }

@@ -2418,17 +2418,31 @@ final class GhosttyTerminalView: NSView {
         return surfaceSlot.liveSurface()
     }
 
+    /// Feed UTF-8 bytes to Ghostty without an intermediate `[UInt8]` copy.
+    ///
+    /// WHY: large pastes (logs, JSON dumps) used to allocate `Array(text.utf8)`
+    /// on the main thread just to get a contiguous pointer. `withUTF8` provides
+    /// a contiguous buffer for the duration of the closure; Ghostty copies the
+    /// bytes before returning. Length is the true UTF-8 byte count (not strlen),
+    /// so embedded NULs are preserved (same contract as the prior Array path).
+    nonisolated static func withUTF8Bytes(
+        _ text: String,
+        _ body: (UnsafePointer<CChar>, Int) -> Void
+    ) {
+        guard !text.isEmpty else { return }
+        var copy = text
+        copy.withUTF8 { buffer in
+            guard !buffer.isEmpty, let base = buffer.baseAddress else { return }
+            base.withMemoryRebound(to: CChar.self, capacity: buffer.count) { ptr in
+                body(ptr, buffer.count)
+            }
+        }
+    }
+
     /// Paste / multi-byte clipboard path. Ghostty may apply bracketed paste.
     private func sendText(_ text: String, to surface: ghostty_surface_t) {
-        // Use the true UTF-8 byte length, not strlen — strlen stops at the first
-        // embedded NUL, truncating pasted/bracketed content that contains \0.
-        let bytes = Array(text.utf8)
-        guard !bytes.isEmpty else { return }
-        bytes.withUnsafeBufferPointer { buf in
-            guard let base = buf.baseAddress else { return }
-            base.withMemoryRebound(to: CChar.self, capacity: buf.count) { ptr in
-                ghostty_surface_text(surface, ptr, UInt(buf.count))
-            }
+        Self.withUTF8Bytes(text) { ptr, count in
+            ghostty_surface_text(surface, ptr, UInt(count))
         }
     }
 
@@ -2436,13 +2450,8 @@ final class GhosttyTerminalView: NSView {
     /// Uses the embedder typed-input entry so shells and TUIs treat it as
     /// keystrokes rather than a paste payload.
     private func sendTypedInput(_ text: String, to surface: ghostty_surface_t) {
-        let bytes = Array(text.utf8)
-        guard !bytes.isEmpty else { return }
-        bytes.withUnsafeBufferPointer { buf in
-            guard let base = buf.baseAddress else { return }
-            base.withMemoryRebound(to: CChar.self, capacity: buf.count) { ptr in
-                ghostty_surface_text_input(surface, ptr, UInt(buf.count))
-            }
+        Self.withUTF8Bytes(text) { ptr, count in
+            ghostty_surface_text_input(surface, ptr, UInt(count))
         }
     }
 
@@ -2625,16 +2634,12 @@ extension GhosttyTerminalView: NSTextInputClient {
     private func setPreedit(_ text: String) {
         markedText = text
         guard let surface = surfaceForInput() else { return }
-        let bytes = Array(text.utf8)
-        if bytes.isEmpty {
+        if text.isEmpty {
             ghostty_surface_preedit(surface, nil, 0)
             return
         }
-        bytes.withUnsafeBufferPointer { buf in
-            guard let base = buf.baseAddress else { return }
-            base.withMemoryRebound(to: CChar.self, capacity: buf.count) { ptr in
-                ghostty_surface_preedit(surface, ptr, UInt(buf.count))
-            }
+        Self.withUTF8Bytes(text) { ptr, count in
+            ghostty_surface_preedit(surface, ptr, UInt(count))
         }
     }
 
