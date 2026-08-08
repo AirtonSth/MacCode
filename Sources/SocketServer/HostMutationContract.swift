@@ -514,7 +514,22 @@ public enum HostMutationContract {
         let encoded = try encoder.encode(JSONValue.object(businessParams(params)))
         var input = Data("rc-command-v1\u{0}\(method)\u{0}".utf8)
         input.append(encoded)
-        return SHA256.hash(data: input).map { String(format: "%02x", $0) }.joined()
+        return hexDigest(SHA256.hash(data: input))
+    }
+
+    /// PERF: nibble table instead of per-byte `String(format:)` so every host
+    /// mutation `params_hash` avoids 32 formatter calls while keeping the same
+    /// CryptoKit lowercase hex contract used for receipt idempotency.
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+    private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 }
 
