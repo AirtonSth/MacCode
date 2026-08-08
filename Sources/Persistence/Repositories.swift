@@ -7696,10 +7696,21 @@ extension TerminalOutputRepository: @unchecked Sendable {}
 
 public final class SessionSnapshotRepository {
     let db: SQLiteDB
+    // PERF: save/latest allocated JSONEncoder/JSONDecoder per call (and latest
+    // constructed a decoder per fallback blob). Shared pair under a short lock
+    // so debounced autosave and startup restore avoid per-call codec construction.
+    private let codecLock = NSLock()
+    private let decoder = JSONDecoder()
+    private let encoder = JSONEncoder()
+
     public init(db: SQLiteDB) { self.db = db }
 
     public func save(_ snap: SessionSnapshot) throws {
-        let data = try JSONEncoder().encode(snap)
+        let data: Data = try {
+            codecLock.lock()
+            defer { codecLock.unlock() }
+            return try encoder.encode(snap)
+        }()
         let json = String(data: data, encoding: .utf8) ?? "{}"
         let st = try db.prepare("INSERT INTO session_snapshots(version, payload_json, created_at) VALUES(?, ?, ?);")
         try st.bind(1, Int64(snap.version))
@@ -7736,8 +7747,11 @@ public final class SessionSnapshotRepository {
             guard let json = st.columnText(0), let data = json.data(using: .utf8) else { continue }
             blobs.append(data)
         }
-        guard let found = SessionSnapshotRepository.firstDecodable(blobs, decode: { data in
-            try? JSONDecoder().decode(SessionSnapshot.self, from: data)
+        guard let found = SessionSnapshotRepository.firstDecodable(blobs, decode: { [self] data in
+            codecLock.lock()
+            let snap = try? decoder.decode(SessionSnapshot.self, from: data)
+            codecLock.unlock()
+            return snap
         }) else {
             return nil
         }
