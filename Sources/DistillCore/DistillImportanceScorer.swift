@@ -11,6 +11,22 @@ public enum DistillImportanceScorer {
         public let droppedLines: Int
     }
 
+    // PERF: compile once. `compact` scores every line of multi-KB tool dumps and
+    // previously recompiled 2–4 patterns per line via `String.range(of:options:
+    // .regularExpression)`. Same patterns as before; match via cached NSRegularExpression.
+    private static let fileLineRegex = try! NSRegularExpression(
+        pattern: #"[\w./~-]+\.[A-Za-z0-9]+:\d+"#
+    )
+    private static let pathRegex = try! NSRegularExpression(
+        pattern: #"(^|\s)(/|\./|~/)[\w./-]+"#
+    )
+    private static let pythonFrameRegex = try! NSRegularExpression(
+        pattern: #"File "[^"]+", line \d+"#
+    )
+    private static let jsFrameRegex = try! NSRegularExpression(
+        pattern: #"^\s*at .+\(.+:\d+(?::\d+)?\)"#
+    )
+
     /// Keep at most `maxKeep` of the highest-scoring lines (original order preserved),
     /// always keeping the last `keepLast`. Returns the original unchanged when it is
     /// already within budget (never inflate).
@@ -58,8 +74,8 @@ public enum DistillImportanceScorer {
         var s = 0
         if isFloorLine(line) { s += 10 }
         if lower.contains("warn") { s += 4 }
-        if line.range(of: #"[\w./~-]+\.[A-Za-z0-9]+:\d+"#, options: .regularExpression) != nil { s += 8 } // file:line
-        if line.range(of: #"(^|\s)(/|\./|~/)[\w./-]+"#, options: .regularExpression) != nil { s += 3 }     // a path
+        if matches(fileLineRegex, in: line) { s += 8 } // file:line
+        if matches(pathRegex, in: line) { s += 3 }     // a path
         if index < 3 { s += 2 } // a little weight to the head (command echo / first lines)
         return s
     }
@@ -75,9 +91,14 @@ public enum DistillImportanceScorer {
             return true
         }
         // file.ext:line  |  Python: File "...", line N  |  JS: at ... (file:line)
-        if line.range(of: #"[\w./~-]+\.[A-Za-z0-9]+:\d+"#, options: .regularExpression) != nil { return true }
-        if line.range(of: #"File "[^"]+", line \d+"#, options: .regularExpression) != nil { return true }
-        if line.range(of: #"^\s*at .+\(.+:\d+(?::\d+)?\)"#, options: .regularExpression) != nil { return true }
+        if matches(fileLineRegex, in: line) { return true }
+        if matches(pythonFrameRegex, in: line) { return true }
+        if matches(jsFrameRegex, in: line) { return true }
         return false
+    }
+
+    private static func matches(_ regex: NSRegularExpression, in line: String) -> Bool {
+        let range = NSRange(line.startIndex..<line.endIndex, in: line)
+        return regex.firstMatch(in: line, options: [], range: range) != nil
     }
 }
