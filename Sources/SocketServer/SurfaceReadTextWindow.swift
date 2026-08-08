@@ -42,38 +42,57 @@ public enum SurfaceReadTextWindow: Sendable {
     ///
     /// Returns the input unchanged when `maxBytes` is nil, non-positive, or already
     /// large enough to hold the whole transcript.
+    ///
+    /// PERF: O(1) UTF-8 jump to `total - maxBytes`, then a short boundary walk and
+    /// optional newline scan on the admitted tail only. The prior Character walk
+    /// paid O(window) grapheme steps and a temporary `String` per step on every
+    /// `surface.read_text` — the iOS terminal mirror's hottest read.
     public static func tail(of text: String, maxBytes: Int?) -> Window {
         guard let maxBytes, maxBytes > 0 else {
             return Window(text: text, truncatedHead: false)
         }
-        let utf8 = text.utf8
-        guard utf8.count > maxBytes else {
+        // O(1) on native Swift strings: under-budget never pays a walk.
+        guard text.utf8.count > maxBytes else {
             return Window(text: text, truncatedHead: false)
         }
 
-        // Walk back from the end by scalar so the cut never splits a UTF-8
-        // sequence or a grapheme's leading scalar.
-        var startIndex = text.endIndex
-        var budget = maxBytes
-        while startIndex > text.startIndex {
-            let previous = text.index(before: startIndex)
-            let cost = String(text[previous]).utf8.count
-            if cost > budget { break }
-            budget -= cost
-            startIndex = previous
-        }
-
-        var windowed = text[startIndex...]
-        // Prefer a line boundary inside the window so the first retained line is
-        // whole. Only do this when a newline exists and dropping to it still
-        // leaves content — otherwise keep the raw byte window.
-        if let newline = windowed.firstIndex(of: "\n") {
-            let afterNewline = windowed.index(after: newline)
-            if afterNewline < windowed.endIndex {
-                windowed = windowed[afterNewline...]
+        var copy = text
+        var windowed = ""
+        copy.withUTF8 { buffer in
+            let total = buffer.count
+            // Longest suffix ≤ maxBytes that starts on a scalar boundary.
+            // Mid-scalar candidates advance forward so the window stays under budget
+            // (same contract as walking whole Characters from the end).
+            var start = total - maxBytes
+            while start < total && isUTF8Continuation(buffer[start]) {
+                start += 1
             }
+            // Prefer a line boundary inside the window so the first retained line
+            // is whole. Only when a newline exists and dropping to it still leaves
+            // content — otherwise keep the raw byte window (live partial lines).
+            if start < total {
+                var lineStart = start
+                var i = start
+                while i < total {
+                    if buffer[i] == UInt8(ascii: "\n") {
+                        let after = i + 1
+                        if after < total {
+                            lineStart = after
+                        }
+                        break
+                    }
+                    i += 1
+                }
+                start = lineStart
+            }
+            windowed = String(decoding: buffer[start..<total], as: UTF8.self)
         }
-        return Window(text: String(windowed), truncatedHead: true)
+        return Window(text: windowed, truncatedHead: true)
+    }
+
+    /// UTF-8 continuation byte (10xxxxxx) — not a valid scalar start.
+    private static func isUTF8Continuation(_ byte: UInt8) -> Bool {
+        (byte & 0xC0) == 0x80
     }
 
     /// Positive byte budget from request params, or nil when unbounded.
