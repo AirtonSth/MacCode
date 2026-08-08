@@ -7928,6 +7928,10 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         pattern: #"\s*\|\s*distill\b[\s\S]*$"#
     )
     private static let usersHomePathRegex = try! NSRegularExpression(pattern: #"/Users/[^/\s]+/"#)
+    // PERF: tool L1 paint trims trailing colon/whitespace on every streaming row.
+    // CharacterSet.union allocates; share one set for the display-label path.
+    private static let toolLabelTrailingTrimSet = CharacterSet.whitespacesAndNewlines
+        .union(CharacterSet(charactersIn: ":"))
 
     private static func replacingMatches(
         _ regex: NSRegularExpression,
@@ -7962,7 +7966,7 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         label = replacingMatches(backgroundPrefixRegex, in: label, with: "")
         // "Get task output: call-<uuid>" / trailing call ids
         label = replacingMatches(trailingCallIdRegex, in: label, with: "")
-        label = label.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ":")))
+        label = label.trimmingCharacters(in: toolLabelTrailingTrimSet)
         if looksLikeShellCommand(label) {
             return shellToolFamilyName(for: item)
         }
