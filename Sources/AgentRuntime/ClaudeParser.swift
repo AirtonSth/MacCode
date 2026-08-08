@@ -1211,12 +1211,16 @@ public final class ClaudeParser {
         return [.turnCompleted(turnId: tid, finalMessage: final)]
     }
 
+    // PERF: progressValue trims string percent payloads on streaming item
+    // events; share one CharacterSet instead of allocating per string parse.
+    private static let progressPercentTrimSet = CharacterSet(charactersIn: "% ")
+
     private static func progressValue(_ obj: [String: Any]) -> Double? {
         for key in ["progress", "percentage", "percent"] {
             if let value = obj[key] as? Double { return AssistantTimelineState.normalizedProgress(value) }
             if let value = obj[key] as? Int { return AssistantTimelineState.normalizedProgress(Double(value)) }
             if let value = obj[key] as? String,
-               let parsed = Double(value.trimmingCharacters(in: CharacterSet(charactersIn: "% "))) {
+               let parsed = Double(value.trimmingCharacters(in: progressPercentTrimSet)) {
                 return AssistantTimelineState.normalizedProgress(parsed)
             }
         }
