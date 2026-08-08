@@ -111,8 +111,9 @@ public struct EncoderFirstRuntime: DistillRuntime {
             maxOutputCharacters: request.maxOutputCharacters
         )
         // Accept only a real reduction; otherwise let the wrapped runtime try.
+        // PERF: never-inflate via O(1) utf8.count (not Character.count grapheme walk).
         guard !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              output.count < source.count else {
+              output.utf8.count < source.utf8.count else {
             return nil
         }
         return output

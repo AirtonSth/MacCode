@@ -168,7 +168,8 @@ public enum TokenSaverWaveALossless {
         }
         guard didCollapse else { return nil }
         let text = out.joined(separator: "\n")
-        return text.count < input.count ? text : nil
+        // PERF: never-inflate via O(1) utf8.count (not Character.count grapheme walk).
+        return text.utf8.count < input.utf8.count ? text : nil
     }
 
     public static func expandStorelessLog(_ input: String) -> String {

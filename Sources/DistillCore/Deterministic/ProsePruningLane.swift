@@ -8,8 +8,9 @@ public enum ProsePruningLane {
         question: String? = nil,
         ranker: QueryAwareChunkRanker = QueryAwareChunkRanker()
     ) -> String? {
+        // PERF: size floor via O(1) utf8.count (not Character.count grapheme walk).
         guard let handle, !handle.isEmpty,
-              input.count >= 2_000,
+              input.utf8.count >= 2_000,
               !rejectsAsCodeOrStructured(input) else {
             return nil
         }
@@ -60,7 +61,8 @@ public enum ProsePruningLane {
         }
 
         let output = out.joined(separator: "\n")
-        guard output.count < input.count,
+        // PERF: never-inflate via O(1) utf8.count (not Character.count grapheme walk).
+        guard output.utf8.count < input.utf8.count,
               LiteralPreservation.guarded(original: input, compressed: output).droppedLiteral == nil,
               FaithfulnessGate.validate(original: input, compressed: output).accepted else {
             return nil

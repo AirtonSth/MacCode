@@ -44,7 +44,8 @@ public enum StackTraceCrusher {
 
         guard didElide else { return nil }
         let output = out.joined(separator: "\n")
-        return output.count < input.count ? output : nil
+        // PERF: never-inflate via O(1) utf8.count (not Character.count grapheme walk).
+        return output.utf8.count < input.utf8.count ? output : nil
     }
 
     private static func isStackFrame(_ line: String) -> Bool {

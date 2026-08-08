@@ -23,7 +23,8 @@ public enum TestReportCrusher {
         out.append(summary.line)
 
         let output = out.joined(separator: "\n")
-        return output.count < input.count ? output : nil
+        // PERF: never-inflate via O(1) utf8.count (not Character.count grapheme walk).
+        return output.utf8.count < input.utf8.count ? output : nil
     }
 
     private static func pytestSummary(in lines: [String]) -> (line: String, failed: Int, passed: Int)? {

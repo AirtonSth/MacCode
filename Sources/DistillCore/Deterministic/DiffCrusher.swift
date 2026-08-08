@@ -44,7 +44,8 @@ public enum DiffCrusher {
         }
         guard didCompact else { return nil }
         let text = out.joined(separator: "\n")
-        return text.count < input.count ? text : nil
+        // PERF: never-inflate via O(1) utf8.count (not Character.count grapheme walk).
+        return text.utf8.count < input.utf8.count ? text : nil
     }
 
     /// A context line is unchanged content: blank, or starting with a single space

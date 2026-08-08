@@ -37,7 +37,9 @@ public enum LogCollapser {
         }
         guard didCollapse else { return nil }
         let text = out.joined(separator: "\n")
-        return text.count < input.count ? text : nil
+        // PERF: never-inflate used Character.count (O(n) grapheme walk) on multi-KB
+        // log dumps. utf8.count is O(1); ASCII-heavy logs match Character length.
+        return text.utf8.count < input.utf8.count ? text : nil
     }
 
     /// Inverse of `collapse`. A marker line `⟦×N⟧` means the immediately preceding

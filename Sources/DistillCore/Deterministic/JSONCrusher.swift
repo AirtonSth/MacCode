@@ -47,7 +47,8 @@ public enum JSONCrusher {
                 options: [.sortedKeys, .withoutEscapingSlashes]
               ),
               let text = String(data: out, encoding: .utf8),
-              text.count < input.count else {
+              // PERF: never-inflate via O(1) utf8.count (not Character.count).
+              text.utf8.count < input.utf8.count else {
             return nil
         }
         return text
@@ -97,11 +98,12 @@ public enum JSONCrusher {
             "columns": columns,
             "rows": csvRows.joined(separator: "\n")
         ]
-        guard let output = serialize(envelope),
-              output.count < input.count else {
-            return nil
-        }
-        let savings = 1.0 - (Double(output.count) / Double(input.count))
+        guard let output = serialize(envelope) else { return nil }
+        // PERF: size/savings via O(1) utf8.count (not Character.count grapheme walk).
+        let inputBytes = input.utf8.count
+        let outputBytes = output.utf8.count
+        guard outputBytes < inputBytes else { return nil }
+        let savings = 1.0 - (Double(outputBytes) / Double(inputBytes))
         return savings >= minSavingsRatio ? output : nil
     }
 
@@ -211,7 +213,8 @@ public enum JSONCrusher {
             output.append(dropSentinel(handle: handle, start: cursor, count: rows.count - cursor))
         }
 
-        guard let text = serialize(output), text.count < input.count else { return nil }
+        // PERF: never-inflate via O(1) utf8.count (not Character.count grapheme walk).
+        guard let text = serialize(output), text.utf8.count < input.utf8.count else { return nil }
         return text
     }
 

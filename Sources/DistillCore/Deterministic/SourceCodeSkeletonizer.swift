@@ -63,8 +63,11 @@ public enum SourceCodeSkeletonizer {
 
         guard didElide else { return nil }
         let text = output.joined(separator: "\n")
-        guard text.count < input.count else { return nil }
-        let savings = 1.0 - (Double(text.count) / Double(input.count))
+        // PERF: size/savings via O(1) utf8.count (not Character.count grapheme walk).
+        let inputBytes = input.utf8.count
+        let textBytes = text.utf8.count
+        guard textBytes < inputBytes else { return nil }
+        let savings = 1.0 - (Double(textBytes) / Double(inputBytes))
         return savings >= minSavingsRatio ? text : nil
     }
 
