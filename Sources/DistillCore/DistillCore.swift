@@ -730,7 +730,12 @@ private enum SR1LineParser {
     // Single source of truth: see CoreModel.DistillSemanticPrefixes for why this
     // must not be re-typed per module.
     private static let semanticPrefixes = DistillSemanticPrefixes.set
-    private static let variableKeyPattern = #"#[A-Za-z][0-9]+"#
+    // PERF: cleanedVariableValue recompiled these via range(of:options:
+    // .regularExpression) on every SR1 variable expansion / humanize pass.
+    private static let variableKeyRegex = try! NSRegularExpression(pattern: #"#[A-Za-z][0-9]+"#)
+    private static let aliasDeclarationRegex = try! NSRegularExpression(
+        pattern: DistillSemanticPrefixes.aliasDeclarationPattern
+    )
 
     static func parseSemanticLine(_ line: String) -> (prefix: Character, content: String)? {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -879,7 +884,7 @@ private enum SR1LineParser {
             .trimmingCharacters(in: CharacterSet(charactersIn: ".,;"))
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if value.localizedCaseInsensitiveContains("dict:") ||
-            value.range(of: DistillSemanticPrefixes.aliasDeclarationPattern, options: .regularExpression) != nil {
+            hasRegexMatch(aliasDeclarationRegex, in: value) {
             return nil
         }
         let segments = parseSemanticSegments(value)
@@ -889,10 +894,15 @@ private enum SR1LineParser {
                 .trimmingCharacters(in: CharacterSet(charactersIn: ".,;"))
         }
         guard !value.isEmpty,
-              value.range(of: variableKeyPattern, options: .regularExpression) == nil else {
+              !hasRegexMatch(variableKeyRegex, in: value) else {
             return nil
         }
         return value
+    }
+
+    private static func hasRegexMatch(_ regex: NSRegularExpression, in text: String) -> Bool {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.firstMatch(in: text, options: [], range: range) != nil
     }
 
     private static func replacingWholeVariableKey(_ key: String, with value: String, in text: String) -> String {
