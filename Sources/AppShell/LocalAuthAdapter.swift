@@ -34,6 +34,11 @@ public final class LocalAuthAdapter: DirectAuthProvider {
     let repo: DeviceTrustRepository
     private let privateAccountStore: PrivateAccountSessionStore?
     private let privateAccountAPI: PrivateAccountAPI
+    // PERF: listDevices formats created_at / last_seen_at for every device.
+    // ISO8601DateFormatter construction is expensive; share one under a short
+    // lock (formatter is not thread-safe; HTTP can list concurrently).
+    private let iso8601Lock = NSLock()
+    private let iso8601Formatter = ISO8601DateFormatter()
 
     public init(repo: DeviceTrustRepository,
                 privateAccountStore: PrivateAccountSessionStore? = nil,
@@ -285,16 +290,18 @@ public final class LocalAuthAdapter: DirectAuthProvider {
 
     public func listDevices() -> [[String: Any]] {
         let list = (try? repo.list()) ?? []
+        iso8601Lock.lock()
+        defer { iso8601Lock.unlock() }
         return list.map { d in
             var dict: [String: Any] = [
                 "id": d.id,
                 "display_name": d.displayName,
-                "created_at": ISO8601DateFormatter().string(from: d.createdAt),
+                "created_at": iso8601Formatter.string(from: d.createdAt),
                 "capabilities": d.capabilities,
                 "revoked": d.revokedAt != nil,
                 "always_allow_pairing": d.alwaysAllowPairing
             ]
-            if let ls = d.lastSeenAt { dict["last_seen_at"] = ISO8601DateFormatter().string(from: ls) }
+            if let ls = d.lastSeenAt { dict["last_seen_at"] = iso8601Formatter.string(from: ls) }
             if let clientDeviceID = d.clientDeviceID { dict["client_device_id"] = clientDeviceID }
             return dict
         }
