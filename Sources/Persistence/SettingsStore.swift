@@ -340,6 +340,12 @@ public final class AgentNewThreadDefaultsStore: @unchecked Sendable {
 
     private let defaults: UserDefaults
     private let key = "agent.newThreadDefaults.v1"
+    // PERF: load/save allocated JSONDecoder/JSONEncoder per call. Shared
+    // process-wide instance; serialize under a short lock (codecs are not
+    // thread-safe).
+    private let codecLock = NSLock()
+    private let decoder = JSONDecoder()
+    private let encoder = JSONEncoder()
 
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -347,11 +353,17 @@ public final class AgentNewThreadDefaultsStore: @unchecked Sendable {
 
     public func load() -> AgentNewThreadDefaults? {
         guard let data = defaults.data(forKey: key) else { return nil }
-        return try? JSONDecoder().decode(AgentNewThreadDefaults.self, from: data)
+        codecLock.lock()
+        let value = try? decoder.decode(AgentNewThreadDefaults.self, from: data)
+        codecLock.unlock()
+        return value
     }
 
     public func save(_ value: AgentNewThreadDefaults) {
-        guard let data = try? JSONEncoder().encode(value) else { return }
+        codecLock.lock()
+        let data = try? encoder.encode(value)
+        codecLock.unlock()
+        guard let data else { return }
         defaults.set(data, forKey: key)
     }
 }
@@ -360,6 +372,11 @@ public final class AgentCustomModelStore {
     private let repo: any SettingsWriteRepository
     private let keyPrefix = "agent.custom_models."
     public var onWriteError: ((Error) -> Void)?
+    // PERF: list/save allocated JSONDecoder/JSONEncoder per call. Concurrent
+    // settings UI / agent surfaces share stores — serialize under a short lock.
+    private let codecLock = NSLock()
+    private let decoder = JSONDecoder()
+    private let encoder = JSONEncoder()
 
     public init(repo: SettingsRepository) {
         self.repo = repo
@@ -375,8 +392,11 @@ public final class AgentCustomModelStore {
 
     public func list(provider: AgentProvider) -> [String] {
         guard let raw = try? repo.get(keyPrefix + provider.rawValue),
-              let data = raw.data(using: .utf8),
-              let values = try? JSONDecoder().decode([String].self, from: data) else { return [] }
+              let data = raw.data(using: .utf8) else { return [] }
+        codecLock.lock()
+        let values = try? decoder.decode([String].self, from: data)
+        codecLock.unlock()
+        guard let values else { return [] }
         return normalized(values)
     }
 
@@ -410,7 +430,10 @@ public final class AgentCustomModelStore {
     }
 
     private func save(_ models: [String], provider: AgentProvider) {
-        guard let data = try? JSONEncoder().encode(normalized(models)),
+        codecLock.lock()
+        let data = try? encoder.encode(normalized(models))
+        codecLock.unlock()
+        guard let data,
               let raw = String(data: data, encoding: .utf8) else { return }
         do {
             try repo.set(keyPrefix + provider.rawValue, raw)
