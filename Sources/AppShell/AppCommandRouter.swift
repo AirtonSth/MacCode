@@ -311,6 +311,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     // PERF: jsonValue converts attachments/model selection/surface payloads on
     // MainActor event publish paths — avoid allocating JSONEncoder per call.
     private let jsonValueEncoder = JSONEncoder()
+    // PERF: every host mutation records/commits command receipts. Commit/finalize
+    // require sortedKeys so digests stay stable; share one MainActor encoder each
+    // instead of allocating per mutation.
+    private let commandReceiptSortedEncoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
     private var providerProbeCache: [ProviderProbeCacheKey: ProviderProbeCapabilities] = [:]
     private var providerUpdateLocks = Set<ProviderProbeCacheKey>()
     private let providerProbeCacheTTL: TimeInterval = 30
@@ -4258,7 +4266,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func recordCommandReceipt(method: String, clientRequestId: String, result: JSONValue) {
         guard let ctx = context,
-              let data = try? JSONEncoder().encode(result),
+              let data = try? jsonValueEncoder.encode(result),
               let json = String(data: data, encoding: .utf8) else { return }
         // Fire-and-forget durable write: Dispatcher already mirrors into volatile
         // cache before this call, so the RPC response path does not wait on SQLite.
@@ -4297,9 +4305,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         result: JSONValue
     ) throws {
         guard let context else { throw LayoutError.workspaceNotFound }
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        let data = try encoder.encode(result)
+        let data = try commandReceiptSortedEncoder.encode(result)
         guard let json = String(data: data, encoding: .utf8) else {
             throw JSONRPCError.internalError
         }
@@ -4325,14 +4331,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         minimumEventSequence: Int64
     ) throws -> [EventBus.Event] {
         guard let context else { throw LayoutError.workspaceNotFound }
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        let resultData = try encoder.encode(result)
+        let resultData = try commandReceiptSortedEncoder.encode(result)
         guard let resultJSON = String(data: resultData, encoding: .utf8) else {
             throw JSONRPCError.internalError
         }
         let intents = try events.map { event -> CommandReceiptEventIntent in
-            let payloadData = try encoder.encode(event.payload)
+            let payloadData = try commandReceiptSortedEncoder.encode(event.payload)
             guard let payloadJSON = String(data: payloadData, encoding: .utf8) else {
                 throw JSONRPCError.internalError
             }
