@@ -818,8 +818,13 @@ public final class DistillHTTPServer: @unchecked Sendable {
             .first
     }
 
+    // PERF: header scans run on every receive/auth/body-limit check; share one
+    // 4-byte CRLFCRLF terminator instead of allocating Data("\r\n\r\n".utf8)
+    // on each call (same pattern as SocketServer HTTPServer).
+    private static let httpHeaderTerminator = Data([0x0d, 0x0a, 0x0d, 0x0a])
+
     static func declaredBodyExceedsLimit(buffer: Data, cap: Int = maxRequestBodyBytes) -> Bool {
-        guard let headerRange = buffer.range(of: Data("\r\n\r\n".utf8)),
+        guard let headerRange = buffer.range(of: httpHeaderTerminator),
               let headerText = String(data: buffer[..<headerRange.lowerBound], encoding: .utf8),
               let declaredLength = declaredContentLength(headerText: headerText) else {
             return false
@@ -831,7 +836,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
     /// matches the expected bearer token. Requires the header section to be complete
     /// (i.e. `\r\n\r\n` present). Used to lift the pre-auth cap once auth is seen.
     private func bufferIsHeaderAuthed(_ data: Data) -> Bool {
-        guard let headerRange = data.range(of: Data("\r\n\r\n".utf8)),
+        guard let headerRange = data.range(of: Self.httpHeaderTerminator),
               let headerText = String(data: data[..<headerRange.lowerBound], encoding: .utf8) else {
             return false
         }
@@ -904,7 +909,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
     /// straddles the previous read boundary.
     /// Internal (not private) so unit tests can exercise the scan-offset logic directly.
     func requestIsComplete(_ data: Data, from scanOffset: Int = 0) -> Bool {
-        let separator = Data("\r\n\r\n".utf8)
+        let separator = Self.httpHeaderTerminator
         let searchStart = max(0, scanOffset - 3)
         let headerRange = data.range(of: separator, in: searchStart..<data.count)
             ?? data.range(of: separator)
@@ -1548,7 +1553,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
     }
 
     private func parse(buffer: Data) -> HTTPRequest? {
-        guard let headerRange = buffer.range(of: Data("\r\n\r\n".utf8)),
+        guard let headerRange = buffer.range(of: Self.httpHeaderTerminator),
               let headerText = String(data: buffer[..<headerRange.lowerBound], encoding: .utf8) else {
             return nil
         }
