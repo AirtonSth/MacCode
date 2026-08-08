@@ -94,13 +94,27 @@ public enum CommandWrapPolicy {
         return nil
     }
 
+    // PERF: passthroughReason runs on every PATH-wrapped spawn. Array literals
+    // for git exact-output subcommands / patch flags reallocated membership
+    // tables per decision; share process-wide Sets (membership unchanged).
+    private static let exactGitOutputSubcommands: Set<String> = [
+        "grep", "show", "cat-file", "blame",
+    ]
+    private static let explicitDiffSummaryFlags: Set<String> = [
+        "--stat", "--shortstat", "--numstat", "--name-only", "--name-status",
+    ]
+    private static let exactPatchEmissionFlags: Set<String> = [
+        "-p", "-u", "--patch", "--patch-with-raw", "--patch-with-stat",
+        "-c", "--cc", "--combined-all-paths", "--raw",
+    ]
+
     /// Subcommands whose full stdout is the agent payload (matches / blob text).
     static func isExactGitSubcommand(_ args: [String]) -> Bool {
         let positional = args
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
             .filter { !$0.isEmpty && !$0.hasPrefix("-") }
         guard let sub = positional.first else { return false }
-        return ["grep", "show", "cat-file", "blame"].contains(sub)
+        return exactGitOutputSubcommands.contains(sub)
     }
 
     static func isSedInPlaceFlag(_ arg: String) -> Bool {
@@ -143,17 +157,11 @@ public enum CommandWrapPolicy {
     }
 
     private static func isExplicitDiffSummaryFlag(_ argument: String) -> Bool {
-        let exact: Set<String> = [
-            "--stat", "--shortstat", "--numstat", "--name-only", "--name-status"
-        ]
-        return exact.contains(argument) || argument.hasPrefix("--stat=")
+        explicitDiffSummaryFlags.contains(argument) || argument.hasPrefix("--stat=")
     }
 
     private static func isPatchEmissionFlag(_ argument: String) -> Bool {
-        if [
-            "-p", "-u", "--patch", "--patch-with-raw", "--patch-with-stat",
-            "-c", "--cc", "--combined-all-paths", "--raw"
-        ].contains(argument) {
+        if exactPatchEmissionFlags.contains(argument) {
             return true
         }
         return argument.hasPrefix("-u")
