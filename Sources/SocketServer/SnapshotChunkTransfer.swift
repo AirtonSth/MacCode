@@ -146,20 +146,39 @@ struct SnapshotChunkInsertResult: Sendable {
 
 /// Pure split/digest helpers — shared by production cache and unit tests.
 public enum SnapshotChunkCodec {
+    /// Lowercase SHA-256 hex. Nibble table avoids per-byte `String(format:)` on
+    /// multi-MB snapshot frames (same digest contract as before).
     public static func sha256Hex(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        hexDigest(SHA256.hash(data: data))
     }
 
+    /// Split `data` into fixed-size windows. Uses Data slices that share storage
+    /// with the parent buffer (copy-on-write) instead of `subdata(in:)` which
+    /// always allocates a fresh copy per chunk — critical when the cache also
+    /// retains `frameBytes` for the same transfer (PERF / memory pressure).
     public static func split(_ data: Data, chunkBytes: Int) -> [Data] {
         guard !data.isEmpty, chunkBytes > 0 else { return data.isEmpty ? [] : [data] }
         var chunks: [Data] = []
+        chunks.reserveCapacity((data.count + chunkBytes - 1) / chunkBytes)
         var offset = 0
         while offset < data.count {
             let end = min(offset + chunkBytes, data.count)
-            chunks.append(data.subdata(in: offset..<end))
+            chunks.append(data[offset..<end])
             offset = end
         }
         return chunks
+    }
+
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+    private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 }
 

@@ -79,6 +79,33 @@ final class SnapshotChunkTransferTests: XCTestCase {
         )
     }
 
+    /// WHY: content-addressed resume digests must stay CryptoKit-identical after
+    /// the nibble-table hex path; a case or pad drift would break client verify.
+    func test_codec_sha256Hex_matchesCryptoKitLowercase() {
+        let samples: [Data] = [
+            Data(),
+            Data([0x00, 0xff]),
+            Data((0..<4_096).map { UInt8($0 & 0xff) }),
+        ]
+        for sample in samples {
+            let expected = SHA256.hash(data: sample)
+                .map { String(format: "%02x", $0) }
+                .joined()
+            XCTAssertEqual(SnapshotChunkCodec.sha256Hex(sample), expected)
+        }
+    }
+
+    /// WHY: split must reassemble byte-identically even when windows share parent
+    /// storage (slice path). A wrong range or overlapping slice corrupts resume.
+    func test_codec_split_largePayloadReassemblesExactly() {
+        let payload = Data((0..<200_000).map { UInt8($0 % 251) })
+        let chunks = SnapshotChunkCodec.split(payload, chunkBytes: 64 * 1024)
+        XCTAssertGreaterThan(chunks.count, 1)
+        XCTAssertEqual(Data(chunks.joined()), payload)
+        XCTAssertEqual(chunks.map(\.count).reduce(0, +), payload.count)
+        XCTAssertEqual(chunks.dropLast().allSatisfy { $0.count == 64 * 1024 }, true)
+    }
+
     func test_adaptivePreference_stableProgressIncreasesWithinBounds() {
         // WHY: client next-transfer growth must raise preferred gradually and
         // never escape host negotiate clamps (no unbounded payload growth).
