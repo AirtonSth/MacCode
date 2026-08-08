@@ -8,7 +8,10 @@ import Foundation
 /// lossy compression be turned on without silently corrupting an exact value the
 /// agent depends on.
 public enum LiteralPreservation {
-    private static let patterns: [String] = [
+    // PERF: compile once. `pinnedLiterals` runs on every lossy adoption gate
+    // (semantic prose, prose pruning, SR1, faithfulness stacks). Rebuilding
+    // 13 NSRegularExpressions per scan dominated multi-KB pin checks.
+    private static let regexes: [NSRegularExpression] = [
         #"[\w./~-]+\.[A-Za-z0-9]+:\d+"#,                                  // file.ext:line (also covers JS `at fn (a.js:1:2)`)
         #"File "[^"\n]+", line \d+"#,                                      // Python traceback frame
         #"/(?:[A-Za-z0-9._~+-]+/)+[A-Za-z0-9._~+-]+"#,                     // absolute path (I8.5: load-bearing, anti-hallucination)
@@ -22,15 +25,21 @@ public enum LiteralPreservation {
         #"\b[A-Z]{1,2}\d{3,5}\b"#,                                        // compiler/lint codes (I10.6): TS2345, E501, E0382
         #"\[\[rc:[0-9a-fA-F]+\]\]"#,                                      // recoverable content marker
         #"</?[A-Za-z][A-Za-z0-9:_-]*(?:\s+[^<>]*?)?>"#,                   // XML/HTML-style tags
-    ]
+    ].compactMap { try? NSRegularExpression(pattern: $0) }
+
+    /// PERF: one compile for the per-line error/panic/fatal/exception probe
+    /// that previously recompiled via `String.range(of:options: .regularExpression)`.
+    private static let errorLineRegex = try! NSRegularExpression(
+        pattern: #"\b(error|panic|fatal|exception)\b"#,
+        options: [.caseInsensitive]
+    )
 
     /// Distinct load-bearing literals found in `text`.
     public static func pinnedLiterals(in text: String) -> Set<String> {
         var found = Set<String>()
-        for pattern in patterns {
-            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
-            let range = NSRange(text.startIndex..<text.endIndex, in: text)
-            for match in regex.matches(in: text, range: range) {
+        let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        for regex in regexes {
+            for match in regex.matches(in: text, range: fullRange) {
                 if let r = Range(match.range, in: text) {
                     found.insert(String(text[r]))
                 }
@@ -40,12 +49,13 @@ public enum LiteralPreservation {
         for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
             if (line.hasPrefix("+") || line.hasPrefix("-")) && !line.hasPrefix("+++") && !line.hasPrefix("---") {
                 let trimmed = line.trimmingCharacters(in: .whitespaces)
-                if trimmed.count > 1 { found.insert(String(trimmed)) }
+                if trimmed.utf8.count > 1 { found.insert(String(trimmed)) }
             }
-            let lower = line.lowercased()
-            if lower.range(of: #"\b(error|panic|fatal|exception)\b"#, options: .regularExpression) != nil {
+            let lineString = String(line)
+            let lineRange = NSRange(lineString.startIndex..<lineString.endIndex, in: lineString)
+            if errorLineRegex.firstMatch(in: lineString, range: lineRange) != nil {
                 let trimmed = line.trimmingCharacters(in: .whitespaces)
-                if trimmed.count > 1 { found.insert(String(trimmed)) }
+                if trimmed.utf8.count > 1 { found.insert(String(trimmed)) }
             }
         }
         return found
