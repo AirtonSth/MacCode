@@ -3829,6 +3829,11 @@ public final class JSONRPCDispatcher {
 
     private let _encoder = JSONEncoder()
     private let _decoder = JSONDecoder()
+    // PERF: agent.message list/cursor paths called ISO8601DateFormatter() per
+    // field (2× per message). Formatter construction is expensive; share one
+    // under a short lock (DateFormatters are not thread-safe).
+    private let iso8601Lock = NSLock()
+    private let iso8601Formatter = ISO8601DateFormatter()
 
     private func encode<T: Encodable>(_ value: T) -> JSONValue {
         guard let data = try? _encoder.encode(value),
@@ -3993,7 +3998,9 @@ public final class JSONRPCDispatcher {
     }
 
     private func iso8601(_ date: Date) -> String {
-        ISO8601DateFormatter().string(from: date)
+        iso8601Lock.lock()
+        defer { iso8601Lock.unlock() }
+        return iso8601Formatter.string(from: date)
     }
 
     private func messageCursor(from value: JSONValue?) -> AgentMessageCursor? {
@@ -4035,9 +4042,9 @@ public final class JSONRPCDispatcher {
                 .flatMap(UUID.init)
                 .map(AgentMessageID.init),
               let createdText = object["created_at"]?.stringValue,
-              let createdAt = ISO8601DateFormatter().date(
-                from: createdText
-              ) else {
+              // parseISO8601 falls back to reference date on bad strings; v1
+              // requires a real parse — reject when the shared formatter fails.
+              let createdAt = parseISO8601Strict(createdText) else {
             throw JSONRPCError.invalidParams
         }
         return AgentMessageCursor(createdAt: createdAt, id: id)
@@ -4050,7 +4057,15 @@ public final class JSONRPCDispatcher {
     }
 
     private func parseISO8601(_ value: String) -> Date {
-        ISO8601DateFormatter().date(from: value) ?? Date(timeIntervalSinceReferenceDate: 0)
+        iso8601Lock.lock()
+        defer { iso8601Lock.unlock() }
+        return iso8601Formatter.date(from: value) ?? Date(timeIntervalSinceReferenceDate: 0)
+    }
+
+    private func parseISO8601Strict(_ value: String) -> Date? {
+        iso8601Lock.lock()
+        defer { iso8601Lock.unlock() }
+        return iso8601Formatter.date(from: value)
     }
 
     private func messagePagePayload(_ page: AgentMessagePage) -> JSONValue {
