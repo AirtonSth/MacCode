@@ -1363,13 +1363,16 @@ public struct LocalDistillRuntime: DistillRuntime {
 
     private static func pathLines(from sourceLines: [String], htmlOnly: Bool) -> [String] {
         sourceLines.compactMap { line in
-            let path = line.trimmingCharacters(in: CharacterSet(charactersIn: "`\"' "))
+            let path = line.trimmingCharacters(in: pathLineQuoteTrimSet)
             guard looksLikePath(path) else { return nil }
             if htmlOnly, !path.lowercased().contains(".html") { return nil }
             return path
         }
     }
 
+    // PERF: pathLines trims every line of multi-KB listings; share the
+    // quote/backtick CharacterSet instead of allocating per line.
+    private static let pathLineQuoteTrimSet = CharacterSet(charactersIn: "`\"' ")
     // PERF: compile once — pathLines/looksLikePath classify every line of multi-KB
     // listings; range(of:options:.regularExpression) recompiled per line.
     private static let multiWhitespaceRegex = try! NSRegularExpression(pattern: #"\s{2,}"#)
