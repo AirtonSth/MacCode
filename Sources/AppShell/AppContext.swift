@@ -493,6 +493,24 @@ public final class AppContext {
     /// Debounce window for coalescing per-token usage writes into one disk write.
     private static let tokenSaverUsageDebounceInterval: TimeInterval = 0.75
 
+    // PERF: agent.item.started EventBus publish encodes AssistantItem on every
+    // tool/assistant item during agent runs. Encode once then JSONSerialization +
+    // JSONValue.from (avoids a second Codable walk). JSONEncoder is not
+    // thread-safe — share one under a short lock instead of allocating per item.
+    private static let assistantItemJSONEncodeLock = NSLock()
+    private static let assistantItemJSONEncoder = JSONEncoder()
+
+    private static func assistantItemJSON(_ item: AssistantItem) -> JSONValue {
+        assistantItemJSONEncodeLock.lock()
+        let data = try? assistantItemJSONEncoder.encode(item)
+        assistantItemJSONEncodeLock.unlock()
+        guard let data,
+              let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+            return .null
+        }
+        return JSONValue.from(object)
+    }
+
     /// Releases host-owned state after a cap transaction has committed its
     /// deletes. This deliberately has no EventBus/UI side effect: callers retain
     /// the existing delete-before-create publication order. A failed read or a
@@ -980,16 +998,6 @@ public final class AppContext {
         // GAP-7: stream agent run lifecycle + timeline to the network
         // event bus so the iOS mirror renders agent output in real time
         // (kinds/payloads match the iOS MirrorEventReducer contract).
-        func itemJSON(_ item: AssistantItem) -> JSONValue {
-            // PERF: encode once, then JSONSerialization + JSONValue.from — avoids a
-            // second full Codable walk via JSONDecoder on every agent.item.started
-            // EventBus publish (same pattern as connectionSnapshotJSON).
-            guard let data = try? JSONEncoder().encode(item),
-                  let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
-                return .null
-            }
-            return JSONValue.from(object)
-        }
         func runtimeEventPayload(_ event: ProviderRuntimeEvent, threadId: String) -> JSONValue {
             var payload: [String: JSONValue] = [
                 "thread_id": .string(threadId),
@@ -1050,7 +1058,7 @@ public final class AppContext {
                                         payload: .object(["thread_id": .string(t), "turn_id": .string(turnId)]))
             case .itemStarted(let item):
                 EventBus.shared.publish(kind: "agent.item.started",
-                                        payload: .object(["thread_id": .string(t), "item": itemJSON(item)]))
+                                        payload: .object(["thread_id": .string(t), "item": Self.assistantItemJSON(item)]))
                 self.recordGraphifyUsageFromAssistantItem(
                     item: item,
                     threadId: tid,
