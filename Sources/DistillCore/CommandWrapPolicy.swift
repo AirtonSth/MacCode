@@ -295,14 +295,23 @@ public enum CommandWrapPolicy {
         compressedContentByteCount >= min(minFaithfulCompressedBytes, rawByteCount)
     }
 
+    // PERF: compile once — was recompiled via replacingOccurrences(.regularExpression)
+    // on every wrap faithfulness floor check after compress.
+    private static let trailingRecoveryHandleRegex = try! NSRegularExpression(
+        pattern: #"\n?\[\[rc:[^\]]*\]\]\s*$"#
+    )
+
     /// Byte length of the compressed content with a trailing `[[rc:<handle>]]` marker line and
     /// surrounding whitespace removed, so the faithfulness floor measures real content — not the
     /// ~70-byte recovery handle that would otherwise let a "NONE" token slip past the floor.
     public static func compressedContentByteCount(_ emitted: String) -> Int {
-        let withoutHandle = emitted.replacingOccurrences(
-            of: "\\n?\\[\\[rc:[^\\]]*\\]\\]\\s*$",
-            with: "",
-            options: .regularExpression
+        let ns = emitted as NSString
+        let full = NSRange(location: 0, length: ns.length)
+        let withoutHandle = trailingRecoveryHandleRegex.stringByReplacingMatches(
+            in: emitted,
+            options: [],
+            range: full,
+            withTemplate: ""
         )
         return withoutHandle.trimmingCharacters(in: .whitespacesAndNewlines).utf8.count
     }
