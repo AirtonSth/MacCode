@@ -126,6 +126,13 @@ public enum TokenSaverWaveALossless {
         return (collapsed, exitPreserved)
     }
 
+    // PERF: compile once — was recompiled via range(of:options:.regularExpression)
+    // on every repeated-log collapse exit-preservation check.
+    private static let exitStatusLineRegex = try! NSRegularExpression(
+        pattern: #"\b(exit|status|code)\b"#,
+        options: [.caseInsensitive]
+    )
+
     public static func preservesExitMarkers(original: String, collapsed: String) -> Bool {
         let markers = ["exit code", "exit_code", "EXIT:", "Process exited", "stderr"]
         for m in markers {
@@ -135,7 +142,8 @@ public enum TokenSaverWaveALossless {
         }
         // Also preserve last non-empty line if it looks like status
         let lastOrig = original.split(separator: "\n", omittingEmptySubsequences: true).last.map(String.init) ?? ""
-        if lastOrig.range(of: #"\b(exit|status|code)\b"#, options: [.regularExpression, .caseInsensitive]) != nil {
+        let full = NSRange(location: 0, length: (lastOrig as NSString).length)
+        if exitStatusLineRegex.firstMatch(in: lastOrig, options: [], range: full) != nil {
             return collapsed.contains(lastOrig)
         }
         return true
