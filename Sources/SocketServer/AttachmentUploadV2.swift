@@ -201,6 +201,16 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
     private let now: @Sendable () -> Date
     private let durabilityHook:
         @Sendable (AttachmentUploadV2DurabilityEvent) throws -> Void
+    // PERF: begin/putChunk/status/cancel, budget scans, and terminal GC each
+    // allocated fresh JSONDecoder/JSONEncoder for every manifest, tombstone,
+    // and denylist read/write. Public API already serializes per-root via
+    // `withLock`, so one pair is safe and avoids per-mutation codec construction.
+    private let decoder = JSONDecoder()
+    private let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
 
     public convenience init(
         root: URL,
@@ -914,7 +924,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
         guard fileManager.fileExists(atPath: url.path) else { return nil }
         do {
             let data = try Data(contentsOf: url)
-            let manifest = try JSONDecoder().decode(Manifest.self, from: data)
+            let manifest = try decoder.decode(Manifest.self, from: data)
             guard manifest.protocolVersion == AttachmentUploadV2Policy.protocolVersion,
                   manifest.uploadId == uploadId,
                   manifest.ownerFingerprint == owner else {
@@ -935,7 +945,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
         let url = cancellationTombstoneURL(owner: owner, uploadId: uploadId)
         guard fileManager.fileExists(atPath: url.path) else { return nil }
         do {
-            let tombstone = try JSONDecoder().decode(
+            let tombstone = try decoder.decode(
                 CancellationTombstone.self,
                 from: Data(contentsOf: url)
             )
@@ -980,7 +990,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
             if !ownerDirExisted {
                 try synchronizeDirectory(root)
             }
-            let data = try JSONEncoder().encode(tombstone)
+            let data = try encoder.encode(tombstone)
             let url = cancellationTombstoneURL(
                 owner: tombstone.ownerFingerprint,
                 uploadId: tombstone.uploadId
@@ -1005,7 +1015,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
             return .empty
         }
         do {
-            let index = try JSONDecoder().decode(
+            let index = try decoder.decode(
                 CancellationDenyIndex.self,
                 from: Data(contentsOf: url)
             )
@@ -1116,8 +1126,6 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
         _ index: CancellationDenyIndex
     ) throws {
         do {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
             let data = try encoder.encode(index)
             try durablyReplace(
                 data,
@@ -1223,8 +1231,6 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
     }
 
     private func persistManifest(_ manifest: Manifest, in jobDir: URL) throws {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
         let data: Data
         do {
             data = try encoder.encode(manifest)
@@ -1475,7 +1481,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
             for jobDir in jobs {
                 let url = manifestURL(in: jobDir)
                 guard let data = try? Data(contentsOf: url),
-                      var manifest = try? JSONDecoder().decode(Manifest.self, from: data),
+                      var manifest = try? decoder.decode(Manifest.self, from: data),
                       manifest.phase == .receiving,
                       manifest.updatedAtEpochSeconds <= cutoff else {
                     continue
@@ -1524,7 +1530,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
                 let terminalJob: TerminalJob?
                 let manifestURL = manifestURL(in: jobDirectory)
                 if let data = try? Data(contentsOf: manifestURL),
-                   let manifest = try? JSONDecoder().decode(Manifest.self, from: data),
+                   let manifest = try? decoder.decode(Manifest.self, from: data),
                    manifest.phase != .receiving {
                     terminalJob = TerminalJob(
                         owner: manifest.ownerFingerprint,
@@ -1539,7 +1545,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
                     let tombstoneURL = jobDirectory
                         .appendingPathComponent("cancelled.json", isDirectory: false)
                     if let data = try? Data(contentsOf: tombstoneURL),
-                       let tombstone = try? JSONDecoder().decode(
+                       let tombstone = try? decoder.decode(
                            CancellationTombstone.self,
                            from: data
                        ) {
@@ -1641,7 +1647,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
             let manifestURL = job.appendingPathComponent("manifest.json")
             guard fileManager.fileExists(atPath: manifestURL.path),
                   let data = try? Data(contentsOf: manifestURL),
-                  let manifest = try? JSONDecoder().decode(Manifest.self, from: data),
+                  let manifest = try? decoder.decode(Manifest.self, from: data),
                   manifest.ownerFingerprint == owner,
                   manifest.phase == .receiving else { continue }
             active += 1
@@ -1668,7 +1674,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
             for job in jobs {
                 let manifestURL = job.appendingPathComponent("manifest.json")
                 guard let data = try? Data(contentsOf: manifestURL),
-                      let manifest = try? JSONDecoder().decode(Manifest.self, from: data),
+                      let manifest = try? decoder.decode(Manifest.self, from: data),
                       manifest.phase == .receiving else {
                     continue
                 }
