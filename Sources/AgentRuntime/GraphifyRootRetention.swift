@@ -51,8 +51,12 @@ public enum GraphifyRootRetention {
         return .quarantine
     }
 
+    // PERF: quarantinePath trims leading/trailing slashes on every rename
+    // target; share one CharacterSet instead of allocating per call.
+    private static let pathSlashTrimSet = CharacterSet(charactersIn: "/")
+
     /// Atomic rename target for quarantine (never rm -rf first).
     public static func quarantinePath(for rootPath: String, stamp: String) -> String {
-        rootPath.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + ".quarantine-\(stamp)"
+        rootPath.trimmingCharacters(in: pathSlashTrimSet) + ".quarantine-\(stamp)"
     }
 }
