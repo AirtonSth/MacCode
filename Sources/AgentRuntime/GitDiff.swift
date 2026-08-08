@@ -924,6 +924,11 @@ public enum GitDiff {
         return r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    // PERF: safeRefComponent edge-trims dashes for PR/delivery branch segments;
+    // share one CharacterSet instead of allocating CharacterSet(charactersIn:)
+    // per host/repo/path fragment.
+    private static let refComponentEdgeTrimSet = CharacterSet(charactersIn: "-")
+
     private static func safeRefComponent(_ raw: String) -> String {
         raw.lowercased()
             .map { char in
@@ -933,7 +938,7 @@ public enum GitDiff {
                 if char == "-", partial.last == "-" { return }
                 partial.append(char)
             }
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+            .trimmingCharacters(in: refComponentEdgeTrimSet)
     }
 
     private static func deliveryBranchName(summary: GitSummary) -> String {
