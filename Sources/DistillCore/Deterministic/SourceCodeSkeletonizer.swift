@@ -164,12 +164,16 @@ public enum SourceCodeSkeletonizer {
         "\(indent)… \(skippedLines) code lines elided [[rc:\(handle)]]; retrieve original for body …"
     }
 
+    // PERF: normalizeRetrieveHandle trims wrapper punctuation on every crush
+    // that elides code; share one set instead of allocating per call.
+    private static let retrieveHandleStructureTrimSet = CharacterSet(charactersIn: "[]{}() \t\n")
+
     private static func normalizeRetrieveHandle(_ handle: String) -> String {
         var normalized = handle.trimmingCharacters(in: .whitespacesAndNewlines)
         if let range = normalized.range(of: "rc:") {
             normalized = String(normalized[range.upperBound...])
         }
-        normalized = normalized.trimmingCharacters(in: CharacterSet(charactersIn: "[]{}() \t\n"))
+        normalized = normalized.trimmingCharacters(in: retrieveHandleStructureTrimSet)
         return normalized
     }
 }
