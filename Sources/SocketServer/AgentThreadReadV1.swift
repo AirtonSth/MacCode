@@ -149,6 +149,12 @@ public enum AgentThreadReadV1: Sendable {
     /// Measurement always uses the candidate's final flag/metadata payload so
     /// truncation keys and `blocked_event` cannot push a "fitting" window over
     /// the wire cap after the fact.
+    ///
+    /// PERF: envelope measurement re-encodes the full JSON-RPC frame. A linear
+    /// drop-oldest loop paid up to `eventLimit` (500) encodes per read. Once the
+    /// full window is known not to fit, size is non-increasing as older events
+    /// are dropped (byte-truncation metadata is stable for `start >= 1`), so a
+    /// binary search finds the longest newest suffix in ~log2(N) measures.
     public static func boundToEnvelope(
         events: [AssistantEvent],
         encodedEvents: [JSONValue],
@@ -177,33 +183,49 @@ public enum AgentThreadReadV1: Sendable {
             return empty
         }
 
-        var start = 0
-        while start <= events.count {
+        func windowAt(start: Int) -> Window {
             let sliceEvents = Array(events[start...])
             let sliceEncoded = Array(encodedEvents[start...])
             let byteTruncated = start > 0 || (sliceEvents.isEmpty && !events.isEmpty)
-            let candidate = makeWindow(
+            return makeWindow(
                 events: sliceEvents,
                 encodedEvents: sliceEncoded,
                 sourceHadOlderEvents: sourceHadOlderEvents,
                 byteTruncated: byteTruncated,
                 blockedEvent: sliceEvents.isEmpty ? blockedEvent : nil
             )
-            let size = measureEnvelope(payload(window: candidate, eventWatermark: eventWatermark))
-            if size <= maxBytes || sliceEvents.isEmpty {
-                return candidate
-            }
-            // Drop oldest; keep contiguous newest suffix.
-            start += 1
         }
 
-        return makeWindow(
-            events: [],
-            encodedEvents: [],
-            sourceHadOlderEvents: true,
-            byteTruncated: true,
-            blockedEvent: blockedEvent
-        )
+        func envelopeFits(_ window: Window) -> Bool {
+            // Empty suffix is always admissible (honest partial / recovery metadata),
+            // matching the prior linear loop's `|| sliceEvents.isEmpty` short-circuit.
+            if window.events.isEmpty { return true }
+            let size = measureEnvelope(
+                payload(window: window, eventWatermark: eventWatermark)
+            )
+            return size <= maxBytes
+        }
+
+        // Prefer the full newest window when it already fits (no byte-trunc flags).
+        let full = windowAt(start: 0)
+        if envelopeFits(full) {
+            return full
+        }
+
+        // Smallest start in 1...count whose envelope fits ⇒ longest newest suffix.
+        var lo = 1
+        var hi = events.count
+        var bestStart = events.count
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2
+            if envelopeFits(windowAt(start: mid)) {
+                bestStart = mid
+                hi = mid - 1
+            } else {
+                lo = mid + 1
+            }
+        }
+        return windowAt(start: bestStart)
     }
 
     private static func makeWindow(
