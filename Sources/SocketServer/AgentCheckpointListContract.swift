@@ -227,16 +227,28 @@ public enum AgentCheckpointListContract: Sendable {
         )
     }
 
+    // PERF: response-id / request / success-ceiling size checks run on every
+    // explicit v1 checkpoint list. JSONEncoder is not thread-safe — serialize
+    // concurrent measurements under a short lock and reuse one encoder.
+    private static let sizeCheckEncodeLock = NSLock()
+    private static let sizeCheckEncoder = JSONEncoder()
+
+    private static func encodeForSizeCheck<T: Encodable>(_ value: T) throws -> Data {
+        sizeCheckEncodeLock.lock()
+        defer { sizeCheckEncodeLock.unlock() }
+        return try sizeCheckEncoder.encode(value)
+    }
+
     public static func acceptsResponseID(_ responseID: JSONRPCID?) -> Bool {
         guard let responseID,
-              let encoded = try? JSONEncoder().encode(responseID) else {
+              let encoded = try? encodeForSizeCheck(responseID) else {
             return responseID == nil
         }
         return encoded.count <= maxEncodedResponseIDBytes
     }
 
     public static func preflightEncodedRequest(_ request: JSONRPCRequest) throws {
-        let data = try JSONEncoder().encode(request)
+        let data = try encodeForSizeCheck(request)
         if data.count > maxEncodedRequestBytes {
             throw JSONRPCError(
                 code: -32602,
@@ -277,7 +289,7 @@ public enum AgentCheckpointListContract: Sendable {
         result: JSONValue
     ) -> JSONRPCResponse {
         let response = JSONRPCResponse(id: id, result: result)
-        if let encoded = try? JSONEncoder().encode(response),
+        if let encoded = try? encodeForSizeCheck(response),
            encoded.count <= maxEncodedResponseBytes {
             return response
         }
@@ -299,7 +311,7 @@ public enum AgentCheckpointListContract: Sendable {
         error: JSONRPCError
     ) -> JSONRPCResponse {
         let withID = JSONRPCResponse(id: id, error: error)
-        if let encoded = try? JSONEncoder().encode(withID),
+        if let encoded = try? encodeForSizeCheck(withID),
            encoded.count <= maxEncodedResponseBytes {
             return withID
         }
@@ -309,7 +321,7 @@ public enum AgentCheckpointListContract: Sendable {
             data: .object(["reason": .string("response_envelope_too_large")])
         )
         let retry = JSONRPCResponse(id: id, error: minimal)
-        if let encoded = try? JSONEncoder().encode(retry),
+        if let encoded = try? encodeForSizeCheck(retry),
            encoded.count <= maxEncodedResponseBytes {
             return retry
         }
