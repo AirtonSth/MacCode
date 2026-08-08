@@ -812,6 +812,13 @@ public enum GitDiff {
         return String(trimmed.prefix(10_000))
     }
 
+    // PERF: branch sanitization is a pure allowed-character set. CharacterSet
+    // membership avoids recompiling ^[A-Za-z0-9._/-]+$ via range(of:options:
+    // .regularExpression) on every delivery-plan branch candidate.
+    private static let branchNameAllowedCharacters = CharacterSet(
+        charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/-"
+    )
+
     private static func sanitizedBranchName(_ value: String?) -> String? {
         guard let value else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -820,7 +827,9 @@ public enum GitDiff {
               !trimmed.hasSuffix("/"),
               !trimmed.contains(".."),
               !trimmed.contains("@{"),
-              trimmed.range(of: #"^[A-Za-z0-9._/-]+$"#, options: .regularExpression) != nil else { return nil }
+              trimmed.unicodeScalars.allSatisfy({ branchNameAllowedCharacters.contains($0) }) else {
+            return nil
+        }
         return trimmed
     }
 
