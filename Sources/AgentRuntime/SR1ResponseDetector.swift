@@ -21,7 +21,12 @@ public enum SR1ResponseDetector {
     // Single source of truth: see CoreModel.DistillSemanticPrefixes for why this
     // must not be re-typed per module.
     private static let semanticPrefixes = DistillSemanticPrefixes.set
-    private static let variableKeyPattern = #"#[A-Za-z][0-9]+"#
+    // PERF: isBareShortOutcomeLine / cleanedVariableValue recompiled these via
+    // range(of:options:.regularExpression) on every SR1 humanize probe.
+    private static let variableKeyRegex = try! NSRegularExpression(pattern: #"#[A-Za-z][0-9]+"#)
+    private static let aliasDeclarationRegex = try! NSRegularExpression(
+        pattern: DistillSemanticPrefixes.aliasDeclarationPattern
+    )
     public static let classifierConfidenceThreshold = 0.82
 
     /// Longest bare `O:` line still treated as an R0 chat reply rather than a
@@ -192,7 +197,7 @@ public enum SR1ResponseDetector {
               let parsed = parseSemanticLine(trimmed),
               parsed.prefix == "O",
               parseSemanticSegmentsInLine(trimmed).count <= 1,
-              trimmed.range(of: variableKeyPattern, options: .regularExpression) == nil else {
+              !hasRegexMatch(variableKeyRegex, in: trimmed) else {
             return false
         }
         return true
@@ -327,7 +332,7 @@ public enum SR1ResponseDetector {
             .trimmingCharacters(in: CharacterSet(charactersIn: ".,;"))
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if value.localizedCaseInsensitiveContains("dict:") ||
-            value.range(of: DistillSemanticPrefixes.aliasDeclarationPattern, options: .regularExpression) != nil {
+            hasRegexMatch(aliasDeclarationRegex, in: value) {
             return nil
         }
         let segments = parseSemanticSegments(value)
@@ -337,10 +342,15 @@ public enum SR1ResponseDetector {
                 .trimmingCharacters(in: CharacterSet(charactersIn: ".,;"))
         }
         guard !value.isEmpty,
-              value.range(of: variableKeyPattern, options: .regularExpression) == nil else {
+              !hasRegexMatch(variableKeyRegex, in: value) else {
             return nil
         }
         return value
+    }
+
+    private static func hasRegexMatch(_ regex: NSRegularExpression, in text: String) -> Bool {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.firstMatch(in: text, options: [], range: range) != nil
     }
 
     private static func replacingWholeVariableKey(_ key: String, with value: String, in text: String) -> String {
