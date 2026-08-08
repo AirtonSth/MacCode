@@ -474,14 +474,15 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         var discardedBulk = 0
         kept.reserveCapacity(coalesced.count)
         for frame in coalesced {
+            // PERF: one JSON parse per coalesced frame for priority + shed +
+            // dropped sequence (was applicationPriority + isSheddable +
+            // eventSequence/frameType/snapshotSequence = 2–4 parses).
+            let object = try? JSONSerialization.jsonObject(with: frame) as? [String: Any]
             // Snapshots and sheddable event kinds are bulk under pressure.
-            let priority = Self.applicationPriority(of: frame)
-            if priority == .bulk || Self.isSheddableApplicationFrame(frame) {
+            let priority = Self.applicationPriority(object: object)
+            if priority == .bulk || Self.isSheddableApplicationFrame(object: object) {
                 discardedBulk += 1
-                if let sequence = Self.eventSequence(in: frame) {
-                    droppedSequences.append(sequence)
-                } else if Self.frameType(in: frame) == "snapshot",
-                          let sequence = Self.snapshotSequence(in: frame) {
+                if let sequence = Self.reportableDroppedSequence(object: object) {
                     droppedSequences.append(sequence)
                 }
                 continue
@@ -493,9 +494,13 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         // If coalescing alone made room and nothing bulk was shed, still report
         // sequences lost to last-write-wins coalesce so the caller can baseline.
         if discardedBulk == 0, coalescedAway > 0 {
-            let keptSequences = Set(kept.compactMap { Self.eventSequence(in: $0.data) })
+            let keptSequences = Set(kept.compactMap { frame -> Int64? in
+                let object = try? JSONSerialization.jsonObject(with: frame.data) as? [String: Any]
+                return Self.eventSequence(object: object)
+            })
             for frame in frames {
-                guard let sequence = Self.eventSequence(in: frame),
+                let object = try? JSONSerialization.jsonObject(with: frame) as? [String: Any]
+                guard let sequence = Self.eventSequence(object: object),
                       !keptSequences.contains(sequence) else { continue }
                 droppedSequences.append(sequence)
             }
@@ -536,7 +541,12 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     /// for `type`, again for sheddable `kind` / snapshot-RPC checks — 2–3 full
     /// parses on every enqueue, including high-frequency `agent.item.delta`.
     static func applicationPriority(of data: Data) -> ApplicationPriority {
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return applicationPriority(object: object)
+    }
+
+    static func applicationPriority(object: [String: Any]?) -> ApplicationPriority {
+        guard let object else {
             // Opaque / test blobs stay on the normal FIFO lane.
             return .normal
         }
@@ -568,9 +578,12 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     ///
     /// PERF: single JSON parse (same contract as before).
     static func isSheddableApplicationFrame(_ data: Data) -> Bool {
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return false
-        }
+        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return isSheddableApplicationFrame(object: object)
+    }
+
+    static func isSheddableApplicationFrame(object: [String: Any]?) -> Bool {
+        guard let object else { return false }
         if object["type"] as? String == "snapshot" { return true }
         // Nested snapshot RPC bodies are the same bulk baseline as bare
         // `type:snapshot` frames; shed under pressure so recovery/control can
@@ -623,15 +636,29 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     }
 
     static func eventSequence(in data: Data) -> Int64? {
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              (object["type"] as? String) == "event" else { return nil }
+        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return eventSequence(object: object)
+    }
+
+    static func eventSequence(object: [String: Any]?) -> Int64? {
+        guard let object, (object["type"] as? String) == "event" else { return nil }
         return int64Field(object["sequence"])
     }
 
     static func snapshotSequence(in data: Data) -> Int64? {
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              (object["type"] as? String) == "snapshot" else { return nil }
+        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return snapshotSequence(object: object)
+    }
+
+    static func snapshotSequence(object: [String: Any]?) -> Int64? {
+        guard let object, (object["type"] as? String) == "snapshot" else { return nil }
         return int64Field(object["sequence"])
+    }
+
+    /// Sequence to report when a frame is shed under degrade (event or bare snapshot).
+    private static func reportableDroppedSequence(object: [String: Any]?) -> Int64? {
+        if let sequence = eventSequence(object: object) { return sequence }
+        return snapshotSequence(object: object)
     }
 
     static func eventKind(in data: Data) -> String? {
@@ -648,7 +675,12 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     }
 
     static func coalescingKey(for data: Data) -> String? {
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return coalescingKey(object: object)
+    }
+
+    static func coalescingKey(object: [String: Any]?) -> String? {
+        guard let object,
               (object["type"] as? String) == "event",
               let kind = object["kind"] as? String else { return nil }
         let payload = object["payload"] as? [String: Any]
