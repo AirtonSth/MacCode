@@ -55,8 +55,13 @@ enum DroppedFilePaths {
         return text.last?.isWhitespace == true ? text + insertion : text + " " + insertion
     }
 
+    // PERF: terminalInputText maps shellEscaped over every dropped path; share
+    // the shell-metacharacter CharacterSet instead of union-allocating per path.
+    private static let shellSpecialCharacters = CharacterSet.whitespacesAndNewlines
+        .union(CharacterSet(charactersIn: "'\"\\$&;()[]{}<>*?!|`"))
+
     private static func shellEscaped(_ path: String) -> String {
-        guard path.rangeOfCharacter(from: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "'\"\\$&;()[]{}<>*?!|`"))) != nil else {
+        guard path.rangeOfCharacter(from: shellSpecialCharacters) != nil else {
             return path
         }
         return "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
