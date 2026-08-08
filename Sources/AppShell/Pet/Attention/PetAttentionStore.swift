@@ -9,6 +9,10 @@ public final class PetAttentionStore {
     private let markAgentThreadReadMutation: (AgentThreadID) throws -> Void
     private let markNotificationReadMutation: (String) throws -> Void
     private let workspaceNameProvider: (WorkspaceID) -> String?
+    // PERF: approvalActionLabel allocated JSONDecoder per approval callback
+    // during refresh. Store usage is sequential; one instance decoder avoids
+    // per-item codec construction (kind-only decode unchanged).
+    private let pendingRequestDecoder = JSONDecoder()
 
     public init(
         threadRepository: AgentThreadRepository,
@@ -139,7 +143,7 @@ public final class PetAttentionStore {
     ) -> PetAttentionItem {
         let kind: PetAttentionCallbackKind = callback.kind == .approval ? .approval : .question
         let isStale = callback.state == .stale
-        let actionLabel = kind == .approval ? Self.approvalActionLabel(from: callback) : nil
+        let actionLabel = kind == .approval ? approvalActionLabel(from: callback) : nil
         let context = attentionContext(for: thread, actionLabel: actionLabel)
         let presentation = PetAttentionPresentation.safe(
             kind: kind == .approval ? .approval : .question(isSecret: false),
@@ -227,10 +231,13 @@ public final class PetAttentionStore {
     }
 
     /// Decodes structured pending-request kind only; never surfaces title/detail payloads.
-    private static func approvalActionLabel(from callback: ProviderPendingCallback) -> String? {
+    private func approvalActionLabel(from callback: ProviderPendingCallback) -> String? {
         guard callback.kind == .approval,
               let data = callback.payloadJSON.data(using: .utf8),
-              let request = try? JSONDecoder().decode(AssistantPendingRequest.self, from: data)
+              let request = try? pendingRequestDecoder.decode(
+                  AssistantPendingRequest.self,
+                  from: data
+              )
         else { return nil }
         return PetApprovalActionLabel.label(for: request.kind)
     }
