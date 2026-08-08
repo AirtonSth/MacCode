@@ -1332,18 +1332,28 @@ public struct LocalDistillRuntime: DistillRuntime {
         }
     }
 
+    // PERF: compile once — pathLines/looksLikePath classify every line of multi-KB
+    // listings; range(of:options:.regularExpression) recompiled per line.
+    private static let multiWhitespaceRegex = try! NSRegularExpression(pattern: #"\s{2,}"#)
+    private static let fileExtensionSuffixRegex = try! NSRegularExpression(
+        pattern: #"\.[A-Za-z0-9]{1,8}$"#
+    )
+
     private static func looksLikePath(_ line: String) -> Bool {
         guard !line.isEmpty,
               !line.contains("\u{0}"),
-              !line.contains("://"),
-              line.range(of: #"\s{2,}"#, options: .regularExpression) == nil else {
+              !line.contains("://") else {
+            return false
+        }
+        let range = NSRange(line.startIndex..<line.endIndex, in: line)
+        if multiWhitespaceRegex.firstMatch(in: line, options: [], range: range) != nil {
             return false
         }
         return line.hasPrefix("/") ||
             line.hasPrefix("./") ||
             line.hasPrefix("../") ||
             line.contains("/") ||
-            line.range(of: #"\.[A-Za-z0-9]{1,8}$"#, options: .regularExpression) != nil
+            fileExtensionSuffixRegex.firstMatch(in: line, options: [], range: range) != nil
     }
 
     private static func isValidJSON(_ text: String) -> Bool {

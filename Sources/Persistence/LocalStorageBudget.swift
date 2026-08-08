@@ -480,7 +480,7 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
             defer { statement.reset() }
             while try statement.step() {
                 guard let raw = statement.columnText(0)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-                      raw.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil else { continue }
+                      Self.isSHA256HexDigest(raw) else { continue }
                 handles.insert(raw)
             }
         }
@@ -627,9 +627,17 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
         return candidate.path
     }
 
+    /// PERF: O(1) length + linear hex scan (no recompiled `^[0-9a-f]{64}$` per row).
+    private static func isSHA256HexDigest(_ value: String) -> Bool {
+        guard value.utf8.count == 64 else { return false }
+        return value.utf8.allSatisfy { b in
+            (0x30...0x39).contains(b) || (0x61...0x66).contains(b)
+        }
+    }
+
     private func validDigest(_ rawValue: String?) -> String? {
         guard let value = rawValue?.lowercased(),
-              value.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil else { return nil }
+              Self.isSHA256HexDigest(value) else { return nil }
         return value
     }
 
