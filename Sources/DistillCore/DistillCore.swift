@@ -423,13 +423,32 @@ public struct DistillEmbedResponse: Codable, Sendable, Equatable {
 /// is applied to input and output, so the delta is an honest, consistent
 /// measure of how much compression removed (an estimate, not a billed count).
 public enum TokenEstimator {
+    /// Deterministic token estimate for savings deltas (not billed counts).
+    ///
+    /// PERF: `String.count` is an O(n) grapheme walk and `split` materializes a
+    /// Substring array on every Token Saver savings record / audit. `utf8.count`
+    /// is O(1); a single UTF-8 pass counts space/LF/tab/CR separators without
+    /// allocating. ASCII-heavy agent text matches the prior Character/split
+    /// estimates exactly; multi-byte aligns with Token Saver's byte orientation.
     public static func estimate(_ text: String) -> Int {
-        let chars = text.count
+        let chars = text.utf8.count
         guard chars > 0 else { return 0 }
         // OpenAI's published rule of thumb (~4 chars/token for English) blended
         // with a word-count floor so short, word-dense lines aren't undercounted.
         let byChars = Int((Double(chars) / 4.0).rounded())
-        let words = text.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" || $0 == "\r" }).count
+        var words = 0
+        var inWord = false
+        for byte in text.utf8 {
+            switch byte {
+            case 0x20, 0x0A, 0x09, 0x0D: // space, LF, tab, CR
+                inWord = false
+            default:
+                if !inWord {
+                    inWord = true
+                    words += 1
+                }
+            }
+        }
         let byWords = Int((Double(words) * 1.3).rounded())
         return max(1, max(byChars, byWords))
     }
@@ -998,7 +1017,9 @@ public actor DistillScheduler {
             candidateOutputCharacters: candidate.count,
             candidateOutputTokens: candidateTokens,
             wouldSaveTokens: wouldSaveTokens,
-            accepted: !candidate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && candidate.count < request.input.count,
+            // PERF: never-inflate via O(1) utf8.count (not Character.count grapheme walk).
+            accepted: !candidate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && candidate.utf8.count < request.input.utf8.count,
             wallClockMilliseconds: elapsedMs
         )
         return DistillResponse(
