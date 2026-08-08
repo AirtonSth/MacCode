@@ -1348,6 +1348,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
     private var _listenerPublicationState: ListenerPublicationState = .idle
     private var _listenerPublishAttempt: Int = 0
     private let listenerRetryPolicy = ListenerRetryPolicy.default
+    // PERF: concurrent HTTP JSON-RPC / snapshot responses used to allocate a
+    // JSONEncoder per encode. Share one encoder; serialize concurrent encodes
+    // (JSONEncoder is not thread-safe).
+    private let jsonEncodeLock = NSLock()
+    private let sharedJSONEncoder = JSONEncoder()
     /// Test seam: nanoseconds budget for `sync.snapshot` state capture (default 5s).
     var snapshotReadTimeoutNanosecondsForTesting: UInt64?
 
@@ -3575,7 +3580,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         case .localTest:
             response = await dispatcher.dispatch(request, mutationContext: mutationContext)
         }
-        guard let encoded = try? JSONEncoder().encode(response),
+        guard let encoded = try? encodeJSON(response),
               var object = try? JSONSerialization.jsonObject(with: encoded) as? [String: Any] else {
             return rpcErrorObject(.internalError, id: wireID)
         }
@@ -3710,7 +3715,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 result: frame
             )
             let encodeStarted = DispatchTime.now().uptimeNanoseconds
-            let data = try JSONEncoder().encode(envelope)
+            let data = try encodeJSON(envelope)
             phaseMetrics?.record(
                 .snapshotEncode,
                 latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: encodeStarted)
@@ -3868,7 +3873,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             )
             // Encode the authoritative frame once — chunks resume these bytes.
             let encodeStarted = DispatchTime.now().uptimeNanoseconds
-            let frameBytes = try JSONEncoder().encode(frame)
+            let frameBytes = try encodeJSON(frame)
             phaseMetrics?.record(
                 .snapshotEncode,
                 latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: encodeStarted)
@@ -4168,9 +4173,19 @@ public final class DirectHTTPServer: @unchecked Sendable {
         ]
     }
 
+    // PERF: fallback empty object for failed JSONSerialization; avoid allocating
+    // Data("{}".utf8) on every rpcJSONData miss.
+    private static let emptyJSONObjectData = Data([0x7b, 0x7d]) // {}
+
+    private func encodeJSON<T: Encodable>(_ value: T) throws -> Data {
+        jsonEncodeLock.lock()
+        defer { jsonEncodeLock.unlock() }
+        return try sharedJSONEncoder.encode(value)
+    }
+
     private func rpcJSONData(_ value: Any) -> Data {
         (try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]))
-            ?? Data("{}".utf8)
+            ?? Self.emptyJSONObjectData
     }
 
     private func handleAttachmentUploadV2(
