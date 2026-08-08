@@ -81,11 +81,15 @@ public enum AgentDelegationCapability {
         return String(bytes: out, encoding: .utf8) ?? ""
     }
 
+    /// PERF: fill 32 random bytes then nibble-hex once (not 32 `String(format:)`
+    /// calls). Output remains 64-char lowercase hex for capability tokens.
     public static func issue() -> String {
         var generator = SystemRandomNumberGenerator()
-        return (0..<32).map { _ in
-            String(format: "%02x", UInt8.random(in: .min ... .max, using: &generator))
-        }.joined()
+        var bytes = [UInt8](repeating: 0, count: 32)
+        for index in bytes.indices {
+            bytes[index] = UInt8.random(in: .min ... .max, using: &generator)
+        }
+        return hexDigest(bytes)
     }
 
     public static func sha256Hex(_ capability: String) -> String {
