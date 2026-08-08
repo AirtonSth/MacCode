@@ -113,14 +113,17 @@ public enum TokenSaverWaveAShadowBridge {
             )
         }
 
+        // PERF: one UTF-8 materialization shared by exact-replay store and
+        // shadow metrics (tool outputs can be multi-KB/MB).
+        let outputBytes = Data(output.utf8)
         observeExactReplay(
             bindingDigest: digest,
             toolName: toolName,
-            current: Data(output.utf8)
+            current: outputBytes
         )
         _ = observeShadowMetrics(
             bindingDigest: digest,
-            providerVisible: Data(output.utf8),
+            providerVisible: outputBytes,
             cacheVolatileTokens: 0,
             queueCohortSize: 0,
             pair: nil

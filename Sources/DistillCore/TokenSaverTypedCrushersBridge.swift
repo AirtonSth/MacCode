@@ -131,13 +131,19 @@ public enum TokenSaverTypedCrushersBridge {
             }
         }
         // task-16 recovery probes (default OFF → deny)
-        for handle in extractRecoveryHandles(from: output) {
-            _ = TokenSaverRecoveryBridge.observeRetrieve(
-                handle: handle,
-                bytes: Data(output.utf8),
-                original: Data(output.utf8),
-                revoked: false
-            )
+        // PERF: materialize UTF-8 once only when handles exist; reuse for
+        // bytes + original across every probe on the same tool output.
+        let recoveryHandles = extractRecoveryHandles(from: output)
+        if !recoveryHandles.isEmpty {
+            let outputBytes = Data(output.utf8)
+            for handle in recoveryHandles {
+                _ = TokenSaverRecoveryBridge.observeRetrieve(
+                    handle: handle,
+                    bytes: outputBytes,
+                    original: outputBytes,
+                    revoked: false
+                )
+            }
         }
         if toolName == "Grep" || toolName == "Glob" {
             // Missing result scope must deny (empty), not self-match on query BindingID.
