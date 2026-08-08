@@ -101,6 +101,11 @@ public final class PaletteFrecencyStore {
     private let key = "palette.frecency"
     /// Hard cap: keep only the N most-recently-updated entries to avoid unbounded growth.
     private let cap: Int
+    // PERF: load/persist allocated JSONDecoder/JSONEncoder per call (and
+    // recordUse does both). Reuse one pair under a short lock.
+    private let codecLock = NSLock()
+    private let decoder = JSONDecoder()
+    private let encoder = JSONEncoder()
 
     public init(repo: any PaletteFrecencyRepository, cap: Int = 50) {
         self.repo = repo
@@ -111,11 +116,13 @@ public final class PaletteFrecencyStore {
 
     public func load() -> [PaletteFrecencyEntry] {
         guard let raw = try? repo.get(key),
-              let data = raw.data(using: .utf8),
-              let entries = try? JSONDecoder().decode([PaletteFrecencyEntry].self, from: data) else {
+              let data = raw.data(using: .utf8) else {
             return []
         }
-        return entries
+        codecLock.lock()
+        let entries = try? decoder.decode([PaletteFrecencyEntry].self, from: data)
+        codecLock.unlock()
+        return entries ?? []
     }
 
     // MARK: Record a use
@@ -140,7 +147,10 @@ public final class PaletteFrecencyStore {
     // MARK: Private
 
     private func persist(_ entries: [PaletteFrecencyEntry]) {
-        guard let data = try? JSONEncoder().encode(entries),
+        codecLock.lock()
+        let data = try? encoder.encode(entries)
+        codecLock.unlock()
+        guard let data,
               let json = String(data: data, encoding: .utf8) else { return }
         try? repo.set(key, json)
     }
