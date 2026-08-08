@@ -212,6 +212,12 @@ public final class SettingsStore {
     private let repo: any SettingsWriteRepository
     private let key = "app_settings"
     private let cache = SettingsCache()
+    // PERF: cache-miss load and every save/update allocated JSONDecoder/
+    // JSONEncoder. Concurrent surfaces share stores — serialize under a short
+    // lock and reuse one pair (wire JSON formatting unchanged).
+    private let codecLock = NSLock()
+    private let decoder = JSONDecoder()
+    private let encoder = JSONEncoder()
     /// Called on the calling thread when a user-initiated write fails.
     /// Nil = silent (legacy behaviour, only use for non-user-initiated paths).
     public var onWriteError: ((Error) -> Void)?
@@ -222,11 +228,13 @@ public final class SettingsStore {
     init(repo: any SettingsWriteRepository) { self.repo = repo }
 
     private func loadFromRepository() throws -> AppSettings {
-        guard let json = try repo.get(key), let data = json.data(using: .utf8),
-              let settings = try? JSONDecoder().decode(AppSettings.self, from: data) else {
+        guard let json = try repo.get(key), let data = json.data(using: .utf8) else {
             return AppSettings()
         }
-        return settings
+        codecLock.lock()
+        let settings = try? decoder.decode(AppSettings.self, from: data)
+        codecLock.unlock()
+        return settings ?? AppSettings()
     }
 
     public func load() -> AppSettings {
@@ -242,7 +250,10 @@ public final class SettingsStore {
     }
 
     public func save(_ settings: AppSettings) {
-        guard let data = try? JSONEncoder().encode(settings),
+        codecLock.lock()
+        let data = try? encoder.encode(settings)
+        codecLock.unlock()
+        guard let data,
               let json = String(data: data, encoding: .utf8) else { return }
         do {
             try repo.set(key, json)
