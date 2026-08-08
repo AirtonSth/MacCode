@@ -54,11 +54,16 @@ public final class ReversibleContentStore: @unchecked Sendable {
         return String(bytes: out, encoding: .utf8) ?? ""
     }
 
+    // PERF: normalize trims wrapper punctuation on every store/retrieve handle
+    // parse; share one set instead of allocating per call (same punctuation
+    // set as the deterministic crushers' retrieve-handle normalizer).
+    private static let handleStructureTrimSet = CharacterSet(charactersIn: "[]{}() \t\n")
+
     /// Extract a bare handle from a raw handle or a `[[rc:...]]` marker, normalized.
     static func normalize(_ handleOrMarker: String) -> String {
         var s = handleOrMarker.trimmingCharacters(in: .whitespacesAndNewlines)
         if let r = s.range(of: "rc:") { s = String(s[r.upperBound...]) }
-        s = s.trimmingCharacters(in: CharacterSet(charactersIn: "[]{}() \t\n"))
+        s = s.trimmingCharacters(in: handleStructureTrimSet)
         return s.lowercased()
     }
 
