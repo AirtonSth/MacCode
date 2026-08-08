@@ -1580,12 +1580,19 @@ public final class DistillHTTPServer: @unchecked Sendable {
         )
     }
 
+    // PERF: every distill HTTP response used to allocate Content-Type /
+    // Connection header Data (and the encode-failure body). Reuse static
+    // bytes; status line and Content-Length stay dynamic per response.
+    private static let contentTypeJSONHeader = Data("Content-Type: application/json\r\n".utf8)
+    private static let connectionCloseHeader = Data("Connection: close\r\n\r\n".utf8)
+    private static let encodingFailedBody = Data(#"{"error":"encoding_failed"}"#.utf8)
+
     private func send<T: Encodable>(status: Int, body: T, connection: NWConnection) {
         let payload: Data
         do {
             payload = try encoder.encode(body)
         } catch {
-            payload = Data(#"{"error":"encoding_failed"}"#.utf8)
+            payload = Self.encodingFailedBody
         }
         let phrase: String
         switch status {
@@ -1601,9 +1608,9 @@ public final class DistillHTTPServer: @unchecked Sendable {
         default: phrase = "Error"
         }
         var data = Data("HTTP/1.1 \(status) \(phrase)\r\n".utf8)
-        data.append(Data("Content-Type: application/json\r\n".utf8))
+        data.append(Self.contentTypeJSONHeader)
         data.append(Data("Content-Length: \(payload.count)\r\n".utf8))
-        data.append(Data("Connection: close\r\n\r\n".utf8))
+        data.append(Self.connectionCloseHeader)
         data.append(payload)
 
         connection.send(content: data, completion: .contentProcessed { _ in
