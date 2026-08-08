@@ -120,8 +120,13 @@ public enum TokenSaverWaveAShadowMetrics {
 
     public static let sharedLedger = Ledger()
 
+    // PERF: isCanonicalDigest used to allocate CharacterSet(charactersIn:) for
+    // every unicode scalar of a 64-char digest (and emit paths can validate the
+    // same digest more than once). Share one lowercase-hex set.
+    private static let lowercaseHexScalars = CharacterSet(charactersIn: "0123456789abcdef")
+
     public static func isCanonicalDigest(_ s: String) -> Bool {
-        s.count == 64 && s.unicodeScalars.allSatisfy { CharacterSet(charactersIn: "0123456789abcdef").contains($0) }
+        s.count == 64 && s.unicodeScalars.allSatisfy { lowercaseHexScalars.contains($0) }
     }
 
     public static func observeWithoutMutation(_ providerVisible: Data) -> Data { providerVisible }
