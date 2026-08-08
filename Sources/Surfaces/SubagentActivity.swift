@@ -507,6 +507,13 @@ public enum SubagentActivityProjection {
         return "Worker"
     }
 
+    // PERF: displayName/providerDisplayName/lastFour/humanize allocate
+    // CharacterSet(charactersIn:) on every nested-worker label paint. Share
+    // separator sets so multi-agent UI rebuilds do not reallocate them.
+    private static let providerNodeIdSeparators = CharacterSet(charactersIn: ".-_ ")
+    private static let identitySegmentSeparators = CharacterSet(charactersIn: ".-_")
+    private static let humanizeNodeIdSeparators = CharacterSet(charactersIn: "-_./")
+
     public static func providerDisplayName(
         _ provider: SubagentProviderKind,
         nodeId: String? = nil
@@ -520,7 +527,7 @@ public enum SubagentActivityProjection {
             guard let nodeId else { return "Unknown" }
             let parts = nodeId
                 .lowercased()
-                .components(separatedBy: CharacterSet(charactersIn: ".-_ "))
+                .components(separatedBy: providerNodeIdSeparators)
                 .filter { !$0.isEmpty }
             for part in parts {
                 if part == "claude" { return "Claude" }
@@ -533,9 +540,8 @@ public enum SubagentActivityProjection {
 
     /// Last 4 alphanumeric characters of the trailing identity segment (uuid/hex).
     public static func lastFourIdentityChars(from nodeId: String) -> String {
-        let separators = CharacterSet(charactersIn: ".-_")
         let segments = nodeId
-            .components(separatedBy: separators)
+            .components(separatedBy: identitySegmentSeparators)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         let candidate = segments.reversed().first(where: { segment in
@@ -552,9 +558,8 @@ public enum SubagentActivityProjection {
 
     /// `deep-worker-plan-writer` / `deep_worker_plan_writer` → "Deep worker plan writer".
     public static func humanizeNodeId(_ raw: String) -> String {
-        let separators = CharacterSet(charactersIn: "-_./")
         let parts = raw
-            .components(separatedBy: separators)
+            .components(separatedBy: humanizeNodeIdSeparators)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         guard !parts.isEmpty else { return raw }
