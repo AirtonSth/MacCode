@@ -274,6 +274,11 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
     private let fileManager: FileManager
     private let attachmentRoot: URL?
     var beforeAttachmentCleanupLockForTesting: (() -> Void)?
+    // PERF: durableReferencedAttachments allocated JSONDecoder per cleanup/snapshot
+    // scan of structured attachment columns (many rows). Shared under a short lock
+    // so concurrent budget managers avoid per-scan codec construction.
+    private let attachmentReferenceCodecLock = NSLock()
+    private let attachmentReferenceDecoder = JSONDecoder()
 
     public init(
         db: SQLiteDB,
@@ -507,7 +512,10 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
 
     private func durableReferencedAttachments(_ database: SQLiteDB) throws -> AttachmentReferences {
         var references = AttachmentReferences()
-        let decoder = JSONDecoder()
+        // Decode under one lock for the full structured-column scan so GC sweeps
+        // do not re-enter the codec lock per attachment row.
+        attachmentReferenceCodecLock.lock()
+        defer { attachmentReferenceCodecLock.unlock() }
         for reference in LocalStorageAttachmentReferenceRegistry.structuredColumns {
             let statement = try database.prepare(
                 "SELECT \(quoted(reference.column)) FROM \(quoted(reference.table)) WHERE \(quoted(reference.column)) IS NOT NULL;"
@@ -515,7 +523,7 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
             defer { statement.reset() }
             while try statement.step() {
                 guard let data = statement.columnBlob(0) else { continue }
-                if let attachments = try? decoder.decode([AgentAttachment].self, from: data) {
+                if let attachments = try? attachmentReferenceDecoder.decode([AgentAttachment].self, from: data) {
                     for attachment in attachments {
                         if let digest = validDigest(attachment.sha256) {
                             references.digests.insert(digest)
