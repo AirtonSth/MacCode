@@ -3709,6 +3709,11 @@ public final class JSONRPCDispatcher {
         "agent", "git", "project", "browser", "mirror",
         "notification", "private", "sync"
     ]
+    // PERF: nested-run RPC params validate subagent_node_id on every nested
+    // agent.create/send; `"-_.".unicodeScalars.contains` built a temporary
+    // view per scalar. Share one alphanumerics+`-_.` set (same membership).
+    nonisolated private static let safeNodeIdScalars = CharacterSet.alphanumerics
+        .union(CharacterSet(charactersIn: "-_."))
 
     /// Required capability for a known method, or nil when the method is not
     /// recognized (unknown -> caller must hold "*").
@@ -4149,10 +4154,7 @@ public final class JSONRPCDispatcher {
               AgentDelegationCapabilityTransport.isWellFormed(parentCapability),
               !nodeID.isEmpty,
               nodeID.utf8.count <= 128,
-              nodeID.unicodeScalars.allSatisfy({
-                  CharacterSet.alphanumerics.contains($0)
-                      || "-_.".unicodeScalars.contains($0)
-              }) else {
+              nodeID.unicodeScalars.allSatisfy({ Self.safeNodeIdScalars.contains($0) }) else {
             throw JSONRPCError.invalidParams
         }
         return AgentNestedRunContext(
