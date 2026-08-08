@@ -136,9 +136,7 @@ enum BrowserScreenshotInlineV1 {
                 ) else {
                     throw BrowserScreenshotInlineV1Error.encodingFailed
                 }
-                let sha256 = SHA256.hash(data: jpeg)
-                    .map { String(format: "%02x", $0) }
-                    .joined()
+                let sha256 = hexDigest(SHA256.hash(data: jpeg))
                 return [
                     "version": .number(Double(version)),
                     "mime_type": .string(mimeType),
@@ -151,6 +149,21 @@ enum BrowserScreenshotInlineV1 {
             }
         }
         throw BrowserScreenshotInlineV1Error.encodingFailed
+    }
+
+    /// PERF: nibble table instead of per-byte `String(format:)` so screenshot
+    /// payload digests avoid 32 formatter calls while keeping the same CryptoKit
+    /// lowercase hex contract for wire `sha256`.
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+    private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 
     private static func validateLimits(
