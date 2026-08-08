@@ -1270,14 +1270,38 @@ public struct LocalDistillRuntime: DistillRuntime {
         return (question, output)
     }
 
+    // PERF: passFailSummary / existsMissingSummary scan multi-KB tool dumps
+    // line-by-line; hasRegexMatch previously recompiled each fixed pattern via
+    // range(of:options:.regularExpression) per line/call.
+    private static let zeroFailuresRegex = try! NSRegularExpression(
+        pattern: #"\b0\s+failures?\b|\bno\s+failures?\b"#,
+        options: [.caseInsensitive]
+    )
+    private static let failureSignalRegex = try! NSRegularExpression(
+        pattern: #"\b(fail(?:ed|ure|ures)?|error|errors|crashloop|nonzero)\b|\bexit\s+[1-9][0-9]*\b|\bcode\s*=\s*[1-9][0-9]*\b"#,
+        options: [.caseInsensitive]
+    )
+    private static let passSignalRegex = try! NSRegularExpression(
+        pattern: #"\b([0-9]+\s+passed|passed|pass)\b|\b0\s+failures?\b|\bexit\s+0\b|\b(?:exists_)?code\s*=\s*0\b"#,
+        options: [.caseInsensitive]
+    )
+    private static let existsCodePresentRegex = try! NSRegularExpression(
+        pattern: #"\b(?:exists_)?code\s*=\s*-?[0-9]+\b"#,
+        options: [.caseInsensitive]
+    )
+    private static let existsCodeZeroRegex = try! NSRegularExpression(
+        pattern: #"\b(?:exists_)?code\s*=\s*0\b"#,
+        options: [.caseInsensitive]
+    )
+
     private static func passFailSummary(source: String, sourceLines: [String], lowerQuestion: String) -> String? {
         let lowerSource = source.lowercased()
         let badLines = sourceLines.filter { line in
             let lowerLine = line.lowercased()
-            if hasRegexMatch(#"\b0\s+failures?\b|\bno\s+failures?\b"#, in: lowerLine) {
+            if hasRegexMatch(zeroFailuresRegex, in: lowerLine) {
                 return false
             }
-            return hasRegexMatch(#"\b(fail(?:ed|ure|ures)?|error|errors|crashloop|nonzero)\b|\bexit\s+[1-9][0-9]*\b|\bcode\s*=\s*[1-9][0-9]*\b"#, in: lowerLine)
+            return hasRegexMatch(failureSignalRegex, in: lowerLine)
         }
         if !badLines.isEmpty {
             let shown = badLines.prefix(3)
@@ -1288,7 +1312,7 @@ public struct LocalDistillRuntime: DistillRuntime {
         if lowerSource.contains("http/1.1 200") || lowerSource.contains("http/2 200") || lowerSource.contains(" 200 ") {
             return "PASS HTTP 200"
         }
-        if hasRegexMatch(#"\b([0-9]+\s+passed|passed|pass)\b|\b0\s+failures?\b|\bexit\s+0\b|\b(?:exists_)?code\s*=\s*0\b"#, in: lowerSource) {
+        if hasRegexMatch(passSignalRegex, in: lowerSource) {
             return "PASS"
         }
         if lowerQuestion.contains("if code 0") {
@@ -1317,10 +1341,10 @@ public struct LocalDistillRuntime: DistillRuntime {
 
     private static func existsMissingSummary(source: String) -> String? {
         let lowerSource = source.lowercased()
-        guard hasRegexMatch(#"\b(?:exists_)?code\s*=\s*-?[0-9]+\b"#, in: lowerSource) else {
+        guard hasRegexMatch(existsCodePresentRegex, in: lowerSource) else {
             return nil
         }
-        return hasRegexMatch(#"\b(?:exists_)?code\s*=\s*0\b"#, in: lowerSource) ? "EXISTS" : "MISSING"
+        return hasRegexMatch(existsCodeZeroRegex, in: lowerSource) ? "EXISTS" : "MISSING"
     }
 
     private static func pathLines(from sourceLines: [String], htmlOnly: Bool) -> [String] {
@@ -1363,8 +1387,9 @@ public struct LocalDistillRuntime: DistillRuntime {
         return (try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])) != nil
     }
 
-    private static func hasRegexMatch(_ pattern: String, in text: String) -> Bool {
-        text.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
+    private static func hasRegexMatch(_ regex: NSRegularExpression, in text: String) -> Bool {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.firstMatch(in: text, options: [], range: range) != nil
     }
 
     static func boundedCommandOutput(_ output: String, maxOutputCharacters: Int) -> String {
