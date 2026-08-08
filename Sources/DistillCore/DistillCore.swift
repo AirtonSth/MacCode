@@ -736,6 +736,10 @@ private enum SR1LineParser {
     private static let aliasDeclarationRegex = try! NSRegularExpression(
         pattern: DistillSemanticPrefixes.aliasDeclarationPattern
     )
+    // PERF: segment/variable cleaning allocated CharacterSet(charactersIn:) on
+    // every multi-marker line and every alias value during SR1 humanize/expand.
+    private static let trailingDotTrimSet = CharacterSet(charactersIn: ".")
+    private static let trailingPunctuationTrimSet = CharacterSet(charactersIn: ".,;")
 
     static func parseSemanticLine(_ line: String) -> (prefix: Character, content: String)? {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -798,7 +802,7 @@ private enum SR1LineParser {
                 : line.endIndex
             let content = line[segmentStart..<segmentEnd]
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                .trimmingCharacters(in: trailingDotTrimSet)
             if !content.isEmpty {
                 segments.append((marker.prefix, content))
             }
@@ -881,7 +885,7 @@ private enum SR1LineParser {
     private static func cleanedVariableValue(_ raw: String) -> String? {
         var value = raw
             .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: ".,;"))
+            .trimmingCharacters(in: trailingPunctuationTrimSet)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if value.localizedCaseInsensitiveContains("dict:") ||
             hasRegexMatch(aliasDeclarationRegex, in: value) {
@@ -891,7 +895,7 @@ private enum SR1LineParser {
         if segments.count == 1 {
             value = segments[0].content
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-                .trimmingCharacters(in: CharacterSet(charactersIn: ".,;"))
+                .trimmingCharacters(in: trailingPunctuationTrimSet)
         }
         guard !value.isEmpty,
               !hasRegexMatch(variableKeyRegex, in: value) else {
