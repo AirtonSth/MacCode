@@ -150,7 +150,7 @@ public enum TokenSaverWaveLosslessPrepass {
     ) -> Result? {
         let reg = TokenSaverTypedCrushers.sharedRegistry
 
-        if input.range(of: #"\d+\s+failed"#, options: .regularExpression) != nil
+        if TokenSaverTypedCrushersBridge.containsFailedCountSummary(input)
             || input.lowercased().contains("pytest") {
             let failureLines = TokenSaverTypedCrushersBridge.pytestFailureLines(from: input)
             let r = TokenSaverTypedCrushers.crushPytest(

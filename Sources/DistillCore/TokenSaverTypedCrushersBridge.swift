@@ -54,12 +54,34 @@ public enum TokenSaverTypedCrushersBridge {
         activation.deactivate()
     }
 
+    // PERF: compile once — pytestFailureLines/extractRecoveryHandles/observeToolOutput
+    // scan multi-KB tool dumps; range(of:options:.regularExpression) recompiled per line/call.
+    private static let summaryFailedCountRegex = try! NSRegularExpression(
+        pattern: #"^\d+\s+failed"#
+    )
+    private static let anyFailedCountRegex = try! NSRegularExpression(
+        pattern: #"\d+\s+failed"#
+    )
+    private static let recoveryHandleRegex = try! NSRegularExpression(
+        pattern: #"\[\[rc:([^\]]+)\]\]"#
+    )
+
+    private static func matches(_ regex: NSRegularExpression, in text: String) -> Bool {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.firstMatch(in: text, options: [], range: range) != nil
+    }
+
+    /// True when `text` contains a `N failed` pytest-style summary token.
+    static func containsFailedCountSummary(_ text: String) -> Bool {
+        matches(anyFailedCountRegex, in: text)
+    }
+
     /// Extract pytest failure case lines (not the summary "N failed" line).
     public static func pytestFailureLines(from output: String) -> [String] {
         output.split(separator: "\n").map(String.init).filter { line in
             let t = line.trimmingCharacters(in: .whitespaces)
             // Case result lines, not summary
-            if t.range(of: #"^\d+\s+failed"#, options: .regularExpression) != nil { return false }
+            if matches(summaryFailedCountRegex, in: t) { return false }
             if t.contains("=====") { return false }
             return t.contains(" FAILED") || t.hasSuffix(" FAILED") || t.hasPrefix("FAILED ")
         }
@@ -67,10 +89,11 @@ public enum TokenSaverTypedCrushersBridge {
 
     /// Extract `[[rc:…]]` handles (hex SHA or production `rcv1.*` scoped form).
     public static func extractRecoveryHandles(from output: String) -> [String] {
-        let pattern = #"\[\[rc:([^\]]+)\]\]"#
-        guard let re = try? NSRegularExpression(pattern: pattern) else { return [] }
         let ns = output as NSString
-        return re.matches(in: output, range: NSRange(location: 0, length: ns.length)).compactMap { m in
+        return recoveryHandleRegex.matches(
+            in: output,
+            range: NSRange(location: 0, length: ns.length)
+        ).compactMap { m in
             guard m.numberOfRanges >= 2 else { return nil }
             let h = ns.substring(with: m.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
             return h.isEmpty ? nil : h
@@ -87,8 +110,7 @@ public enum TokenSaverTypedCrushersBridge {
     ) {
         // A release-approved binding without its encrypted original store still fails open/raw.
         if let store = activation.store(for: bindingDigest) {
-            if output.range(of: #"\d+\s+failed"#, options: .regularExpression) != nil
-                || output.contains("pytest") {
+            if containsFailedCountSummary(output) || output.contains("pytest") {
                 _ = TokenSaverTypedCrushers.crushPytest(
                     original: output,
                     failureLines: pytestFailureLines(from: output),
