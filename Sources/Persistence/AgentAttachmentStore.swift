@@ -475,8 +475,25 @@ public final class AgentAttachmentStore: @unchecked Sendable {
         try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
+    /// Lowercase SHA-256 hex for attachment CAS / blob names.
+    ///
+    /// PERF: nibble table instead of per-byte `String(format:)` so stage /
+    /// resolve / verify digests avoid 32 formatter calls while keeping the same
+    /// CryptoKit lowercase hex contract.
     private static func digest(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        hexDigest(SHA256.hash(data: data))
+    }
+
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+    private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 
     /// Streams `source` into `destination` in 1 MiB windows while hashing.
@@ -519,7 +536,7 @@ public final class AgentAttachmentStore: @unchecked Sendable {
                 throw AgentAttachmentResolverError.notReadableFile(destination.path)
             }
         }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return hexDigest(hasher.finalize())
     }
 
     private static func streamDigest(at source: URL) throws -> String {
@@ -542,7 +559,7 @@ public final class AgentAttachmentStore: @unchecked Sendable {
             if chunk.isEmpty { break }
             hasher.update(data: chunk)
         }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return hexDigest(hasher.finalize())
     }
 
     private static func isDigest(_ value: String) -> Bool {
