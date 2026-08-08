@@ -468,29 +468,24 @@ public enum AgentMessageTransport {
             maxBytes: eventContentMaxBytes
         )
         let attachments = boundedAttachments(message.attachments)
-        let bounded = AgentMessage(
-            id: message.id,
-            threadId: message.threadId,
-            role: message.role,
-            content: content,
-            createdAt: message.createdAt,
-            attachments: attachments
-        )
-        let base: JSONValue
-        if let data = try? JSONEncoder().encode(bounded),
-           let value = try? JSONDecoder().decode(JSONValue.self, from: data),
-           case .object(var object) = value {
-            object["attachments"] = attachmentReferenceValues(attachments)
-            base = .object(object)
-        } else {
-            base = .object([
-                "id": .string(message.id.value.uuidString),
-                "threadId": .string(message.threadId.value.uuidString),
-                "role": .string(message.role.rawValue),
-                "content": .string(content),
-                "attachments": .array([]),
-            ])
-        }
+        // PERF: build the wire object directly. The prior path encoded a bounded
+        // AgentMessage then immediately decoded it as JSONValue solely to swap
+        // attachments — a full JSON round-trip on every agent.message.appended
+        // (including multi-KB assistant bodies truncated only after encode).
+        // Identity fields match default Codable shape (`{value: uuid}` IDs,
+        // deferredToDate createdAt); attachments use the reference projection.
+        let base: JSONValue = .object([
+            "id": .object(["value": .string(message.id.value.uuidString)]),
+            "threadId": .object([
+                "value": .string(message.threadId.value.uuidString),
+            ]),
+            "role": .string(message.role.rawValue),
+            "content": .string(content),
+            "createdAt": .number(
+                message.createdAt.timeIntervalSinceReferenceDate
+            ),
+            "attachments": attachmentReferenceValues(attachments),
+        ])
         let payload = messageWireObject(
             base: base,
             content: content,
