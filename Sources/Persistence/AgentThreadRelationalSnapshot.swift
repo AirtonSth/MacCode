@@ -241,12 +241,20 @@ private extension AgentThreadRepository {
         return AgentThreadRelationalSnapshot(threads: threads, tables: tables)
     }
 
+    // PERF: persistUndoGCPin decoded structured attachment columns and encoded
+    // the pin payload with fresh codecs on every thread-delete undo pin. Share
+    // process-wide codecs under a short lock (JSONEncoder/Decoder are not
+    // thread-safe; concurrent deletes can pin in parallel) so multi-row scans
+    // avoid per-call construction while pin JSON is unchanged.
+    private static let undoGCPinCodecLock = NSLock()
+    private static let undoGCPinDecoder = JSONDecoder()
+    private static let undoGCPinEncoder = JSONEncoder()
+
     static func persistUndoGCPin(
         _ pin: AgentThreadUndoGCPin,
         snapshot: AgentThreadRelationalSnapshot,
         database: SQLiteDB
     ) throws {
-        let decoder = JSONDecoder()
         var attachments: [AgentAttachment] = []
         var opaqueParts: [String] = []
         let structured = Set(LocalStorageAttachmentReferenceRegistry.structuredColumns.map {
@@ -263,9 +271,18 @@ private extension AgentThreadRepository {
                 for row in table.rows {
                     guard row.indices.contains(columnIndex),
                           let data = data(from: row[columnIndex]) else { continue }
-                    if structured.contains(key),
-                       let decoded = try? decoder.decode([AgentAttachment].self, from: data) {
-                        attachments.append(contentsOf: decoded)
+                    if structured.contains(key) {
+                        undoGCPinCodecLock.lock()
+                        let decoded = try? undoGCPinDecoder.decode(
+                            [AgentAttachment].self,
+                            from: data
+                        )
+                        undoGCPinCodecLock.unlock()
+                        if let decoded {
+                            attachments.append(contentsOf: decoded)
+                        } else {
+                            opaqueParts.append(String(decoding: data, as: UTF8.self))
+                        }
                     } else {
                         opaqueParts.append(String(decoding: data, as: UTF8.self))
                     }
@@ -273,10 +290,10 @@ private extension AgentThreadRepository {
             }
         }
 
-        let attachmentsJSON = String(
-            decoding: try JSONEncoder().encode(attachments),
-            as: UTF8.self
-        )
+        undoGCPinCodecLock.lock()
+        let attachmentsData = try undoGCPinEncoder.encode(attachments)
+        undoGCPinCodecLock.unlock()
+        let attachmentsJSON = String(decoding: attachmentsData, as: UTF8.self)
         let statement = try database.prepare("""
             INSERT INTO agent_thread_undo_gc_pins(
                 owner_id, attachments_json, opaque_payload, expires_at, created_at
