@@ -1290,6 +1290,15 @@ public final class DirectHTTPServer: @unchecked Sendable {
     // Data("\r\n\r\n".utf8) on each nextHeaderTerminatorRange call.
     private nonisolated static let httpHeaderTerminator = Data([0x0d, 0x0a, 0x0d, 0x0a])
 
+    // PERF: plain-text 4xx paths (header/body limits, static-file 404, bad
+    // Content-Length / content-encoding) reallocated the same short bodies on
+    // every response. Share static Data; wire text and status codes unchanged.
+    private static let notFoundBody = Data("not found\n".utf8)
+    private static let requestHeaderTooLargeBody = Data("request header too large\n".utf8)
+    private static let requestBodyTooLargeBody = Data("request body too large\n".utf8)
+    private static let badContentLengthBody = Data("bad content length\n".utf8)
+    private static let badEncodedBodyBody = Data("bad encoded body\n".utf8)
+
     /// Pure helper: search `buf` for the CRLFCRLF header terminator starting
     /// at byte index `from`. The caller must pass
     ///   from = max(0, previousBufferCount - (terminator.count - 1))
@@ -1880,7 +1889,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             if n <= 0 { return }
             buffer.append(tmp, count: n)
             if buffer.count > Self.maxRequestHeaderBytes {
-                send(fd: fd, status: 431, contentType: "text/plain", body: Data("request header too large\n".utf8))
+                send(fd: fd, status: 431, contentType: "text/plain", body: Self.requestHeaderTooLargeBody)
                 return
             }
             headerSearchOffset = max(0, prevCount - (terminatorLength - 1))
@@ -2206,7 +2215,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         let contentLength: Int
         if let rawContentLength = headers["content-length"] {
             guard let parsed = Int(rawContentLength), parsed >= 0 else {
-                send(fd: fd, status: 400, contentType: "text/plain", body: Data("bad content length\n".utf8))
+                send(fd: fd, status: 400, contentType: "text/plain", body: Self.badContentLengthBody)
                 return
             }
             contentLength = parsed
@@ -2276,7 +2285,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     fd: fd,
                     status: 413,
                     contentType: "text/plain",
-                    body: Data("request body too large\n".utf8)
+                    body: Self.requestBodyTooLargeBody
                 )
             }
             return
@@ -2774,7 +2783,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         if Self.staticFileHTTPMethods.contains(method),
            path.hasPrefix(DirectStaticFileRegistry.routePrefix) {
             guard let file = DirectStaticFileRegistry.shared.resolve(routePath: path) else {
-                send(fd: fd, status: 404, contentType: "text/plain", body: Data("not found\n".utf8))
+                send(fd: fd, status: 404, contentType: "text/plain", body: Self.notFoundBody)
                 return
             }
             sendFile(
@@ -2839,20 +2848,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     maximumSize: requestBodyLimit
                 )
             } catch PayloadCodecError.outputTooLarge {
-                send(fd: fd, status: 413, contentType: "text/plain", body: Data("request body too large\n".utf8))
+                send(fd: fd, status: 413, contentType: "text/plain", body: Self.requestBodyTooLargeBody)
                 return
             } catch {
-                send(fd: fd, status: 400, contentType: "text/plain", body: Data("bad encoded body\n".utf8))
+                send(fd: fd, status: 400, contentType: "text/plain", body: Self.badEncodedBodyBody)
                 return
             }
             guard bodyData.count <= requestBodyLimit else {
-                send(fd: fd, status: 413, contentType: "text/plain", body: Data("request body too large\n".utf8))
+                send(fd: fd, status: 413, contentType: "text/plain", body: Self.requestBodyTooLargeBody)
                 return
             }
         }
         if bodyData.count > Self.maxRequestBodyBytes,
            (!requestedAttachmentUpload || !Self.isAttachmentUploadRPCEnvelope(bodyData)) {
-            send(fd: fd, status: 413, contentType: "text/plain", body: Data("request body too large\n".utf8))
+            send(fd: fd, status: 413, contentType: "text/plain", body: Self.requestBodyTooLargeBody)
             return
         }
         if let attachmentUploadV3Route {
@@ -5038,7 +5047,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
     ) {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
               let size = (attrs[.size] as? NSNumber)?.uint64Value else {
-            send(fd: fd, status: 404, contentType: "text/plain", body: Data("not found\n".utf8))
+            send(fd: fd, status: 404, contentType: "text/plain", body: Self.notFoundBody)
             return
         }
         let status: Int
@@ -5071,7 +5080,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         let handle: FileHandle?
         if sendBody {
             guard let opened = try? FileHandle(forReadingFrom: url) else {
-                send(fd: fd, status: 404, contentType: "text/plain", body: Data("not found\n".utf8))
+                send(fd: fd, status: 404, contentType: "text/plain", body: Self.notFoundBody)
                 return
             }
             if offset > 0 {
@@ -5079,7 +5088,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     try opened.seek(toOffset: offset)
                 } catch {
                     try? opened.close()
-                    send(fd: fd, status: 404, contentType: "text/plain", body: Data("not found\n".utf8))
+                    send(fd: fd, status: 404, contentType: "text/plain", body: Self.notFoundBody)
                     return
                 }
             }
