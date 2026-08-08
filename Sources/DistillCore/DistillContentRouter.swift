@@ -251,9 +251,15 @@ public struct DistillContentRouter: Sendable {
         return DistillRouteResult(output: output, contentType: .mixed, lossless: lossless)
     }
 
+    /// PERF: gain ratio used Character.count (O(n) grapheme walk) twice per route
+    /// decision on multi-KB tool dumps. utf8.count is O(1) and matches byte-oriented
+    /// Token Saver savings; ASCII-heavy command/build/test output is identical.
     private func meetsGain(input: String, output: String, ratio: Double) -> Bool {
-        guard input.count > 0, output.count < input.count else { return false }
-        let reduction = 1.0 - (Double(output.count) / Double(input.count))
+        let inputBytes = input.utf8.count
+        guard inputBytes > 0 else { return false }
+        let outputBytes = output.utf8.count
+        guard outputBytes < inputBytes else { return false }
+        let reduction = 1.0 - (Double(outputBytes) / Double(inputBytes))
         return reduction >= ratio
     }
 

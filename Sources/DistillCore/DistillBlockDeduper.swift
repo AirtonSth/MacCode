@@ -20,6 +20,12 @@ public enum DistillBlockDeduper {
 
     /// Collapse 2nd+ exact duplicates of blocks (paragraphs split on blank lines) that are
     /// at least `minBlockChars` long. Returns the input unchanged when nothing dedupes.
+    ///
+    /// PERF: size floor and never-inflate checks used `String.count` (O(n) grapheme
+    /// walk) per substantial block and again on the joined result. `utf8.count` is
+    /// O(1); for ASCII-heavy agent prompts (the common case) it matches Character
+    /// length exactly, and it stays consistent with Token Saver's byte-oriented
+    /// savings gates elsewhere.
     public static func dedupe(
         _ text: String,
         minBlockChars: Int = 400,
@@ -36,11 +42,13 @@ public enum DistillBlockDeduper {
         out.reserveCapacity(blocks.count)
         var deduped = 0
         var nearDeduped = 0
+        let textBytes = text.utf8.count
+        let minBlockBytes = max(0, minBlockChars)
 
         for block in blocks {
             let key = block.trimmingCharacters(in: .whitespacesAndNewlines)
             // Only dedupe substantial blocks; tiny/blank blocks pass through verbatim.
-            guard key.count >= minBlockChars else {
+            guard key.utf8.count >= minBlockBytes else {
                 out.append(block)
                 continue
             }
@@ -67,8 +75,8 @@ public enum DistillBlockDeduper {
             return Result(output: text, dedupedBlocks: 0, nearDedupedBlocks: 0)
         }
         let joined = out.joined(separator: "\n\n")
-        // Never inflate (the pointer is far shorter than a >=400-char block, so this holds).
-        return joined.count < text.count
+        // Never inflate (the pointer is far shorter than a >=400-byte block, so this holds).
+        return joined.utf8.count < textBytes
             ? Result(output: joined, dedupedBlocks: deduped, nearDedupedBlocks: nearDeduped)
             : Result(output: text, dedupedBlocks: 0, nearDedupedBlocks: 0)
     }
