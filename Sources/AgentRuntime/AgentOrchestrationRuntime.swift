@@ -67,6 +67,20 @@ public enum AgentOrchestrationReceiptLifecycleStatus: String, Codable, Sendable,
 public enum AgentDelegationCapability {
     private static let digestByteCount = 32
 
+    /// PERF: nibble table instead of per-byte `String(format:)` so capability /
+    /// policy digests avoid 32 formatter calls while keeping CryptoKit lowercase hex.
+    fileprivate static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+    fileprivate static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
+    }
+
     public static func issue() -> String {
         var generator = SystemRandomNumberGenerator()
         return (0..<32).map { _ in
@@ -75,9 +89,7 @@ public enum AgentDelegationCapability {
     }
 
     public static func sha256Hex(_ capability: String) -> String {
-        SHA256.hash(data: Data(capability.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
+        hexDigest(SHA256.hash(data: Data(capability.utf8)))
     }
 
     public static func matches(
@@ -514,8 +526,9 @@ public struct AgentOrchestrationLedgerEntry: Codable, Sendable, Equatable {
 
     public init(receipt: AgentOrchestrationAdmissionReceipt, outcome: String, finalizedAt: Date? = nil) {
         runId = receipt.runId
-        threadIdHash = SHA256.hash(data: Data(receipt.threadId.value.uuidString.utf8))
-            .map { String(format: "%02x", $0) }.joined()
+        threadIdHash = AgentDelegationCapability.hexDigest(
+            SHA256.hash(data: Data(receipt.threadId.value.uuidString.utf8))
+        )
         nodeId = receipt.nodeId
         attemptId = receipt.attemptId
         provider = receipt.provider
@@ -3017,6 +3030,6 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     }
 
     private static func sha256Hex(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        AgentDelegationCapability.hexDigest(SHA256.hash(data: data))
     }
 }
