@@ -583,13 +583,20 @@ public final class AgentAttachmentStore: @unchecked Sendable {
         return trimmed
     }
 
+    // PERF: compile once — was recompiled via range(of:options:.regularExpression)
+    // on every attachment stage/resolve/validate media-type check.
+    private static let mimeTypeRegex = try! NSRegularExpression(
+        pattern: #"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$"#
+    )
+
     private static func validatedMIMEType(_ raw: String?) throws -> String? {
         guard let raw else { return nil }
         let normalized = raw.split(separator: ";", maxSplits: 1).first.map(String.init)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() ?? ""
+        let full = NSRange(location: 0, length: (normalized as NSString).length)
         guard !normalized.isEmpty,
-              normalized.range(of: #"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$"#, options: .regularExpression) != nil else {
+              mimeTypeRegex.firstMatch(in: normalized, options: [], range: full) != nil else {
             throw AgentAttachmentResolverError.malformedReference("invalid media type")
         }
         return normalized
