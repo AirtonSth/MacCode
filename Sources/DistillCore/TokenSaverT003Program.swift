@@ -661,7 +661,9 @@ public struct TokenSaverFileFingerprintRegistry: Sendable, Equatable {
     ) -> TokenSaverFileFingerprintAction {
         let key = [scope.workspaceID, scope.projectID, scope.threadID, scope.provider, path]
             .joined(separator: "\u{1f}")
-        let fingerprint = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        // PERF: DistillSHA256 nibble hex (not String(format:)) for multi-KB/MB
+        // file fingerprints on the recovery skip path; CryptoKit-identical digest.
+        let fingerprint = DistillSHA256.hex(bytes)
         let prior = fingerprints[key]
         let protected = recentKeys.suffix(protectedRecentCount).contains(key)
         fingerprints[key] = fingerprint
