@@ -482,7 +482,7 @@ public struct ManagedDistillCLI: Sendable {
 
         guard distillAdmission() else { return failOpen() }
         guard let (data, status) = await transport(urlRequest), status == 200,
-              let response = try? JSONDecoder().decode(DistillResponse.self, from: data),
+              let response = Self.decodeResponse(DistillResponse.self, from: data),
               !response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return failOpen()
         }
@@ -611,7 +611,7 @@ public struct ManagedDistillCLI: Sendable {
 
             guard distillAdmission() else { return failOpen() }
             guard let (data, status) = await transport(urlRequest), status == 200,
-                  let response = try? JSONDecoder().decode(DistillResponse.self, from: data),
+                  let response = Self.decodeResponse(DistillResponse.self, from: data),
                   !response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 return failOpen()
             }
@@ -686,7 +686,7 @@ public struct ManagedDistillCLI: Sendable {
         var urlRequest = URLRequest(url: url)
         urlRequest.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
         guard let (data, status) = await transport(urlRequest), status == 200,
-              let snapshot = try? JSONDecoder().decode(DistillStatsSnapshot.self, from: data) else {
+              let snapshot = Self.decodeResponse(DistillStatsSnapshot.self, from: data) else {
             return (Self.statsUnavailableBody, 1)
         }
         return (Data(Self.formatStats(snapshot).utf8), 0)
@@ -706,10 +706,29 @@ public struct ManagedDistillCLI: Sendable {
         return lines.joined(separator: "\n") + "\n"
     }
 
-    private static func canonicalBody(_ request: DistillRequest) -> Data? {
+    // PERF: every managed distill POST builds a sortedKeys body for the wire
+    // payload and recovery operation IDs; responses decode DistillResponse /
+    // stats on the same path. JSONEncoder/Decoder are not thread-safe —
+    // serialize concurrent PATH-wrapper spawns under a short lock and reuse
+    // one encoder (sortedKeys unchanged) + one decoder.
+    private static let codecLock = NSLock()
+    private static let canonicalEncoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        return try? encoder.encode(request)
+        return encoder
+    }()
+    private static let responseDecoder = JSONDecoder()
+
+    private static func canonicalBody(_ request: DistillRequest) -> Data? {
+        codecLock.lock()
+        defer { codecLock.unlock() }
+        return try? canonicalEncoder.encode(request)
+    }
+
+    private static func decodeResponse<T: Decodable>(_ type: T.Type, from data: Data) -> T? {
+        codecLock.lock()
+        defer { codecLock.unlock() }
+        return try? responseDecoder.decode(type, from: data)
     }
 
     public static func recoveryContext(environment: [String: String]) -> TokenSaverRecoveryRequestContext? {
