@@ -81,12 +81,16 @@ public struct SilentCatchUpV1: Sendable, Equatable {
     }
 
     /// Only digits / optional leading sign — refuse free-form content (privacy).
+    // PERF: silent wake payloads sanitize watermark/sinceSeq/bootEpoch on every
+    // agent-completion catch-up; share one digit/sign set instead of allocating
+    // CharacterSet(charactersIn:) per field.
+    private static let numericWireScalars = CharacterSet(charactersIn: "0123456789+-")
+
     private static func sanitizeNumericString(_ raw: String?) -> String? {
         guard let raw else { return nil }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        let allowed = CharacterSet(charactersIn: "0123456789+-")
-        guard trimmed.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
+        guard trimmed.unicodeScalars.allSatisfy({ numericWireScalars.contains($0) }) else { return nil }
         return trimmed
     }
 
