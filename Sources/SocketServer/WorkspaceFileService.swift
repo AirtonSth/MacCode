@@ -757,12 +757,19 @@ private struct MagicKind {
     let kind: String?
     let mime: String?
 
+    // PERF: static magic signatures — was allocating Data("GIF…"/ "%PDF") per probe.
+    private static let gif87a: [UInt8] = [0x47, 0x49, 0x46, 0x38, 0x37, 0x61]
+    private static let gif89a: [UInt8] = [0x47, 0x49, 0x46, 0x38, 0x39, 0x61]
+    private static let pdf: [UInt8] = [0x25, 0x50, 0x44, 0x46] // %PDF
+
     init(data: Data, ext: String) {
         let bytes = [UInt8](data.prefix(16))
         if bytes.starts(with: [0x89, 0x50, 0x4E, 0x47]) { kind = "image"; mime = "image/png"; return }
         if bytes.starts(with: [0xFF, 0xD8, 0xFF]) { kind = "image"; mime = "image/jpeg"; return }
-        if data.prefix(6) == Data("GIF87a".utf8) || data.prefix(6) == Data("GIF89a".utf8) { kind = "image"; mime = "image/gif"; return }
-        if data.prefix(4) == Data("%PDF".utf8) { kind = "pdf"; mime = "application/pdf"; return }
+        if bytes.starts(with: Self.gif87a) || bytes.starts(with: Self.gif89a) {
+            kind = "image"; mime = "image/gif"; return
+        }
+        if bytes.starts(with: Self.pdf) { kind = "pdf"; mime = "application/pdf"; return }
         if data.count >= 12, data[0] == 0x52, data[1] == 0x49, data[2] == 0x46, data[3] == 0x46,
            data[8] == 0x57, data[9] == 0x45, data[10] == 0x42, data[11] == 0x50 {
             kind = "image"; mime = "image/webp"; return

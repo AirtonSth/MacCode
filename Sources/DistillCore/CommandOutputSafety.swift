@@ -3,11 +3,22 @@ import Foundation
 /// I7.5 / I7.6 / I2.9 / I10.8: safety + budget helpers for the command-output and
 /// subtype-routing paths. Pure, unit-testable.
 public enum CommandOutputSafety {
+    // PERF: compile once. omitted-region / failing-line scans ran on every head/tail
+    // lossy decision and recompiled via String.range(options: .regularExpression).
+    private static let omittedErrorRegex = try! NSRegularExpression(
+        pattern: #"\b(error|panic|exception|traceback|fatal|fail|failed|failure)\b|✕|✗"#,
+        options: [.caseInsensitive]
+    )
+    fileprivate static let failingLineRegex = try! NSRegularExpression(
+        pattern: #"\b(fail|failed|✕)\b"#,
+        options: [.caseInsensitive]
+    )
+
     /// I7.5: before accepting a head/tail summary that omits a region, scan the omitted
     /// region for failure markers — any hit refuses the summary (fall through to MLX).
     public static func omittedRegionHasError(_ omitted: String) -> Bool {
-        let pattern = #"(?i)\b(error|panic|exception|traceback|fatal|fail|failed|failure)\b|✕|✗"#
-        return omitted.range(of: pattern, options: .regularExpression) != nil
+        let range = NSRange(omitted.startIndex..<omitted.endIndex, in: omitted)
+        return omittedErrorRegex.firstMatch(in: omitted, options: [], range: range) != nil
     }
 
     /// I7.6: the intent classifier may only go default-on when its semantic parity vs the
@@ -32,9 +43,16 @@ public enum CommandOutputCharGate {
     /// Truncate to <= limit characters at a LINE boundary, but always keep failing-test
     /// lines verbatim (appended after the head) plus an explicit elision marker.
     public static func truncate(_ text: String, limit: Int) -> String {
-        guard text.count > limit else { return text }
+        // PERF: under-limit short-circuit via O(1) utf8.count (chars ≤ bytes).
+        // Over budget, only then walk graphemes for the Character-oriented budget.
+        let limit = max(0, limit)
+        if text.utf8.count <= limit { return text }
+        if text.count <= limit { return text }
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        let failing = lines.filter { $0.range(of: #"(?i)\b(fail|failed|✕)\b"#, options: .regularExpression) != nil }
+        let failing = lines.filter { line in
+            let range = NSRange(line.startIndex..<line.endIndex, in: line)
+            return CommandOutputSafety.failingLineRegex.firstMatch(in: line, options: [], range: range) != nil
+        }
         var kept: [String] = []
         var used = 0
         for line in lines {
@@ -68,7 +86,10 @@ public enum DistillLatencyBudget {
 /// fall below confidence → current path. Pure windowing.
 public enum SubtypeWindowing {
     public static func headTailWindows(_ text: String, windowChars: Int = 2048) -> (head: String, tail: String) {
-        guard text.count > windowChars * 2 else { return (text, text) }
+        // PERF: O(1) utf8 under-window short-circuit (chars ≤ bytes).
+        let budget = max(0, windowChars) * 2
+        if text.utf8.count <= budget { return (text, text) }
+        if text.count <= budget { return (text, text) }
         let head = String(text.prefix(windowChars))
         let tail = String(text.suffix(windowChars))
         return (head, tail)

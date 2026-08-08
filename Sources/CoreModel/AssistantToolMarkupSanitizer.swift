@@ -64,16 +64,23 @@ public enum AssistantToolMarkupSanitizer {
     /// Removes `uncalledToolMarker` from user-facing text. Detection keys on the
     /// marker, but the transcript must never show it — same contract as
     /// `BackgroundAwaitContinuation.strippingAwaitingMarker` for `[[RC_AWAITING]]`.
+    // PERF: fixed marker — compile once (was rebuilt on every render strip).
+    private static let uncalledToolMarkerRegex = try! NSRegularExpression(
+        pattern: NSRegularExpression.escapedPattern(for: uncalledToolMarker),
+        options: [.caseInsensitive]
+    )
+
     public static func strippingUncalledToolMarker(_ text: String) -> String {
         guard text.range(of: uncalledToolMarker, options: .caseInsensitive) != nil else {
             return text
         }
-        let pattern = NSRegularExpression.escapedPattern(for: uncalledToolMarker)
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
-            return text
-        }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        let stripped = regex.stringByReplacingMatches(in: text, range: range, withTemplate: "")
+        let stripped = uncalledToolMarkerRegex.stringByReplacingMatches(
+            in: text,
+            options: [],
+            range: range,
+            withTemplate: ""
+        )
         return tidyWhitespace(stripped)
     }
 
@@ -190,10 +197,29 @@ public enum AssistantToolMarkupSanitizer {
 
     // MARK: - Whitespace
 
+    // PERF: compile once. tidyWhitespace runs on every strip/sanitize of final
+    // assistant text; replacingOccurrences(options: .regularExpression) recompiled.
+    private static let trailingSpacesBeforeNewlineRegex = try! NSRegularExpression(
+        pattern: #"[ \t]+\n"#
+    )
+    private static let multiNewlineCollapseRegex = try! NSRegularExpression(
+        pattern: #"\n{3,}"#
+    )
+
     private static func tidyWhitespace(_ text: String) -> String {
-        text
-            .replacingOccurrences(of: #"[ \t]+\n"#, with: "\n", options: .regularExpression)
-            .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var result = text
+        for (regex, template) in [
+            (trailingSpacesBeforeNewlineRegex, "\n"),
+            (multiNewlineCollapseRegex, "\n\n")
+        ] {
+            let range = NSRange(result.startIndex..<result.endIndex, in: result)
+            result = regex.stringByReplacingMatches(
+                in: result,
+                options: [],
+                range: range,
+                withTemplate: template
+            )
+        }
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
