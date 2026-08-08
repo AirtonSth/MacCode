@@ -155,20 +155,52 @@ enum GrokACPFailureTaxonomy {
         return .nonRecoverable
     }
 
+    // PERF: compile once — sanitize runs on every Grok failure normalize and
+    // recompiled 5 NSRegularExpressions via replacingOccurrences each call.
+    private static let whitespaceCollapseRegex = try! NSRegularExpression(
+        pattern: #"\s+"#
+    )
+    private static let diagnosticRedactions: [(NSRegularExpression, String)] = [
+        (try! NSRegularExpression(
+            pattern: #"(authorization\s*[:=]\s*bearer\s+)[^\s,;]+"#,
+            options: [.caseInsensitive]
+        ), "$1<redacted>"),
+        (try! NSRegularExpression(
+            pattern: #"\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"#,
+            options: [.caseInsensitive]
+        ), "Bearer <redacted>"),
+        (try! NSRegularExpression(
+            pattern: #"\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\s*[:=]\s*[^\s,;]+"#,
+            options: [.caseInsensitive]
+        ), "$1=<redacted>"),
+        (try! NSRegularExpression(
+            pattern: #"(?:file://)?/(?:Users|home|private|var|tmp|Volumes|opt|usr|etc)/[^\s,;]+"#,
+            options: [.caseInsensitive]
+        ), "<path>"),
+    ]
+
     private static func sanitize(_ raw: String) -> String {
-        var text = raw.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+        var text = replaceAll(whitespaceCollapseRegex, in: raw, with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let redactions: [(String, String)] = [
-            (#"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+"#, "$1<redacted>"),
-            (#"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"#, "Bearer <redacted>"),
-            (#"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\s*[:=]\s*[^\s,;]+"#, "$1=<redacted>"),
-            (#"(?i)(?:file://)?/(?:Users|home|private|var|tmp|Volumes|opt|usr|etc)/[^\s,;]+"#, "<path>")
-        ]
-        for (pattern, replacement) in redactions {
-            text = text.replacingOccurrences(of: pattern, with: replacement, options: .regularExpression)
+        for (regex, template) in diagnosticRedactions {
+            text = replaceAll(regex, in: text, with: template)
         }
         if text.isEmpty { text = "Provider reported an error." }
         return String(text.prefix(800))
+    }
+
+    private static func replaceAll(
+        _ regex: NSRegularExpression,
+        in text: String,
+        with template: String
+    ) -> String {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.stringByReplacingMatches(
+            in: text,
+            options: [],
+            range: range,
+            withTemplate: template
+        )
     }
 }
 
