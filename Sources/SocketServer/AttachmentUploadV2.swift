@@ -1783,8 +1783,23 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
         return imageExtensions.contains(ext) ? .image : .file
     }
 
+    /// PERF: nibble table instead of per-byte `String(format:)` so chunk /
+    /// stream digest finalize avoids 32 formatter calls while keeping the same
+    /// CryptoKit lowercase hex contract.
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+    private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
+    }
+
     private static func digest(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        hexDigest(SHA256.hash(data: data))
     }
 
     private static func streamDigest(at url: URL) throws -> String {
@@ -1806,7 +1821,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
             if data.isEmpty { break }
             hasher.update(data: data)
         }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return hexDigest(hasher.finalize())
     }
 
     /// Stable host reference for crash-safe finalize retries. Owner scoping
@@ -1821,7 +1836,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
         ).prefix(16))
         bytes[6] = (bytes[6] & 0x0f) | 0x50
         bytes[8] = (bytes[8] & 0x3f) | 0x80
-        let hex = bytes.map { String(format: "%02x", $0) }.joined()
+        let hex = hexDigest(bytes)
         let ranges = [0..<8, 8..<12, 12..<16, 16..<20, 20..<32]
         let segments = ranges.map { range -> String in
             let start = hex.index(hex.startIndex, offsetBy: range.lowerBound)
