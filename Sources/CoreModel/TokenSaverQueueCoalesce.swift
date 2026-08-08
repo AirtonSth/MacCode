@@ -403,16 +403,23 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
         return true
     }
 
+    // PERF: compile once — was recompiled on every compact commit validation.
+    private static let compactMarkerRegex = try! NSRegularExpression(
+        pattern: #"\[\[rc:([^\]]+)\]\]"#
+    )
+
     /// Every well-formed `[[rc:handle]]` maps 1:1 to an omission; no extras, missing, empty, or malformed `[[rc:` stubs.
     public static func validateCompactMarkers(text: String, omissions: [Omission]) -> Bool {
         // Reject any `[[rc:` that is not a complete well-formed marker with non-empty handle.
-        let openCount = text.components(separatedBy: TokenSaverQueueCoalesce.handlePrefix).count - 1
-        let pattern = #"\[\[rc:([^\]]+)\]\]"#
-        guard let re = try? NSRegularExpression(pattern: pattern) else { return false }
+        // PERF: count opens without allocating a full `components(separatedBy:)` array.
+        let openCount = countOccurrences(
+            of: TokenSaverQueueCoalesce.handlePrefix,
+            in: text
+        )
         let ns = text as NSString
         let full = NSRange(location: 0, length: ns.length)
         var textHandles: [String] = []
-        re.enumerateMatches(in: text, options: [], range: full) { match, _, _ in
+        compactMarkerRegex.enumerateMatches(in: text, options: [], range: full) { match, _, _ in
             guard let match, match.numberOfRanges >= 2 else { return }
             let r = match.range(at: 1)
             if r.location != NSNotFound {
@@ -435,6 +442,18 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
             guard text.contains(o.marker) else { return false }
         }
         return true
+    }
+
+    /// Count non-overlapping occurrences of `needle` without splitting the haystack.
+    private static func countOccurrences(of needle: String, in haystack: String) -> Int {
+        guard !needle.isEmpty else { return 0 }
+        var count = 0
+        var search = haystack.startIndex..<haystack.endIndex
+        while let range = haystack.range(of: needle, range: search) {
+            count += 1
+            search = range.upperBound..<haystack.endIndex
+        }
+        return count
     }
 
     /// PERF: nibble table instead of per-byte `String(format:)` so projection
