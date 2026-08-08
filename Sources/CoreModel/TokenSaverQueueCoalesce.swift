@@ -437,6 +437,21 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
         return true
     }
 
+    /// PERF: nibble table instead of per-byte `String(format:)` so projection
+    /// commitments avoid 32 formatter calls while keeping the same CryptoKit
+    /// lowercase hex contract for durable compaction identity.
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+    private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
+    }
+
     private static func projectionCommitment(
         projection: Projection,
         compactProjectionText: String?,
@@ -453,7 +468,7 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
             appendField(Data(omission.handle.utf8))
             appendField(Data(SHA256.hash(data: omission.original)))
         }
-        return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        return hexDigest(SHA256.hash(data: bytes))
     }
 
     public func projection(for op: CompactionOperationID) -> Projection? {
