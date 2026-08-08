@@ -684,13 +684,17 @@ public enum AgentCheckpointListContract: Sendable {
     private static func boundFiles(
         _ files: [AgentTurnCheckpointFile]
     ) -> (files: [AgentTurnCheckpointFile], truncated: Bool) {
-        let encoder = JSONEncoder()
+        // PERF: freezeItem calls boundFiles for every checkpoint list candidate;
+        // reusing sizeCheckEncoder under the existing lock avoids allocating a
+        // JSONEncoder per freeze while keeping encode sizing identical.
         var kept: [AgentTurnCheckpointFile] = []
         kept.reserveCapacity(min(files.count, AgentTurnCheckpointListWireProjection.maxFiles))
         var encodedArrayBytes = 2
+        sizeCheckEncodeLock.lock()
+        defer { sizeCheckEncodeLock.unlock() }
         for file in files {
             guard kept.count < AgentTurnCheckpointListWireProjection.maxFiles,
-                  let encoded = try? encoder.encode(file) else {
+                  let encoded = try? sizeCheckEncoder.encode(file) else {
                 break
             }
             let separatorBytes = kept.isEmpty ? 0 : 1
