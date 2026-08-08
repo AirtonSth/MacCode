@@ -341,6 +341,11 @@ enum ConnectionTransportFrame: Equatable, Sendable {
     private static let dottedNameExpression = try! NSRegularExpression(
         pattern: #"[a-z][a-z0-9]*(?:\.[a-z0-9_]+)+"#
     )
+    // PERF: WS heartbeats/events and client frames encode/decode continuously.
+    // Reuse codecs under a short lock (JSONEncoder/JSONDecoder are not thread-safe).
+    private static let codecLock = NSLock()
+    private static let sharedEncoder = JSONEncoder()
+    private static let sharedDecoder = JSONDecoder()
 
     case welcome(ConnectionWelcomeFrame)
     case heartbeat(ConnectionHeartbeatFrame)
@@ -351,16 +356,17 @@ enum ConnectionTransportFrame: Equatable, Sendable {
     case snapshot(ConnectionSnapshotFrame)
 
     func encoded() throws -> Data {
-        let encoder = JSONEncoder()
+        Self.codecLock.lock()
+        defer { Self.codecLock.unlock() }
         let data: Data
         switch self {
-        case .welcome(let frame): try Self.validate(frame); data = try encoder.encode(frame)
-        case .heartbeat(let frame): try Self.validate(frame); data = try encoder.encode(frame)
-        case .closing(let frame): try Self.validate(frame); data = try encoder.encode(frame)
-        case .error(let frame): try Self.validate(frame); data = try encoder.encode(frame)
-        case .event(let frame): try Self.validate(frame); data = try encoder.encode(frame)
-        case .baselineRequired(let frame): try Self.validate(frame); data = try encoder.encode(frame)
-        case .snapshot(let frame): try Self.validate(frame); data = try encoder.encode(frame)
+        case .welcome(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
+        case .heartbeat(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
+        case .closing(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
+        case .error(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
+        case .event(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
+        case .baselineRequired(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
+        case .snapshot(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
         }
         guard data.count <= Self.maximumEncodedBytes else {
             throw ConnectionProtocolFailure.frameTooLarge
@@ -442,35 +448,36 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             throw ConnectionProtocolFailure.invalidFrame
         }
 
-        let decoder = JSONDecoder()
+        codecLock.lock()
+        defer { codecLock.unlock() }
         do {
             switch type {
             case "welcome":
-                let frame = try decoder.decode(ConnectionWelcomeFrame.self, from: data)
+                let frame = try sharedDecoder.decode(ConnectionWelcomeFrame.self, from: data)
                 try validate(frame)
                 return .welcome(frame)
             case "heartbeat":
-                let frame = try decoder.decode(ConnectionHeartbeatFrame.self, from: data)
+                let frame = try sharedDecoder.decode(ConnectionHeartbeatFrame.self, from: data)
                 try validate(frame)
                 return .heartbeat(frame)
             case "closing":
-                let frame = try decoder.decode(ConnectionClosingFrame.self, from: data)
+                let frame = try sharedDecoder.decode(ConnectionClosingFrame.self, from: data)
                 try validate(frame)
                 return .closing(frame)
             case "error":
-                let frame = try decoder.decode(ConnectionErrorFrame.self, from: data)
+                let frame = try sharedDecoder.decode(ConnectionErrorFrame.self, from: data)
                 try validate(frame)
                 return .error(frame)
             case "event":
-                let frame = try decoder.decode(ConnectionEventFrame.self, from: data)
+                let frame = try sharedDecoder.decode(ConnectionEventFrame.self, from: data)
                 try validate(frame)
                 return .event(frame)
             case "baselineRequired":
-                let frame = try decoder.decode(ConnectionBaselineRequiredFrame.self, from: data)
+                let frame = try sharedDecoder.decode(ConnectionBaselineRequiredFrame.self, from: data)
                 try validate(frame)
                 return .baselineRequired(frame)
             case "snapshot":
-                let frame = try decoder.decode(ConnectionSnapshotFrame.self, from: data)
+                let frame = try sharedDecoder.decode(ConnectionSnapshotFrame.self, from: data)
                 try validate(frame)
                 return .snapshot(frame)
             default: throw ConnectionProtocolFailure.unknownType
