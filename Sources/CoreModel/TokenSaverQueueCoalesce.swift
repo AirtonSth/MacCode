@@ -185,6 +185,11 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
         }
 
         private let lock = NSLock()
+        // PERF: load/save projection each allocated JSONDecoder/JSONEncoder.
+        // Mutations already hold `lock`, so one pair is safe and avoids
+        // per-call codec construction on the Token Saver queue-coalesce path.
+        private let decoder = JSONDecoder()
+        private let encoder = JSONEncoder()
         private let root: URL
         private let originalStore: TokenSaverLossyOriginalStoring?
         public init(directory: URL, originalStore: TokenSaverLossyOriginalStoring? = nil) throws {
@@ -210,7 +215,7 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
             // Exclusive create: withoutOverwriting fails if another writer raced in.
             do {
                 let record = DiskProjection(projection: projection, commitment: commitment)
-                try JSONEncoder().encode(record).write(to: url, options: [.withoutOverwriting])
+                try encoder.encode(record).write(to: url, options: [.withoutOverwriting])
                 return true
             } catch {
                 if let existing = loadProjectionRecordUnlocked(url: url) {
@@ -228,7 +233,7 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
         }
         private func loadProjectionRecordUnlocked(url: URL) -> DiskProjection? {
             guard let data = try? Data(contentsOf: url) else { return nil }
-            if let record = try? JSONDecoder().decode(DiskProjection.self, from: data) {
+            if let record = try? decoder.decode(DiskProjection.self, from: data) {
                 return record
             }
             // N-1 files contained only the projection raw value. They remain readable,
