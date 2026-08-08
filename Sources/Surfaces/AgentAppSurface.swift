@@ -7908,28 +7908,60 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
 
     // MARK: Tool card presentation (collapsed density)
 
+    // PERF: tool L1/L2 paint recompiled these on every row (label, summary, distill
+    // chip, shell family). Compile once; same patterns as the prior String.range /
+    // replacingOccurrences(options: .regularExpression) forms.
+    private static let bgPrefixRegex = try! NSRegularExpression(pattern: #"^\[bg\]\s*"#)
+    private static let backgroundPrefixRegex = try! NSRegularExpression(
+        pattern: #"^background:\s*"#,
+        options: [.caseInsensitive]
+    )
+    private static let trailingCallIdRegex = try! NSRegularExpression(
+        pattern: #"(?::\s*|\s+)call-[0-9a-f-]{8,}\s*$"#,
+        options: [.caseInsensitive]
+    )
+    private static let distillPipePresentRegex = try! NSRegularExpression(pattern: #"\|\s*distill\b"#)
+    private static let distillPipeWithStderrRegex = try! NSRegularExpression(
+        pattern: #"\s*2>&1\s*\|\s*distill\b[\s\S]*$"#
+    )
+    private static let distillPipeSuffixRegex = try! NSRegularExpression(
+        pattern: #"\s*\|\s*distill\b[\s\S]*$"#
+    )
+    private static let usersHomePathRegex = try! NSRegularExpression(pattern: #"/Users/[^/\s]+/"#)
+
+    private static func replacingMatches(
+        _ regex: NSRegularExpression,
+        in text: String,
+        with template: String
+    ) -> String {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.stringByReplacingMatches(
+            in: text,
+            options: [],
+            range: range,
+            withTemplate: template
+        )
+    }
+
+    private static func firstMatchRange(_ regex: NSRegularExpression, in text: String) -> Range<String.Index>? {
+        let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: nsRange),
+              let range = Range(match.range, in: text) else {
+            return nil
+        }
+        return range
+    }
+
     /// L1 title for tool rows: short tool name without full shell pipelines or call UUIDs.
     /// Does not mutate stored summary/body — pure display transform.
     static func toolDisplayLabel(for item: AssistantItem) -> String {
         var label = basePrimaryText(for: item)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         // Provider titles sometimes embed `[bg]` + the whole command.
-        label = label.replacingOccurrences(
-            of: #"^\[bg\]\s*"#,
-            with: "",
-            options: .regularExpression
-        )
-        label = label.replacingOccurrences(
-            of: #"(?i)^background:\s*"#,
-            with: "",
-            options: .regularExpression
-        )
+        label = replacingMatches(bgPrefixRegex, in: label, with: "")
+        label = replacingMatches(backgroundPrefixRegex, in: label, with: "")
         // "Get task output: call-<uuid>" / trailing call ids
-        label = label.replacingOccurrences(
-            of: #"(?i)(?::\s*|\s+)call-[0-9a-f-]{8,}\s*$"#,
-            with: "",
-            options: .regularExpression
-        )
+        label = replacingMatches(trailingCallIdRegex, in: label, with: "")
         label = label.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ":")))
         if looksLikeShellCommand(label) {
             return shellToolFamilyName(for: item)
@@ -8051,7 +8083,7 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
     /// Token Saver distill wrapper was present on the command (display chip only).
     static func toolCommandWasDistilled(for item: AssistantItem) -> Bool {
         guard let raw = rawShellCommand(for: item) ?? toolCommandPreview(for: item) else { return false }
-        return raw.range(of: #"\|\s*distill\b"#, options: .regularExpression) != nil
+        return firstMatchRange(distillPipePresentRegex, in: raw) != nil
     }
 
     /// Compact elapsed label (`12s`, `1m 53s`) from start→end timestamps.
@@ -8139,10 +8171,10 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         var elided = 0
         // Drop Token Saver distill pipes (presentation only; body stays intact).
         // Count as elided so Token Saver proof is not silently erased (chip + "+N more").
-        if let range = s.range(of: #"\s*2>&1\s*\|\s*distill\b[\s\S]*$"#, options: .regularExpression) {
+        if let range = firstMatchRange(distillPipeWithStderrRegex, in: s) {
             s = String(s[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
             elided += 1
-        } else if let range = s.range(of: #"\s*\|\s*distill\b[\s\S]*$"#, options: .regularExpression) {
+        } else if let range = firstMatchRange(distillPipeSuffixRegex, in: s) {
             s = String(s[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
             elided += 1
         }
@@ -8168,11 +8200,7 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
             s = s.replacingOccurrences(of: home, with: "~")
         }
         // Collapse `/Users/name/...` even when not exactly NSHomeDirectory (remote paths).
-        s = s.replacingOccurrences(
-            of: #"/Users/[^/\s]+/"#,
-            with: "~/",
-            options: .regularExpression
-        )
+        s = replacingMatches(usersHomePathRegex, in: s, with: "~/")
         let limit = 96
         if s.count > limit {
             s = String(s.prefix(limit - 1)) + "…"
@@ -8217,11 +8245,13 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
 
     static func shellToolFamilyName(for item: AssistantItem) -> String {
         if let summary = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !summary.isEmpty,
-           !looksLikeShellCommand(summary.replacingOccurrences(of: #"^\[bg\]\s*"#, with: "", options: .regularExpression)),
-           summary.count <= 32,
-           !summary.contains(":") {
-            return summary.replacingOccurrences(of: #"^\[bg\]\s*"#, with: "", options: .regularExpression)
+           !summary.isEmpty {
+            let withoutBg = replacingMatches(bgPrefixRegex, in: summary, with: "")
+            if !looksLikeShellCommand(withoutBg),
+               summary.count <= 32,
+               !summary.contains(":") {
+                return withoutBg
+            }
         }
         switch item.type {
         case .commandExecution: return "Shell"
