@@ -10,10 +10,18 @@ private final class PetPopoverPanel: NSPanel {
 }
 
 enum PetAccessibilityIdentifier {
+    // PERF: nibble table instead of per-byte `String(format:)` so every
+    // attention/active row identity hash avoids 32 formatter calls on paint.
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
     static func row(_ raw: String) -> String {
-        SHA256.hash(data: Data(raw.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in SHA256.hash(data: Data(raw.utf8)) {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 }
 
