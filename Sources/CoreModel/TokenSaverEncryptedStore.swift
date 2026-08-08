@@ -226,6 +226,11 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
     }
 
     private let lock = NSLock()
+    // PERF: store/readback/delete/migration/meta write each allocated a fresh
+    // JSONDecoder/JSONEncoder. Mutations already hold `lock`, so one pair is
+    // safe and avoids per-record codec construction on the Token Saver path.
+    private let decoder = JSONDecoder()
+    private let encoder = JSONEncoder()
     private let rootURL: URL
     private let metaURL: URL
     /// N-1 migration source only. New stores never persist a plaintext DEK file.
@@ -282,7 +287,9 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         self.keyReference = reference
         if meta.keyReference == nil {
             meta.keyReference = reference
-            try Self.writeMeta(meta, to: metaURL)
+            // Init is not yet complete (key still pending); one-shot encode is
+            // fine for this single open-path write.
+            try JSONEncoder().encode(meta).write(to: metaURL, options: .atomic)
         }
 
         if meta.shredActive || meta.deleteEpoch > 0 {
@@ -313,7 +320,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         meta.retentionDays = max(0, days)
-        try Self.writeMeta(meta, to: metaURL)
+        try writeMetaUnlocked(meta)
     }
 
     public var lossyAdmissionAllowed: Bool {
@@ -330,7 +337,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         defer { lock.unlock() }
         meta.migrationComplete = true
         meta.pendingMigrationIDs = []
-        try Self.writeMeta(meta, to: metaURL)
+        try writeMetaUnlocked(meta)
     }
 
     /// Shadow migration: inventory N-1 records, rewrite to N, journal progress, then seal complete.
@@ -343,18 +350,18 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         for f in files where f.pathExtension == "tsrec" {
             let id = f.deletingPathExtension().lastPathComponent
             let data = try Data(contentsOf: f)
-            let record = try JSONDecoder().decode(DiskRecord.self, from: data)
+            let record = try decoder.decode(DiskRecord.self, from: data)
             if record.formatVersion == Self.previousSchemaVersion {
                 pending.append(id)
             }
         }
         meta.pendingMigrationIDs = pending
-        try Self.writeMeta(meta, to: metaURL)
+        try writeMetaUnlocked(meta)
 
         for id in pending {
             let url = rootURL.appendingPathComponent(id + ".tsrec")
             let data = try Data(contentsOf: url)
-            let record = try JSONDecoder().decode(DiskRecord.self, from: data)
+            let record = try decoder.decode(DiskRecord.self, from: data)
             let box = try AES.GCM.SealedBox(combined: record.ciphertext)
             let plain = try AES.GCM.open(box, using: key)
             let resealed = try AES.GCM.seal(plain, using: key)
@@ -363,13 +370,13 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
                 scope: record.scope,
                 ciphertext: resealed.combined!
             )
-            try JSONEncoder().encode(upgraded).write(to: url, options: .atomic)
+            try encoder.encode(upgraded).write(to: url, options: .atomic)
             meta.pendingMigrationIDs.removeAll { $0 == id }
-            try Self.writeMeta(meta, to: metaURL)
+            try writeMetaUnlocked(meta)
         }
         meta.migrationComplete = true
         meta.pendingMigrationIDs = []
-        try Self.writeMeta(meta, to: metaURL)
+        try writeMetaUnlocked(meta)
     }
 
     public func store(id: String, plaintext: Data, scope: Scope) throws -> Envelope {
@@ -386,7 +393,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         let sealed = try AES.GCM.seal(plaintext, using: key)
         let combined = sealed.combined!
         let record = DiskRecord(formatVersion: Self.schemaVersion, scope: scope, ciphertext: combined)
-        let data = try JSONEncoder().encode(record)
+        let data = try encoder.encode(record)
         do {
             try data.write(to: fileURL(for: id), options: .withoutOverwriting)
         } catch CocoaError.fileWriteFileExists {
@@ -403,7 +410,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         let url = fileURL(for: id)
         guard FileManager.default.fileExists(atPath: url.path) else { throw StoreError.missing }
         let data = try Data(contentsOf: url)
-        let record = try JSONDecoder().decode(DiskRecord.self, from: data)
+        let record = try decoder.decode(DiskRecord.self, from: data)
         guard record.scope == expectedScope else { throw StoreError.denied }
         guard Self.readerSupports(formatVersion: record.formatVersion) else { throw StoreError.unsupportedFormat }
         let box = try AES.GCM.SealedBox(combined: record.ciphertext)
@@ -422,7 +429,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         let url = fileURL(for: id)
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         let data = try Data(contentsOf: url)
-        let record = try JSONDecoder().decode(DiskRecord.self, from: data)
+        let record = try decoder.decode(DiskRecord.self, from: data)
         guard record.scope == expectedScope else { throw StoreError.denied }
         try FileManager.default.removeItem(at: url)
     }
@@ -439,7 +446,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         meta.shredActive = true
         meta.migrationComplete = false
         // Durable tombstone before any shred of DEK/records.
-        try Self.writeMeta(meta, to: metaURL)
+        try writeMetaUnlocked(meta)
         key = nil
         try keyProvider.delete(reference: keyReference)
         if let files = try? FileManager.default.contentsOfDirectory(at: rootURL, includingPropertiesForKeys: nil) {
@@ -458,7 +465,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
             if meta.lateOutcomesRejected < .max {
                 meta.lateOutcomesRejected += 1
             }
-            try? Self.writeMeta(meta, to: metaURL)
+            try? writeMetaUnlocked(meta)
             return false
         }
         return true
@@ -475,7 +482,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
             scope: scope,
             ciphertext: sealed.combined!
         )
-        try JSONEncoder().encode(record).write(to: fileURL(for: id), options: .atomic)
+        try encoder.encode(record).write(to: fileURL(for: id), options: .atomic)
     }
 
     public func plaintextExistsOnDisk(scanning payload: Data) -> Bool {
@@ -498,9 +505,9 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         return rootURL.appendingPathComponent(safe + ".tsrec")
     }
 
-    private static func writeMeta(_ meta: Meta, to url: URL) throws {
-        let data = try JSONEncoder().encode(meta)
-        try data.write(to: url, options: .atomic)
+    private func writeMetaUnlocked(_ meta: Meta) throws {
+        let data = try encoder.encode(meta)
+        try data.write(to: metaURL, options: .atomic)
     }
 
     private static func defaultKeyReference(for root: URL) -> String {
