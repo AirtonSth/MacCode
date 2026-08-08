@@ -3071,7 +3071,10 @@ public final class AppContext {
             }
         }
         do {
-            guard try store.retrieve(capability: capability, scope: scope) == Data(stageOriginal.utf8) else {
+            // PERF: one UTF-8 materialization per payload for retrieve equality /
+            // prepareOriginal (prompts can be multi-KB/MB on store-before-loss).
+            let stageOriginalBytes = Data(stageOriginal.utf8)
+            guard try store.retrieve(capability: capability, scope: scope) == stageOriginalBytes else {
                 // Stage was prepared for this response; abandon it if content cannot be used.
                 _ = try? store.discardAbandoned(
                     capability: capability,
@@ -3092,8 +3095,9 @@ public final class AppContext {
                     freeBytes: (diskAttributes[.systemFreeSize] as? NSNumber)?.int64Value ?? 0,
                     totalBytes: (diskAttributes[.systemSize] as? NSNumber)?.int64Value ?? 0
                 )
+                let originalBytes = Data(original.utf8)
                 let preparedFull = try TokenSaverRuntimeRecoveryWorker(db: db).prepareOriginal(
-                    Data(original.utf8),
+                    originalBytes,
                     scope: scope,
                     operationID: "semantic-full-original:\(runId.value.uuidString)",
                     lane: "semantic_prose",
@@ -3103,7 +3107,7 @@ public final class AppContext {
                 guard try store.retrieve(
                     capability: preparedFull.capability,
                     scope: scope
-                ) == Data(original.utf8) else {
+                ) == originalBytes else {
                     discardProvisionals()
                     return nil
                 }
