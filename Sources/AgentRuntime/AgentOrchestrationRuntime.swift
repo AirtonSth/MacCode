@@ -1069,6 +1069,11 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     public static let defaultExternalLeaseDuration: TimeInterval = 24 * 60 * 60
     private static let maxConcurrentReservations = 32
     private static let maximumReceiptAncestorDepth = 64
+    // PERF: nested child admission validates node ids on every admit path;
+    // `"-_.".unicodeScalars.contains` built a temporary view per scalar.
+    // Share one alphanumerics+`-_.` set (same membership contract).
+    private static let safeNodeIdScalars = CharacterSet.alphanumerics
+        .union(CharacterSet(charactersIn: "-_."))
 
     public let policyDigest: String
     private let repository: AgentOrchestrationRepository
@@ -1278,9 +1283,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         guard !trimmedNodeId.isEmpty,
               trimmedNodeId.caseInsensitiveCompare("root") != .orderedSame,
               trimmedNodeId.utf8.count <= 128,
-              trimmedNodeId.unicodeScalars.allSatisfy({
-                  CharacterSet.alphanumerics.contains($0) || "-_.".unicodeScalars.contains($0)
-              }) else {
+              trimmedNodeId.unicodeScalars.allSatisfy({ Self.safeNodeIdScalars.contains($0) }) else {
             throw AgentOrchestrationAdmissionError.invalidChildAdmission("node id must be a non-root safe token")
         }
         do {
@@ -1478,9 +1481,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         guard !trimmedNodeId.isEmpty,
               trimmedNodeId.caseInsensitiveCompare("root") != .orderedSame,
               trimmedNodeId.utf8.count <= 128,
-              trimmedNodeId.unicodeScalars.allSatisfy({
-                  CharacterSet.alphanumerics.contains($0) || "-_.".unicodeScalars.contains($0)
-              }) else {
+              trimmedNodeId.unicodeScalars.allSatisfy({ Self.safeNodeIdScalars.contains($0) }) else {
             throw AgentOrchestrationAdmissionError.invalidChildAdmission("node id must be a non-root safe token")
         }
         let ownerPID = ownerProcessID ?? ProcessInfo.processInfo.processIdentifier
