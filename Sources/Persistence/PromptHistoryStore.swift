@@ -6,6 +6,12 @@ public final class PromptHistoryStore {
 
     private let repo: any SettingsKeyValueRepository
     public var onWriteError: ((Error) -> Void)?
+    // PERF: load/save allocated JSONDecoder/JSONEncoder per call. Concurrent
+    // agent surfaces share stores — serialize under a short lock and reuse one
+    // pair (wire JSON formatting unchanged).
+    private let codecLock = NSLock()
+    private let decoder = JSONDecoder()
+    private let encoder = JSONEncoder()
 
     public init(db: SQLiteDB) {
         self.repo = SettingsRepository(db: db)
@@ -17,16 +23,22 @@ public final class PromptHistoryStore {
 
     public func load(workspaceID: WorkspaceID) -> [String] {
         guard let json = try? repo.get(key(for: workspaceID)),
-              let data = json.data(using: .utf8),
-              let history = try? JSONDecoder().decode([String].self, from: data) else {
+              let data = json.data(using: .utf8) else {
             return []
         }
+        codecLock.lock()
+        let history = try? decoder.decode([String].self, from: data)
+        codecLock.unlock()
+        guard let history else { return [] }
         return Array(history.suffix(Self.limit))
     }
 
     public func save(_ history: [String], workspaceID: WorkspaceID) {
         let capped = Array(history.suffix(Self.limit))
-        guard let data = try? JSONEncoder().encode(capped),
+        codecLock.lock()
+        let data = try? encoder.encode(capped)
+        codecLock.unlock()
+        guard let data,
               let json = String(data: data, encoding: .utf8) else { return }
         do {
             try repo.set(key(for: workspaceID), json)
