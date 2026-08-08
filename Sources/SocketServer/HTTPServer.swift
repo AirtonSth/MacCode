@@ -1290,14 +1290,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
     // Data("\r\n\r\n".utf8) on each nextHeaderTerminatorRange call.
     private nonisolated static let httpHeaderTerminator = Data([0x0d, 0x0a, 0x0d, 0x0a])
 
-    // PERF: plain-text 4xx paths (header/body limits, static-file 404, bad
-    // Content-Length / content-encoding) reallocated the same short bodies on
-    // every response. Share static Data; wire text and status codes unchanged.
+    // PERF: plain-text HTTP responses reallocated the same short bodies on
+    // every reject/health/auth probe. Share static Data; wire text and status
+    // codes unchanged. (Dynamic bodies like rate-limit retry copy stay inline.)
     private static let notFoundBody = Data("not found\n".utf8)
     private static let requestHeaderTooLargeBody = Data("request header too large\n".utf8)
     private static let requestBodyTooLargeBody = Data("request body too large\n".utf8)
     private static let badContentLengthBody = Data("bad content length\n".utf8)
     private static let badEncodedBodyBody = Data("bad encoded body\n".utf8)
+    private static let unauthorizedBody = Data("unauthorized\n".utf8)
+    private static let okBody = Data("ok\n".utf8)
+    private static let badRequestBody = Data("bad request\n".utf8)
+    private static let unknownRequestBody = Data("unknown request\n".utf8)
+    private static let disabledBody = Data("disabled\n".utf8)
+    private static let tooManyOutstandingPairingBody = Data("too many outstanding pairing requests\n".utf8)
 
     /// Pure helper: search `buf` for the CRLFCRLF header terminator starting
     /// at byte index `from`. The caller must pass
@@ -2326,7 +2332,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                let auth = auth {
                 guard let token = presentedBearerToken, auth.verify(token: token) else {
                     send(fd: fd, status: 401, contentType: "text/plain",
-                         body: "unauthorized\n".data(using: .utf8)!,
+                         body: Self.unauthorizedBody,
                          additionalHeaders: ["WWW-Authenticate": wwwAuthenticateHeaderValue(scheme: "Bearer", realm: "RC2")]); return
                 }
             }
@@ -2824,7 +2830,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     challengeHeaders["Cache-Control"] = "no-store"
                 }
                 send(fd: fd, status: 401, contentType: "text/plain",
-                     body: "unauthorized\n".data(using: .utf8)!,
+                     body: Self.unauthorizedBody,
                      additionalHeaders: challengeHeaders); return
             }
         }
@@ -2907,7 +2913,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         switch (method, path) {
         case ("GET", "/healthz"):
             // Liveness only: independent of WebSocket sessions and snapshot work.
-            send(fd: fd, status: 200, contentType: "text/plain", body: "ok\n".data(using: .utf8)!)
+            send(fd: fd, status: 200, contentType: "text/plain", body: Self.okBody)
         case ("GET", "/v1/health"):
             // IMP-MAC_SERVER_SYNC-009: authenticated sync diagnostics so
             // power users / support can answer "why is sync slow". Gated by
@@ -3074,7 +3080,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // Cap simultaneously-outstanding requests per peer so one device
             // cannot flood the approve/deny queue.
             guard pairingThrottle.reserveOutstanding(peer: peer) else {
-                send(fd: fd, status: 429, contentType: "text/plain", body: "too many outstanding pairing requests\n".data(using: .utf8)!); return
+                send(fd: fd, status: 429, contentType: "text/plain", body: Self.tooManyOutstandingPairingBody); return
             }
             let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any]
             let deviceName = (obj?["device_name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Unnamed device"
@@ -3100,13 +3106,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
             guard let auth = auth,
                   let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
                   let requestId = obj["request_id"] as? String else {
-                send(fd: fd, status: 400, contentType: "text/plain", body: "bad request\n".data(using: .utf8)!); return
+                send(fd: fd, status: 400, contentType: "text/plain", body: Self.badRequestBody); return
             }
             guard let s = auth.pairingRequestStatus(requestId: requestId) else {
                 // Unknown to the auth provider: nothing left to wait for, so
                 // free the creator's slot too (idempotent no-op otherwise).
                 pairingThrottle.releaseOutstanding(requestId: requestId)
-                send(fd: fd, status: 404, contentType: "text/plain", body: "unknown request\n".data(using: .utf8)!); return
+                send(fd: fd, status: 404, contentType: "text/plain", body: Self.unknownRequestBody); return
             }
             if s.status != "pending" {
                 // Terminal (approved/denied/expired/cancelled): release the
@@ -3128,7 +3134,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
             guard let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
                   let requestId = obj["request_id"] as? String else {
-                send(fd: fd, status: 400, contentType: "text/plain", body: "bad request\n".data(using: .utf8)!); return
+                send(fd: fd, status: 400, contentType: "text/plain", body: Self.badRequestBody); return
             }
             if auth.cancelPairingRequest(requestId: requestId) {
                 // Release by request id: frees the CREATOR's slot even when the
@@ -3141,14 +3147,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 // Already terminal/unknown: the binding may still be live if no
                 // terminal-status poll ever arrived — release it (idempotent).
                 pairingThrottle.releaseOutstanding(requestId: requestId)
-                send(fd: fd, status: 404, contentType: "text/plain", body: "unknown request\n".data(using: .utf8)!)
+                send(fd: fd, status: 404, contentType: "text/plain", body: Self.unknownRequestBody)
             }
         case ("POST", "/v1/pair/redeem"):
             guard let auth = auth,
                   let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
                   let code = obj["code"] as? String,
                   let name = obj["device_name"] as? String else {
-                send(fd: fd, status: 400, contentType: "text/plain", body: "bad request\n".data(using: .utf8)!); return
+                send(fd: fd, status: 400, contentType: "text/plain", body: Self.badRequestBody); return
             }
             // Brute-force brake: refuse while the peer is locked out, count
             // wrong codes toward an exponential backoff, and reset on success.
@@ -3172,13 +3178,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 sendJSON(fd: fd, status: 410, body: pairingErrorPayload(code: "code_expired"), acceptEncoding: headers["accept-encoding"])
             }
         case ("GET", "/v1/devices"):
-            guard let auth = auth else { send(fd: fd, status: 503, contentType: "text/plain", body: "disabled\n".data(using: .utf8)!); return }
+            guard let auth = auth else { send(fd: fd, status: 503, contentType: "text/plain", body: Self.disabledBody); return }
             sendJSON(fd: fd, status: 200, body: ["devices": auth.listDevices()], acceptEncoding: headers["accept-encoding"])
         case ("POST", "/v1/devices/revoke"):
             guard let auth = auth,
                   let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
                   let id = obj["id"] as? String else {
-                send(fd: fd, status: 400, contentType: "text/plain", body: "bad request\n".data(using: .utf8)!); return
+                send(fd: fd, status: 400, contentType: "text/plain", body: Self.badRequestBody); return
             }
             auth.revokeDevice(id)
             sendJSON(fd: fd, status: 200, body: ["revoked": id], acceptEncoding: headers["accept-encoding"])
@@ -3230,7 +3236,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // gate ever regresses, without verifying the same token twice.
             guard requestBearerVerified else {
                 send(fd: fd, status: 401, contentType: "text/plain",
-                     body: "unauthorized\n".data(using: .utf8)!,
+                     body: Self.unauthorizedBody,
                      additionalHeaders: [
                         "WWW-Authenticate":
                             wwwAuthenticateHeaderValue(
@@ -3259,7 +3265,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 additionalHeaders: ["Cache-Control": "no-store"]
             )
         default:
-            send(fd: fd, status: 404, contentType: "text/plain", body: "not found\n".data(using: .utf8)!)
+            send(fd: fd, status: 404, contentType: "text/plain", body: Self.notFoundBody)
             return
         }
         // C-07: keep the TCP connection open for the next request unless the
