@@ -63,7 +63,8 @@ public final class DiffPanelViewModel: ObservableObject {
     /// Cap the rendered diff so a giant `git show` can't stall TextKit
     /// layout / spike memory (PERF-006). ~400K chars is already far
     /// beyond what is human-reviewable in one pass.
-    private static let maxDiffRenderChars = 400 * 1024
+    /// nonisolated: pure Int constant shared with the off-main cap helper.
+    nonisolated public static let maxDiffRenderChars = 400 * 1024
 
     @Published public var cwd: String
     @Published public var summary: GitSummary
@@ -270,20 +271,43 @@ public final class DiffPanelViewModel: ObservableObject {
         }
     }
 
+    /// Cap raw diff text for TextKit layout without walking the full Character
+    /// count of multi-MB inputs on the main thread (PERF).
+    ///
+    /// Contract: at most `maxChars` Characters, on a Character boundary.
+    /// When `utf8.count <= maxChars`, Character count is necessarily ≤
+    /// `maxChars` (each Character is ≥1 UTF-8 byte), so the original is
+    /// returned without a Character index scan. Over-budget paths walk only
+    /// the admitted head via `index(_:offsetBy:limitedBy:)`, never
+    /// `String.count` of the whole body (which is O(total Characters) and
+    /// stalls the main actor on multi-MB `git show` output).
+    nonisolated public static func cappedDiffSourceForRender(
+        _ raw: String,
+        maxChars: Int = DiffPanelViewModel.maxDiffRenderChars
+    ) -> (source: String, truncated: Bool) {
+        let limit = max(0, maxChars)
+        if limit == 0 {
+            return raw.isEmpty ? (raw, false) : ("", true)
+        }
+        // O(1) on native Swift strings: under-budget text never pays a
+        // Character index walk just to decide whether to truncate.
+        if raw.utf8.count <= limit {
+            return (raw, false)
+        }
+        if let end = raw.index(raw.startIndex, offsetBy: limit, limitedBy: raw.endIndex),
+           end < raw.endIndex {
+            return (String(raw[..<end]), true)
+        }
+        // Multi-byte-heavy body whose grapheme count still fits the budget.
+        return (raw, false)
+    }
+
     /// Async entry point called from `rawDiff.didSet`. Caps the source,
     /// stamps a generation token, then builds segment descriptors off the
     /// main thread. Only the matching generation writes `styledDiff` so a
     /// stale task can never overwrite a newer result (PERF-008).
     private func rebuildStyledDiffAsync() {
-        let source: String
-        let truncated: Bool
-        if rawDiff.count > Self.maxDiffRenderChars {
-            source = String(rawDiff.prefix(Self.maxDiffRenderChars))
-            truncated = true
-        } else {
-            source = rawDiff
-            truncated = false
-        }
+        let (source, truncated) = Self.cappedDiffSourceForRender(rawDiff)
         // Update truncation flag immediately (cheap, stays on main).
         diffTruncated = truncated
         styledDiffGen &+= 1

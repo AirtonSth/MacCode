@@ -35,16 +35,55 @@ final class DiffPanelOffMainBuildTests: XCTestCase {
     /// remains cheap at that boundary; this measure guard catches regressions.
     func test_performance_buildDiffSegments_atRenderCap() {
         let line = "+let value = try await client.request(path: \"/api/items\")\n"
-        let repeatCount = (400 * 1024 / line.utf8.count) + 1
+        let limit = DiffPanelViewModel.maxDiffRenderChars
+        let repeatCount = (limit / line.utf8.count) + 1
         let source = String(repeating: line, count: repeatCount)
-        let capped = String(source.prefix(400 * 1024))
+        let (capped, truncated) = DiffPanelViewModel.cappedDiffSourceForRender(source, maxChars: limit)
 
-        XCTAssertEqual(capped.count, 400 * 1024,
+        XCTAssertTrue(truncated, "over-budget source must truncate before segment build")
+        XCTAssertEqual(capped.count, limit,
                        "fixture must match the diff render cap that rebuildStyledDiffAsync uses")
 
         measure {
             _ = DiffPanelViewModel.buildDiffSegments(capped)
         }
+    }
+
+    // MARK: - Render cap (main-thread decision)
+
+    /// WHY: under-budget diffs must stay identity so reviewers never lose
+    /// trailing hunks to a false positive truncate.
+    func test_cappedDiffSourceForRender_underBudgetIsIdentity() {
+        let raw = String(repeating: "+ok\n", count: 100)
+        let (source, truncated) = DiffPanelViewModel.cappedDiffSourceForRender(raw, maxChars: 10_000)
+        XCTAssertFalse(truncated)
+        XCTAssertEqual(source, raw)
+    }
+
+    /// WHY: the Character contract must hold for multi-byte content — never
+    /// split a grapheme, and never admit more than `maxChars` Characters.
+    func test_cappedDiffSourceForRender_preservesCharacterBoundary() {
+        let raw = String(repeating: "é", count: 100) + String(repeating: "x", count: 100)
+        let (source, truncated) = DiffPanelViewModel.cappedDiffSourceForRender(raw, maxChars: 50)
+        XCTAssertTrue(truncated)
+        XCTAssertEqual(source.count, 50)
+        XCTAssertEqual(source, String(raw.prefix(50)))
+        XCTAssertEqual(String(data: Data(source.utf8), encoding: .utf8), source)
+    }
+
+    /// WHY: multi-MB over-budget inputs used to pay `String.count` of the
+    /// entire body on the main actor before prefix. The cap must stay
+    /// Character-correct while only walking the admitted head.
+    func test_cappedDiffSourceForRender_largeOverBudgetDoesNotNeedFullCount() {
+        // 2 MiB ASCII body; budget 64 KiB Characters — same as product path
+        // ratio (cap ≪ total) without the full 400K walk in unit tests.
+        let raw = String(repeating: "a", count: 2 * 1024 * 1024)
+        let limit = 64 * 1024
+        let (source, truncated) = DiffPanelViewModel.cappedDiffSourceForRender(raw, maxChars: limit)
+        XCTAssertTrue(truncated)
+        XCTAssertEqual(source.count, limit)
+        XCTAssertEqual(source.utf8.count, limit)
+        XCTAssertTrue(source.allSatisfy { $0 == "a" })
     }
 
     // MARK: - Addition lines
