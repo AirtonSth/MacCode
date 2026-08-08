@@ -2854,18 +2854,35 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         verifyInstalledPackage(at: defaultPackageURL())
     }
 
+    // PERF: every Auto admission package gate allocated JSONDecoder with
+    // iso8601 date strategy. Share one process-wide decoder under a short
+    // lock (JSONDecoder is not thread-safe; concurrent admissions can verify)
+    // so package gate checks avoid per-call codec construction.
+    private static let packageManifestDecodeLock = NSLock()
+    private static let packageManifestDecoder: JSONDecoder = {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }()
+
     public static func verifyInstalledPackage(at packageURL: URL) -> Bool {
         let pinned = AgentSkillInstaller.remoteCodeOrchestratePinnedPackage
         let canonicalPackageURL = packageURL.standardizedFileURL
         let manifestURL = canonicalPackageURL.appendingPathComponent(
             AgentSkillInstaller.remoteCodeOrchestrateManifestName
         )
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
         guard isRegularFileWithoutSymlink(manifestURL),
               isDirectoryWithoutSymlink(canonicalPackageURL),
-              let data = try? Data(contentsOf: manifestURL),
-              let manifest = try? decoder.decode(RemoteCodeOrchestrateManifest.self, from: data),
+              let data = try? Data(contentsOf: manifestURL) else {
+            return false
+        }
+        packageManifestDecodeLock.lock()
+        let decodedManifest = try? packageManifestDecoder.decode(
+            RemoteCodeOrchestrateManifest.self,
+            from: data
+        )
+        packageManifestDecodeLock.unlock()
+        guard let manifest = decodedManifest,
               manifest.schemaVersion == 1,
               manifest.managedBy == "RemoteCode",
               manifest.skillID == pinned.skillID,
