@@ -49,25 +49,51 @@ public enum AgentMessageTransport {
     }
 
     /// Longest valid UTF-8 prefix no larger than `maxBytes`.
+    ///
+    /// Truncates on a Character boundary (same contract as the prior Character-forward
+    /// scan). Implementation jumps O(1) into the UTF-8 view then walks back at most one
+    /// grapheme cluster — the softTruncateUTF8Payload pattern — so large list/get/event
+    /// envelopes do not pay O(budget) Character index traffic.
     public static func utf8Prefix(_ text: String, maxBytes: Int) -> String {
         guard maxBytes > 0 else { return "" }
         guard text.utf8.count > maxBytes else { return text }
-        var end = text.startIndex
-        var used = 0
-        while end < text.endIndex {
-            let next = text.index(after: end)
-            let scalarBytes = text[end..<next].utf8.count
-            guard used + scalarBytes <= maxBytes else { break }
-            used += scalarBytes
-            end = next
+        var utf8End = text.utf8.index(
+            text.utf8.startIndex,
+            offsetBy: maxBytes,
+            limitedBy: text.utf8.endIndex
+        ) ?? text.utf8.endIndex
+        while utf8End > text.utf8.startIndex {
+            if let end = utf8End.samePosition(in: text) {
+                return String(text[..<end])
+            }
+            text.utf8.formIndex(before: &utf8End)
         }
-        return String(text[..<end])
+        return ""
     }
 
+    /// SHA-256 hex digest of the full message body (wire `body_sha256` / digest marker).
+    ///
+    /// Hashes contiguous UTF-8 storage without a `Data(text.utf8)` intermediate, and
+    /// formats hex with a nibble table instead of per-byte `String(format:)`.
     public static func bodySHA256Hex(_ text: String) -> String {
-        SHA256.hash(data: Data(text.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
+        var hasher = SHA256()
+        var copy = text
+        copy.withUTF8 { buffer in
+            hasher.update(bufferPointer: UnsafeRawBufferPointer(buffer))
+        }
+        return hexDigest(hasher.finalize())
+    }
+
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+    private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 
     /// Test/in-memory router adapter. Production AppCommandRouter overrides
