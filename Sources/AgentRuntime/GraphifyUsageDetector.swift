@@ -112,25 +112,54 @@ public enum GraphifyUsageDetector {
         return out
     }
 
+    // PERF: compile once — matchSegment runs on every shell segment of tool
+    // payloads when Graphify usage is detected; env strip recompiled in a loop
+    // and the graphify subcommand pattern recompiled per segment.
+    private static let quotedEnvAssignmentRegex = try! NSRegularExpression(
+        pattern: #"^[A-Za-z_][A-Za-z0-9_]*="[^"]*"\s+"#
+    )
+    private static let bareEnvAssignmentRegex = try! NSRegularExpression(
+        pattern: #"^[A-Za-z_][A-Za-z0-9_]*=\S+\s+"#
+    )
+    private static let graphifySubcommandRegex = try! NSRegularExpression(
+        pattern: #"^(?:/usr/bin/env\s+)?(?:\S+/)?graphify(?:y)?\s+(query|path|explain)(?:\s|$)"#,
+        options: [.caseInsensitive]
+    )
+
     /// Segment must start with optional env/path then graphify + allowed subcommand.
     static func matchSegment(_ segment: String) -> String? {
         // Strip leading env assignments: FOO=bar graphify query …
         var s = segment
-        while let range = s.range(of: #"^[A-Za-z_][A-Za-z0-9_]*="[^"]*"\s+"#, options: .regularExpression)
-                ?? s.range(of: #"^[A-Za-z_][A-Za-z0-9_]*=\S+\s+"#, options: .regularExpression) {
-            s = String(s[range.upperBound...])
+        while let prefix = leadingEnvAssignmentPrefix(in: s) {
+            s = String(s[prefix...])
         }
         // Optional path prefix: /usr/bin/env, absolute path, ./graphify
         // Capture the token after graphify.
-        let pattern = #"(?i)^(?:/usr/bin/env\s+)?(?:\S+/)?graphify(?:y)?\s+(query|path|explain)(?:\s|$)"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
         let ns = s as NSString
-        guard let match = regex.firstMatch(in: s, range: NSRange(location: 0, length: ns.length)),
+        guard let match = graphifySubcommandRegex.firstMatch(
+            in: s,
+            options: [],
+            range: NSRange(location: 0, length: ns.length)
+        ),
               match.numberOfRanges >= 2,
               let r = Range(match.range(at: 1), in: s) else {
             return nil
         }
         let sub = String(s[r]).lowercased()
         return allowedSubcommands.contains(sub) ? sub : nil
+    }
+
+    /// End index of a leading `KEY=value ` env assignment, if present.
+    private static func leadingEnvAssignmentPrefix(in text: String) -> String.Index? {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        for regex in [quotedEnvAssignmentRegex, bareEnvAssignmentRegex] {
+            guard let match = regex.firstMatch(in: text, options: [], range: range),
+                  match.range.location == 0,
+                  let end = Range(match.range, in: text)?.upperBound else {
+                continue
+            }
+            return end
+        }
+        return nil
     }
 }
