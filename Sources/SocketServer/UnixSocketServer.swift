@@ -364,6 +364,13 @@ public final class UnixSocketServer: @unchecked Sendable {
             outbound.finish()
             releaseClient(fd)
         }
+        // PERF: reuse codecs for the connection lifetime. Client read/respond
+        // stays on this queue; EventBus stream deliveries run on a different
+        // serial queue, so keep a dedicated stream encoder (JSONEncoder is not
+        // thread-safe across concurrent encode calls).
+        let decoder = JSONDecoder()
+        let clientEncoder = JSONEncoder()
+        let streamEncoder = JSONEncoder()
         var buffer = Data()
         var tmp = [UInt8](repeating: 0, count: 4096)
         while isRunning(generation: generation) {
@@ -378,10 +385,21 @@ public final class UnixSocketServer: @unchecked Sendable {
                 let lineData = buffer.subdata(in: buffer.startIndex..<nlIdx)
                 buffer.removeSubrange(buffer.startIndex...nlIdx)
                 if lineData.isEmpty { continue }
+                // Single decode per line (avoids a second JSONDecoder pass in
+                // respond for ordinary request/response traffic).
+                let req: JSONRPCRequest
+                do {
+                    req = try decoder.decode(JSONRPCRequest.self, from: lineData)
+                } catch {
+                    let resp = JSONRPCResponse(id: nil, error: .parseError)
+                    if let data = Self.encode(response: resp, encoder: clientEncoder) {
+                        _ = outbound.enqueue(data)
+                    }
+                    continue
+                }
                 // Special-case events.stream so this connection becomes a
                 // long-lived event feed instead of a single request/response.
-                if let req = try? JSONDecoder().decode(JSONRPCRequest.self, from: lineData),
-                   req.method == "events.stream" {
+                if req.method == "events.stream" {
                     let since: Int64 = req.params?["after_seq"]?.intValue.map(Int64.init) ?? 0
                     if let existing = streamSubscription.removeCurrent() {
                         EventBus.shared.unsubscribe(existing)
@@ -392,13 +410,12 @@ public final class UnixSocketServer: @unchecked Sendable {
                     let ack = JSONRPCResponse(id: req.id, result: .object([
                         "subscribed": .bool(true)
                     ]))
-                    guard let ackData = encode(response: ack),
+                    guard let ackData = Self.encode(response: ack, encoder: clientEncoder),
                           outbound.enqueue(ackData) == .accepted else {
                         _ = outbound.terminate(errorData: nil, closingData: nil, reason: "queue_full")
                         return
                     }
-                    let id = EventBus.shared.subscribe(since: since) { [weak self] ev in
-                        guard let self else { return }
+                    let id = EventBus.shared.subscribe(since: since) { ev in
                         guard !streamSubscription.isCleanupRequested else { return }
                         let payload: [String: JSONValue] = [
                             "seq": .number(Double(ev.seq)),
@@ -407,7 +424,7 @@ public final class UnixSocketServer: @unchecked Sendable {
                             "payload": ev.payload
                         ]
                         let resp = JSONRPCResponse(id: req.id, result: .object(payload))
-                        guard let data = self.encode(response: resp) else { return }
+                        guard let data = Self.encode(response: resp, encoder: streamEncoder) else { return }
                         switch outbound.enqueue(data) {
                         case .accepted, .closed:
                             break
@@ -422,67 +439,59 @@ public final class UnixSocketServer: @unchecked Sendable {
                     continue
                 }
                 guard respond(
-                    lineData: lineData,
+                    req: req,
                     outbound: outbound,
-                    generation: generation
+                    generation: generation,
+                    encoder: clientEncoder
                 ) else { return }
             }
         }
     }
 
     private func respond(
-        lineData: Data,
+        req: JSONRPCRequest,
         outbound: WebSocketOutboundQueue,
-        generation: UInt64
+        generation: UInt64,
+        encoder: JSONEncoder
     ) -> Bool {
-        let decoder = JSONDecoder()
-        do {
-            let req = try decoder.decode(JSONRPCRequest.self, from: lineData)
-            guard beginRequest(generation: generation) else {
-                EventBus.shared.publish(kind: "diagnostic.unix_request_limit", payload: .object([
-                    "max_active_requests": .number(Double(activeRequestLimit))
-                ]))
-                return false
-            }
-            let semaphore = DispatchSemaphore(value: 0)
-            let slot = LockedUnixResponse()
-            // The CommandRouting conformance is @preconcurrency, so the
-            // compiler will not insert an actor hop when the dispatcher
-            // calls a main-actor method. An explicit @MainActor Task keeps
-            // every synchronous AppKit/SwiftUI call on the main actor.
-            let task = Task { @MainActor in
-                defer { self.endRequest() }
-                let response: JSONRPCResponse
-                if let localRequestHandlerForTesting {
-                    response = await localRequestHandlerForTesting(req)
-                } else {
-                    response = await dispatcher.dispatchUnixSocket(req)
-                }
-                slot.value = response
-                semaphore.signal()
-            }
-            let requestTimeout = req.method == "agent.message.send"
-                ? agentMessageSendRequestTimeout
-                : localRequestTimeout
-            guard semaphore.wait(timeout: .now() + requestTimeout) == .success else {
-                task.cancel()
-                EventBus.shared.publish(kind: "diagnostic.unix_request_timeout", payload: .object([
-                    "method": .string(req.method),
-                    "timeout_seconds": .number(Self.timeoutSeconds(requestTimeout))
-                ]))
-                return false
-            }
-            if let resp = slot.value, let data = encode(response: resp) {
-                _ = outbound.enqueue(data)
-            }
-            return true
-        } catch {
-            let resp = JSONRPCResponse(id: nil, error: .parseError)
-            if let data = encode(response: resp) {
-                _ = outbound.enqueue(data)
-            }
-            return true
+        guard beginRequest(generation: generation) else {
+            EventBus.shared.publish(kind: "diagnostic.unix_request_limit", payload: .object([
+                "max_active_requests": .number(Double(activeRequestLimit))
+            ]))
+            return false
         }
+        let semaphore = DispatchSemaphore(value: 0)
+        let slot = LockedUnixResponse()
+        // The CommandRouting conformance is @preconcurrency, so the
+        // compiler will not insert an actor hop when the dispatcher
+        // calls a main-actor method. An explicit @MainActor Task keeps
+        // every synchronous AppKit/SwiftUI call on the main actor.
+        let task = Task { @MainActor in
+            defer { self.endRequest() }
+            let response: JSONRPCResponse
+            if let localRequestHandlerForTesting {
+                response = await localRequestHandlerForTesting(req)
+            } else {
+                response = await dispatcher.dispatchUnixSocket(req)
+            }
+            slot.value = response
+            semaphore.signal()
+        }
+        let requestTimeout = req.method == "agent.message.send"
+            ? agentMessageSendRequestTimeout
+            : localRequestTimeout
+        guard semaphore.wait(timeout: .now() + requestTimeout) == .success else {
+            task.cancel()
+            EventBus.shared.publish(kind: "diagnostic.unix_request_timeout", payload: .object([
+                "method": .string(req.method),
+                "timeout_seconds": .number(Self.timeoutSeconds(requestTimeout))
+            ]))
+            return false
+        }
+        if let resp = slot.value, let data = Self.encode(response: resp, encoder: encoder) {
+            _ = outbound.enqueue(data)
+        }
+        return true
     }
 
     private static func timeoutSeconds(_ timeout: DispatchTimeInterval) -> Double {
@@ -502,8 +511,8 @@ public final class UnixSocketServer: @unchecked Sendable {
         }
     }
 
-    private func encode(response: JSONRPCResponse) -> Data? {
-        guard var data = try? JSONEncoder().encode(response) else { return nil }
+    private static func encode(response: JSONRPCResponse, encoder: JSONEncoder) -> Data? {
+        guard var data = try? encoder.encode(response) else { return nil }
         data.append(0x0A)
         return data
     }
