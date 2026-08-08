@@ -966,8 +966,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
+    // PERF: sync.snapshot maps every workspace/surface/thread through
+    // connectionSnapshotJSON. JSONEncoder is not thread-safe — share one under
+    // a short lock instead of allocating per row.
+    private static let connectionSnapshotEncodeLock = NSLock()
+    private static let connectionSnapshotEncoder = JSONEncoder()
+
     nonisolated private static func connectionSnapshotJSON<T: Encodable>(_ value: T) -> JSONValue {
-        guard let data = try? JSONEncoder().encode(value),
+        connectionSnapshotEncodeLock.lock()
+        let data = try? connectionSnapshotEncoder.encode(value)
+        connectionSnapshotEncodeLock.unlock()
+        guard let data,
               let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
             return .null
         }
