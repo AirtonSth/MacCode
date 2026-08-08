@@ -623,6 +623,21 @@ public final class ScheduledTaskStore: @unchecked Sendable {
         string.flatMap(dates.date(from:)).map(ScheduledTaskOccurrenceCalculator.canonicalInstant)
     }
 
+    // PERF: safeErrorSummary recompiled three secret-redaction patterns via
+    // replacingOccurrences(options: .regularExpression) on every run error write.
+    // Compile once; same templates as the prior string forms.
+    private static let errorSummaryRedactionRegexes: [NSRegularExpression] = [
+        try! NSRegularExpression(
+            pattern: #"(?i)(api[_-]?key|access[_-]?token|token|secret|password)\s*[:=]\s*[^\s,;]+"#
+        ),
+        try! NSRegularExpression(
+            pattern: #"(?i)bearer\s+[A-Za-z0-9._~+/-]+"#
+        ),
+        try! NSRegularExpression(
+            pattern: #"\bsk-[A-Za-z0-9_-]{8,}\b"#
+        ),
+    ]
+
     private static func safeErrorSummary(_ value: String?, removingPrompt prompt: String? = nil) -> String? {
         guard let value else { return nil }
         var oneLine = value.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -632,13 +647,14 @@ public final class ScheduledTaskStore: @unchecked Sendable {
         if let normalizedPrompt, !normalizedPrompt.isEmpty {
             oneLine = oneLine.replacingOccurrences(of: normalizedPrompt, with: "[REDACTED PROMPT]")
         }
-        let patterns = [
-            "(?i)(api[_-]?key|access[_-]?token|token|secret|password)\\s*[:=]\\s*[^\\s,;]+",
-            "(?i)bearer\\s+[A-Za-z0-9._~+/-]+",
-            "\\bsk-[A-Za-z0-9_-]{8,}\\b"
-        ]
-        for pattern in patterns {
-            oneLine = oneLine.replacingOccurrences(of: pattern, with: "[REDACTED]", options: .regularExpression)
+        for regex in errorSummaryRedactionRegexes {
+            let range = NSRange(oneLine.startIndex..<oneLine.endIndex, in: oneLine)
+            oneLine = regex.stringByReplacingMatches(
+                in: oneLine,
+                options: [],
+                range: range,
+                withTemplate: "[REDACTED]"
+            )
         }
         return String(oneLine.prefix(500))
     }
