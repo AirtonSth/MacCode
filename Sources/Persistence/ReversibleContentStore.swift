@@ -24,12 +24,34 @@ public final class ReversibleContentStore: @unchecked Sendable {
     /// Lowercased hex SHA-256 of `data` — the content-addressed handle. Identical
     /// bytes always produce the same handle, so storing twice is a no-op upsert and
     /// repeated blocks (dedup, P4) collapse to one row.
+    ///
+    /// PERF: nibble-table hex instead of per-byte `String(format:)` so large
+    /// store-before-loss payloads (tool outputs) avoid 32 formatter calls per digest.
     public static func handle(for data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        hexDigest(SHA256.hash(data: data))
     }
 
+    /// Same handle as `handle(for: Data(text.utf8))` without an intermediate
+    /// `Data` copy — hashes contiguous UTF-8 storage (Token Saver store-before-loss).
     public static func handle(for text: String) -> String {
-        handle(for: Data(text.utf8))
+        var hasher = SHA256()
+        var copy = text
+        copy.withUTF8 { buffer in
+            hasher.update(bufferPointer: UnsafeRawBufferPointer(buffer))
+        }
+        return hexDigest(hasher.finalize())
+    }
+
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+    private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 
     /// Extract a bare handle from a raw handle or a `[[rc:...]]` marker, normalized.

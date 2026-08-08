@@ -1,5 +1,7 @@
 import XCTest
 @testable import Persistence
+import CryptoKit
+import Foundation
 
 final class ReversibleContentStoreTests: XCTestCase {
     private func makeDB() throws -> SQLiteDB {
@@ -49,6 +51,27 @@ final class ReversibleContentStoreTests: XCTestCase {
         let h = ReversibleContentStore.handle(for: "hello")
         // SHA-256("hello") well-known vector.
         XCTAssertEqual(h, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+    }
+
+    /// WHY: String and Data entry points must stay byte-identical after the
+    /// contiguous-UTF-8 + nibble-table path; CAS / [[rc:handle]] recovery keys
+    /// on a stable content-addressed digest across both call sites.
+    func test_handle_stringAndDataPathsMatchCryptoKit() {
+        let samples = ["", "hello", "plan-notes-v1-✅-", String(repeating: "N", count: 8192)]
+        for sample in samples {
+            let data = Data(sample.utf8)
+            let expected = SHA256.hash(data: data)
+                .map { String(format: "%02x", $0) }
+                .joined()
+            XCTAssertEqual(ReversibleContentStore.handle(for: sample), expected,
+                           "String handle must match CryptoKit for \(sample.prefix(20))…")
+            XCTAssertEqual(ReversibleContentStore.handle(for: data), expected,
+                           "Data handle must match CryptoKit for \(sample.prefix(20))…")
+            XCTAssertEqual(
+                ReversibleContentStore.handle(for: sample),
+                ReversibleContentStore.handle(for: data)
+            )
+        }
     }
 
     func test_retrieveUnknownHandleReturnsNil() throws {
