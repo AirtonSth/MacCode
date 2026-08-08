@@ -416,6 +416,21 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
         return .installed
     }
 
+    /// PERF: nibble table instead of per-byte `String(format:)` so multi-MB/GB
+    /// model file verify finalizes without 32 formatter calls; CryptoKit-identical
+    /// lowercase hex for install validation caches.
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+    private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
+    }
+
     public static func sha256Hex(url: URL) throws -> String {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
@@ -428,8 +443,7 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
             return true
         }) {}
 
-        let digest = hasher.finalize()
-        return digest.map { String(format: "%02x", $0) }.joined()
+        return hexDigest(hasher.finalize())
     }
 
     public static func safePathComponent(_ value: String) -> String {
