@@ -3264,6 +3264,11 @@ public final class AgentRunRepository: @unchecked Sendable {
     private var globalRetentionScheduled = false
     private var globalRetentionRequested = false
     private var globalRetentionCompletions: [@Sendable (Bool) -> Void] = []
+    // PERF: listLatestStreamEvents / listStreamEventsByIds allocated JSONDecoder
+    // on every agent reload/replay read (up to hundreds of events). Shared under
+    // a short lock so concurrent thread reads avoid per-call codec construction.
+    private let streamEventCodecLock = NSLock()
+    private let streamEventDecoder = JSONDecoder()
     public init(db: SQLiteDB) { self.db = db }
 
     private func boundedStreamRow(kind: String, payloadJSON: String) -> (kind: String, payloadJSON: String) {
@@ -4218,8 +4223,7 @@ public final class AgentRunRepository: @unchecked Sendable {
         try st.bind(1, threadId.value.uuidString)
         try st.bind(2, Int64(limit))
         if let maxPayloadBytes { try st.bind(3, max(1, maxPayloadBytes)) }
-        var events: [AssistantEvent] = []
-        let decoder = JSONDecoder()
+        var payloads: [(eventId: Int64, data: Data)] = []
         while try st.step() {
             let eventId = st.columnInt64(1)
             guard let json = st.columnText(0),
@@ -4229,15 +4233,9 @@ public final class AgentRunRepository: @unchecked Sendable {
                 }
                 continue
             }
-            do {
-                events.append(try decoder.decode(AssistantEvent.self, from: data))
-            } catch {
-                if strictDecoding {
-                    throw PersistenceDataError.corruptStreamEvent("row \(eventId) has an invalid AssistantEvent payload")
-                }
-            }
+            payloads.append((eventId, data))
         }
-        return events
+        return try decodeStreamEventPayloads(payloads, strictDecoding: strictDecoding)
     }
 
     // MARK: - agent.thread.read response_version=1 (metadata-first)
@@ -4348,8 +4346,7 @@ public final class AgentRunRepository: @unchecked Sendable {
         for (offset, id) in ids.enumerated() {
             try st.bind(Int32(offset + 1), id)
         }
-        var events: [AssistantEvent] = []
-        let decoder = JSONDecoder()
+        var payloads: [(eventId: Int64, data: Data)] = []
         while try st.step() {
             let eventId = st.columnInt64(0)
             guard let json = st.columnText(1),
@@ -4359,11 +4356,27 @@ public final class AgentRunRepository: @unchecked Sendable {
                 }
                 continue
             }
+            payloads.append((eventId, data))
+        }
+        return try decodeStreamEventPayloads(payloads, strictDecoding: strictDecoding)
+    }
+
+    private func decodeStreamEventPayloads(
+        _ payloads: [(eventId: Int64, data: Data)],
+        strictDecoding: Bool
+    ) throws -> [AssistantEvent] {
+        streamEventCodecLock.lock()
+        defer { streamEventCodecLock.unlock() }
+        var events: [AssistantEvent] = []
+        events.reserveCapacity(payloads.count)
+        for payload in payloads {
             do {
-                events.append(try decoder.decode(AssistantEvent.self, from: data))
+                events.append(try streamEventDecoder.decode(AssistantEvent.self, from: payload.data))
             } catch {
                 if strictDecoding {
-                    throw PersistenceDataError.corruptStreamEvent("row \(eventId) has an invalid AssistantEvent payload")
+                    throw PersistenceDataError.corruptStreamEvent(
+                        "row \(payload.eventId) has an invalid AssistantEvent payload"
+                    )
                 }
             }
         }
