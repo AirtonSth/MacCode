@@ -1286,6 +1286,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return .chunk(uploadId: rawUploadId, index: index)
     }
 
+    // PERF: HTTP header scans hit this every read; avoid allocating
+    // Data("\r\n\r\n".utf8) on each nextHeaderTerminatorRange call.
+    private nonisolated static let httpHeaderTerminator = Data([0x0d, 0x0a, 0x0d, 0x0a])
+
     /// Pure helper: search `buf` for the CRLFCRLF header terminator starting
     /// at byte index `from`. The caller must pass
     ///   from = max(0, previousBufferCount - (terminator.count - 1))
@@ -1296,10 +1300,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
         in buf: Data,
         from: Int
     ) -> Range<Data.Index>? {
-        let terminator = Data("\r\n\r\n".utf8)
         let searchStart = buf.index(buf.startIndex, offsetBy: from)
         let slice = buf[searchStart...]
-        guard let r = slice.range(of: terminator) else { return nil }
+        guard let r = slice.range(of: httpHeaderTerminator) else { return nil }
         return r
     }
 
