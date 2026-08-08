@@ -107,6 +107,19 @@ public indirect enum JSONValue: Codable, Sendable, Equatable {
 
 public extension JSONValue {
     static func obj(_ pairs: [String: JSONValue]) -> JSONValue { .object(pairs) }
+
+    /// Decode already-encoded JSON bytes into `JSONValue`.
+    ///
+    /// PERF: `JSONSerialization` + `from(_:)` avoids a full Codable walk via
+    /// `JSONDecoder` for receipt/event-log reloads (same structure as
+    /// connectionSnapshotJSON / workspaceCreatedPayload).
+    static func decode(from data: Data) -> JSONValue? {
+        guard let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+            return nil
+        }
+        return JSONValue.from(object)
+    }
+
     static func from(_ any: Any?) -> JSONValue {
         guard let any, !(any is NSNull) else { return .null }
         if let s = any as? String { return .string(s) }

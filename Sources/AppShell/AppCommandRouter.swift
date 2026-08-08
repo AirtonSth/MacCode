@@ -4237,7 +4237,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return CommandReceiptPersistenceGateway.shared.sync {
             guard let json = try? repo.get(method: methodCopy, clientRequestId: clientRequestIdCopy),
                   let data = json.data(using: .utf8) else { return nil as JSONValue? }
-            return try? JSONDecoder().decode(JSONValue.self, from: data)
+            return JSONValue.decode(from: data)
         }
     }
 
@@ -4340,13 +4340,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             )
         }
         return try persisted.map { event in
-            guard let payloadData = event.payloadJSON.data(using: .utf8) else {
+            guard let payloadData = event.payloadJSON.data(using: .utf8),
+                  let payload = JSONValue.decode(from: payloadData) else {
                 throw JSONRPCError.internalError
             }
             return EventBus.Event(
                 seq: event.seq,
                 kind: event.kind,
-                payload: try JSONDecoder().decode(JSONValue.self, from: payloadData),
+                payload: payload,
                 ts: event.createdAt.timeIntervalSince1970
             )
         }
@@ -6860,7 +6861,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     private func decodeFilesState(_ raw: String?) -> [String: JSONValue]? {
         guard let raw, let data = raw.data(using: .utf8),
-              case .object(let state) = try? JSONDecoder().decode(JSONValue.self, from: data) else {
+              case .object(let state) = JSONValue.decode(from: data) else {
             return nil
         }
         return state

@@ -413,7 +413,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                 let rows = try log.read(since: 0, limit: 256)
                 let events = rows.compactMap { row -> EventBus.Event? in
                     guard let data = row.payloadJSON.data(using: .utf8),
-                          let val = try? JSONDecoder().decode(JSONValue.self, from: data)
+                          let val = JSONValue.decode(from: data)
                     else { return nil }
                     return EventBus.Event(seq: row.seq, kind: row.kind, payload: val, ts: Date().timeIntervalSince1970)
                 }

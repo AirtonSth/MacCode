@@ -1228,7 +1228,7 @@ public final class JSONRPCDispatcher {
             )
         case .committed(let resultJSON):
             guard let data = resultJSON.data(using: .utf8),
-                  let result = try? JSONDecoder().decode(JSONValue.self, from: data) else {
+                  let result = JSONValue.decode(from: data) else {
                 return receiptFailure(
                     id: req.id,
                     code: -32092,
