@@ -638,6 +638,12 @@ public final class PetController {
     }
 
     /// Drop provider-runtime telemetry ("claude runtime: …", dotted method ids).
+    // PERF: dotted-id scan used CharacterSet.alphanumerics.union(…) inside
+    // allSatisfy — allocating a new set for every scalar. Share one set for
+    // live-activity stream previews.
+    private static let providerRuntimeTokenScalars = CharacterSet.alphanumerics
+        .union(CharacterSet(charactersIn: "._-"))
+
     nonisolated static func isProviderRuntimeNoise(_ raw: String) -> Bool {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return true }
@@ -645,9 +651,7 @@ public final class PetController {
         if lower.contains(" runtime: ") { return true }
         if lower.hasPrefix("runtime:") { return true }
         if trimmed.contains("."), !trimmed.contains(" "),
-           trimmed.unicodeScalars.allSatisfy({
-               CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-")).contains($0)
-           }) {
+           trimmed.unicodeScalars.allSatisfy({ providerRuntimeTokenScalars.contains($0) }) {
             return true
         }
         return false
