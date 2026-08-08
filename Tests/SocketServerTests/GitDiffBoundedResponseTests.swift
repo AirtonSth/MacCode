@@ -126,6 +126,48 @@ final class GitDiffBoundedResponseTests: XCTestCase {
                        "byte clip mid-line may keep total_lines == returned lines while truncated")
     }
 
+    // MARK: Under/over budget perf contracts
+
+    /// WHY: under-budget patches must stay identity (no false truncate) and keep
+    /// honest total_lines so the client does not show a truncation affordance
+    /// for a complete window.
+    func testBound_underBudgetIsIdentityWithHonestTotalLines() {
+        let text = (0..<50).map { "line-\($0)" }.joined(separator: "\n")
+        let window = GitDiffBoundedResponse.bound(
+            text: text,
+            maxBytes: 64 * 1024,
+            maxLines: 500
+        )
+        XCTAssertEqual(window.text, text)
+        XCTAssertFalse(window.truncated)
+        XCTAssertEqual(window.totalLines, 50)
+        // Same storage — fast path must not copy.
+        XCTAssertTrue(window.text == text)
+    }
+
+    /// WHY: multi-MB over-budget inputs used to finish a full unicodeScalars
+    /// walk just for total_lines. Caps must still clip the admitted head and
+    /// report the original line count without admitting the tail.
+    func testBound_largeOverBudgetClipsHeadAndReportsTotalLines() {
+        // ~2 MiB of short ASCII lines; checkpoint-style window 128 KiB / 500 lines.
+        let line = "+let value = try await client.request(path: \"/api/items\")\n"
+        let repeatCount = (2 * 1024 * 1024 / line.utf8.count) + 1
+        let text = String(repeating: line, count: repeatCount)
+        let maxBytes = GitDiffBoundedResponse.checkpointDefaultMaxBytes
+        let maxLines = GitDiffBoundedResponse.checkpointDefaultMaxLines
+        let window = GitDiffBoundedResponse.bound(
+            text: text,
+            maxBytes: maxBytes,
+            maxLines: maxLines
+        )
+        XCTAssertTrue(window.truncated)
+        XCTAssertLessThanOrEqual(window.text.utf8.count, maxBytes)
+        XCTAssertLessThanOrEqual(GitDiffBoundedResponse.lineCount(window.text), maxLines)
+        XCTAssertEqual(window.totalLines, GitDiffBoundedResponse.lineCount(text))
+        XCTAssertGreaterThan(window.totalLines, maxLines)
+        XCTAssertEqual(String(data: Data(window.text.utf8), encoding: .utf8), window.text)
+    }
+
     // MARK: Param parse fail-closed
 
     func testParseOptInCaps_absentIsLegacy() throws {

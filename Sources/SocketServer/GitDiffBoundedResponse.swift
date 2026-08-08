@@ -72,54 +72,66 @@ public enum GitDiffBoundedResponse: Sendable {
         return (maxBytes, maxLines)
     }
 
-    /// Prefix of `text` at most both caps. One Unicode-scalar walk; no per-line String map.
+    /// Prefix of `text` at most both caps. No per-line String map.
     ///
     /// `truncated` is true exactly when any original text was omitted. A byte cap
     /// may clip mid-line so `truncated` can be true while the returned line count
     /// still equals `total_lines`. Never splits a UTF-8 scalar.
+    ///
+    /// PERF: under-budget patches take one UTF-8 LF scan (`lineCount`) and return
+    /// the original string — no unicodeScalars walk and no copy. Over-budget paths
+    /// walk unicodeScalars only until the admitted head, then finish `total_lines`
+    /// with the same O(n) UTF-8 LF scan instead of scanning the tail as scalars.
     public static func bound(text: String, maxBytes: Int, maxLines: Int) -> Window {
         guard !text.isEmpty else {
             return Window(text: "", truncated: false, totalLines: 0)
         }
 
+        // Fast path: whole body fits the byte budget. A single UTF-8 LF scan
+        // decides identity vs line-only truncation (common for under-window
+        // checkpoint diffs on a weak link).
+        if text.utf8.count <= maxBytes {
+            let totalLines = lineCount(text)
+            if totalLines <= maxLines {
+                return Window(text: text, truncated: false, totalLines: totalLines)
+            }
+            // Byte budget ok; still need a line-bounded prefix (below).
+        }
+
         var end = text.startIndex
         var bytes = 0
         var newlinesInPrefix = 0
-        var totalNewlines = 0
-        var prefixDone = false
         var i = text.unicodeScalars.startIndex
 
         while i < text.unicodeScalars.endIndex {
             let scalar = text.unicodeScalars[i]
             let next = text.unicodeScalars.index(after: i)
             let isNewline = scalar.value == 0x0A
-            if isNewline { totalNewlines += 1 }
 
-            if !prefixDone {
-                // Unicode-scalar indices are valid String indices. Counting the
-                // scalar's encoded width avoids both grapheme-cluster surprises
-                // (Swift treats CRLF as one Character) and intermediate strings.
-                let cost: Int
-                switch scalar.value {
-                case ...0x7F: cost = 1
-                case ...0x7FF: cost = 2
-                case ...0xFFFF: cost = 3
-                default: cost = 4
-                }
-                // Non-empty prefix line count = 1 + newline count (matches iOS split).
-                let projectedLines = 1 + newlinesInPrefix + (isNewline ? 1 : 0)
-                if bytes + cost > maxBytes || projectedLines > maxLines {
-                    prefixDone = true
-                } else {
-                    bytes += cost
-                    if isNewline { newlinesInPrefix += 1 }
-                    end = next
-                }
+            // Unicode-scalar indices are valid String indices. Counting the
+            // scalar's encoded width avoids both grapheme-cluster surprises
+            // (Swift treats CRLF as one Character) and intermediate strings.
+            let cost: Int
+            switch scalar.value {
+            case ...0x7F: cost = 1
+            case ...0x7FF: cost = 2
+            case ...0xFFFF: cost = 3
+            default: cost = 4
             }
+            // Non-empty prefix line count = 1 + newline count (matches iOS split).
+            let projectedLines = 1 + newlinesInPrefix + (isNewline ? 1 : 0)
+            if bytes + cost > maxBytes || projectedLines > maxLines {
+                // Prefix complete — do not walk the tail as unicodeScalars.
+                break
+            }
+            bytes += cost
+            if isNewline { newlinesInPrefix += 1 }
+            end = next
             i = next
         }
 
-        let totalLines = 1 + totalNewlines
+        // UTF-8 LF scan of the full body (same contract as lineCount / iOS).
+        let totalLines = lineCount(text)
         if end == text.endIndex {
             return Window(text: text, truncated: false, totalLines: totalLines)
         }
