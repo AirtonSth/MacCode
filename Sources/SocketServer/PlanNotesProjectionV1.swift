@@ -210,10 +210,13 @@ public enum PlanNotesProjectionV1: Sendable {
     ///
     /// WHY mid-page digest check: reassembly across pages must not splice two
     /// revisions of the same thread's notes into one client buffer.
+    ///
+    /// PERF: no full-body `Data(notes.utf8)` — total via O(1) `utf8.count`,
+    /// digest via contiguous UTF-8 hash, and the admitted window is decoded
+    /// from a `withUTF8` slice. Multi-MiB notes only allocate the returned page.
     public static func page(notes: String, caps: Caps) throws -> Page {
-        let data = Data(notes.utf8)
-        let total = data.count
-        let digest = contentDigest(of: data)
+        let total = notes.utf8.count
+        let digest = contentDigest(of: notes)
 
         if let expected = caps.expectedContentDigest, expected != digest {
             throw JSONRPCError(
@@ -230,11 +233,9 @@ public enum PlanNotesProjectionV1: Sendable {
         guard caps.offsetBytes <= total else {
             throw JSONRPCError.invalidParams
         }
-        guard isUTF8Boundary(data, offset: caps.offsetBytes) else {
-            throw JSONRPCError.invalidParams
-        }
 
         if caps.offsetBytes == total {
+            // EOF cursor — no buffer walk needed.
             return Page(
                 notes: "",
                 totalBytes: total,
@@ -248,27 +249,36 @@ public enum PlanNotesProjectionV1: Sendable {
             )
         }
 
-        var end = min(caps.offsetBytes + caps.maxBytes, total)
-        // `end` is exclusive: a valid cut is EOF or the start of a scalar
-        // (not a continuation). Walking only from end-1 would leave a lead
-        // byte of the next scalar in the slice and produce invalid UTF-8.
-        while end > caps.offsetBytes && end < total && isUTF8Continuation(data[end]) {
-            end -= 1
-        }
-        // If the budget cannot hold even one scalar, still emit one so
-        // pagination always makes progress (at most +3 bytes over max_bytes).
-        if end == caps.offsetBytes {
-            end = nextScalarEnd(data, from: caps.offsetBytes)
-        }
+        var copy = notes
+        var chunk = ""
+        var returned = 0
+        var boundaryOK = false
+        copy.withUTF8 { buffer in
+            guard isUTF8Boundary(buffer, offset: caps.offsetBytes) else { return }
+            boundaryOK = true
 
-        let slice = data[caps.offsetBytes..<end]
-        guard let chunk = String(data: slice, encoding: .utf8) else {
-            // Authoritative notes are always valid UTF-8 from Swift String storage;
-            // a failed decode here means a cursor bug, not bad user data.
+            var end = min(caps.offsetBytes + caps.maxBytes, total)
+            // `end` is exclusive: a valid cut is EOF or the start of a scalar
+            // (not a continuation). Walking only from end-1 would leave a lead
+            // byte of the next scalar in the slice and produce invalid UTF-8.
+            while end > caps.offsetBytes && end < total && isUTF8Continuation(buffer[end]) {
+                end -= 1
+            }
+            // If the budget cannot hold even one scalar, still emit one so
+            // pagination always makes progress (at most +3 bytes over max_bytes).
+            if end == caps.offsetBytes {
+                end = nextScalarEnd(buffer, from: caps.offsetBytes)
+            }
+
+            // Authoritative notes are always valid UTF-8 from Swift String storage.
+            let slice = buffer[caps.offsetBytes..<end]
+            chunk = String(decoding: slice, as: UTF8.self)
+            returned = slice.count
+        }
+        guard boundaryOK else {
             throw JSONRPCError.invalidParams
         }
 
-        let returned = slice.count
         let next = caps.offsetBytes + returned
         let hasMore = next < total
         return Page(
@@ -378,9 +388,21 @@ public enum PlanNotesProjectionV1: Sendable {
     // MARK: - UTF-8 cursor helpers
 
     public static func isUTF8Boundary(_ data: Data, offset: Int) -> Bool {
-        if offset == 0 || offset == data.count { return true }
-        guard offset > 0, offset < data.count else { return false }
-        return !isUTF8Continuation(data[offset])
+        data.withUnsafeBytes { raw in
+            let buffer = raw.bindMemory(to: UInt8.self)
+            return isUTF8Boundary(buffer, offset: offset)
+        }
+    }
+
+    /// Same contract as the `Data` overload; used by `page` / `utf8Prefix` on
+    /// contiguous UTF-8 storage without an intermediate `Data` copy.
+    public static func isUTF8Boundary(
+        _ buffer: UnsafeBufferPointer<UInt8>,
+        offset: Int
+    ) -> Bool {
+        if offset == 0 || offset == buffer.count { return true }
+        guard offset > 0, offset < buffer.count else { return false }
+        return !isUTF8Continuation(buffer[offset])
     }
 
     public static func isUTF8Continuation(_ byte: UInt8) -> Bool {
@@ -389,8 +411,18 @@ public enum PlanNotesProjectionV1: Sendable {
 
     /// End index (exclusive) of the UTF-8 scalar that starts at `from`.
     public static func nextScalarEnd(_ data: Data, from: Int) -> Int {
-        guard from < data.count else { return from }
-        let lead = data[from]
+        data.withUnsafeBytes { raw in
+            let buffer = raw.bindMemory(to: UInt8.self)
+            return nextScalarEnd(buffer, from: from)
+        }
+    }
+
+    public static func nextScalarEnd(
+        _ buffer: UnsafeBufferPointer<UInt8>,
+        from: Int
+    ) -> Int {
+        guard from < buffer.count else { return from }
+        let lead = buffer[from]
         let width: Int
         if lead < 0x80 {
             width = 1
@@ -401,7 +433,7 @@ public enum PlanNotesProjectionV1: Sendable {
         } else {
             width = 4
         }
-        return min(from + width, data.count)
+        return min(from + width, buffer.count)
     }
 
     /// Longest UTF-8-safe prefix of `text` with at most `maxBytes` raw bytes.
