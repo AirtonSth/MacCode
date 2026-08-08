@@ -34,6 +34,83 @@ public protocol TokenSaverAccountUsageRefreshing: Sendable {
 }
 
 public enum AssistantAccountUsageParser {
+    // PERF: Claude/Grok account-usage refresh recompiled many NSRegularExpressions
+    // via String.range/replacingOccurrences(.regularExpression) and built
+    // ISO8601DateFormatter per parse. Compile/format once; matching is thread-safe,
+    // formatters are serialized under a short lock.
+    private static let oscSequenceRegex = try! NSRegularExpression(
+        pattern: "\u{001B}\\][^\u{0007}\u{001B}]*(?:\u{0007}|\u{001B}\\\\)"
+    )
+    private static let csiSequenceRegex = try! NSRegularExpression(
+        pattern: "\u{001B}\\[[0-?]*[ -/]*[@-~]"
+    )
+    private static let controlCharRegex = try! NSRegularExpression(
+        pattern: "[\u{0000}-\u{0008}\u{000B}\u{000C}\u{000E}-\u{001F}\u{007F}]"
+    )
+    private static let multiHorizontalSpaceRegex = try! NSRegularExpression(pattern: #"[ \t]{2,}"#)
+    private static let whitespaceCollapseRegex = try! NSRegularExpression(pattern: #"\s+"#)
+
+    // WHY full-match + first-number (not capture group 1): patterns use
+    // greedy [^\n\r%] runs that leave only the last digit in group 1;
+    // original String.range path extracted the first number in the match.
+    private static let numberCaptureRegex = try! NSRegularExpression(pattern: #"[0-9]+(?:\.[0-9]+)?"#)
+
+    private static let claudeScreenWeeklyRegexes: [NSRegularExpression] = [
+        try! NSRegularExpression(
+            pattern: #"(?is)Current\s*week\s*\(\s*all\s*models\s*\).*?([0-9]+(?:\.[0-9]+)?)\s*%\s*used"#
+        ),
+        try! NSRegularExpression(
+            pattern: #"(?is)Weekly\s*limits?.*?all\s*models.*?([0-9]+(?:\.[0-9]+)?)\s*%\s*used"#
+        ),
+        try! NSRegularExpression(
+            pattern: #"(?is)(?:weekly|subscription|usage)[^\n\r%]{0,120}([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:used|utilized)"#
+        ),
+    ]
+    private static let claudeScreenCompactWeeklyRegexes: [NSRegularExpression] = [
+        try! NSRegularExpression(
+            pattern: #"(?is)Currentweek\(allmodels\).*?([0-9]+(?:\.[0-9]+)?)%used"#
+        ),
+        try! NSRegularExpression(
+            pattern: #"(?is)Weeklylimits?.*?allmodels.*?([0-9]+(?:\.[0-9]+)?)%used"#
+        ),
+    ]
+    private static let claudeScreenSessionRegex = try! NSRegularExpression(
+        pattern: #"(?is)Current\s*session.*?([0-9]+(?:\.[0-9]+)?)\s*%\s*used"#
+    )
+    private static let claudeScreenCompactSessionRegex = try! NSRegularExpression(
+        pattern: #"(?is)Curre(?:n)?tsession.*?([0-9]+(?:\.[0-9]+)?)%used"#
+    )
+    private static let claudeLooseWeeklyRegexes: [NSRegularExpression] = [
+        // Modern one-line: "Current week (all models): 54% used · resets ..."
+        try! NSRegularExpression(
+            pattern: #"(?i)current\s*week\s*\(\s*all\s*models\s*\)[^\n\r%]{0,40}([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:used|utilized)"#
+        ),
+        try! NSRegularExpression(
+            pattern: #"(?i)(?:weekly|subscription|usage)[^\n\r%]{0,80}([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:used|utilized)"#
+        ),
+        try! NSRegularExpression(
+            pattern: #"(?i)([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:used|utilized)[^\n\r]{0,80}(?:weekly|subscription|usage|week)"#
+        ),
+        try! NSRegularExpression(
+            pattern: #"(?i)(?:weekly|subscription|usage)[^\n\r%]{0,80}([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:remaining|left)"#
+        ),
+    ]
+    private static let claudeLooseSessionRegex = try! NSRegularExpression(
+        pattern: #"(?i)current\s*session[^\n\r%]{0,40}([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:used|utilized)"#
+    )
+
+    private static let iso8601Lock = NSLock()
+    private static let iso8601Fractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    private static let iso8601WholeSecond: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
     public static func codex(from payload: [String: Any]) -> AssistantAccountUsage? {
         let rateLimitsByLimitId = payload["rateLimitsByLimitId"] as? [String: Any]
             ?? payload["rate_limits_by_limit_id"] as? [String: Any]
@@ -95,24 +172,23 @@ public enum AssistantAccountUsageParser {
     /// and after screen was preferred from text that became infinite recursion
     /// (signal 10 crash on empty / partial / remaining-only strings).
     private static func claudeUsageLoosePatterns(_ text: String) -> AssistantAccountUsage? {
-        let patterns = [
-            // Modern one-line: "Current week (all models): 54% used · resets ..."
-            #"(?i)current\s*week\s*\(\s*all\s*models\s*\)[^\n\r%]{0,40}([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:used|utilized)"#,
-            #"(?i)(?:weekly|subscription|usage)[^\n\r%]{0,80}([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:used|utilized)"#,
-            #"(?i)([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:used|utilized)[^\n\r]{0,80}(?:weekly|subscription|usage|week)"#,
-            #"(?i)(?:weekly|subscription|usage)[^\n\r%]{0,80}([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:remaining|left)"#
-        ]
-        for pattern in patterns {
-            guard let match = text.range(of: pattern, options: .regularExpression) else { continue }
-            let matched = String(text[match])
-            guard let numberRange = matched.range(of: #"[0-9]+(?:\.[0-9]+)?"#, options: .regularExpression),
-                  let percent = Double(matched[numberRange]) else { continue }
+        let nsText = text as NSString
+        let fullRange = NSRange(location: 0, length: nsText.length)
+        for regex in claudeLooseWeeklyRegexes {
+            guard let match = regex.firstMatch(in: text, options: [], range: fullRange) else { continue }
+            let matched = nsText.substring(with: match.range)
+            let matchedNS = matched as NSString
+            let matchedRange = NSRange(location: 0, length: matchedNS.length)
+            guard let numberMatch = numberCaptureRegex.firstMatch(
+                in: matched,
+                options: [],
+                range: matchedRange
+            ),
+            let percent = Double(matchedNS.substring(with: numberMatch.range)) else { continue }
             let lower = matched.lowercased()
             let used = (lower.contains("remaining") || lower.contains("left")) ? max(0, 100 - percent) : percent
             // Also pick up session % when the modern one-liner is present.
-            let session = firstPercent(in: text, patterns: [
-                #"(?i)current\s*session[^\n\r%]{0,40}([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:used|utilized)"#
-            ])
+            let session = firstPercent(in: text, regexes: [claudeLooseSessionRegex])
             return AssistantAccountUsage(
                 provider: .claude,
                 weeklyUsedPercent: used,
@@ -214,42 +290,22 @@ public enum AssistantAccountUsageParser {
 
     private static func parseISO8601Milliseconds(_ value: String?) -> Int64? {
         guard let value, !value.isEmpty else { return nil }
-        let withFraction = ISO8601DateFormatter()
-        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = withFraction.date(from: value) {
-            return Int64(date.timeIntervalSince1970 * 1000)
-        }
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        return plain.date(from: value).map { Int64($0.timeIntervalSince1970 * 1000) }
+        iso8601Lock.lock()
+        let date = iso8601Fractional.date(from: value) ?? iso8601WholeSecond.date(from: value)
+        iso8601Lock.unlock()
+        return date.map { Int64($0.timeIntervalSince1970 * 1000) }
     }
 
     public static func claudeUsageScreen(_ text: String) -> AssistantAccountUsage? {
         let normalized = terminalPlainText(text)
-        let compacted = normalized.replacingOccurrences(
-            of: #"\s+"#,
-            with: "",
-            options: .regularExpression
-        )
-        let weeklyPatterns = [
-            #"(?is)Current\s*week\s*\(\s*all\s*models\s*\).*?([0-9]+(?:\.[0-9]+)?)\s*%\s*used"#,
-            #"(?is)Weekly\s*limits?.*?all\s*models.*?([0-9]+(?:\.[0-9]+)?)\s*%\s*used"#,
-            #"(?is)(?:weekly|subscription|usage)[^\n\r%]{0,120}([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:used|utilized)"#
-        ]
-        let compactedWeeklyPatterns = [
-            #"(?is)Currentweek\(allmodels\).*?([0-9]+(?:\.[0-9]+)?)%used"#,
-            #"(?is)Weeklylimits?.*?allmodels.*?([0-9]+(?:\.[0-9]+)?)%used"#
-        ]
-        guard let weeklyUsed = firstPercent(in: normalized, patterns: weeklyPatterns)
-            ?? firstPercent(in: compacted, patterns: compactedWeeklyPatterns) else {
+        let compacted = replaceAll(whitespaceCollapseRegex, in: normalized, with: "")
+        guard let weeklyUsed = firstPercent(in: normalized, regexes: claudeScreenWeeklyRegexes)
+            ?? firstPercent(in: compacted, regexes: claudeScreenCompactWeeklyRegexes) else {
             // Loose patterns only — never claudeUsageText (would re-enter this path).
             return claudeUsageLoosePatterns(normalized)
         }
-        let currentSessionUsed = firstPercent(in: normalized, patterns: [
-            #"(?is)Current\s*session.*?([0-9]+(?:\.[0-9]+)?)\s*%\s*used"#
-        ]) ?? firstPercent(in: compacted, patterns: [
-            #"(?is)Curre(?:n)?tsession.*?([0-9]+(?:\.[0-9]+)?)%used"#
-        ])
+        let currentSessionUsed = firstPercent(in: normalized, regexes: [claudeScreenSessionRegex])
+            ?? firstPercent(in: compacted, regexes: [claudeScreenCompactSessionRegex])
         return AssistantAccountUsage(
             provider: .claude,
             weeklyUsedPercent: weeklyUsed,
@@ -297,40 +353,40 @@ public enum AssistantAccountUsageParser {
         return resetMilliseconds(from: window["resetsAt"] ?? window["resets_at"])
     }
 
-    private static func firstPercent(in text: String, patterns: [String]) -> Double? {
-        for pattern in patterns {
-            guard let match = text.range(of: pattern, options: .regularExpression) else { continue }
-            let matched = String(text[match])
-            guard let numberRange = matched.range(of: #"[0-9]+(?:\.[0-9]+)?"#, options: .regularExpression) else {
-                continue
-            }
-            return Double(matched[numberRange])
+    private static func firstPercent(in text: String, regexes: [NSRegularExpression]) -> Double? {
+        let nsText = text as NSString
+        let fullRange = NSRange(location: 0, length: nsText.length)
+        for regex in regexes {
+            guard let match = regex.firstMatch(in: text, options: [], range: fullRange) else { continue }
+            let matched = nsText.substring(with: match.range)
+            let matchedNS = matched as NSString
+            let matchedRange = NSRange(location: 0, length: matchedNS.length)
+            guard let numberMatch = numberCaptureRegex.firstMatch(
+                in: matched,
+                options: [],
+                range: matchedRange
+            ),
+            let percent = Double(matchedNS.substring(with: numberMatch.range)) else { continue }
+            return percent
         }
         return nil
     }
 
+    private static func replaceAll(
+        _ regex: NSRegularExpression,
+        in text: String,
+        with template: String
+    ) -> String {
+        let range = NSRange(location: 0, length: (text as NSString).length)
+        return regex.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: template)
+    }
+
     private static func terminalPlainText(_ text: String) -> String {
-        var result = text.replacingOccurrences(
-            of: "\u{001B}\\][^\u{0007}\u{001B}]*(?:\u{0007}|\u{001B}\\\\)",
-            with: " ",
-            options: .regularExpression
-        )
-        result = result.replacingOccurrences(
-            of: "\u{001B}\\[[0-?]*[ -/]*[@-~]",
-            with: " ",
-            options: .regularExpression
-        )
+        var result = replaceAll(oscSequenceRegex, in: text, with: " ")
+        result = replaceAll(csiSequenceRegex, in: result, with: " ")
         result = result.replacingOccurrences(of: "\r", with: "\n")
-        result = result.replacingOccurrences(
-            of: "[\u{0000}-\u{0008}\u{000B}\u{000C}\u{000E}-\u{001F}\u{007F}]",
-            with: " ",
-            options: .regularExpression
-        )
-        result = result.replacingOccurrences(
-            of: #"[ \t]{2,}"#,
-            with: " ",
-            options: .regularExpression
-        )
+        result = replaceAll(controlCharRegex, in: result, with: " ")
+        result = replaceAll(multiHorizontalSpaceRegex, in: result, with: " ")
         return result
     }
 
@@ -342,7 +398,10 @@ public enum AssistantAccountUsageParser {
         if let int = Int64(string) {
             return int < 10_000_000_000 ? int * 1000 : int
         }
-        return ISO8601DateFormatter().date(from: string).map { Int64($0.timeIntervalSince1970 * 1000) }
+        iso8601Lock.lock()
+        let date = iso8601WholeSecond.date(from: string)
+        iso8601Lock.unlock()
+        return date.map { Int64($0.timeIntervalSince1970 * 1000) }
     }
 
     private static func windowMinutes(from snapshot: [String: Any]) -> Int? {
