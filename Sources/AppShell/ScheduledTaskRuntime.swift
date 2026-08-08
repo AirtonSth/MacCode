@@ -586,9 +586,18 @@ public final class ScheduledTaskExecutor {
         return wrapper.path
     }
 
+    // PERF: runnerFilename recompiled `[^A-Za-z0-9._-]` via
+    // replacingOccurrences(options: .regularExpression) on every cross-user
+    // sudo wrapper install. ASCII CharacterSet membership matches that class
+    // without a per-call regex compile.
+    private static let runnerFilenameAllowedScalars = CharacterSet(
+        charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
+    )
+
     nonisolated static func runnerFilename(taskID: UUID, providerInstanceID: String) -> String {
-        let suffix = providerInstanceID
-            .replacingOccurrences(of: "[^A-Za-z0-9._-]", with: "-", options: .regularExpression)
+        let suffix = String(providerInstanceID.unicodeScalars.map {
+            runnerFilenameAllowedScalars.contains($0) ? Character($0) : Character("-")
+        })
         return "\(taskID.uuidString.lowercased())-\(suffix).sh"
     }
 
