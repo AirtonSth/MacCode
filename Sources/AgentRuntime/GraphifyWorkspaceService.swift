@@ -20,6 +20,12 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     public var fseventsDebounce: TimeInterval = 2.5
 
     private let lock = NSLock()
+    // PERF: ensure/refresh probes load+save fingerprint JSON on the hot path
+    // (every send + FSEvents debounce). JSONEncoder/Decoder are not thread-
+    // safe — share one pair under a short lock (file I/O stays outside).
+    private let fingerprintCodecLock = NSLock()
+    private let fingerprintEncoder = JSONEncoder()
+    private let fingerprintDecoder = JSONDecoder()
     private var stickyByWorkspace: [String: String] = [:]
     private var schedules: [String: RefreshSchedule] = [:]
     private var watchers: [String: GraphifyCheckoutWatcher] = [:]
@@ -289,14 +295,20 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     private func loadFingerprint(_ checkout: GraphifyCheckout) -> Fingerprint? {
         let url = fingerprintPath(for: checkout)
         guard let data = try? Data(contentsOf: url) else { return nil }
-        return try? JSONDecoder().decode(Fingerprint.self, from: data)
+        fingerprintCodecLock.lock()
+        let decoded = try? fingerprintDecoder.decode(Fingerprint.self, from: data)
+        fingerprintCodecLock.unlock()
+        return decoded
     }
 
     private func saveFingerprint(_ checkout: GraphifyCheckout, head: String?) {
         let fp = Fingerprint(head: head, displayRoot: checkout.displayRoot, builtAt: Date().timeIntervalSince1970)
         let url = fingerprintPath(for: checkout)
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if let data = try? JSONEncoder().encode(fp) {
+        fingerprintCodecLock.lock()
+        let data = try? fingerprintEncoder.encode(fp)
+        fingerprintCodecLock.unlock()
+        if let data {
             try? data.write(to: url, options: .atomic)
         }
     }
