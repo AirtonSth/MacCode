@@ -305,6 +305,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private let sshPasswordStore: SSHPasswordStoring
     private let sshCommandRunner: SSHCommandRunner
     private let agentAppReadGateway: AgentAppReadGateway
+    // PERF: publishQueuedMessage + notificationList constructed ISO8601DateFormatter
+    // per date field. Construction is expensive; share one MainActor-isolated formatter.
+    private let iso8601Formatter = ISO8601DateFormatter()
     private var providerProbeCache: [ProviderProbeCacheKey: ProviderProbeCapabilities] = [:]
     private var providerUpdateLocks = Set<ProviderProbeCacheKey>()
     private let providerProbeCacheTTL: TimeInterval = 30
@@ -483,8 +486,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             "attachments": jsonValue(message.attachments.compactMap(AgentAttachmentReference.init)),
             "interaction_mode": .string(message.interactionMode.rawValue),
             "position": .number(Double(message.position)),
-            "created_at": .string(ISO8601DateFormatter().string(from: message.createdAt)),
-            "updated_at": .string(ISO8601DateFormatter().string(from: message.updatedAt))
+            "created_at": .string(iso8601Formatter.string(from: message.createdAt)),
+            "updated_at": .string(iso8601Formatter.string(from: message.updatedAt))
         ]
         if let durableState = message.durableState {
             payload["durable_state"] = .string(durableState.rawValue)
@@ -5959,13 +5962,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             var d: [String: JSONValue] = [
                 "id": .string(n.id),
                 "title": .string(n.title),
-                "created_at": .string(ISO8601DateFormatter().string(from: n.createdAt))
+                "created_at": .string(iso8601Formatter.string(from: n.createdAt))
             ]
             if let b = n.body { d["body"] = .string(b) }
             if let c = n.category { d["category"] = .string(c) }
             if let w = n.workspaceId { d["workspace_id"] = .string(w.value.uuidString) }
             if let s = n.surfaceId { d["surface_id"] = .string(s.value.uuidString) }
-            if let r = n.readAt { d["read_at"] = .string(ISO8601DateFormatter().string(from: r)) }
+            if let r = n.readAt { d["read_at"] = .string(iso8601Formatter.string(from: r)) }
             d["push_policy"] = .string("background_only")
             return d
         }
