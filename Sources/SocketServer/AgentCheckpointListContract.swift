@@ -568,7 +568,12 @@ public enum AgentCheckpointListContract: Sendable {
         catalogRevision: Int64,
         responseID: JSONRPCID?
     ) throws -> JSONValue {
-        let encoder = JSONEncoder()
+        // PERF: packPage used to allocate a JSONEncoder for id/cursor/final
+        // envelope sizing on every agent.checkpoint.list page. Reuse the locked
+        // sizeCheckEncoder (default formatting) for the whole pack.
+        sizeCheckEncodeLock.lock()
+        defer { sizeCheckEncodeLock.unlock() }
+        let encoder = sizeCheckEncoder
         let idEncoded = try encodeID(responseID, encoder: encoder)
         let revisionText = String(catalogRevision)
         // Exact framing outside variable parts (items / truncated / next_before / id / rev):
