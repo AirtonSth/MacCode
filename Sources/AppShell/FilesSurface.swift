@@ -537,6 +537,10 @@ func visibleFileEntries<T: FileNameFilterable>(
     return filterFileEntries(base, query: query)
 }
 
+// PERF: path-bar submit trims leading/trailing slashes on every relative
+// submission; share one slash CharacterSet instead of allocating per call.
+private let filesPathSlashTrimSet = CharacterSet(charactersIn: "/")
+
 func resolveSubmittedFilesPath(raw: String, root: String) -> String? {
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return nil }
@@ -544,7 +548,7 @@ func resolveSubmittedFilesPath(raw: String, root: String) -> String? {
     if trimmed.hasPrefix(root + "/") {
         return String(trimmed.dropFirst(root.count + 1))
     }
-    return trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    return trimmed.trimmingCharacters(in: filesPathSlashTrimSet)
 }
 
 func shouldGateLargeMedia(size: Int, loadAnyway: Bool, threshold: Int = LargeMediaGuardThreshold) -> Bool {
