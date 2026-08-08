@@ -167,6 +167,11 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
 
     public final class FileDurabilityStore: DurabilityStore, LossyOriginalStore, @unchecked Sendable {
         private let lock = NSLock()
+        // PERF: load/save snapshot each allocated JSONDecoder/JSONEncoder.
+        // Mutations already hold `lock`, so one pair is safe and avoids
+        // per-call codec construction on the Token Saver rollover path.
+        private let decoder = JSONDecoder()
+        private let encoder = JSONEncoder()
         private let url: URL
         private let lockURL: URL
         private let originalStore: TokenSaverLossyOriginalStoring?
@@ -179,7 +184,7 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
         public func loadSnapshot() -> Snapshot? {
             lock.lock(); defer { lock.unlock() }
             guard let data = try? Data(contentsOf: url) else { return nil }
-            return try? JSONDecoder().decode(Snapshot.self, from: data)
+            return try? decoder.decode(Snapshot.self, from: data)
         }
         public func saveSnapshot(_ snapshot: Snapshot, expectedRevision: UInt64) -> Bool {
             lock.lock(); defer { lock.unlock() }
@@ -196,12 +201,12 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
             do {
                 let current: Snapshot?
                 if FileManager.default.fileExists(atPath: url.path) {
-                    current = try JSONDecoder().decode(Snapshot.self, from: Data(contentsOf: url))
+                    current = try decoder.decode(Snapshot.self, from: Data(contentsOf: url))
                 } else {
                     current = nil
                 }
                 guard (current?.revision ?? 0) == expectedRevision else { return false }
-                let data = try JSONEncoder().encode(snapshot)
+                let data = try encoder.encode(snapshot)
                 try data.write(to: url, options: .atomic)
                 return true
             } catch { return false }
