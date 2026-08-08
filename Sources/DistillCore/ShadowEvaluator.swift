@@ -58,13 +58,23 @@ public actor ShadowEvaluator {
         missRate <= maxMissRate && totalFailureSuppressionEvents == 0
     }
 
+    // PERF: compile once — suppressesFailure scans every original line of multi-KB
+    // tool dumps; range(of:options:.regularExpression) recompiled the same
+    // case-insensitive failure pattern per line.
+    private static let failureLineRegex = try! NSRegularExpression(
+        pattern: #"\b(fail|failed|failure|error|panic|✕|not ok)\b"#,
+        options: [.caseInsensitive]
+    )
+
     /// Detect failure-suppression deterministically: lines matching FAIL/ERROR/✕/"not ok"
     /// present in `original` but absent from `shadowOutput`.
     public static func suppressesFailure(original: String, shadowOutput: String) -> Bool {
-        let pattern = #"(?i)\b(fail|failed|failure|error|panic|✕|not ok)\b"#
         let outLines = Set(shadowOutput.split(whereSeparator: \.isNewline).map(String.init))
         for line in original.split(whereSeparator: \.isNewline).map(String.init) {
-            guard line.range(of: pattern, options: .regularExpression) != nil else { continue }
+            let range = NSRange(line.startIndex..<line.endIndex, in: line)
+            guard failureLineRegex.firstMatch(in: line, options: [], range: range) != nil else {
+                continue
+            }
             if !outLines.contains(line) && !shadowOutput.contains(line) { return true }
         }
         return false
