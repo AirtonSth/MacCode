@@ -84,6 +84,23 @@ public enum ProsePruningLane {
         "... \(omitted) prose lines elided [[rc:\(handle)]]; retrieve before negative claims ..."
     }
 
+    // PERF: compile once — prune scans every line of multi-KB prose for code-like
+    // indent and salience; range(of:options:.regularExpression) recompiled per line.
+    private static let indentedCodeLikeRegex = try! NSRegularExpression(
+        pattern: #"^\s{4,}\S"#
+    )
+    private static let salientKeywordRegex = try! NSRegularExpression(
+        pattern: #"\b(error|fatal|warn|warning|fail|panic|exception|traceback|must|never|only|not)\b"#
+    )
+    private static let fileLineLocationRegex = try! NSRegularExpression(
+        pattern: #"[\w./~-]+\.[A-Za-z0-9]+:\d+"#
+    )
+
+    private static func matches(_ regex: NSRegularExpression, in text: String) -> Bool {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.firstMatch(in: text, options: [], range: range) != nil
+    }
+
     private static func rejectsAsCodeOrStructured(_ input: String) -> Bool {
         if input.contains("```") ||
             JSONCrusher.looksLikeJSON(input) ||
@@ -99,17 +116,17 @@ public enum ProsePruningLane {
                 trimmed.hasPrefix("struct ") ||
                 trimmed.hasPrefix("import ") ||
                 trimmed.contains("{") && trimmed.contains("}") ||
-                trimmed.range(of: #"^\s{4,}\S"#, options: .regularExpression) != nil
+                matches(indentedCodeLikeRegex, in: trimmed)
         }
         return !lines.isEmpty && Double(codeLike.count) / Double(lines.count) > 0.25
     }
 
     private static func isSalient(_ line: String) -> Bool {
         let lower = line.lowercased()
-        if lower.range(of: #"\b(error|fatal|warn|warning|fail|panic|exception|traceback|must|never|only|not)\b"#, options: .regularExpression) != nil {
+        if matches(salientKeywordRegex, in: lower) {
             return true
         }
-        if line.range(of: #"[\w./~-]+\.[A-Za-z0-9]+:\d+"#, options: .regularExpression) != nil {
+        if matches(fileLineLocationRegex, in: line) {
             return true
         }
         if line.contains("[[rc:") || line.contains("`") {
