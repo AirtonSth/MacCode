@@ -1133,8 +1133,20 @@ public final class TokenSaverScopedRecoveryStore: @unchecked Sendable {
         return (thread, project, global)
     }
 
+    /// PERF: nibble table instead of per-byte `String(format:)` so recovery
+    /// integrity digests and idempotency keys avoid 32 formatter calls while
+    /// keeping the same CryptoKit lowercase hex contract for durable verify.
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
     private static func sha256(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256.hash(data: data)
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 
     private static func idempotencyKey(
