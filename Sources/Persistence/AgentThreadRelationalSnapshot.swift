@@ -50,15 +50,26 @@ enum AgentThreadUndoGCPinTimestamp {
         string(from: date, roundedMilliseconds: floor)
     }
 
+    // PERF: ISO8601DateFormatter construction is expensive. Share one fractional
+    // formatter under a short lock (formatter is not thread-safe; undo GC and
+    // thread-delete paths can run concurrently across repositories).
+    private static let fractionalLock = NSLock()
+    private static let fractionalFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
     private static func string(
         from date: Date,
         roundedMilliseconds: (Double) -> Double
     ) -> String {
         let milliseconds = roundedMilliseconds(date.timeIntervalSince1970 * 1_000)
         let safeDate = Date(timeIntervalSince1970: milliseconds / 1_000)
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: safeDate)
+        fractionalLock.lock()
+        let text = fractionalFormatter.string(from: safeDate)
+        fractionalLock.unlock()
+        return text
     }
 }
 
