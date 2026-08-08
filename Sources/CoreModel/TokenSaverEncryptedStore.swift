@@ -182,8 +182,23 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
                 withUnsafeBytes(of: &length) { payload.append(contentsOf: $0) }
                 payload.append(bytes)
             }
-            return SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
+            return TokenSaverEncryptedStore.hexDigest(SHA256.hash(data: payload))
         }
+    }
+
+    /// PERF: nibble table instead of per-byte `String(format:)` so scope,
+    /// record-path, and key-reference digests avoid 32 formatter calls while
+    /// keeping the same CryptoKit lowercase hex contract for durable paths.
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+    private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 
     private struct DiskRecord: Codable {
@@ -479,9 +494,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
     public var projectRootForTests: URL { rootURL.deletingLastPathComponent() }
 
     private func fileURL(for id: String) -> URL {
-        let safe = SHA256.hash(data: Data(id.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
+        let safe = Self.hexDigest(SHA256.hash(data: Data(id.utf8)))
         return rootURL.appendingPathComponent(safe + ".tsrec")
     }
 
@@ -492,9 +505,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
 
     private static func defaultKeyReference(for root: URL) -> String {
         let canonical = root.resolvingSymlinksInPath().standardizedFileURL.path
-        return SHA256.hash(data: Data(canonical.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
+        return hexDigest(SHA256.hash(data: Data(canonical.utf8)))
     }
 
     public enum StoreError: Error {
