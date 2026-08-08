@@ -486,6 +486,12 @@ public final class AttachmentUploadV3Store: @unchecked Sendable {
         }
     }
 
+    // PERF: every authenticated prepare allocated JSONDecoder. Share process-
+    // wide under a short lock (JSONDecoder is not thread-safe); wire decode
+    // behavior unchanged.
+    private static let prepareDecodeLock = NSLock()
+    private static let prepareDecoder = JSONDecoder()
+
     public static func decodePrepareRequest(
         _ data: Data
     ) throws -> AttachmentUploadV3PrepareRequest {
@@ -494,8 +500,9 @@ public final class AttachmentUploadV3Store: @unchecked Sendable {
             throw AttachmentUploadV3Error.invalidParams("prepare body size")
         }
         do {
-            let decoder = JSONDecoder()
-            return try decoder.decode(
+            prepareDecodeLock.lock()
+            defer { prepareDecodeLock.unlock() }
+            return try prepareDecoder.decode(
                 AttachmentUploadV3PrepareRequest.self,
                 from: data
             )
