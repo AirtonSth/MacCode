@@ -31,7 +31,17 @@ public final class DistillServiceClient: @unchecked Sendable {
     private let baseURL: URL
     private let authToken: String
     private let session: URLSession
-    private let encoder = JSONEncoder()
+    // PERF: distill() used to allocate a sortedKeys JSONEncoder per request for
+    // wire body + recovery operation IDs while post()/decode also hit instance
+    // codecs without serialization. JSONEncoder/Decoder are not thread-safe —
+    // share one sortedKeys encoder + decoder under a short lock (key order is
+    // still valid JSON for rank/embed; distill recovery digests stay stable).
+    private let codecLock = NSLock()
+    private let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
     private let decoder = JSONDecoder()
 
     /// Explicit request timeout for the optimizer round-trip (item 218). Kept in
@@ -120,10 +130,8 @@ public final class DistillServiceClient: @unchecked Sendable {
         // the URLSession was configured with a larger timeout (item 218).
         httpRequest.timeoutInterval = Self.requestTimeoutSeconds
         let wireRequest = request
-        let canonicalEncoder = JSONEncoder()
-        canonicalEncoder.outputFormatting = [.sortedKeys]
         do {
-            let body = try canonicalEncoder.encode(wireRequest)
+            let body = try encode(wireRequest)
             httpRequest.httpBody = body
             if let recoveryContext, recoveryContext.hasCompleteScope {
                 let derivedOperationID = ManagedDistillCLI.recoveryOperationID(kind: "distill", canonicalPayload: body)
@@ -160,7 +168,7 @@ public final class DistillServiceClient: @unchecked Sendable {
             throw DistillClientError.badStatus(http.statusCode, body)
         }
         do {
-            return try decoder.decode(DistillResponse.self, from: data)
+            return try decode(DistillResponse.self, from: data)
         } catch {
             throw DistillClientError.decode(String(describing: error))
         }
@@ -203,7 +211,7 @@ public final class DistillServiceClient: @unchecked Sendable {
         httpRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         httpRequest.timeoutInterval = Self.requestTimeoutSeconds
         do {
-            httpRequest.httpBody = try encoder.encode(body)
+            httpRequest.httpBody = try encode(body)
         } catch {
             throw DistillClientError.transport("encode request: \(error)")
         }
@@ -226,9 +234,21 @@ public final class DistillServiceClient: @unchecked Sendable {
             throw DistillClientError.badStatus(http.statusCode, body)
         }
         do {
-            return try decoder.decode(Response.self, from: data)
+            return try decode(responseType, from: data)
         } catch {
             throw DistillClientError.decode(String(describing: error))
         }
+    }
+
+    private func encode<T: Encodable>(_ value: T) throws -> Data {
+        codecLock.lock()
+        defer { codecLock.unlock() }
+        return try encoder.encode(value)
+    }
+
+    private func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+        codecLock.lock()
+        defer { codecLock.unlock() }
+        return try decoder.decode(type, from: data)
     }
 }
