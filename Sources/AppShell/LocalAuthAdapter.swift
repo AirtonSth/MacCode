@@ -120,11 +120,25 @@ public final class LocalAuthAdapter: DirectAuthProvider {
 
     /// Hash a stable authorized identity into an opaque 64-char hex fingerprint.
     /// Pure helper so tests can assert the mapping without logging raw ids.
+    ///
+    /// PERF: nibble table instead of per-byte `String(format:)` so bearer owner
+    /// fingerprints avoid 32 formatter calls while keeping the same CryptoKit
+    /// lowercase hex contract for revocation-checkable owner binding.
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+    private nonisolated static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
+    }
+
     nonisolated static func opaqueAuthorizedOwnerFingerprint(stableIdentity: String) -> String {
         let material = Data("rc2.authorized-owner.v1:\(stableIdentity)".utf8)
-        return SHA256.hash(data: material)
-            .map { String(format: "%02x", $0) }
-            .joined()
+        return hexDigest(SHA256.hash(data: material))
     }
 
     public func createPairingRequest(deviceName: String) -> (requestId: String, code: String)? {
