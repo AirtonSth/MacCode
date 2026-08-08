@@ -739,11 +739,15 @@ public enum TokenSaverExecutionReceiptSeam {
         )
     }
 
+    // PERF: isValid scans every Token Saver lane/wave token; the prior
+    // `"-_.".unicodeScalars.contains` built a temporary view per scalar.
+    // Share one alphanumerics+`-_.` set (same membership contract).
+    private static let safeTokenScalars = CharacterSet.alphanumerics
+        .union(CharacterSet(charactersIn: "-_."))
+
     private static func isSafeToken(_ value: String, maximumLength: Int) -> Bool {
         guard !value.isEmpty, value.count <= maximumLength else { return false }
-        return value.unicodeScalars.allSatisfy {
-            CharacterSet.alphanumerics.contains($0) || "-_.".unicodeScalars.contains($0)
-        }
+        return value.unicodeScalars.allSatisfy { safeTokenScalars.contains($0) }
     }
 }
 
