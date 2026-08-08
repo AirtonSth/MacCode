@@ -521,6 +521,11 @@ public final class TokenSaverDistillServiceController {
     private let terminateForeignServers: ForeignServerTerminator
     private let memoryProfileProvider: @Sendable () -> ManagedProcessMemoryProfile
     private let ownedProcessTerminationTimeout: TimeInterval
+    // PERF: every sidecar stdout line (ready event + savings_recorded) and CLI
+    // state write allocated JSONDecoder/JSONEncoder. Controller is MainActor-
+    // isolated so one pair is safe and avoids per-line codec construction.
+    private let jsonDecoder = JSONDecoder()
+    private let jsonEncoder = JSONEncoder()
     private var process: Process?
     private var processOwnershipTag: SpawnedProcessTag?
     private var terminatingProcess: Process?
@@ -956,7 +961,7 @@ public final class TokenSaverDistillServiceController {
 
     private func handleOutputLine(_ lineData: Data) {
         if case .starting = status {
-            let ready = try? JSONDecoder().decode(DistillServiceReadyEvent.self, from: lineData)
+            let ready = try? jsonDecoder.decode(DistillServiceReadyEvent.self, from: lineData)
             if let ready {
                 writeCLIState(ready: ready)
                 // Healthy startup clears the restart-attempt counter so the next
@@ -978,7 +983,7 @@ public final class TokenSaverDistillServiceController {
     /// process. A `savings_recorded` event means real distill traffic happened
     /// (CLI or app), so the Token Saver card must re-read the ledger.
     func handleRunningOutputLine(_ lineData: Data) {
-        guard let event = try? JSONDecoder().decode(TokenSaverDistillProcessEvent.self, from: lineData),
+        guard let event = try? jsonDecoder.decode(TokenSaverDistillProcessEvent.self, from: lineData),
               event.event == "savings_recorded" else {
             return
         }
@@ -1013,7 +1018,7 @@ public final class TokenSaverDistillServiceController {
         do {
             let url = cliStateURL
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try JSONEncoder().encode(state).write(to: url, options: .atomic)
+            try jsonEncoder.encode(state).write(to: url, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         } catch {
             NSLog("RemoteCode Token Saver distill CLI state write failed: \(error)")
