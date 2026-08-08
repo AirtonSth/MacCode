@@ -2264,9 +2264,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             current = ""
         }
 
-        let pattern = Self.distillInstructionsBlockPattern
         let next: String
-        if let range = current.range(of: pattern, options: .regularExpression) {
+        if let range = Self.rangeOfDistillInstructionsBlock(in: current) {
             let replaced = current.replacingCharacters(
                 in: range,
                 with: "\n\n\(Self.distillAgentInstructionsTemplate)\n\n"
@@ -2287,7 +2286,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             return .notPresent
         }
         let current = try String(contentsOf: url, encoding: .utf8)
-        guard let range = current.range(of: Self.distillInstructionsBlockPattern, options: .regularExpression) else {
+        guard let range = Self.rangeOfDistillInstructionsBlock(in: current) else {
             return .notPresent
         }
 
@@ -2301,8 +2300,22 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return .removed
     }
 
-    private static var distillInstructionsBlockPattern: String {
-        "(?:\\n{0,2})?\(Self.distillInstructionsBeginMarker)[\\s\\S]*?\(Self.distillInstructionsEndMarker)(?:\\n{0,2})?"
+    // PERF: upsert/remove distill instructions recompiled the begin/end block
+    // pattern via range(of:options:.regularExpression) on every Token Saver
+    // skill install/uninstall. Compile once; match semantics unchanged.
+    private static let distillInstructionsBlockRegex: NSRegularExpression = {
+        let begin = NSRegularExpression.escapedPattern(for: distillInstructionsBeginMarker)
+        let end = NSRegularExpression.escapedPattern(for: distillInstructionsEndMarker)
+        return try! NSRegularExpression(
+            pattern: "(?:\\n{0,2})?\(begin)[\\s\\S]*?\(end)(?:\\n{0,2})?"
+        )
+    }()
+
+    private static func rangeOfDistillInstructionsBlock(in text: String) -> Range<String.Index>? {
+        let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = distillInstructionsBlockRegex.firstMatch(in: text, options: [], range: nsRange),
+              let range = Range(match.range, in: text) else { return nil }
+        return range
     }
 
 }
