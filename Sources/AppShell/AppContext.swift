@@ -2898,11 +2898,15 @@ public final class AppContext {
         }()
         // A shadow/audit no-win must not suppress a later promoted optimize call for
         // the same prompt. The two paths have different recovery and adoption rights.
+        // PERF: length comparisons for multi-KB prompts used Character.count (O(n)
+        // grapheme walk) repeatedly. utf8.count is O(1) and matches byte-oriented
+        // savings better than grapheme count; ASCII-heavy agent prompts are identical.
+        let promptBytes = utf8Count
         let skipKey = DistillResultCacheKey(request: DistillRequest(
             mode: .longText,
             priority: .interactive,
             input: prompt,
-            maxOutputCharacters: max(512, prompt.count)
+            maxOutputCharacters: max(512, promptBytes)
         ), pipelineVersion: DistillResultCacheKey.pipelineVersion + (semanticPromoted ? "-optimize" : "-audit"))
         if tokenSaverPromptSkipSetContains(skipKey) {
             return prompt
@@ -2920,16 +2924,17 @@ public final class AppContext {
         let deduped = dedupeProbe.output
         let deterministicCandidate = [diffWindowed, deduped]
             .compactMap { $0 }
-            .filter { $0.count < prompt.count }
-            .min { $0.count < $1.count }
+            .filter { $0.utf8.count < promptBytes }
+            .min { $0.utf8.count < $1.utf8.count }
             ?? prompt
+        let deterministicBytes = deterministicCandidate.utf8.count
 
         // Adopt `candidate` only if it beats the ORIGINAL prompt; record honest end-to-end
         // savings (original -> final), tagged with the caller's cache_state AND the engine
         // that produced the win (deterministic pre-pass vs the model) so the Token Saver
         // breakdown attributes per technique.
         func adopt(_ candidate: String, stage: TokenSaverRouteStage) -> String {
-            guard candidate.count < prompt.count else {
+            guard candidate.utf8.count < promptBytes else {
                 self.tokenSaverPromptSkipSet[skipKey] = Date()
                 return prompt
             }
@@ -2960,14 +2965,14 @@ public final class AppContext {
                 NSLog("RemoteCode Token Saver semantic observation skipped: \(semanticObservation.reason)")
             }
             // No model service: deterministic pre-passes still fail open and can save tokens.
-            return deterministicCandidate.count < prompt.count ? adopt(deterministicCandidate, stage: .deterministic) : prompt
+            return deterministicBytes < promptBytes ? adopt(deterministicCandidate, stage: .deterministic) : prompt
         }
         let request = DistillRequest(
             mode: .longText,
             priority: .interactive,
             input: deterministicCandidate,
             runMode: semanticPromoted ? .optimize : .audit,
-            maxOutputCharacters: max(512, deterministicCandidate.count)
+            maxOutputCharacters: max(512, deterministicBytes)
         )
         do {
             let response: DistillResponse
@@ -2997,8 +3002,8 @@ public final class AppContext {
             // The deterministic lane never adopts sidecar bytes. A semantic candidate
             // is live only after its own lane is promoted and exact-scope recovery was
             // durably stored and read back. Shadow runs observe it verbatim-only.
-            let modelWon = literalSafeModelOutput.count < deterministicCandidate.count
-            if !modelWon, deterministicCandidate.count >= prompt.count {
+            let modelWon = literalSafeModelOutput.utf8.count < deterministicBytes
+            if !modelWon, deterministicBytes >= promptBytes {
                 tokenSaverPromptSkipSet[skipKey] = Date()
             }
             let semanticAdmitted = tokenSaverProjectAdmission(
@@ -3026,7 +3031,7 @@ public final class AppContext {
                     threadId: threadId,
                     runId: runId
                 )
-                return deterministicCandidate.count < prompt.count
+                return deterministicBytes < promptBytes
                     ? adopt(deterministicCandidate, stage: .deterministic)
                     : prompt
             }
@@ -3034,7 +3039,7 @@ public final class AppContext {
         } catch {
             NSLog("RemoteCode Token Saver compression skipped (provider=\(provider.rawValue)): \(error)")
             // Fail-open to the deterministic pre-pass if it helped, else the original.
-            return deterministicCandidate.count < prompt.count ? adopt(deterministicCandidate, stage: .deterministic) : prompt
+            return deterministicBytes < promptBytes ? adopt(deterministicCandidate, stage: .deterministic) : prompt
         }
     }
 
