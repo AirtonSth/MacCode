@@ -611,17 +611,27 @@ public enum AgentMessageTransport {
         return .object(object)
     }
 
+    // PERF: v1 list/get binary-search fits re-encode the envelope ~log(N) times
+    // per RPC, and attachment wire sizing encodes each reference. JSONEncoder is
+    // not thread-safe — serialize concurrent fits under a short lock.
+    private static let encodeLock = NSLock()
+    private static let sharedEncoder = JSONEncoder()
+
     private static func encodedResponseBytes(
         id: JSONRPCID?,
         result: JSONValue
     ) -> Int {
-        (try? JSONEncoder().encode(
+        encodeLock.lock()
+        defer { encodeLock.unlock() }
+        return (try? sharedEncoder.encode(
             JSONRPCResponse(id: id, result: result)
         ).count) ?? Int.max
     }
 
     private static func encodedValueBytes(_ value: JSONValue) -> Int {
-        (try? JSONEncoder().encode(value).count) ?? Int.max
+        encodeLock.lock()
+        defer { encodeLock.unlock() }
+        return (try? sharedEncoder.encode(value).count) ?? Int.max
     }
 
     private static func isUTF8Boundary(
