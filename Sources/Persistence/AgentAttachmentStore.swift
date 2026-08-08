@@ -41,6 +41,11 @@ public final class AgentAttachmentStore: @unchecked Sendable {
 
     public let root: URL
     private let fileManager: FileManager
+    // PERF: stage/resolve/GC load and rewrite .metadata sidecars with a fresh
+    // JSONDecoder/JSONEncoder per call. Public API already serializes per-root
+    // via AgentAttachmentStorageSynchronization.withLock, so one pair is safe.
+    private let decoder = JSONDecoder()
+    private let encoder = JSONEncoder()
 
     public init(root: URL, fileManager: FileManager = .default) {
         self.root = root.standardizedFileURL
@@ -462,14 +467,14 @@ public final class AgentAttachmentStore: @unchecked Sendable {
         let url = metadataURL(referenceID: referenceID)
         guard fileManager.fileExists(atPath: url.path) else { return nil }
         do {
-            return try JSONDecoder().decode(Metadata.self, from: Data(contentsOf: url))
+            return try decoder.decode(Metadata.self, from: Data(contentsOf: url))
         } catch {
             throw AgentAttachmentResolverError.malformedReference("corrupt host attachment metadata")
         }
     }
 
     private func persistMetadata(_ metadata: Metadata, referenceID: String) throws {
-        let data = try JSONEncoder().encode(metadata)
+        let data = try encoder.encode(metadata)
         let url = metadataURL(referenceID: referenceID)
         try data.write(to: url, options: .atomic)
         try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
