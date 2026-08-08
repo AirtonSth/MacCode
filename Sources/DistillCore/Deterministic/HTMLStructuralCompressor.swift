@@ -4,6 +4,15 @@ import Foundation
 /// style bodies after the caller has stored the original and supplied a retrieve
 /// handle; user-visible HTML text and the enclosing tags stay in place.
 public enum HTMLStructuralCompressor {
+    // PERF: compile once. `compress` previously built `NSRegularExpression` for
+    // script + style on every store-backed HTML route (multi-KB pages).
+    private static let scriptElisionRegex = try! NSRegularExpression(
+        pattern: #"(?is)(<script\b[^>]*>)(.*?)(</script\s*>)"#
+    )
+    private static let styleElisionRegex = try! NSRegularExpression(
+        pattern: #"(?is)(<style\b[^>]*>)(.*?)(</style\s*>)"#
+    )
+
     public static func compress(
         _ input: String,
         droppedHandle: String,
@@ -17,8 +26,20 @@ public enum HTMLStructuralCompressor {
         guard !handle.isEmpty, inputBytes >= minimumBlockCharacters else { return nil }
 
         var replacements: [(range: Range<String.Index>, text: String)] = []
-        replacements.append(contentsOf: elisions(in: input, tagName: "script", handle: handle, minimumBlockCharacters: minimumBlockCharacters))
-        replacements.append(contentsOf: elisions(in: input, tagName: "style", handle: handle, minimumBlockCharacters: minimumBlockCharacters))
+        replacements.append(contentsOf: elisions(
+            in: input,
+            tagName: "script",
+            regex: scriptElisionRegex,
+            handle: handle,
+            minimumBlockCharacters: minimumBlockCharacters
+        ))
+        replacements.append(contentsOf: elisions(
+            in: input,
+            tagName: "style",
+            regex: styleElisionRegex,
+            handle: handle,
+            minimumBlockCharacters: minimumBlockCharacters
+        ))
         guard !replacements.isEmpty else { return nil }
 
         var output = input
@@ -35,11 +56,10 @@ public enum HTMLStructuralCompressor {
     private static func elisions(
         in input: String,
         tagName: String,
+        regex: NSRegularExpression,
         handle: String,
         minimumBlockCharacters: Int
     ) -> [(range: Range<String.Index>, text: String)] {
-        let pattern = #"(?is)(<\#(tagName)\b[^>]*>)(.*?)(</\#(tagName)\s*>)"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
         let nsRange = NSRange(input.startIndex..<input.endIndex, in: input)
         return regex.matches(in: input, range: nsRange).compactMap { match in
             guard match.numberOfRanges == 4,
