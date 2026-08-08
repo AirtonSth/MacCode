@@ -369,8 +369,16 @@ public enum PetLiveActivityCopy: Sendable {
         return nil
     }
 
+    // PERF: detailThreadTitle calls isElapsed when parsing pet detail strings for
+    // Live Activity cards; range(of:options:.regularExpression) recompiled the
+    // duration pattern on every make(). Compile once.
+    private static let elapsedDurationRegex = try! NSRegularExpression(
+        pattern: #"^\d+[smhd](\s+\d+[smhd])?$"#
+    )
+
     private static func isElapsed(_ value: String) -> Bool {
-        value.range(of: #"^\d+[smhd](\s+\d+[smhd])?$"#, options: .regularExpression) != nil
+        let range = NSRange(location: 0, length: (value as NSString).length)
+        return elapsedDurationRegex.firstMatch(in: value, options: [], range: range) != nil
     }
 
     private static func shortTitle(_ raw: String) -> String {
