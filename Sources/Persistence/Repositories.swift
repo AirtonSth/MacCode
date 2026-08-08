@@ -2218,10 +2218,30 @@ public final class AgentMessageRepository: @unchecked Sendable {
         )
     }
 
+    /// SHA-256 hex of the full message body (durable `body_sha256` column / wire digest).
+    ///
+    /// Hashes contiguous UTF-8 storage without a `Data(text.utf8)` intermediate, and
+    /// formats hex with a nibble table instead of per-byte `String(format:)`. Must stay
+    /// byte-identical to `AgentMessageTransport.bodySHA256Hex` (same lowercase digest).
     private static func bodySHA256Hex(_ text: String) -> String {
-        SHA256.hash(data: Data(text.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
+        var hasher = SHA256()
+        var copy = text
+        copy.withUTF8 { buffer in
+            hasher.update(bufferPointer: UnsafeRawBufferPointer(buffer))
+        }
+        return hexDigest(hasher.finalize())
+    }
+
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+    private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 
     private static func utf8Chunk(

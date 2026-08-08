@@ -1,6 +1,7 @@
 import XCTest
 @testable import Persistence
 import CoreModel
+import CryptoKit
 
 final class AgentMessageBodyChunkTests: XCTestCase {
     private func makeFixture() throws -> (
@@ -147,6 +148,38 @@ final class AgentMessageBodyChunkTests: XCTestCase {
             secondSQL.contains { $0.contains("SELECT content\n") },
             "a migrated body digest must be persisted and reused"
         )
+    }
+
+    func testAppendBodyDigestMatchesCryptoKitLowercaseHex() throws {
+        // Pins the contiguous-UTF-8 bodySHA256Hex rewrite: durable digest must
+        // stay byte-identical to SHA256(Data(utf8)) + lowercase hex (wire contract).
+        let fixture = try makeFixture()
+        let bodies = [
+            "",
+            "tiny",
+            "café 🙂",
+            String(repeating: "stream-token-", count: 8_192),
+        ]
+        for body in bodies {
+            let message = AgentMessage(
+                threadId: fixture.thread.id,
+                role: .assistant,
+                content: body
+            )
+            try fixture.repo.append(message)
+            let chunk = try XCTUnwrap(try fixture.repo.bodyChunk(
+                id: message.id,
+                offsetBytes: 0,
+                maxContentBytes: 64,
+                expectedBodyRevision: nil,
+                expectedBodySHA256: nil
+            ))
+            let expected = SHA256.hash(data: Data(body.utf8))
+                .map { String(format: "%02x", $0) }
+                .joined()
+            XCTAssertEqual(chunk.bodySHA256, expected, "body=\(body.prefix(24))…")
+            XCTAssertEqual(chunk.bodyByteCount, body.utf8.count)
+        }
     }
 
     func testFirstOversizedListRowStillOwnsAPaginationCursor() throws {
