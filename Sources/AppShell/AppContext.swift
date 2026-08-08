@@ -351,6 +351,9 @@ public final class AppContext {
     private var tokenSaverAccountUsageRefreshTask: Task<Void, Never>?
     private var tokenSaverUsageNotificationTask: Task<Void, Never>?
     private var tokenSaverLastUsageNotificationAt: Date = .distantPast
+    // PERF: daily economy upsert formats updatedAt. ISO8601DateFormatter
+    // construction is expensive; share one MainActor-isolated formatter.
+    private let iso8601Formatter = ISO8601DateFormatter()
     /// Per-run usage state. Claude can emit independent per-request charges
     /// followed by an authoritative cumulative result, while Codex and Grok emit
     /// cumulative snapshots. Keep both tracks so the effective run total is the
@@ -4408,7 +4411,7 @@ public final class AppContext {
                 breakdown.totalCredible,
                 threadCacheAmort
             )
-            let iso = ISO8601DateFormatter().string(from: now)
+            let iso = iso8601Formatter.string(from: now)
             _ = try tokenSaverDailyEconomyRepo.upsert(
                 TokenSaverDailyEconomyRecord(
                     dayStartMs: dayStartMs,
