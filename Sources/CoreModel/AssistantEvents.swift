@@ -410,16 +410,39 @@ public struct AssistantProposedPlan: Codable, Sendable, Equatable, Identifiable 
         !isImplemented
     }
 
+    // PERF: exportTitle/exportFileName are read from SwiftUI proposed-plan cards
+    // (title + save-as name) and recompiled markdown/list/whitespace strip patterns
+    // on every body evaluation. Compile once; matching is thread-safe.
+    private static let exportHeadingPrefixRegex = try! NSRegularExpression(pattern: #"^#{1,6}\s*"#)
+    private static let exportNumberedPrefixRegex = try! NSRegularExpression(pattern: #"^\d+[\.)]\s*"#)
+    private static let exportBulletPrefixRegex = try! NSRegularExpression(pattern: #"^[-*]\s*"#)
+    private static let exportWhitespaceCollapseRegex = try! NSRegularExpression(pattern: #"\s+"#)
+    private static let exportHyphenCollapseRegex = try! NSRegularExpression(pattern: #"-+"#)
+
+    private static func replaceAll(
+        _ regex: NSRegularExpression,
+        in text: String,
+        with template: String
+    ) -> String {
+        let range = NSRange(location: 0, length: (text as NSString).length)
+        return regex.stringByReplacingMatches(
+            in: text,
+            options: [],
+            range: range,
+            withTemplate: template
+        )
+    }
+
     public static func exportTitle(for markdown: String) -> String {
         let fallback = "Proposed Plan"
         for rawLine in markdown.split(whereSeparator: \.isNewline) {
             let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
-            let stripped = trimmed
-                .replacingOccurrences(of: #"^#{1,6}\s*"#, with: "", options: .regularExpression)
-                .replacingOccurrences(of: #"^\d+[\.)]\s*"#, with: "", options: .regularExpression)
-                .replacingOccurrences(of: #"^[-*]\s*"#, with: "", options: .regularExpression)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            var stripped = trimmed
+            stripped = replaceAll(exportHeadingPrefixRegex, in: stripped, with: "")
+            stripped = replaceAll(exportNumberedPrefixRegex, in: stripped, with: "")
+            stripped = replaceAll(exportBulletPrefixRegex, in: stripped, with: "")
+            stripped = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !stripped.isEmpty else { continue }
             return String(stripped.prefix(80))
         }
@@ -431,9 +454,10 @@ public struct AssistantProposedPlan: Codable, Sendable, Equatable, Identifiable 
         let title = exportTitle(for: markdown).unicodeScalars.map { scalar -> Character in
             allowed.contains(scalar) ? Character(scalar) : "-"
         }
-        let collapsed = String(title)
-            .replacingOccurrences(of: #"\s+"#, with: "-", options: .regularExpression)
-            .replacingOccurrences(of: #"-+"#, with: "-", options: .regularExpression)
+        var collapsed = String(title)
+        collapsed = replaceAll(exportWhitespaceCollapseRegex, in: collapsed, with: "-")
+        collapsed = replaceAll(exportHyphenCollapseRegex, in: collapsed, with: "-")
+        collapsed = collapsed
             .trimmingCharacters(in: CharacterSet(charactersIn: "-_ "))
             .lowercased()
         return "\(collapsed.isEmpty ? "proposed-plan" : String(collapsed.prefix(64))).md"
