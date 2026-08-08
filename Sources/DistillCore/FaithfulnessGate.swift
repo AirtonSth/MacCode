@@ -16,6 +16,20 @@ public enum FaithfulnessGate {
         "exception", "traceback", "must", "never", "only", "not"
     ]
 
+    // PERF: one compiled alternation. `salientWords(in:)` used to recompile
+    // `\bword\b` via `String.range(of:options: .regularExpression)` for each of
+    // 13 words on every original line of multi-KB faithfulness checks.
+    private static let salientWordRegex: NSRegularExpression = {
+        let alternation = salientWords
+            .sorted()
+            .map { NSRegularExpression.escapedPattern(for: $0) }
+            .joined(separator: "|")
+        return try! NSRegularExpression(
+            pattern: "\\b(?:\(alternation))\\b",
+            options: [.caseInsensitive]
+        )
+    }()
+
     public static func validate(original: String, compressed: String) -> Result {
         if compressed == original { return .accepted }
 
@@ -43,10 +57,11 @@ public enum FaithfulnessGate {
     }
 
     private static func salientWords(in line: String) -> Set<String> {
-        let lower = line.lowercased()
         var result = Set<String>()
-        for word in salientWords where lower.range(of: #"\b\#(word)\b"#, options: .regularExpression) != nil {
-            result.insert(word)
+        let range = NSRange(line.startIndex..<line.endIndex, in: line)
+        for match in salientWordRegex.matches(in: line, range: range) {
+            guard let r = Range(match.range, in: line) else { continue }
+            result.insert(String(line[r]).lowercased())
         }
         return result
     }

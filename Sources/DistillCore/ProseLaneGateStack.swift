@@ -36,10 +36,14 @@ public enum ProseLaneGateStack {
             return Verdict(accepted: false, output: original, reason: faithful.reason ?? "unfaithful")
         }
         // Gate 3: minGainRatio + never-inflate.
-        guard original.count > 0, compressed.count < original.count else {
+        // PERF: O(1) utf8.count (not Character.count grapheme walk); matches
+        // DistillContentRouter.meetsGain and byte-oriented Token Saver savings.
+        let originalBytes = original.utf8.count
+        let compressedBytes = compressed.utf8.count
+        guard originalBytes > 0, compressedBytes < originalBytes else {
             return Verdict(accepted: false, output: original, reason: "no_gain")
         }
-        let reduction = 1.0 - Double(compressed.count) / Double(original.count)
+        let reduction = 1.0 - Double(compressedBytes) / Double(originalBytes)
         if reduction < minGainRatio {
             return Verdict(accepted: false, output: original, reason: "below_min_gain")
         }

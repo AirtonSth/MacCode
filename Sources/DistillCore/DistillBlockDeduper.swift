@@ -129,19 +129,25 @@ public enum DistillBlockDeduper {
         return pointer
     }
 
+    // PERF: compile once. Near-dup compares call `normalizeVolatile` per candidate
+    // pair (and per line pair), and `String.replacingOccurrences(options: .regularExpression)`
+    // recompiled all four patterns on every call.
+    private static let volatileReplacements: [(NSRegularExpression, String)] = [
+        (try! NSRegularExpression(pattern: #"\b\d{4}-\d{2}-\d{2}[T ][0-9:.+-Zz]+\b"#, options: [.caseInsensitive]), "<timestamp>"),
+        (try! NSRegularExpression(pattern: #"\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b"#, options: [.caseInsensitive]), "<time>"),
+        (try! NSRegularExpression(pattern: #"\bpid\s*[=: ]\s*\d+\b"#, options: [.caseInsensitive]), "<pid>"),
+        (try! NSRegularExpression(pattern: #"\b0x[0-9a-fA-F]{12,16}\b"#, options: [.caseInsensitive]), "<aslr>")
+    ]
+
     private static func normalizeVolatile(_ text: String) -> String {
         var normalized = text
-        let replacements: [(String, String)] = [
-            (#"\b\d{4}-\d{2}-\d{2}[T ][0-9:.+-Zz]+\b"#, "<timestamp>"),
-            (#"\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b"#, "<time>"),
-            (#"\bpid\s*[=: ]\s*\d+\b"#, "<pid>"),
-            (#"\b0x[0-9a-fA-F]{12,16}\b"#, "<aslr>")
-        ]
-        for (pattern, replacement) in replacements {
-            normalized = normalized.replacingOccurrences(
-                of: pattern,
-                with: replacement,
-                options: [.regularExpression, .caseInsensitive]
+        for (regex, replacement) in volatileReplacements {
+            let range = NSRange(normalized.startIndex..<normalized.endIndex, in: normalized)
+            normalized = regex.stringByReplacingMatches(
+                in: normalized,
+                options: [],
+                range: range,
+                withTemplate: replacement
             )
         }
         return normalized
