@@ -531,37 +531,55 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     /// Classify using only existing protocol `type` / sheddable `kind` fields
     /// (plus the existing Wave-4 JSON-RPC success envelope that wraps a
     /// `result.type == "snapshot"` transport frame — not a new command class).
+    ///
+    /// PERF: one `JSONSerialization` per frame. The previous path parsed once
+    /// for `type`, again for sheddable `kind` / snapshot-RPC checks — 2–3 full
+    /// parses on every enqueue, including high-frequency `agent.item.delta`.
     static func applicationPriority(of data: Data) -> ApplicationPriority {
-        guard let type = frameType(in: data) else {
-            // Large `sync.snapshot` RPC replies are multiplexed on the same WS
-            // as stop/input. Treat the existing nested snapshot result as bulk
-            // so they cannot monopolize the control drain path.
-            if isSnapshotRPCSuccessEnvelope(data) {
-                return .bulk
-            }
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             // Opaque / test blobs stay on the normal FIFO lane.
             return .normal
         }
-        switch type {
-        case "error", "closing", "baselineRequired", "heartbeat":
-            return .priority
-        case "snapshot":
-            return .bulk
-        case "event":
-            return isSheddableApplicationFrame(data) ? .bulk : .normal
-        default:
-            return .normal
+        if let type = object["type"] as? String {
+            switch type {
+            case "error", "closing", "baselineRequired", "heartbeat":
+                return .priority
+            case "snapshot":
+                return .bulk
+            case "event":
+                if let kind = object["kind"] as? String, isSheddableKind(kind) {
+                    return .bulk
+                }
+                return .normal
+            default:
+                return .normal
+            }
         }
+        // Large `sync.snapshot` RPC replies are multiplexed on the same WS
+        // as stop/input. Treat the existing nested snapshot result as bulk
+        // so they cannot monopolize the control drain path.
+        if isSnapshotRPCSuccessEnvelope(object: object) {
+            return .bulk
+        }
+        return .normal
     }
 
     /// Whether an encoded application frame is safe to shed under pressure.
+    ///
+    /// PERF: single JSON parse (same contract as before).
     static func isSheddableApplicationFrame(_ data: Data) -> Bool {
-        if frameType(in: data) == "snapshot" { return true }
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        if object["type"] as? String == "snapshot" { return true }
         // Nested snapshot RPC bodies are the same bulk baseline as bare
         // `type:snapshot` frames; shed under pressure so recovery/control can
         // reclaim capacity without inventing a new wire field.
-        if isSnapshotRPCSuccessEnvelope(data) { return true }
-        guard let kind = eventKind(in: data) else { return false }
+        if isSnapshotRPCSuccessEnvelope(object: object) { return true }
+        guard object["type"] as? String == "event",
+              let kind = object["kind"] as? String else {
+            return false
+        }
         return isSheddableKind(kind)
     }
 
@@ -569,8 +587,14 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     /// `ConnectionSnapshotFrame` (`type == "snapshot"`). Detected only from
     /// those wire keys — no new priority vocabulary.
     static func isSnapshotRPCSuccessEnvelope(_ data: Data) -> Bool {
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              object["jsonrpc"] as? String == "2.0",
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        return isSnapshotRPCSuccessEnvelope(object: object)
+    }
+
+    private static func isSnapshotRPCSuccessEnvelope(object: [String: Any]) -> Bool {
+        guard object["jsonrpc"] as? String == "2.0",
               object["method"] == nil,
               let result = object["result"] as? [String: Any],
               result["type"] as? String == "snapshot" else {
