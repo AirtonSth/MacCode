@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 import CoreModel
 
 /// Core logic of the managed `distill` CLI, ported off Python to native Swift (N1)
@@ -53,7 +52,9 @@ public struct ManagedDistillCLI: Sendable {
         material.append(kindData)
         material.append(Data("|\(stablePayload.count):".utf8))
         material.append(stablePayload)
-        let digest = SHA256.hash(data: material).map { String(format: "%02x", $0) }.joined()
+        // PERF: DistillSHA256 nibble hex (not String(format:)) for per-request
+        // operation IDs on every distill/retrieve; CryptoKit-identical digest.
+        let digest = DistillSHA256.hex(material)
         return "tscli1.\(digest)"
     }
 
