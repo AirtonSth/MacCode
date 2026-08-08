@@ -231,11 +231,9 @@ public struct FeedPanelView: View {
                                         .foregroundColor(DS.Palette.textTertiary)
                                     DSPill(item.kind, tone: kindTone(item.kind))
                                     Spacer()
-                                    Text(vm.relativeTime(for: item))
+                                    Text(relativeLabel(for: item))
                                         .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary)
                                         .help(item.ts.formatted(date: .abbreviated, time: .standard))
-                                        // Force re-render each tick so relative time stays accurate.
-                                        .id("ts-\(item.id)-\(timestampTick)")
                                 }
                                 if !item.title.isEmpty {
                                     Text(item.title).font(DS.Font.caption)
@@ -268,6 +266,14 @@ public struct FeedPanelView: View {
         .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
             timestampTick &+= 1
         }
+    }
+
+    /// Relative timestamp for a row. Touches `timestampTick` so the 1s timer
+    /// refreshes labels without remounting LazyVStack cells (a prior
+    /// `.id("ts-\(id)-\(tick)")` forced identity thrash every second — PERF).
+    private func relativeLabel(for item: FeedPanelViewModel.Item) -> String {
+        _ = timestampTick
+        return vm.relativeTime(for: item)
     }
 
     private func kindTone(_ k: String) -> DSPill.Tone {
