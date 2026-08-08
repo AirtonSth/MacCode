@@ -4731,8 +4731,7 @@ public final class AppContext {
             // surface.output is high-frequency binary; never persisted (same
             // predicate as AppDelegate.shouldPersistEvent).
             guard ev.kind != "surface.output" else { return }
-            let payloadData = (try? JSONEncoder().encode(ev.payload)) ?? Data("null".utf8)
-            let json = String(data: payloadData, encoding: .utf8) ?? "null"
+            let json = EventBus.encodePayloadForPersistence(ev.payload)
             queue.async {
                 _ = try? log.append(seq: ev.seq, kind: ev.kind, payloadJSON: json)
                 appendCount += 1

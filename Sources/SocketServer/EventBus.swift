@@ -109,6 +109,22 @@ public final class EventBus: @unchecked Sendable {
     public var persister: ((Event) -> Void)?
     public var shouldRetainRecentEvent: ((Event) -> Bool)?
 
+    // PERF: EventLog persisters encode payload on every retained publish.
+    // Share one encoder under a short lock (JSONEncoder is not thread-safe)
+    // and a static `null` Data for encode failures.
+    private static let persistencePayloadEncodeLock = NSLock()
+    private static let persistencePayloadEncoder = JSONEncoder()
+    private static let nullJSONData = Data([0x6e, 0x75, 0x6c, 0x6c]) // "null"
+
+    /// Encode an event payload for EventLog storage. Used by AppDelegate /
+    /// AppContext persisters so each publish does not allocate a JSONEncoder.
+    public static func encodePayloadForPersistence(_ payload: JSONValue) -> String {
+        persistencePayloadEncodeLock.lock()
+        let data = (try? persistencePayloadEncoder.encode(payload)) ?? nullJSONData
+        persistencePayloadEncodeLock.unlock()
+        return String(data: data, encoding: .utf8) ?? "null"
+    }
+
     public struct RecentEventsResult: Sendable {
         public let lastSeq: Int64
         public let events: [Event]

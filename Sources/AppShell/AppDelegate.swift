@@ -233,8 +233,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
         EventBus.shared.persister = { ev in
             guard Self.shouldPersistEvent(ev) else { return }
-            let payloadData = (try? JSONEncoder().encode(ev.payload)) ?? Data("null".utf8)
-            let json = String(data: payloadData, encoding: .utf8) ?? "null"
+            let json = EventBus.encodePayloadForPersistence(ev.payload)
             _ = try? log.append(seq: ev.seq, kind: ev.kind, payloadJSON: json)
         }
         do {
