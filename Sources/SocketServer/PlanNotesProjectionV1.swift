@@ -179,13 +179,13 @@ public enum PlanNotesProjectionV1: Sendable {
 
     /// Compact v1 save success — no notes body, just CAS/size metadata.
     public static func saveResult(notes: String) -> JSONValue {
-        let data = Data(notes.utf8)
-        let digest = contentDigest(of: data)
+        let totalBytes = notes.utf8.count
+        let digest = contentDigest(of: notes)
         return .object([
             "ok": .bool(true),
             "content_digest": .string(digest),
             "revision": .string(digest),
-            "total_bytes": .number(Double(data.count)),
+            "total_bytes": .number(Double(totalBytes)),
         ])
     }
 
@@ -289,9 +289,14 @@ public enum PlanNotesProjectionV1: Sendable {
     /// WHY: the previous event embedded full `notes`, which could exceed the WS
     /// outbound budget and stall the live stream. Full text stays fetchable via
     /// `agent.plan.notes.get` with protocol_version 1.
+    ///
+    /// PERF: total size via O(1) `utf8.count`, digest via contiguous UTF-8 hash
+    /// (no intermediate `Data(notes.utf8)`), preview via O(1) under-budget /
+    /// bounded-head `utf8Prefix` — multi-MiB notes must not allocate a second
+    /// full-body copy just to ship a 256-byte preview event.
     public static func compactUpdateEvent(threadId: AgentThreadID, notes: String) -> JSONValue {
-        let data = Data(notes.utf8)
-        let digest = contentDigest(of: data)
+        let totalBytes = notes.utf8.count
+        let digest = contentDigest(of: notes)
         let preview = utf8Prefix(notes, maxBytes: eventPreviewMaxBytes)
         let previewBytes = preview.utf8.count
         return .object([
@@ -299,20 +304,41 @@ public enum PlanNotesProjectionV1: Sendable {
             "protocol_version": .number(Double(protocolVersion)),
             "content_digest": .string(digest),
             "revision": .string(digest),
-            "total_bytes": .number(Double(data.count)),
+            "total_bytes": .number(Double(totalBytes)),
             "preview": .string(preview),
             "preview_bytes": .number(Double(previewBytes)),
-            "preview_truncated": .bool(previewBytes < data.count),
+            "preview_truncated": .bool(previewBytes < totalBytes),
             "rehydrate_required": .bool(true),
         ])
     }
 
+    /// SHA-256 lowercase hex of `notes` UTF-8 — same digest as `contentDigest(of: Data(notes.utf8))`.
+    ///
+    /// Hashes contiguous UTF-8 storage without a `Data(text.utf8)` intermediate, and
+    /// formats hex with a nibble table instead of per-byte `String(format:)`.
     public static func contentDigest(of notes: String) -> String {
-        contentDigest(of: Data(notes.utf8))
+        var hasher = SHA256()
+        var copy = notes
+        copy.withUTF8 { buffer in
+            hasher.update(bufferPointer: UnsafeRawBufferPointer(buffer))
+        }
+        return hexDigest(hasher.finalize())
     }
 
     public static func contentDigest(of data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        hexDigest(SHA256.hash(data: data))
+    }
+
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+    private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 
     /// Encode a JSON-RPC success envelope the same way the socket path does,
@@ -379,18 +405,38 @@ public enum PlanNotesProjectionV1: Sendable {
     }
 
     /// Longest UTF-8-safe prefix of `text` with at most `maxBytes` raw bytes.
+    ///
+    /// Under-budget path is O(1) via `utf8.count` (no `Data(text.utf8)`). Over-budget
+    /// walks only the admitted head on contiguous UTF-8 storage and cuts on a scalar
+    /// boundary (same contract as the prior `Data` + continuation walk).
     public static func utf8Prefix(_ text: String, maxBytes: Int) -> String {
         guard maxBytes > 0 else { return "" }
-        let data = Data(text.utf8)
-        guard data.count > maxBytes else { return text }
-        var end = maxBytes
-        // Exclusive end must sit on a scalar boundary (see page()).
-        while end > 0 && end < data.count && isUTF8Continuation(data[end]) {
-            end -= 1
+        // O(1) on native Swift strings: under-budget never pays a full-body copy.
+        guard text.utf8.count > maxBytes else { return text }
+        var copy = text
+        var result = ""
+        copy.withUTF8 { buffer in
+            var end = maxBytes
+            // Exclusive end must sit on a scalar boundary (see page()).
+            while end > 0 && end < buffer.count && isUTF8Continuation(buffer[end]) {
+                end -= 1
+            }
+            if end == 0 {
+                let lead = buffer[0]
+                let width: Int
+                if lead < 0x80 {
+                    width = 1
+                } else if lead < 0xE0 {
+                    width = 2
+                } else if lead < 0xF0 {
+                    width = 3
+                } else {
+                    width = 4
+                }
+                end = min(width, buffer.count)
+            }
+            result = String(decoding: buffer[0..<end], as: UTF8.self)
         }
-        if end == 0 {
-            end = nextScalarEnd(data, from: 0)
-        }
-        return String(data: data[0..<end], encoding: .utf8) ?? ""
+        return result
     }
 }

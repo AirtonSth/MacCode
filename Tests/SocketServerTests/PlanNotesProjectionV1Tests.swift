@@ -1,6 +1,8 @@
 import XCTest
 @testable import SocketServer
 import CoreModel
+import CryptoKit
+import Foundation
 
 /// Pure unit tests for the plan-notes v1 byte-page projection and compact
 /// update event.
@@ -484,5 +486,45 @@ final class PlanNotesProjectionV1Tests: XCTestCase {
         )
         XCTAssertEqual(foundationData, jsonData,
                        "Foundation and JSONValue advertisements must be byte-identical after canonicalization")
+    }
+
+    // MARK: Digest / utf8Prefix perf contracts
+
+    /// WHY: contentDigest must stay byte-identical to CryptoKit lowercase hex
+    /// after the contiguous-UTF-8 + nibble-table path; CAS and client rehydrate
+    /// depend on stable digests across String and Data entry points.
+    func testContentDigest_matchesCryptoKitLowercaseHexForStringAndData() {
+        let samples = ["", "x", "plan-notes-v1-✅-", String(repeating: "N", count: 8192)]
+        for sample in samples {
+            let data = Data(sample.utf8)
+            let expected = SHA256.hash(data: data)
+                .map { String(format: "%02x", $0) }
+                .joined()
+            XCTAssertEqual(PlanNotesProjectionV1.contentDigest(of: sample), expected,
+                           "String digest must match CryptoKit for \(sample.prefix(20))…")
+            XCTAssertEqual(PlanNotesProjectionV1.contentDigest(of: data), expected,
+                           "Data digest must match CryptoKit for \(sample.prefix(20))…")
+            XCTAssertEqual(
+                PlanNotesProjectionV1.contentDigest(of: sample),
+                PlanNotesProjectionV1.contentDigest(of: data)
+            )
+        }
+    }
+
+    /// WHY: under-budget utf8Prefix must be identity (no false truncate), and
+    /// over-budget cuts must stay on a UTF-8 scalar boundary so previews never
+    /// emit broken multi-byte sequences on the wire.
+    func testUtf8Prefix_underBudgetIdentityAndScalarSafeOverBudget() {
+        let short = "hello plan notes"
+        XCTAssertEqual(
+            PlanNotesProjectionV1.utf8Prefix(short, maxBytes: 256),
+            short
+        )
+        // "é" is 2 UTF-8 bytes; budget mid-scalar must walk back.
+        let multi = String(repeating: "é", count: 100)
+        let prefix = PlanNotesProjectionV1.utf8Prefix(multi, maxBytes: 5)
+        XCTAssertLessThanOrEqual(prefix.utf8.count, 5)
+        XCTAssertEqual(String(data: Data(prefix.utf8), encoding: .utf8), prefix)
+        XCTAssertTrue(prefix.allSatisfy { $0 == "é" } || prefix.isEmpty)
     }
 }
