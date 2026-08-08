@@ -2333,8 +2333,13 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
     }
 
+    // PERF: multi-select user-input answers split on comma/semicolon/newline for
+    // every Codex question resolve; share one separator CharacterSet instead of
+    // allocating CharacterSet(charactersIn:) per answer.
+    private static let multiSelectAnswerSeparators = CharacterSet(charactersIn: ",;\n")
+
     private static func splitMultiSelectAnswer(_ text: String) -> [String] {
-        let parts = text.components(separatedBy: CharacterSet(charactersIn: ",;\n"))
+        let parts = text.components(separatedBy: multiSelectAnswerSeparators)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         return parts.isEmpty ? [text] : parts
