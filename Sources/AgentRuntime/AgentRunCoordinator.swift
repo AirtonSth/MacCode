@@ -7453,17 +7453,30 @@ private struct ProviderSessionRuntimePayload: Codable, Equatable {
         updatedAtMs = try container.decodeIfPresent(Int64.self, forKey: .updatedAtMs)
     }
 
+    // PERF: turn lifecycle paths decode/encode this payload repeatedly (start,
+    // stream status, terminal, recovery). JSONEncoder/JSONDecoder are not
+    // thread-safe — share one pair under a short lock instead of allocating
+    // per call. Output is default-formatted (same as prior per-call codecs).
+    private static let codecLock = NSLock()
+    private static let codecEncoder = JSONEncoder()
+    private static let codecDecoder = JSONDecoder()
+
     static func decode(_ json: String?) -> ProviderSessionRuntimePayload {
         guard let json,
-              let data = json.data(using: .utf8),
-              let payload = try? JSONDecoder().decode(ProviderSessionRuntimePayload.self, from: data) else {
+              let data = json.data(using: .utf8) else {
             return ProviderSessionRuntimePayload(turnCount: 0)
         }
-        return payload
+        codecLock.lock()
+        let payload = try? codecDecoder.decode(ProviderSessionRuntimePayload.self, from: data)
+        codecLock.unlock()
+        return payload ?? ProviderSessionRuntimePayload(turnCount: 0)
     }
 
     func encoded() -> String? {
-        guard let data = try? JSONEncoder().encode(self) else { return nil }
+        Self.codecLock.lock()
+        let data = try? Self.codecEncoder.encode(self)
+        Self.codecLock.unlock()
+        guard let data else { return nil }
         return String(data: data, encoding: .utf8)
     }
 }
