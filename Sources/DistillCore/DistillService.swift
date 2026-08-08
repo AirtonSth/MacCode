@@ -1049,6 +1049,21 @@ public final class DistillHTTPServer: @unchecked Sendable {
         return (requiresOperationID ? context.hasCompleteMutationContext : context.hasCompleteScope) ? context : nil
     }
 
+    /// True when `split(separator: "\n", omittingEmptySubsequences: false).count >= threshold`.
+    ///
+    /// PERF: UTF-8 LF scan with early exit — no `Array` of `Substring` for multi-line
+    /// tool dumps. Component count is `newlineCount + 1` for this split form.
+    private static func newlineSeparatedComponentCount(_ text: String, atLeast threshold: Int) -> Bool {
+        if threshold <= 1 { return true }
+        let neededNewlines = threshold - 1
+        var newlines = 0
+        for byte in text.utf8 where byte == 0x0A {
+            newlines += 1
+            if newlines >= neededNewlines { return true }
+        }
+        return false
+    }
+
     /// Lossy deterministic crushers with store-before-loss (command-output only).
     /// Returns a ready response when stack/test/source/diff/HTML crushers win; nil to
     /// fall through to EncoderFirst (lossless → BERT → E4B).
@@ -1064,15 +1079,24 @@ public final class DistillHTTPServer: @unchecked Sendable {
             return nil
         }
         // Cheap size + shape gate: avoid prepareOriginal on tiny / non-lossy payloads.
+        // PERF: multi-MB tool outputs already pass the byte gate — do not allocate a
+        // full `split` Array just to count lines. When the byte gate fails, scan LF
+        // with early exit at 30 components (same as
+        // `split(separator: "\n", omittingEmptySubsequences: false).count`).
         let input = request.input
-        let lineCount = input.split(separator: "\n", omittingEmptySubsequences: false).count
-        guard input.utf8.count >= 2_048 || lineCount >= 30 else { return nil }
+        guard input.utf8.count >= 2_048
+                || Self.newlineSeparatedComponentCount(input, atLeast: 30) else {
+            return nil
+        }
         guard CommandOutputLossyRouter.isLossyCandidate(input) else { return nil }
         guard distillAdmission() else { return nil }
 
         do {
+            // PERF: one UTF-8 materialization for prepare + readback equality
+            // (store-before-loss path on multi-KB/MB command output).
+            let originalBytes = Data(input.utf8)
             let preparation = try scopedRecoveryStore.prepareOriginal(
-                Data(input.utf8),
+                originalBytes,
                 context: scopedContext,
                 lane: "deterministic_lossy"
             )
@@ -1080,7 +1104,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
                   try scopedRecoveryStore.retrieveOriginal(
                     capability: preparation.capability,
                     context: scopedContext
-                  ) == Data(input.utf8) else {
+                  ) == originalBytes else {
                 return nil
             }
             guard let routed = CommandOutputLossyRouter.routeIfBeneficial(
@@ -1377,8 +1401,11 @@ public final class DistillHTTPServer: @unchecked Sendable {
                 var deliveredWithHandle = false
                 if let scopedContext, let scopedRecoveryStore {
                     do {
+                        // PERF: one UTF-8 materialization for prepare + readback equality
+                        // on lossy optimize outputs (can be multi-KB/MB).
+                        let originalBytes = Data(distillRequest.input.utf8)
                         let preparation = try scopedRecoveryStore.prepareOriginal(
-                            Data(distillRequest.input.utf8),
+                            originalBytes,
                             context: scopedContext,
                             lane: distillRequest.mode == .commandOutput ? "deterministic_wrapper" : "semantic_prose"
                         )
@@ -1386,7 +1413,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
                               try scopedRecoveryStore.retrieveOriginal(
                                 capability: preparation.capability,
                                 context: scopedContext
-                              ) == Data(distillRequest.input.utf8),
+                              ) == originalBytes,
                               try scopedRecoveryStore.markDelivered(
                                 capability: preparation.capability,
                                 idempotencyKey: preparation.idempotencyKey,
