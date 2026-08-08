@@ -23,7 +23,7 @@ public actor EmbeddingCache {
     }
 
     public static func key(text: String, modelID: String, chunkerVersion: String) -> Key {
-        let hash = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        let hash = DistillSHA256.hex(text)
         return Key(contentHash: hash, modelID: modelID, chunkerVersion: chunkerVersion)
     }
 

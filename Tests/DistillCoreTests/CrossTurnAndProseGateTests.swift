@@ -1,5 +1,7 @@
 import XCTest
 @testable import DistillCore
+import CryptoKit
+import Foundation
 
 /// I11 cross-turn dedup safety + I12.7 prose-lane gate stack.
 final class CrossTurnAndProseGateTests: XCTestCase {
@@ -9,6 +11,22 @@ final class CrossTurnAndProseGateTests: XCTestCase {
         let b = "deploy 2026-06-14T09:30:00Z ok"
         XCTAssertNotEqual(CrossTurnDedupPolicy.rawByteHash(a), CrossTurnDedupPolicy.rawByteHash(b))
         XCTAssertEqual(CrossTurnDedupPolicy.rawByteHash(a), CrossTurnDedupPolicy.rawByteHash(a))
+    }
+
+    /// WHY: skip-set / dedup / cache fingerprints must stay CryptoKit-identical
+    /// after contiguous UTF-8 + nibble hex; a case drift would poison skip-set
+    /// keys or false-negative cross-turn pointers.
+    func test_distillSHA256_matchesCryptoKitLowercaseHex() {
+        let samples = ["", "hello", "deploy ✅ 2026", String(repeating: "N", count: 4096)]
+        for sample in samples {
+            let expected = SHA256.hash(data: Data(sample.utf8))
+                .map { String(format: "%02x", $0) }
+                .joined()
+            XCTAssertEqual(DistillSHA256.hex(sample), expected)
+            XCTAssertEqual(DistillSHA256.hex(Data(sample.utf8)), expected)
+            XCTAssertEqual(CrossTurnDedupPolicy.rawByteHash(sample), expected)
+            XCTAssertEqual(DeterministicSkipSet.key(sample), expected)
+        }
     }
 
     // I11.2/3: pointer only when byte-identical, same-thread, and prior was verbatim.

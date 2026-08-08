@@ -15,7 +15,7 @@ public struct DeterministicSkipSet: Sendable {
     public init(ttlTurns: Int = 60) { self.ttlTurns = max(1, ttlTurns) }
 
     public static func key(_ input: String) -> String {
-        SHA256.hash(data: Data(input.utf8)).map { String(format: "%02x", $0) }.joined()
+        DistillSHA256.hex(input)
     }
 
     /// Record a DETERMINISTIC non-compressible verdict. `routerReturnedNil` must be the

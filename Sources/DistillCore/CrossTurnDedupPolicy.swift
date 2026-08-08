@@ -17,7 +17,7 @@ public enum CrossTurnDedupPolicy {
     /// I11.7: the dedup key is a hash of the RAW bytes — no whitespace / ANSI / timestamp
     /// normalization (near-dup variants are I9's job; "byte-exact" stays literal).
     public static func rawByteHash(_ payload: String) -> String {
-        SHA256.hash(data: Data(payload.utf8)).map { String(format: "%02x", $0) }.joined()
+        DistillSHA256.hex(payload)
     }
 
     /// A pointer is sound only if the candidate is byte-identical to a prior occurrence the
