@@ -42,6 +42,11 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
     public let fileURL: URL
     public let maxRecords: Int
     private let lock = NSLock()
+    // PERF: every provider spawn/remove/sweep load+replace allocated
+    // JSONDecoder/JSONEncoder. Methods always call these under `lock`, so one
+    // instance pair is safe and avoids per-mutation codec construction.
+    private let decoder = JSONDecoder()
+    private let encoder = JSONEncoder()
 
     public init(fileURL: URL, maxRecords: Int = defaultMaxRecords) {
         self.fileURL = fileURL
@@ -109,7 +114,7 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
 
     private func loadUnlocked() throws -> [SpawnedProcessTag] {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
-        return try JSONDecoder().decode([SpawnedProcessTag].self, from: Data(contentsOf: fileURL))
+        return try decoder.decode([SpawnedProcessTag].self, from: Data(contentsOf: fileURL))
     }
 
     private func replaceUnlocked(_ tags: [SpawnedProcessTag]) throws {
@@ -118,7 +123,7 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        try JSONEncoder().encode(tags).write(to: fileURL, options: .atomic)
+        try encoder.encode(tags).write(to: fileURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
     }
 }
