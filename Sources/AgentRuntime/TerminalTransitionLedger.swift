@@ -199,6 +199,9 @@ public final class TerminalTransitionLedger: @unchecked Sendable {
     private let maxRows: Int
     private let ttl: TimeInterval
     private let queue = DispatchQueue(label: "io.remotecode.terminal-ledger")
+    /// PERF: avoid re-reading + splitting the whole JSONL on every append just to
+    /// decide whether to prune. Updated on append / prune; cold-filled once.
+    private var cachedRowCount: Int?
     private let encoder: JSONEncoder = {
         let e = JSONEncoder()
         e.dateEncodingStrategy = .iso8601
@@ -239,9 +242,29 @@ public final class TerminalTransitionLedger: @unchecked Sendable {
     }
 
     private func rowCountLocked() throws -> Int {
+        if let cachedRowCount { return cachedRowCount }
+        let count = try computeRowCountFromDiskLocked()
+        cachedRowCount = count
+        return count
+    }
+
+    /// Same count as `split(separator: "\n", omittingEmptySubsequences: true).count`
+    /// without building a `String` or `Array` of line slices.
+    private func computeRowCountFromDiskLocked() throws -> Int {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return 0 }
-        let text = try String(contentsOf: fileURL, encoding: .utf8)
-        return text.split(separator: "\n", omittingEmptySubsequences: true).count
+        let data = try Data(contentsOf: fileURL)
+        var count = 0
+        var lineHasContent = false
+        for byte in data {
+            if byte == 0x0A {
+                if lineHasContent { count += 1 }
+                lineHasContent = false
+            } else {
+                lineHasContent = true
+            }
+        }
+        if lineHasContent { count += 1 }
+        return count
     }
 
     public func allRecords() throws -> [TerminalTransitionRecord] {
@@ -266,6 +289,10 @@ public final class TerminalTransitionLedger: @unchecked Sendable {
         } else {
             try line.write(to: fileURL)
         }
+        if let cached = cachedRowCount {
+            cachedRowCount = cached + 1
+        }
+        // else leave nil — first `rowCountLocked` cold-fills including this line
     }
 
     private func loadLocked() throws -> [TerminalTransitionRecord] {
@@ -290,5 +317,6 @@ public final class TerminalTransitionLedger: @unchecked Sendable {
             return data
         }.reduce(into: Data()) { $0.append($1) }
         try body.write(to: fileURL, options: .atomic)
+        cachedRowCount = rows.count
     }
 }
