@@ -26,8 +26,7 @@ public struct GraphifyRepoKey: Hashable, Codable, Sendable, Equatable {
 
     /// Stable App Support directory name for this identity.
     public var artifactDirectoryName: String {
-        let digest = SHA256.hash(data: Data(commonDir.utf8))
-        return digest.map { String(format: "%02x", $0) }.joined()
+        GraphifyDigest.hex(SHA256.hash(data: Data(commonDir.utf8)))
     }
 }
 
@@ -47,12 +46,28 @@ public struct GraphifyCheckout: Codable, Sendable, Equatable {
     /// Stable App Support directory for this exact checkout (worktree-aware).
     public var artifactDirectoryName: String {
         let material = key.commonDir + "\n" + displayRoot
-        let digest = SHA256.hash(data: Data(material.utf8))
-        return digest.map { String(format: "%02x", $0) }.joined()
+        return GraphifyDigest.hex(SHA256.hash(data: Data(material.utf8)))
     }
 
     /// Scheduler identity (unique per worktree checkout).
     public var scheduleID: String { artifactDirectoryName }
+}
+
+/// PERF: nibble table instead of per-byte `String(format:)` so Graphify
+/// artifact/schedule digests avoid 32 formatter calls while keeping the same
+/// CryptoKit lowercase hex contract for durable App Support paths.
+enum GraphifyDigest {
+    private static let hexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+    static func hex<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(hexNibbleAlphabet[Int(byte >> 4)])
+            out.append(hexNibbleAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
+    }
 }
 
 public enum GraphifyWorkspaceKind: Codable, Sendable, Equatable {
