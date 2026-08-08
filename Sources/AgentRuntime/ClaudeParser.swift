@@ -988,12 +988,15 @@ public final class ClaudeParser {
     nonisolated(unsafe) static var assistantTextNormalizationsForTesting = 0
     #endif
 
+    // PERF: compile once — normalized/compact forms run on every assistant block
+    // for stream-json dedup; replacingOccurrences(options: .regularExpression) recompiled.
+    private static let whitespaceRegex = try! NSRegularExpression(pattern: #"\s+"#)
+
     private func normalizedAssistantText(_ text: String) -> String {
         #if DEBUG
         Self.assistantTextNormalizationsForTesting &+= 1
         #endif
-        return text
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        return Self.replaceAll(Self.whitespaceRegex, in: text, with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -1001,9 +1004,22 @@ public final class ClaudeParser {
         #if DEBUG
         Self.assistantTextNormalizationsForTesting &+= 1
         #endif
-        return text
-            .replacingOccurrences(of: "\\s+", with: "", options: .regularExpression)
+        return Self.replaceAll(Self.whitespaceRegex, in: text, with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func replaceAll(
+        _ regex: NSRegularExpression,
+        in text: String,
+        with template: String
+    ) -> String {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.stringByReplacingMatches(
+            in: text,
+            options: [],
+            range: range,
+            withTemplate: template
+        )
     }
 
     // Claude's AskUserQuestion tool sends a `questions` array, each entry with its
