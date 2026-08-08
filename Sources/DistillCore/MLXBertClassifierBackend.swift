@@ -260,6 +260,9 @@ struct BertWordPieceTokenizer: Sendable {
     private let unkId: Int
     let clsId: Int, sepId: Int, padId: Int
     private let maxWordChars = 100
+    // PERF: vocab.txt is multi-10k lines; share CR-only trim set instead of
+    // allocating CharacterSet(charactersIn: "\r") per line on load.
+    private static let crOnlyTrimSet = CharacterSet(charactersIn: "\r")
 
     init?(vocabFile: URL, lowercase: Bool) {
         guard let text = try? String(contentsOf: vocabFile, encoding: .utf8) else { return nil }
@@ -268,7 +271,7 @@ struct BertWordPieceTokenizer: Sendable {
         // vocab.txt: one token per line; the line index IS the token id. Tokens never
         // contain leading/trailing whitespace, but strip the line's \r/\n only.
         for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
-            let tok = String(line).trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
+            let tok = String(line).trimmingCharacters(in: Self.crOnlyTrimSet)
             v[tok] = arr.count
             arr.append(tok)
         }
