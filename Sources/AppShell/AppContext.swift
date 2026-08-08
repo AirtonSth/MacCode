@@ -981,7 +981,14 @@ public final class AppContext {
         // event bus so the iOS mirror renders agent output in real time
         // (kinds/payloads match the iOS MirrorEventReducer contract).
         func itemJSON(_ item: AssistantItem) -> JSONValue {
-            (try? JSONDecoder().decode(JSONValue.self, from: JSONEncoder().encode(item))) ?? .null
+            // PERF: encode once, then JSONSerialization + JSONValue.from — avoids a
+            // second full Codable walk via JSONDecoder on every agent.item.started
+            // EventBus publish (same pattern as connectionSnapshotJSON).
+            guard let data = try? JSONEncoder().encode(item),
+                  let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+                return .null
+            }
+            return JSONValue.from(object)
         }
         func runtimeEventPayload(_ event: ProviderRuntimeEvent, threadId: String) -> JSONValue {
             var payload: [String: JSONValue] = [

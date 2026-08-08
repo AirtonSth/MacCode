@@ -498,9 +498,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private func jsonValue<T: Encodable>(_ value: T) -> JSONValue {
+        // PERF: encode once, then JSONSerialization + JSONValue.from — avoids a
+        // second full Codable walk via JSONDecoder (same as connectionSnapshotJSON /
+        // workspaceCreatedPayload).
         guard let data = try? JSONEncoder().encode(value),
-              let json = try? JSONDecoder().decode(JSONValue.self, from: data) else { return .null }
-        return json
+              let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+            return .null
+        }
+        return JSONValue.from(object)
     }
 
     public func withSuppressedLayoutEvents<T>(_ body: () throws -> T) rethrows -> T {
