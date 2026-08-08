@@ -319,6 +319,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         encoder.outputFormatting = [.sortedKeys]
         return encoder
     }()
+    // PERF: provider instances, SSH hosts, and pending-callback list allocated
+    // JSONDecoder/JSONEncoder per call. MainActor-isolated router — share one
+    // pair (no lock; codecs are only touched on this actor).
+    private let settingsJSONDecoder = JSONDecoder()
+    private let settingsJSONEncoder = JSONEncoder()
     private var providerProbeCache: [ProviderProbeCacheKey: ProviderProbeCapabilities] = [:]
     private var providerUpdateLocks = Set<ProviderProbeCacheKey>()
     private let providerProbeCacheTTL: TimeInterval = 30
@@ -4474,14 +4479,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func listAgentPendingCallbacks(thread: AgentThreadID) throws -> AssistantPendingCallbacksSnapshot {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        let decoder = JSONDecoder()
         var requests: [AssistantPendingRequest] = []
         var userInputs: [AssistantUserInputRequest] = []
         for callback in try ctx.providerPendingCallbackRepo.listVisible(threadId: thread) {
             guard let data = callback.payloadJSON.data(using: .utf8) else { continue }
             switch callback.kind {
             case .approval:
-                guard var request = try? decoder.decode(AssistantPendingRequest.self, from: data) else { continue }
+                guard var request = try? settingsJSONDecoder.decode(AssistantPendingRequest.self, from: data) else { continue }
                 request.state = callback.state
                 request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
                 if callback.state == .stale, let reason = callback.staleReason {
@@ -4489,7 +4493,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 }
                 requests.append(request)
             case .userInput:
-                guard var input = try? decoder.decode(AssistantUserInputRequest.self, from: data) else { continue }
+                guard var input = try? settingsJSONDecoder.decode(AssistantUserInputRequest.self, from: data) else { continue }
                 input.state = callback.state
                 input.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
                 if callback.state == .stale, let reason = callback.staleReason, input.answer == nil {
@@ -5282,7 +5286,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let raw = try? context?.settingsRepo.get("agent.provider.instances")?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty,
               let data = raw.data(using: .utf8),
-              let decoded = try? JSONDecoder().decode([AgentProviderInstanceConfig].self, from: data) else {
+              let decoded = try? settingsJSONDecoder.decode([AgentProviderInstanceConfig].self, from: data) else {
             return []
         }
         var seen = Set<String>()
@@ -6441,7 +6445,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private func readSSHHosts(workspace: WorkspaceID, from repo: SettingsRepository) throws -> [SSHHostProfile] {
         guard let raw = try repo.get(sshHostsKey(workspace: workspace)),
               let data = raw.data(using: .utf8) else { return [] }
-        return (try? JSONDecoder().decode([SSHHostProfile].self, from: data)) ?? []
+        return (try? settingsJSONDecoder.decode([SSHHostProfile].self, from: data)) ?? []
     }
 
     private func writeSSHHosts(_ hosts: [SSHHostProfile], workspace: WorkspaceID, to repo: SettingsRepository) throws {
@@ -6459,7 +6463,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             h.password = nil
             return h
         }
-        let data = try JSONEncoder().encode(stripped)
+        let data = try settingsJSONEncoder.encode(stripped)
         try repo.set(sshHostsKey(workspace: workspace), String(data: data, encoding: .utf8) ?? "[]")
     }
 
