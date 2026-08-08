@@ -350,6 +350,16 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
     private static let ioLock = NSLock()
     private static let lockFileName = "usage.lock"
     private static let advisoryLock: @convention(c) (Int32, Int32) -> Int32 = flock
+    // PERF: every load/save allocated JSONDecoder/JSONEncoder while callers
+    // construct a fresh store per write. Share process-wide codecs under a
+    // short lock (prettyPrinted+sortedKeys unchanged for usage.json).
+    private static let codecLock = NSLock()
+    private static let decoder = JSONDecoder()
+    private static let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return encoder
+    }()
     private let url: URL
     private let fileManager: FileManager
     private let calendar: Calendar
@@ -377,10 +387,13 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
     }
 
     private func loadUnlocked(period: TokenSaverPeriod) -> TokenSaverUsageSnapshot {
-        let decoder = JSONDecoder()
-        guard let data = try? Data(contentsOf: url),
-              let snapshot = try? decoder.decode(TokenSaverUsageSnapshot.self, from: data),
-              snapshot.period == period else {
+        guard let data = try? Data(contentsOf: url) else {
+            return .empty(period: period)
+        }
+        Self.codecLock.lock()
+        let decoded = try? Self.decoder.decode(TokenSaverUsageSnapshot.self, from: data)
+        Self.codecLock.unlock()
+        guard let snapshot = decoded, snapshot.period == period else {
             return .empty(period: period)
         }
         // Older usage.json files predate Grok; ensure every managed agent provider
@@ -515,9 +528,12 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
 
     private func saveUnlocked(_ snapshot: TokenSaverUsageSnapshot) throws {
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(snapshot).write(to: url, options: .atomic)
+        let data: Data = try {
+            Self.codecLock.lock()
+            defer { Self.codecLock.unlock() }
+            return try Self.encoder.encode(snapshot)
+        }()
+        try data.write(to: url, options: .atomic)
     }
 
     /// Serializes the complete usage.json read-modify-write across RemoteCode and
