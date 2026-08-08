@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 
 public struct CacheAlignerVolatileTokenScan: Sendable, Equatable {
     public let uuidCount: Int
@@ -54,8 +53,8 @@ public enum CacheAlignerPromptContract {
             "maxOutputCharacters=\(request.maxOutputCharacters)"
         ].joined(separator: "\n")
 
-        return SHA256.hash(data: Data(contract.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
+        // PERF: DistillSHA256 contiguous UTF-8 + nibble hex (not Data(utf8) +
+        // String(format:)) on every distill metrics prompt-hash record.
+        return DistillSHA256.hex(contract)
     }
 }
