@@ -3731,7 +3731,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         )
         let payloadJSON: String
         do {
-            let data = try JSONEncoder().encode(event)
+            // PERF: reuse streamEventEncoder (same default-format wire JSON as
+            // live stream events) instead of allocating JSONEncoder per start
+            // failure. Matches handle/publish paths.
+            let data = try streamEventEncoder.encode(event)
             guard let json = String(data: data, encoding: .utf8) else {
                 throw NSError(
                     domain: "RemoteCode.AgentRunCoordinator",
