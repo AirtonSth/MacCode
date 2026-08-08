@@ -2208,11 +2208,17 @@ public enum ProviderProxyPolicy {
         return String(raw.prefix(128))
     }
 
+    // PERF: makeNodeId sanitizes provider basenames on nested Token Saver
+    // PATH-wrapper spawns; union CharacterSet(charactersIn:) per call is waste.
+    private static let nodeIdTokenScalars = CharacterSet.alphanumerics
+        .union(CharacterSet(charactersIn: "-_."))
+
     private static func sanitizeToken(_ raw: String, fallback: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !trimmed.isEmpty else { return fallback }
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_."))
-        let filtered = String(trimmed.unicodeScalars.map { allowed.contains($0) ? Character($0) : Character("_") })
+        let filtered = String(trimmed.unicodeScalars.map {
+            nodeIdTokenScalars.contains($0) ? Character($0) : Character("_")
+        })
         return filtered.isEmpty ? fallback : filtered
     }
 
