@@ -3058,7 +3058,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         switch status {
         case "completed", "succeeded", "success": return .completed
         case "failed": return .failed
-        case "cancelled", "canceled": return .cancelled
+        // User denial of command/fileChange approvals arrives as wire status
+        // "declined" (openai/codex CommandExecutionStatus/PatchApplyStatus).
+        // AssistantItemState has no .declined; terminal cancel matches denial.
+        case "cancelled", "canceled", "declined", "decline", "denied", "deny": return .cancelled
         default: return .streaming
         }
     }
