@@ -96,12 +96,56 @@ public struct CommandPaletteFilter {
     /// original (insertion) order so the palette is deterministic.
     public static func rank<T>(_ items: [T], query: String,
                                _ fields: (T) -> (title: String, subtitle: String, keywords: [String])) -> [T] {
-        items.enumerated().compactMap { idx, item -> (T, Int, Int)? in
+        // PERF: palette filters on every keystroke; query and field lowercasing
+        // was repeated per-item via score(). Hoist query normalization and avoid
+        // re-lowercasing query inside the per-item loop.
+        let qLow = query.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if qLow.isEmpty {
+            // score() returns 0 for empty query -> keep all, sorted by insertion order.
+            return items
+        }
+        let tokens: [String]
+        if qLow.contains(" ") {
+            tokens = qLow.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+            if tokens.isEmpty { return items }
+        } else {
+            tokens = [qLow]
+        }
+        // Single-token vs multi-token scoring without re-lowercasing query.
+        return items.enumerated().compactMap { idx, item -> (T, Int, Int)? in
             let f = fields(item)
-            guard let s = score(query: query, title: f.title, subtitle: f.subtitle, keywords: f.keywords) else { return nil }
+            let tLow = f.title.lowercased()
+            let sLow = f.subtitle.lowercased()
+            // Keywords lowercased once per item; scoreToken will use contains on these.
+            let kwLow = f.keywords.map { $0.lowercased() }
+            let score: Int?
+            if tokens.count > 1 {
+                var minScore = Int.max
+                var ok = true
+                for token in tokens {
+                    guard let s = scoreTokenLowercased(token: token, titleLow: tLow, subtitleLow: sLow, keywordsLow: kwLow) else {
+                        ok = false; break
+                    }
+                    if s < minScore { minScore = s }
+                }
+                score = ok ? (minScore == Int.max ? nil : minScore) : nil
+            } else {
+                score = scoreTokenLowercased(token: tokens[0], titleLow: tLow, subtitleLow: sLow, keywordsLow: kwLow)
+            }
+            guard let s = score else { return nil }
             return (item, s, idx)
         }
         .sorted { $0.1 != $1.1 ? $0.1 > $1.1 : $0.2 < $1.2 }
         .map(\.0)
+    }
+
+    private static func scoreTokenLowercased(token: String, titleLow: String, subtitleLow: String, keywordsLow: [String]) -> Int? {
+        if titleLow == token { return 100 }
+        if titleLow.hasPrefix(token) { return 80 }
+        if titleLow.contains(token) { return 60 }
+        if subtitleLow.contains(token) { return 40 }
+        if keywordsLow.contains(where: { $0.contains(token) }) { return 20 }
+        if isSubsequence(token, of: titleLow) { return 10 }
+        return nil
     }
 }
