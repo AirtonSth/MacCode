@@ -1295,6 +1295,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     static let pairingPanelStyleMask: NSWindow.StyleMask = [.titled]
 
+    // PERF: DateFormatter is expensive; pairing sheet shows created-at per prompt.
+    private static let pairingCreatedAtFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .none
+        f.timeStyle = .medium
+        return f
+    }()
+
     static func configurePairingPanel(_ panel: NSPanel) {
         panel.title = "Pairing Request"
         panel.isMovableByWindowBackground = true
@@ -1363,11 +1371,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         codeField.setAccessibilityLabel(Self.pairingCodeAccessibilityLabel(prompt.code))
         content.addSubview(codeField)
 
-        // Created-at detail
-        let fmt = DateFormatter()
-        fmt.dateStyle = .none
-        fmt.timeStyle = .medium
-        let createdLabel = NSTextField(labelWithString: "Requested at \(fmt.string(from: prompt.createdAt))")
+        // Created-at detail — DateFormatter is expensive; reuse one.
+        let createdLabel = NSTextField(labelWithString: "Requested at \(Self.pairingCreatedAtFormatter.string(from: prompt.createdAt))")
         createdLabel.alignment = .center
         createdLabel.font = NSFont.systemFont(ofSize: 11)
         createdLabel.textColor = .secondaryLabelColor
