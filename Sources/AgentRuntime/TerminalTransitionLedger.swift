@@ -249,10 +249,18 @@ public final class TerminalTransitionLedger: @unchecked Sendable {
     }
 
     /// Same count as `split(separator: "\n", omittingEmptySubsequences: true).count`
-    /// without building a `String` or `Array` of line slices.
+    /// without building an `Array` of line slices. Validate UTF-8 first so a
+    /// damaged ledger still fails loudly like the prior String-based path.
     private func computeRowCountFromDiskLocked() throws -> Int {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return 0 }
         let data = try Data(contentsOf: fileURL)
+        guard String(data: data, encoding: .utf8) != nil else {
+            throw NSError(
+                domain: "RemoteCode.TerminalTransitionLedger",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Terminal transition ledger is not valid UTF-8."]
+            )
+        }
         var count = 0
         var lineHasContent = false
         for byte in data {

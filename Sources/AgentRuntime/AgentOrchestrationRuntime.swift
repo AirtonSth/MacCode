@@ -2865,54 +2865,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         return decoder
     }()
 
-    // PERF: Auto `route`/`admit` re-read and SHA-256 every orchestrate package
-    // file (~100KB) on every gate. Cache the verification result keyed by
-    // package path + a cheap tree attribute signature (relative path, type,
-    // size, content mtime). Content writes update mtime on APFS, so install
-    // and the tamper test invalidate the cache without full re-hash until the
-    // tree actually changes. Fail-closed: unreadable trees skip the cache.
-    private struct PackageVerifyCacheEntry {
-        let signature: String
-        let result: Bool
-    }
-    private static let packageVerifyCacheLock = NSLock()
-    private static var packageVerifyCache: [String: PackageVerifyCacheEntry] = [:]
-    private static let packageVerifySignatureKeys: Set<URLResourceKey> = [
-        .isDirectoryKey,
-        .isRegularFileKey,
-        .isSymbolicLinkKey,
-        .fileSizeKey,
-        .contentModificationDateKey,
-    ]
-
     public static func verifyInstalledPackage(at packageURL: URL) -> Bool {
-        let canonicalPackageURL = packageURL.standardizedFileURL
-        let cacheKey = canonicalPackageURL.path
-        if let signature = packageTreeSignature(at: canonicalPackageURL) {
-            packageVerifyCacheLock.lock()
-            if let cached = packageVerifyCache[cacheKey], cached.signature == signature {
-                let result = cached.result
-                packageVerifyCacheLock.unlock()
-                return result
-            }
-            packageVerifyCacheLock.unlock()
-
-            let result = verifyInstalledPackageUncached(at: canonicalPackageURL)
-            packageVerifyCacheLock.lock()
-            packageVerifyCache[cacheKey] = PackageVerifyCacheEntry(
-                signature: signature,
-                result: result
-            )
-            packageVerifyCacheLock.unlock()
-            return result
-        }
-        return verifyInstalledPackageUncached(at: canonicalPackageURL)
-    }
-
-    /// Full package gate: manifest pin check, per-file SHA-256, and
-    /// installer-owned tree walk. Callers should prefer
-    /// `verifyInstalledPackage(at:)` so the attribute cache applies.
-    private static func verifyInstalledPackageUncached(at packageURL: URL) -> Bool {
         let pinned = AgentSkillInstaller.remoteCodeOrchestratePinnedPackage
         let canonicalPackageURL = packageURL.standardizedFileURL
         let manifestURL = canonicalPackageURL.appendingPathComponent(
@@ -2960,53 +2913,6 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             packageURL: canonicalPackageURL,
             filePaths: Set(manifest.files.map(\.relativePath))
         )
-    }
-
-    /// Cheap package-tree fingerprint for the verification cache. Sorted so
-    /// enumerator order cannot produce false cache misses.
-    private static func packageTreeSignature(at packageURL: URL) -> String? {
-        guard isDirectoryWithoutSymlink(packageURL) else { return nil }
-        let keys = packageVerifySignatureKeys
-        guard let values = try? packageURL.resourceValues(forKeys: keys),
-              let rootMTime = values.contentModificationDate else {
-            return nil
-        }
-        guard let enumerator = FileManager.default.enumerator(
-            at: packageURL,
-            includingPropertiesForKeys: Array(keys),
-            options: [],
-            errorHandler: { _, _ in false }
-        ) else {
-            return nil
-        }
-
-        var parts: [String] = [
-            ".:d:\(values.fileSize ?? 0):\(rootMTime.timeIntervalSinceReferenceDate)",
-        ]
-        let root = packageURL.path + "/"
-        for case let item as URL in enumerator {
-            let standardized = item.standardizedFileURL
-            guard standardized.path.hasPrefix(root) else { return nil }
-            let relativePath = String(standardized.path.dropFirst(root.count))
-            guard let itemValues = try? item.resourceValues(forKeys: keys),
-                  itemValues.isSymbolicLink != true,
-                  let mtime = itemValues.contentModificationDate else {
-                return nil
-            }
-            let kind: String
-            if itemValues.isDirectory == true {
-                kind = "d"
-            } else if itemValues.isRegularFile == true {
-                kind = "f"
-            } else {
-                return nil
-            }
-            parts.append(
-                "\(relativePath):\(kind):\(itemValues.fileSize ?? 0):\(mtime.timeIntervalSinceReferenceDate)"
-            )
-        }
-        parts.sort()
-        return parts.joined(separator: "\n")
     }
 
     public static func defaultKillSwitch() -> Bool {

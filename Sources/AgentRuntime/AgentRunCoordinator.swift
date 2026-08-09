@@ -966,11 +966,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private var launchForkReconciliationTask: Task<Void, Never>?
     private var seq: [AgentRunID: Int] = [:]
     // PERF-MAC_AGENT-005: reuse one encoder instead of allocating per stream
-    // event, and prune on a cadence rather than every event. Both are touched
-    // under `lock` (encode is serialized there) so they stay thread-safe.
+    // event, and prune on a cadence rather than every event. Encoding is
+    // serialized by `streamEventEncoderLock`; callers may encode outside the
+    // mirror lock while provider callbacks arrive concurrently.
+    private let streamEventEncoderLock = NSLock()
     private let streamEventEncoder = JSONEncoder()
     private var streamEventsSincePrune: [AgentThreadID: Int] = [:]
     private static let streamEventPruneInterval = 25
+
+    private func encodeStreamEvent(_ event: AssistantEvent) throws -> Data {
+        streamEventEncoderLock.lock()
+        defer { streamEventEncoderLock.unlock() }
+        return try streamEventEncoder.encode(event)
+    }
     // PERF-MAC_AGENT-007: per-thread buffer of pending stream-event writes plus
     // the timestamp of the last flush, so 2-3 writes/event collapse into batched
     // flushes (see shouldFlushStreamBatch). All touched under `lock`.
@@ -3731,10 +3739,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         )
         let payloadJSON: String
         do {
-            // PERF: reuse streamEventEncoder (same default-format wire JSON as
-            // live stream events) instead of allocating JSONEncoder per start
-            // failure. Matches handle/publish paths.
-            let data = try streamEventEncoder.encode(event)
+            // This path is not serialized by `mirrorEventLock`; keep its
+            // encoder local because JSONEncoder is mutable and not thread-safe.
+            let data = try JSONEncoder().encode(event)
             guard let json = String(data: data, encoding: .utf8) else {
                 throw NSError(
                     domain: "RemoteCode.AgentRunCoordinator",
@@ -5260,7 +5267,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // buffer ownership still require the lock; encoding does not.
             let data: Data?
             do {
-                data = try streamEventEncoder.encode(ev)
+                data = try encodeStreamEvent(ev)
             } catch {
                 recordMirrorPersistenceFailure(error, threadId: threadId)
                 emitPersistenceIssue("run.stream_event.encode", error: error, runId: runId, threadId: threadId)
@@ -7271,7 +7278,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
             let data: Data
             do {
-                data = try streamEventEncoder.encode(event)
+                data = try encodeStreamEvent(event)
             } catch {
                 recordMirrorPersistenceFailure(error, threadId: threadId)
                 return .failed(operation: "run.stream_event.encode", error: error)

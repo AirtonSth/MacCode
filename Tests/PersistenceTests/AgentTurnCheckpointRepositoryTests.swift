@@ -889,6 +889,43 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
         }
     }
 
+    func testProjectionStopsAtFirstOversizedGrapheme() {
+        // WHY: a single extended grapheme can exceed the preview cap. The bounded
+        // prefix must stop there; admitting a later small character would persist
+        // the oversized grapheme and make checkpoint-list reads fail closed.
+        let oversizedGrapheme = "e" + String(repeating: "\u{301}", count: 600)
+        let raw = oversizedGrapheme + "x"
+
+        let projected = AgentTurnCheckpointListWireProjection.projectString(
+            raw,
+            maximumEncodedBytes: AgentTurnCheckpointListWireProjection.maxEncodedErrorMessageBytes
+        )
+
+        XCTAssertTrue(projected.truncated)
+        XCTAssertEqual(projected.value, "")
+        XCTAssertGreaterThan(projected.totalEncodedBytes, AgentTurnCheckpointListWireProjection.maxEncodedErrorMessageBytes)
+        XCTAssertLessThanOrEqual(
+            AgentTurnCheckpointWireIdentity.encodedJSONStringByteCount(projected.value ?? ""),
+            AgentTurnCheckpointListWireProjection.maxEncodedErrorMessageBytes
+        )
+    }
+
+    func testProjectionStopsAfterOversizedGraphemeEvenWhenPrefixFits() {
+        // WHY: a bounded prefix may contain a valid small grapheme before the next
+        // grapheme exceeds the byte cap. Once that boundary is reached, a later
+        // suffix must not be admitted or the projection is no longer a prefix.
+        let oversizedGrapheme = "e" + String(repeating: "\u{301}", count: 600)
+        let raw = "a" + oversizedGrapheme + "x"
+
+        let projected = AgentTurnCheckpointListWireProjection.projectString(
+            raw,
+            maximumEncodedBytes: AgentTurnCheckpointListWireProjection.maxEncodedErrorMessageBytes
+        )
+
+        XCTAssertTrue(projected.truncated)
+        XCTAssertEqual(projected.value, "a")
+    }
+
     func testCatalogRevisionIncrementsTransactionallyWithInsertUpsertDelete() throws {
         // WHY: page fences must move with every mutation that can change list
         // fields/order; a non-transactional or O(N) digest would mix revisions.

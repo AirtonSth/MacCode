@@ -1687,6 +1687,7 @@ public enum AgentTurnCheckpointListWireProjection {
         var previewEncoded = 2
         var previewEnd = raw.startIndex
         var index = raw.startIndex
+        var previewAdmissionOpen = true
         while index < raw.endIndex {
             let next = raw.index(after: index)
             var charCost = 0
@@ -1694,9 +1695,13 @@ public enum AgentTurnCheckpointListWireProjection {
                 charCost += AgentTurnCheckpointWireIdentity.encodedJSONScalarCost(scalar)
             }
             totalEncodedBytes += charCost
-            if previewEncoded + charCost <= maximumEncodedBytes {
-                previewEncoded += charCost
-                previewEnd = next
+            if previewAdmissionOpen {
+                if previewEncoded + charCost <= maximumEncodedBytes {
+                    previewEncoded += charCost
+                    previewEnd = next
+                } else {
+                    previewAdmissionOpen = false
+                }
             }
             index = next
         }

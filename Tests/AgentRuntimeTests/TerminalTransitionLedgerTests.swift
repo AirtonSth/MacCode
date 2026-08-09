@@ -93,6 +93,26 @@ final class TerminalTransitionLedgerTests: XCTestCase {
         XCTAssertEqual(try ledger.records(forRunId: "run-1").count, 1)
     }
 
+    func test_ledger_appendFailsLoudlyWhenExistingFileIsNotUTF8() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-term-ledger-corrupt-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data([0xFF]).write(to: dir.appendingPathComponent("terminal-transitions.jsonl"))
+
+        let ledger = TerminalTransitionLedger(directory: dir, maxRows: 10, ttl: 3600)
+        XCTAssertThrowsError(
+            try ledger.append(TerminalTransitionRecord(
+                runId: "run-corrupt",
+                threadId: "thread-corrupt",
+                reason: .processDeath,
+                initiator: .processDeath,
+                requestedStatus: .failed
+            )),
+            "a damaged ledger must not be silently accepted and extended"
+        )
+    }
+
     func test_terminalInitiator_userStop_processDeath_rpcTimeout() {
         XCTAssertEqual(
             AgentRunCoordinator.terminalInitiator(

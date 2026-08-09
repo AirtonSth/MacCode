@@ -57,16 +57,34 @@ public enum SurfaceReadTextWindow: Sendable {
         }
 
         var copy = text
+        let total = copy.utf8.count
+        // Longest suffix ≤ maxBytes that starts on a Character boundary.
+        // Mid-scalar candidates advance forward so the window stays under budget.
+        var start = total - maxBytes
+        while start < total {
+            let byteIndex = copy.utf8.index(copy.utf8.startIndex, offsetBy: start)
+            if !isUTF8Continuation(copy.utf8[byteIndex]) {
+                break
+            }
+            start += 1
+        }
+        // A scalar boundary can still be inside an extended grapheme cluster
+        // (for example, between the scalars in "é" or a family emoji). The
+        // previous Character walk excluded that whole cluster when it did not
+        // fit, so preserve that contract while retaining the O(1) byte jump.
+        var characterStart = copy.utf8.index(
+            copy.utf8.startIndex,
+            offsetBy: start,
+            limitedBy: copy.utf8.endIndex
+        ) ?? copy.utf8.endIndex
+        while characterStart < copy.utf8.endIndex,
+              characterStart.samePosition(in: copy) == nil {
+            copy.utf8.formIndex(after: &characterStart)
+        }
+        start = copy.utf8.distance(from: copy.utf8.startIndex, to: characterStart)
+
         var windowed = ""
         copy.withUTF8 { buffer in
-            let total = buffer.count
-            // Longest suffix ≤ maxBytes that starts on a scalar boundary.
-            // Mid-scalar candidates advance forward so the window stays under budget
-            // (same contract as walking whole Characters from the end).
-            var start = total - maxBytes
-            while start < total && isUTF8Continuation(buffer[start]) {
-                start += 1
-            }
             // Prefer a line boundary inside the window so the first retained line
             // is whole. Only when a newline exists and dropping to it still leaves
             // content — otherwise keep the raw byte window (live partial lines).
