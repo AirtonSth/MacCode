@@ -322,7 +322,15 @@ public final class GrokACPEventMapper: @unchecked Sendable {
             latestUsage = parsed
             events.append(.tokenUsage(parsed))
         }
+        // Reasoning / assistant first, then any tool_call still lacking a terminal
+        // tool_call_update — otherwise timeline tool rows stay streaming forever
+        // after session/prompt returns, cancels, or fails (GROK-ACP-005).
         closeOpenItems(&events)
+        let toolFinalState = Self.toolFinalState(forStopReason: stopReason)
+        for id in openToolCallIds.sorted() {
+            events.append(.itemCompleted(itemId: id, finalState: toolFinalState))
+        }
+        openToolCallIds.removeAll(keepingCapacity: false)
         guard let turnId else { return events }
         finished = true
         // Prefer the trailing phase; if it is empty after control-token strip
@@ -344,7 +352,6 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         currentAssistantPhase = ""
         lastNonEmptyAssistantPhase = ""
         sawDetachedShellSpawn = false
-        openToolCallIds.removeAll(keepingCapacity: false)
         return events
     }
 
@@ -463,6 +470,15 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         }
     }
 
+    /// Terminal state for tools still open when the turn ends without a terminal
+    /// `tool_call_update`. Mirrors adapter run status mapping so cancelled turns
+    /// do not paint tools completed, and failure paths do not leave them streaming.
+    private static func toolFinalState(forStopReason stopReason: String) -> AssistantItemState {
+        if stopReason == "cancelled" { return .cancelled }
+        if GrokACPTerminalClassifier.isCompletedStopReason(stopReason) { return .completed }
+        return .failed
+    }
+
     private static func usage(_ raw: [String: Any]) -> AssistantTokenUsage? {
         let input = int(raw["inputTokens"]) ?? int(raw["input_tokens"]) ?? 0
         let output = int(raw["outputTokens"]) ?? int(raw["output_tokens"]) ?? 0
@@ -474,6 +490,10 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         // ACP usage_update / finishTurn usage is per-request occupancy, not the
         // cumulative modelUsage shape from the CLI end event.
         let contextTokens = total > 0 ? total : (input + output)
+        // Live Grok 1.0 session/prompt `_meta.usage` stamps `costUsdTicks`
+        // (1 USD = 10^10 ticks). GrokParser maps CLI end cost the same way;
+        // without this, Agent App ACP turns never set reportedCostMicros.
+        let reportedCostMicros = costMicros(from: raw)
         return AssistantTokenUsage(
             inputTokens: input,
             outputTokens: output,
@@ -481,9 +501,43 @@ public final class GrokACPEventMapper: @unchecked Sendable {
             contextWindow: window,
             uncachedInputTokens: cached.map { max(0, input - $0) },
             cacheReadInputTokens: cached,
+            reportedCostMicros: reportedCostMicros,
             contextTokens: contextTokens > 0 ? contextTokens : nil,
             semantics: .cumulative
         )
+    }
+
+    /// Convert ACP / headless cost stamps to micros (1 USD = 1_000_000 micros).
+    /// Prefers integer ticks (`costUsdTicks` live 1.0 wire) then float USD.
+    private static func costMicros(from raw: [String: Any]) -> Int? {
+        if let ticks = doubleValue(raw["costUsdTicks"]
+            ?? raw["cost_usd_ticks"]
+            ?? raw["cost_in_usd_ticks"]
+            ?? raw["costInUsdTicks"]),
+           ticks.isFinite, ticks >= 0 {
+            // ticks / 1e10 USD * 1e6 micros = ticks / 1e4
+            let micros = (ticks / 10_000).rounded()
+            guard micros <= Double(Int.max) else { return nil }
+            return Int(micros)
+        }
+        if let usd = doubleValue(raw["costUSD"] ?? raw["cost_usd"] ?? raw["total_cost_usd"]),
+           usd.isFinite, usd >= 0 {
+            let micros = (usd * 1_000_000).rounded()
+            guard micros <= Double(Int.max) else { return nil }
+            return Int(micros)
+        }
+        return nil
+    }
+
+    private static func doubleValue(_ value: Any?) -> Double? {
+        if let value = value as? Double { return value }
+        if let value = value as? Int { return Double(value) }
+        if let value = value as? Int64 { return Double(value) }
+        if let value = value as? NSNumber { return value.doubleValue }
+        if let value = value as? String {
+            return Double(value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return nil
     }
 
     private static func int(_ value: Any?) -> Int? {

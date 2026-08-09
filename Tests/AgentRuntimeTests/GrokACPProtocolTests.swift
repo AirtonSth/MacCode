@@ -624,6 +624,86 @@ final class GrokACPProtocolTests: XCTestCase {
                       "AG-057: only the last assistant text phase is the final answer")
     }
 
+    /// GROK-ACP-005: if session/prompt ends while a tool_call never got a terminal
+    /// tool_call_update, finishTurn must still emit itemCompleted so tool rows
+    /// do not remain streaming forever on the Agent App timeline.
+    func test_finishTurn_sealsOpenToolCalls_byStopReason() {
+        func run(stopReason: String, expected: AssistantItemState, file: StaticString = #filePath, line: UInt = #line) {
+            let mapper = GrokACPEventMapper(sessionId: "grok-open-tool-\(stopReason)")
+            var events: [AssistantEvent] = []
+            events += mapper.beginTurn()
+            events += mapper.consumeSessionUpdate([
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tool-open-\(stopReason)",
+                "title": "run_terminal_command",
+                "rawInput": ["command": "sleep 999"]
+            ])
+            XCTAssertTrue(mapper.hasOpenToolCalls, "tool_call without update must stay open", file: file, line: line)
+            events += mapper.finishTurn(stopReason: stopReason, usage: nil)
+
+            let completions = events.compactMap { event -> AssistantItemState? in
+                if case .itemCompleted(let id, let state) = event, id == "tool-open-\(stopReason)" {
+                    return state
+                }
+                return nil
+            }
+            XCTAssertEqual(completions, [expected],
+                           "finishTurn(\(stopReason)) must seal open tool as \(expected); got \(completions)",
+                           file: file, line: line)
+            XCTAssertFalse(mapper.hasOpenToolCalls,
+                           "openToolCallIds must clear after finishTurn",
+                           file: file, line: line)
+            // Tool completion must precede turnCompleted so the timeline is terminal before the turn ends.
+            let toolDone = events.firstIndex {
+                if case .itemCompleted(let id, _) = $0 { return id == "tool-open-\(stopReason)" }
+                return false
+            }
+            let turnDone = events.firstIndex {
+                if case .turnCompleted = $0 { return true }
+                return false
+            }
+            XCTAssertNotNil(toolDone)
+            XCTAssertNotNil(turnDone)
+            if let toolDone, let turnDone {
+                XCTAssertLessThan(toolDone, turnDone,
+                                  "open tools must complete before turnCompleted",
+                                  file: file, line: line)
+            }
+        }
+
+        run(stopReason: "end_turn", expected: .completed)
+        run(stopReason: "max_tokens", expected: .completed)
+        run(stopReason: "cancelled", expected: .cancelled)
+        run(stopReason: "failed", expected: .failed)
+    }
+
+    /// Tools that already received a terminal update must not get a second seal.
+    func test_finishTurn_doesNotDoubleCompleteAlreadyTerminalTools() {
+        let mapper = GrokACPEventMapper(sessionId: "grok-tool-already-done")
+        var events: [AssistantEvent] = []
+        events += mapper.beginTurn()
+        events += mapper.consumeSessionUpdate([
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tool-done",
+            "title": "read_file",
+            "rawInput": ["path": "a.txt"]
+        ])
+        events += mapper.consumeSessionUpdate([
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tool-done",
+            "status": "completed",
+            "content": [["type": "content", "content": ["type": "text", "text": "ok"]]]
+        ])
+        XCTAssertFalse(mapper.hasOpenToolCalls)
+        events += mapper.finishTurn(stopReason: "end_turn", usage: nil)
+        let toolCompletions = events.filter {
+            if case .itemCompleted("tool-done", _) = $0 { return true }
+            return false
+        }
+        XCTAssertEqual(toolCompletions.count, 1,
+                       "already-terminal tools must not receive a second itemCompleted on finishTurn")
+    }
+
     func test_mapperPlanModeEmitsReviewableProposedPlanAndActiveProgress() {
         let mapper = GrokACPEventMapper(sessionId: "grok-plan-mode")
         mapper.setPlanReviewModeId("plan")
@@ -712,6 +792,34 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(mapper.availableCommands.map(\.name), ["compact"])
         XCTAssertEqual(mapper.currentModeId, "plan")
         XCTAssertEqual(mapper.latestUsage?.totalTokens, 12)
+    }
+
+    /// Live Grok 1.0 session/prompt `_meta.usage` includes `costUsdTicks`
+    /// (1 USD = 10^10 ticks). finishTurn must map them into reportedCostMicros
+    /// so Agent App spend / Token Saver rings match the CLI parser path.
+    func test_finishTurn_mapsCostUsdTicksToReportedCostMicros() {
+        let mapper = GrokACPEventMapper(sessionId: "grok-cost-ticks")
+        var events: [AssistantEvent] = []
+        events += mapper.beginTurn()
+        // 1 USD = 10^10 ticks; micros = USD * 1e6 → micros = ticks / 1e4.
+        // 50_000_000 ticks → 5_000 micros.
+        events += mapper.finishTurn(
+            stopReason: "end_turn",
+            usage: [
+                "inputTokens": 100,
+                "outputTokens": 20,
+                "totalTokens": 120,
+                "costUsdTicks": 50_000_000
+            ]
+        )
+        let costs = events.compactMap { event -> Int? in
+            if case .tokenUsage(let usage) = event { return usage.reportedCostMicros }
+            return nil
+        }
+        XCTAssertEqual(costs, [5_000],
+                       "costUsdTicks 50_000_000 must become reportedCostMicros 5000 (ticks/1e4)")
+        XCTAssertEqual(mapper.latestUsage?.reportedCostMicros, 5_000)
+        XCTAssertEqual(mapper.latestUsage?.totalTokens, 120)
     }
 
     /// Live incident: last agent_message_chunk phase was `Repos` + `8` + `<|eos|>`
