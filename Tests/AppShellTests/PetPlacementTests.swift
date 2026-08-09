@@ -289,4 +289,68 @@ final class PetPlacementTests: XCTestCase {
 
         XCTAssertEqual(result.frame, CGRect(x: 512, y: 212, width: 576, height: 376))
     }
+
+    func test_dockHitTestFindsCenteredBottomShelfWithoutAccessibilityPermission() throws {
+        let screen = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        let dock = CGRect(x: 400, y: 0, width: 640, height: 80)
+        let result = try XCTUnwrap(PetDockFrameProvider.hitTestFrame(
+            screenFrame: screen,
+            visibleFrame: CGRect(x: 0, y: 80, width: 1_440, height: 790),
+            dockWindowNumbers: [42],
+            windowNumberAtPoint: { dock.contains($0) ? 42 : 7 }
+        ))
+
+        XCTAssertLessThanOrEqual(result.minX, dock.minX)
+        XCTAssertGreaterThanOrEqual(result.maxX, dock.maxX)
+        XCTAssertEqual(result.minY, screen.minY, accuracy: 0.001)
+        XCTAssertGreaterThan(result.maxY, dock.maxY)
+        XCTAssertLessThan(result.width, screen.width)
+    }
+
+    func test_dockHitTestFindsRightShelfOnOffsetDisplay() throws {
+        let screen = CGRect(x: 3_337, y: 158, width: 1_728, height: 1_117)
+        let dock = CGRect(x: 4_985, y: 350, width: 80, height: 700)
+        let result = try XCTUnwrap(PetDockFrameProvider.hitTestFrame(
+            screenFrame: screen,
+            visibleFrame: CGRect(x: 3_337, y: 158, width: 1_648, height: 1_085),
+            dockWindowNumbers: [99],
+            windowNumberAtPoint: { dock.contains($0) ? 99 : 0 }
+        ))
+
+        XCTAssertGreaterThanOrEqual(result.maxX, dock.maxX)
+        XCTAssertLessThanOrEqual(result.minX, dock.minX)
+        XCTAssertLessThanOrEqual(result.minY, dock.minY)
+        XCTAssertGreaterThanOrEqual(result.maxY, dock.maxY)
+        XCTAssertLessThan(result.height, screen.height)
+    }
+
+    func test_dockHitTestReturnsNilForAutoHiddenDockWithNoReservedEdge() {
+        let screen = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        XCTAssertNil(PetDockFrameProvider.hitTestFrame(
+            screenFrame: screen,
+            visibleFrame: CGRect(x: 0, y: 0, width: 1_440, height: 870),
+            dockWindowNumbers: [42],
+            windowNumberAtPoint: { _ in 42 }
+        ))
+    }
+
+    func test_dockHitTestDoesNotReadAdjacentDisplayAtSharedMaximum() {
+        let screen = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        XCTAssertNil(PetDockFrameProvider.hitTestFrame(
+            screenFrame: screen,
+            visibleFrame: CGRect(x: 0, y: 80, width: 1_440, height: 790),
+            dockWindowNumbers: [42],
+            windowNumberAtPoint: { point in point.x >= screen.maxX ? 42 : 0 }
+        ))
+    }
+
+    func test_axFrameConversionDoesNotDoubleCountQuartzDisplayOffset() {
+        let result = PetDockFrameProvider.appKitFrame(
+            quartzFrame: CGRect(x: 3_500, y: 1_139, width: 400, height: 80),
+            quartzDisplayFrame: CGRect(x: 3_337, y: 122, width: 1_728, height: 1_117),
+            appKitScreenFrame: CGRect(x: 3_337, y: 158, width: 1_728, height: 1_117)
+        )
+
+        XCTAssertEqual(result, CGRect(x: 3_500, y: 178, width: 400, height: 80))
+    }
 }

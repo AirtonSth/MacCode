@@ -14,12 +14,14 @@ final class PetSystemActivityMonitorTests: XCTestCase {
         var locks: [Bool] = []
         var wakes = 0
         var screenChanges = 0
+        var dockChanges = 0
         var accessibilityChanges = 0
         let callbacks = expectation(description: "all callbacks")
-        callbacks.expectedFulfillmentCount = 10
+        callbacks.expectedFulfillmentCount = 13
         monitor.onScreenLockChanged = { locks.append($0); callbacks.fulfill() }
         monitor.onWake = { wakes += 1; callbacks.fulfill() }
         monitor.onScreenParametersChanged = { screenChanges += 1; callbacks.fulfill() }
+        monitor.onDockContentsMayHaveChanged = { dockChanges += 1; callbacks.fulfill() }
         monitor.onAccessibilityDisplayOptionsChanged = { accessibilityChanges += 1; callbacks.fulfill() }
         monitor.start()
         defer { monitor.stop() }
@@ -31,12 +33,16 @@ final class PetSystemActivityMonitorTests: XCTestCase {
         workspaceCenter.post(name: NSWorkspace.screensDidSleepNotification, object: nil)
         workspaceCenter.post(name: NSWorkspace.screensDidWakeNotification, object: nil)
         workspaceCenter.post(name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
+        workspaceCenter.post(name: NSWorkspace.didLaunchApplicationNotification, object: nil)
+        workspaceCenter.post(name: NSWorkspace.didTerminateApplicationNotification, object: nil)
+        applicationCenter.post(name: NSApplication.didBecomeActiveNotification, object: nil)
         applicationCenter.post(name: NSApplication.didChangeScreenParametersNotification, object: nil)
 
         await fulfillment(of: [callbacks], timeout: 1)
         XCTAssertEqual(locks, [true, false, true, false, true, false])
         XCTAssertEqual(wakes, 2)
         XCTAssertEqual(screenChanges, 1)
+        XCTAssertEqual(dockChanges, 3)
         XCTAssertEqual(accessibilityChanges, 1)
     }
 

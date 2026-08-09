@@ -6,6 +6,7 @@ public final class PetSystemActivityMonitor {
     public var onScreenLockChanged: ((Bool) -> Void)?
     public var onWake: (() -> Void)?
     public var onScreenParametersChanged: (() -> Void)?
+    public var onDockContentsMayHaveChanged: (() -> Void)?
     public var onAccessibilityDisplayOptionsChanged: (() -> Void)?
 
     private let workspaceNotificationCenter: NotificationCenter
@@ -45,6 +46,18 @@ public final class PetSystemActivityMonitor {
         }
         observe(workspaceCenter, name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification) { [weak self] in
             self?.onAccessibilityDisplayOptionsChanged?()
+        }
+        // Unpinned running apps add/remove Dock tiles without changing the
+        // display's visibleFrame. Reconcile the pet when that shelf width can
+        // change, and again when RemoteCode becomes active after Dock edits.
+        observe(workspaceCenter, name: NSWorkspace.didLaunchApplicationNotification) { [weak self] in
+            self?.onDockContentsMayHaveChanged?()
+        }
+        observe(workspaceCenter, name: NSWorkspace.didTerminateApplicationNotification) { [weak self] in
+            self?.onDockContentsMayHaveChanged?()
+        }
+        observe(applicationNotificationCenter, name: NSApplication.didBecomeActiveNotification) { [weak self] in
+            self?.onDockContentsMayHaveChanged?()
         }
         observe(applicationNotificationCenter, name: NSApplication.didChangeScreenParametersNotification) { [weak self] in
             self?.onScreenParametersChanged?()

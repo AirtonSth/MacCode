@@ -572,7 +572,7 @@ public final class PetWindowController: NSObject {
     private(set) var lastProcessedGlobalMousePointForTests: CGPoint?
     var keyWindowProviderForTests: (() -> NSWindow?)?
     /// Deterministic geometry seam for placement tests; production reads the
-    /// live Dock Accessibility hierarchy instead.
+    /// live Dock window hit shape instead.
     var dockFrameProviderForTests: ((NSScreen) -> CGRect?)?
 
     public init(model: PetViewModel, placementStore: PetPlacementStore) {
@@ -906,9 +906,8 @@ public final class PetWindowController: NSObject {
             dockFrame = PetDockFrameProvider.frame(for: screen)
         }
         guard let dockFrame else {
-            // Accessibility is optional. Without the Dock's actual occupied
-            // strip, retain the conservative AppKit bounds rather than risk
-            // restoring the pet beneath an inaccessible Dock.
+            // Without the Dock's actual occupied strip, retain the conservative
+            // AppKit bounds rather than risk restoring the pet beneath it.
             return PetPlacementContext(
                 placementFrame: screen.visibleFrame,
                 dockFrame: nil,

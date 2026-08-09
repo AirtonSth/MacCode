@@ -366,6 +366,9 @@ public final class PetController {
         systemMonitor.onScreenParametersChanged = { [weak self] in
             self?.windowController?.screensDidChange()
         }
+        systemMonitor.onDockContentsMayHaveChanged = { [weak self] in
+            self?.windowController?.screensDidChange()
+        }
         systemMonitor.onAccessibilityDisplayOptionsChanged = { [weak self] in
             self?.applySettings(self?.settingsStore.load() ?? AppSettings())
         }
