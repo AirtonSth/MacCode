@@ -92,6 +92,19 @@ final class SurfaceReadTextWindowTests: XCTestCase {
         XCTAssertFalse(window.text.unicodeScalars.contains("\u{FFFD}"))
     }
 
+    /// WHY: a scalar boundary can still be inside one user-visible grapheme. The
+    /// host must not return only a combining mark or half a family emoji when the
+    /// byte budget cannot fit the whole Character; that would corrupt terminal text.
+    func testWindowNeverSplitsAnExtendedGraphemeCluster() {
+        for cluster in ["e\u{301}", "👨‍👩‍👧‍👦"] {
+            let window = SurfaceReadTextWindow.tail(
+                of: "prefix" + cluster,
+                maxBytes: cluster.utf8.count - 1
+            )
+            XCTAssertEqual(window.text, "", "cluster was split: \(window.text.debugDescription)")
+        }
+    }
+
     /// WHY: the first retained line should be whole so the mirror never renders a
     /// line that starts mid-word as if that were the real output. It must drop only
     /// the partial leading line, not every line but the last — over-trimming would

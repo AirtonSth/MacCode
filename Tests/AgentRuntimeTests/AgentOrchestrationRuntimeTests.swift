@@ -143,7 +143,27 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         let ownershipManifestURL = packageURL.appendingPathComponent(
             AgentSkillInstaller.remoteCodeOrchestrateManifestName
         )
+        let skillURL = packageURL.appendingPathComponent("SKILL.md")
 
+        XCTAssertTrue(AgentOrchestrationRuntime.verifyInstalledPackage(at: packageURL))
+
+        let originalSkill = try Data(contentsOf: skillURL)
+        XCTAssertFalse(originalSkill.isEmpty)
+        let originalModificationDate = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: skillURL.path)[.modificationDate] as? Date
+        )
+        var sameSizeTamper = originalSkill
+        sameSizeTamper[0] ^= 0x01
+        try sameSizeTamper.write(to: skillURL)
+        try FileManager.default.setAttributes(
+            [.modificationDate: originalModificationDate],
+            ofItemAtPath: skillURL.path
+        )
+        XCTAssertFalse(
+            AgentOrchestrationRuntime.verifyInstalledPackage(at: packageURL),
+            "package verification must hash content even when size and modification time are unchanged"
+        )
+        try originalSkill.write(to: skillURL, options: .atomic)
         XCTAssertTrue(AgentOrchestrationRuntime.verifyInstalledPackage(at: packageURL))
 
         let ownershipManifest = try Data(contentsOf: ownershipManifestURL)
@@ -154,7 +174,7 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         )
         try ownershipManifest.write(to: ownershipManifestURL, options: .atomic)
 
-        try Data("tampered\n".utf8).write(to: packageURL.appendingPathComponent("SKILL.md"))
+        try Data("tampered\n".utf8).write(to: skillURL)
         XCTAssertFalse(AgentOrchestrationRuntime.verifyInstalledPackage(at: packageURL))
     }
 

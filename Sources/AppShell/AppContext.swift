@@ -2931,18 +2931,13 @@ public final class AppContext {
         // NetPositiveGate (G3): there is no app-side cached prefix to preserve (resume sends
         // the full wrapped prompt), so this is a numeric decision — compress the new-turn
         // argv only when it is large enough AND the session is not a warm follow-up.
-        // PERF: Character.count is O(n). Use utf8.count (O(1)) for definitive under-floor
-        // skips and for sizes where Character count is guaranteed ≥ floor (UTF-8 ≤ 4
-        // bytes/scalar). Only walk graphemes in the floor…4×floor boundary band.
         let floor = Self.tokenSaverMinCompressChars
-        let utf8Count = prompt.utf8.count
-        if utf8Count < floor {
+        if prompt.count < floor {
             return prompt
         }
         let gate = NetPositiveGate(floorCharacters: floor, warmResumeTTLSeconds: 300)
         let secondsSinceLastTurn = secondsSinceLastTurn(threadId: threadId)
-        let inputCharacters = utf8Count >= floor * 4 ? utf8Count : prompt.count
-        guard gate.shouldCompress(inputCharacters: inputCharacters, secondsSinceLastTurn: secondsSinceLastTurn) else {
+        guard gate.shouldCompress(inputCharacters: prompt.count, secondsSinceLastTurn: secondsSinceLastTurn) else {
             return prompt
         }
         let semanticObservation = tokenSaverProjectObservation(threadId: threadId, lane: "semantic_prose")
@@ -2955,17 +2950,14 @@ public final class AppContext {
             }
             return lane.retentionDays > 0 && !lane.optedOut && !lane.killSwitchActive
         }()
+        let promptBytes = prompt.utf8.count
         // A shadow/audit no-win must not suppress a later promoted optimize call for
         // the same prompt. The two paths have different recovery and adoption rights.
-        // PERF: length comparisons for multi-KB prompts used Character.count (O(n)
-        // grapheme walk) repeatedly. utf8.count is O(1) and matches byte-oriented
-        // savings better than grapheme count; ASCII-heavy agent prompts are identical.
-        let promptBytes = utf8Count
         let skipKey = DistillResultCacheKey(request: DistillRequest(
             mode: .longText,
             priority: .interactive,
             input: prompt,
-            maxOutputCharacters: max(512, promptBytes)
+            maxOutputCharacters: max(512, prompt.count)
         ), pipelineVersion: DistillResultCacheKey.pipelineVersion + (semanticPromoted ? "-optimize" : "-audit"))
         if tokenSaverPromptSkipSetContains(skipKey) {
             return prompt
@@ -2983,10 +2975,11 @@ public final class AppContext {
         let deduped = dedupeProbe.output
         let deterministicCandidate = [diffWindowed, deduped]
             .compactMap { $0 }
-            .filter { $0.utf8.count < promptBytes }
+            .filter { $0.utf8.count < prompt.utf8.count }
             .min { $0.utf8.count < $1.utf8.count }
             ?? prompt
         let deterministicBytes = deterministicCandidate.utf8.count
+        let deterministicCharacters = deterministicCandidate.count
 
         // Adopt `candidate` only if it beats the ORIGINAL prompt; record honest end-to-end
         // savings (original -> final), tagged with the caller's cache_state AND the engine
@@ -3031,7 +3024,7 @@ public final class AppContext {
             priority: .interactive,
             input: deterministicCandidate,
             runMode: semanticPromoted ? .optimize : .audit,
-            maxOutputCharacters: max(512, deterministicBytes)
+            maxOutputCharacters: max(512, deterministicCharacters)
         )
         do {
             let response: DistillResponse
