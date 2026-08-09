@@ -4,7 +4,7 @@ import XCTest
 final class PetPlacementTests: XCTestCase {
     private let visibleFrame = CGRect(x: 100, y: 100, width: 1_000, height: 700)
 
-    func test_petScreenFrameRespectsDockAndMenuBarVisibleBounds() {
+    func test_petScreenFrameKeepsPhysicalBottomAndSidesButClearsMenuBar() {
         let screenFrame = CGRect(x: 0, y: 0, width: 1_000, height: 800)
         let dockAndMenuVisibleFrame = CGRect(x: 80, y: 60, width: 840, height: 710)
 
@@ -13,21 +13,114 @@ final class PetPlacementTests: XCTestCase {
                 screenFrame: screenFrame,
                 visibleFrame: dockAndMenuVisibleFrame
             ),
-            dockAndMenuVisibleFrame,
-            "the pet must stay inside usable desktop bounds (Dock side/bottom and menu bar clear)"
+            CGRect(x: 0, y: 0, width: 1_000, height: 770),
+            "the pet may share a free bottom/side edge, but must remain below the menu bar"
         )
     }
 
     func test_petScreenFramePreservesOffsetDisplayCoordinates() {
-        let visible = CGRect(x: 3_400, y: 218, width: 1_600, height: 1_025)
         XCTAssertEqual(
             PetScreenGeometry.petPlacementFrame(
                 screenFrame: CGRect(x: 3_337, y: 158, width: 1_728, height: 1_117),
-                visibleFrame: visible
+                visibleFrame: CGRect(x: 3_400, y: 218, width: 1_600, height: 1_025)
             ),
-            visible,
-            "secondary-display visibleFrame offsets must be preserved as the placement rect"
+            CGRect(x: 3_337, y: 158, width: 1_728, height: 1_085),
+            "secondary-display offsets must not become artificial side/bottom margins"
         )
+    }
+
+    func test_frameAvoidingCenteredBottomDockKeepsFreeCornersAtPhysicalBottom() throws {
+        let placementFrame = CGRect(x: 0, y: 0, width: 1_440, height: 820)
+        let dockFrame = CGRect(x: 400, y: 0, width: 640, height: 80)
+        let petSize = CGSize(width: 100, height: 100)
+
+        let bottomLeft = try XCTUnwrap(PetScreenGeometry.frameAvoidingDock(
+            frame: CGRect(x: 0, y: 0, width: petSize.width, height: petSize.height),
+            placementFrame: placementFrame,
+            dockFrame: dockFrame,
+            fallbackFrame: CGRect(x: 0, y: 80, width: 1_440, height: 740)
+        ))
+        let bottomRight = try XCTUnwrap(PetScreenGeometry.frameAvoidingDock(
+            frame: CGRect(x: 1_340, y: 0, width: petSize.width, height: petSize.height),
+            placementFrame: placementFrame,
+            dockFrame: dockFrame,
+            fallbackFrame: CGRect(x: 0, y: 80, width: 1_440, height: 740)
+        ))
+
+        XCTAssertEqual(bottomLeft.minY, placementFrame.minY, accuracy: 0.001)
+        XCTAssertEqual(bottomRight.minY, placementFrame.minY, accuracy: 0.001)
+        XCTAssertFalse(bottomLeft.intersects(dockFrame))
+        XCTAssertFalse(bottomRight.intersects(dockFrame))
+
+        let rightDock = CGRect(x: 900, y: 0, width: 540, height: 80)
+        let rightAnchor = try XCTUnwrap(PetScreenGeometry.frameAvoidingDock(
+            frame: CGRect(x: 1_340, y: 0, width: petSize.width, height: petSize.height),
+            placementFrame: placementFrame,
+            dockFrame: rightDock,
+            fallbackFrame: CGRect(x: 0, y: 80, width: 1_440, height: 740)
+        ))
+        XCTAssertEqual(rightAnchor.minY, placementFrame.minY, accuracy: 0.001)
+        XCTAssertLessThanOrEqual(rightAnchor.maxX, rightDock.minX + 0.001)
+    }
+
+    func test_frameAvoidingSideDockMovesPetBesideDockAtSameBottom() throws {
+        let placementFrame = CGRect(x: 0, y: 0, width: 1_000, height: 770)
+        let dockFrame = CGRect(x: 0, y: 0, width: 80, height: 700)
+        let result = try XCTUnwrap(PetScreenGeometry.frameAvoidingDock(
+            frame: CGRect(x: 0, y: 0, width: 100, height: 100),
+            placementFrame: placementFrame,
+            dockFrame: dockFrame,
+            fallbackFrame: CGRect(x: 80, y: 0, width: 920, height: 770)
+        ))
+
+        XCTAssertEqual(result.minX, 80, accuracy: 0.001)
+        XCTAssertEqual(result.minY, 0, accuracy: 0.001)
+        XCTAssertFalse(result.intersects(dockFrame))
+    }
+
+    func test_frameAvoidingFullWidthDockFallsBackAboveIt() throws {
+        let placementFrame = CGRect(x: 0, y: 0, width: 1_000, height: 770)
+        let dockFrame = CGRect(x: 0, y: 0, width: 1_000, height: 80)
+        let fallbackFrame = CGRect(x: 0, y: 80, width: 1_000, height: 690)
+        let result = try XCTUnwrap(PetScreenGeometry.frameAvoidingDock(
+            frame: CGRect(x: 450, y: 0, width: 100, height: 100),
+            placementFrame: placementFrame,
+            dockFrame: dockFrame,
+            fallbackFrame: fallbackFrame
+        ))
+
+        XCTAssertEqual(result.minY, fallbackFrame.minY, accuracy: 0.001)
+        XCTAssertFalse(result.intersects(dockFrame))
+    }
+
+    func test_frameAvoidingDockFailsClosedWhenNoSafeFrameExists() {
+        let placementFrame = CGRect(x: 0, y: 0, width: 1_000, height: 770)
+        let dockFrame = CGRect(x: 0, y: 0, width: 1_000, height: 740)
+        let result = PetScreenGeometry.frameAvoidingDock(
+            frame: CGRect(x: 450, y: 0, width: 100, height: 100),
+            placementFrame: placementFrame,
+            dockFrame: dockFrame,
+            fallbackFrame: placementFrame
+        )
+
+        XCTAssertNil(result, "never return a frame known to be under the Dock")
+    }
+
+    func test_safeFallbackFrameRemovesDockOverlapFromVisibleFrame() throws {
+        let visibleFrame = CGRect(x: 0, y: 100, width: 1_000, height: 700)
+        let dockFrame = CGRect(x: 400, y: 90, width: 200, height: 30)
+        let fallback = try XCTUnwrap(
+            PetScreenGeometry.safeFallbackFrame(
+                visibleFrame: visibleFrame,
+                dockFrame: dockFrame
+            )
+        )
+
+        XCTAssertFalse(fallback.intersects(dockFrame))
+        XCTAssertGreaterThanOrEqual(fallback.minX, visibleFrame.minX)
+        XCTAssertGreaterThanOrEqual(fallback.minY, visibleFrame.minY)
+        XCTAssertLessThanOrEqual(fallback.maxX, visibleFrame.maxX)
+        XCTAssertLessThanOrEqual(fallback.maxY, visibleFrame.maxY)
     }
 
     func test_normalizedPositionAlwaysClampsToUnitRange() {

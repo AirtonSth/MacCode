@@ -102,10 +102,133 @@ enum PetPopoverSizing {
 }
 
 enum PetScreenGeometry {
-    /// Usable desktop rect for the pet: inside `visibleFrame` so Dock and menu bar stay clear.
-    /// `screenFrame` is kept for API stability at call sites; placement bounds come from `visibleFrame`.
-    static func petPlacementFrame(screenFrame _: CGRect, visibleFrame: CGRect) -> CGRect {
-        visibleFrame
+    /// Physical placement envelope for the pet.
+    ///
+    /// The pet may share the Dock's bottom edge when it is beside the Dock, so
+    /// `visibleFrame` cannot be used as the complete placement rect. Keep the
+    /// menu-bar clearance from `visibleFrame.maxY`, then resolve any actual Dock
+    /// overlap separately with `frameAvoidingDock`.
+    static func petPlacementFrame(screenFrame: CGRect, visibleFrame: CGRect) -> CGRect {
+        let topEdge = min(screenFrame.maxY, max(screenFrame.minY, visibleFrame.maxY))
+        return CGRect(
+            x: screenFrame.minX,
+            y: screenFrame.minY,
+            width: screenFrame.width,
+            height: max(0, topEdge - screenFrame.minY)
+        )
+    }
+
+    /// Clamps a pet to the physical envelope while keeping it out of the
+    /// Dock's occupied strip. The Dock can split the bottom edge into two free
+    /// regions, so a single rectangular `visibleFrame` is too conservative.
+    /// Returns `nil` when neither the physical envelope nor the fallback can
+    /// contain a non-overlapping panel.
+    static func frameAvoidingDock(
+        frame: CGRect,
+        placementFrame: CGRect,
+        dockFrame: CGRect?,
+        fallbackFrame: CGRect? = nil
+    ) -> CGRect? {
+        let clamped = PetPlacement.clamped(frame: frame, to: placementFrame)
+        guard let dockFrame,
+              clamped.intersection(dockFrame).area > 0 else {
+            return clamped
+        }
+
+        let candidateOrigins = [
+            CGPoint(x: dockFrame.minX - clamped.width, y: clamped.minY),
+            CGPoint(x: dockFrame.maxX, y: clamped.minY),
+            CGPoint(x: clamped.minX, y: dockFrame.minY - clamped.height),
+            CGPoint(x: clamped.minX, y: dockFrame.maxY)
+        ]
+        let candidates = candidateOrigins.enumerated().compactMap { index, origin -> (Int, CGRect)? in
+            let candidate = PetPlacement.clamped(
+                frame: CGRect(origin: origin, size: clamped.size),
+                to: placementFrame
+            )
+            return candidate.intersection(dockFrame).area == 0
+                ? (index, candidate)
+                : nil
+        }
+
+        func nearest(_ frames: [CGRect]) -> CGRect? {
+            frames.min { lhs, rhs in
+                let lhsDistance = hypot(
+                    lhs.minX - clamped.minX,
+                    lhs.minY - clamped.minY
+                )
+                let rhsDistance = hypot(
+                    rhs.minX - clamped.minX,
+                    rhs.minY - clamped.minY
+                )
+                return lhsDistance < rhsDistance
+            }
+        }
+
+        // Prefer a left/right route so a corner anchor can share the Dock's
+        // bottom edge whenever there is horizontal room. Move above/below
+        // only when neither side can contain the panel.
+        if let nearest = nearest(candidates.filter { $0.0 < 2 }.map { $0.1 }) {
+            return nearest
+        }
+        if let nearest = nearest(candidates.filter { $0.0 >= 2 }.map { $0.1 }) {
+            return nearest
+        }
+
+        // If the Dock leaves no physical route for this size, fall back to
+        // AppKit's conservative safe rect instead of placing the pet under it.
+        if let fallbackFrame {
+            // `fallbackFrame` is normally `NSScreen.visibleFrame`; validate it
+            // anyway because transient or synthetic geometry can be malformed.
+            let fallback = PetPlacement.clamped(frame: clamped, to: fallbackFrame)
+            if fallback.intersection(dockFrame).area == 0 {
+                return fallback
+            }
+        }
+        // No safe frame exists in the supplied geometry. Fail closed instead
+        // of returning a frame known to intersect the Dock.
+        return nil
+    }
+
+    /// Returns the largest rectangle inside `visibleFrame` that is also
+    /// disjoint from a trusted Dock footprint. Usually this is just
+    /// `visibleFrame`; the extra subtraction handles AX bounds that include a
+    /// few points of Dock glass beyond AppKit's rounded safe-area edge.
+    static func safeFallbackFrame(
+        visibleFrame: CGRect,
+        dockFrame: CGRect
+    ) -> CGRect? {
+        let overlap = visibleFrame.intersection(dockFrame)
+        guard overlap.area > 0 else { return visibleFrame }
+
+        let candidates = [
+            CGRect(
+                x: visibleFrame.minX,
+                y: visibleFrame.minY,
+                width: max(0, overlap.minX - visibleFrame.minX),
+                height: visibleFrame.height
+            ),
+            CGRect(
+                x: overlap.maxX,
+                y: visibleFrame.minY,
+                width: max(0, visibleFrame.maxX - overlap.maxX),
+                height: visibleFrame.height
+            ),
+            CGRect(
+                x: visibleFrame.minX,
+                y: overlap.maxY,
+                width: visibleFrame.width,
+                height: max(0, visibleFrame.maxY - overlap.maxY)
+            ),
+            CGRect(
+                x: visibleFrame.minX,
+                y: visibleFrame.minY,
+                width: visibleFrame.width,
+                height: max(0, overlap.minY - visibleFrame.minY)
+            )
+        ].filter { $0.area > 0 && $0.intersection(dockFrame).area == 0 }
+
+        return candidates.max { lhs, rhs in lhs.area < rhs.area }
     }
 
     static func largestPositiveIntersectionIndex(
@@ -415,6 +538,12 @@ private struct PetAttentionPopoverView: View {
 
 @MainActor
 public final class PetWindowController: NSObject {
+    private struct PetPlacementContext {
+        let placementFrame: CGRect
+        let dockFrame: CGRect?
+        let fallbackFrame: CGRect?
+    }
+
     public var onOpenItem: ((PetAttentionItem) -> Void)?
     public var onOpenActiveThread: ((PetActiveThreadItem) -> Void)?
     public var onMarkAllViewed: (() -> Void)?
@@ -442,6 +571,9 @@ public final class PetWindowController: NSObject {
     private(set) var globalMouseMoveProcessCountForTests = 0
     private(set) var lastProcessedGlobalMousePointForTests: CGPoint?
     var keyWindowProviderForTests: (() -> NSWindow?)?
+    /// Deterministic geometry seam for placement tests; production reads the
+    /// live Dock Accessibility hierarchy instead.
+    var dockFrameProviderForTests: ((NSScreen) -> CGRect?)?
 
     public init(model: PetViewModel, placementStore: PetPlacementStore) {
         self.model = model
@@ -468,6 +600,7 @@ public final class PetWindowController: NSObject {
     public func show() {
         ensurePetPanel()
         applySettings(model.settings)
+        guard isVisible else { return }
         petPanel?.orderFrontRegardless()
         installMouseMonitors()
     }
@@ -499,10 +632,13 @@ public final class PetWindowController: NSObject {
         }
         ensurePetPanel()
         let size = petSize(scale: settings.petSize)
-        if let panel = petPanel {
-            panel.setContentSize(size)
-            panel.setFrame(resolvePetFrame(size: size, settings: settings), display: true)
+        guard let frame = resolvePetFrame(size: size, settings: settings),
+              let panel = petPanel else {
+            hide()
+            return
         }
+        panel.setContentSize(size)
+        panel.setFrame(frame, display: true)
         if !isVisible {
             petPanel?.orderFrontRegardless()
             installMouseMonitors()
@@ -660,18 +796,23 @@ public final class PetWindowController: NSObject {
     private func finishDrag(frame: CGRect) {
         guard let panel = petPanel,
               let screen = screen(containing: frame) ?? fallbackScreen() else { return }
-        let placementFrame = petPlacementFrame(for: screen)
-        let clamped = PetPlacement.clamped(frame: frame, to: placementFrame)
+        let context = petPlacementContext(for: screen)
+        guard let clamped = resolvedPetFrame(frame, in: context) else {
+            // A transient Dock snapshot left no safe route. Reconcile against
+            // the last persisted position instead of committing an unsafe drop.
+            applySettings(model.settings)
+            return
+        }
         panel.setFrame(clamped, display: true)
         placementStore.save(PetStoredPlacement(
             displayID: displayID(for: screen),
-            position: PetPlacement.normalizedPosition(for: clamped, in: placementFrame)
+            position: PetPlacement.normalizedPosition(for: clamped, in: context.placementFrame)
         ))
         onAdoptFreePosition?()
         if isPopoverVisible { positionPopover() }
     }
 
-    private func resolvePetFrame(size: CGSize, settings: AppSettings) -> CGRect {
+    private func resolvePetFrame(size: CGSize, settings: AppSettings) -> CGRect? {
         let stored = placementStore.load()
         let existingScreen = petPanel?.isVisible == true
             ? petPanel.flatMap { screen(containing: $0.frame) }
@@ -680,7 +821,7 @@ public final class PetWindowController: NSObject {
             NSScreen.screens.first { displayID(for: $0) == stored.displayID }
         } ?? existingScreen
             ?? fallbackScreen()
-        guard let targetScreen else { return CGRect(origin: .zero, size: size) }
+        guard let targetScreen else { return nil }
 
         let normalized: PetNormalizedPosition
         switch settings.petPosition {
@@ -688,10 +829,14 @@ public final class PetWindowController: NSObject {
         case "free": normalized = stored?.position ?? PetNormalizedPosition(x: 1, y: 0)
         default: normalized = PetNormalizedPosition(x: 1, y: 0)
         }
-        return PetPlacement.frame(
-            size: size,
-            normalizedPosition: normalized,
-            in: petPlacementFrame(for: targetScreen)
+        let context = petPlacementContext(for: targetScreen)
+        return resolvedPetFrame(
+            PetPlacement.frame(
+                size: size,
+                normalizedPosition: normalized,
+                in: context.placementFrame
+            ),
+            in: context
         )
     }
 
@@ -702,21 +847,28 @@ public final class PetWindowController: NSObject {
                 || abs(panel.frame.height - size.height) > 0.01 else { return }
 
         let targetScreen = screen(containing: panel.frame) ?? fallbackScreen()
-        let normalized = targetScreen.map {
-            PetPlacement.normalizedPosition(for: panel.frame, in: petPlacementFrame(for: $0))
+        let context = targetScreen.map { petPlacementContext(for: $0) }
+        let normalized = context.map {
+            PetPlacement.normalizedPosition(for: panel.frame, in: $0.placementFrame)
         }
         panel.setContentSize(size)
-        if let targetScreen, let normalized {
-            panel.setFrame(
-                PetPlacement.frame(
-                    size: size,
-                    normalizedPosition: normalized,
-                    in: petPlacementFrame(for: targetScreen)
-                ),
-                display: true
+        if let context, let normalized {
+            let frame = PetPlacement.frame(
+                size: size,
+                normalizedPosition: normalized,
+                in: context.placementFrame
             )
+            if let resolved = resolvedPetFrame(frame, in: context) {
+                panel.setFrame(resolved, display: true)
+            } else {
+                hide()
+                return
+            }
+        } else if let resolved = resolvePetFrame(size: size, settings: model.settings) {
+            panel.setFrame(resolved, display: true)
         } else {
-            panel.setFrame(resolvePetFrame(size: size, settings: model.settings), display: true)
+            hide()
+            return
         }
         if isPopoverVisible { positionPopover() }
     }
@@ -742,10 +894,46 @@ public final class PetWindowController: NSObject {
         return screens[index]
     }
 
-    private func petPlacementFrame(for screen: NSScreen) -> CGRect {
-        PetScreenGeometry.petPlacementFrame(
+    private func petPlacementContext(for screen: NSScreen) -> PetPlacementContext {
+        let physicalFrame = PetScreenGeometry.petPlacementFrame(
             screenFrame: screen.frame,
             visibleFrame: screen.visibleFrame
+        )
+        let dockFrame: CGRect?
+        if let dockFrameProviderForTests {
+            dockFrame = dockFrameProviderForTests(screen)
+        } else {
+            dockFrame = PetDockFrameProvider.frame(for: screen)
+        }
+        guard let dockFrame else {
+            // Accessibility is optional. Without the Dock's actual occupied
+            // strip, retain the conservative AppKit bounds rather than risk
+            // restoring the pet beneath an inaccessible Dock.
+            return PetPlacementContext(
+                placementFrame: screen.visibleFrame,
+                dockFrame: nil,
+                fallbackFrame: nil
+            )
+        }
+        return PetPlacementContext(
+            placementFrame: physicalFrame,
+            dockFrame: dockFrame,
+            fallbackFrame: PetScreenGeometry.safeFallbackFrame(
+                visibleFrame: screen.visibleFrame,
+                dockFrame: dockFrame
+            )
+        )
+    }
+
+    private func resolvedPetFrame(
+        _ frame: CGRect,
+        in context: PetPlacementContext
+    ) -> CGRect? {
+        PetScreenGeometry.frameAvoidingDock(
+            frame: frame,
+            placementFrame: context.placementFrame,
+            dockFrame: context.dockFrame,
+            fallbackFrame: context.fallbackFrame
         )
     }
 

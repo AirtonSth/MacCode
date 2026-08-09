@@ -13,6 +13,23 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         return try Bootstrap(channel: .debug, appSupportOverride: directory).run().1
     }
 
+    private static func centeredDockFrame(for screen: NSScreen) -> CGRect {
+        let width = min(640, screen.frame.width * 0.4)
+        let height = min(80, screen.frame.height * 0.1)
+        return CGRect(
+            x: screen.frame.midX - width / 2,
+            y: screen.frame.minY,
+            width: width,
+            height: height
+        )
+    }
+
+    private static func useCenteredDockFixture(on controller: PetWindowController) {
+        controller.dockFrameProviderForTests = { screen in
+            Self.centeredDockFrame(for: screen)
+        }
+    }
+
     func test_panelAndPopoverUseSeparateAccessibleAllSpacesWindows() throws {
         let db = try database()
         let model = PetViewModel(settings: AppSettings(petEnabled: true))
@@ -53,7 +70,7 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         XCTAssertTrue(pet.isVisible)
     }
 
-    func test_bottomLeftPlacementStaysInsideVisibleFrameWhenDockReservesSpace() throws {
+    func test_bottomLeftPlacementUsesFreePhysicalCornerWithoutCoveringDock() throws {
         let db = try database()
         let model = PetViewModel(settings: AppSettings(
             petEnabled: true,
@@ -63,21 +80,24 @@ final class PetWindowAndLifecycleTests: XCTestCase {
             model: model,
             placementStore: PetPlacementStore(repository: SettingsRepository(db: db))
         )
+        Self.useCenteredDockFixture(on: controller)
         defer { controller.stop() }
 
         controller.show()
         let panel = try XCTUnwrap(controller.petPanelForTests)
         let screen = try XCTUnwrap(panel.screen ?? NSScreen.main)
-        let visible = screen.visibleFrame
+        let placementFrame = PetScreenGeometry.petPlacementFrame(
+            screenFrame: screen.frame,
+            visibleFrame: screen.visibleFrame
+        )
 
-        XCTAssertEqual(panel.frame.minX, visible.minX, accuracy: 0.001,
-            "the pet must not sit under a left-side Dock")
-        XCTAssertEqual(panel.frame.minY, visible.minY, accuracy: 0.001,
-            "the pet must not sit under a bottom Dock")
-        XCTAssertGreaterThanOrEqual(panel.frame.minX, visible.minX - 0.001)
-        XCTAssertGreaterThanOrEqual(panel.frame.minY, visible.minY - 0.001)
-        XCTAssertLessThanOrEqual(panel.frame.maxX, visible.maxX + 0.001)
-        XCTAssertLessThanOrEqual(panel.frame.maxY, visible.maxY + 0.001)
+        XCTAssertGreaterThanOrEqual(panel.frame.minX, placementFrame.minX - 0.001)
+        XCTAssertGreaterThanOrEqual(panel.frame.minY, placementFrame.minY - 0.001)
+        XCTAssertEqual(panel.frame.minY, placementFrame.minY, accuracy: 0.001)
+        XCTAssertLessThanOrEqual(panel.frame.maxX, placementFrame.maxX + 0.001)
+        XCTAssertLessThanOrEqual(panel.frame.maxY, placementFrame.maxY + 0.001)
+        XCTAssertFalse(panel.frame.intersects(Self.centeredDockFrame(for: screen)),
+            "the pet must not sit under the Dock even when it shares the physical bottom")
     }
 
     func test_petPanelDoesNotReapplyAppKitSafeAreaWhenDraggedToPhysicalEdge() throws {
@@ -98,11 +118,12 @@ final class PetWindowAndLifecycleTests: XCTestCase {
             "a borderless desktop pet must not inherit normal-window Dock/menu constraints")
     }
 
-    func test_dragBeyondBottomLeftClampsAndPersistsVisibleFrameEdge() throws {
+    func test_dragBeyondBottomLeftClampsAndPersistsPhysicalFreeEdge() throws {
         let db = try database()
         let placementStore = PetPlacementStore(repository: SettingsRepository(db: db))
         let model = PetViewModel(settings: AppSettings(petEnabled: true))
         let controller = PetWindowController(model: model, placementStore: placementStore)
+        Self.useCenteredDockFixture(on: controller)
         defer { controller.stop() }
 
         controller.show()
@@ -121,13 +142,13 @@ final class PetWindowAndLifecycleTests: XCTestCase {
 
         controller.finishDragForTests(frame: draggedBeyondEdge)
 
-        XCTAssertEqual(panel.frame.minX, placementFrame.minX, accuracy: 0.001)
-        XCTAssertEqual(panel.frame.minY, placementFrame.minY, accuracy: 0.001)
-        XCTAssertEqual(placementFrame, screen.visibleFrame)
+        XCTAssertGreaterThanOrEqual(panel.frame.minX, placementFrame.minX - 0.001)
+        XCTAssertGreaterThanOrEqual(panel.frame.minY, placementFrame.minY - 0.001)
+        XCTAssertFalse(panel.frame.intersects(Self.centeredDockFrame(for: screen)))
         XCTAssertEqual(
             try XCTUnwrap(placementStore.load()).position,
-            PetNormalizedPosition(x: 0, y: 0),
-            "relaunch must restore the visible bottom-left edge after the user drags there"
+            PetPlacement.normalizedPosition(for: panel.frame, in: placementFrame),
+            "relaunch must restore the resolved physical edge after the drag"
         )
     }
 
@@ -140,6 +161,7 @@ final class PetWindowAndLifecycleTests: XCTestCase {
             model: model,
             placementStore: PetPlacementStore(repository: SettingsRepository(db: db))
         )
+        Self.useCenteredDockFixture(on: controller)
         defer { controller.stop() }
 
         controller.show()
@@ -1048,6 +1070,9 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         defer { controller.stop() }
 
         controller.start()
+        controller.windowControllerForTests.dockFrameProviderForTests = { screen in
+            Self.centeredDockFrame(for: screen)
+        }
         let panel = try XCTUnwrap(controller.windowControllerForTests.petPanelForTests)
         let screen = try XCTUnwrap(panel.screen ?? NSScreen.main)
         let placementFrame = PetScreenGeometry.petPlacementFrame(
