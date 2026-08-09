@@ -136,7 +136,7 @@ public struct WorkspaceFileService: Sendable {
         let rootURL = try safeRoot(root)
         let file = try resolve(root: rootURL, path: path, mustExist: true)
         let identity = try classify(root: rootURL, path: file.path)
-        guard ["html", "image", "video", "pdf"].contains(identity.kind),
+        guard previewKinds.contains(identity.kind),
               let grant = DirectStaticFileRegistry.shared.register(fileURL: file) else {
             throw JSONRPCError(code: -32602, message: "preview unavailable", data: .string(file.path))
         }
@@ -302,7 +302,7 @@ public struct WorkspaceFileService: Sendable {
         } else {
             kind = "binary"
         }
-        let isText = ["markdown", "html", "code", "text"].contains(kind) && probe.canDecode
+        let isText = textKinds.contains(kind) && probe.canDecode
         let writable = fm.isWritableFile(atPath: file.path)
         let isEditable = isText && size <= Int64(WorkspaceFileLimits.editBytes) && writable
         let reason: String
@@ -398,7 +398,7 @@ public struct WorkspaceFileService: Sendable {
         } else {
             kind = "unknown"
         }
-        let isText = ["markdown", "html", "code", "text"].contains(kind)
+        let isText = textKinds.contains(kind)
         let writable = FileManager.default.isWritableFile(atPath: url.path)
         let isEditable = isText && size <= Int64(WorkspaceFileLimits.editBytes) && writable
         let reason: String
@@ -826,15 +826,21 @@ private struct TextProbe {
 
 private let imageExtensions = Set(["png", "jpg", "jpeg", "gif", "bmp", "tiff", "heic", "webp", "svg", "avif"])
 private let videoExtensions = Set(["mp4", "mov", "m4v", "webm"])
+// PERF: classify/preview run on Files surface open/list/RPC. Array-literal
+// membership and the language map rebuilt per call; share process-wide tables
+// (kind/extension membership contract unchanged).
+private let textKinds: Set<String> = ["markdown", "html", "code", "text"]
+private let previewKinds: Set<String> = ["html", "image", "video", "pdf"]
+private let languageNamesByExtension: [String: String] = [
+    "swift": "swift", "ts": "typescript", "tsx": "typescript", "js": "javascript", "jsx": "javascript",
+    "py": "python", "json": "json", "yaml": "yaml", "yml": "yaml", "toml": "toml",
+    "xml": "xml", "css": "css", "scss": "scss", "sh": "shell", "bash": "shell",
+    "zsh": "shell", "sql": "sql", "log": "log", "txt": "text", "c": "c", "h": "c",
+    "cpp": "cpp", "hpp": "cpp", "rs": "rust", "go": "go", "rb": "ruby", "php": "php",
+]
 
 private func languageName(ext: String) -> String? {
-    [
-        "swift": "swift", "ts": "typescript", "tsx": "typescript", "js": "javascript", "jsx": "javascript",
-        "py": "python", "json": "json", "yaml": "yaml", "yml": "yaml", "toml": "toml",
-        "xml": "xml", "css": "css", "scss": "scss", "sh": "shell", "bash": "shell",
-        "zsh": "shell", "sql": "sql", "log": "log", "txt": "text", "c": "c", "h": "c",
-        "cpp": "cpp", "hpp": "cpp", "rs": "rust", "go": "go", "rb": "ruby", "php": "php"
-    ][ext]
+    languageNamesByExtension[ext]
 }
 
 private func fallbackMIME(ext: String, kind: String) -> String {
