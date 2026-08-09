@@ -31,6 +31,10 @@ public final class GrokParser {
     /// trailing phase falls back to this so finalMessage is not wiped to nil.
     private var lastNonEmptyAssistantPhase = ""
     private var turnFinished = false
+    /// tool_call ids that have not yet reached a terminal tool_call_update /
+    /// tool_result. Sealed on end/error/finalize so timeline tools do not stay
+    /// streaming forever (GROK-PARSER-001).
+    private var openToolCallIds = Set<String>()
 
     public var capturedSessionId: String? { sessionId }
 
@@ -89,7 +93,8 @@ public final class GrokParser {
             if let usage = Self.tokenUsage(from: obj) {
                 out.append(.tokenUsage(usage))
             }
-            closeOpenItems(&out)
+            let stopReason = (obj["stopReason"] as? String) ?? (obj["stop_reason"] as? String)
+            closeOpenItems(&out, toolFinalState: Self.toolFinalState(forStopReason: stopReason))
             if let turnId = currentTurnId, !turnFinished {
                 turnFinished = true
                 out.append(.turnCompleted(turnId: turnId, finalMessage: resolvedFinalMessage()))
@@ -97,7 +102,7 @@ public final class GrokParser {
 
         case "error":
             ensureTurn(&out)
-            closeOpenItems(&out)
+            closeOpenItems(&out, toolFinalState: .failed)
             let message = (obj["message"] as? String)
                 ?? (obj["data"] as? String)
                 ?? (obj["error"] as? String)
@@ -122,26 +127,60 @@ public final class GrokParser {
             let name = (obj["name"] as? String)
                 ?? (obj["tool"] as? String)
                 ?? (obj["toolName"] as? String)
+                ?? (obj["title"] as? String)
                 ?? "tool"
-            let itemId = (obj["id"] as? String) ?? (obj["toolCallId"] as? String) ?? UUID().uuidString
+            // Prefer toolCallId (live streaming-json 1.0); fall back to id.
+            let itemId = (obj["toolCallId"] as? String)
+                ?? (obj["tool_call_id"] as? String)
+                ?? (obj["id"] as? String)
+                ?? UUID().uuidString
             let turnId = currentTurnId ?? ""
-            let input = encodeJSON(obj["input"] ?? obj["arguments"] ?? obj["data"] ?? [:])
+            let input = encodeJSON(obj["input"] ?? obj["arguments"] ?? obj["rawInput"] ?? obj["data"] ?? [:])
+            openToolCallIds.insert(itemId)
             out.append(.itemStarted(item: AssistantItem(
                 id: itemId, turnId: turnId, type: .tool, state: .streaming,
                 summary: name, body: input ?? "", startedAtMs: now
             )))
 
+        case "tool_call_update":
+            // Live grok 1.0 streaming-json completes tools via tool_call_update
+            // (status pending → completed), not tool_result (GROK-PARSER-001).
+            ensureTurn(&out)
+            let itemId = (obj["toolCallId"] as? String)
+                ?? (obj["tool_call_id"] as? String)
+                ?? (obj["id"] as? String)
+                ?? UUID().uuidString
+            let output = Self.toolOutput(from: obj)
+            let title = obj["title"] as? String
+            if output != nil || title != nil {
+                out.append(.itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: output, summary: title))
+            }
+            if let status = obj["status"] as? String {
+                switch status {
+                case "completed", "cancelled", "failed":
+                    openToolCallIds.remove(itemId)
+                    out.append(.itemCompleted(itemId: itemId, finalState: Self.itemState(status)))
+                case "in_progress", "pending", "running":
+                    openToolCallIds.insert(itemId)
+                    // Keep item streaming — do not mark completed on progress status.
+                default:
+                    openToolCallIds.remove(itemId)
+                    out.append(.itemCompleted(itemId: itemId, finalState: Self.itemState(status)))
+                }
+            }
+
         case "tool_result", "tool_response":
             ensureTurn(&out)
-            let itemId = (obj["id"] as? String)
-                ?? (obj["toolCallId"] as? String)
+            let itemId = (obj["toolCallId"] as? String)
                 ?? (obj["tool_call_id"] as? String)
+                ?? (obj["id"] as? String)
                 ?? UUID().uuidString
             let payload = (obj["content"] as? String)
                 ?? (obj["output"] as? String)
                 ?? (obj["data"] as? String)
                 ?? encodeJSON(obj["result"] as Any? ?? obj["content"] as Any? ?? "")
                 ?? ""
+            openToolCallIds.remove(itemId)
             out.append(.itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: payload, summary: nil))
             out.append(.itemCompleted(itemId: itemId, finalState: .completed))
 
@@ -153,7 +192,7 @@ public final class GrokParser {
 
     public func finalize() -> [AssistantEvent] {
         var out: [AssistantEvent] = []
-        closeOpenItems(&out)
+        closeOpenItems(&out, toolFinalState: .completed)
         if let turnId = currentTurnId, !turnFinished {
             turnFinished = true
             out.append(.turnCompleted(turnId: turnId, finalMessage: resolvedFinalMessage()))
@@ -244,9 +283,16 @@ public final class GrokParser {
         }
     }
 
-    private func closeOpenItems(_ out: inout [AssistantEvent]) {
+    private func closeOpenItems(
+        _ out: inout [AssistantEvent],
+        toolFinalState: AssistantItemState = .completed
+    ) {
         closeReasoningItem(&out)
         closeAssistantItem(&out)
+        for id in openToolCallIds.sorted() {
+            out.append(.itemCompleted(itemId: id, finalState: toolFinalState))
+        }
+        openToolCallIds.removeAll(keepingCapacity: false)
     }
 
     private func encodeJSON(_ value: Any) -> String? {
@@ -256,6 +302,56 @@ public final class GrokParser {
             return value as? String
         }
         return s
+    }
+
+    private static func toolOutput(from obj: [String: Any]) -> String? {
+        if let raw = obj["rawOutput"] {
+            if let string = raw as? String { return string }
+            if JSONSerialization.isValidJSONObject(raw),
+               let data = try? JSONSerialization.data(withJSONObject: raw, options: [.sortedKeys]),
+               let string = String(data: data, encoding: .utf8) {
+                return string
+            }
+        }
+        if let string = obj["output"] as? String, !string.isEmpty { return string }
+        if let string = obj["content"] as? String, !string.isEmpty { return string }
+        let blocks = obj["content"] as? [[String: Any]] ?? []
+        let text = blocks.compactMap { block -> String? in
+            if let content = block["content"] as? [String: Any] { return content["text"] as? String }
+            return block["text"] as? String
+        }.joined(separator: "\n")
+        return text.isEmpty ? nil : text
+    }
+
+    private static func itemState(_ status: String) -> AssistantItemState {
+        switch status {
+        case "completed": return .completed
+        case "cancelled": return .cancelled
+        default: return .failed
+        }
+    }
+
+    /// Map streaming-json / ACP-style stop reasons onto tool terminal state when
+    /// sealing tools that never received a terminal update.
+    private static func toolFinalState(forStopReason stopReason: String?) -> AssistantItemState {
+        guard let stopReason, !stopReason.isEmpty else { return .completed }
+        let normalized = normalizeStopReason(stopReason)
+        if normalized == "cancelled" || normalized == "canceled" { return .cancelled }
+        if GrokACPTerminalClassifier.isCompletedStopReason(normalized) { return .completed }
+        // Live CLI often emits PascalCase EndTurn; after normalize that is end_turn.
+        // Anything else (error, failed, …) fails open tools.
+        return .failed
+    }
+
+    /// `EndTurn` → `end_turn`, `max_tokens` stays, so classifier can match ACP ids.
+    private static func normalizeStopReason(_ stopReason: String) -> String {
+        let trimmed = stopReason.trimmingCharacters(in: .whitespacesAndNewlines)
+        let snake = trimmed.replacingOccurrences(
+            of: "([a-z0-9])([A-Z])",
+            with: "$1_$2",
+            options: .regularExpression
+        )
+        return snake.lowercased()
     }
 
     /// Maps Grok `end` spend fields into the shared token-usage event.

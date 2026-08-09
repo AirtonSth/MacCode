@@ -209,4 +209,79 @@ final class GrokParserTests: XCTestCase {
             return false
         }, "tool calls must seal the Thought row so tool lines render after it, not under an ever-growing Thinking… block")
     }
+
+    /// GROK-PARSER-001: live grok 1.0 streaming-json completes tools via
+    /// `type=tool_call_update` (not tool_result). Parser must emit output + terminal state.
+    func test_toolCallUpdate_completesToolWithOutput() {
+        let parser = GrokParser()
+        var events: [AssistantEvent] = []
+        events += parser.parseLine(#"{"type":"tool_call","toolCallId":"tc-1","title":"run_terminal_command","rawInput":{"command":"echo hi"}}"#)
+        events += parser.parseLine(#"{"type":"tool_call_update","toolCallId":"tc-1","status":"pending"}"#)
+        events += parser.parseLine(#"{"type":"tool_call_update","toolCallId":"tc-1","status":"completed","rawOutput":"hi\n"}"#)
+
+        XCTAssertTrue(events.contains {
+            if case .itemStarted(let item) = $0 {
+                return item.id == "tc-1" && item.type == .tool && item.state == .streaming
+            }
+            return false
+        }, "tool_call must open a streaming tool item keyed by toolCallId")
+        XCTAssertTrue(events.contains {
+            if case .itemDelta(let id, _, let output, _) = $0 {
+                return id == "tc-1" && output == "hi\n"
+            }
+            return false
+        }, "completed tool_call_update must surface rawOutput as itemDelta")
+        XCTAssertTrue(events.contains {
+            if case .itemCompleted("tc-1", .completed) = $0 { return true }
+            return false
+        }, "terminal status on tool_call_update must complete the tool item")
+        // pending must not complete
+        let completions = events.filter {
+            if case .itemCompleted("tc-1", _) = $0 { return true }
+            return false
+        }
+        XCTAssertEqual(completions.count, 1, "only the terminal update should complete the tool")
+    }
+
+    /// Open tools without a terminal update must seal on `end` so CLI timeline
+    /// rows do not remain streaming after the turn completes (parity with ACP).
+    func test_end_sealsOpenToolWithoutTerminalUpdate() {
+        let parser = GrokParser()
+        var events: [AssistantEvent] = []
+        events += parser.parseLine(#"{"type":"tool_call","toolCallId":"tc-open","title":"run_terminal_command","rawInput":{"command":"sleep 999"}}"#)
+        events += parser.parseLine(#"{"type":"text","data":"still working"}"#)
+        events += parser.parseLine(#"{"type":"end","stopReason":"EndTurn","sessionId":"sess-tools"}"#)
+
+        let toolCompletions = events.compactMap { event -> AssistantItemState? in
+            if case .itemCompleted(let id, let state) = event, id == "tc-open" { return state }
+            return nil
+        }
+        XCTAssertEqual(toolCompletions, [.completed],
+                       "end with completed-class stopReason must seal open tools as completed")
+
+        let toolDone = events.firstIndex {
+            if case .itemCompleted("tc-open", _) = $0 { return true }
+            return false
+        }
+        let turnDone = events.firstIndex {
+            if case .turnCompleted = $0 { return true }
+            return false
+        }
+        XCTAssertNotNil(toolDone)
+        XCTAssertNotNil(turnDone)
+        if let toolDone, let turnDone {
+            XCTAssertLessThan(toolDone, turnDone, "open tools must complete before turnCompleted")
+        }
+    }
+
+    func test_end_cancelledStopReason_sealsOpenToolAsCancelled() {
+        let parser = GrokParser()
+        var events: [AssistantEvent] = []
+        events += parser.parseLine(#"{"type":"tool_call","toolCallId":"tc-cancel","name":"shell"}"#)
+        events += parser.parseLine(#"{"type":"end","stopReason":"cancelled"}"#)
+        XCTAssertTrue(events.contains {
+            if case .itemCompleted("tc-cancel", .cancelled) = $0 { return true }
+            return false
+        }, "cancelled end must seal open tools as cancelled, not completed")
+    }
 }
