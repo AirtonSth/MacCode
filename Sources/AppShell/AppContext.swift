@@ -1402,6 +1402,28 @@ public final class AppContext {
                     _ = self?.prepareForApplicationTermination()
                 }
             }
+            // Late iOS WS subscribers: re-push Token Saver glanceable card.
+            NotificationCenter.default.addObserver(
+                forName: EventBus.subscriberAddedNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    // Prefer cached body (no disk). If never published this
+                    // process, build once from disk so first connect still works.
+                    if TokenSaverWidgetDigest.lastCachedBody() != nil {
+                        TokenSaverWidgetDigest.republishLast()
+                    } else {
+                        self.publishTokenSaverWidgetDigestFromDisk()
+                    }
+                }
+            }
+            // Seed sticky digest at launch so the first remote subscriber has
+            // something to replay even before the sidebar opens.
+            Task { @MainActor [weak self] in
+                self?.publishTokenSaverWidgetDigestFromDisk()
+            }
         }
 
         lastTokenSaverAccountIdentity = currentTokenSaverAccountIdentity()
@@ -2491,6 +2513,7 @@ public final class AppContext {
                     detail: usages.isEmpty ? "empty" : nil,
                     providers: usages.map(\.provider.rawValue)
                 )
+                self.publishTokenSaverWidgetDigestFromDisk(isRefreshing: false)
                 self.tokenSaverAccountUsageRefreshTask = nil
             }
         }
@@ -2615,6 +2638,22 @@ public final class AppContext {
     /// the field names and types so silent schema drift fails a mac test.
     /// `threadId` is present only in the run-time path; `reason` only in the
     /// refresh path — both are optional.
+
+    /// Disk-backed Token Saver glanceable publish for remote iOS clients.
+    @MainActor
+    public func publishTokenSaverWidgetDigestFromDisk(isRefreshing: Bool = false) {
+        let enabled = SettingsStore(db: db).load().tokenSaverEnabled
+        let subscribed = PrivateAccountSessionStore(repo: settingsRepo).load()?.user.subscribed == true
+        TokenSaverWidgetDigest.publishFromDisk(
+            appSupportDirectory: appSupportDirectory,
+            economyRepo: tokenSaverDailyEconomyRepo,
+            tokenSaverEnabled: enabled,
+            subscribed: subscribed,
+            isRefreshing: isRefreshing,
+            updatedAt: Date()
+        )
+    }
+
     nonisolated static func accountUsagePayload(
         threadId: String? = nil,
         reason: String? = nil,

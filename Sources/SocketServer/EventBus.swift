@@ -7,6 +7,13 @@ import Foundation
 public final class EventBus: @unchecked Sendable {
     public static let shared = EventBus()
 
+    /// Posted on the main queue after a new live subscriber is installed so
+    /// AppShell can re-emit sticky glanceable state (Token Saver digest) to
+    /// late remote clients whose replay cursor missed the last publish.
+    public static let subscriberAddedNotification = Notification.Name(
+        "io.remotecode.eventbus.subscriberAdded"
+    )
+
     public struct MutationEventIntent: Sendable, Equatable {
         public let kind: String
         public let payload: JSONValue
@@ -345,6 +352,7 @@ public final class EventBus: @unchecked Sendable {
                 }
                 handler(mapped)
             }
+            Self.notifySubscriberAdded()
             return id
         }
         if DispatchQueue.getSpecific(key: deliveryQueueKey) != nil {
@@ -389,7 +397,14 @@ public final class EventBus: @unchecked Sendable {
         }
         lock.unlock()
         for ev in backlog { handler(ev) }
+        Self.notifySubscriberAdded()
         return id
+    }
+
+    private static func notifySubscriberAdded() {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: subscriberAddedNotification, object: nil)
+        }
     }
 
     public func unsubscribe(_ id: UUID) {

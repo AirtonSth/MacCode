@@ -116,6 +116,8 @@ public protocol CommandRouting: AnyObject {
     func sshFilesRemoteList(surface: SurfaceID, path: String?) throws -> JSONValue
     // agent
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor
+    /// Sticky glanceable Token Saver payload for deterministic iOS pull.
+    func tokenSaverDigest() -> JSONValue?
     func listAgentThreads(workspace: WorkspaceID?) throws -> [AgentThread]
     func listAgentThreadsOffMain(workspace: WorkspaceID?) async throws -> [AgentThread]
     func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?) throws -> AgentThread
@@ -301,6 +303,9 @@ public protocol CommandRouting: AnyObject {
 }
 
 public extension CommandRouting {
+    /// Test/fake hosts may omit Token Saver entirely.
+    func tokenSaverDigest() -> JSONValue? { nil }
+
     func closeWorkspace(_ id: WorkspaceID) throws {
         try closeWorkspace(id, publishEvent: true)
     }
@@ -2228,6 +2233,8 @@ public final class JSONRPCDispatcher {
                     "surface": encode(s)
                 ]))
                 return .init(id: id, result: encode(s))
+            case "token_saver.digest.get":
+                return .init(id: id, result: router.tokenSaverDigest() ?? .object([:]))
             case "agent.thread.list":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
                 let threads = try await router.listAgentThreadsOffMain(workspace: wid)
@@ -3671,7 +3678,7 @@ public final class JSONRPCDispatcher {
     nonisolated public static let readOnlyBatchMethods: Set<String> = [
         "rpc.batch",
         "system.ping", "system.capabilities", "system.identify",
-        "events.recent", "settings.get",
+        "events.recent", "settings.get", "token_saver.digest.get",
         "ssh.host.list", "ssh.files.local.list", "ssh.files.remote.list",
         "fs.roots", "fs.list", "fs.workspace.list", "fs.workspace.read", "fs.workspace.preview_url",
         "files.state.get",
@@ -3707,7 +3714,7 @@ public final class JSONRPCDispatcher {
         "ssh", "fs", "files",
         "workspace", "window", "surface", "pane",
         "agent", "git", "project", "browser", "mirror",
-        "notification", "private", "sync"
+        "notification", "private", "sync", "token_saver"
     ]
     // PERF: nested-run RPC params validate subagent_node_id on every nested
     // agent.create/send; `"-_.".unicodeScalars.contains` built a temporary

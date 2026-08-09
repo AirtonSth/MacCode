@@ -7,6 +7,7 @@ import Persistence
 import AgentRuntime
 import Surfaces
 import DesignSystemKit
+import SocketServer
 
 public extension Notification.Name {
     static let rc2TokenSaverUsageChanged = Notification.Name("rc2TokenSaverUsageChanged")
@@ -663,6 +664,7 @@ public final class SidebarViewModel: ObservableObject {
                     from: result.snapshot,
                     emitPositiveChange: trackLocalUsageChange
                 )
+                self.publishTokenSaverWidgetDigest()
             }
         }
     }
@@ -889,6 +891,7 @@ public final class SidebarViewModel: ObservableObject {
         tokenSaverDailyEconomyWeekTotal = result.economyWeekTotal
         tokenSaverProviderCacheAmortToday = result.providerCacheAmortToday
         updateTokenSaverLocalUsage(from: result.snapshot, emitPositiveChange: false)
+        publishTokenSaverWidgetDigest()
     }
 
     /// Runs the heavy Token Saver reads off the main actor. `repo` is
@@ -966,6 +969,7 @@ public final class SidebarViewModel: ObservableObject {
         guard !tokenSaverAccountUsageIsRefreshing else { return }
         guard privateAccountUser != nil else { return }
         tokenSaverAccountUsageIsRefreshing = true
+        publishTokenSaverWidgetDigest()
         // Fire-and-forget: kick the refresh, then observe the usage-changed
         // notification to detect completion.  A 90-second timeout ensures the
         // spinner stops even when the CLI probe hangs or the notification is
@@ -997,7 +1001,25 @@ public final class SidebarViewModel: ObservableObject {
             }
             self.tokenSaverAccountUsageIsRefreshing = false
             if done { self.tokenSaverAccountUsageLastUpdated = Date() }
+            self.publishTokenSaverWidgetDigest()
         }
+    }
+
+
+    /// Push the glanceable Token Saver card to paired iOS clients (Home Screen widget).
+    public func publishTokenSaverWidgetDigest() {
+        let todaySaved = tokenSaverDailyEconomyToday?.totalCredible ?? 0
+        let weekSaved = tokenSaverDailyEconomyWeekTotal
+        TokenSaverWidgetDigest.publish(
+            enabled: tokenSaverEnabled,
+            subscribed: privateAccountUser?.subscribed == true,
+            primaryScope: .today,
+            todaySavedTokens: todaySaved,
+            weekSavedTokens: weekSaved,
+            snapshot: tokenSaverUsageSnapshot,
+            isRefreshing: tokenSaverAccountUsageIsRefreshing,
+            updatedAt: tokenSaverAccountUsageLastUpdated ?? Date()
+        )
     }
 
     public func setInsomniaEnabled(_ enabled: Bool) {

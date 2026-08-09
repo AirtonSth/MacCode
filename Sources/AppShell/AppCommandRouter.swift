@@ -2408,6 +2408,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         destinationWindowIsKeyForTests?(window) ?? window.isKeyWindow
     }
 
+    public func tokenSaverDigest() -> JSONValue? {
+        guard let context else { return nil }
+        // Rebuild from durable disk state before returning so RPC never serves
+        // a stale process cache after usage writes.
+        context.publishTokenSaverWidgetDigestFromDisk()
+        guard let body = TokenSaverWidgetDigest.lastCachedBody() else { return nil }
+        return .object(body)
+    }
+
     public func listAgentThreads(workspace: WorkspaceID?) throws -> [AgentThread] {
         guard let ctx = context else { return [] }
         return try ctx.threadRepo.list(workspaceId: workspace)
