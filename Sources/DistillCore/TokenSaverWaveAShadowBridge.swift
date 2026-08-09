@@ -16,6 +16,11 @@ public enum TokenSaverWaveAShadowBridge {
     private static var pointerCounts: [ReplayKey: Int] = [:]
     private static var replayInsertionOrder: [ReplayKey] = []
     private static let maxReplayKeys = 2_048
+    // PERF: observeToolOutput runs on every Token Saver tool observation.
+    // Array-literal membership reallocated per call; share process-wide Set.
+    private static let shellLikeToolNames: Set<String> = [
+        "Bash", "bash", "Shell", "shell",
+    ]
 
     /// Exact-replay state is atomic per BindingID+tool — never cross-binding.
     public static func observeExactReplay(
@@ -81,7 +86,7 @@ public enum TokenSaverWaveAShadowBridge {
         // Score only when a real BindingID digest is provided (no tool-only synthetic IDs).
         guard let digest = bindingDigest, !digest.isEmpty else { return }
 
-        let isLogLike = ["Bash", "bash", "Shell", "shell"].contains(toolName)
+        let isLogLike = shellLikeToolNames.contains(toolName)
             || LogCollapser.looksLikeLog(output)
             || output.contains("exit")
         if isLogLike {
