@@ -3542,6 +3542,165 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         )
     }
 
+    func test_hookCompletedNestedRunStatusMapsToTerminalStates() async throws {
+        // WHY: openai/codex HookCompletedNotification nests HookRunSummary under `run`
+        // with HookRunStatus blocked/stopped (camelCase). Reading only flat/hook/summary
+        // left live hooks without ids/status and itemState defaulted blocked/stopped to
+        // .streaming so hook rows spun forever (CODEX-APP-003).
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "hooks"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.notificationHandler?("hook/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "run": [
+                "id": "hook-run-blocked-1",
+                "eventName": "PreToolUse",
+                "handlerType": "command",
+                "status": "blocked",
+                "entries": [["kind": "stop", "text": "blocked by policy"]]
+            ]
+        ])
+        client.notificationHandler?("hook/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "run": [
+                "id": "hook-run-stopped-1",
+                "eventName": "PostToolUse",
+                "handlerType": "command",
+                "status": "stopped"
+            ]
+        ])
+
+        let events = try await waitForEvents(in: sink) { events in
+            events.contains {
+                if case .itemStarted(let item) = $0 {
+                    return item.id == "hook-run-stopped-1" && item.state == .cancelled
+                }
+                return false
+            }
+        }
+        XCTAssertTrue(
+            events.contains {
+                if case .itemStarted(let item) = $0 {
+                    return item.id == "hook-run-blocked-1" && item.state == .failed
+                }
+                return false
+            },
+            "hook/completed nested run.status=blocked must be terminal .failed, not .streaming"
+        )
+        XCTAssertTrue(
+            events.contains {
+                if case .itemStarted(let item) = $0 {
+                    return item.id == "hook-run-stopped-1" && item.state == .cancelled
+                }
+                return false
+            },
+            "hook/completed nested run.status=stopped must be terminal .cancelled, not .streaming"
+        )
+    }
+
+    func test_autoApprovalReviewUsesReviewIdAndTerminalStatuses() async throws {
+        // WHY: ItemGuardianApprovalReviewCompletedNotification carries reviewId +
+        // GuardianApprovalReviewStatus (approved/denied/timedOut/aborted). Missing
+        // reviewId forced random UUIDs; approved/timedOut/aborted fell through itemState
+        // default to .streaming so review chips never settled (CODEX-APP-004).
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "guardian review"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.notificationHandler?("item/autoApprovalReview/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "reviewId": "review-stable-1",
+            "targetItemId": "cmd-1",
+            "review": [
+                "status": "approved",
+                "riskLevel": "low",
+                "rationale": "safe"
+            ]
+        ])
+        client.notificationHandler?("item/autoApprovalReview/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "reviewId": "review-timeout-1",
+            "review": ["status": "timedOut"]
+        ])
+        client.notificationHandler?("item/autoApprovalReview/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "reviewId": "review-aborted-1",
+            "review": ["status": "aborted"]
+        ])
+
+        let events = try await waitForEvents(in: sink) { events in
+            events.contains {
+                if case .itemStarted(let item) = $0 {
+                    return item.id == "review-aborted-1" && item.state == .cancelled
+                }
+                return false
+            }
+        }
+        XCTAssertTrue(
+            events.contains {
+                if case .itemStarted(let item) = $0 {
+                    return item.id == "review-stable-1"
+                        && item.type == .review
+                        && item.state == .completed
+                }
+                return false
+            },
+            "autoApprovalReview must use reviewId and map approved → .completed"
+        )
+        XCTAssertTrue(
+            events.contains {
+                if case .itemStarted(let item) = $0 {
+                    return item.id == "review-timeout-1" && item.state == .failed
+                }
+                return false
+            },
+            "timedOut guardian review must be terminal .failed"
+        )
+        XCTAssertTrue(
+            events.contains {
+                if case .itemStarted(let item) = $0 {
+                    return item.id == "review-aborted-1" && item.state == .cancelled
+                }
+                return false
+            },
+            "aborted guardian review must be terminal .cancelled"
+        )
+    }
+
     func test_adapterMapsCommonAppServerItemLifecycleAndDeltas() async throws {
         let client = MockCodexAppServerClient(autoComplete: false)
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in

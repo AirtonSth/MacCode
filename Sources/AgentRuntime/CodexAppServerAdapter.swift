@@ -1193,9 +1193,17 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 events.append(.turnStarted(turnId: turnId))
             }
         case "hook/started", "hook.started", "hook/completed", "hook.completed":
-            let hook = payload["hook"] as? [String: Any] ?? payload["summary"] as? [String: Any] ?? payload
+            // openai/codex HookStarted/CompletedNotification nests HookRunSummary under `run`
+            // (camelCase wire). Keep legacy flat / hook / summary fallbacks for tests and older peers.
+            let hook = payload["run"] as? [String: Any]
+                ?? payload["hook"] as? [String: Any]
+                ?? payload["summary"] as? [String: Any]
+                ?? payload
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
-            let itemId = string(hook, "id") ?? string(payload, "hookRunId") ?? string(payload, "hook_run_id") ?? "hook-\(UUID().uuidString)"
+            let itemId = string(hook, "id")
+                ?? string(payload, "hookRunId")
+                ?? string(payload, "hook_run_id")
+                ?? "hook-\(UUID().uuidString)"
             let completed = method.contains("completed")
             events.append(.itemStarted(item: AssistantItem(
                 id: itemId,
@@ -1230,7 +1238,16 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case "item/autoApprovalReview/started", "item.autoApprovalReview.started", "item/autoApprovalReview/completed", "item.autoApprovalReview.completed":
             let review = payload["review"] as? [String: Any] ?? payload["autoApprovalReview"] as? [String: Any] ?? payload
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
-            let itemId = string(payload, "itemId") ?? string(payload, "item_id") ?? string(review, "id") ?? "auto-approval-\(UUID().uuidString)"
+            // Upstream ItemGuardianApprovalReview*Notification uses reviewId + optional targetItemId
+            // (camelCase). Prefer those before inventing a UUID so start/complete share one item id.
+            let itemId = string(payload, "itemId")
+                ?? string(payload, "item_id")
+                ?? string(payload, "reviewId")
+                ?? string(payload, "review_id")
+                ?? string(payload, "targetItemId")
+                ?? string(payload, "target_item_id")
+                ?? string(review, "id")
+                ?? "auto-approval-\(UUID().uuidString)"
             let completed = method.contains("completed")
             events.append(.itemStarted(item: AssistantItem(
                 id: itemId,
@@ -3060,14 +3077,29 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     }
 
     private static func itemState(for status: String?) -> AssistantItemState {
-        switch status {
-        case "completed", "succeeded", "success": return .completed
-        case "failed": return .failed
+        // Normalize camelCase / snake_case so wire enums match one switch.
+        let normalized = status?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "_", with: "")
+            .lowercased()
+        switch normalized {
+        case "completed", "succeeded", "success", "approved":
+            // GuardianApprovalReviewStatus.approved is a successful terminal review.
+            return .completed
+        case "failed", "blocked", "timedout", "errored", "error":
+            // HookRunStatus.blocked and timed-out reviews are terminal failures.
+            return .failed
         // User denial of command/fileChange approvals arrives as wire status
         // "declined" (openai/codex CommandExecutionStatus/PatchApplyStatus).
-        // AssistantItemState has no .declined; terminal cancel matches denial.
-        case "cancelled", "canceled", "declined", "decline", "denied", "deny": return .cancelled
-        default: return .streaming
+        // HookRunStatus.stopped and GuardianApprovalReviewStatus.aborted/denied
+        // are user-or-system cancellations — not still-in-progress.
+        // AssistantItemState has no .declined/.aborted; terminal cancel matches.
+        case "cancelled", "canceled", "declined", "decline", "denied", "deny",
+             "stopped", "aborted", "interrupted":
+            return .cancelled
+        default:
+            // inProgress / running / pending / nil → keep streaming.
+            return .streaming
         }
     }
 
