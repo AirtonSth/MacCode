@@ -680,6 +680,127 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTFail("Codex app-server process exit must finish the local run instead of leaving Agent App running forever")
     }
 
+    func test_turnCompletedWithFailedStatusFinishesRunAsFailed() async throws {
+        // WHY: openai/codex app-server emits failures only as turn/completed with
+        // turn.status=failed (+ turn.error.message). Treating that notification as
+        // success paints Agent App green after auth/model failures (CODEX-APP-001).
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "will fail"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turn": [
+                "id": "turn-app-server-1",
+                "status": "failed",
+                "error": ["message": "model overloaded"]
+            ]
+        ])
+
+        let finish = try await waitForFinish(in: sink, timeout: 3)
+        XCTAssertEqual(finish.0, .failed, "turn/completed with status=failed must finish as .failed, not .completed")
+        XCTAssertEqual(finish.1, "model overloaded")
+        XCTAssertEqual(finish.2, "codex-thread-1")
+
+        let events = await sink.snapshot()
+        XCTAssertTrue(
+            events.contains {
+                if case .error(let message, let recoverable) = $0 {
+                    return message == "model overloaded" && recoverable == false
+                }
+                return false
+            },
+            "failed turn/completed must emit a non-recoverable error event with turn.error.message"
+        )
+        XCTAssertFalse(
+            events.contains { if case .turnCompleted = $0 { return true } else { return false } },
+            "failed turn must not emit success turnCompleted"
+        )
+    }
+
+    func test_turnCompletedWithInterruptedStatusFinishesRunAsCancelled() async throws {
+        // WHY: interrupts arrive as turn/completed + turn.status=interrupted, not a
+        // separate method. They must map to .cancelled like the user-stop path so
+        // Agent App does not report a successful completed run (CODEX-APP-001).
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "will interrupt"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turn": [
+                "id": "turn-app-server-1",
+                "status": "interrupted"
+            ]
+        ])
+
+        let finish = try await waitForFinish(in: sink, timeout: 3)
+        XCTAssertEqual(finish.0, .cancelled, "turn/completed with status=interrupted must finish as .cancelled")
+        XCTAssertNil(finish.1)
+        XCTAssertEqual(finish.2, "codex-thread-1")
+    }
+
+    func test_turnCompletedWithTopLevelFailedStatusFinishesRunAsFailed() async throws {
+        // WHY: status may appear at top-level as a fallback when turn dict is flat;
+        // still must not complete successfully.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "will fail"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "status": "Failed",
+            "error": ["message": "rate limit exceeded"]
+        ])
+
+        let finish = try await waitForFinish(in: sink, timeout: 3)
+        XCTAssertEqual(finish.0, .failed)
+        XCTAssertEqual(finish.1, "rate limit exceeded")
+    }
+
     func test_adapterForksNativeProviderSessionWithoutReusingParentIdentity() async throws {
         let client = MockCodexAppServerClient(supportsForkReconciliation: true)
         let adapter = CodexAppServerAdapter(
@@ -3367,6 +3488,58 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(secondTurnGoal.turnId, "turn-app-server-2")
         XCTAssertNotEqual(secondTurnGoal.id, inTurn.id,
                           "goal item ids must be turn-scoped so two turns never share one item id")
+    }
+
+    func test_itemCompletedWithDeclinedStatusMapsToCancelled() async throws {
+        // WHY: openai/codex emits item/completed with status=declined when the user
+        // denies a command/fileChange approval. Mapping only completed/failed/cancelled
+        // left declined on the default .streaming path so items looked forever in-progress
+        // (CODEX-APP-002). Terminal cancel is the correct denial signal.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "will decline command"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.notificationHandler?("item/started", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "item": ["id": "cmd-declined-1", "type": "commandExecution", "command": "rm -rf /"]
+        ])
+        client.notificationHandler?("item/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "item": [
+                "id": "cmd-declined-1",
+                "type": "commandExecution",
+                "command": "rm -rf /",
+                "status": "declined"
+            ]
+        ])
+
+        _ = try await waitForItemCompleted(in: sink, itemId: "cmd-declined-1")
+        let events = await sink.snapshot()
+        XCTAssertTrue(
+            events.contains {
+                if case .itemCompleted(let itemId, let state) = $0 {
+                    return itemId == "cmd-declined-1" && state == .cancelled
+                }
+                return false
+            },
+            "item/completed with status=declined must emit finalState .cancelled, not remain streaming"
+        )
     }
 
     func test_adapterMapsCommonAppServerItemLifecycleAndDeltas() async throws {

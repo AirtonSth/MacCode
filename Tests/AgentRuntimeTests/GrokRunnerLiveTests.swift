@@ -159,9 +159,11 @@ final class GrokRunnerLiveTests: ProviderProcessTestCase {
         )
 
         let discovery = await adapter.discoveryResult()
+        // Empty modes catalog now opens Plan (live set_mode plan canary). Only
+        // an explicit advertised catalog without plan stays fail-closed.
         if !discovery.capabilities.supportsPlanReview {
             XCTAssertFalse(discovery.interactionModes.contains(.plan),
-                           "Plan must stay capability-gated when the live ACP session does not advertise modes")
+                           "Plan must stay capability-gated when the live ACP catalog omits plan")
             do {
                 _ = try await adapter.startSession(planRequest) { _ in }
                 XCTFail("a live ACP session without Plan capability must reject Plan before provider execution")

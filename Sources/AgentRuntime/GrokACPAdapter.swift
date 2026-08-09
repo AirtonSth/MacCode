@@ -201,16 +201,17 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             let opened = try await client.newSession(cwd: discoveryCwd)
             let discovered = initialized.models.isEmpty ? opened.models : initialized.models
             let modeIDs = Set(opened.availableModes.map(\.id))
-            // Live Grok 0.2.x often omits `modes.availableModes` from session/new
+            // Live Grok 0.2.x / 1.0.0 often omits `modes.availableModes` from session/new
             // while still accepting session/set_mode for the CLI wire IDs
-            // (default / acceptEdits / bypassPermissions / plan). When modes are
-            // advertised, only expose the negotiated subset.
-            let interactionModes: [AgentInteractionMode]
-            if modeIDs.isEmpty {
-                interactionModes = [.default]
-            } else {
-                interactionModes = opened.planModeId != nil ? [.default, .plan] : [.default]
-            }
+            // (default / acceptEdits / bypassPermissions / plan). Live canary
+            // confirms set_mode plan succeeds when the catalog is omitted.
+            // Empty catalog → open Plan (same pattern as permission modes).
+            // When modes ARE advertised, only expose the negotiated subset
+            // (fail-closed for Plan if plan is absent from the catalog).
+            let interactionModes = Self.interactionModes(
+                availableModeIDs: modeIDs,
+                advertisedPlanModeID: opened.planModeId
+            )
             let permissionModes = Self.permissionModes(from: modeIDs)
             // Attachment kinds for iOS/macOS pickers.
             // Grok 0.2.x reports promptCapabilities.image=false while still accepting
@@ -550,8 +551,13 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             }
             let mapper = GrokACPEventMapper(sessionId: opened.sessionId)
             // Seed mode so plan session updates can tell live progress from Plan review.
+            let availableModeIDs = Set(opened.availableModes.map(\.id))
+            let planModeID = Self.resolvedPlanModeID(
+                availableModeIDs: availableModeIDs,
+                advertisedPlanModeID: opened.planModeId
+            )
             mapper.setCurrentModeId(opened.currentModeId)
-            mapper.setPlanReviewModeId(opened.planModeId)
+            mapper.setPlanReviewModeId(planModeID)
             let session = Session(
                 threadId: request.threadId,
                 providerThreadId: opened.sessionId,
@@ -559,8 +565,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 capabilities: capabilities,
                 mapper: mapper,
                 model: opened.currentModelId ?? request.model,
-                availableModeIDs: Set(opened.availableModes.map(\.id)),
-                planModeID: opened.planModeId,
+                availableModeIDs: availableModeIDs,
+                planModeID: planModeID,
                 mode: opened.currentModeId,
                 onEvent: onEvent
             )
@@ -1092,7 +1098,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     }
 
     /// Map advertised ACP mode IDs to RemoteCode permission modes.
-    /// Empty advertisement (live Grok 0.2.x) means the known CLI set is usable.
+    /// Empty advertisement (live Grok 0.2.x / 1.0.0) means the known CLI set is usable.
     static func permissionModes(from availableModeIDs: Set<String>) -> [AgentPermissionMode] {
         if availableModeIDs.isEmpty {
             return defaultPermissionModes
@@ -1105,6 +1111,34 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             modes.append(.fullAccess)
         }
         return modes
+    }
+
+    /// Map advertised ACP mode IDs to interaction modes.
+    /// Empty advertisement (live Grok 1.0.0 canary): Plan is open via wire id `plan`.
+    /// When modes are advertised without plan, stay fail-closed.
+    static func interactionModes(
+        availableModeIDs: Set<String>,
+        advertisedPlanModeID: String?
+    ) -> [AgentInteractionMode] {
+        if availableModeIDs.isEmpty {
+            return [.default, .plan]
+        }
+        return advertisedPlanModeID != nil ? [.default, .plan] : [.default]
+    }
+
+    /// Wire mode id for Plan when the session omits availableModes (live Grok 1.0.0).
+    static let emptyCatalogPlanModeID = "plan"
+
+    /// Resolve Plan mode to an ACP mode ID for session/set_mode.
+    /// Empty catalog → known wire `"plan"`. Advertised without plan → nil (fail-closed).
+    static func resolvedPlanModeID(
+        availableModeIDs: Set<String>,
+        advertisedPlanModeID: String?
+    ) -> String? {
+        if availableModeIDs.isEmpty {
+            return emptyCatalogPlanModeID
+        }
+        return advertisedPlanModeID
     }
 
     /// Resolve a permission mode to an ACP mode ID for session/set_mode.

@@ -9,10 +9,9 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
 
     // MARK: - Pure builder tests (no process, no I/O)
 
-    /// The control-interrupt line must be valid JSON containing the fields
-    /// the Claude CLI stream-json protocol requires: type="control" and
-    /// action="interrupt". Verifies the builder produces a parseable, correct
-    /// payload before any I/O path is exercised.
+    /// The control-interrupt line must be valid JSON matching Agent SDK /
+    /// Claude CLI control channel: type=control_request, request.subtype=interrupt,
+    /// and a non-empty request_id. Wrong shape is silently ignored by the CLI.
     func test_controlInterruptLine_isValidJSONWithRequiredFields() throws {
         let data = ClaudeStreamingCLIAdapter.controlInterruptLine()
 
@@ -23,10 +22,13 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
             "controlInterruptLine must produce parseable JSON"
         )
 
-        XCTAssertEqual(object["type"] as? String, "control",
-                       "stream-json control message must carry type=control")
-        XCTAssertEqual(object["action"] as? String, "interrupt",
-                       "stream-json control message must carry action=interrupt")
+        XCTAssertEqual(object["type"] as? String, "control_request",
+                       "stream-json interrupt must carry type=control_request")
+        let requestId = try XCTUnwrap(object["request_id"] as? String)
+        XCTAssertFalse(requestId.isEmpty, "control_request interrupt needs a request_id")
+        let request = try XCTUnwrap(object["request"] as? [String: Any])
+        XCTAssertEqual(request["subtype"] as? String, "interrupt",
+                       "stream-json interrupt request.subtype must be interrupt")
     }
 
     /// The line must be newline-terminated so the Claude CLI's line reader
@@ -35,6 +37,57 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
         let data = ClaudeStreamingCLIAdapter.controlInterruptLine()
         XCTAssertEqual(data.last, 0x0A,
                        "stream-json control messages must be newline-terminated for the CLI line reader to flush")
+    }
+
+    // MARK: - control_response permission wire (pure)
+
+    func test_controlPermissionResponseLine_allowMapsApproveAndApproveForSession() throws {
+        for response: AgentProviderRequestResponse in [.approve, .approveForSession] {
+            let data = try ClaudeStreamingCLIAdapter.controlPermissionResponseLine(
+                requestId: "req-allow-1",
+                response: response
+            )
+            XCTAssertEqual(data.last, 0x0A)
+            let stripped = data.dropLast()
+            let object = try XCTUnwrap(
+                try JSONSerialization.jsonObject(with: Data(stripped)) as? [String: Any]
+            )
+            XCTAssertEqual(object["type"] as? String, "control_response")
+            let envelope = try XCTUnwrap(object["response"] as? [String: Any])
+            XCTAssertEqual(envelope["subtype"] as? String, "success")
+            XCTAssertEqual(envelope["request_id"] as? String, "req-allow-1")
+            let result = try XCTUnwrap(envelope["response"] as? [String: Any])
+            XCTAssertEqual(result["behavior"] as? String, "allow")
+            XCTAssertNil(result["message"])
+        }
+    }
+
+    func test_controlPermissionResponseLine_denyRequiresMessage() throws {
+        let declined = try ClaudeStreamingCLIAdapter.controlPermissionResponseLine(
+            requestId: "req-deny-1",
+            response: .decline("not in plan")
+        )
+        let declinedObj = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(declined.dropLast())) as? [String: Any]
+        )
+        let declinedResult = try XCTUnwrap(
+            (declinedObj["response"] as? [String: Any])?["response"] as? [String: Any]
+        )
+        XCTAssertEqual(declinedResult["behavior"] as? String, "deny")
+        XCTAssertEqual(declinedResult["message"] as? String, "not in plan")
+
+        let cancelled = try ClaudeStreamingCLIAdapter.controlPermissionResponseLine(
+            requestId: "req-cancel-1",
+            response: .cancel
+        )
+        let cancelledObj = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(cancelled.dropLast())) as? [String: Any]
+        )
+        let cancelledResult = try XCTUnwrap(
+            (cancelledObj["response"] as? [String: Any])?["response"] as? [String: Any]
+        )
+        XCTAssertEqual(cancelledResult["behavior"] as? String, "deny")
+        XCTAssertEqual(cancelledResult["message"] as? String, "Cancelled")
     }
 
     // MARK: - needsSessionResume pure seam tests

@@ -603,8 +603,21 @@ public final class GrokACPClient: @unchecked Sendable {
         return try Self.openResult(result, fallbackSessionId: sessionId)
     }
 
+    /// Map host `AgentReasoningEffort` to Grok ACP / CLI wire tokens.
+    /// Agent `parse_reasoning_effort_meta` accepts minimal/low/medium/high/xhigh/max;
+    /// `ultracode` is Claude-only and is ignored unless mapped (same as GrokRunner.effortArgs → high).
+    static func wireReasoningEffort(_ effort: AgentReasoningEffort) -> String {
+        switch effort {
+        case .ultracode:
+            return "high"
+        case .minimal, .low, .medium, .high, .xhigh, .max:
+            return effort.rawValue
+        }
+    }
+
     /// `reasoningEffort` is the ACP `_meta.reasoningEffort` wire value (grok-build
     /// `REASONING_EFFORT_META_KEY`). Omit when the host has nothing to bind.
+    /// Values are mapped via `wireReasoningEffort` before the wire call.
     func setModel(
         sessionId: String,
         modelId: String,
@@ -612,7 +625,7 @@ public final class GrokACPClient: @unchecked Sendable {
     ) async throws {
         var params: JSONObject = ["sessionId": sessionId, "modelId": modelId]
         if let reasoningEffort {
-            params["_meta"] = ["reasoningEffort": reasoningEffort.rawValue]
+            params["_meta"] = ["reasoningEffort": Self.wireReasoningEffort(reasoningEffort)]
         }
         _ = try await requestJSONObject(method: "session/set_model", params: params, timeout: 15)
     }

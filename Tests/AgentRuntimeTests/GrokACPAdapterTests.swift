@@ -709,8 +709,8 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
     }
 
     func test_discoveryWithoutModeAdvertisementExposesFullPermissionSet() async throws {
-        // Live Grok 0.2.x session/new often omits modes.availableModes while still
-        // accepting session/set_mode for default / acceptEdits / bypassPermissions.
+        // Live Grok 0.2.x / 1.0.0 session/new often omits modes.availableModes while still
+        // accepting session/set_mode for default / acceptEdits / bypassPermissions / plan.
         let peer = try FakeGrokACPPeer(mode: .discovery)
         defer { peer.remove() }
         let adapter = GrokACPAdapter(binaryNameOverride: peer.path)
@@ -721,8 +721,10 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(discovery.permissionModes, AgentPermissionMode.allCases,
                        "omitted mode advertisement must not lock Full access out of the picker")
         XCTAssertTrue(discovery.permissionModes.contains(.fullAccess))
-        XCTAssertEqual(discovery.interactionModes, [.default],
-                       "Plan stays fail-closed until ACP advertises a plan mode id")
+        XCTAssertEqual(discovery.interactionModes, [.default, .plan],
+                       "empty mode catalog must open Plan (live set_mode plan succeeds)")
+        XCTAssertTrue(discovery.capabilities.supportsPlanReview,
+                      "empty mode catalog must expose Plan review capability")
     }
 
     func test_authenticatedDiscoverySurfacesOnlyNegotiatedPlanCapability() async throws {
@@ -793,6 +795,48 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         )
     }
 
+    /// WHY: empty modes catalog must open Plan with wire id `plan`; advertised
+    /// catalog without plan must stay fail-closed (GROK-ACP-006).
+    func test_planModeResolutionEmptyCatalogOpensPlanAdvertisedWithoutPlanStaysClosed() {
+        XCTAssertEqual(
+            GrokACPAdapter.interactionModes(availableModeIDs: [], advertisedPlanModeID: nil),
+            [.default, .plan]
+        )
+        XCTAssertEqual(
+            GrokACPAdapter.resolvedPlanModeID(availableModeIDs: [], advertisedPlanModeID: nil),
+            "plan"
+        )
+        XCTAssertEqual(
+            GrokACPAdapter.interactionModes(
+                availableModeIDs: ["default"],
+                advertisedPlanModeID: nil
+            ),
+            [.default],
+            "advertised catalog without plan must not expose Plan"
+        )
+        XCTAssertNil(
+            GrokACPAdapter.resolvedPlanModeID(
+                availableModeIDs: ["default"],
+                advertisedPlanModeID: nil
+            ),
+            "advertised without plan → fail-closed (no wire fallback)"
+        )
+        XCTAssertEqual(
+            GrokACPAdapter.interactionModes(
+                availableModeIDs: ["default", "plan"],
+                advertisedPlanModeID: "plan"
+            ),
+            [.default, .plan]
+        )
+        XCTAssertEqual(
+            GrokACPAdapter.resolvedPlanModeID(
+                availableModeIDs: ["default", "plan"],
+                advertisedPlanModeID: "plan"
+            ),
+            "plan"
+        )
+    }
+
     func test_discoveryFailureLabelsStaticFallback() async {
         let adapter = GrokACPAdapter(binaryNameOverride: "/definitely/missing/grok")
         let result = await adapter.listModelsResult()
@@ -859,39 +903,26 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
                           "the non-secret account-home selector must isolate authenticated catalogs")
     }
 
-    func test_planFailsBeforePromptWhenSessionDoesNotAdvertisePlanMode() async throws {
+    /// WHY: live Grok 1.0.0 omits modes but accepts session/set_mode modeId=plan.
+    /// Empty catalog must start Plan (wire id `plan`), not throw "did not advertise".
+    func test_planUsesWirePlanIdWhenSessionOmitsModeAdvertisement() async throws {
         let peer = try FakeGrokACPPeer(mode: .permission)
         defer { peer.remove() }
         let adapter = GrokACPAdapter(binaryNameOverride: peer.path)
         let request = makeRequest(interactionMode: .plan)
+        let box = GrokACPEventBox()
 
-        do {
-            _ = try await adapter.startSession(request) { _ in }
-            XCTFail("Grok must not claim Plan support when ACP omitted the mode")
-        } catch let error as AgentProviderAdapterError {
-            guard case .unsupported(let detail) = error else {
-                return XCTFail("Expected unsupported, got \(error)")
-            }
-            XCTAssertTrue(detail.contains("Plan"))
-        }
-
-        XCTAssertFalse(adapter.hasSession(threadId: request.threadId),
-                       "a prompt-start failure must remove the stopped Grok session so retry cannot reuse a zombie client")
-
-        let retry = GrokACPEventBox()
-        _ = try await adapter.startSession(makeRequest(
-            threadId: request.threadId,
-            interactionMode: .default
-        )) { retry.append($0) }
-        let pending = try await retry.waitForRequest(timeout: 3)
+        _ = try await adapter.startSession(request) { box.append($0) }
+        let pending = try await box.waitForRequest(timeout: 3)
         try await adapter.respondToRequest(
             threadId: request.threadId,
             requestId: pending.id,
             response: .approve
         )
-        let finished = try await retry.waitFinished(timeout: 3)
+        let finished = try await box.waitFinished(timeout: 3)
         XCTAssertEqual(finished.status, .completed,
-                       "retry after a rejected Plan start must create a fresh usable Grok session")
+                       "Plan must start when ACP omits mode advertisement (set_mode plan)")
+        XCTAssertTrue(adapter.hasSession(threadId: request.threadId))
     }
 
     func test_planUsesAdvertisedModeAndStreamsReviewableArtifact() async throws {

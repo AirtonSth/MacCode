@@ -33,6 +33,8 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         XCTAssertEqual(a[a.index(after: a.firstIndex(of: "--output-format")!)], "stream-json")
         XCTAssertTrue(a.contains("--replay-user-messages"),
                       "durable Claude sessions need echoed user messages so the timeline remains complete")
+        XCTAssertTrue(a.contains("--include-partial-messages"),
+                      "stream-json sessions must request partial messages for token-level streaming")
         XCTAssertEqual(a[a.index(after: a.firstIndex(of: "--session-id")!)], request.threadId.value.uuidString,
                        "new durable Claude sessions must use a stable provider session id for restart diagnostics")
         XCTAssertFalse(a.contains("hello world"),
