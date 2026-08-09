@@ -241,13 +241,26 @@ public final class PetController {
         }
     }
 
+    // PERF: event-log recovery and live EventBus handling classify every
+    // published kind. Array literals reallocated membership tables per event;
+    // share process-wide Sets (membership contract unchanged).
+    private static let potentialProjectionKinds: Set<String> = [
+        "git.push", "git.deliver", "project.script.finished",
+        "ssh.transfer.completed", "ssh.transfer.failed", "ssh.session.updated",
+        "agent.provider.updated", "files.edit.conflict", "files.edit.saved",
+        "files.edit.discarded", "files.edit.closed",
+    ]
+    private static let fileEditResolvedKinds: Set<String> = [
+        "files.edit.saved", "files.edit.discarded", "files.edit.closed",
+    ]
+    private static let attentionProjectionKinds: Set<String> = [
+        "notification.created", "notification.read", "notification.dismissed",
+        "agent.thread.read", "agent.thread.updated", "agent.thread.deleted",
+        "agent.thread.deleted_many",
+    ]
+
     private static func isPotentialProjectionKind(_ kind: String) -> Bool {
-        [
-            "git.push", "git.deliver", "project.script.finished",
-            "ssh.transfer.completed", "ssh.transfer.failed", "ssh.session.updated",
-            "agent.provider.updated", "files.edit.conflict", "files.edit.saved",
-            "files.edit.discarded", "files.edit.closed"
-        ].contains(kind)
+        potentialProjectionKinds.contains(kind)
     }
 
     private static func isProjectionCandidate(_ event: EventBus.Event) -> Bool {
@@ -259,7 +272,7 @@ public final class PetController {
            payload["surface_id"]?.stringValue.flatMap(UUID.init(uuidString:)) != nil {
             return true
         }
-        guard ["files.edit.saved", "files.edit.discarded", "files.edit.closed"].contains(event.kind),
+        guard Self.fileEditResolvedKinds.contains(event.kind),
               case .object(let payload) = event.payload,
               payload["session_id"]?.stringValue?.isEmpty == false else { return false }
         return true
@@ -402,10 +415,7 @@ public final class PetController {
             handledEventOutOfOrderForTests = true
         }
         lastHandledEventSequence = event.seq
-        let attentionProjectionChanged = [
-            "notification.created", "notification.read", "notification.dismissed",
-            "agent.thread.read", "agent.thread.updated", "agent.thread.deleted", "agent.thread.deleted_many"
-        ].contains(event.kind)
+        let attentionProjectionChanged = Self.attentionProjectionKinds.contains(event.kind)
         let focusedSurfaceByWorkspace = context.state.workspaces.reduce(
             into: [WorkspaceID: SurfaceID]()
         ) { result, entry in

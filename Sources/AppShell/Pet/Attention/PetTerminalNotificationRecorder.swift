@@ -6,6 +6,15 @@ import SocketServer
 public struct PetTerminalNotificationRecorder {
     private let repository: NotificationRepository
 
+    // PERF: record/classify run on every pet-bound EventBus event and recovery
+    // replay. Array-literal membership reallocated per call; share Sets.
+    private static let fileEditResolvedKinds: Set<String> = [
+        "files.edit.saved", "files.edit.discarded", "files.edit.closed",
+    ]
+    private static let sshUnexpectedDisconnectReasons: Set<String> = [
+        "unexpected_child_exit", "connection_failed",
+    ]
+
     public init(repository: NotificationRepository) {
         self.repository = repository
     }
@@ -49,7 +58,7 @@ public struct PetTerminalNotificationRecorder {
             try repository.markRead(id: Self.sshDisconnectID(surfaceID))
             return nil
         }
-        if ["files.edit.saved", "files.edit.discarded", "files.edit.closed"].contains(event.kind),
+        if Self.fileEditResolvedKinds.contains(event.kind),
            case .object(let payload) = event.payload,
            let sessionID = payload["session_id"]?.stringValue,
            !sessionID.isEmpty {
@@ -116,7 +125,7 @@ public struct PetTerminalNotificationRecorder {
         case "ssh.session.updated":
             guard surfaceID != nil,
                   payload["status"]?.stringValue == "disconnected",
-                  ["unexpected_child_exit", "connection_failed"].contains(
+                  Self.sshUnexpectedDisconnectReasons.contains(
                     payload["reason"]?.stringValue ?? ""
                   ) else { return nil }
             kind = .sshUnexpectedDisconnect
