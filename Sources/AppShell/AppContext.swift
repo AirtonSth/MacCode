@@ -352,8 +352,22 @@ public final class AppContext {
 
     public let coordinator: AgentRunCoordinator
     public var router: AppCommandRouter! {
-        didSet { drainRecoveredForkPrunedThreadIDsIfPossible() }
+        didSet {
+            drainRecoveredForkPrunedThreadIDsIfPossible()
+            refreshActiveAgentWorkspaceProjection()
+        }
     }
+    private struct ActiveAgentThreadContext {
+        let workspaceID: WorkspaceID
+        let title: String
+    }
+
+    /// Main-actor cache of coordinator-owned work. Workspace chrome reads the
+    /// grouped projection instead of synchronously querying durable thread rows on
+    /// every SwiftUI render. The per-thread cache ensures each newly active thread
+    /// needs at most one lifecycle-time lookup even during large orchestrated bursts.
+    private var activeAgentThreadContextByID: [AgentThreadID: ActiveAgentThreadContext] = [:]
+    private var activeAgentThreadTitlesByWorkspace: [WorkspaceID: [String]] = [:]
     private var pendingRecoveredForkPrunedThreadIDs: Set<AgentThreadID> = []
     public var socketServer: UnixSocketServer?
     private let tokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefreshing
@@ -825,7 +839,7 @@ public final class AppContext {
         self.coordinator.terminalTransitionLedger = TerminalTransitionLedger(directory: diagnosticsDir)
         contextReference.value = self
         let liveActivitySyncCoordinator = self.liveActivitySyncCoordinator
-        coordinator.onActiveRunProjectionChanged = { projection, cause in
+        coordinator.onActiveRunProjectionChanged = { [weak contextReference] projection, cause in
             let syncCause: LiveActivitySyncCause
             switch cause {
             case .started:
@@ -836,6 +850,12 @@ public final class AppContext {
                 syncCause = .launchReconciliation
             }
             liveActivitySyncCoordinator.submit(projection, cause: syncCause)
+            // Scheduled runs intentionally do not select/bind an Agent App tab. Keep
+            // workspace-level chrome in parity with user-started runs by projecting
+            // coordinator ownership independently of per-tab busy state.
+            Task { @MainActor [weak contextReference] in
+                contextReference?.value?.refreshActiveAgentWorkspaceProjection()
+            }
         }
         liveActivityAcceptanceOutbox.resumePending()
         if performLaunchRunReconciliation {
@@ -1449,6 +1469,52 @@ public final class AppContext {
         if let tokenSaverAccountObserver {
             NotificationCenter.default.removeObserver(tokenSaverAccountObserver)
         }
+    }
+
+    /// True while this process's shared coordinator owns any run in the workspace.
+    /// Unlike AgentAppSurface.isBusy, this is deliberately workspace-wide so a
+    /// headless scheduled thread and an interactively selected thread drive the
+    /// same workspace spinner without making unrelated Agent App tabs spin.
+    public func hasActiveAgentRun(in workspaceID: WorkspaceID) -> Bool {
+        activeAgentThreadTitlesByWorkspace[workspaceID] != nil
+    }
+
+    /// Titles for workspace-level busy help/VoiceOver copy. The cache is refreshed
+    /// once per coordinator lifecycle transition, never from a SwiftUI body read.
+    public func activeAgentThreadTitles(in workspaceID: WorkspaceID) -> [String] {
+        activeAgentThreadTitlesByWorkspace[workspaceID] ?? []
+    }
+
+    private func refreshActiveAgentWorkspaceProjection() {
+        let activeThreadIDs = coordinator.activeThreadIdsSnapshot()
+        let cachedThreadIDs = Set(activeAgentThreadContextByID.keys)
+
+        for threadID in cachedThreadIDs.subtracting(activeThreadIDs) {
+            activeAgentThreadContextByID.removeValue(forKey: threadID)
+        }
+        let newlyActiveThreadIDs = activeThreadIDs.subtracting(cachedThreadIDs).sorted {
+            $0.value.uuidString < $1.value.uuidString
+        }
+        for threadID in newlyActiveThreadIDs {
+            guard let thread = try? threadRepo.get(id: threadID),
+                  let workspaceID = thread.workspaceId else { continue }
+            activeAgentThreadContextByID[threadID] = ActiveAgentThreadContext(
+                workspaceID: workspaceID,
+                title: thread.title
+            )
+        }
+
+        var projected: [WorkspaceID: [String]] = [:]
+        let orderedThreadIDs = activeAgentThreadContextByID.keys.sorted {
+            $0.value.uuidString < $1.value.uuidString
+        }
+        for threadID in orderedThreadIDs {
+            guard let context = activeAgentThreadContextByID[threadID] else { continue }
+            projected[context.workspaceID, default: []].append(context.title)
+        }
+        guard projected != activeAgentThreadTitlesByWorkspace else { return }
+        activeAgentThreadTitlesByWorkspace = projected
+        router?.windowController?.refreshSurfaceRuntimeState()
     }
 
     func ensureQueueDrainWaiterIfNeeded(threadId: AgentThreadID) {

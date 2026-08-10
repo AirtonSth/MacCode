@@ -857,12 +857,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let ids = ctx.state.window.workspaces
         return ids.compactMap { id in
             guard var ws = ctx.state.workspaces[id] else { return nil }
-            // This synchronous path feeds local UI/layout callers only. Busy
-            // state must come from live in-memory surfaces; the authoritative
-            // HTTP read performs the durable thread projection off MainActor.
-            let busy = ws.layout.paneIDs().contains { pid in
+            // This synchronous path feeds local UI/layout callers only. Combine
+            // live surface activity with the lifecycle-time, in-memory agent-run
+            // projection. Do not synchronously read durable thread rows here.
+            let busySurface = ws.layout.paneIDs().contains { pid in
                 (ws.layout.find(paneID: pid)?.surfaces ?? []).contains { isWorkspaceActivitySurface($0) }
             }
+            let busy = busySurface || ctx.hasActiveAgentRun(in: id)
             if busy { ws.metadata["busy"] = "true" }
             else { ws.metadata.removeValue(forKey: "busy") }
             return ws
@@ -1040,6 +1041,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func isWorkspaceBusy(_ id: WorkspaceID) -> Bool {
         guard let ctx = context,
               let ws = ctx.state.workspaces[id] else { return false }
+        if ctx.hasActiveAgentRun(in: id) { return true }
         return ws.layout.paneIDs().contains { pid in
             (ws.layout.find(paneID: pid)?.surfaces ?? []).contains {
                 isWorkspaceActivitySurface($0)

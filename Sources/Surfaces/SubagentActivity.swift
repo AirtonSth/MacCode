@@ -872,7 +872,7 @@ public struct SubagentActivityBadge: View {
 
     private var countLabel: String {
         if snapshot.isEmpty {
-            return orchestrateActive ? "waiting" : "0 done"
+            return orchestrateActive ? "ready" : "0 done"
         }
         if snapshot.activeCount == 0, snapshot.unknownCount == 0 {
             return "\(snapshot.doneCount) done"
@@ -886,7 +886,7 @@ public struct SubagentActivityBadge: View {
     private var helpText: String {
         if snapshot.isEmpty {
             return orchestrateActive
-                ? "Auto orchestrate: delegated workers appear here"
+                ? "Auto orchestrate is ready; delegated workers appear here"
                 : "No subagent activity yet"
         }
         var parts = ["\(snapshot.activeCount) active", "\(snapshot.doneCount) done"]
@@ -896,7 +896,7 @@ public struct SubagentActivityBadge: View {
 
     private var accessibilityLabel: String {
         if snapshot.isEmpty, orchestrateActive {
-            return "Subagents, Auto orchestrate waiting for workers"
+            return "Subagents, Auto orchestrate ready, no workers active"
         }
         var label = "Subagents, \(snapshot.activeCount) active, \(snapshot.doneCount) done"
         if snapshot.unknownCount > 0 { label += ", \(snapshot.unknownCount) unknown" }

@@ -1949,7 +1949,11 @@ public final class SidebarViewModel: ObservableObject {
                 }
             }
         }
-        return Self.busyTooltip(runningThreadTitles: [], busySurfaceTitles: surfaceTitles)
+        let runningThreadTitles = context?.activeAgentThreadTitles(in: ws.id) ?? []
+        return Self.busyTooltip(
+            runningThreadTitles: runningThreadTitles,
+            busySurfaceTitles: surfaceTitles
+        )
     }
 
     public func reorderWorkspace(_ dragged: WorkspaceID, before target: WorkspaceID) {

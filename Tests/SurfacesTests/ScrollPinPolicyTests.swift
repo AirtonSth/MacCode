@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 @testable import Surfaces
 
@@ -288,6 +289,27 @@ final class ScrollPinPolicyTests: XCTestCase {
             "SwiftUI detach always wins"
         )
     }
+    /// A dense provider stream previously called `layoutSubtreeIfNeeded()` from
+    /// updateNSView/frame notifications, recursively entering NSHostingView layout
+    /// thousands of times. Keep the follower measurement path read-only.
+    func test_timelineFollowerDoesNotForceSynchronousAppKitLayout() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        let start = try XCTUnwrap(source.range(of: "private struct TimelineScrollFollower"))
+        let tail = source[start.lowerBound...]
+        let end = try XCTUnwrap(tail.range(of: "// PERF-MAC_AGENT-004"))
+        let follower = String(tail[..<end.lowerBound])
+
+        XCTAssertFalse(follower.contains("layoutSubtreeIfNeeded()"))
+        XCTAssertFalse(follower.contains("updateConstraintsForSubtreeIfNeeded()"))
+    }
+
     /// Stream follow must not dual-scroll content+BOTTOM (multipass jump).
     func test_programmaticScrollTargets_streamUsesBottomOnly() {
         let targets = AgentAppView.programmaticScrollTargets(

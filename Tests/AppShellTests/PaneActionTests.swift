@@ -189,7 +189,7 @@ final class PaneActionTests: XCTestCase {
         XCTAssertNil(vm.workspaces.first(where: { $0.id == ws.id })?.metadata["busy"],
                      "local workspace listing must not synchronously read durable thread state")
         XCTAssertFalse(vm.isWorkspaceBusy(vm.workspaces.first(where: { $0.id == ws.id })!),
-                       "workspace busy state must come from live runtime surfaces")
+                       "durable status alone must not bypass the live in-memory runtime projection")
     }
 
     func test_agentSurfaceBusyRollsUpRunningThreadForTabSpinner() async throws {
@@ -217,11 +217,37 @@ final class PaneActionTests: XCTestCase {
         XCTAssertFalse(agent.isBusy,
                        "an Agent tab must not spin for a running thread it does not own")
 
+        // A scheduled task uses exactly this unbound/headless shape. Per-tab chrome
+        // stays idle, but the workspace aggregate must match an interactively
+        // started run so the sidebar shows its spinner.
+        for _ in 0..<50 {
+            if ctx.hasActiveAgentRun(in: ws.id) { break }
+            await Task.yield()
+        }
+        XCTAssertTrue(ctx.hasActiveAgentRun(in: ws.id),
+                      "a coordinator-owned unbound run must enter the workspace projection")
+        XCTAssertTrue(router.isWorkspaceBusy(ws.id),
+                      "scheduled/headless and user-started runs must drive the same workspace busy state")
+        XCTAssertEqual(try router.listWorkspaces().first(where: { $0.id == ws.id })?.metadata["busy"], "true")
+
+        let sidebar = SidebarViewModel(context: ctx, router: router)
+        let sidebarWorkspace = try XCTUnwrap(sidebar.workspaces.first(where: { $0.id == ws.id }))
+        XCTAssertTrue(sidebar.isWorkspaceBusy(sidebarWorkspace))
+        XCTAssertEqual(sidebar.busyTooltip(for: sidebarWorkspace),
+                       "Agent run in thread \"Long task\"")
+
         // Bind this tab to the running thread → it now owns a real active run identity.
         agent.viewModel.selectThread(thread.id)
         XCTAssertTrue(agent.isBusy,
                       "the tab strip must spin while THIS tab owns a real active run identity")
         ctx.coordinator.stopRun(threadId: thread.id)
+        for _ in 0..<50 {
+            if !ctx.hasActiveAgentRun(in: ws.id) { break }
+            await Task.yield()
+        }
+        XCTAssertFalse(ctx.hasActiveAgentRun(in: ws.id),
+                       "terminal lifecycle must clear the workspace projection")
+        XCTAssertFalse(router.isWorkspaceBusy(ws.id))
     }
 
     func test_sshSurfaceCreatesSavedHostSidebarInsteadOfDisconnectedTerminalPlaceholder() throws {

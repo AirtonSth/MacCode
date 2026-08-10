@@ -16305,8 +16305,11 @@ private struct TimelineScrollFollower: NSViewRepresentable {
 
         private func geometry() -> (origin: CGFloat, gap: CGFloat, atBottom: Bool, isFlipped: Bool)? {
             guard let scroll = scrollView, let doc = scroll.documentView else { return nil }
-            // Post-layout height so Lazy materialization is reflected before gap math.
-            doc.layoutSubtreeIfNeeded()
+            // Never force layout here. This method runs from updateNSView and from
+            // frame/bounds notifications that NSHostingView can emit mid-layout;
+            // recursively flushing the document produces SwiftUI's reentrant-layout
+            // fault on every dense provider delta. Those callbacks already expose the
+            // latest completed geometry, and a trailing snap handles later growth.
             let origin = scroll.contentView.bounds.origin.y
             let visible = scroll.contentView.bounds.height
             let content = max(doc.bounds.height, doc.frame.height)
@@ -16404,7 +16407,8 @@ private struct TimelineScrollFollower: NSViewRepresentable {
 
         private func scrollToBottom() {
             guard let scroll = scrollView, let doc = scroll.documentView else { return }
-            doc.layoutSubtreeIfNeeded()
+            // scheduleScrollToBottom runs on a trailing MainActor turn. Read the
+            // completed frame directly instead of recursively laying out SwiftUI.
             let visible = scroll.contentView.bounds.height
             let content = max(doc.bounds.height, doc.frame.height)
             let targetY = ScrollBottomGeometry.maxScrollOriginY(
