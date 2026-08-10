@@ -116,6 +116,77 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertThrowsError(try GrokACPClient.launchArguments(for: request))
     }
 
+    func test_regularACPLaunchIncludesModelAndReasoningEffort() throws {
+        // WHY: Agent App Grok picker model + effort must reach process argv for
+        // ordinary (non sam-grok-worker) ACP sessions. Bare ["agent","--no-leader","stdio"]
+        // left picker selections with no effect (GROK-ACP-006).
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .grok,
+            model: "grok-4.5",
+            cwd: "/tmp",
+            prompt: "hello",
+            permissionMode: .fullAccess,
+            reasoningEffort: .high
+        )
+
+        XCTAssertEqual(
+            try GrokACPClient.launchArguments(for: request),
+            [
+                "--model", "grok-4.5",
+                "--reasoning-effort", "high",
+                "agent", "--no-leader", "stdio"
+            ]
+        )
+    }
+
+    func test_regularACPLaunchEmptyModelOmitsModelFlagAndMatchesEffortSemantics() throws {
+        // WHY: empty model means account default (Grok 4.5). Do not emit --model;
+        // still emit --reasoning-effort when effort is set, matching
+        // GrokRunner.modelSupportsReasoningEffort("") == true.
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .grok,
+            model: "  ",
+            cwd: "/tmp",
+            prompt: "hello",
+            permissionMode: .fullAccess,
+            reasoningEffort: .medium
+        )
+
+        XCTAssertTrue(GrokRunner.modelSupportsReasoningEffort(""))
+        XCTAssertEqual(
+            try GrokACPClient.launchArguments(for: request),
+            [
+                "--reasoning-effort", "medium",
+                "agent", "--no-leader", "stdio"
+            ]
+        )
+    }
+
+    func test_regularACPLaunchComposerFastOmitsReasoningEffort() throws {
+        // WHY: composer-fast rejects/ignores effort; omit --reasoning-effort so
+        // the CLI does not fail or silently ignore a misleading flag.
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .grok,
+            model: "grok-composer-2.5-fast",
+            cwd: "/tmp",
+            prompt: "hello",
+            permissionMode: .fullAccess,
+            reasoningEffort: .high
+        )
+
+        XCTAssertFalse(GrokRunner.modelSupportsReasoningEffort("grok-composer-2.5-fast"))
+        XCTAssertEqual(
+            try GrokACPClient.launchArguments(for: request),
+            [
+                "--model", "grok-composer-2.5-fast",
+                "agent", "--no-leader", "stdio"
+            ]
+        )
+    }
+
     func test_initializeAdvertisesOnlyImplementedClientCapabilities() {
         let params = GrokACPClient.initializeParams(clientVersion: "test")
         XCTAssertEqual(params["protocolVersion"] as? Int, 1)
