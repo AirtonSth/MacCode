@@ -26,17 +26,16 @@ public final class ScheduledTaskStore: @unchecked Sendable {
     private let db: SQLiteDB
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
-    private let dates: ISO8601DateFormatter
+    private let dates = LockedISO8601Formatter({
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }())
 
     public init(db: SQLiteDB) {
         self.db = db
         self.encoder = JSONEncoder()
         self.decoder = JSONDecoder()
-        // Whole-second ISO8601 (no fractional seconds). Matches
-        // ScheduledTaskOccurrenceCalculator.canonicalInstant so next_run_at /
-        // scheduled_at / occurrence keys stay on the same precision.
-        self.dates = ISO8601DateFormatter()
-        self.dates.formatOptions = [.withInternetDateTime]
     }
 
     public func list(search: String = "") throws -> [ScheduledTask] {

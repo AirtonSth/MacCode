@@ -269,10 +269,18 @@ public final class Bootstrap {
         }
     }
 
-    nonisolated private static func corruptBackupTimestamp(_ date: Date) -> String {
+    // PERF: ISO8601DateFormatter is expensive; share one with fractional-safe options.
+    private static let corruptBackupLock = NSLock()
+    private static let corruptBackupFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withTimeZone]
-        return f.string(from: date)
+        return f
+    }()
+
+    nonisolated private static func corruptBackupTimestamp(_ date: Date) -> String {
+        corruptBackupLock.lock()
+        defer { corruptBackupLock.unlock() }
+        return corruptBackupFormatter.string(from: date)
     }
 
     nonisolated private static func isCorruptionFailure(_ error: Error) -> Bool {
@@ -293,8 +301,14 @@ public final class Bootstrap {
             || message.contains("unsupported file format")
     }
 
+    // PERF: reuse shared formatter for init timestamp (called on every fresh DB).
+    private static let initDefaultsLock = NSLock()
+    private static let initDefaultsFormatter = ISO8601DateFormatter()
+
     private func initDefaults(db: SQLiteDB) throws {
-        let now = ISO8601DateFormatter().string(from: Date())
+        Self.initDefaultsLock.lock()
+        defer { Self.initDefaultsLock.unlock() }
+        let now = Self.initDefaultsFormatter.string(from: Date())
         // ensure singleton selection row
         let s = try db.prepare("INSERT OR IGNORE INTO workspace_selection(id, updated_at) VALUES(1, ?);")
         try s.bind(1, now)

@@ -232,7 +232,7 @@ public final class DeviceTrustRepository {
     let db: SQLiteDB
     public init(db: SQLiteDB) { self.db = db }
 
-    private let iso = ISO8601DateFormatter()
+    private let iso = LockedISO8601Formatter(ISO8601DateFormatter())
 
     /// Pure predicate: returns `true` when the stored `last_seen_at` is old
     /// enough that a new write is warranted, avoiding a WAL write on every

@@ -905,6 +905,11 @@ public final class ClaudeParser {
         }
     }
 
+    // PERF: ISO8601DateFormatter init is expensive; parsing runs on every stream
+    // timestamp fallback. Share one formatter under a short lock (not thread-safe).
+    private static let isoFallbackLock = NSLock()
+    private static let isoFallbackFormatter = ISO8601DateFormatter()
+
     private func resetMilliseconds(from value: Any?) -> Int64? {
         if let int = intValue(value) {
             return Int64(int)
@@ -913,7 +918,9 @@ public final class ClaudeParser {
         if let int = Int64(string) {
             return int
         }
-        return ISO8601DateFormatter().date(from: string).map { Int64($0.timeIntervalSince1970 * 1000) }
+        Self.isoFallbackLock.lock()
+        defer { Self.isoFallbackLock.unlock() }
+        return Self.isoFallbackFormatter.date(from: string).map { Int64($0.timeIntervalSince1970 * 1000) }
     }
 
     private func jsonString(_ value: Any?) -> String? {

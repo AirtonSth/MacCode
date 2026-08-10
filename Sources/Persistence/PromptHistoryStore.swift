@@ -58,7 +58,8 @@ public final class PromptHistoryStore {
         var result: [String] = []
         for entry in all.reversed() {
             guard seen.insert(entry).inserted else { continue }
-            if needle.isEmpty || entry.lowercased().contains(needle) {
+            // PERF: avoid per-entry lowercased() alloc on every keystroke — use case-insensitive range
+            if needle.isEmpty || entry.range(of: needle, options: .caseInsensitive) != nil {
                 result.append(entry)
                 if result.count == limit { break }
             }

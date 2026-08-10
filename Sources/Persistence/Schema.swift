@@ -1141,6 +1141,10 @@ public enum Schema {
         ["workspace_selection", "terminal_sessions", "browser_profiles"]
     }
 
+    // PERF: ISO8601DateFormatter is expensive; reuse one for migration timestamps.
+    private static let migrationAppliedAtLock = NSLock()
+    private static let migrationAppliedAtFormatter = ISO8601DateFormatter()
+
     public static func migrate(_ db: SQLiteDB) throws {
         try migrateSteps(db, steps)
     }
@@ -1175,7 +1179,10 @@ public enum Schema {
                 try db.execute(step.sql)
                 let ins = try db.prepare("INSERT OR IGNORE INTO schema_meta(version, applied_at) VALUES(?, ?);")
                 try ins.bind(1, Int64(step.version))
-                try ins.bind(2, ISO8601DateFormatter().string(from: Date()))
+                Self.migrationAppliedAtLock.lock()
+                let appliedAt = Self.migrationAppliedAtFormatter.string(from: Date())
+                Self.migrationAppliedAtLock.unlock()
+                try ins.bind(2, appliedAt)
                 _ = try ins.step()
             }
         }

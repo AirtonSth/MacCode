@@ -251,12 +251,16 @@ public struct HTTP3PrototypeComparisonReport: Sendable, Equatable, Codable {
         self.nonClaims = Self.fixedNonClaims
     }
 
+    private static let exportEncoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
+
     /// Deterministic UTF-8 JSON for offline comparison tooling.
     /// Sorted keys; secret-free aggregates and fixed non-claim codes only.
     public func exportJSON() -> Data {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return (try? encoder.encode(self)) ?? Data(#"{}"#.utf8)
+        return (try? Self.exportEncoder.encode(self)) ?? Data(#"{}"#.utf8)
     }
 
     public func exportJSONString() -> String {

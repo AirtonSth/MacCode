@@ -351,11 +351,13 @@ public enum PlanNotesProjectionV1: Sendable {
         return String(bytes: out, encoding: .utf8) ?? ""
     }
 
+    private static let responseBytesEncoder = JSONEncoder()
+
     /// Encode a JSON-RPC success envelope the same way the socket path does,
     /// so tests can prove the final frame stays under `maxEncodedResponseBytes`.
     public static func encodedJSONRPCResponseBytes(id: JSONRPCID, page: Page) throws -> Int {
         let response = JSONRPCResponse(id: id, result: page.json)
-        return try JSONEncoder().encode(response).count
+        return try responseBytesEncoder.encode(response).count
     }
 
     // MARK: - Parsing helpers

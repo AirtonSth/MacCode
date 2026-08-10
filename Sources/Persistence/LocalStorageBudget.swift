@@ -258,6 +258,9 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
     public static let terminalRunStatuses: Set<AgentRunStatus> = [
         .completed, .failed, .cancelled, .interrupted
     ]
+    // PERF: terminal GC runs on every storage-budget check; avoid per-call map+sorted.
+    private static let terminalRunStatusRawValuesSorted: [String] = terminalRunStatuses.map(\.rawValue).sorted()
+    private static let terminalRunStatusPlaceholders: String = Array(repeating: "?", count: terminalRunStatuses.count).joined(separator: ", ")
 
     private static let markerRegex = try! NSRegularExpression(
         pattern: #"\[\[rc:([0-9a-fA-F]{64})\]\]"#
@@ -726,8 +729,8 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
         table: String,
         cutoffText: String
     ) throws -> Int {
-        let statuses = Self.terminalRunStatuses.map(\.rawValue).sorted()
-        let placeholders = Array(repeating: "?", count: statuses.count).joined(separator: ", ")
+        let statuses = Self.terminalRunStatusRawValuesSorted
+        let placeholders = Self.terminalRunStatusPlaceholders
         let count = try database.prepare("""
             SELECT COUNT(*) FROM \(quoted(table)) AS storage_row
             JOIN agent_runs ON agent_runs.id = storage_row.run_id
