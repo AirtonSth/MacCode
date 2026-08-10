@@ -7408,9 +7408,18 @@ final class StreamEventBatch: @unchecked Sendable {
         let threadId: AgentThreadID
         let encodedByteCount: Int
     }
+
+    /// Compact after this many consumed head slots (and when dead ≥ live).
+    /// Matches WebSocketOutboundQueue: amortized O(1) drain/evict without
+    /// O(n) `removeFirst` on every token during tool storms.
+    private static let compactionThreshold = 1_024
+
     private let lock = NSLock()
     private let limits: Limits
-    private var buffer: [Entry] = []
+    /// Ring-style storage: live range is `storage[headIndex...]` (non-nil).
+    /// Consumed slots are nilled so large AssistantEvent payloads release early.
+    private var storage: [Entry?] = []
+    private var headIndex = 0
     private var bufferedBytes = 0
     private var flushScheduled = false
     private var saturationRunID: AgentRunID?
@@ -7424,10 +7433,23 @@ final class StreamEventBatch: @unchecked Sendable {
         )
     }
 
+    private var queuedCount: Int { storage.count - headIndex }
+
+    private func compactIfNeeded() {
+        if headIndex == storage.count {
+            storage.removeAll(keepingCapacity: true)
+            headIndex = 0
+        } else if headIndex >= Self.compactionThreshold,
+                  headIndex >= storage.count - headIndex {
+            storage.removeFirst(headIndex)
+            headIndex = 0
+        }
+    }
+
     var isEmpty: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return buffer.isEmpty
+        return queuedCount == 0
     }
 
     /// Appends an event. Returns `true` iff the caller should schedule a flush Task
@@ -7458,14 +7480,19 @@ final class StreamEventBatch: @unchecked Sendable {
             return .saturated
         }
         var didEvict = false
-        while !buffer.isEmpty
-            && (buffer.count >= limits.maxBufferedCount
+        while queuedCount > 0
+            && (queuedCount >= limits.maxBufferedCount
                 || bufferedBytes + bytes > limits.maxBufferedBytes) {
-            let removed = buffer.removeFirst()
-            bufferedBytes = max(0, bufferedBytes - removed.encodedByteCount)
-            didEvict = true
+            // Amortized O(1) eviction — advance head; do not shift the array.
+            if let removed = storage[headIndex] {
+                storage[headIndex] = nil
+                bufferedBytes = max(0, bufferedBytes - removed.encodedByteCount)
+                didEvict = true
+            }
+            headIndex += 1
+            compactIfNeeded()
         }
-        buffer.append(Entry(event: event, run: run, threadId: threadId, encodedByteCount: bytes))
+        storage.append(Entry(event: event, run: run, threadId: threadId, encodedByteCount: bytes))
         bufferedBytes += bytes
         if didEvict {
             saturationRunID = run
@@ -7483,16 +7510,26 @@ final class StreamEventBatch: @unchecked Sendable {
         defer { lock.unlock() }
         var count = 0
         var bytes = 0
-        while count < buffer.count && count < limits.drainCount {
-            let next = buffer[count].encodedByteCount
+        let live = queuedCount
+        while count < live && count < limits.drainCount {
+            guard let nextEntry = storage[headIndex + count] else { break }
+            let next = nextEntry.encodedByteCount
             if count > 0 && bytes + next > limits.drainBytes { break }
             bytes += next
             count += 1
         }
-        let drained = Array(buffer.prefix(count))
-        buffer.removeFirst(count)
-        bufferedBytes -= bytes
-        let hasMore = !buffer.isEmpty
+        var drained: [Entry] = []
+        drained.reserveCapacity(count)
+        for offset in 0..<count {
+            if let entry = storage[headIndex + offset] {
+                drained.append(entry)
+                storage[headIndex + offset] = nil
+            }
+        }
+        headIndex += count
+        bufferedBytes = max(0, bufferedBytes - bytes)
+        compactIfNeeded()
+        let hasMore = queuedCount > 0
         flushScheduled = hasMore
         if !hasMore { saturationRunID = nil }
         return DrainQuantum(
@@ -7507,8 +7544,17 @@ final class StreamEventBatch: @unchecked Sendable {
     func drain() -> [(event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID)] {
         lock.lock()
         defer { lock.unlock() }
-        let out = buffer.map { ($0.event, $0.run, $0.threadId) }
-        buffer.removeAll(keepingCapacity: true)
+        var out: [(event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID)] = []
+        out.reserveCapacity(queuedCount)
+        if headIndex < storage.count {
+            for idx in headIndex..<storage.count {
+                if let entry = storage[idx] {
+                    out.append((entry.event, entry.run, entry.threadId))
+                }
+            }
+        }
+        storage.removeAll(keepingCapacity: true)
+        headIndex = 0
         bufferedBytes = 0
         flushScheduled = false
         saturationRunID = nil
@@ -9477,6 +9523,47 @@ public struct AgentAppView: View {
         }
     }
 
+    /// Content key for the view-level hidden-persisted memo.
+    ///
+    /// Inputs that actually change `hiddenPersistedAssistantMessageIDs` outcomes:
+    /// assistant message identity + content digest, and per-turn final /
+    /// renderable assistant body content digests (and item ids). Deliberately
+    /// omits `timelineUpdateTick` so pure paint ticks with unchanged content
+    /// hit cache. Digests are cheap `Hasher` folds over text content — not
+    /// UTF-8 length alone — so equal-length replacements (e.g. "alpha"→"bravo")
+    /// invalidate the memo and force hide-set recompute.
+    nonisolated static func hiddenPersistedAssistantContentKey(
+        messages: [AgentMessage],
+        timelineTurns: [AssistantTurnSnapshot]
+    ) -> String {
+        var key = "m\(messages.count)"
+        for message in messages {
+            if message.role != .assistant { continue }
+            key += "|a\(message.id.value.uuidString):\(hiddenPersistedTextDigest(message.content))"
+        }
+        key += "|t\(timelineTurns.count)"
+        for turn in timelineTurns {
+            var bodyHasher = Hasher()
+            var itemIds = ""
+            for item in turn.items where item.type == .assistantMessage {
+                bodyHasher.combine(item.body)
+                if !itemIds.isEmpty { itemIds += "," }
+                itemIds += item.id
+            }
+            let finalDigest = hiddenPersistedTextDigest(turn.finalAssistantMessage ?? "")
+            key += "|\(turn.turnId):f\(finalDigest):b\(bodyHasher.finalize()):i\(itemIds):fin\(turn.finished ? 1 : 0)"
+        }
+        return key
+    }
+
+    /// Within-process content fingerprint for memo keys. Combines full text so
+    /// equal-length swaps do not collide (unlike utf8.count alone).
+    nonisolated static func hiddenPersistedTextDigest(_ text: String) -> Int {
+        var hasher = Hasher()
+        hasher.combine(text)
+        return hasher.finalize()
+    }
+
     static func hiddenPersistedAssistantMessageIDs(messages: [AgentMessage],
                                                    timelineTurns: [AssistantTurnSnapshot],
                                                    persistedAssistantTexts: [String]? = nil) -> Set<AgentMessageID> {
@@ -10347,9 +10434,13 @@ public struct AgentAppView: View {
     }
 
     private var hiddenPersistedAssistantMessageIDs: Set<AgentMessageID> {
-        // PERF-MAC_AGENT-011: transcriptSignature is now cached in SignatureCache so
-        // this call and the call in transcriptEntries share one computation per body pass.
-        let key = "\(vm.messages.count)|\(vm.messages.last?.id.value.uuidString ?? "-")|\(transcriptSignature)|u\(vm.timelineUpdateTick)"
+        // R4-C: key on content fingerprint (message ids/utf8 lengths + assistant
+        // body/final lengths), not timelineUpdateTick. Pure paint ticks (~30 Hz)
+        // with unchanged content must hit; streaming body growth must recompute.
+        let key = Self.hiddenPersistedAssistantContentKey(
+            messages: vm.messages,
+            timelineTurns: vm.timeline.turns
+        )
         if hiddenPersistedAssistantMessageCache.key == key {
             return hiddenPersistedAssistantMessageCache.ids
         }
@@ -12059,10 +12150,15 @@ public struct AgentAppView: View {
     }
 
     @ViewBuilder
-    private func assistantProse(_ text: String) -> some View {
+    private func assistantProse(_ text: String, cacheMarkdown: Bool = true) -> some View {
         // UX-MAC_AGENT-BG-AWAIT: the background-await self-declaration marker is an
         // internal signal the host detects on; it must never render in the transcript.
-        AgentMessageMarkdownView(text: BackgroundAwaitContinuation.strippingAwaitingMarker(text))
+        // R4-B: live streaming rows pass cacheMarkdown: false so growing partials
+        // do not thrash AgentMessageMarkdown NSCache occupancy.
+        AgentMessageMarkdownView(
+            text: BackgroundAwaitContinuation.strippingAwaitingMarker(text),
+            cacheResults: cacheMarkdown
+        )
             .foregroundColor(DS.Palette.text)
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -12720,7 +12816,7 @@ public struct AgentAppView: View {
             // already rendered it (prevents the answer showing twice).
             if let final = turn.finalAssistantMessage, inputs.shouldRenderFinal {
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    assistantProse(final)
+                    assistantProse(final, cacheMarkdown: turn.finished)
                     assistantCopyBar(text: BackgroundAwaitContinuation.strippingAwaitingMarker(final), identifierSuffix: turn.turnId)
                 }
             }
@@ -12812,7 +12908,7 @@ public struct AgentAppView: View {
         switch item.type {
         case .assistantMessage:
             if Self.shouldRenderAssistantItemBody(item.body, persistedAssistantTexts: persistedAssistantTexts) {
-                assistantProse(item.body)
+                assistantProse(item.body, cacheMarkdown: item.state != .streaming)
             }
         case .reasoning:
             reasoningRow(item)
@@ -12820,7 +12916,7 @@ public struct AgentAppView: View {
             VStack(alignment: .leading, spacing: DS.Space.xs) {
                 Text("PLAN").font(DS.Font.caption2.weight(.semibold)).tracking(0.6)
                     .foregroundColor(DS.Palette.accent)
-                assistantProse(item.body)
+                assistantProse(item.body, cacheMarkdown: item.state != .streaming)
             }
         case .imageView:
             imageViewRow(item)
