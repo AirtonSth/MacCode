@@ -79,6 +79,61 @@ final class AgentMessageMarkdownTests: XCTestCase {
         XCTAssertEqual(first, second, "cached attributed inline must equal a fresh parse")
     }
 
+    // MARK: - R4-B streaming partial cache thrash
+
+    /// Live streaming rows pass `cache: false` so growing prefixes never call setObject.
+    /// WHY: each intermediate length is a unique NSCache key; countLimit alone still
+    /// retained every partial until eviction thrash under memory pressure.
+    func test_blocks_cacheFalse_doesNotStoreStreamingPartials() {
+        AgentMessageMarkdown.blocksCacheStoreCountForTesting = 0
+        var text = ""
+        for i in 0..<80 {
+            text += "tok\(i) "
+            let blocks = AgentMessageMarkdown.blocks(from: text, cache: false)
+            XCTAssertFalse(blocks.isEmpty, "live path must still parse without storing")
+        }
+        XCTAssertEqual(
+            AgentMessageMarkdown.blocksCacheStoreCountForTesting, 0,
+            "cache:false must never insert growing stream partials into NSCache"
+        )
+    }
+
+    func test_attributedInline_cacheFalse_doesNotStoreStreamingPartials() {
+        AgentMessageMarkdown.inlineCacheStoreCountForTesting = 0
+        var text = ""
+        for i in 0..<40 {
+            text += "w\(i) "
+            _ = AgentMessageMarkdown.attributedInline(text, cache: false)
+        }
+        XCTAssertEqual(
+            AgentMessageMarkdown.inlineCacheStoreCountForTesting, 0,
+            "cache:false must skip attributedInline store for live partials"
+        )
+    }
+
+    func test_shouldStoreMarkdownCache_respectsFlagAndSizeBand() {
+        XCTAssertTrue(AgentMessageMarkdown.shouldStoreMarkdownCache(textUTF8Count: 64, cache: true))
+        XCTAssertFalse(AgentMessageMarkdown.shouldStoreMarkdownCache(textUTF8Count: 64, cache: false),
+                       "live path flag must disable store even for small text")
+        XCTAssertFalse(AgentMessageMarkdown.shouldStoreMarkdownCache(textUTF8Count: 0, cache: true))
+        // 48 KiB band — above must not store (finished large bodies still parse; just no pin).
+        XCTAssertFalse(
+            AgentMessageMarkdown.shouldStoreMarkdownCache(textUTF8Count: 49 * 1_024, cache: true),
+            "size band must refuse store for oversized source keys"
+        )
+    }
+
+    /// cache:true still memoizes identical finished content (regression pin for F3).
+    func test_blocks_cacheTrue_stillMemoizesFinishedContent() {
+        let probe = "R4-B finished body memo \(UUID().uuidString)"
+        AgentMessageMarkdown.blocksComputeCountForTesting = 0
+        AgentMessageMarkdown.blocksCacheStoreCountForTesting = 0
+        _ = AgentMessageMarkdown.blocks(from: probe, cache: true)
+        _ = AgentMessageMarkdown.blocks(from: probe, cache: true)
+        XCTAssertEqual(AgentMessageMarkdown.blocksComputeCountForTesting, 1)
+        XCTAssertEqual(AgentMessageMarkdown.blocksCacheStoreCountForTesting, 1)
+    }
+
     func test_selectionGroups_keepAdjacentProseInOneSelectableSurface() {
         let blocks = AgentMessageMarkdown.blocks(from: """
         First paragraph.

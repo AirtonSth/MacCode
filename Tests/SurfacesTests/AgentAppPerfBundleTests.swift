@@ -302,6 +302,9 @@ final class AgentAppPerfBundleTests: XCTestCase {
         // run that emitted far more events therefore rehydrates only the latest
         // retained rows (~20 turns at 5 events/turn), with the newest assistant
         // message preserved. Emit 1,200 turns so retention engages.
+        //
+        // Same-thread re-select is a soft path (keeps the painted live timeline).
+        // Force a true full open by switching away and back.
         let runner = ReplayBenchmarkRunner(turns: 1_200)
         let (vm, _) = try makeVM(provider: runner)
         vm.createThread(title: "bounded replay")
@@ -315,12 +318,20 @@ final class AgentAppPerfBundleTests: XCTestCase {
         XCTAssertEqual(vm.timeline.turns.count, 1_200,
                        "the live run must build the full transcript before the bounded thread-open replay")
 
+        vm.createThread(title: "switch-away")
+        let otherId = try XCTUnwrap(vm.selectedThreadId)
+        XCTAssertNotEqual(otherId, threadId)
+        await waitAsync("switched away", timeout: 6) { vm.selectedThreadId == otherId }
+
         let start = DispatchTime.now()
         vm.selectThread(threadId)
+        await waitAsync("full open replay applied", timeout: 10) {
+            vm.selectedThreadId == threadId && vm.timeline.latestAssistantMessage == "REPLAY_1199"
+        }
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
         let budgetMs = 2_000.0
 
-        print("ThreadOpenReplayBenchmark events=6001 turns=1200 elapsedMs=\(Int(elapsedMs)) budgetMs=\(Int(budgetMs))")
+        print("ThreadOpenReplayBenchmark events=6001 turns=\(vm.timeline.turns.count) elapsedMs=\(Int(elapsedMs)) budgetMs=\(Int(budgetMs))")
         // 100 retained stream events / 5 events per fixture turn = 20 turns.
         XCTAssertEqual(vm.timeline.turns.count, 20,
                        "thread-open hot replay must apply only the durable retention window, not the full 1,200-turn live history")
@@ -1417,6 +1428,558 @@ final class AgentAppPerfBundleTests: XCTestCase {
         XCTAssertFalse(
             wide.contains("398000"),
             "large residuals must not render as a raw digit wall"
+        )
+    }
+
+    // MARK: - R4-A StreamEventBatch headIndex ring
+
+    /// Order, eviction (oldest first), drain quanta, and saturation still hold
+    /// after the removeFirst → headIndex port.
+    func test_streamEventBatch_headIndex_evictDrainOrderAndSaturation() {
+        let batch = StreamEventBatch(limits: .init(
+            maxBufferedCount: 4,
+            maxBufferedBytes: 64 * 1_024,
+            drainCount: 2,
+            drainBytes: 64 * 1_024
+        ))
+        let tid = AgentThreadID()
+        let run = AgentRunID()
+        XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "a"), run: run, threadId: tid), .scheduled)
+        XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "b"), run: run, threadId: tid), .buffered)
+        XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "c"), run: run, threadId: tid), .buffered)
+        XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "d"), run: run, threadId: tid), .buffered)
+        // Fifth admission must drop oldest ("a") so newest still enters.
+        XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "e"), run: run, threadId: tid), .bufferedAfterEviction)
+
+        let q1 = batch.drainQuantum()
+        XCTAssertEqual(q1.entries.count, 2)
+        XCTAssertTrue(q1.hasMore)
+        if case .turnStarted(let id0) = q1.entries[0].event {
+            XCTAssertEqual(id0, "b", "oldest surviving event after eviction must drain first")
+        } else { XCTFail("expected turnStarted") }
+        if case .turnStarted(let id1) = q1.entries[1].event {
+            XCTAssertEqual(id1, "c")
+        } else { XCTFail("expected turnStarted") }
+
+        let q2 = batch.drainQuantum()
+        XCTAssertEqual(q2.entries.count, 2)
+        XCTAssertFalse(q2.hasMore)
+        if case .turnStarted(let id3) = q2.entries[1].event {
+            XCTAssertEqual(id3, "e", "newest admitted event must survive to last drain")
+        } else { XCTFail("expected turnStarted") }
+
+        // Hard ceiling still latches once per run.
+        let tiny = StreamEventBatch(limits: .init(
+            maxBufferedCount: 8,
+            maxBufferedBytes: 256,
+            drainCount: 8,
+            drainBytes: 256
+        ))
+        let huge = AssistantEvent.error(message: String(repeating: "z", count: 8_192), recoverable: true)
+        XCTAssertEqual(tiny.appendBounded(event: huge, run: run, threadId: tid), .saturated)
+        XCTAssertEqual(tiny.appendBounded(event: huge, run: run, threadId: tid), .saturationAlreadyReported)
+        XCTAssertTrue(tiny.isEmpty)
+    }
+
+    /// Microbench: Array.removeFirst eviction/drain vs headIndex ring
+    /// (same process, n≥5). Pure algorithm A/B — not product lock/encode overhead.
+    /// Primary metric: wall ms to fill then fully drain a large FIFO.
+    func test_microbench_streamEventBatch_headIndexFasterThanRemoveFirst() throws {
+        // WHY: removeFirst shifts every remaining element (O(n) per pop → O(n²) full
+        // drain). headIndex advances O(1) per pop and only occasionally compacts.
+        // Scale N so shift cost dominates allocator noise; n_samples ≥ 5.
+        let n = 40_000
+        let compactionThreshold = 1_024
+        let samples = 5
+        let warmup = 2
+        // Non-trivial payload so each removeFirst moves real memory.
+        let payload = String(repeating: "p", count: 128)
+
+        struct Entry {
+            let id: Int
+            let body: String
+        }
+
+        func median(_ values: [Double]) -> Double {
+            let s = values.sorted()
+            return s[s.count / 2]
+        }
+
+        /// Pre-R4-A: Array + removeFirst on every eviction / full drain.
+        func timeLegacyRemoveFirst() -> Double {
+            var buffer: [Entry] = []
+            buffer.reserveCapacity(n)
+            for i in 0..<n {
+                buffer.append(Entry(id: i, body: payload))
+            }
+            var sink = 0
+            let start = DispatchTime.now().uptimeNanoseconds
+            // Simulate continuous admission under full buffer: each append forces
+            // one oldest eviction via removeFirst (the StreamEventBatch hot path).
+            for i in 0..<(n / 2) {
+                let removed = buffer.removeFirst()
+                sink &+= removed.id
+                buffer.append(Entry(id: n + i, body: payload))
+            }
+            // Drain remaining.
+            while !buffer.isEmpty {
+                let removed = buffer.removeFirst()
+                sink &+= removed.id
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        /// R4-A pattern (StreamEventBatch / WebSocketOutboundQueue): headIndex +
+        /// optional-slot release + amortized compaction.
+        func timeHeadIndex() -> Double {
+            var storage: [Entry?] = []
+            storage.reserveCapacity(n + compactionThreshold)
+            for i in 0..<n {
+                storage.append(Entry(id: i, body: payload))
+            }
+            var head = 0
+            var sink = 0
+
+            func queued() -> Int { storage.count - head }
+            func compactIfNeeded() {
+                if head == storage.count {
+                    storage.removeAll(keepingCapacity: true)
+                    head = 0
+                } else if head >= compactionThreshold, head >= storage.count - head {
+                    storage.removeFirst(head)
+                    head = 0
+                }
+            }
+            func popFirst() {
+                guard head < storage.count, let e = storage[head] else { return }
+                storage[head] = nil
+                head += 1
+                sink &+= e.id
+                compactIfNeeded()
+            }
+
+            let start = DispatchTime.now().uptimeNanoseconds
+            for i in 0..<(n / 2) {
+                popFirst()
+                storage.append(Entry(id: n + i, body: payload))
+            }
+            while queued() > 0 { popFirst() }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        // Functional pin on product queue (order / eviction / saturation).
+        do {
+            let batch = StreamEventBatch(limits: .init(
+                maxBufferedCount: 4,
+                maxBufferedBytes: 64 * 1_024,
+                drainCount: 2,
+                drainBytes: 64 * 1_024
+            ))
+            let tid = AgentThreadID()
+            let run = AgentRunID()
+            _ = batch.appendBounded(event: .turnStarted(turnId: "1"), run: run, threadId: tid)
+            _ = batch.appendBounded(event: .turnStarted(turnId: "2"), run: run, threadId: tid)
+            _ = batch.appendBounded(event: .turnStarted(turnId: "3"), run: run, threadId: tid)
+            _ = batch.appendBounded(event: .turnStarted(turnId: "4"), run: run, threadId: tid)
+            XCTAssertEqual(
+                batch.appendBounded(event: .turnStarted(turnId: "5"), run: run, threadId: tid),
+                .bufferedAfterEviction
+            )
+            let drained = batch.drain()
+            XCTAssertEqual(drained.count, 4)
+            if case .turnStarted(let id) = drained[0].event {
+                XCTAssertEqual(id, "2", "oldest must be gone; next-oldest drains first")
+            } else { XCTFail("expected turnStarted") }
+            if case .turnStarted(let id) = drained[3].event {
+                XCTAssertEqual(id, "5")
+            } else { XCTFail("expected turnStarted") }
+        }
+
+        for _ in 0..<warmup { _ = timeLegacyRemoveFirst(); _ = timeHeadIndex() }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            before.append(timeLegacyRemoveFirst())
+            after.append(timeHeadIndex())
+        }
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = (beforeMed - afterMed) / beforeMed * 100.0
+        NSLog("[perf-proof] streamEventBatch removeFirst_ms=%@ headIndex_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+              String(beforeMed), String(afterMed), improvement,
+              String(describing: before), String(describing: after))
+        XCTAssertGreaterThan(
+            improvement, 5.0,
+            "StreamEventBatch headIndex must beat removeFirst by ≥5% (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
+        )
+    }
+
+    // MARK: - R4-B Markdown NSCache streaming partial thrash
+
+    /// Live path with `cache: false` must not store growing partials; finished
+    /// identical text still caches once when `cache: true`.
+    func test_markdownCache_streamingPartialsDoNotStoreWhenCacheFalse() {
+        #if DEBUG
+        AgentMessageMarkdown.blocksCacheStoreCountForTesting = 0
+        AgentMessageMarkdown.inlineCacheStoreCountForTesting = 0
+        var growing = "Hello"
+        for i in 0..<40 {
+            growing += " token\(i)"
+            _ = AgentMessageMarkdown.blocks(from: growing, cache: false)
+            _ = AgentMessageMarkdown.attributedInline(growing, cache: false)
+        }
+        XCTAssertEqual(
+            AgentMessageMarkdown.blocksCacheStoreCountForTesting, 0,
+            "live streaming partials must not insert into blocks NSCache"
+        )
+        XCTAssertEqual(
+            AgentMessageMarkdown.inlineCacheStoreCountForTesting, 0,
+            "live streaming partials must not insert into inline NSCache"
+        )
+
+        // Stable finished body may store once.
+        let stable = "Finished **answer** with `code`."
+        AgentMessageMarkdown.blocksCacheStoreCountForTesting = 0
+        AgentMessageMarkdown.inlineCacheStoreCountForTesting = 0
+        AgentMessageMarkdown.blocksComputeCountForTesting = 0
+        _ = AgentMessageMarkdown.blocks(from: stable, cache: true)
+        _ = AgentMessageMarkdown.blocks(from: stable, cache: true)
+        XCTAssertEqual(AgentMessageMarkdown.blocksCacheStoreCountForTesting, 1)
+        XCTAssertEqual(AgentMessageMarkdown.blocksComputeCountForTesting, 1,
+                       "second identical finished parse must hit cache")
+        XCTAssertTrue(AgentMessageMarkdown.shouldStoreMarkdownCache(textUTF8Count: 100, cache: true))
+        XCTAssertFalse(AgentMessageMarkdown.shouldStoreMarkdownCache(textUTF8Count: 100, cache: false))
+        XCTAssertFalse(AgentMessageMarkdown.shouldStoreMarkdownCache(textUTF8Count: 100_000, cache: true),
+                       "over-band texts must not pin every intermediate length")
+        #else
+        // Release: policy helper still testable without store counters.
+        XCTAssertTrue(AgentMessageMarkdown.shouldStoreMarkdownCache(textUTF8Count: 100, cache: true))
+        XCTAssertFalse(AgentMessageMarkdown.shouldStoreMarkdownCache(textUTF8Count: 100, cache: false))
+        #endif
+    }
+
+    // MARK: - R4-C hiddenPersisted content fingerprint (no tick)
+
+    /// Pure paint ticks must not change the cache key; streaming body growth must.
+    func test_hiddenPersistedContentKey_stableOnPaintTick_changesOnBodyGrowth() {
+        let thread = AgentThreadID()
+        let msg = AgentMessage(threadId: thread, role: .assistant, content: "Hello world")
+        let turnShort = AssistantTurnSnapshot(
+            turnId: "t1",
+            items: [
+                AssistantItem(id: "a1", turnId: "t1", type: .assistantMessage,
+                              body: "Hel", startedAtMs: 1)
+            ],
+            finalAssistantMessage: nil,
+            finished: false
+        )
+        let turnGrown = AssistantTurnSnapshot(
+            turnId: "t1",
+            items: [
+                AssistantItem(id: "a1", turnId: "t1", type: .assistantMessage,
+                              body: "Hello full streamed answer", startedAtMs: 1)
+            ],
+            finalAssistantMessage: "Hello full streamed answer",
+            finished: false
+        )
+        let k1 = AgentAppView.hiddenPersistedAssistantContentKey(messages: [msg], timelineTurns: [turnShort])
+        let k2 = AgentAppView.hiddenPersistedAssistantContentKey(messages: [msg], timelineTurns: [turnShort])
+        XCTAssertEqual(k1, k2, "identical inputs must produce identical keys (paint-tick stable)")
+        // Simulate "tick-only" by recomputing with same messages/turns — key must match.
+        XCTAssertEqual(
+            k1,
+            AgentAppView.hiddenPersistedAssistantContentKey(messages: [msg], timelineTurns: [turnShort]),
+            "pure paint with unchanged content must hit the same key"
+        )
+        let kGrown = AgentAppView.hiddenPersistedAssistantContentKey(messages: [msg], timelineTurns: [turnGrown])
+        XCTAssertNotEqual(k1, kGrown, "streaming body growth must change the content key so hide set recomputes")
+
+        // Functional pin: hide contract still holds for combined live answer.
+        let persisted = AgentMessage(
+            threadId: thread,
+            role: .assistant,
+            content: "S start. D inspect. O done."
+        )
+        let done = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage,
+                              body: "S start. D inspect.", startedAtMs: 1),
+                AssistantItem(id: "msg-2", turnId: "turn-1", type: .assistantMessage,
+                              body: "O done.", startedAtMs: 2)
+            ],
+            finalAssistantMessage: "S start. D inspect. O done.",
+            finished: true
+        )
+        XCTAssertEqual(
+            AgentAppView.hiddenPersistedAssistantMessageIDs(messages: [persisted], timelineTurns: [done]),
+            [persisted.id],
+            "content-key change must not alter hide semantics"
+        )
+    }
+
+    /// Equal-length body/final (and message) swaps must change the content key.
+    /// Length-only fingerprints would collide on "alpha"→"bravo" and serve a
+    /// stale hide set; digests over content close that hole.
+    func test_hiddenPersistedContentKey_changesOnEqualLengthContentReplacement() {
+        let thread = AgentThreadID()
+        let msgId = AgentMessageID()
+        // Same identity + same UTF-8 length; only the text differs.
+        let msgAlpha = AgentMessage(id: msgId, threadId: thread, role: .assistant, content: "alpha")
+        let msgBravo = AgentMessage(id: msgId, threadId: thread, role: .assistant, content: "bravo")
+        XCTAssertEqual(msgAlpha.content.utf8.count, msgBravo.content.utf8.count)
+
+        let turnAlpha = AssistantTurnSnapshot(
+            turnId: "t1",
+            items: [
+                AssistantItem(id: "a1", turnId: "t1", type: .assistantMessage,
+                              body: "alpha", startedAtMs: 1)
+            ],
+            finalAssistantMessage: "alpha",
+            finished: true
+        )
+        let turnBravo = AssistantTurnSnapshot(
+            turnId: "t1",
+            items: [
+                AssistantItem(id: "a1", turnId: "t1", type: .assistantMessage,
+                              body: "bravo", startedAtMs: 1)
+            ],
+            finalAssistantMessage: "bravo",
+            finished: true
+        )
+        XCTAssertEqual(
+            turnAlpha.items[0].body.utf8.count,
+            turnBravo.items[0].body.utf8.count
+        )
+        XCTAssertEqual(
+            turnAlpha.finalAssistantMessage?.utf8.count,
+            turnBravo.finalAssistantMessage?.utf8.count
+        )
+
+        let kAlpha = AgentAppView.hiddenPersistedAssistantContentKey(
+            messages: [msgAlpha], timelineTurns: [turnAlpha]
+        )
+        let kBravo = AgentAppView.hiddenPersistedAssistantContentKey(
+            messages: [msgBravo], timelineTurns: [turnBravo]
+        )
+        XCTAssertNotEqual(
+            kAlpha, kBravo,
+            "equal-length alpha→bravo on message/body/final must change the content key"
+        )
+
+        // Body-only equal-length swap (final + message unchanged).
+        let turnBodyOnly = AssistantTurnSnapshot(
+            turnId: "t1",
+            items: [
+                AssistantItem(id: "a1", turnId: "t1", type: .assistantMessage,
+                              body: "bravo", startedAtMs: 1)
+            ],
+            finalAssistantMessage: "alpha",
+            finished: true
+        )
+        XCTAssertNotEqual(
+            AgentAppView.hiddenPersistedAssistantContentKey(
+                messages: [msgAlpha], timelineTurns: [turnAlpha]
+            ),
+            AgentAppView.hiddenPersistedAssistantContentKey(
+                messages: [msgAlpha], timelineTurns: [turnBodyOnly]
+            ),
+            "equal-length body swap alone must change the content key"
+        )
+
+        // Final-only equal-length swap (body + message unchanged).
+        let turnFinalOnly = AssistantTurnSnapshot(
+            turnId: "t1",
+            items: [
+                AssistantItem(id: "a1", turnId: "t1", type: .assistantMessage,
+                              body: "alpha", startedAtMs: 1)
+            ],
+            finalAssistantMessage: "bravo",
+            finished: true
+        )
+        XCTAssertNotEqual(
+            AgentAppView.hiddenPersistedAssistantContentKey(
+                messages: [msgAlpha], timelineTurns: [turnAlpha]
+            ),
+            AgentAppView.hiddenPersistedAssistantContentKey(
+                messages: [msgAlpha], timelineTurns: [turnFinalOnly]
+            ),
+            "equal-length final swap alone must change the content key"
+        )
+
+        // Message-only equal-length swap (turns unchanged).
+        XCTAssertNotEqual(
+            AgentAppView.hiddenPersistedAssistantContentKey(
+                messages: [msgAlpha], timelineTurns: [turnAlpha]
+            ),
+            AgentAppView.hiddenPersistedAssistantContentKey(
+                messages: [msgBravo], timelineTurns: [turnAlpha]
+            ),
+            "equal-length persisted message swap alone must change the content key"
+        )
+
+        // When evaluated, hide set recomputes for equal-length content swaps
+        // (multi-item combined live answer — same path as production hide).
+        // Avoid SR1 semantic prefixes (S/C/D/R/O/N/P) so neither body is
+        // filtered as dialect. Single-item live body that equals persisted is
+        // intentionally *not* hidden; multi-item join is.
+        let contentA = "hello there friendx"
+        let contentB = "hello there buddyyy" // same UTF-8 length, different text
+        XCTAssertEqual(contentA.utf8.count, contentB.utf8.count)
+        let msgCombinedA = AgentMessage(id: msgId, threadId: thread, role: .assistant, content: contentA)
+        let msgCombinedB = AgentMessage(id: msgId, threadId: thread, role: .assistant, content: contentB)
+        let turnCombinedA = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage,
+                              body: "hello there", startedAtMs: 1),
+                AssistantItem(id: "msg-2", turnId: "turn-1", type: .assistantMessage,
+                              body: "friendx", startedAtMs: 2)
+            ],
+            finalAssistantMessage: nil,
+            finished: true
+        )
+        let turnCombinedB = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage,
+                              body: "hello there", startedAtMs: 1),
+                AssistantItem(id: "msg-2", turnId: "turn-1", type: .assistantMessage,
+                              body: "buddyyy", startedAtMs: 2)
+            ],
+            finalAssistantMessage: nil,
+            finished: true
+        )
+        XCTAssertNotEqual(
+            AgentAppView.hiddenPersistedAssistantContentKey(
+                messages: [msgCombinedA], timelineTurns: [turnCombinedA]
+            ),
+            AgentAppView.hiddenPersistedAssistantContentKey(
+                messages: [msgCombinedB], timelineTurns: [turnCombinedB]
+            ),
+            "equal-length combined-answer swap must change the content key"
+        )
+        XCTAssertEqual(
+            AgentAppView.hiddenPersistedAssistantMessageIDs(
+                messages: [msgCombinedA], timelineTurns: [turnCombinedA]
+            ),
+            [msgCombinedA.id],
+            "matching combined live+persisted must hide"
+        )
+        XCTAssertTrue(
+            AgentAppView.hiddenPersistedAssistantMessageIDs(
+                messages: [msgCombinedA], timelineTurns: [turnCombinedB]
+            ).isEmpty,
+            "equal-length different combined live must not hide (would be stale if key collided)"
+        )
+        XCTAssertEqual(
+            AgentAppView.hiddenPersistedAssistantMessageIDs(
+                messages: [msgCombinedB], timelineTurns: [turnCombinedB]
+            ),
+            [msgCombinedB.id],
+            "matching B live+persisted must hide after equal-length replacement"
+        )
+    }
+
+    /// Microbench optional: content-key build vs full hide recompute on tick-only
+    /// (same content, n≥5). Proves skip path stays cheaper than recompute.
+    func test_microbench_hiddenPersisted_keyHitFasterThanFullRecompute() throws {
+        let thread = AgentThreadID()
+        var messages: [AgentMessage] = []
+        for i in 0..<12 {
+            messages.append(AgentMessage(
+                threadId: thread,
+                role: i % 2 == 0 ? .user : .assistant,
+                content: String(repeating: "body \(i) ", count: 80)
+            ))
+        }
+        var turns: [AssistantTurnSnapshot] = []
+        for t in 0..<6 {
+            let items = (0..<4).map { j in
+                AssistantItem(
+                    id: "t\(t)-i\(j)",
+                    turnId: "turn-\(t)",
+                    type: .assistantMessage,
+                    body: String(repeating: "x", count: 200 + t * 10 + j),
+                    startedAtMs: Int64(t * 10 + j)
+                )
+            }
+            turns.append(AssistantTurnSnapshot(
+                turnId: "turn-\(t)",
+                items: items,
+                finalAssistantMessage: items.last?.body,
+                finished: t < 5
+            ))
+        }
+        let iterations = 2_000
+        let samples = 5
+        let warmup = 2
+
+        func median(_ values: [Double]) -> Double {
+            let s = values.sorted()
+            return s[s.count / 2]
+        }
+
+        func timeFullRecompute() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for _ in 0..<iterations {
+                let ids = AgentAppView.hiddenPersistedAssistantMessageIDs(
+                    messages: messages,
+                    timelineTurns: turns
+                )
+                sink &+= ids.count
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            _ = sink
+            return Double(end - start) / 1_000_000.0
+        }
+
+        func timeKeyOnly() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            var lastKey: String?
+            for _ in 0..<iterations {
+                let key = AgentAppView.hiddenPersistedAssistantContentKey(
+                    messages: messages,
+                    timelineTurns: turns
+                )
+                if lastKey == key {
+                    sink &+= 1 // simulated cache hit — skip recompute
+                } else {
+                    lastKey = key
+                    let ids = AgentAppView.hiddenPersistedAssistantMessageIDs(
+                        messages: messages,
+                        timelineTurns: turns
+                    )
+                    sink &+= ids.count
+                }
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        for _ in 0..<warmup { _ = timeFullRecompute(); _ = timeKeyOnly() }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            before.append(timeFullRecompute())
+            after.append(timeKeyOnly())
+        }
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = (beforeMed - afterMed) / beforeMed * 100.0
+        NSLog("[perf-proof] hiddenPersisted full_ms=%@ keyHit_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+              String(beforeMed), String(afterMed), improvement,
+              String(describing: before), String(describing: after))
+        XCTAssertGreaterThan(
+            improvement, 5.0,
+            "tick-only hidden cache hit must beat full recompute by ≥5% (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
         )
     }
 

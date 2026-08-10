@@ -26,16 +26,38 @@ enum AgentMessageMarkdown {
     // ran for every visible block (and every table cell) on every pass. Persisted
     // message bodies are immutable, so after the first parse every re-render of
     // stable history is a cache hit; only the live streaming row (changing text)
-    // reparses. `countLimit` bounds memory so the growing partial bodies of one
-    // streaming turn cannot accumulate without bound; NSCache also evicts under
-    // memory pressure. NSCache is thread-safe; these run on the main actor.
+    // reparses.
+    //
+    // R4-B: countLimit alone still retains every unique partial length during a
+    // stream (each growing prefix is a distinct key). Bound occupancy with
+    // totalCostLimit (UTF-8 cost) and allow callers to pass `cache: false` for
+    // live rows so intermediate partials are never stored. NSCache is thread-safe;
+    // these run on the main actor.
     private final class BlocksBox { let blocks: [AgentMessageMarkdownBlock]; init(_ b: [AgentMessageMarkdownBlock]) { blocks = b } }
     private final class AttributedBox { let value: AttributedString; init(_ v: AttributedString) { value = v } }
+
+    /// Soft byte budget for cached markdown parse results (blocks + inline share
+    /// independent budgets). Large finished messages still cache once; streaming
+    /// partial thrash cannot unbounded-grow occupancy.
+    private static let blocksCacheCostLimit = 2 * 1_024 * 1_024
+    private static let inlineCacheCostLimit = 2 * 1_024 * 1_024
+    /// Skip storing partials above this band even when `cache: true` — finished
+    /// large bodies still benefit if they re-render with identical text (hit path
+    /// after first store under cost limit). Below this, every intermediate stream
+    /// length used to pin a slot under countLimit-only.
+    private static let maxCachedTextUTF8Bytes = 48 * 1_024
+
     private static let blocksCache: NSCache<NSString, BlocksBox> = {
-        let cache = NSCache<NSString, BlocksBox>(); cache.countLimit = 512; return cache
+        let cache = NSCache<NSString, BlocksBox>()
+        cache.countLimit = 512
+        cache.totalCostLimit = blocksCacheCostLimit
+        return cache
     }()
     private static let inlineCache: NSCache<NSString, AttributedBox> = {
-        let cache = NSCache<NSString, AttributedBox>(); cache.countLimit = 2_048; return cache
+        let cache = NSCache<NSString, AttributedBox>()
+        cache.countLimit = 2_048
+        cache.totalCostLimit = inlineCacheCostLimit
+        return cache
     }()
 
     #if DEBUG
@@ -43,13 +65,27 @@ enum AgentMessageMarkdown {
     // unit test can prove repeated renders of identical content hit the cache.
     nonisolated(unsafe) static var blocksComputeCountForTesting = 0
     nonisolated(unsafe) static var inlineComputeCountForTesting = 0
+    /// Test-only: successful setObject admissions (not lookups).
+    nonisolated(unsafe) static var blocksCacheStoreCountForTesting = 0
+    nonisolated(unsafe) static var inlineCacheStoreCountForTesting = 0
     #endif
 
-    static func blocks(from text: String) -> [AgentMessageMarkdownBlock] {
+    /// Whether a source string is eligible to occupy NSCache under R4-B policy.
+    static func shouldStoreMarkdownCache(textUTF8Count: Int, cache: Bool) -> Bool {
+        cache && textUTF8Count > 0 && textUTF8Count <= maxCachedTextUTF8Bytes
+    }
+
+    static func blocks(from text: String, cache: Bool = true) -> [AgentMessageMarkdownBlock] {
         let key = text as NSString
-        if let cached = blocksCache.object(forKey: key) { return cached.blocks }
+        if cache, let cached = blocksCache.object(forKey: key) { return cached.blocks }
         let result = computeBlocks(from: text)
-        blocksCache.setObject(BlocksBox(result), forKey: key)
+        let cost = text.utf8.count
+        if shouldStoreMarkdownCache(textUTF8Count: cost, cache: cache) {
+            blocksCache.setObject(BlocksBox(result), forKey: key, cost: cost)
+            #if DEBUG
+            blocksCacheStoreCountForTesting &+= 1
+            #endif
+        }
         return result
     }
 
@@ -76,7 +112,7 @@ enum AgentMessageMarkdown {
         return groups
     }
 
-    static func selectableProse(from blocks: [AgentMessageMarkdownBlock], compact: Bool) -> AttributedString {
+    static func selectableProse(from blocks: [AgentMessageMarkdownBlock], compact: Bool, cache: Bool = true) -> AttributedString {
         var result = AttributedString()
         for (index, block) in blocks.enumerated() {
             if index > 0 { result.append(AttributedString("\n")) }
@@ -115,7 +151,7 @@ enum AgentMessageMarkdown {
                 continue
             }
 
-            var line = attributedInline(source)
+            var line = attributedInline(source, cache: cache)
             line.font = .system(size: size, weight: weight)
             line.foregroundColor = color
             result.append(line)
@@ -288,11 +324,17 @@ enum AgentMessageMarkdown {
         return blocks.isEmpty ? [AgentMessageMarkdownBlock(kind: .paragraph, text: text)] : blocks
     }
 
-    static func attributedInline(_ text: String) -> AttributedString {
+    static func attributedInline(_ text: String, cache: Bool = true) -> AttributedString {
         let key = text as NSString
-        if let cached = inlineCache.object(forKey: key) { return cached.value }
+        if cache, let cached = inlineCache.object(forKey: key) { return cached.value }
         let result = computeAttributedInline(text)
-        inlineCache.setObject(AttributedBox(result), forKey: key)
+        let cost = text.utf8.count
+        if shouldStoreMarkdownCache(textUTF8Count: cost, cache: cache) {
+            inlineCache.setObject(AttributedBox(result), forKey: key, cost: cost)
+            #if DEBUG
+            inlineCacheStoreCountForTesting &+= 1
+            #endif
+        }
         return result
     }
 
@@ -519,6 +561,9 @@ enum AgentMessageMarkdown {
 struct AgentMessageMarkdownView: View {
     let text: String
     var compact: Bool = false
+    /// When false (live streaming rows), parse results are not inserted into NSCache
+    /// so growing partial bodies cannot thrash occupancy (R4-B).
+    var cacheResults: Bool = true
 
     /// IMP-010: tracks which code block (by enumeration offset) is hovered.
     @State private var hoveredCode: Int? = nil
@@ -528,12 +573,12 @@ struct AgentMessageMarkdownView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: compact ? DS.Space.sm : DS.Space.md) {
-            ForEach(Array(AgentMessageMarkdown.selectionGroups(from: AgentMessageMarkdown.blocks(from: text)).enumerated()), id: \.offset) { index, group in
+            ForEach(Array(AgentMessageMarkdown.selectionGroups(from: AgentMessageMarkdown.blocks(from: text, cache: cacheResults)).enumerated()), id: \.offset) { index, group in
                 if group.count == 1, let block = group.first, isIsolatedBlock(block) {
                     blockView(block, index: index)
                 } else {
                     AgentLinkedAttributedText(
-                        attributed: AgentMessageMarkdown.selectableProse(from: group, compact: compact),
+                        attributed: AgentMessageMarkdown.selectableProse(from: group, compact: compact, cache: cacheResults),
                         font: .systemFont(ofSize: 13),
                         textColor: DS.NS.text,
                         lineFragmentPadding: 0,
@@ -569,7 +614,8 @@ struct AgentMessageMarkdownView: View {
             fontSize: size,
             fontWeight: weight,
             textColor: color,
-            lineSpacing: compact ? min(lineSpacing, 3) : lineSpacing
+            lineSpacing: compact ? min(lineSpacing, 3) : lineSpacing,
+            cacheResults: cacheResults
         )
     }
 
