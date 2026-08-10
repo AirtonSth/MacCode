@@ -28,6 +28,65 @@ final class ProviderNativeSubagentLifecycleTests: XCTestCase {
         )
     }
 
+    func testLiveXAISessionNotificationSpawnAndFinish() {
+        // WHY: live grok-build emit_subagent_notification uses method
+        // `x.ai/session_notification` (not the underscore legacy form). Dropping
+        // that method left Subagents UI blind to native Grok children.
+        let childID = UUID(uuidString: "019FB003-077E-7391-9013-BE1849DF3941")!
+        let spawn = grokRuntimeEvent(
+            update: [
+                "sessionUpdate": "subagent_spawned",
+                "subagent_id": childID.uuidString.lowercased(),
+                "child_session_id": childID.uuidString.lowercased(),
+                "description": "native explore",
+            ],
+            method: "x.ai/session_notification"
+        )
+        let finish = grokRuntimeEvent(
+            update: [
+                "sessionUpdate": "subagent_finished",
+                "subagent_id": childID.uuidString.lowercased(),
+                "child_session_id": childID.uuidString.lowercased(),
+                "status": "completed",
+            ],
+            method: "x.ai/session_notification"
+        )
+        XCTAssertTrue(ProviderNativeSubagentLifecycle.isPotentialLifecycleEvent(spawn))
+        XCTAssertTrue(ProviderNativeSubagentLifecycle.isPotentialLifecycleEvent(finish))
+        XCTAssertEqual(
+            ProviderNativeSubagentLifecycle.updates(from: spawn, parentProvider: .grok).first?.phase,
+            .active
+        )
+        XCTAssertEqual(
+            ProviderNativeSubagentLifecycle.updates(from: finish, parentProvider: .grok).first?.phase,
+            .completed
+        )
+        XCTAssertEqual(
+            ProviderNativeSubagentLifecycle.updates(from: spawn, parentProvider: .grok)
+                .first?.childRunId.value,
+            childID
+        )
+    }
+
+    func testLiveXAISessionUpdateMethodAlsoProjectsChild() {
+        // WHY: pager also classifies `x.ai/session/update` as a session-update
+        // ext method carrier for subagent lifecycle payloads.
+        let childID = UUID()
+        let event = grokRuntimeEvent(
+            update: [
+                "sessionUpdate": "subagent_spawned",
+                "subagent_id": childID.uuidString.lowercased(),
+                "child_session_id": childID.uuidString.lowercased(),
+            ],
+            method: "x.ai/session/update"
+        )
+        XCTAssertTrue(ProviderNativeSubagentLifecycle.isPotentialLifecycleEvent(event))
+        XCTAssertEqual(
+            ProviderNativeSubagentLifecycle.updates(from: event, parentProvider: .grok).first?.phase,
+            .active
+        )
+    }
+
     func testOrdinaryProviderEventsSkipTheLifecyclePersistenceHotPath() {
         XCTAssertFalse(
             ProviderNativeSubagentLifecycle.isPotentialLifecycleEvent(
@@ -383,7 +442,8 @@ final class ProviderNativeSubagentLifecycleTests: XCTestCase {
 
     private func grokRuntimeEvent(
         update: [String: Any],
-        isReplay: Bool = false
+        isReplay: Bool = false,
+        method: String = "_x.ai/session_notification"
     ) -> AssistantEvent {
         let payload: [String: Any] = [
             "_meta": ["isReplay": isReplay],
@@ -394,7 +454,7 @@ final class ProviderNativeSubagentLifecycleTests: XCTestCase {
         return .providerRuntime(ProviderRuntimeEvent(
             provider: .grok,
             source: "grok.acp",
-            method: "_x.ai/session_notification",
+            method: method,
             payloadJSON: String(decoding: data, as: UTF8.self),
             receivedAtMs: 1
         ))

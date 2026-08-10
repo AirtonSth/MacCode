@@ -566,8 +566,8 @@ final class GrokACPProtocolTests: XCTestCase {
     func test_mapperRewrapsPlainACPSubagentLifecycleForSubagentsSurface() {
         // WHY: orchestrated Grok workers must reach ProviderNativeSubagentLifecycle
         // even when the wire uses plain ACP sessionUpdate kinds instead of the
-        // `_x.ai/session/update` envelope (user rule: orchestrated agents always
-        // appear as subagents under the controller).
+        // live `x.ai/session_notification` envelope (user rule: orchestrated
+        // agents always appear as subagents under the controller).
         let childID = "019FB003-077E-7391-9013-BE1849DF3941"
         let mapper = GrokACPEventMapper(sessionId: "grok-parent")
         let events = mapper.consumeSessionUpdate([
@@ -579,7 +579,7 @@ final class GrokACPProtocolTests: XCTestCase {
         guard case .providerRuntime(let runtime)? = events.last else {
             return XCTFail("subagent_spawned must emit a providerRuntime event")
         }
-        XCTAssertEqual(runtime.method, "_x.ai/session/update")
+        XCTAssertEqual(runtime.method, "x.ai/session_notification")
         XCTAssertTrue(
             ProviderNativeSubagentLifecycle.isPotentialLifecycleEvent(events.last!),
             "re-wrapped event must be on the Subagents lifecycle hot path"
@@ -593,6 +593,65 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(
             updates.first?.childRunId.value.uuidString.lowercased(),
             childID.lowercased()
+        )
+    }
+
+    func test_legacyUnderscoreSessionNotificationStillReachesLifecycle() {
+        // WHY: persisted replay / older fixtures may still emit `_x.ai/*`.
+        let childID = "019FB003-077E-7391-9013-BE1849DF3941"
+        let payload: [String: Any] = [
+            "sessionId": "grok-parent",
+            "update": [
+                "sessionUpdate": "subagent_finished",
+                "subagent_id": childID.lowercased(),
+                "child_session_id": childID.lowercased(),
+                "status": "completed",
+            ] as [String: Any],
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        let event = AssistantEvent.providerRuntime(ProviderRuntimeEvent(
+            provider: .grok,
+            source: "grok.acp",
+            method: "_x.ai/session_notification",
+            payloadJSON: String(decoding: data, as: UTF8.self),
+            receivedAtMs: 1
+        ))
+        XCTAssertTrue(ProviderNativeSubagentLifecycle.isPotentialLifecycleEvent(event))
+        XCTAssertEqual(
+            ProviderNativeSubagentLifecycle.updates(from: event, parentProvider: .grok).first?.phase,
+            .completed
+        )
+    }
+
+    /// WHY: live grok-build emit_subagent_notification uses `x.ai/session_notification`.
+    /// Adapter must forward both live and legacy prefixes (GROK-ACP-005).
+    func test_adapterAcceptsLiveAndLegacyGrokExtNotificationPrefixes() throws {
+        let root = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let adapter = try String(
+            contentsOf: root.appendingPathComponent("Sources/AgentRuntime/GrokACPAdapter.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(
+            adapter.contains("hasPrefix(\"x.ai/\")") && adapter.contains("hasPrefix(\"_x.ai/\")"),
+            "handleNotification must treat live x.ai/* and legacy _x.ai/* as runtime events"
+        )
+        XCTAssertTrue(
+            adapter.contains("unwrapGrokExtNotification"),
+            "adapter should unwrap leader nested {method,params} ext envelopes"
+        )
+        let lifecycle = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/AgentRuntime/ProviderNativeSubagentLifecycle.swift"
+            ),
+            encoding: .utf8
+        )
+        XCTAssertTrue(
+            lifecycle.contains("\"x.ai/session_notification\"")
+                && lifecycle.contains("\"_x.ai/session_notification\""),
+            "lifecycle must accept live and legacy session_notification methods"
         )
     }
 

@@ -62,7 +62,11 @@ enum ProviderNativeSubagentLifecycle {
     }
 
     private static func isGrokSubagentMethod(_ method: String) -> Bool {
-        method == "_x.ai/session_notification"
+        // Live grok-build: `x.ai/session_notification` (and `x.ai/session/update`).
+        // Legacy/replay: underscore-prefixed carriers. Mapper re-wrap prefers live.
+        method == "x.ai/session_notification"
+            || method == "x.ai/session/update"
+            || method == "_x.ai/session_notification"
             || method == "_x.ai/session/update"
             // Mapper re-wraps plain ACP kinds; accept the kind name too so a
             // missed re-wrap still reaches the Subagents ledger.
