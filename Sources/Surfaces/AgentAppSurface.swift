@@ -988,38 +988,85 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Scoped to the selected thread plus parent-chain descendants (middleware
     /// nested Agent App workers). Sibling threads without a parent link are
     /// excluded so the badge never aggregates the whole workspace.
+    ///
+    /// Prefer `loadSubagentActivitySnapshotOffMainActor` for the 2s poll so SQLite
+    /// + JSON decode never sit on the main thread (hang_breach under multi-thread).
     public func refreshSubagentActivity() {
         guard !isDisposed else { return }
-        guard let selectedThreadId else {
-            if Self.shouldPublishSubagentActivity(current: subagentActivity, next: .empty) {
-                subagentActivity = .empty
-            }
+        guard selectedThreadId != nil else {
+            applySubagentActivity(.empty)
             return
         }
-        // Thread-scoped fetch (selected rows + bounded nested-worker window) so
-        // the 2s MainActor poll does not JSON-decode the global 10k ledger.
-        let receipts = (try? orchestrationRuntime.activityReceipts(
-            threadIds: [selectedThreadId],
-            limit: SubagentActivityProjection.defaultReceiptFetchLimit
-        )) ?? []
-        // Nested middleware children execute on their own thread ids; include
-        // every live coordinator run so unknown lifecycle can still refine to
-        // Working for descendants that appear via parent-chain attribution.
+        // Synchronous path kept for event-driven reselect; poll uses the off-main loader.
+        let snapshot = loadSubagentActivitySnapshotSync(persistLifecycleReconciliation: true)
+        applySubagentActivity(snapshot)
+    }
+
+    /// Apply a precomputed snapshot on the main actor (poll completion path).
+    public func applySubagentActivity(_ next: SubagentActivitySnapshot) {
+        guard !isDisposed else { return }
+        guard Self.shouldPublishSubagentActivity(current: subagentActivity, next: next) else { return }
+        subagentActivity = next
+    }
+
+    /// Apply a poll result only while the thread that produced it is still selected.
+    public func applySubagentActivity(
+        _ next: SubagentActivitySnapshot,
+        loadedFor threadId: AgentThreadID
+    ) {
+        guard selectedThreadId == threadId else { return }
+        applySubagentActivity(next)
+    }
+
+    /// Off-main badge load used by the shared 2s poll. Read-only reconciliation
+    /// (no lifecycle write lock) so multi-thread sessions do not stall UI.
+    func loadSubagentActivitySnapshotOffMainActor(
+        for threadId: AgentThreadID
+    ) async -> SubagentActivitySnapshot {
+        guard !isDisposed else { return .empty }
+        let orchestrationRuntime = orchestrationRuntime
+        let coordinator = coordinator
+        let clock = clock
         let activeRunIds = Set(
             coordinator.activeThreadIdsSnapshot().compactMap { threadId in
                 coordinator.activeRunId(threadId: threadId)
             }
         )
-        let next = SubagentActivityProjection.project(
+        return await Task.detached(priority: .utility) {
+            let receipts = (try? orchestrationRuntime.activityReceipts(
+                threadIds: [threadId],
+                limit: SubagentActivityProjection.defaultReceiptFetchLimit,
+                persistLifecycleReconciliation: false
+            )) ?? []
+            return SubagentActivityProjection.project(
+                receipts: receipts,
+                threadIds: [threadId],
+                activeRunIds: activeRunIds,
+                now: clock()
+            )
+        }.value
+    }
+
+    private func loadSubagentActivitySnapshotSync(
+        persistLifecycleReconciliation: Bool
+    ) -> SubagentActivitySnapshot {
+        guard let selectedThreadId else { return .empty }
+        let receipts = (try? orchestrationRuntime.activityReceipts(
+            threadIds: [selectedThreadId],
+            limit: SubagentActivityProjection.defaultReceiptFetchLimit,
+            persistLifecycleReconciliation: persistLifecycleReconciliation
+        )) ?? []
+        let activeRunIds = Set(
+            coordinator.activeThreadIdsSnapshot().compactMap { threadId in
+                coordinator.activeRunId(threadId: threadId)
+            }
+        )
+        return SubagentActivityProjection.project(
             receipts: receipts,
             threadIds: [selectedThreadId],
             activeRunIds: activeRunIds,
             now: clock()
         )
-        // Soft reselect + the 2s poll re-enter here constantly. Re-assigning an
-        // identical snapshot republishes @Published subagent chrome for no reason.
-        guard Self.shouldPublishSubagentActivity(current: subagentActivity, next: next) else { return }
-        subagentActivity = next
     }
 
     /// Skip equal subagent snapshot reloads (soft reselect / idle poll multipass).

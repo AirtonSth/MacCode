@@ -13,11 +13,13 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     public static let shared = GraphifyWorkspaceService()
 
     /// Safety net when FSEvents misses an edit: re-check at most this often even if "fresh".
-    public var maxAgeFresh: TimeInterval = 45
+    /// Raised from 45s so multi-thread agents on large monorepos do not thrash
+    /// `graphify update` (live sample: multi-GB / ~100% CPU rebuilds).
+    public var maxAgeFresh: TimeInterval = 180
     /// Minimum gap between CLI update starts for the same checkout (anti-thrash).
-    public var minRebuildInterval: TimeInterval = 15
+    public var minRebuildInterval: TimeInterval = 45
     /// Trailing debounce after FSEvents dirty marks.
-    public var fseventsDebounce: TimeInterval = 2.5
+    public var fseventsDebounce: TimeInterval = 4.0
 
     private let lock = NSLock()
     // PERF: ensure/refresh probes load+save fingerprint JSON on the hot path
@@ -31,6 +33,11 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     private var watchers: [String: GraphifyCheckoutWatcher] = [:]
     private var debounceWork: [String: DispatchWorkItem] = [:]
     private var binaryInstallAttempted = false
+    /// Process-wide gate: at most one graphify CLI child at a time. Per-checkout
+    /// `inFlight` already coalesces same-root work; this stops two large monorepos
+    /// (or worktrees) from double-taxing CPU/RAM during multi-thread sessions.
+    private var globalCLIInFlight = false
+    private var globalCLIRerunIDs: Set<String> = []
 
     public var appSupportDirectory: URL
     public var binaryPathOverride: String?
@@ -334,6 +341,15 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             return
         }
 
+        // Global single-flight: another checkout is already running graphify CLI.
+        if globalCLIInFlight {
+            schedule.rerunRequested = true
+            schedules[checkout.scheduleID] = schedule
+            globalCLIRerunIDs.insert(checkout.scheduleID)
+            lock.unlock()
+            return
+        }
+
         if let last = schedule.lastEnsureStarted,
            Date().timeIntervalSince(last) < minRebuildInterval,
            schedule.dirtyGeneration <= schedule.builtGeneration {
@@ -369,6 +385,7 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             schedule.dirtyGeneration &+= 1
         }
         schedule.inFlight = true
+        globalCLIInFlight = true
         schedule.lastEnsureStarted = Date()
         schedule.status = .building
         let targetGen = schedule.dirtyGeneration
@@ -390,10 +407,26 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             let needRerun = s.rerunRequested || s.dirtyGeneration > s.builtGeneration
             s.rerunRequested = false
             service.schedules[checkout.scheduleID] = s
+            service.globalCLIInFlight = false
+            let deferredIDs = service.globalCLIRerunIDs
+            service.globalCLIRerunIDs.removeAll(keepingCapacity: true)
+            let deferredRoots = deferredIDs.compactMap { id -> String? in
+                guard id != checkout.scheduleID,
+                      let deferred = service.schedules[id],
+                      !deferred.displayRoot.isEmpty else { return nil }
+                return deferred.displayRoot
+            }
             service.lock.unlock()
 
             if status == .fresh {
                 service.saveFingerprint(checkout, head: service.currentHead(checkout.displayRoot))
+            }
+            // Kick deferred checkouts that waited on the global gate (at most one
+            // trailing ensure per id via startEnsureIfNeeded coalescing).
+            for displayRoot in deferredRoots {
+                if let deferredCheckout = GraphifyGitProbe.identity(at: displayRoot)?.checkout {
+                    service.startEnsureIfNeeded(checkout: deferredCheckout)
+                }
             }
             if needRerun {
                 // Exactly one trailing update for changes during the build.

@@ -102,12 +102,16 @@ public final class AgentWorkspaceRailReloadCoordinator {
 
     private func ensureSubagentPoll(for workspaceID: WorkspaceID) {
         guard subagentPollTasks[workspaceID] == nil else { return }
-        subagentPollTasks[workspaceID] = Task { @MainActor [weak self] in
+        // Intentionally NOT @MainActor for the whole loop: sleep + SQLite/JSON
+        // load run off the main thread; only snapshot apply hops to MainActor.
+        // WHY: sample stacks under 5 agent threads showed hang_breach on
+        // refreshSubagentActivity → activityReceipts decode on the main thread.
+        subagentPollTasks[workspaceID] = Task { [weak self] in
             while !Task.isCancelled {
-                let interval = self?.subagentPollNanoseconds ?? 2_000_000_000
+                let interval = await MainActor.run { self?.subagentPollNanoseconds ?? 2_000_000_000 }
                 try? await Task.sleep(nanoseconds: interval)
                 guard !Task.isCancelled else { return }
-                self?.flushSubagent(workspaceID)
+                await self?.flushSubagent(workspaceID)
             }
         }
     }
@@ -127,11 +131,22 @@ public final class AgentWorkspaceRailReloadCoordinator {
         }
     }
 
-    private func flushSubagent(_ workspaceID: WorkspaceID) {
+    private func flushSubagent(_ workspaceID: WorkspaceID) async {
         // One tick per workspace: only surfaces with a selected thread (badge context)
         // refresh; others stay empty without extra SQLite work.
-        for viewModel in liveViewModels(for: workspaceID) where viewModel.selectedThreadId != nil {
-            viewModel.refreshSubagentActivity()
+        let targets: [(viewModel: AgentAppViewModel, threadId: AgentThreadID)] = await MainActor.run {
+            liveViewModels(for: workspaceID).compactMap { viewModel in
+                guard let threadId = viewModel.selectedThreadId else { return nil }
+                return (viewModel, threadId)
+            }
+        }
+        for target in targets {
+            let snapshot = await target.viewModel.loadSubagentActivitySnapshotOffMainActor(
+                for: target.threadId
+            )
+            await MainActor.run {
+                target.viewModel.applySubagentActivity(snapshot, loadedFor: target.threadId)
+            }
         }
     }
 

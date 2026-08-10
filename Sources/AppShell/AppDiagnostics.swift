@@ -16,6 +16,11 @@ public struct ManagedProcessMemoryProfile: Sendable, Equatable {
     public let providerRootCap: Int?
     public let sidecarMaxConcurrentRequests: Int
     public let sidecarMaxQueueDepth: Int
+    /// How long a Distill request may wait for an admission slot before the
+    /// sidecar fails open (`queue_full` → client keeps original tool output).
+    /// 0 means wait until the hard queue depth rejects. Multi-thread bursts
+    /// need a finite budget so 4s MLX generations do not stack unbounded.
+    public let sidecarMaxQueueWaitMilliseconds: Int
     public let idleReleaseAge: TimeInterval
     public let warningFraction: Double
     public let criticalFraction: Double
@@ -24,35 +29,114 @@ public struct ManagedProcessMemoryProfile: Sendable, Equatable {
     /// Reserved for telemetry only. Never used to refuse a user-started provider.
     public let managedTreeCeilingKB: Int?
 
+    public init(
+        name: String,
+        physicalMemoryBytes: UInt64,
+        providerRootCap: Int?,
+        sidecarMaxConcurrentRequests: Int,
+        sidecarMaxQueueDepth: Int,
+        sidecarMaxQueueWaitMilliseconds: Int = 0,
+        idleReleaseAge: TimeInterval,
+        warningFraction: Double,
+        criticalFraction: Double,
+        hostProcessCeilingKB: Int?,
+        managedTreeCeilingKB: Int?
+    ) {
+        self.name = name
+        self.physicalMemoryBytes = physicalMemoryBytes
+        self.providerRootCap = providerRootCap
+        self.sidecarMaxConcurrentRequests = max(1, sidecarMaxConcurrentRequests)
+        self.sidecarMaxQueueDepth = max(0, sidecarMaxQueueDepth)
+        self.sidecarMaxQueueWaitMilliseconds = max(0, sidecarMaxQueueWaitMilliseconds)
+        self.idleReleaseAge = idleReleaseAge
+        self.warningFraction = warningFraction
+        self.criticalFraction = criticalFraction
+        self.hostProcessCeilingKB = hostProcessCeilingKB
+        self.managedTreeCeilingKB = managedTreeCeilingKB
+    }
+
+    /// Scale Distill admission from installed RAM.
+    ///
+    /// Concurrent slots grow with memory because each in-flight MLX generation
+    /// retains working set; queue depth is deliberately modest so multi-thread
+    /// agents fail open instead of stacking multi-second waits. Provider starts
+    /// stay unlimited (user-controlled).
     public static func resolve(physicalMemoryBytes: UInt64) -> Self {
-        let eightGiB = UInt64(8) * 1_024 * 1_024 * 1_024
-        if physicalMemoryBytes <= eightGiB {
+        let gib: UInt64 = 1_024 * 1_024 * 1_024
+        if physicalMemoryBytes <= 8 * gib {
             return Self(
                 name: "low-memory-8g",
                 physicalMemoryBytes: physicalMemoryBytes,
                 providerRootCap: nil,
                 sidecarMaxConcurrentRequests: 1,
                 sidecarMaxQueueDepth: 4,
-                // Early release of completed provider trees (claude/codex/grok).
+                // Fail open quickly on tiny machines — one slow MLX call is enough.
+                sidecarMaxQueueWaitMilliseconds: 750,
                 idleReleaseAge: 60,
                 warningFraction: 0.60,
                 criticalFraction: 0.75,
-                // Observation/pressure only — never admission-blocking.
                 hostProcessCeilingKB: nil,
                 managedTreeCeilingKB: nil
             )
         }
+        if physicalMemoryBytes <= 16 * gib {
+            return Self(
+                name: "mid-memory-16g",
+                physicalMemoryBytes: physicalMemoryBytes,
+                providerRootCap: nil,
+                sidecarMaxConcurrentRequests: 2,
+                sidecarMaxQueueDepth: 8,
+                sidecarMaxQueueWaitMilliseconds: 1_000,
+                idleReleaseAge: 90,
+                warningFraction: 0.65,
+                criticalFraction: 0.80,
+                hostProcessCeilingKB: nil,
+                managedTreeCeilingKB: nil
+            )
+        }
+        if physicalMemoryBytes <= 32 * gib {
+            return Self(
+                name: "standard-32g",
+                physicalMemoryBytes: physicalMemoryBytes,
+                providerRootCap: nil,
+                sidecarMaxConcurrentRequests: 4,
+                sidecarMaxQueueDepth: 16,
+                sidecarMaxQueueWaitMilliseconds: 1_500,
+                idleReleaseAge: 2 * 60,
+                warningFraction: 0.70,
+                criticalFraction: 0.85,
+                hostProcessCeilingKB: nil,
+                managedTreeCeilingKB: nil
+            )
+        }
+        if physicalMemoryBytes <= 64 * gib {
+            return Self(
+                name: "high-memory-64g",
+                physicalMemoryBytes: physicalMemoryBytes,
+                providerRootCap: nil,
+                sidecarMaxConcurrentRequests: 6,
+                sidecarMaxQueueDepth: 24,
+                sidecarMaxQueueWaitMilliseconds: 2_000,
+                idleReleaseAge: 2 * 60,
+                warningFraction: 0.72,
+                criticalFraction: 0.88,
+                hostProcessCeilingKB: nil,
+                managedTreeCeilingKB: nil
+            )
+        }
+        // 128 GiB+ workstation class. Concurrent still capped — MLX/GPU serializes
+        // generations, and unbounded parallel LLM compress thrash the GPU more
+        // than they help multi-thread agents.
         return Self(
-            name: "standard",
+            name: "high-memory-128g",
             physicalMemoryBytes: physicalMemoryBytes,
             providerRootCap: nil,
-            sidecarMaxConcurrentRequests: 4,
+            sidecarMaxConcurrentRequests: 8,
             sidecarMaxQueueDepth: 32,
-            // Early idle release: completed provider processes (claude/codex/grok)
-            // were retaining hundreds of MB for 30 minutes. Resume-preserving.
+            sidecarMaxQueueWaitMilliseconds: 2_500,
             idleReleaseAge: 2 * 60,
-            warningFraction: 0.70,
-            criticalFraction: 0.85,
+            warningFraction: 0.75,
+            criticalFraction: 0.90,
             hostProcessCeilingKB: nil,
             managedTreeCeilingKB: nil
         )

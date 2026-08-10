@@ -998,8 +998,17 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
         try handle.synchronize()
     }
 
-    private func withReceiptRead<T>(_ body: () throws -> T) throws -> T {
-        try withCrossProcessLock(body)
+    fileprivate func withReceiptRead<T>(_ body: () throws -> T) throws -> T {
+        try withCrossProcessLock {
+            switch storage {
+            case .database(let db, _):
+                // BEGIN DEFERRED: shared read lock only so the 2s badge poll and
+                // other readers do not reserve the writer against live agent upserts.
+                return try db.readTransaction(body)
+            case .file:
+                return try body()
+            }
+        }
     }
 
     private func withCrossProcessLock<T>(_ body: () throws -> T) throws -> T {
@@ -2145,8 +2154,15 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     /// Prefer `activityReceipts(threadIds:limit:)` for the live badge poll — the
     /// global form still mutates every accepted row in the window and is kept
     /// for tests / launch-style full-window reconciliation.
-    public func activityReceipts(limit: Int = 10_000) throws -> [AgentOrchestrationAdmissionReceipt] {
-        try activityReceipts(scope: .global, limit: max(1, limit))
+    public func activityReceipts(
+        limit: Int = 10_000,
+        persistLifecycleReconciliation: Bool = true
+    ) throws -> [AgentOrchestrationAdmissionReceipt] {
+        try activityReceipts(
+            scope: .global,
+            limit: max(1, limit),
+            persistLifecycleReconciliation: persistLifecycleReconciliation
+        )
     }
 
     /// Thread-scoped activity read for the Subagents chrome badge.
@@ -2155,15 +2171,21 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     /// then reconciles **scoped** receipts only. Unrelated sibling-thread dead
     /// workers are intentionally not mutated here — they reconcile when that
     /// thread is selected, via the global path, or at launch-time reconciliation.
+    ///
+    /// Pass `persistLifecycleReconciliation: false` for the high-frequency UI poll:
+    /// dead workers are projected as `.unknown` in memory only (no write lock, no
+    /// ledger append). Periodic mutating calls still persist demotions.
     public func activityReceipts(
         threadIds: Set<AgentThreadID>,
         limit: Int = 10_000,
-        childRecordLimit: Int = AgentOrchestrationRuntime.defaultChildActivityReceiptLimit
+        childRecordLimit: Int = AgentOrchestrationRuntime.defaultChildActivityReceiptLimit,
+        persistLifecycleReconciliation: Bool = true
     ) throws -> [AgentOrchestrationAdmissionReceipt] {
         guard !threadIds.isEmpty else { return [] }
         return try activityReceipts(
             scope: .threads(threadIds, childRecordLimit: max(1, childRecordLimit)),
-            limit: max(1, limit)
+            limit: max(1, limit),
+            persistLifecycleReconciliation: persistLifecycleReconciliation
         )
     }
 
@@ -2174,10 +2196,12 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
 
     private func activityReceipts(
         scope: ActivityReceiptScope,
-        limit: Int
+        limit: Int,
+        persistLifecycleReconciliation: Bool
     ) throws -> [AgentOrchestrationAdmissionReceipt] {
-        let result = try repository.withReceiptMutation {
-            () -> (receipts: [AgentOrchestrationAdmissionReceipt], reservationIds: [String]) in
+        // Nested function (not a stored closure) so the existing body can share
+        // mutation vs read-only transaction wrappers without explicit `self.` noise.
+        func loadBody() throws -> (receipts: [AgentOrchestrationAdmissionReceipt], reservationIds: [String]) {
             var receipts: [AgentOrchestrationAdmissionReceipt]
             let scopeThreadIds: Set<AgentThreadID>?
             switch scope {
@@ -2315,25 +2339,36 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
                     ? current
                     : receipt.lifecycleUpdatedAt.addingTimeInterval(0.001)
                 let unknown = receipt.updatingLifecycle(.unknown, at: updatedAt)
-                try repository.appendLifecycleUnlocked(unknown)
-                try repository.appendLedgerUnlocked(
-                    AgentOrchestrationLedgerEntry(
-                        receipt: unknown,
-                        outcome: "unknown",
-                        finalizedAt: updatedAt
+                if persistLifecycleReconciliation {
+                    try repository.appendLifecycleUnlocked(unknown)
+                    try repository.appendLedgerUnlocked(
+                        AgentOrchestrationLedgerEntry(
+                            receipt: unknown,
+                            outcome: "unknown",
+                            finalizedAt: updatedAt
+                        )
                     )
-                )
-                receipts[index] = unknown
-                if let reservationId = receipt.reservationId {
-                    reservationIds.append(reservationId)
+                    if let reservationId = receipt.reservationId {
+                        reservationIds.append(reservationId)
+                    }
                 }
+                // Always project demoted state to the caller (badge + persistence path).
+                receipts[index] = unknown
             }
 
             receipts.sort { $0.lifecycleUpdatedAt > $1.lifecycleUpdatedAt }
             return (receipts, reservationIds)
         }
-        for reservationId in result.reservationIds {
-            releaseReservation(reservationId)
+
+        let result: (receipts: [AgentOrchestrationAdmissionReceipt], reservationIds: [String])
+        if persistLifecycleReconciliation {
+            result = try repository.withReceiptMutation { try loadBody() }
+            for reservationId in result.reservationIds {
+                releaseReservation(reservationId)
+            }
+        } else {
+            // High-frequency badge poll: DEFERRED read lock only, no lifecycle writes.
+            result = try repository.withReceiptRead { try loadBody() }
         }
         return result.receipts
     }

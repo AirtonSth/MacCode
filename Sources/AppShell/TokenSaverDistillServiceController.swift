@@ -881,6 +881,7 @@ public final class TokenSaverDistillServiceController {
             "--model-url", model.url,
             "--max-concurrent-requests", String(memoryProfile.sidecarMaxConcurrentRequests),
             "--max-queue-depth", String(memoryProfile.sidecarMaxQueueDepth),
+            "--max-queue-wait-ms", String(memoryProfile.sidecarMaxQueueWaitMilliseconds),
             "--idle-timeout-ms", String(idleTimeoutMS)
         ]
 

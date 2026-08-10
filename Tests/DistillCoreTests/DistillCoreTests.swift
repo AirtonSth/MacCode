@@ -132,6 +132,42 @@ final class DistillCoreTests: XCTestCase {
         XCTAssertEqual(active, 0)
     }
 
+    func test_schedulerQueueWaitTimeoutFailsOpenWithoutDoubleResume() async throws {
+        // WHY: multi-thread agents stack behind multi-second MLX generations when
+        // the waiter queue has no time budget. Timeout must throw queueFull so the
+        // client keeps original tool output (Token Saver fail-open), and must not
+        // leave a waiter that double-resumes when the slot later frees.
+        let runtime = BlockingRuntime()
+        let scheduler = DistillScheduler(
+            runtime: runtime,
+            maxConcurrentRequests: 1,
+            maxQueueDepth: 4,
+            maxQueueWaitMilliseconds: 80
+        )
+
+        let first = Task {
+            try await scheduler.submit(DistillRequest(mode: .commandOutput, input: "held"))
+        }
+        while await runtime.pendingCount == 0 {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        do {
+            _ = try await scheduler.submit(DistillRequest(mode: .commandOutput, input: "waits"))
+            XCTFail("waiter must time out as queueFull instead of blocking unbounded")
+        } catch DistillError.queueFull {
+            // expected
+        }
+
+        let queued = await scheduler.queuedRequestCount
+        XCTAssertEqual(queued, 0, "timed-out waiter must be removed from the queue")
+
+        await runtime.releaseAll()
+        _ = try await first.value
+        let active = await scheduler.activeRequestCount
+        XCTAssertEqual(active, 0)
+    }
+
     func test_schedulerQueuesUpToBoundedDepthForRecurrentRequests() async throws {
         let runtime = BlockingRuntime()
         let scheduler = DistillScheduler(runtime: runtime, maxConcurrentRequests: 1, maxQueueDepth: 1)

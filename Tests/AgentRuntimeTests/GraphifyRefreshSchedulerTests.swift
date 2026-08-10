@@ -115,6 +115,76 @@ final class GraphifyRefreshSchedulerTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(updateCount, 2, "dirty during build must produce trailing update")
     }
 
+    func test_globalSingleFlightDefersSecondCheckoutUntilFirstCompletes() throws {
+        // WHY: two agent threads rooted in different large checkouts must not run
+        // graphify CLI concurrently, and the deferred checkout must not be lost.
+        let firstRepo = try makeGitRepo(named: "single-flight-a")
+        let secondRepo = try makeGitRepo(named: "single-flight-b")
+        let firstCheckout = try XCTUnwrap(GraphifyGitProbe.identity(at: firstRepo.path)?.checkout)
+        let secondCheckout = try XCTUnwrap(GraphifyGitProbe.identity(at: secondRepo.path)?.checkout)
+        let stateLock = NSLock()
+        let firstStarted = expectation(description: "first graphify update started")
+        let releaseFirst = DispatchSemaphore(value: 0)
+        var active = 0
+        var maximumActive = 0
+        var completedRoots = Set<String>()
+
+        service.runProcess = { args, cwd, env in
+            stateLock.lock()
+            active += 1
+            maximumActive = max(maximumActive, active)
+            let isFirst = completedRoots.isEmpty
+            stateLock.unlock()
+
+            if isFirst {
+                firstStarted.fulfill()
+                _ = releaseFirst.wait(timeout: .now() + 3)
+            }
+            let outDir = env?["GRAPHIFY_OUT"].map(URL.init(fileURLWithPath:))
+                ?? URL(fileURLWithPath: cwd).appendingPathComponent("graphify-out")
+            try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+            try? "{\"nodes\":[],\"edges\":[]}".write(
+                to: outDir.appendingPathComponent("graph.json"),
+                atomically: true,
+                encoding: .utf8
+            )
+
+            stateLock.lock()
+            active -= 1
+            completedRoots.insert(cwd)
+            stateLock.unlock()
+            return (0, args.joined(separator: " "), "")
+        }
+
+        service.requestRefresh(checkout: firstCheckout, force: true)
+        wait(for: [firstStarted], timeout: 2)
+        service.requestRefresh(checkout: secondCheckout, force: true)
+
+        stateLock.lock()
+        let activeWhileFirstHeld = active
+        let maxWhileFirstHeld = maximumActive
+        stateLock.unlock()
+        XCTAssertEqual(activeWhileFirstHeld, 1)
+        XCTAssertEqual(maxWhileFirstHeld, 1, "the global gate must admit only one CLI child")
+
+        releaseFirst.signal()
+        let deadline = Date().addingTimeInterval(4)
+        while Date() < deadline {
+            stateLock.lock()
+            let complete = completedRoots.count == 2
+            stateLock.unlock()
+            if complete { break }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+
+        stateLock.lock()
+        let finalRoots = completedRoots
+        let finalMaximum = maximumActive
+        stateLock.unlock()
+        XCTAssertEqual(finalRoots, Set([firstRepo.path, secondRepo.path]))
+        XCTAssertEqual(finalMaximum, 1, "deferred work must remain globally single-flight")
+    }
+
     func test_authoritativeResolveRefreshesEvenWhenGraphExists() throws {
         let repo = try makeGitRepo(named: "r3")
         guard let id = GraphifyGitProbe.identity(at: repo.path) else { return XCTFail("identity") }
@@ -182,4 +252,3 @@ final class GraphifyRefreshSchedulerTests: XCTestCase {
         return (p.terminationStatus, String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "")
     }
 }
-
