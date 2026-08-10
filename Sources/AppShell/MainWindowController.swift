@@ -263,15 +263,18 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     /// rebuild regressions that os.log alone cannot surface.
     var rebuildCount: Int = 0
 
-    /// Shell main-content destination. Scheduled Tasks opens here (same place
-    /// as workspaces), not in a separate NSWindow.
+    /// Shell main-content destination. Scheduled Tasks and Active Threads open
+    /// here (same place as workspaces), not in a separate NSWindow.
     private enum ShellContentMode: Equatable {
         case workspace
         case scheduledTasks
+        case activeThreads
     }
     private var shellContentMode: ShellContentMode = .workspace
     private var scheduledTasksViewModel: ScheduledTasksViewModel?
     private var scheduledTasksHostingView: NSView?
+    private var activeThreadsViewModel: ActiveThreadsViewModel?
+    private var activeThreadsHostingView: NSView?
 
     public init(context: AppContext, router: AppCommandRouter, updater: AppUpdateChecking? = nil) {
         self.context = context
@@ -307,6 +310,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         // (not a separate window). Sidebar routes both through this controller.
         sidebar.onPresentScheduledTasks = { [weak self] in
             self?.presentScheduledTasksInMainContent()
+        }
+        sidebar.onPresentActiveThreads = { [weak self] in
+            self?.presentActiveThreadsInMainContent()
         }
         sidebar.onWorkspaceContentActivated = { [weak self] in
             self?.presentWorkspaceContent()
@@ -584,6 +590,14 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
                 collapsedWorkspaceLabel.stringValue = "Schedule Tasks"
                 visibleWorkspaceLabel.stringValue = "Schedule Tasks"
                 window.title = "Schedule Tasks"
+                visibleFinderButton.isHidden = true
+                visibleNewWindowButton.isHidden = true
+                return
+            }
+            if shellContentMode == .activeThreads {
+                collapsedWorkspaceLabel.stringValue = "Active Threads"
+                visibleWorkspaceLabel.stringValue = "Active Threads"
+                window.title = "Active Threads"
                 visibleFinderButton.isHidden = true
                 visibleNewWindowButton.isHidden = true
                 return
@@ -926,10 +940,24 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     func presentScheduledTasksInMainContent() {
         shellContentMode = .scheduledTasks
         sidebar.setScheduledTasksSelected(true)
+        sidebar.setActiveThreadsSelected(false)
+        activeThreadsHostingView = nil
         lastWorkspaceContainerSignature = nil
         installScheduledTasksContent()
         updateCollapsedWorkspaceHeader()
         shellLog.debug("shellContentMode=scheduledTasks")
+    }
+
+    /// Active Threads shell destination: live actives + recent finished runs.
+    func presentActiveThreadsInMainContent() {
+        shellContentMode = .activeThreads
+        sidebar.setActiveThreadsSelected(true)
+        sidebar.setScheduledTasksSelected(false)
+        scheduledTasksHostingView = nil
+        lastWorkspaceContainerSignature = nil
+        installActiveThreadsContent()
+        updateCollapsedWorkspaceHeader()
+        shellLog.debug("shellContentMode=activeThreads")
     }
 
     /// Return the main content column to the selected workspace layout.
@@ -937,7 +965,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         guard shellContentMode != .workspace else { return }
         shellContentMode = .workspace
         sidebar.setScheduledTasksSelected(false)
+        sidebar.setActiveThreadsSelected(false)
         scheduledTasksHostingView = nil
+        activeThreadsHostingView = nil
         lastWorkspaceContainerSignature = nil
         rebuildWorkspaceContainer()
         updateCollapsedWorkspaceHeader()
@@ -968,15 +998,47 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         rebuildCount += 1
     }
 
+    private func installActiveThreadsContent() {
+        for sub in workspaceContent.subviews { sub.removeFromSuperview() }
+        paneControllers.removeAll()
+        guard let context, let router else {
+            let empty = makeEmptyState()
+            workspaceContent.addSubview(empty)
+            pin(empty, to: workspaceContent)
+            return
+        }
+        let vm = activeThreadsViewModel ?? ActiveThreadsViewModel(context: context, router: router)
+        activeThreadsViewModel = vm
+        vm.reload()
+        let host = NSHostingView(rootView: ActiveThreadsRootView(vm: vm))
+        host.translatesAutoresizingMaskIntoConstraints = false
+        host.wantsLayer = true
+        host.layer?.backgroundColor = DS.NS.bg.cgColor
+        RemoteCodeAppearance.apply(to: host)
+        workspaceContent.addSubview(host)
+        pin(host, to: workspaceContent)
+        activeThreadsHostingView = host
+        lastWorkspaceContainerSignature = "activeThreads"
+        rebuildCount += 1
+    }
+
     private func rebuildWorkspaceContainer() {
-        // Keep Schedule Tasks mounted across refreshFromState bursts while the
-        // user is on that shell destination.
+        // Keep Schedule Tasks / Active Threads mounted across refreshFromState
+        // bursts while the user is on that shell destination.
         if shellContentMode == .scheduledTasks {
             if scheduledTasksHostingView?.superview === workspaceContent {
                 scheduledTasksViewModel?.reload()
                 return
             }
             installScheduledTasksContent()
+            return
+        }
+        if shellContentMode == .activeThreads {
+            if activeThreadsHostingView?.superview === workspaceContent {
+                activeThreadsViewModel?.reload()
+                return
+            }
+            installActiveThreadsContent()
             return
         }
 
