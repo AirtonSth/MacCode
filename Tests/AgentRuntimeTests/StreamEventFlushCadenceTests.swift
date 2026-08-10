@@ -146,6 +146,113 @@ final class StreamEventFlushCadenceTests: XCTestCase {
         XCTAssertFalse(AgentRunCoordinator.activePlanFitsCompactBudget(tooLarge, stepLimit: 2, byteLimit: 256))
     }
 
+    /// R5-A: cheap estimate must be ≥ true JSON size so compact recovery never
+    /// admits a plan that would exceed the wire-byte ceiling.
+    func test_activePlanEstimatedCompactJSONBytes_isUpperBoundOfEncoder() throws {
+        // Control-only payload: every byte becomes `\u00XX` (6) on the wire.
+        let controlOnly = String(repeating: "\u{0001}", count: 100)
+        let fixtures: [AssistantActivePlan] = [
+            AssistantActivePlan(steps: [], updatedAtMs: 0),
+            AssistantActivePlan(
+                explanation: "short",
+                steps: [.init(id: "a", title: "t", status: .pending)],
+                updatedAtMs: 42
+            ),
+            AssistantActivePlan(
+                explanation: String(repeating: "plan ", count: 200),
+                steps: (0..<20).map {
+                    .init(id: "s\($0)", title: "Step \($0) with \"quotes\" and\nnewlines", status: .inProgress)
+                },
+                updatedAtMs: 1_700_000_000_000
+            ),
+            AssistantActivePlan(
+                explanation: "ctrl:\u{0001}\u{0008}\t",
+                steps: [.init(id: "x", title: "done", status: .completed)],
+                updatedAtMs: 9
+            ),
+            AssistantActivePlan(
+                explanation: controlOnly,
+                steps: [.init(id: controlOnly, title: controlOnly, status: .pending)],
+                updatedAtMs: 1
+            ),
+            AssistantActivePlan(
+                explanation: String(repeating: "\\\"", count: 80),
+                steps: [.init(id: "q", title: String(repeating: "\\", count: 40), status: .completed)],
+                updatedAtMs: 99
+            ),
+        ]
+        let encoder = JSONEncoder()
+        for plan in fixtures {
+            let encoded = try encoder.encode(plan)
+            XCTAssertGreaterThanOrEqual(
+                plan.estimatedCompactJSONBytes,
+                encoded.count,
+                "estimate must upper-bound JSON size (estimate=\(plan.estimatedCompactJSONBytes) encoded=\(encoded.count))"
+            )
+        }
+    }
+
+    func test_activePlanCompactBudget_microbench_estimateVsJSONEncoder() {
+        let plan = AssistantActivePlan(
+            explanation: String(repeating: "detail ", count: 80),
+            steps: (0..<40).map {
+                .init(id: "step-\($0)", title: "Title for step \($0) with more text", status: .pending)
+            },
+            updatedAtMs: 1_700_000_000_000
+        )
+        let iterations = 8_000
+        let warmup = 2
+        let samples = 5
+        let encoder = JSONEncoder()
+        let lock = NSLock()
+
+        func timeJSON() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var accepted = 0
+            for _ in 0..<iterations {
+                lock.lock()
+                let bytes = (try? encoder.encode(plan))?.count ?? Int.max
+                lock.unlock()
+                if bytes <= 256 * 1_024 { accepted &+= 1 }
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertEqual(accepted, iterations)
+            return Double(end - start) / 1_000_000.0
+        }
+        func timeEstimate() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var accepted = 0
+            for _ in 0..<iterations {
+                if plan.estimatedCompactJSONBytes <= 256 * 1_024 { accepted &+= 1 }
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertEqual(accepted, iterations)
+            return Double(end - start) / 1_000_000.0
+        }
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+
+        for _ in 0..<warmup { _ = timeJSON(); _ = timeEstimate() }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            before.append(timeJSON())
+            after.append(timeEstimate())
+        }
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = (beforeMed - afterMed) / beforeMed * 100.0
+        NSLog("[perf-proof] activePlan budget encode_ms=%@ estimate_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+              String(beforeMed), String(afterMed), improvement,
+              String(describing: before), String(describing: after))
+        XCTAssertGreaterThan(
+            improvement, 5.0,
+            "estimate-based plan budget must beat JSONEncoder by ≥5% (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
+        )
+    }
+
     func test_boundedHotReplay_keepsNewestFIFOAndNeverRetainsOversizedEvent() {
         let events = (0..<20).map {
             AssistantEvent.turnStarted(turnId: "turn-\($0)-" + String(repeating: "x", count: 64))
