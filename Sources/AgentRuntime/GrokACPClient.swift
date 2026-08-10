@@ -460,7 +460,20 @@ public final class GrokACPClient: @unchecked Sendable {
     static func launchArguments(for request: AgentRunRequest) throws -> [String] {
         guard request.environment[AgentAppRuntimeProfile.environmentKey]
                 == AgentAppRuntimeProfile.samGrokWorkerV1.rawValue else {
-            return launchArguments
+            // Regular ACP path: bind UI model/effort on process argv (global flags
+            // before `agent`), matching GrokRunner.buildArgs. Bare launchArguments
+            // previously dropped both, so picker selections had no effect when
+            // session/new did not return currentModelId (GROK-ACP-006).
+            var args: [String] = []
+            let model = request.model.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !model.isEmpty {
+                args.append(contentsOf: ["--model", model])
+            }
+            if let effort = request.reasoningEffort,
+               GrokRunner.modelSupportsReasoningEffort(model) {
+                args.append(contentsOf: GrokRunner.effortArgs(effort))
+            }
+            return args + launchArguments
         }
         let model = request.model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard request.provider == .grok,
