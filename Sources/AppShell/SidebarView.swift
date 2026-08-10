@@ -310,7 +310,10 @@ public final class SidebarViewModel: ObservableObject {
     public weak var router: AppCommandRouter?
 
     @Published public var workspaces: [Workspace] = [] {
-        didSet { busyStateCache.removeAll(keepingCapacity: true) }
+        didSet {
+            busyStateCache.removeAll(keepingCapacity: true)
+            filteredWorkspacesCache = nil
+        }
     }
     /// PERF-MAC_SHELL_WINDOW-003: memoize per-workspace busy state for the
     /// lifetime of one `workspaces` snapshot so repeated SwiftUI `body`
@@ -318,6 +321,11 @@ public final class SidebarViewModel: ObservableObject {
     /// every render. Invalidated whenever `workspaces` is reassigned via
     /// `reload`, which is driven by the same mutations that change busy.
     private var busyStateCache: [WorkspaceID: Bool] = [:]
+    // PERF: filteredWorkspaces is recomputed on every SwiftUI body evaluation
+    // and on the drag-scroll timer (16 Hz). Cache the last filtered result and
+    // invalidate only when workspaces or filterText changes so repeated renders
+    // without filter changes are O(1).
+    private var filteredWorkspacesCache: [Workspace]?
     /// UX-SIDEBAR-COMPLETED-DOT: workspaces whose in-progress action just finished
     /// (busy → idle) and that the user has not opened since. Drives the small
     /// "action completed" dot shown in the spinner's slot. Cleared when the
@@ -337,7 +345,9 @@ public final class SidebarViewModel: ObservableObject {
     /// workspace list. Empty string shows everything; matching is over
     /// name, description, and cwd. The backing `workspaces` array stays
     /// canonical so drag-reorder indices remain correct.
-    @Published public var filterText: String = ""
+    @Published public var filterText: String = "" {
+        didSet { if filterText != oldValue { filteredWorkspacesCache = nil } }
+    }
     @Published public var privateAccountUser: PrivateAccountUser?
     @Published public var updateAvailability: AppUpdateAvailability = .unknown
     @Published public private(set) var insomniaEnabled: Bool = false
@@ -1539,13 +1549,16 @@ public final class SidebarViewModel: ObservableObject {
     /// shown rows still carry the real workspace identities used by
     /// drag-reorder (which resolves indices against `workspaces`).
     public var filteredWorkspaces: [Workspace] {
+        if let cached = filteredWorkspacesCache { return cached }
         let query = filterText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !query.isEmpty else { return workspaces }
-        return workspaces.filter { ws in
+        let result = workspaces.filter { ws in
             if ws.name.lowercased().contains(query) { return true }
             if (ws.metadata["description"]?.lowercased().contains(query)) == true { return true }
             return ws.cwd.lowercased().contains(query)
         }
+        filteredWorkspacesCache = result
+        return result
     }
 
     public func newWorkspace() {
