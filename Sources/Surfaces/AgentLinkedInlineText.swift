@@ -57,10 +57,12 @@ struct AgentLinkedInlineText: View {
     var lineFragmentPadding: CGFloat = 0
     /// Extra spacing between lines (points), matching SwiftUI `.lineSpacing`.
     var lineSpacing: CGFloat = 0
+    /// When false, skip NSCache store for live streaming partials (R4-B).
+    var cacheResults: Bool = true
 
     var body: some View {
         AgentLinkedAttributedText(
-            attributed: AgentMessageMarkdown.attributedInline(text),
+            attributed: AgentMessageMarkdown.attributedInline(text, cache: cacheResults),
             font: Self.nsFont(size: fontSize, weight: fontWeight, monospaced: monospaced),
             textColor: textColor,
             lineFragmentPadding: lineFragmentPadding,
