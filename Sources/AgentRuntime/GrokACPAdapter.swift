@@ -776,10 +776,37 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
               let params = params as? [String: Any],
               params["sessionId"] as? String == session.providerThreadId,
               let update = params["update"] as? [String: Any] else {
-            if method.hasPrefix("_x.ai/") { emit(Self.runtimeEvent(method: method, payload: params), session: session) }
+            // Live grok-build emits `x.ai/*`; legacy/replay may use `_x.ai/*`.
+            // Leader may nest live method under underscore envelope `{method,params}`.
+            if Self.isGrokExtNotificationMethod(method) {
+                let (resolvedMethod, resolvedPayload) = Self.unwrapGrokExtNotification(
+                    method: method,
+                    params: params
+                )
+                emit(Self.runtimeEvent(method: resolvedMethod, payload: resolvedPayload), session: session)
+            }
             return
         }
         for event in session.mapper.consumeSessionUpdate(update) { emit(event, session: session) }
+    }
+
+    /// Live (`x.ai/…`) and legacy (`_x.ai/…`) Grok ACP extension notifications.
+    private static func isGrokExtNotificationMethod(_ method: String) -> Bool {
+        method.hasPrefix("x.ai/") || method.hasPrefix("_x.ai/")
+    }
+
+    /// Unwrap leader nested form: outer `_x.ai/…` with params `{ method, params }`.
+    private static func unwrapGrokExtNotification(
+        method: String,
+        params: Any?
+    ) -> (method: String, params: Any?) {
+        guard let dict = params as? [String: Any],
+              let nestedMethod = dict["method"] as? String,
+              isGrokExtNotificationMethod(nestedMethod),
+              dict.keys.contains("params") else {
+            return (method, params)
+        }
+        return (nestedMethod, dict["params"])
     }
 
     /// Apply load-time `session/update` to mapper session state only.
