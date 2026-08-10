@@ -3739,9 +3739,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         )
         let payloadJSON: String
         do {
-            // This path is not serialized by `mirrorEventLock`; keep its
-            // encoder local because JSONEncoder is mutable and not thread-safe.
-            let data = try JSONEncoder().encode(event)
+            let data = try encodeStreamEvent(event)
             guard let json = String(data: data, encoding: .utf8) else {
                 throw NSError(
                     domain: "RemoteCode.AgentRunCoordinator",

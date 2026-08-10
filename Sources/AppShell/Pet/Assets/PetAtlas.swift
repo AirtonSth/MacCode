@@ -198,9 +198,12 @@ final class PetAtlas {
         return try PetAtlas(manifestURL: manifestURL)
     }
 
+    // PERF: PetAtlas decodes two manifests per init (once per launch); share one decoder.
+    private static let manifestDecoder = JSONDecoder()
+
     init(manifestURL: URL) throws {
         let data = try Data(contentsOf: manifestURL)
-        self.manifest = try JSONDecoder().decode(PetAtlasManifest.self, from: data).validated()
+        self.manifest = try Self.manifestDecoder.decode(PetAtlasManifest.self, from: data).validated()
 
         let directory = manifestURL.deletingLastPathComponent()
         let atlasURL = directory.appendingPathComponent(manifest.atlas)
@@ -220,7 +223,7 @@ final class PetAtlas {
             throw PetAtlasError.missingResource(idleMicroManifestURL.lastPathComponent)
         }
         let idleMicroData = try Data(contentsOf: idleMicroManifestURL)
-        self.idleMicroManifest = try JSONDecoder().decode(
+        self.idleMicroManifest = try Self.manifestDecoder.decode(
             PetIdleMicroManifest.self,
             from: idleMicroData
         ).validated(frameBounds: CGRect(

@@ -3,14 +3,27 @@ import CoreModel
 import Darwin
 import CryptoKit
 
-let iso = ISO8601DateFormatter()
+// PERF: ISO8601DateFormatter is expensive and not thread-safe. The
+// persistence layer shares one formatter per process to avoid per-row
+// allocation, but Repositories are accessed from multiple queues. Wrap
+// the shared formatters with a short NSLock so concurrent
+// string(from:)/date(from:) are safe without per-call allocation.
+final class LockedISO8601Formatter: @unchecked Sendable {
+    private let lock = NSLock()
+    private let formatter: ISO8601DateFormatter
+    init(_ formatter: ISO8601DateFormatter) { self.formatter = formatter }
+    func string(from date: Date) -> String { lock.lock(); defer { lock.unlock() }; return formatter.string(from: date) }
+    func date(from string: String) -> Date? { lock.lock(); defer { lock.unlock() }; return formatter.date(from: string) }
+}
+
+let iso = LockedISO8601Formatter(ISO8601DateFormatter())
 /// Accept fractional ISO-8601 on read so checkpoint keyset timestamps that
 /// store sub-second precision still decode correctly on legacy list/detail paths.
-private let isoFractional: ISO8601DateFormatter = {
+private let isoFractional = LockedISO8601Formatter({
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     return formatter
-}()
+}())
 
 public enum PersistenceDataError: Error, CustomStringConvertible {
     case corruptProviderEventLog(String)

@@ -468,6 +468,8 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
     ///
     /// WHY static nonisolated: callers live on arbitrary actors; the parse is
     /// pure computation with no I/O, so it can run anywhere.
+    private static let blobsDecoder = JSONDecoder()
+
     public static func totalSizeFromBlobs(_ data: Data) -> Int64? {
         // HF ?blobs=true response: array of objects with "size" (Int64) fields.
         // We accept both top-level arrays and the `siblings` key of a model object.
@@ -478,7 +480,7 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
             let siblings: [BlobEntry]
         }
 
-        let decoder = JSONDecoder()
+        let decoder = Self.blobsDecoder
 
         // Try top-level array first.
         if let entries = try? decoder.decode([BlobEntry].self, from: data) {

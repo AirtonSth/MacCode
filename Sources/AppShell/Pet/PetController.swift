@@ -197,8 +197,8 @@ public final class PetController {
             }
             projectionWatermark = stored
             var scanCursor = stored
-            let decoder = JSONDecoder()
-            let timestampFormatter = ISO8601DateFormatter()
+            let decoder = Self.recoveryDecoder
+            let timestampFormatter = Self.recoveryTimestampFormatter
             while scanCursor < capturedCursor {
                 let rows = try context.eventLog.read(since: scanCursor, limit: 500)
                     .filter { $0.seq <= capturedCursor }
@@ -240,6 +240,11 @@ public final class PetController {
             return "Ready-item recovery could not be initialized."
         }
     }
+
+    // PERF: ISO8601DateFormatter is expensive; recovery can parse hundreds of rows.
+    // PetController is @MainActor, so one MainActor-isolated formatter avoids per-recovery alloc.
+    private static let recoveryTimestampFormatter = ISO8601DateFormatter()
+    private static let recoveryDecoder = JSONDecoder()
 
     // PERF: event-log recovery and live EventBus handling classify every
     // published kind. Array literals reallocated membership tables per event;

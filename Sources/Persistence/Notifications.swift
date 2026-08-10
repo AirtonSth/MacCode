@@ -22,7 +22,7 @@ public struct AppNotification: Codable, Sendable, Equatable, Identifiable {
 public final class NotificationRepository {
     let db: SQLiteDB
     public init(db: SQLiteDB) { self.db = db }
-    private let iso = ISO8601DateFormatter()
+    private let iso = LockedISO8601Formatter(ISO8601DateFormatter())
 
     public func insert(_ n: AppNotification) throws {
         let st = try db.prepare("""
