@@ -8,7 +8,7 @@ import CryptoKit
 // allocation, but Repositories are accessed from multiple queues. Wrap
 // the shared formatters with a short NSLock so concurrent
 // string(from:)/date(from:) are safe without per-call allocation.
-private final class LockedISO8601Formatter: @unchecked Sendable {
+final class LockedISO8601Formatter: @unchecked Sendable {
     private let lock = NSLock()
     private let formatter: ISO8601DateFormatter
     init(_ formatter: ISO8601DateFormatter) { self.formatter = formatter }
