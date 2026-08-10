@@ -166,7 +166,7 @@ public struct AgentModelPopoverPresentation: Equatable {
 
 @MainActor
 public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
-    @Published public var threads: [AgentThread] = []
+    @Published public var threads: [AgentThread] = [] { didSet { filteredThreadsCache = nil } }
     @Published public var selectedThreadId: AgentThreadID?
     /// Transcript paint lives on `transcriptState` so stream ticks do not
     /// republish chrome/rail fields on this object. Proxies keep `vm.messages` /
@@ -401,7 +401,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// retype. Cleared when a run starts or any non-error event arrives.
     @Published public private(set) var lastErrorRecoverable: Bool = false
     /// P2: search/filter query for the thread rail. Empty = show all threads.
-    @Published public var threadSearchQuery: String = ""
+    @Published public var threadSearchQuery: String = "" { didSet { if oldValue != threadSearchQuery { filteredThreadsCache = nil } } }
     /// UX-MAC_AGENT-STOP: true between the user clicking Stop and the run
     /// actually reaching a terminal state. Prevents repeated Stop clicks and
     /// shows a "Stopping..." label so the user knows the interrupt was sent.
@@ -2783,9 +2783,27 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     /// P2: threads visible in the rail after applying the search query.
     /// Empty query returns all non-subagent threads (nested workers stay off-rail).
+    // R7: memoize filteredThreads — rail re-evaluates body on every 16Hz drag tick
+    // and on every streaming delta (threads unchanged). Cache hit avoids filter+search.
+    // Invalidate when threads identity changes (count+first/last id) or query changes.
+    private var filteredThreadsCache: (query: String, count: Int, firstId: AgentThreadID?, lastId: AgentThreadID?, result: [AgentThread])?
     public var filteredThreads: [AgentThread] {
-        AgentAppViewModel.filterThreads(threads, query: threadSearchQuery)
+        let firstId = threads.first?.id
+        let lastId = threads.last?.id
+        if let cache = filteredThreadsCache,
+           cache.query == threadSearchQuery,
+           cache.count == threads.count,
+           cache.firstId == firstId,
+           cache.lastId == lastId {
+            return cache.result
+        }
+        let result = AgentAppViewModel.filterThreads(threads, query: threadSearchQuery)
+        filteredThreadsCache = (query: threadSearchQuery, count: threads.count, firstId: firstId, lastId: lastId, result: result)
+        return result
     }
+
+    /// Test seam to clear cache when threads array is mutated externally (tests).
+    func invalidateFilteredThreadsCache() { filteredThreadsCache = nil }
 
     /// Pure helper: drops orchestrated nested-worker rows, then applies search.
     /// Empty query keeps every non-subagent thread.
@@ -9870,17 +9888,21 @@ public struct AgentAppView: View {
                 Array(entries.suffix(from: idx))
             )
         }
-        var liveTail: [TranscriptEntry] = []
+        // R8: evita O(n²) insert(at:0) no tail de turns vivos (cada insert shifta).
+        // Coleta em ordem reversa e reverte uma vez → O(n).
         var end = entries.count
+        var revTail: [TranscriptEntry] = []
+        revTail.reserveCapacity(4)
         while end > 0 {
             let idx = end - 1
             if case .turn(let turn) = entries[idx], !turn.finished {
-                liveTail.insert(entries[idx], at: 0)
+                revTail.append(entries[idx])
                 end = idx
             } else {
                 break
             }
         }
+        let liveTail = Array(revTail.reversed())
         return (Array(entries.prefix(end)), liveTail)
     }
 
