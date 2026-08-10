@@ -81,4 +81,194 @@ final class AgentLinkedInlineTextTests: XCTestCase {
         XCTAssertEqual(textView.selectedRange(), NSRange(location: 0, length: value.length),
                        "routine SwiftUI updates with unchanged text must not collapse an in-progress multiline transcript selection")
     }
+
+    // MARK: - Update plan (skip redundant AppKit rebuilds)
+
+    /// WHY: Parent transcript refreshes re-enter updateNSView for every mounted
+    /// row while one message streams. Equal attributed + typography must be a
+    /// no-op so stable history rows do not rebuild NSAttributedString on the
+    /// main thread (observed freeze: AgentLinkedInlineTextRepresentable.apply).
+    func test_updatePlan_equalIndependentlyConstructedPresentation_isNoOp() {
+        let font = NSFont.systemFont(ofSize: 13)
+        let color = DS.NS.text
+        let a = AgentLinkedInlineTextAppliedState(
+            attributed: AttributedString("stable history row with `Package.swift`"),
+            font: font,
+            textColor: color,
+            lineSpacing: 5,
+            maximumNumberOfLines: nil,
+            lineFragmentPadding: 0
+        )
+        let b = AgentLinkedInlineTextAppliedState(
+            attributed: AttributedString("stable history row with `Package.swift`"),
+            font: NSFont.systemFont(ofSize: 13),
+            textColor: color,
+            lineSpacing: 5,
+            maximumNumberOfLines: nil,
+            lineFragmentPadding: 0
+        )
+        let plan = AgentLinkedInlineTextUpdatePlan.make(previous: a, next: b)
+        XCTAssertTrue(plan.isNoOp, "semantically equal rows must skip conversion and layout")
+        XCTAssertFalse(plan.storageDirty)
+        XCTAssertFalse(plan.heightDirty)
+    }
+
+    func test_updatePlan_sameCharactersDifferentLinkDestination_marksStorageDirty() {
+        var first = AttributedString("docs")
+        first.link = URL(string: "https://example.com/a")
+        var second = AttributedString("docs")
+        second.link = URL(string: "https://example.com/b")
+        let font = NSFont.systemFont(ofSize: 13)
+        let previous = AgentLinkedInlineTextAppliedState(
+            attributed: first,
+            font: font,
+            textColor: DS.NS.text,
+            lineSpacing: 0,
+            maximumNumberOfLines: nil,
+            lineFragmentPadding: 0
+        )
+        let next = AgentLinkedInlineTextAppliedState(
+            attributed: second,
+            font: font,
+            textColor: DS.NS.text,
+            lineSpacing: 0,
+            maximumNumberOfLines: nil,
+            lineFragmentPadding: 0
+        )
+        let plan = AgentLinkedInlineTextUpdatePlan.make(previous: previous, next: next)
+        XCTAssertTrue(plan.storageDirty,
+                      "plain-string fingerprints are insufficient; link URL changes must rebuild storage")
+        XCTAssertTrue(plan.heightDirty,
+                      "attributed changes conservatively invalidate height (runs may affect metrics)")
+    }
+
+    func test_updatePlan_streamingAppend_marksStorageAndHeightDirty() {
+        let font = NSFont.systemFont(ofSize: 13)
+        let previous = AgentLinkedInlineTextAppliedState(
+            attributed: AttributedString("Hello"),
+            font: font,
+            textColor: DS.NS.text,
+            lineSpacing: 5,
+            maximumNumberOfLines: nil,
+            lineFragmentPadding: 0
+        )
+        let next = AgentLinkedInlineTextAppliedState(
+            attributed: AttributedString("Hello world"),
+            font: font,
+            textColor: DS.NS.text,
+            lineSpacing: 5,
+            maximumNumberOfLines: nil,
+            lineFragmentPadding: 0
+        )
+        let plan = AgentLinkedInlineTextUpdatePlan.make(previous: previous, next: next)
+        XCTAssertTrue(plan.storageDirty)
+        XCTAssertTrue(plan.heightDirty)
+        XCTAssertFalse(plan.isNoOp)
+    }
+
+    func test_updatePlan_colorOnly_storageDirtyWithoutHeight() {
+        let font = NSFont.systemFont(ofSize: 13)
+        let previous = AgentLinkedInlineTextAppliedState(
+            attributed: AttributedString("palette swap"),
+            font: font,
+            textColor: DS.NS.text,
+            lineSpacing: 5,
+            maximumNumberOfLines: nil,
+            lineFragmentPadding: 0
+        )
+        let next = AgentLinkedInlineTextAppliedState(
+            attributed: AttributedString("palette swap"),
+            font: font,
+            textColor: DS.NS.textSecondary,
+            lineSpacing: 5,
+            maximumNumberOfLines: nil,
+            lineFragmentPadding: 0
+        )
+        let plan = AgentLinkedInlineTextUpdatePlan.make(previous: previous, next: next)
+        XCTAssertTrue(plan.storageDirty, "color-only must restyle storage")
+        XCTAssertFalse(plan.heightDirty, "color-only must not force intrinsic height invalidation")
+    }
+
+    func test_updatePlan_fontLineSpacingMaxLinesPadding_driveExpectedFlags() {
+        let base = AgentLinkedInlineTextAppliedState(
+            attributed: AttributedString("metrics"),
+            font: NSFont.systemFont(ofSize: 13),
+            textColor: DS.NS.text,
+            lineSpacing: 5,
+            maximumNumberOfLines: nil,
+            lineFragmentPadding: 0
+        )
+
+        let fontPlan = AgentLinkedInlineTextUpdatePlan.make(
+            previous: base,
+            next: AgentLinkedInlineTextAppliedState(
+                attributed: base.attributed,
+                font: NSFont.systemFont(ofSize: 15, weight: .semibold),
+                textColor: base.textColor,
+                lineSpacing: base.lineSpacing,
+                maximumNumberOfLines: base.maximumNumberOfLines,
+                lineFragmentPadding: base.lineFragmentPadding
+            )
+        )
+        XCTAssertTrue(fontPlan.storageDirty && fontPlan.heightDirty)
+
+        let spacingPlan = AgentLinkedInlineTextUpdatePlan.make(
+            previous: base,
+            next: AgentLinkedInlineTextAppliedState(
+                attributed: base.attributed,
+                font: base.font,
+                textColor: base.textColor,
+                lineSpacing: 8,
+                maximumNumberOfLines: base.maximumNumberOfLines,
+                lineFragmentPadding: base.lineFragmentPadding
+            )
+        )
+        XCTAssertTrue(spacingPlan.storageDirty && spacingPlan.heightDirty)
+
+        let maxLinesPlan = AgentLinkedInlineTextUpdatePlan.make(
+            previous: base,
+            next: AgentLinkedInlineTextAppliedState(
+                attributed: base.attributed,
+                font: base.font,
+                textColor: base.textColor,
+                lineSpacing: base.lineSpacing,
+                maximumNumberOfLines: 2,
+                lineFragmentPadding: base.lineFragmentPadding
+            )
+        )
+        XCTAssertFalse(maxLinesPlan.storageDirty)
+        XCTAssertTrue(maxLinesPlan.heightDirty)
+        XCTAssertTrue(maxLinesPlan.maximumNumberOfLinesDirty)
+
+        let paddingPlan = AgentLinkedInlineTextUpdatePlan.make(
+            previous: base,
+            next: AgentLinkedInlineTextAppliedState(
+                attributed: base.attributed,
+                font: base.font,
+                textColor: base.textColor,
+                lineSpacing: base.lineSpacing,
+                maximumNumberOfLines: base.maximumNumberOfLines,
+                lineFragmentPadding: 4
+            )
+        )
+        XCTAssertFalse(paddingPlan.storageDirty)
+        XCTAssertTrue(paddingPlan.heightDirty)
+        XCTAssertTrue(paddingPlan.lineFragmentPaddingDirty)
+    }
+
+    func test_updatePlan_nilPrevious_isFullyDirty() {
+        let next = AgentLinkedInlineTextAppliedState(
+            attributed: AttributedString("first mount"),
+            font: NSFont.systemFont(ofSize: 13),
+            textColor: DS.NS.text,
+            lineSpacing: 0,
+            maximumNumberOfLines: nil,
+            lineFragmentPadding: 0
+        )
+        let plan = AgentLinkedInlineTextUpdatePlan.make(previous: nil, next: next)
+        XCTAssertTrue(plan.storageDirty)
+        XCTAssertTrue(plan.heightDirty)
+        XCTAssertTrue(plan.maximumNumberOfLinesDirty)
+        XCTAssertTrue(plan.lineFragmentPaddingDirty)
+    }
 }

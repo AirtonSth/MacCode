@@ -121,6 +121,65 @@ struct AgentLinkedAttributedText: View {
     }
 }
 
+/// Last presentation applied to an `NSTextView` for a linked transcript cell.
+///
+/// WHY: SwiftUI re-calls `updateNSView` for every parent body refresh (e.g. one
+/// streaming token). Rebuilding `NSAttributedString` for every stable older row
+/// saturates the main thread. Cache the full semantic presentation so equal
+/// rows skip conversion and layout; plain-string fingerprints are insufficient
+/// because identical characters can carry different link destinations.
+struct AgentLinkedInlineTextAppliedState {
+    let attributed: AttributedString
+    let font: NSFont
+    let textColor: NSColor
+    let lineSpacing: CGFloat
+    let maximumNumberOfLines: Int?
+    let lineFragmentPadding: CGFloat
+}
+
+/// Pure dirty-flag plan for transcript text updates (test seam).
+struct AgentLinkedInlineTextUpdatePlan: Equatable {
+    let storageDirty: Bool
+    let heightDirty: Bool
+    let maximumNumberOfLinesDirty: Bool
+    let lineFragmentPaddingDirty: Bool
+
+    var isNoOp: Bool {
+        !storageDirty && !heightDirty && !maximumNumberOfLinesDirty && !lineFragmentPaddingDirty
+    }
+
+    /// Compare previous applied state to the next presentation.
+    ///
+    /// - storageDirty: rebuild attributed storage (text, font, color, line spacing).
+    /// - heightDirty: intrinsic height / layout may change (not color-only).
+    static func make(
+        previous: AgentLinkedInlineTextAppliedState?,
+        next: AgentLinkedInlineTextAppliedState
+    ) -> AgentLinkedInlineTextUpdatePlan {
+        guard let previous else {
+            return AgentLinkedInlineTextUpdatePlan(
+                storageDirty: true,
+                heightDirty: true,
+                maximumNumberOfLinesDirty: true,
+                lineFragmentPaddingDirty: true
+            )
+        }
+        let attributedChanged = previous.attributed != next.attributed
+        let fontChanged = !previous.font.isEqual(next.font)
+        let textColorChanged = !previous.textColor.isEqual(next.textColor)
+        let lineSpacingChanged = previous.lineSpacing != next.lineSpacing
+        let maximumLinesChanged = previous.maximumNumberOfLines != next.maximumNumberOfLines
+        let paddingChanged = previous.lineFragmentPadding != next.lineFragmentPadding
+        return AgentLinkedInlineTextUpdatePlan(
+            storageDirty: attributedChanged || fontChanged || textColorChanged || lineSpacingChanged,
+            heightDirty: attributedChanged || fontChanged || lineSpacingChanged
+                || maximumLinesChanged || paddingChanged,
+            maximumNumberOfLinesDirty: maximumLinesChanged,
+            lineFragmentPaddingDirty: paddingChanged
+        )
+    }
+}
+
 /// Internal so unit tests can assert link runs carry pointingHand after conversion.
 struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
     let attributed: AttributedString
@@ -172,25 +231,55 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
     }
 
     func updateNSView(_ tv: IntrinsicHeightTextView, context: Context) {
+        // Always refresh routing even when presentation is unchanged.
         context.coordinator.openURL = openURL
         context.coordinator.textView = tv
         apply(to: tv, context: context)
     }
 
     private func apply(to tv: IntrinsicHeightTextView, context: Context) {
-        tv.textContainer?.maximumNumberOfLines = maximumNumberOfLines ?? 0
-        tv.textContainer?.lineBreakMode = maximumNumberOfLines == nil ? .byWordWrapping : .byTruncatingTail
-        let ns = Self.makeNSAttributedString(
+        let next = AgentLinkedInlineTextAppliedState(
             attributed: attributed,
             font: font,
             textColor: textColor,
-            lineSpacing: lineSpacing
+            lineSpacing: lineSpacing,
+            maximumNumberOfLines: maximumNumberOfLines,
+            lineFragmentPadding: lineFragmentPadding
         )
-        Self.applyTextStorage(ns, to: tv)
-        tv.font = font
-        tv.textColor = textColor
-        tv.invalidateIntrinsicContentSize()
-        tv.needsLayout = true
+        let plan = AgentLinkedInlineTextUpdatePlan.make(
+            previous: context.coordinator.applied,
+            next: next
+        )
+        // WHY: Parent transcript refreshes re-enter updateNSView for every
+        // mounted row. Skip conversion/layout when the cell is semantically
+        // identical so only the actively streaming row pays rebuild cost.
+        guard !plan.isNoOp else { return }
+
+        if plan.maximumNumberOfLinesDirty {
+            tv.textContainer?.maximumNumberOfLines = maximumNumberOfLines ?? 0
+            tv.textContainer?.lineBreakMode = maximumNumberOfLines == nil
+                ? .byWordWrapping
+                : .byTruncatingTail
+        }
+        if plan.lineFragmentPaddingDirty {
+            tv.textContainer?.lineFragmentPadding = lineFragmentPadding
+        }
+        if plan.storageDirty {
+            let ns = Self.makeNSAttributedString(
+                attributed: attributed,
+                font: font,
+                textColor: textColor,
+                lineSpacing: lineSpacing
+            )
+            Self.applyTextStorage(ns, to: tv)
+            tv.font = font
+            tv.textColor = textColor
+        }
+        if plan.heightDirty {
+            tv.invalidateIntrinsicContentSize()
+            tv.needsLayout = true
+        }
+        context.coordinator.applied = next
     }
 
     static func applyTextStorage(_ next: NSAttributedString, to textView: NSTextView) {
@@ -242,6 +331,8 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextViewDelegate {
         var openURL: OpenURLAction
         weak var textView: NSTextView?
+        /// Last presentation successfully applied to this view's storage/layout.
+        var applied: AgentLinkedInlineTextAppliedState?
 
         init(openURL: OpenURLAction) {
             self.openURL = openURL
