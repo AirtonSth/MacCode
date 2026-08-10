@@ -9526,9 +9526,12 @@ public struct AgentAppView: View {
     /// Content key for the view-level hidden-persisted memo.
     ///
     /// Inputs that actually change `hiddenPersistedAssistantMessageIDs` outcomes:
-    /// assistant message identity + body utf8 length, and per-turn final /
-    /// renderable assistant body utf8 totals (and item ids). Deliberately omits
-    /// `timelineUpdateTick` so pure paint ticks with unchanged content hit cache.
+    /// assistant message identity + content digest, and per-turn final /
+    /// renderable assistant body content digests (and item ids). Deliberately
+    /// omits `timelineUpdateTick` so pure paint ticks with unchanged content
+    /// hit cache. Digests are cheap `Hasher` folds over text content — not
+    /// UTF-8 length alone — so equal-length replacements (e.g. "alpha"→"bravo")
+    /// invalidate the memo and force hide-set recompute.
     nonisolated static func hiddenPersistedAssistantContentKey(
         messages: [AgentMessage],
         timelineTurns: [AssistantTurnSnapshot]
@@ -9536,21 +9539,29 @@ public struct AgentAppView: View {
         var key = "m\(messages.count)"
         for message in messages {
             if message.role != .assistant { continue }
-            key += "|a\(message.id.value.uuidString):\(message.content.utf8.count)"
+            key += "|a\(message.id.value.uuidString):\(hiddenPersistedTextDigest(message.content))"
         }
         key += "|t\(timelineTurns.count)"
         for turn in timelineTurns {
-            let finalBytes = turn.finalAssistantMessage?.utf8.count ?? 0
-            var bodyBytes = 0
+            var bodyHasher = Hasher()
             var itemIds = ""
             for item in turn.items where item.type == .assistantMessage {
-                bodyBytes += item.body.utf8.count
+                bodyHasher.combine(item.body)
                 if !itemIds.isEmpty { itemIds += "," }
                 itemIds += item.id
             }
-            key += "|\(turn.turnId):f\(finalBytes):b\(bodyBytes):i\(itemIds):fin\(turn.finished ? 1 : 0)"
+            let finalDigest = hiddenPersistedTextDigest(turn.finalAssistantMessage ?? "")
+            key += "|\(turn.turnId):f\(finalDigest):b\(bodyHasher.finalize()):i\(itemIds):fin\(turn.finished ? 1 : 0)"
         }
         return key
+    }
+
+    /// Within-process content fingerprint for memo keys. Combines full text so
+    /// equal-length swaps do not collide (unlike utf8.count alone).
+    nonisolated static func hiddenPersistedTextDigest(_ text: String) -> Int {
+        var hasher = Hasher()
+        hasher.combine(text)
+        return hasher.finalize()
     }
 
     static func hiddenPersistedAssistantMessageIDs(messages: [AgentMessage],

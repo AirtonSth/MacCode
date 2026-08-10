@@ -1722,6 +1722,169 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
     }
 
+    /// Equal-length body/final (and message) swaps must change the content key.
+    /// Length-only fingerprints would collide on "alpha"→"bravo" and serve a
+    /// stale hide set; digests over content close that hole.
+    func test_hiddenPersistedContentKey_changesOnEqualLengthContentReplacement() {
+        let thread = AgentThreadID()
+        let msgId = AgentMessageID()
+        // Same identity + same UTF-8 length; only the text differs.
+        let msgAlpha = AgentMessage(id: msgId, threadId: thread, role: .assistant, content: "alpha")
+        let msgBravo = AgentMessage(id: msgId, threadId: thread, role: .assistant, content: "bravo")
+        XCTAssertEqual(msgAlpha.content.utf8.count, msgBravo.content.utf8.count)
+
+        let turnAlpha = AssistantTurnSnapshot(
+            turnId: "t1",
+            items: [
+                AssistantItem(id: "a1", turnId: "t1", type: .assistantMessage,
+                              body: "alpha", startedAtMs: 1)
+            ],
+            finalAssistantMessage: "alpha",
+            finished: true
+        )
+        let turnBravo = AssistantTurnSnapshot(
+            turnId: "t1",
+            items: [
+                AssistantItem(id: "a1", turnId: "t1", type: .assistantMessage,
+                              body: "bravo", startedAtMs: 1)
+            ],
+            finalAssistantMessage: "bravo",
+            finished: true
+        )
+        XCTAssertEqual(
+            turnAlpha.items[0].body.utf8.count,
+            turnBravo.items[0].body.utf8.count
+        )
+        XCTAssertEqual(
+            turnAlpha.finalAssistantMessage?.utf8.count,
+            turnBravo.finalAssistantMessage?.utf8.count
+        )
+
+        let kAlpha = AgentAppView.hiddenPersistedAssistantContentKey(
+            messages: [msgAlpha], timelineTurns: [turnAlpha]
+        )
+        let kBravo = AgentAppView.hiddenPersistedAssistantContentKey(
+            messages: [msgBravo], timelineTurns: [turnBravo]
+        )
+        XCTAssertNotEqual(
+            kAlpha, kBravo,
+            "equal-length alpha→bravo on message/body/final must change the content key"
+        )
+
+        // Body-only equal-length swap (final + message unchanged).
+        let turnBodyOnly = AssistantTurnSnapshot(
+            turnId: "t1",
+            items: [
+                AssistantItem(id: "a1", turnId: "t1", type: .assistantMessage,
+                              body: "bravo", startedAtMs: 1)
+            ],
+            finalAssistantMessage: "alpha",
+            finished: true
+        )
+        XCTAssertNotEqual(
+            AgentAppView.hiddenPersistedAssistantContentKey(
+                messages: [msgAlpha], timelineTurns: [turnAlpha]
+            ),
+            AgentAppView.hiddenPersistedAssistantContentKey(
+                messages: [msgAlpha], timelineTurns: [turnBodyOnly]
+            ),
+            "equal-length body swap alone must change the content key"
+        )
+
+        // Final-only equal-length swap (body + message unchanged).
+        let turnFinalOnly = AssistantTurnSnapshot(
+            turnId: "t1",
+            items: [
+                AssistantItem(id: "a1", turnId: "t1", type: .assistantMessage,
+                              body: "alpha", startedAtMs: 1)
+            ],
+            finalAssistantMessage: "bravo",
+            finished: true
+        )
+        XCTAssertNotEqual(
+            AgentAppView.hiddenPersistedAssistantContentKey(
+                messages: [msgAlpha], timelineTurns: [turnAlpha]
+            ),
+            AgentAppView.hiddenPersistedAssistantContentKey(
+                messages: [msgAlpha], timelineTurns: [turnFinalOnly]
+            ),
+            "equal-length final swap alone must change the content key"
+        )
+
+        // Message-only equal-length swap (turns unchanged).
+        XCTAssertNotEqual(
+            AgentAppView.hiddenPersistedAssistantContentKey(
+                messages: [msgAlpha], timelineTurns: [turnAlpha]
+            ),
+            AgentAppView.hiddenPersistedAssistantContentKey(
+                messages: [msgBravo], timelineTurns: [turnAlpha]
+            ),
+            "equal-length persisted message swap alone must change the content key"
+        )
+
+        // When evaluated, hide set recomputes for equal-length content swaps
+        // (multi-item combined live answer — same path as production hide).
+        // Avoid SR1 semantic prefixes (S/C/D/R/O/N/P) so neither body is
+        // filtered as dialect. Single-item live body that equals persisted is
+        // intentionally *not* hidden; multi-item join is.
+        let contentA = "hello there friendx"
+        let contentB = "hello there buddyyy" // same UTF-8 length, different text
+        XCTAssertEqual(contentA.utf8.count, contentB.utf8.count)
+        let msgCombinedA = AgentMessage(id: msgId, threadId: thread, role: .assistant, content: contentA)
+        let msgCombinedB = AgentMessage(id: msgId, threadId: thread, role: .assistant, content: contentB)
+        let turnCombinedA = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage,
+                              body: "hello there", startedAtMs: 1),
+                AssistantItem(id: "msg-2", turnId: "turn-1", type: .assistantMessage,
+                              body: "friendx", startedAtMs: 2)
+            ],
+            finalAssistantMessage: nil,
+            finished: true
+        )
+        let turnCombinedB = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage,
+                              body: "hello there", startedAtMs: 1),
+                AssistantItem(id: "msg-2", turnId: "turn-1", type: .assistantMessage,
+                              body: "buddyyy", startedAtMs: 2)
+            ],
+            finalAssistantMessage: nil,
+            finished: true
+        )
+        XCTAssertNotEqual(
+            AgentAppView.hiddenPersistedAssistantContentKey(
+                messages: [msgCombinedA], timelineTurns: [turnCombinedA]
+            ),
+            AgentAppView.hiddenPersistedAssistantContentKey(
+                messages: [msgCombinedB], timelineTurns: [turnCombinedB]
+            ),
+            "equal-length combined-answer swap must change the content key"
+        )
+        XCTAssertEqual(
+            AgentAppView.hiddenPersistedAssistantMessageIDs(
+                messages: [msgCombinedA], timelineTurns: [turnCombinedA]
+            ),
+            [msgCombinedA.id],
+            "matching combined live+persisted must hide"
+        )
+        XCTAssertTrue(
+            AgentAppView.hiddenPersistedAssistantMessageIDs(
+                messages: [msgCombinedA], timelineTurns: [turnCombinedB]
+            ).isEmpty,
+            "equal-length different combined live must not hide (would be stale if key collided)"
+        )
+        XCTAssertEqual(
+            AgentAppView.hiddenPersistedAssistantMessageIDs(
+                messages: [msgCombinedB], timelineTurns: [turnCombinedB]
+            ),
+            [msgCombinedB.id],
+            "matching B live+persisted must hide after equal-length replacement"
+        )
+    }
+
     /// Microbench optional: content-key build vs full hide recompute on tick-only
     /// (same content, n≥5). Proves skip path stays cheaper than recompute.
     func test_microbench_hiddenPersisted_keyHitFasterThanFullRecompute() throws {
