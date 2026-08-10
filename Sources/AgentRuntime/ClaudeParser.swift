@@ -273,6 +273,20 @@ public final class ClaudeParser {
             if let usage = tokenUsage(from: obj) {
                 out.append(.tokenUsage(usage))
             }
+            // CLAUDE-AMBIENT-TASK-RESULT: on resume the CLI dumps orphaned
+            // background-task notifications and may emit a success result with
+            // origin.kind == "task-notification", num_turns == 0, and an empty
+            // body — without processing the user prompt. Completing a turn for
+            // that ambient result finishes the host run empty ("without producing
+            // an assistant response"). Keep usage accounting; do not own lifecycle.
+            if !isError,
+               Self.isAmbientTaskNotificationResult(
+                obj,
+                resultText: resultText,
+                hasAssistantBody: !assembledAssistantBody.isEmpty
+               ) {
+                break
+            }
             if isError {
                 let msg = resultText
                     ?? (obj["error"] as? [String: Any])?["message"] as? String
@@ -818,6 +832,31 @@ public final class ClaudeParser {
 
     private static func isExitPlanMode(_ name: String?) -> Bool {
         name?.replacingOccurrences(of: "_", with: "").replacingOccurrences(of: "-", with: "").lowercased() == "exitplanmode"
+    }
+
+    /// True when a CLI `result` is only the ambient dump of orphaned background
+    /// task notifications (not a user-turn terminal).
+    ///
+    /// Wire shape observed on resume after a previous Claude process exit:
+    /// `{type:"result", subtype:"success", is_error:false, result:"", num_turns:0,
+    ///  origin:{kind:"task-notification"}, …}`.
+    /// Pure — no I/O. Exposed via tests through parseLine behavior.
+    static func isAmbientTaskNotificationResult(
+        _ obj: [String: Any],
+        resultText: String?,
+        hasAssistantBody: Bool
+    ) -> Bool {
+        // Real model output always owns the lifecycle, even if origin is set.
+        if hasAssistantBody { return false }
+        if let text = resultText, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return false
+        }
+        if (obj["is_error"] as? Bool) == true { return false }
+        guard let origin = obj["origin"] as? [String: Any] else { return false }
+        let kind = (origin["kind"] as? String)
+            ?? (origin["type"] as? String)
+            ?? ""
+        return kind == "task-notification"
     }
 
     private func planMarkdown(from payload: Any?) -> String? {

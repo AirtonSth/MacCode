@@ -1758,6 +1758,8 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
                 session.activeTurnId = nil
                 lock.unlock()
                 emitSessionSnapshot(session: session, reason: "turn_completed")
+                // Ambient task-notification results are filtered in ClaudeParser
+                // (no turnCompleted). Any turnCompleted here owns the lifecycle.
                 finishActiveTurn(session, finalMessage: finalMessage)
             }
         }
