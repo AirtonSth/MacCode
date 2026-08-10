@@ -118,6 +118,8 @@ final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
                      "session count is unlimited — user controls concurrent agents")
         XCTAssertEqual(profile.sidecarMaxConcurrentRequests, 1)
         XCTAssertEqual(profile.sidecarMaxQueueDepth, 4)
+        XCTAssertEqual(profile.sidecarMaxQueueWaitMilliseconds, 750,
+                       "tiny machines fail open quickly instead of stacking MLX waits")
         XCTAssertEqual(profile.idleReleaseAge, 60,
                        "only safely resumable completed sessions use the shorter release window")
         XCTAssertNil(profile.hostProcessCeilingKB,
@@ -125,11 +127,41 @@ final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
         XCTAssertNil(profile.managedTreeCeilingKB)
     }
 
+    func test_memoryProfileScalesDistillConcurrencyWithInstalledRAM() {
+        // WHY: multi-thread agents on high-RAM Macs were stuck at concurrent=4 because
+        // the profile only had 8g vs "everything else". Tiers must grow with RAM while
+        // still capping concurrent (GPU serializes MLX) and keeping a finite queue wait.
+        let gib = UInt64(1_024 * 1_024 * 1_024)
+        let mid = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: 16 * gib)
+        XCTAssertEqual(mid.name, "mid-memory-16g")
+        XCTAssertEqual(mid.sidecarMaxConcurrentRequests, 2)
+        XCTAssertEqual(mid.sidecarMaxQueueDepth, 8)
+        XCTAssertEqual(mid.sidecarMaxQueueWaitMilliseconds, 1_000)
+
+        let standard = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: 32 * gib)
+        XCTAssertEqual(standard.name, "standard-32g")
+        XCTAssertEqual(standard.sidecarMaxConcurrentRequests, 4)
+        XCTAssertEqual(standard.sidecarMaxQueueDepth, 16)
+        XCTAssertEqual(standard.sidecarMaxQueueWaitMilliseconds, 1_500)
+
+        let high64 = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: 64 * gib)
+        XCTAssertEqual(high64.name, "high-memory-64g")
+        XCTAssertEqual(high64.sidecarMaxConcurrentRequests, 6)
+        XCTAssertEqual(high64.sidecarMaxQueueDepth, 24)
+
+        let high128 = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: 128 * gib)
+        XCTAssertEqual(high128.name, "high-memory-128g")
+        XCTAssertEqual(high128.sidecarMaxConcurrentRequests, 8)
+        XCTAssertEqual(high128.sidecarMaxQueueDepth, 32)
+        XCTAssertEqual(high128.sidecarMaxQueueWaitMilliseconds, 2_500)
+        XCTAssertNil(high128.providerRootCap, "provider starts stay user-controlled at every tier")
+    }
+
     func test_standardProfileHasUnlimitedProviderRootCap() {
         let profile = ManagedProcessMemoryProfile.resolve(
             physicalMemoryBytes: UInt64(16) * 1_024 * 1_024 * 1_024
         )
-        XCTAssertEqual(profile.name, "standard")
+        XCTAssertEqual(profile.name, "mid-memory-16g")
         XCTAssertNil(profile.providerRootCap,
                      "Codex long-lived app-servers must not hit a fixed session budget")
         XCTAssertEqual(

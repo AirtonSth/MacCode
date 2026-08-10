@@ -8,10 +8,10 @@ import Persistence
 /// Authoritative, fail-closed admission for paid `/v1/distill` work.
 ///
 /// Inherited hints and a previously installed CLI symlink are routing aids, not
-/// authority: both can outlive a toggle. The current app setting and the live
-/// sidecar state-file lease are re-read for every request. Removing the lease is
-/// the first step of controller teardown, so a process that already loaded stale
-/// state cannot submit another compression request while the sidecar exits.
+/// authority: both can outlive a toggle. The live sidecar state-file lease is
+/// re-read before any short positive DB-admission cache on every request.
+/// Removing the lease is the first step of controller teardown, so a process that
+/// already loaded stale settings cannot submit compression while the sidecar exits.
 private final class LiveTokenSaverDistillAdmission: @unchecked Sendable {
     private struct StateLease: Decodable, Equatable {
         let baseURL: String
@@ -84,7 +84,14 @@ private final class LiveTokenSaverDistillAdmission: @unchecked Sendable {
         self.settingsRepository = stores.repository
     }
 
+    // Short positive DB-admission cache: N MCP children call isAdmitted per tool.
+    // The state-file lease is still checked before this cache on every request;
+    // controller teardown removes that lease first, so toggle-off fails closed.
+    private static let admissionCacheLock = NSLock()
+    private static var admissionCache: (token: String, admitted: Bool, expires: Date)?
+
     func isAdmitted() -> Bool {
+        let now = Date()
         guard Self.isOwnedRegularFile(stateURL),
               let lease = Self.readLease(stateURL),
               lease.authToken == expectedAuthToken,
@@ -93,9 +100,24 @@ private final class LiveTokenSaverDistillAdmission: @unchecked Sendable {
               Self.processIsAlive(expectedPID) else {
             return false
         }
+        Self.admissionCacheLock.lock()
+        if let cache = Self.admissionCache,
+           cache.token == expectedAuthToken,
+           cache.admitted,
+           cache.expires > now {
+            Self.admissionCacheLock.unlock()
+            return true
+        }
+        Self.admissionCacheLock.unlock()
         // `reload` bypasses the SettingsStore instance cache. Read errors
         // degrade to AppSettings defaults, whose Token Saver gate is OFF.
-        return settingsStore.reload().tokenSaverEnabled && hasActiveSubscription()
+        let admitted = settingsStore.reload().tokenSaverEnabled && hasActiveSubscription()
+        if admitted {
+            Self.admissionCacheLock.lock()
+            Self.admissionCache = (expectedAuthToken, true, now.addingTimeInterval(2))
+            Self.admissionCacheLock.unlock()
+        }
+        return admitted
     }
 
     // PERF: admission re-reads DistillCLIState.json on every /v1/distill gate.
@@ -117,8 +139,10 @@ private final class LiveTokenSaverDistillAdmission: @unchecked Sendable {
         appSupport: URL
     ) -> (store: SettingsStore, repository: SettingsRepository)? {
         let databaseURL = appSupport.appendingPathComponent("remotecode.sqlite")
+        // Readonly: MCP children and admission probes must not open N writer
+        // connections against the multi-GB app DB (multi-thread codex fan-out).
         guard isOwnedRegularFile(databaseURL),
-              let db = try? SQLiteDB(path: databaseURL.path) else {
+              let db = try? SQLiteDB(path: databaseURL.path, readonly: true) else {
             return nil
         }
         return (SettingsStore(db: db), SettingsRepository(db: db))
@@ -248,6 +272,7 @@ struct RemoteCodeDistillServiceMain {
                 ),
                 maxConcurrentRequests: configuration.maxConcurrentRequests,
                 maxQueueDepth: configuration.maxQueueDepth,
+                maxQueueWaitMilliseconds: configuration.maxQueueWaitMilliseconds,
                 // C5: feed per-request engine routing (deterministic / BERT / MLX) into the
                 // metrics recorder so the BERT-first payoff is observable in /metrics.
                 routeRecorder: { event in await sharedMetrics.recordRoute(event) }
@@ -764,6 +789,7 @@ struct RemoteCodeDistillServiceMain {
       --model-url \(DistillApprovedModel.url)
       --max-concurrent-requests 8
       --max-queue-depth 64
+      --max-queue-wait-ms 1500
       --idle-timeout-ms 300000
     """
 }

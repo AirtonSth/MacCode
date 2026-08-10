@@ -231,6 +231,9 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
     public let modelURL: String
     public let maxConcurrentRequests: Int
     public let maxQueueDepth: Int
+    /// Bounded wait for an admission slot (0 = unlimited until hard queue depth).
+    /// Multi-thread agents need a finite budget so MLX latency does not stack.
+    public let maxQueueWaitMilliseconds: Int
     public let idleTimeoutMS: Int
     /// Per-call wall-clock deadline for a single distill generation. On exceed, the
     /// runtime fails open to the deterministic fallback so the agent never stalls.
@@ -246,6 +249,7 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
         modelURL: String = DistillApprovedModel.url,
         maxConcurrentRequests: Int = 8,
         maxQueueDepth: Int = 64,
+        maxQueueWaitMilliseconds: Int = 0,
         idleTimeoutMS: Int = 300_000,
         mlxCallDeadlineMS: Int = 20_000
     ) throws {
@@ -274,6 +278,7 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
         self.modelURL = modelURL
         self.maxConcurrentRequests = max(1, maxConcurrentRequests)
         self.maxQueueDepth = max(0, maxQueueDepth)
+        self.maxQueueWaitMilliseconds = max(0, maxQueueWaitMilliseconds)
         self.idleTimeoutMS = max(1_000, idleTimeoutMS)
         self.mlxCallDeadlineMS = max(1_000, mlxCallDeadlineMS)
     }
@@ -316,6 +321,7 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
             modelURL: values["model-url"] ?? DistillApprovedModel.url,
             maxConcurrentRequests: try intValue("max-concurrent-requests", default: 8),
             maxQueueDepth: try intValue("max-queue-depth", default: 64),
+            maxQueueWaitMilliseconds: try intValue("max-queue-wait-ms", default: 0),
             idleTimeoutMS: try intValue("idle-timeout-ms", default: 300_000),
             mlxCallDeadlineMS: try intValue("mlx-call-deadline-ms", default: 20_000)
         )

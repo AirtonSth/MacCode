@@ -929,10 +929,15 @@ public actor DistillScheduler {
     private let runtime: any DistillRuntime
     private let maxConcurrentRequests: Int
     private let maxQueueDepth: Int
+    /// 0 = wait until hard queue depth rejects or a slot frees.
+    /// Positive = fail open with `queueFull` after this many ms in the waiter queue.
+    private let maxQueueWaitMilliseconds: Int
     private let resultCacheTTLSeconds: TimeInterval
     private let resultCacheCapacity: Int
     private var activeRequests = 0
-    private var waiters: [CheckedContinuation<Void, Error>] = []
+    /// Identified waiters so a timed-out entry can be removed without resuming
+    /// a continuation that already received a slot (double-resume crash).
+    private var waiters: [(id: UUID, continuation: CheckedContinuation<Void, Error>)] = []
     private var resultCache: [DistillResultCacheKey: DistillResultCacheEntry] = [:]
     private var resultCacheHits = 0
     private var resultCacheMisses = 0
@@ -945,6 +950,7 @@ public actor DistillScheduler {
         runtime: any DistillRuntime,
         maxConcurrentRequests: Int = 8,
         maxQueueDepth: Int = 0,
+        maxQueueWaitMilliseconds: Int = 0,
         resultCacheTTLSeconds: TimeInterval = 1_800,
         resultCacheCapacity: Int = 128,
         routeRecorder: (@Sendable (TokenSaverRouteTelemetryEvent) async -> Void)? = nil
@@ -952,6 +958,7 @@ public actor DistillScheduler {
         self.runtime = runtime
         self.maxConcurrentRequests = max(1, maxConcurrentRequests)
         self.maxQueueDepth = max(0, maxQueueDepth)
+        self.maxQueueWaitMilliseconds = max(0, maxQueueWaitMilliseconds)
         self.resultCacheTTLSeconds = max(0, resultCacheTTLSeconds)
         self.resultCacheCapacity = max(0, resultCacheCapacity)
         self.routeRecorder = routeRecorder
@@ -1093,9 +1100,41 @@ public actor DistillScheduler {
         guard waiters.count < maxQueueDepth else {
             throw DistillError.queueFull
         }
-        try await withCheckedThrowingContinuation { continuation in
-            waiters.append(continuation)
+        let waiterID = UUID()
+        let waitMS = maxQueueWaitMilliseconds
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            // Re-check under the actor: a slot may have freed between the outer
+            // check and this continuation setup.
+            if activeRequests < maxConcurrentRequests {
+                activeRequests += 1
+                continuation.resume()
+                return
+            }
+            guard waiters.count < maxQueueDepth else {
+                continuation.resume(throwing: DistillError.queueFull)
+                return
+            }
+            waiters.append((waiterID, continuation))
+            // Finite queue wait (when configured): multi-thread agents must not
+            // stack behind multi-second MLX generations. Timeouts fail open as
+            // queueFull so clients keep original tool output.
+            if waitMS > 0 {
+                let waitNS = UInt64(waitMS) * 1_000_000
+                Task { [waiterID] in
+                    try? await Task.sleep(nanoseconds: waitNS)
+                    await self.timeoutWaiter(id: waiterID)
+                }
+            }
         }
+    }
+
+    private func timeoutWaiter(id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else {
+            // Already admitted or cancelled — do not double-resume.
+            return
+        }
+        let waiter = waiters.remove(at: index)
+        waiter.continuation.resume(throwing: DistillError.queueFull)
     }
 
     private func releaseSlot() {
@@ -1109,7 +1148,8 @@ public actor DistillScheduler {
             }
             return
         }
-        waiters.removeFirst().resume()
+        // Slot transfers to the next waiter without changing activeRequests.
+        waiters.removeFirst().continuation.resume()
     }
 }
 

@@ -390,6 +390,98 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         )
     }
 
+    func testOffMainSubagentLoadDoesNotOverwriteNewerThreadSelection() async throws {
+        // WHY: the new off-main poll may finish after the user switches threads;
+        // its old-thread snapshot must not replace the newly selected thread's badge.
+        let root = NSTemporaryDirectory() + "rc-subagent-stale-load-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: root).run()
+        let threads = AgentThreadRepository(db: db)
+        let messages = AgentMessageRepository(db: db)
+        let runs = AgentRunRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runs,
+            messageRepo: messages,
+            threadRepo: threads,
+            providers: [
+                .codex: FakeProviderRunner(provider: .codex),
+                .claude: FakeProviderRunner(provider: .claude),
+                .grok: FakeProviderRunner(provider: .grok)
+            ]
+        )
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            rolloutGate: { true },
+            killSwitch: { false },
+            processIsAlive: { _ in true }
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: WorkspaceID(),
+            cwd: root,
+            coordinator: coordinator,
+            threadRepo: threads,
+            messageRepo: messages,
+            orchestrationRuntime: runtime
+        )
+
+        vm.createThread(title: "old selected thread")
+        let oldThreadID = try XCTUnwrap(vm.selectedThreadId)
+        let parentRunID = AgentRunID()
+        let parentCapability = AgentDelegationCapability.issue()
+        _ = try runtime.recordExternalRoot(
+            runId: parentRunID,
+            threadId: oldThreadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            permissionMode: .supervised,
+            delegationCapabilitySHA256: AgentDelegationCapability.sha256Hex(parentCapability),
+            ownerProcessID: getpid()
+        )
+        let childRunID = AgentRunID()
+        _ = try runtime.recordAuthorizedExternalChild(
+            runId: childRunID,
+            threadId: oldThreadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            nodeId: "late-old-thread-worker",
+            parentRunId: parentRunID,
+            parentThreadId: oldThreadID,
+            parentCapability: parentCapability,
+            childCapability: AgentDelegationCapability.issue(),
+            requestedPermissionMode: .supervised,
+            ownerProcessID: getpid()
+        )
+        try runtime.finalizeReceipt(runId: childRunID, status: .completed)
+        vm.refreshSubagentActivity()
+        XCTAssertEqual(vm.subagentActivity.doneCount, 1)
+
+        let clock = OneShotBlockingClock()
+        vm.setClockForTests { clock.now() }
+        let load = Task {
+            await vm.loadSubagentActivitySnapshotOffMainActor(for: oldThreadID)
+        }
+        await fulfillment(of: [clock.blocked], timeout: 2)
+
+        vm.createThread(title: "new selected thread")
+        let newThreadID = try XCTUnwrap(vm.selectedThreadId)
+        XCTAssertNotEqual(newThreadID, oldThreadID)
+        XCTAssertTrue(vm.subagentActivity.isEmpty)
+
+        clock.release.signal()
+        let lateSnapshot = await load.value
+        vm.applySubagentActivity(lateSnapshot, loadedFor: oldThreadID)
+
+        XCTAssertEqual(vm.selectedThreadId, newThreadID)
+        XCTAssertTrue(
+            vm.subagentActivity.isEmpty,
+            "a completed poll for the old thread must not overwrite the newer selection"
+        )
+    }
+
     func testNextThreadRestoresLastUserProviderModelAndReasoningChoice() throws {
         let suiteName = "rc-auto-last-selection-" + UUID().uuidString
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -618,5 +710,24 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         )
         XCTAssertNotEqual(vm.status, .running)
         XCTAssertNil(vm.currentRunId)
+    }
+}
+
+private final class OneShotBlockingClock: @unchecked Sendable {
+    let blocked = XCTestExpectation(description: "off-main projection reached clock")
+    let release = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var shouldBlock = true
+
+    func now() -> Date {
+        lock.lock()
+        let block = shouldBlock
+        shouldBlock = false
+        lock.unlock()
+        if block {
+            blocked.fulfill()
+            _ = release.wait(timeout: .now() + 3)
+        }
+        return Date(timeIntervalSince1970: 1_000)
     }
 }

@@ -1698,6 +1698,50 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         XCTAssertFalse(ids.contains(sibling.id), "unrelated sibling-thread receipts must stay out of the scoped fetch")
     }
 
+    func testActivityReceiptsReadOnlyPollProjectsUnknownWithoutPersisting() throws {
+        // WHY: the 2s UI badge poll must demote dead workers for chrome without
+        // taking a write lock / appending ledger rows every tick under multi-thread load.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            processIsAlive: { $0 == 111 }
+        )
+        let threadA = AgentThreadID()
+        let dead = try runtime.recordExternalRoot(
+            runId: AgentRunID(),
+            threadId: threadA,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            permissionMode: .supervised,
+            ownerProcessID: 999
+        )
+
+        let projected = try runtime.activityReceipts(
+            threadIds: [threadA],
+            persistLifecycleReconciliation: false
+        )
+        XCTAssertEqual(
+            projected.first(where: { $0.id == dead.id })?.lifecycleStatus,
+            .unknown,
+            "read-only poll still projects demotion for the badge"
+        )
+        XCTAssertEqual(
+            try repository.receipt(runId: dead.runId!)?.lifecycleStatus,
+            .accepted,
+            "read-only poll must not persist lifecycle demotion"
+        )
+        XCTAssertEqual(
+            try repository.ledger(limit: 10).filter { $0.runId == dead.runId }.count,
+            0,
+            "read-only poll must not append unknown ledger rows"
+        )
+    }
+
     func testActivityReceiptsThreadScopedReconcilesOnlyScopedDeadWorkers() throws {
         // WHY: scoped polls must still demote dead workers on the selected
         // thread, but must not mutate dead accepted rows on other threads

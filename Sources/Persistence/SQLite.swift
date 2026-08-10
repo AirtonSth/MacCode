@@ -255,14 +255,18 @@ public final class SQLiteDB {
         return stmt!
     }
 
-    public init(path: String) throws {
+    public init(path: String, readonly: Bool = false) throws {
         self.path = path
         let dir = (path as NSString).deletingLastPathComponent
-        if !dir.isEmpty && path != ":memory:" {
+        if !readonly, !dir.isEmpty && path != ":memory:" {
             try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         }
         var h: OpaquePointer?
-        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
+        // Readonly opens are used by Distill MCP / admission helpers so N codex
+        // children do not each hold a writer against the 1GB+ app database.
+        let flags = readonly
+            ? (SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX)
+            : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX)
         let rc = sqlite3_open_v2(path, &h, flags, nil)
         if rc != SQLITE_OK {
             let msg = h.map { String(cString: sqlite3_errmsg($0)) } ?? "open failed"
@@ -271,6 +275,12 @@ public final class SQLiteDB {
         }
         self.handle = h
         queue.setSpecific(key: Self.queueKey, value: 1)
+        if readonly {
+            // Shared read path only — no WAL mutation, short busy wait.
+            try execute("PRAGMA query_only=ON;")
+            try execute("PRAGMA busy_timeout=1000;")
+            return
+        }
         try execute("PRAGMA journal_mode=WAL;")
         try execute("PRAGMA foreign_keys=ON;")
         try execute("PRAGMA synchronous=NORMAL;")
