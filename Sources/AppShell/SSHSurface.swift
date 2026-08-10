@@ -2252,7 +2252,8 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
         let needle = hostFilter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !needle.isEmpty else { return hosts }
         return hosts.filter {
-            $0.label.lowercased().contains(needle) || $0.destination.lowercased().contains(needle)
+            // PERF: avoid per-host lowercased() alloc on every keystroke — use case-insensitive range
+            $0.label.range(of: needle, options: .caseInsensitive) != nil || $0.destination.range(of: needle, options: .caseInsensitive) != nil
         }
     }
 

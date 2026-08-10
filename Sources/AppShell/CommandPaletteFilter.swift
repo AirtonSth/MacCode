@@ -29,15 +29,15 @@ public struct CommandPaletteFilter {
     /// Score a single, already-lowercased token against the item fields.
     private static func scoreToken(_ token: String, title: String,
                                    subtitle: String, keywords: [String]) -> Int? {
-        let t = title.lowercased()
-        if t == token { return 100 }
-        if t.hasPrefix(token) { return 80 }
-        if t.contains(token) { return 60 }
-        if subtitle.lowercased().contains(token) { return 40 }
-        if keywords.contains(where: { $0.lowercased().contains(token) }) { return 20 }
+        if title.compare(token, options: .caseInsensitive) == .orderedSame { return 100 }
+        if title.range(of: token, options: [.caseInsensitive, .anchored]) != nil { return 80 }
+        if title.range(of: token, options: .caseInsensitive) != nil { return 60 }
+        if subtitle.range(of: token, options: .caseInsensitive) != nil { return 40 }
+        if keywords.contains(where: { $0.range(of: token, options: .caseInsensitive) != nil }) { return 20 }
         // IMP-004: subsequence tier — "ntm" matches "New Terminal Surface".
         // Ranked below all substring tiers so exact/prefix/contains always win.
-        if isSubsequence(token, of: t) { return 10 }
+        // Avoid per-entry lowercased alloc — use caseInsensitive subsequence.
+        if isSubsequenceCaseInsensitive(token, haystack: title) { return 10 }
         return nil
     }
 
@@ -51,6 +51,19 @@ public struct CommandPaletteFilter {
                 if h == ch { matched = true; break }
             }
             if !matched { return false }
+        }
+        return true
+    }
+
+    /// PERF: case-insensitive subsequence without allocating `haystack.lowercased()` per entry.
+    /// `needle` is already lowercased; scans `haystack` with caseInsensitive per-char range.
+    static func isSubsequenceCaseInsensitive(_ needle: String, haystack: String) -> Bool {
+        var searchFrom = haystack.startIndex
+        for ch in needle {
+            guard let r = haystack.range(of: String(ch), options: .caseInsensitive, range: searchFrom..<haystack.endIndex) else {
+                return false
+            }
+            searchFrom = r.upperBound
         }
         return true
     }
@@ -111,26 +124,23 @@ public struct CommandPaletteFilter {
         } else {
             tokens = [qLow]
         }
-        // Single-token vs multi-token scoring without re-lowercasing query.
+        // Single-token vs multi-token scoring without re-lowercasing query and
+        // without per-item field lowercasing (allocation-free haystack via case-insensitive range).
         return items.enumerated().compactMap { idx, item -> (T, Int, Int)? in
             let f = fields(item)
-            let tLow = f.title.lowercased()
-            let sLow = f.subtitle.lowercased()
-            // Keywords lowercased once per item; scoreToken will use contains on these.
-            let kwLow = f.keywords.map { $0.lowercased() }
             let score: Int?
             if tokens.count > 1 {
                 var minScore = Int.max
                 var ok = true
                 for token in tokens {
-                    guard let s = scoreTokenLowercased(token: token, titleLow: tLow, subtitleLow: sLow, keywordsLow: kwLow) else {
+                    guard let s = scoreTokenCaseInsensitive(token: token, title: f.title, subtitle: f.subtitle, keywords: f.keywords) else {
                         ok = false; break
                     }
                     if s < minScore { minScore = s }
                 }
                 score = ok ? (minScore == Int.max ? nil : minScore) : nil
             } else {
-                score = scoreTokenLowercased(token: tokens[0], titleLow: tLow, subtitleLow: sLow, keywordsLow: kwLow)
+                score = scoreTokenCaseInsensitive(token: tokens[0], title: f.title, subtitle: f.subtitle, keywords: f.keywords)
             }
             guard let s = score else { return nil }
             return (item, s, idx)
@@ -139,13 +149,15 @@ public struct CommandPaletteFilter {
         .map(\.0)
     }
 
-    private static func scoreTokenLowercased(token: String, titleLow: String, subtitleLow: String, keywordsLow: [String]) -> Int? {
-        if titleLow == token { return 100 }
-        if titleLow.hasPrefix(token) { return 80 }
-        if titleLow.contains(token) { return 60 }
-        if subtitleLow.contains(token) { return 40 }
-        if keywordsLow.contains(where: { $0.contains(token) }) { return 20 }
-        if isSubsequence(token, of: titleLow) { return 10 }
+    // PERF: case-insensitive scoring without per-item lowercased() allocs on every keystroke.
+    // Used by rank() hot path; token is already lowercased.
+    private static func scoreTokenCaseInsensitive(token: String, title: String, subtitle: String, keywords: [String]) -> Int? {
+        if title.compare(token, options: .caseInsensitive) == .orderedSame { return 100 }
+        if title.range(of: token, options: [.caseInsensitive, .anchored]) != nil { return 80 }
+        if title.range(of: token, options: .caseInsensitive) != nil { return 60 }
+        if subtitle.range(of: token, options: .caseInsensitive) != nil { return 40 }
+        if keywords.contains(where: { $0.range(of: token, options: .caseInsensitive) != nil }) { return 20 }
+        if isSubsequenceCaseInsensitive(token, haystack: title) { return 10 }
         return nil
     }
 }

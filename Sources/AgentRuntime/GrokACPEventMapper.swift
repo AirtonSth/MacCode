@@ -246,12 +246,12 @@ public final class GrokACPEventMapper: @unchecked Sendable {
             events.append(Self.runtimeEvent(method: kind, payload: update))
 
         case "subagent_spawned", "subagent_progress", "subagent_finished":
-            // Grok normally emits these under method `_x.ai/session/update`.
+            // Live grok-build emits these under `x.ai/session_notification`.
             // When they arrive as plain ACP `session/update` kinds instead,
-            // re-wrap so ProviderNativeSubagentLifecycle (which keys on the
-            // `_x.ai/session/*` method envelope) still persists a Subagents row.
+            // re-wrap so ProviderNativeSubagentLifecycle (live + legacy methods)
+            // still persists a Subagents row.
             events.append(Self.runtimeEvent(
-                method: "_x.ai/session/update",
+                method: "x.ai/session_notification",
                 payload: [
                     "sessionId": sessionId,
                     "update": update

@@ -1553,9 +1553,10 @@ public final class SidebarViewModel: ObservableObject {
         let query = filterText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !query.isEmpty else { return workspaces }
         let result = workspaces.filter { ws in
-            if ws.name.lowercased().contains(query) { return true }
-            if (ws.metadata["description"]?.lowercased().contains(query)) == true { return true }
-            return ws.cwd.lowercased().contains(query)
+            // PERF: avoid per-entry lowercased() alloc on every keystroke — use case-insensitive range
+            if ws.name.range(of: query, options: .caseInsensitive) != nil { return true }
+            if let desc = ws.metadata["description"], desc.range(of: query, options: .caseInsensitive) != nil { return true }
+            return ws.cwd.range(of: query, options: .caseInsensitive) != nil
         }
         filteredWorkspacesCache = result
         return result

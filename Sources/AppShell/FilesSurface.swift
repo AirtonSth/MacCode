@@ -521,10 +521,15 @@ func filterFileEntries<T: FileNameFilterable>(_ entries: [T], query: String) -> 
     guard !trimmed.isEmpty else { return entries }
     let lower = trimmed.lowercased()
     return entries.filter { entry in
-        let name = entry.name.lowercased()
-        if name.contains(lower) { return true }
-        return CommandPaletteFilter.isSubsequence(lower, of: name)
+        // PERF: avoid per-entry `lowercased()` allocation on every keystroke/body eval.
+        // `range(of:options:.caseInsensitive)` is allocation-free for the haystack.
+        if entry.name.range(of: lower, options: .caseInsensitive) != nil { return true }
+        return isSubsequenceCaseInsensitive(lower, of: entry.name)
     }
+}
+
+private func isSubsequenceCaseInsensitive(_ needle: String, of haystack: String) -> Bool {
+    return CommandPaletteFilter.isSubsequenceCaseInsensitive(needle, haystack: haystack)
 }
 
 func visibleFileEntries<T: FileNameFilterable>(
@@ -1636,6 +1641,12 @@ private struct FilesSurfaceRoot: View {
     @State private var dropTargeted = false
     @FocusState private var newFileFieldFocused: Bool
     @State private var nameFilter = ""
+    // PERF: visibleEntries filters on every SwiftUI body evaluation (scroll, selection, etc.).
+    // Cache last result and only recompute when entries, showHidden, or nameFilter changes —
+    // mirrors SidebarView.filteredWorkspacesCache, avoids O(N) filter on transient body passes.
+    @State private var visibleEntriesCache: [FileEntry] = []
+    @State private var visibleEntriesCacheKey: (count: Int, showHidden: Bool, query: String) = (0, false, "")
+    @State private var visibleEntriesSource: [FileEntry] = []
 
     // Preview HTML cache -- avoids recomputing MarkdownSurface.renderHTML / highlightedHTML
     // on every SwiftUI body pass. Seeded immediately on .onAppear; subsequent changes are
@@ -1721,7 +1732,12 @@ private struct FilesSurfaceRoot: View {
         .onChange(of: model.currentDirectory) { _ in
             pathInput = displayPath
             selectedFileIDs = []
+            updateVisibleEntriesCacheIfNeeded()
         }
+        .onChange(of: model.entries) { _ in updateVisibleEntriesCacheIfNeeded() }
+        .onChange(of: showHidden) { _ in updateVisibleEntriesCacheIfNeeded() }
+        .onChange(of: nameFilter) { _ in updateVisibleEntriesCacheIfNeeded() }
+        .onAppear { updateVisibleEntriesCacheIfNeeded() }
         .onChange(of: selectedFileIDs) { ids in
             guard ids.count == 1,
                   let id = ids.first,
@@ -1846,8 +1862,25 @@ private struct FilesSurfaceRoot: View {
 
     // Dotfiles are hidden unless the user opts in via the sidebar toggle (IMP-MAC_FILES-014).
     // Name filter further narrows the visible set when the user types in the filter field.
+    // PERF: avoid O(N) filter on every transient body (scroll/selection) — cache last result.
+    // `onChange` of entries/showHidden/nameFilter keeps cache fresh; body fast-path reuses it.
+    // Count-only key is fast, but a rename keeps count same — also check source equality to avoid stale.
     private var visibleEntries: [FileEntry] {
-        visibleFileEntries(model.entries, showHidden: showHidden, query: nameFilter, isHidden: \.isHidden)
+        let key = (count: model.entries.count, showHidden: showHidden, query: nameFilter)
+        if !visibleEntriesCache.isEmpty && key.count == visibleEntriesCacheKey.count && key.showHidden == visibleEntriesCacheKey.showHidden && key.query == visibleEntriesCacheKey.query && visibleEntriesSource == model.entries {
+            return visibleEntriesCache
+        }
+        return visibleFileEntries(model.entries, showHidden: showHidden, query: nameFilter, isHidden: \.isHidden)
+    }
+
+    private func updateVisibleEntriesCacheIfNeeded() {
+        let key = (count: model.entries.count, showHidden: showHidden, query: nameFilter)
+        if !visibleEntriesCache.isEmpty && key.count == visibleEntriesCacheKey.count && key.showHidden == visibleEntriesCacheKey.showHidden && key.query == visibleEntriesCacheKey.query && visibleEntriesSource == model.entries {
+            return
+        }
+        visibleEntriesCache = visibleFileEntries(model.entries, showHidden: showHidden, query: nameFilter, isHidden: \.isHidden)
+        visibleEntriesCacheKey = key
+        visibleEntriesSource = model.entries
     }
 
     private func visibleChildren(of directory: FileEntry) -> [FileEntry] {
