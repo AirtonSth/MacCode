@@ -60,6 +60,17 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         var pendingUserInputIds = Set<String>()
         var environment: [String: String] = [:]
         var cancellationRequested = false
+        /// Prompt of the in-flight turn — needed to re-drive once after an
+        /// ambient task-notification-only CLI exit (see CLAUDE-AMBIENT-TASK-RESULT).
+        var lastInFlightPrompt: String?
+        /// Last request used to (re)spawn this session (cwd / model / resume).
+        var lastSpawnRequest: AgentRunRequest?
+        /// Saw a non-terminal ambient `result` with origin.kind == task-notification.
+        var ambientTaskNotificationResultSeen = false
+        /// True once this logical turn already spent its one ambient-exit retry.
+        var ambientResumeRetryUsed = false
+        /// Foreground assistant content or a non-ambient result completed the turn.
+        var sawForegroundTurnProgress = false
         /// CLAUDE-BG-LIFECYCLE: task ids the CLI reports as still running —
         /// background shells (`task_type: local_bash`) and async subagents
         /// (`local_agent`). Authoritative snapshot from
@@ -189,6 +200,13 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session.sawError = false
         session.status = .running
         session.cancellationRequested = false
+        session.lastInFlightPrompt = request.providerPrompt
+        session.lastSpawnRequest = request
+        // Fresh user turn: clear ambient-only bookkeeping. A mid-run ambient
+        // retry reuses the same Session fields without going through sendTurn.
+        session.ambientTaskNotificationResultSeen = false
+        session.ambientResumeRetryUsed = false
+        session.sawForegroundTurnProgress = false
         // UX-RESUME: consume the interrupted flag for this thread so the
         // emission below fires exactly once per respawn, not on every turn.
         let wasInterrupted = interruptedThreadIds.remove(request.threadId) != nil
@@ -658,6 +676,9 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             // in this same batch is judged against the up-to-date set.
             armedPostIdleFlush = trackBackgroundWork(in: rawObject, session: session)
             isBackgroundLifecycle = Self.isBackgroundLifecycleLine(rawObject)
+            // CLAUDE-AMBIENT-TASK-RESULT: remember ambient-only results so a
+            // subsequent process exit can re-drive the user prompt once.
+            noteAmbientOrForegroundProgress(in: rawObject, session: session)
         }
         // Re-arm deferred-finish inactivity only on real progress (bg lifecycle
         // or model/tool content). Generic system/status heartbeats must NOT
@@ -757,12 +778,40 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                     }
                     session.activeTurnId = nil
                     session.inFlightToolIds.removeAll()
+                    // A real turnCompleted is never ambient (parser skips those).
+                    session.sawForegroundTurnProgress = true
                     lock.unlock()
                     emitSessionSnapshot(session: session, reason: "turn_completed")
                 }
                 concludeTurn(finalMessage: finalMessage, session: session, allowDeferral: true)
             }
         }
+    }
+
+    /// Tracks whether the stream produced only ambient task-notification results
+    /// or real foreground turn progress. Pure session mutation under `lock`.
+    private func noteAmbientOrForegroundProgress(in obj: [String: Any], session: Session) {
+        let type = obj["type"] as? String
+        if type == "assistant" {
+            lock.lock()
+            session.sawForegroundTurnProgress = true
+            lock.unlock()
+            return
+        }
+        guard type == "result" else { return }
+        let isError = (obj["is_error"] as? Bool) ?? ((obj["subtype"] as? String).map { $0 != "success" } ?? false)
+        let resultText = obj["result"] as? String
+        if !isError,
+           ClaudeParser.isAmbientTaskNotificationResult(obj, resultText: resultText, hasAssistantBody: false) {
+            lock.lock()
+            session.ambientTaskNotificationResultSeen = true
+            lock.unlock()
+            return
+        }
+        // Non-ambient result (including errors) is real turn ownership.
+        lock.lock()
+        session.sawForegroundTurnProgress = true
+        lock.unlock()
     }
 
     /// CLAUDE-BG-LIFECYCLE — the fix for "thread reads as finished while a
@@ -1102,6 +1151,84 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             sessions.removeValue(forKey: session.threadId)
         }
         let shouldFinish = session.inFlightRunId != nil
+        // CLAUDE-AMBIENT-TASK-RESULT: after resume the CLI may dump orphan
+        // task_notifications, emit origin=task-notification result, and exit
+        // without processing the user prompt. One bounded re-spawn+re-prompt
+        // recovers the turn (Elephant Task 1: "Did you finish?" failed empty).
+        let shouldRetryAmbient = shouldFinish
+            && !session.cancellationRequested
+            && session.ambientTaskNotificationResultSeen
+            && !session.sawForegroundTurnProgress
+            && !session.ambientResumeRetryUsed
+        let retryOnEvent = shouldRetryAmbient ? session.onEvent : nil
+        let retryRunId = shouldRetryAmbient ? session.inFlightRunId : nil
+        let retryPrompt = shouldRetryAmbient ? session.lastInFlightPrompt : nil
+        let retrySpawnRequest = shouldRetryAmbient ? session.lastSpawnRequest : nil
+        let retryProviderThreadId = session.providerThreadId
+        let canRetryAmbient = retryOnEvent != nil
+            && retryRunId != nil
+            && !(retryPrompt?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            && retrySpawnRequest != nil
+        if canRetryAmbient,
+           let onEvent = retryOnEvent,
+           let runId = retryRunId,
+           let prompt = retryPrompt,
+           var spawnRequest = retrySpawnRequest {
+            // Detach dead session ownership before spawning a replacement.
+            session.deferredFinish = nil
+            session.deferralWatchdog?.cancel()
+            session.deferralWatchdog = nil
+            session.pendingBackgroundTaskIds.removeAll()
+            session.inFlightRunId = nil
+            session.onEvent = nil
+            lock.unlock()
+
+            // Prefer the live resume id from the dead session.
+            if let providerThreadId = retryProviderThreadId, !providerThreadId.isEmpty {
+                spawnRequest = spawnRequest.withProviderThreadId(providerThreadId)
+            }
+            do {
+                let newSession = try startNewSession(request: spawnRequest)
+                lock.lock()
+                newSession.onEvent = onEvent
+                newSession.inFlightRunId = runId
+                newSession.sawError = false
+                newSession.status = .running
+                newSession.cancellationRequested = false
+                newSession.lastInFlightPrompt = prompt
+                newSession.lastSpawnRequest = spawnRequest
+                newSession.ambientTaskNotificationResultSeen = false
+                newSession.ambientResumeRetryUsed = true
+                newSession.sawForegroundTurnProgress = false
+                if let providerThreadId = retryProviderThreadId {
+                    newSession.providerThreadId = providerThreadId
+                }
+                lock.unlock()
+                claudeStreamLog.info(
+                    "claude.ambient_task_result.retry thread=\(session.threadId.value.uuidString, privacy: .public)"
+                )
+                // Non-fatal diagnostic so the stream shows why the CLI respawned.
+                onEvent(.event(.providerRuntime(ProviderRuntimeEvent(
+                    provider: .claude,
+                    source: "claude.stream-json.session",
+                    method: "claude.session.ambient_task_retry",
+                    payloadJSON: Self.jsonString([
+                        "reason": "ambient_task_notification_result",
+                        "providerThreadId": retryProviderThreadId ?? ""
+                    ]) ?? "{}",
+                    receivedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+                ))))
+                try sendPrompt(prompt, to: newSession)
+                onEvent(.status(.running))
+                return
+            } catch {
+                onEvent(.error("Claude ambient task-notification retry failed: \(error)"))
+                onEvent(.status(.failed))
+                onEvent(.finished(.failed, finalMessage: nil, providerThreadId: retryProviderThreadId))
+                return
+            }
+        }
+
         session.inFlightRunId = nil
         // CLAUDE-BG-LIFECYCLE: the process is gone, so a withheld finish can never
         // be resumed. Drop it — the terminal below reports cancelled/failed, never

@@ -2645,8 +2645,176 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                        "plain foreground command")
     }
 
+    // MARK: - CLAUDE-AMBIENT-TASK-RESULT (orphan task_notification empty run)
+
+    /// WHY: Elephant Task 1 resume after a long CI wait failed twice with
+    /// "Claude run completed without producing an assistant response". Wire:
+    /// resume dumps orphaned task_notifications → result origin=task-notification
+    /// num_turns=0 empty → process exits without processing the user prompt.
+    /// Adapter must ignore ambient ownership and re-drive the prompt once.
+    func test_ambientTaskNotificationExit_retriesPromptOnceAndCompletes() async throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-ambient-retry-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let script = tmp.appendingPathComponent("fake-claude")
+        let launchCount = tmp.appendingPathComponent("launch-count.txt")
+        try """
+        #!/usr/bin/env python3
+        import json, pathlib, sys
+        counter = pathlib.Path("\(launchCount.path)")
+        n = int(counter.read_text()) if counter.exists() else 0
+        n += 1
+        counter.write_text(str(n))
+        session = "ambient-retry-session"
+        print(json.dumps({"type":"system","subtype":"init","session_id":session}), flush=True)
+        if n == 1:
+            # First process: orphan dump then ambient result, then exit (mirrors live CLI).
+            print(json.dumps({
+                "type":"system","subtype":"task_notification","task_id":"orphan-1",
+                "status":"stopped",
+                "summary":"Orphaned by a previous Claude Code process exit and reported in an aggregate summary.",
+                "session_id":session
+            }), flush=True)
+            for line in sys.stdin:
+                if not line.strip():
+                    continue
+                print(json.dumps({
+                    "type":"result","subtype":"success","is_error":False,"result":"",
+                    "num_turns":0,"origin":{"kind":"task-notification"},
+                    "session_id":session,
+                    "usage":{"input_tokens":0,"output_tokens":0}
+                }), flush=True)
+                sys.exit(0)
+        else:
+            # Second process (retry): real answer for the re-driven prompt.
+            for line in sys.stdin:
+                if not line.strip():
+                    continue
+                print(json.dumps({
+                    "type":"assistant",
+                    "message":{"content":[{"type":"text","text":"AMBIENT_RETRY_OK"}]},
+                    "session_id":session
+                }), flush=True)
+                print(json.dumps({
+                    "type":"result","subtype":"success","is_error":False,
+                    "result":"AMBIENT_RETRY_OK","session_id":session
+                }), flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let adapter = ClaudeStreamingCLIAdapter(binaryNameOverride: script.path)
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "Did you finish?",
+            providerThreadId: "ambient-retry-session"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        try await waitForFinish(in: sink, expected: "AMBIENT_RETRY_OK", timeout: 6)
+        let launches = Int((try? String(contentsOf: launchCount, encoding: .utf8)) ?? "0") ?? 0
+        XCTAssertEqual(launches, 2,
+                       "ambient-only exit must re-spawn the CLI once with the same prompt")
+        let events = await sink.snapshot()
+        let finishes = events.compactMap { event -> (AgentRunStatus, String?)? in
+            if case .finished(let status, let final, _) = event { return (status, final) }
+            return nil
+        }
+        XCTAssertEqual(finishes.count, 1, "exactly one terminal finish for the logical turn")
+        XCTAssertEqual(finishes.first?.0, .completed)
+        XCTAssertEqual(finishes.first?.1, "AMBIENT_RETRY_OK")
+        let sawRetryDiagnostic = events.contains {
+            if case .event(.providerRuntime(let runtime)) = $0 {
+                return runtime.method == "claude.session.ambient_task_retry"
+            }
+            return false
+        }
+        XCTAssertTrue(sawRetryDiagnostic,
+                      "stream must surface ambient_task_retry so operators can see the respawn")
+        try? adapter.stopSession(threadId: threadId)
+    }
+
+    /// Ambient result followed by a real answer in the SAME process must not
+    /// finish early (SDK/bridge lifecycle ownership parity).
+    func test_ambientTaskNotificationResult_sameProcessDoesNotFinishEarly() async throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-ambient-same-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let script = tmp.appendingPathComponent("fake-claude")
+        try """
+        #!/usr/bin/env python3
+        import json, sys, time
+        session = "ambient-same-session"
+        print(json.dumps({"type":"system","subtype":"init","session_id":session}), flush=True)
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            print(json.dumps({
+                "type":"system","subtype":"task_notification","task_id":"T-ambient",
+                "status":"completed","session_id":session
+            }), flush=True)
+            print(json.dumps({
+                "type":"result","subtype":"success","is_error":False,"result":"",
+                "num_turns":0,"origin":{"kind":"task-notification"},
+                "session_id":session,
+                "usage":{"input_tokens":0,"output_tokens":0}
+            }), flush=True)
+            time.sleep(0.15)
+            print(json.dumps({
+                "type":"assistant",
+                "message":{"content":[{"type":"text","text":"SAME_PROCESS_OK"}]},
+                "session_id":session
+            }), flush=True)
+            print(json.dumps({
+                "type":"result","subtype":"success","is_error":False,
+                "result":"SAME_PROCESS_OK","session_id":session
+            }), flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let adapter = ClaudeStreamingCLIAdapter(binaryNameOverride: script.path)
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "continue"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        try? await Task.sleep(nanoseconds: 80_000_000)
+        let early = await sink.snapshot()
+        let earlyFinishes = early.filter {
+            if case .finished = $0 { return true }
+            return false
+        }
+        XCTAssertEqual(earlyFinishes.count, 0,
+                       "ambient task-notification result alone must not finish the run")
+
+        try await waitForFinish(in: sink, expected: "SAME_PROCESS_OK", timeout: 4)
+        let finishes = await sink.snapshot().compactMap { event -> String? in
+            if case .finished(.completed, let final, _) = event { return final }
+            return nil
+        }
+        XCTAssertEqual(finishes, ["SAME_PROCESS_OK"])
+        adapter.stopAll()
+    }
+
     private func waitForFinish(in sink: EventSink, expected: String) async throws {
-        let deadline = Date().addingTimeInterval(3)
+        try await waitForFinish(in: sink, expected: expected, timeout: 3)
+    }
+
+    private func waitForFinish(in sink: EventSink, expected: String, timeout: TimeInterval) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             let events = await sink.snapshot()
             if events.contains(where: {

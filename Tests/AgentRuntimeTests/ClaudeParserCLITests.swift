@@ -566,4 +566,67 @@ final class ClaudeParserCLITests: XCTestCase {
                        ["true", "false"])
         XCTAssertTrue(request.isSecret, "a password schema must render masked input")
     }
+
+    // MARK: - CLAUDE-AMBIENT-TASK-RESULT
+
+    /// WHY: after a previous Claude process dies mid-task, resume dumps orphaned
+    /// `task_notification` rows and a success result with origin.kind =
+    /// task-notification, num_turns=0, empty body — without processing the new
+    /// user prompt. Completing a turn for that ambient result paints
+    /// "without producing an assistant response" and drops the real answer.
+    func test_ambientTaskNotificationResult_doesNotCompleteTurn() {
+        let ambient = #"{"type":"result","subtype":"success","is_error":false,"result":"","num_turns":0,"origin":{"kind":"task-notification"},"session_id":"sess-ambient","usage":{"input_tokens":0,"output_tokens":0}}"#
+        let real = #"{"type":"result","subtype":"success","is_error":false,"result":"REAL_ANSWER","session_id":"sess-ambient"}"#
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"sess-ambient"}"#,
+            #"{"type":"system","subtype":"task_notification","task_id":"orphan-1","status":"stopped","summary":"Orphaned by a previous Claude Code process exit","session_id":"sess-ambient"}"#,
+            ambient,
+            #"{"type":"assistant","message":{"content":[{"type":"text","text":"REAL_ANSWER"}]}}"#,
+            real
+        ])
+        let completed = evs.compactMap { event -> String? in
+            if case .turnCompleted(_, let final) = event { return final }
+            return nil
+        }
+        XCTAssertEqual(completed, ["REAL_ANSWER"],
+                       "ambient task-notification results must not synthesize turnCompleted; only the real user-turn result owns lifecycle")
+        XCTAssertFalse(completed.contains(where: { $0.isEmpty }),
+                       "empty ambient results must never complete a turn")
+    }
+
+    func test_isAmbientTaskNotificationResult_helper() {
+        let ambient: [String: Any] = [
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": "",
+            "num_turns": 0,
+            "origin": ["kind": "task-notification"]
+        ]
+        XCTAssertTrue(
+            ClaudeParser.isAmbientTaskNotificationResult(ambient, resultText: "", hasAssistantBody: false),
+            "empty success with origin.task-notification and no assistant body is ambient"
+        )
+        XCTAssertFalse(
+            ClaudeParser.isAmbientTaskNotificationResult(ambient, resultText: "", hasAssistantBody: true),
+            "assistant body already accumulated means the result is not ambient-only"
+        )
+        XCTAssertFalse(
+            ClaudeParser.isAmbientTaskNotificationResult(ambient, resultText: "hi", hasAssistantBody: false),
+            "non-empty result text is a real answer even if origin is set"
+        )
+        var errored = ambient
+        errored["is_error"] = true
+        XCTAssertFalse(
+            ClaudeParser.isAmbientTaskNotificationResult(errored, resultText: "", hasAssistantBody: false),
+            "errors must still complete the turn"
+        )
+        let plain: [String: Any] = [
+            "type": "result", "subtype": "success", "result": "", "is_error": false
+        ]
+        XCTAssertFalse(
+            ClaudeParser.isAmbientTaskNotificationResult(plain, resultText: "", hasAssistantBody: false),
+            "empty success without origin is not classified ambient (may be a real empty answer)"
+        )
+    }
 }
