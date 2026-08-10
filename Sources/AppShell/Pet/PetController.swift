@@ -197,7 +197,7 @@ public final class PetController {
             }
             projectionWatermark = stored
             var scanCursor = stored
-            let decoder = JSONDecoder()
+            let decoder = Self.recoveryDecoder
             let timestampFormatter = Self.recoveryTimestampFormatter
             while scanCursor < capturedCursor {
                 let rows = try context.eventLog.read(since: scanCursor, limit: 500)
@@ -244,6 +244,7 @@ public final class PetController {
     // PERF: ISO8601DateFormatter is expensive; recovery can parse hundreds of rows.
     // PetController is @MainActor, so one MainActor-isolated formatter avoids per-recovery alloc.
     private static let recoveryTimestampFormatter = ISO8601DateFormatter()
+    private static let recoveryDecoder = JSONDecoder()
 
     // PERF: event-log recovery and live EventBus handling classify every
     // published kind. Array literals reallocated membership tables per event;
