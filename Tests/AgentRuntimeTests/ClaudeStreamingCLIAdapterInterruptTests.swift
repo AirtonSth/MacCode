@@ -41,25 +41,64 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
 
     // MARK: - control_response permission wire (pure)
 
-    func test_controlPermissionResponseLine_allowMapsApproveAndApproveForSession() throws {
-        for response: AgentProviderRequestResponse in [.approve, .approveForSession] {
-            let data = try ClaudeStreamingCLIAdapter.controlPermissionResponseLine(
-                requestId: "req-allow-1",
-                response: response
-            )
-            XCTAssertEqual(data.last, 0x0A)
-            let stripped = data.dropLast()
-            let object = try XCTUnwrap(
-                try JSONSerialization.jsonObject(with: Data(stripped)) as? [String: Any]
-            )
-            XCTAssertEqual(object["type"] as? String, "control_response")
-            let envelope = try XCTUnwrap(object["response"] as? [String: Any])
-            XCTAssertEqual(envelope["subtype"] as? String, "success")
-            XCTAssertEqual(envelope["request_id"] as? String, "req-allow-1")
-            let result = try XCTUnwrap(envelope["response"] as? [String: Any])
-            XCTAssertEqual(result["behavior"] as? String, "allow")
-            XCTAssertNil(result["message"])
-        }
+    func test_controlPermissionResponseLine_approveIsOneShotAllow() throws {
+        let data = try ClaudeStreamingCLIAdapter.controlPermissionResponseLine(
+            requestId: "req-allow-1",
+            response: .approve
+        )
+        XCTAssertEqual(data.last, 0x0A)
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(data.dropLast())) as? [String: Any]
+        )
+        XCTAssertEqual(object["type"] as? String, "control_response")
+        let envelope = try XCTUnwrap(object["response"] as? [String: Any])
+        XCTAssertEqual(envelope["subtype"] as? String, "success")
+        XCTAssertEqual(envelope["request_id"] as? String, "req-allow-1")
+        let result = try XCTUnwrap(envelope["response"] as? [String: Any])
+        XCTAssertEqual(result["behavior"] as? String, "allow")
+        XCTAssertNil(result["message"])
+        XCTAssertNil(result["updatedPermissions"],
+                     "one-shot approve must not persist session rules")
+    }
+
+    /// CLAUDE-CLI-006: Approve for session must carry updatedPermissions so the CLI
+    /// session permission set grows; bare behavior:allow re-prompts every call.
+    func test_controlPermissionResponseLine_approveForSessionIncludesUpdatedPermissions() throws {
+        let withSuggestions = try ClaudeStreamingCLIAdapter.controlPermissionResponseLine(
+            requestId: "req-session-1",
+            response: .approveForSession,
+            toolName: "Bash",
+            permissionSuggestionsJSON: #"[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"ls *"}],"behavior":"allow","destination":"session"}]"#
+        )
+        let suggestedResult = try XCTUnwrap(
+            (try JSONSerialization.jsonObject(with: Data(withSuggestions.dropLast())) as? [String: Any])
+                .flatMap { ($0["response"] as? [String: Any])?["response"] as? [String: Any] }
+        )
+        XCTAssertEqual(suggestedResult["behavior"] as? String, "allow")
+        let echoed = try XCTUnwrap(suggestedResult["updatedPermissions"] as? [[String: Any]])
+        XCTAssertEqual(echoed.count, 1)
+        XCTAssertEqual(echoed[0]["type"] as? String, "addRules")
+        XCTAssertEqual(echoed[0]["destination"] as? String, "session")
+        let rules = try XCTUnwrap(echoed[0]["rules"] as? [[String: Any]])
+        XCTAssertEqual(rules[0]["ruleContent"] as? String, "ls *",
+                       "permission_suggestions must be echoed, not re-synthesized")
+
+        let synthesized = try ClaudeStreamingCLIAdapter.controlPermissionResponseLine(
+            requestId: "req-session-2",
+            response: .approveForSession,
+            toolName: "Edit"
+        )
+        let synthResult = try XCTUnwrap(
+            (try JSONSerialization.jsonObject(with: Data(synthesized.dropLast())) as? [String: Any])
+                .flatMap { ($0["response"] as? [String: Any])?["response"] as? [String: Any] }
+        )
+        let synthPerms = try XCTUnwrap(synthResult["updatedPermissions"] as? [[String: Any]])
+        XCTAssertEqual(synthPerms[0]["type"] as? String, "addRules")
+        XCTAssertEqual(synthPerms[0]["behavior"] as? String, "allow")
+        XCTAssertEqual(synthPerms[0]["destination"] as? String, "session")
+        let synthRules = try XCTUnwrap(synthPerms[0]["rules"] as? [[String: Any]])
+        XCTAssertEqual(synthRules[0]["toolName"] as? String, "Edit",
+                       "without suggestions, synthesize addRules for the tool_name")
     }
 
     func test_controlPermissionResponseLine_denyRequiresMessage() throws {
@@ -88,6 +127,72 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
         )
         XCTAssertEqual(cancelledResult["behavior"] as? String, "deny")
         XCTAssertEqual(cancelledResult["message"] as? String, "Cancelled")
+    }
+
+    // MARK: - control_response user-input wire (pure, CLAUDE-CLI-004/005)
+
+    func test_controlUserInputResponseLine_askUserQuestionAllowCarriesAnswers() throws {
+        let data = try ClaudeStreamingCLIAdapter.controlUserInputResponseLine(
+            requestId: "req-ask-1",
+            kind: .askUserQuestion(toolUseID: "toolu-ask-1"),
+            text: #"{"0":"OAuth"}"#,
+            decision: .accept
+        )
+        XCTAssertEqual(data.last, 0x0A)
+        let result = try XCTUnwrap(
+            (try JSONSerialization.jsonObject(with: Data(data.dropLast())) as? [String: Any])
+                .flatMap { ($0["response"] as? [String: Any])?["response"] as? [String: Any] }
+        )
+        XCTAssertEqual(result["behavior"] as? String, "allow")
+        XCTAssertEqual(result["toolUseID"] as? String, "toolu-ask-1")
+        let updated = try XCTUnwrap(result["updatedInput"] as? [String: Any])
+        let answers = try XCTUnwrap(updated["answers"] as? [String: Any])
+        XCTAssertEqual(answers["0"] as? String, "OAuth",
+                       "JSON answers must land in updatedInput.answers (PermissionResult allow path)")
+    }
+
+    func test_controlUserInputResponseLine_askUserQuestionCancelIsDeny() throws {
+        let data = try ClaudeStreamingCLIAdapter.controlUserInputResponseLine(
+            requestId: "req-ask-2",
+            kind: .askUserQuestion(toolUseID: nil),
+            text: nil,
+            decision: .cancel
+        )
+        let result = try XCTUnwrap(
+            (try JSONSerialization.jsonObject(with: Data(data.dropLast())) as? [String: Any])
+                .flatMap { ($0["response"] as? [String: Any])?["response"] as? [String: Any] }
+        )
+        XCTAssertEqual(result["behavior"] as? String, "deny")
+        XCTAssertEqual(result["message"] as? String, "Cancelled")
+        XCTAssertEqual(result["toolUseID"] as? String, "req-ask-2")
+    }
+
+    func test_controlUserInputResponseLine_elicitationAcceptAndCancel() throws {
+        let accept = try ClaudeStreamingCLIAdapter.controlUserInputResponseLine(
+            requestId: "req-elicit-1",
+            kind: .elicitation,
+            text: #"{"environment":"staging"}"#,
+            decision: .accept
+        )
+        let acceptBody = try XCTUnwrap(
+            (try JSONSerialization.jsonObject(with: Data(accept.dropLast())) as? [String: Any])
+                .flatMap { ($0["response"] as? [String: Any])?["response"] as? [String: Any] }
+        )
+        XCTAssertEqual(acceptBody["action"] as? String, "accept")
+        let content = try XCTUnwrap(acceptBody["content"] as? [String: Any])
+        XCTAssertEqual(content["environment"] as? String, "staging")
+
+        let cancel = try ClaudeStreamingCLIAdapter.controlUserInputResponseLine(
+            requestId: "req-elicit-2",
+            kind: .elicitation,
+            text: nil,
+            decision: .cancel
+        )
+        let cancelBody = try XCTUnwrap(
+            (try JSONSerialization.jsonObject(with: Data(cancel.dropLast())) as? [String: Any])
+                .flatMap { ($0["response"] as? [String: Any])?["response"] as? [String: Any] }
+        )
+        XCTAssertEqual(cancelBody["action"] as? String, "cancel")
     }
 
     // MARK: - needsSessionResume pure seam tests

@@ -348,17 +348,61 @@ public final class ClaudeParser {
             out.append(contentsOf: compactionEvents(from: obj, now: now))
         case "control_request":
             // CLI stream-json control channel (Agent SDK 0.3.x / claude CLI):
-            // {"type":"control_request","request_id":"…","request":{"subtype":"can_use_tool",…}}
-            // Host approvals must key on the envelope request_id (not tool_use_id).
-            if let inner = obj["request"] as? [String: Any],
-               stringValue(inner["subtype"]) == "can_use_tool" {
-                var flattened = inner
-                if let rid = stringValue(obj["request_id"]) ?? stringValue(obj["requestId"]) {
-                    flattened["request_id"] = rid
+            // {"type":"control_request","request_id":"…","request":{"subtype":"can_use_tool"|…}}
+            // Host replies key on the envelope request_id (not tool_use_id).
+            if let inner = obj["request"] as? [String: Any] {
+                let subtype = stringValue(inner["subtype"])
+                let envelopeId = stringValue(obj["request_id"]) ?? stringValue(obj["requestId"])
+                if subtype == "can_use_tool" {
+                    var flattened = inner
+                    if let rid = envelopeId {
+                        flattened["request_id"] = rid
+                    }
+                    let toolName = stringValue(inner["tool_name"])
+                        ?? stringValue(inner["toolName"])
+                        ?? stringValue(inner["name"])
+                    // CLAUDE-CLI-004: AskUserQuestion arrives as can_use_tool; answers must
+                    // ride control_response updatedInput, not a freeform user turn. Open a
+                    // structured user-input card keyed by envelope request_id.
+                    if Self.isAskUserQuestion(toolName) {
+                        let input = (inner["input"] as? [String: Any]) ?? [:]
+                        let requestId = envelopeId
+                            ?? stringValue(inner["tool_use_id"])
+                            ?? UUID().uuidString
+                        // Prefer control request_id: if tool_use already opened a card for
+                        // the same tool_use_id, resolve that card so the UI is not dual-pending.
+                        if let toolUseId = stringValue(inner["tool_use_id"]),
+                           toolUseId != requestId,
+                           emittedStructuredUserInputRequestIds.contains(toolUseId) {
+                            out.append(.userInputResolved(requestId: toolUseId, answer: nil))
+                        }
+                        let request = askUserQuestionRequest(
+                            toolId: requestId,
+                            input: input,
+                            turnId: currentTurnId ?? requestId,
+                            now: now
+                        )
+                        out.append(contentsOf: deduplicatedStructuredUserInputRequest(request))
+                    } else if let request = permissionRequest(from: flattened, now: now) {
+                        out.append(.requestOpened(request))
+                    }
+                } else if subtype == "elicitation" {
+                    // CLAUDE-CLI-005: MCP elicitation/create on the control channel.
+                    var flattened = inner
+                    if let rid = envelopeId {
+                        flattened["request_id"] = rid
+                    }
+                    if let request = userInputRequest(from: flattened, now: now) {
+                        out.append(.userInputRequested(request))
+                    }
                 }
-                if let request = permissionRequest(from: flattened, now: now) {
-                    out.append(.requestOpened(request))
-                }
+            }
+        case "control_cancel_request":
+            // CLAUDE-CLI-008: CLI cancelled an in-flight control request — drop both
+            // approval and user-input pending UI for that request_id.
+            if let id = stringValue(obj["request_id"]) ?? stringValue(obj["requestId"]), !id.isEmpty {
+                out.append(.requestResolved(requestId: id, state: .cancelled))
+                out.append(.userInputResolved(requestId: id, answer: nil))
             }
         case "permission_request", "request.opened", "canUseTool/request":
             if let request = permissionRequest(from: obj, now: now) {
@@ -831,7 +875,21 @@ public final class ClaudeParser {
     }
 
     private static func isExitPlanMode(_ name: String?) -> Bool {
-        name?.replacingOccurrences(of: "_", with: "").replacingOccurrences(of: "-", with: "").lowercased() == "exitplanmode"
+        normalizedToolName(name) == "exitplanmode"
+    }
+
+    /// Strip `_`/`-` and lowercase — matches Agent SDK / CLI tool-name normalization.
+    private static func normalizedToolName(_ name: String?) -> String {
+        (name ?? "")
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+            .lowercased()
+    }
+
+    /// AskUserQuestion (and legacy aliases) on the can_use_tool control path.
+    private static func isAskUserQuestion(_ name: String?) -> Bool {
+        let normalized = normalizedToolName(name)
+        return normalized == "askuserquestion" || normalized == "askuser"
     }
 
     /// True when a CLI `result` is only the ambient dump of orphaned background
