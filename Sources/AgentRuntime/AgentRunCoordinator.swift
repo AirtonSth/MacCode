@@ -7054,23 +7054,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     nonisolated static let compactActivePlanStepLimit = 512
     nonisolated static let compactActivePlanByteLimit = 256 * 1_024
 
-    // PERF: activePlanUpdated encodes the plan solely for a byte ceiling on every
-    // plan stream event. JSONEncoder is not thread-safe — share one under a short
-    // lock instead of allocating per update.
-    private static let activePlanSizeEncodeLock = NSLock()
-    private static let activePlanSizeEncoder = JSONEncoder()
-
+    // PERF: activePlanUpdated previously JSON-encoded the plan solely for a byte
+    // ceiling on every plan stream event. Use estimatedCompactJSONBytes (upper
+    // bound of wire size) so admission stays O(payload) without JSONEncoder allocs.
     nonisolated static func activePlanFitsCompactBudget(
         _ plan: AssistantActivePlan,
         stepLimit: Int = compactActivePlanStepLimit,
         byteLimit: Int = compactActivePlanByteLimit
     ) -> Bool {
         guard plan.steps.count <= max(1, stepLimit) else { return false }
-        activePlanSizeEncodeLock.lock()
-        let bytes = (try? activePlanSizeEncoder.encode(plan))?.count
-        activePlanSizeEncodeLock.unlock()
-        guard let bytes else { return false }
-        return bytes <= max(1, byteLimit)
+        // Upper-bound estimate: may reject a few edge-case plans that would still
+        // fit true JSON size near the ceiling; never admits oversize recovery state.
+        return plan.estimatedCompactJSONBytes <= max(1, byteLimit)
     }
 
     /// Pure flush-cadence decision: flush when there is pending work AND either the

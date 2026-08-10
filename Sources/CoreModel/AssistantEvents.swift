@@ -502,6 +502,42 @@ public struct AssistantActivePlan: Codable, Sendable, Equatable {
         self.steps = steps
         self.updatedAtMs = updatedAtMs
     }
+
+    /// Upper bound of `JSONEncoder`-encoded size for compact recovery budget checks.
+    ///
+    /// WHY: `activePlanUpdated` used to `JSONEncoder().encode(plan)` on every plan
+    /// stream event solely to enforce a byte ceiling. UTF-8 payload sums with
+    /// escape headroom avoid that allocation while remaining ≥ true wire size.
+    ///
+    /// Escape model: every UTF-8 byte may expand to a JSON `\u00XX` sequence
+    /// (6 ASCII bytes) in the worst case (control characters). Multi-byte UTF-8
+    /// and ordinary ASCII are smaller on the wire, so this is intentionally
+    /// conservative — may reject edge plans near the ceiling that would still
+    /// fit true JSON, never admits oversize recovery state.
+    public var estimatedCompactJSONBytes: Int {
+        // Object skeleton + key names + updatedAtMs digits + commas/braces.
+        var total = 96
+        if let explanation {
+            total += Self.jsonStringUpperBoundBytes(explanation)
+        } else {
+            total += 4 // null
+        }
+        total += 16 // "steps":[]
+        for step in steps {
+            // {"id":"...","title":"...","status":"in_progress"}
+            total += 64
+                + Self.jsonStringUpperBoundBytes(step.id)
+                + Self.jsonStringUpperBoundBytes(step.title)
+                + step.status.rawValue.utf8.count
+        }
+        return total
+    }
+
+    /// Worst-case JSON string payload size including surrounding quotes.
+    /// Control bytes encode as `\u00XX` (6); quotes/backslashes as 2 — 6 covers both.
+    private static func jsonStringUpperBoundBytes(_ value: String) -> Int {
+        2 + value.utf8.count * 6
+    }
 }
 
 /// Compact correctness state that survives transcript retention. Transcript
@@ -968,23 +1004,92 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         return total + elements * Self.aggregateHotElementOverhead
     }
 
+    /// Exact contribution of one element to `aggregateHotTextByteCount` (text + overhead).
+    /// Used so budget eviction can debit without re-walking the whole timeline each step.
+    private static func hotTextBytes(_ value: String?) -> Int { value?.utf8.count ?? 0 }
+
+    private static func hotTextContribution(turn: AssistantTurnSnapshot) -> Int {
+        var total = turn.turnId.utf8.count + hotTextBytes(turn.finalAssistantMessage)
+        var elements = 1 + turn.items.count
+        for item in turn.items {
+            total += item.body.utf8.count
+            total += item.id.utf8.count + item.turnId.utf8.count
+            total += hotTextBytes(item.output) + hotTextBytes(item.summary) + hotTextBytes(item.resourcePath)
+        }
+        return total + elements * aggregateHotElementOverhead
+    }
+
+    private static func hotTextContribution(activity: AssistantWorkActivity) -> Int {
+        let text = activity.id.utf8.count + activity.title.utf8.count
+            + hotTextBytes(activity.detail) + hotTextBytes(activity.state)
+        return text + aggregateHotElementOverhead
+    }
+
+    private static func hotTextContribution(request: AssistantPendingRequest) -> Int {
+        let text = request.id.utf8.count + hotTextBytes(request.turnId)
+            + request.title.utf8.count + hotTextBytes(request.detail)
+        return text + aggregateHotElementOverhead
+    }
+
+    private static func hotTextContribution(userInput: AssistantUserInputRequest) -> Int {
+        var total = userInput.id.utf8.count + hotTextBytes(userInput.turnId)
+            + userInput.prompt.utf8.count + hotTextBytes(userInput.answer)
+        var elements = 1 + userInput.options.count + userInput.questions.count
+        for option in userInput.options { total += option.utf8.count }
+        for question in userInput.questions {
+            total += question.id.utf8.count + question.prompt.utf8.count + hotTextBytes(question.header)
+            elements += question.options.count
+            for option in question.options {
+                total += option.label.utf8.count + hotTextBytes(option.detail)
+            }
+        }
+        return total + elements * aggregateHotElementOverhead
+    }
+
+    private static func hotTextContribution(plan: AssistantProposedPlan) -> Int {
+        let text = plan.id.utf8.count + hotTextBytes(plan.turnId) + plan.markdown.utf8.count
+        return text + aggregateHotElementOverhead
+    }
+
+    private static func hotTextContribution(event: ProviderRuntimeEvent) -> Int {
+        let text = event.id.utf8.count + event.source.utf8.count + event.method.utf8.count
+            + hotTextBytes(event.providerTurnId) + hotTextBytes(event.providerItemId)
+            + hotTextBytes(event.providerRequestId) + event.payloadJSON.utf8.count
+        return text + aggregateHotElementOverhead
+    }
+
+    private static func hotTextContribution(translation: AssistantSR1Translation) -> Int {
+        let text = hotTextBytes(translation.itemId) + hotTextBytes(translation.messageId)
+            + translation.originalText.utf8.count + translation.rewrittenText.utf8.count
+        return text + aggregateHotElementOverhead
+    }
+
     /// Keeps the newest live transcript content while evicting old rendered text.
     /// Compact active plan and pending interaction state are deliberately untouched.
+    ///
+    /// PERF: under pressure the previous implementation re-ran `aggregateHotTextByteCount`
+    /// (full timeline walk) after every `removeFirst`. That is O(n²) on long streams.
+    /// Eviction now debits the exact contribution of each removed element; bulk clears
+    /// still re-sync once via a full recount.
     public mutating func enforceAggregateHotTextBudget(
         byteLimit: Int = aggregateHotTextByteLimit
     ) {
         let limit = max(1, byteLimit)
         var total = aggregateHotTextByteCount
         guard total > limit else { return }
+        func debit(_ amount: Int) {
+            total -= amount
+            if total < 0 { total = 0 }
+        }
         func remove(_ value: inout String?) {
             guard total > limit, let text = value else { return }
-            total -= text.utf8.count
+            debit(text.utf8.count)
             value = nil
         }
         for turnIndex in turns.indices {
             for itemIndex in turns[turnIndex].items.indices {
                 if total <= limit { return }
-                total -= turns[turnIndex].items[itemIndex].body.utf8.count
+                debit(turns[turnIndex].items[itemIndex].body.utf8.count)
                 turns[turnIndex].items[itemIndex].body = ""
                 remove(&turns[turnIndex].items[itemIndex].output)
                 remove(&turns[turnIndex].items[itemIndex].summary)
@@ -992,16 +1097,16 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             remove(&turns[turnIndex].finalAssistantMessage)
         }
         while total > limit, !providerRuntimeEvents.isEmpty {
-            providerRuntimeEvents.removeFirst()
-            total = aggregateHotTextByteCount
+            let evicted = providerRuntimeEvents.removeFirst()
+            debit(Self.hotTextContribution(event: evicted))
         }
         while total > limit, let key = sr1TranslationsByItemId.keys.first,
-              sr1TranslationsByItemId.removeValue(forKey: key) != nil {
-            total = aggregateHotTextByteCount
+              let translation = sr1TranslationsByItemId.removeValue(forKey: key) {
+            debit(Self.hotTextContribution(translation: translation))
         }
         while total > limit, let key = sr1TranslationsByMessageId.keys.first,
-              sr1TranslationsByMessageId.removeValue(forKey: key) != nil {
-            total = aggregateHotTextByteCount
+              let translation = sr1TranslationsByMessageId.removeValue(forKey: key) {
+            debit(Self.hotTextContribution(translation: translation))
         }
         if total > limit {
             pendingItemDeltas.removeAll(keepingCapacity: true)
@@ -1033,36 +1138,50 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             total = aggregateHotTextByteCount
         }
         while total > limit, workActivities.count > 1 {
-            workActivities.removeFirst()
-            total = aggregateHotTextByteCount
+            let evicted = workActivities.removeFirst()
+            debit(Self.hotTextContribution(activity: evicted))
         }
         while total > limit, proposedPlans.count > 1 {
-            proposedPlans.removeFirst()
-            total = aggregateHotTextByteCount
+            let evicted = proposedPlans.removeFirst()
+            debit(Self.hotTextContribution(plan: evicted))
         }
         while total > limit, pendingRequests.count > 1 {
-            pendingRequests.removeFirst()
-            total = aggregateHotTextByteCount
+            let evicted = pendingRequests.removeFirst()
+            debit(Self.hotTextContribution(request: evicted))
         }
         while total > limit, pendingUserInputs.count > 1 {
-            pendingUserInputs.removeFirst()
-            total = aggregateHotTextByteCount
+            let evicted = pendingUserInputs.removeFirst()
+            debit(Self.hotTextContribution(userInput: evicted))
         }
         while total > limit, turns.count > 1 {
-            turns.removeFirst()
-            total = aggregateHotTextByteCount
+            let evicted = turns.removeFirst()
+            debit(Self.hotTextContribution(turn: evicted))
         }
-        if total > limit { remove(&error); total = aggregateHotTextByteCount }
+        if total > limit { remove(&error) }
         if total > limit, var plan = activePlan {
             plan.explanation = nil
             for index in plan.steps.indices { plan.steps[index].title = "" }
             activePlan = plan
             total = aggregateHotTextByteCount
         }
-        if total > limit { workActivities.removeAll(); proposedPlans.removeAll(); total = aggregateHotTextByteCount }
-        if total > limit { pendingRequests.removeAll(); pendingUserInputs.removeAll(); total = aggregateHotTextByteCount }
-        if total > limit { turns.removeAll(); total = aggregateHotTextByteCount }
-        if total > limit { activePlan = nil; total = aggregateHotTextByteCount }
+        if total > limit {
+            workActivities.removeAll()
+            proposedPlans.removeAll()
+            total = aggregateHotTextByteCount
+        }
+        if total > limit {
+            pendingRequests.removeAll()
+            pendingUserInputs.removeAll()
+            total = aggregateHotTextByteCount
+        }
+        if total > limit {
+            turns.removeAll()
+            total = aggregateHotTextByteCount
+        }
+        if total > limit {
+            activePlan = nil
+            total = aggregateHotTextByteCount
+        }
         if total > limit {
             threadId = nil
             providerThreadId = nil

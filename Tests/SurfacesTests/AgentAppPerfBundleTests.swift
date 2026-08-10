@@ -1983,6 +1983,99 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
     }
 
+    /// R5-B: enforceAggregateHotTextBudget under pressure must not re-walk the
+    /// full timeline after every removeFirst (O(n²)). Debit path vs naive recount.
+    func test_r5_enforceAggregateBudget_debitVsFullRecount_microbench() {
+        func makeOversizedState(turns: Int, events: Int) -> AssistantTimelineState {
+            var state = AssistantTimelineState()
+            state.threadId = "thread-r5"
+            for t in 0..<turns {
+                let turnId = "turn-\(t)"
+                var turn = AssistantTurnSnapshot(turnId: turnId, startedAtMs: Int64(t))
+                for i in 0..<4 {
+                    turn.items.append(AssistantItem(
+                        id: "item-\(t)-\(i)",
+                        turnId: turnId,
+                        type: .assistantMessage,
+                        body: String(repeating: "B", count: 2_048),
+                        output: String(repeating: "O", count: 1_024),
+                        startedAtMs: Int64(t * 10 + i)
+                    ))
+                }
+                turn.finalAssistantMessage = String(repeating: "F", count: 512)
+                state.turns.append(turn)
+            }
+            for e in 0..<events {
+                state.providerRuntimeEvents.append(ProviderRuntimeEvent(
+                    id: "ev-\(e)",
+                    provider: .codex,
+                    source: "test",
+                    method: "event",
+                    payloadJSON: String(repeating: "p", count: 256),
+                    receivedAtMs: Int64(e)
+                ))
+            }
+            return state
+        }
+
+        // Naive recount path (pre-R5): after each eviction, re-walk aggregate.
+        func enforceWithFullRecount(_ state: inout AssistantTimelineState, byteLimit: Int) {
+            let limit = max(1, byteLimit)
+            var total = state.aggregateHotTextByteCount
+            guard total > limit else { return }
+            while total > limit, !state.providerRuntimeEvents.isEmpty {
+                state.providerRuntimeEvents.removeFirst()
+                total = state.aggregateHotTextByteCount
+            }
+            while total > limit, state.turns.count > 1 {
+                state.turns.removeFirst()
+                total = state.aggregateHotTextByteCount
+            }
+        }
+
+        let budget = 64_000
+        let samples = 5
+        let warmup = 2
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+        func timeMs(_ body: () -> Void) -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            body()
+            let end = DispatchTime.now().uptimeNanoseconds
+            return Double(end - start) / 1_000_000.0
+        }
+
+        for _ in 0..<warmup {
+            var a = makeOversizedState(turns: 80, events: 200)
+            var b = makeOversizedState(turns: 80, events: 200)
+            enforceWithFullRecount(&a, byteLimit: budget)
+            b.enforceAggregateHotTextBudget(byteLimit: budget)
+        }
+
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            var a = makeOversizedState(turns: 80, events: 200)
+            var b = makeOversizedState(turns: 80, events: 200)
+            before.append(timeMs { enforceWithFullRecount(&a, byteLimit: budget) })
+            after.append(timeMs { b.enforceAggregateHotTextBudget(byteLimit: budget) })
+            XCTAssertLessThanOrEqual(a.aggregateHotTextByteCount, budget)
+            XCTAssertLessThanOrEqual(b.aggregateHotTextByteCount, budget)
+        }
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = (beforeMed - afterMed) / beforeMed * 100.0
+        NSLog("[perf-proof] enforceAggregate fullRecount_ms=%@ debit_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+              String(beforeMed), String(afterMed), improvement,
+              String(describing: before), String(describing: after))
+        XCTAssertGreaterThan(
+            improvement, 5.0,
+            "debit-based enforceAggregate must beat full recount by ≥5% (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
+        )
+    }
+
 }
 
 private final class ReplayBenchmarkRunner: AgentProviderRunner, @unchecked Sendable {
