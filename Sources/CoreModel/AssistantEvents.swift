@@ -1096,9 +1096,18 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             }
             remove(&turns[turnIndex].finalAssistantMessage)
         }
-        while total > limit, !providerRuntimeEvents.isEmpty {
-            let evicted = providerRuntimeEvents.removeFirst()
-            debit(Self.hotTextContribution(event: evicted))
+        if total > limit, !providerRuntimeEvents.isEmpty {
+            var drop = 0
+            var debitSum = 0
+            for ev in providerRuntimeEvents {
+                if total - debitSum <= limit { break }
+                debitSum += Self.hotTextContribution(event: ev)
+                drop += 1
+            }
+            if drop > 0 {
+                providerRuntimeEvents.removeFirst(drop)
+                debit(debitSum)
+            }
         }
         while total > limit, let key = sr1TranslationsByItemId.keys.first,
               let translation = sr1TranslationsByItemId.removeValue(forKey: key) {
@@ -1137,25 +1146,75 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             }
             total = aggregateHotTextByteCount
         }
-        while total > limit, workActivities.count > 1 {
-            let evicted = workActivities.removeFirst()
-            debit(Self.hotTextContribution(activity: evicted))
+        if total > limit, workActivities.count > 1 {
+            var drop = 0
+            var debitSum = 0
+            let keepOne = max(0, workActivities.count - 1)
+            for ev in workActivities {
+                if drop >= keepOne || total - debitSum <= limit { break }
+                debitSum += Self.hotTextContribution(activity: ev)
+                drop += 1
+            }
+            if drop > 0 {
+                workActivities.removeFirst(drop)
+                debit(debitSum)
+            }
         }
-        while total > limit, proposedPlans.count > 1 {
-            let evicted = proposedPlans.removeFirst()
-            debit(Self.hotTextContribution(plan: evicted))
+        if total > limit, proposedPlans.count > 1 {
+            var drop = 0
+            var debitSum = 0
+            let keepOne = max(0, proposedPlans.count - 1)
+            for ev in proposedPlans {
+                if drop >= keepOne || total - debitSum <= limit { break }
+                debitSum += Self.hotTextContribution(plan: ev)
+                drop += 1
+            }
+            if drop > 0 {
+                proposedPlans.removeFirst(drop)
+                debit(debitSum)
+            }
         }
-        while total > limit, pendingRequests.count > 1 {
-            let evicted = pendingRequests.removeFirst()
-            debit(Self.hotTextContribution(request: evicted))
+        if total > limit, pendingRequests.count > 1 {
+            var drop = 0
+            var debitSum = 0
+            let keepOne = max(0, pendingRequests.count - 1)
+            for ev in pendingRequests {
+                if drop >= keepOne || total - debitSum <= limit { break }
+                debitSum += Self.hotTextContribution(request: ev)
+                drop += 1
+            }
+            if drop > 0 {
+                pendingRequests.removeFirst(drop)
+                debit(debitSum)
+            }
         }
-        while total > limit, pendingUserInputs.count > 1 {
-            let evicted = pendingUserInputs.removeFirst()
-            debit(Self.hotTextContribution(userInput: evicted))
+        if total > limit, pendingUserInputs.count > 1 {
+            var drop = 0
+            var debitSum = 0
+            let keepOne = max(0, pendingUserInputs.count - 1)
+            for ev in pendingUserInputs {
+                if drop >= keepOne || total - debitSum <= limit { break }
+                debitSum += Self.hotTextContribution(userInput: ev)
+                drop += 1
+            }
+            if drop > 0 {
+                pendingUserInputs.removeFirst(drop)
+                debit(debitSum)
+            }
         }
-        while total > limit, turns.count > 1 {
-            let evicted = turns.removeFirst()
-            debit(Self.hotTextContribution(turn: evicted))
+        if total > limit, turns.count > 1 {
+            var drop = 0
+            var debitSum = 0
+            let keepOne = max(0, turns.count - 1)
+            for ev in turns {
+                if drop >= keepOne || total - debitSum <= limit { break }
+                debitSum += Self.hotTextContribution(turn: ev)
+                drop += 1
+            }
+            if drop > 0 {
+                turns.removeFirst(drop)
+                debit(debitSum)
+            }
         }
         if total > limit { remove(&error) }
         if total > limit, var plan = activePlan {

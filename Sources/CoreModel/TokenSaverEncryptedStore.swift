@@ -267,7 +267,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
             // Fail closed: unreadable/corrupt meta must not regenerate a live store.
             let data = try Data(contentsOf: metaURL)
             do {
-                self.meta = try JSONDecoder().decode(Meta.self, from: data)
+                self.meta = try decoder.decode(Meta.self, from: data)
             } catch {
                 throw StoreError.corruptMeta
             }
@@ -289,7 +289,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
             meta.keyReference = reference
             // Init is not yet complete (key still pending); one-shot encode is
             // fine for this single open-path write.
-            try JSONEncoder().encode(meta).write(to: metaURL, options: .atomic)
+            try encoder.encode(meta).write(to: metaURL, options: .atomic)
         }
 
         if meta.shredActive || meta.deleteEpoch > 0 {
