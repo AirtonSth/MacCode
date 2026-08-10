@@ -12,6 +12,24 @@ struct ClaudeCLIUnavailableError: Error, CustomStringConvertible {
     var description: String { message }
 }
 
+/// Wire kind for control-channel user-input replies (AskUserQuestion vs elicitation).
+enum ClaudeControlUserInputKind: Sendable, Equatable {
+    case askUserQuestion(toolUseID: String?)
+    case elicitation
+}
+
+/// Captured at can_use_tool open so approveForSession can echo suggestions / tool name.
+struct ClaudePendingPermissionMeta: Sendable, Equatable {
+    var toolName: String
+    /// Raw JSON array of PermissionUpdate suggestions from the CLI, if any.
+    var suggestionsJSON: String?
+    var toolUseID: String?
+}
+
+// Typealiases keep Session field types short without exporting the names.
+private typealias ControlUserInputKind = ClaudeControlUserInputKind
+private typealias PendingPermissionMeta = ClaudePendingPermissionMeta
+
 public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked Sendable {
     /// A turn `result` that arrived while the CLI still had background work
     /// running. Carries `runId` so a late event can never finish a newer run.
@@ -58,6 +76,14 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         var sawError = false
         var pendingRequestIds = Set<String>()
         var pendingUserInputIds = Set<String>()
+        /// Control-channel user-input ids (AskUserQuestion / elicitation) that must
+        /// answer with `control_response` rather than a freeform stdin user prompt.
+        /// Tool_use-only AskUserQuestion stays in `pendingUserInputIds` alone so the
+        /// corpus path that reads a user JSONL line keeps working.
+        var pendingControlUserInputs: [String: ControlUserInputKind] = [:]
+        /// tool_name + permission_suggestions captured at can_use_tool open so
+        /// approveForSession can emit `updatedPermissions` (CLAUDE-CLI-006).
+        var pendingPermissionMeta: [String: PendingPermissionMeta] = [:]
         var environment: [String: String] = [:]
         var cancellationRequested = false
         /// Prompt of the in-flight turn — needed to re-drive once after an
@@ -323,10 +349,19 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             lock.unlock()
             throw AgentProviderAdapterError.unsupported("Claude streaming request not found: \(requestId)")
         }
+        let permissionMeta = session.pendingPermissionMeta[requestId]
         lock.unlock()
 
-        try sendPermissionResponse(requestId: requestId, response: response, to: session)
-        lock.lock(); session.pendingRequestIds.remove(requestId); lock.unlock()
+        try sendPermissionResponse(
+            requestId: requestId,
+            response: response,
+            permissionMeta: permissionMeta,
+            to: session
+        )
+        lock.lock()
+        session.pendingRequestIds.remove(requestId)
+        session.pendingPermissionMeta.removeValue(forKey: requestId)
+        lock.unlock()
         let resolved = AssistantEvent.requestResolved(requestId: requestId, state: Self.requestState(for: response))
         record(resolved, session: session)
         emit(.event(resolved), session: session)
@@ -342,10 +377,34 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             lock.unlock()
             throw AgentProviderAdapterError.unsupported("Claude streaming user input request not found: \(requestId)")
         }
+        let controlKind = session.pendingControlUserInputs[requestId]
         lock.unlock()
 
-        try sendPrompt(text, to: session)
-        lock.lock(); session.pendingUserInputIds.remove(requestId); lock.unlock()
+        if let controlKind {
+            // CLAUDE-CLI-004 / 005: control-channel AskUserQuestion + elicitation
+            // must complete via control_response, not a freeform user prompt.
+            let line = try Self.controlUserInputResponseLine(
+                requestId: requestId,
+                kind: controlKind,
+                text: text,
+                decision: .accept
+            )
+            try session.writeQueue.sync {
+                try GuardedStdinWrite.write(
+                    line,
+                    to: session.stdinPipe.fileHandleForWriting,
+                    process: session.process,
+                    notFound: { AgentProviderAdapterError.sessionNotFound(session.threadId) }
+                )
+            }
+        } else {
+            // tool_use → userInput corpus path: host writes a user JSONL line.
+            try sendPrompt(text, to: session)
+        }
+        lock.lock()
+        session.pendingUserInputIds.remove(requestId)
+        session.pendingControlUserInputs.removeValue(forKey: requestId)
+        lock.unlock()
         let resolved = AssistantEvent.userInputResolved(requestId: requestId, answer: text)
         record(resolved, session: session)
         emit(.event(resolved), session: session)
@@ -361,18 +420,41 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             lock.unlock()
             throw AgentProviderAdapterError.unsupported("Claude streaming user input request not found: \(requestId)")
         }
+        let controlKind = session.pendingControlUserInputs[requestId]
         lock.unlock()
 
-        let line = Self.controlInterruptLine()
-        try session.writeQueue.sync {
-            try GuardedStdinWrite.write(
-                line,
-                to: session.stdinPipe.fileHandleForWriting,
-                process: session.process,
-                notFound: { AgentProviderAdapterError.sessionNotFound(session.threadId) }
+        if let controlKind {
+            // CLAUDE-CLI-004 / 005: deny / decline the control request itself.
+            let line = try Self.controlUserInputResponseLine(
+                requestId: requestId,
+                kind: controlKind,
+                text: nil,
+                decision: .cancel
             )
+            try session.writeQueue.sync {
+                try GuardedStdinWrite.write(
+                    line,
+                    to: session.stdinPipe.fileHandleForWriting,
+                    process: session.process,
+                    notFound: { AgentProviderAdapterError.sessionNotFound(session.threadId) }
+                )
+            }
+        } else {
+            // tool_use path: interrupt the turn (legacy corpus behavior).
+            let line = Self.controlInterruptLine()
+            try session.writeQueue.sync {
+                try GuardedStdinWrite.write(
+                    line,
+                    to: session.stdinPipe.fileHandleForWriting,
+                    process: session.process,
+                    notFound: { AgentProviderAdapterError.sessionNotFound(session.threadId) }
+                )
+            }
         }
-        lock.lock(); session.pendingUserInputIds.remove(requestId); lock.unlock()
+        lock.lock()
+        session.pendingUserInputIds.remove(requestId)
+        session.pendingControlUserInputs.removeValue(forKey: requestId)
+        lock.unlock()
         let resolved = AssistantEvent.userInputResolved(requestId: requestId, answer: nil)
         record(resolved, session: session)
         emit(.event(resolved), session: session)
@@ -712,6 +794,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             // tool_use commands that background children so the turn-end path can
             // stamp [[RC_AWAITING]] without deferring the terminal.
             trackDetachedShellSpawn(in: rawObject, session: session)
+            // Capture control-channel meta (AskUserQuestion / elicitation /
+            // permission_suggestions) before events are applied so respond paths
+            // know which wire shape to write.
+            trackControlChannelMeta(in: rawObject, session: session)
         }
         // Rewrite turnCompleted finalMessage BEFORE record/emit/concludeTurn so
         // both the persisted stream event (UI reload source) and the coordinator
@@ -758,6 +844,13 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                 lock.unlock()
                 emitSessionSnapshot(session: session, reason: "user_input_requested")
             }
+            if case .userInputResolved(let requestId, _) = event {
+                lock.lock()
+                session.pendingUserInputIds.remove(requestId)
+                session.pendingControlUserInputs.removeValue(forKey: requestId)
+                lock.unlock()
+                emitSessionSnapshot(session: session, reason: "user_input_resolved")
+            }
             if case .requestOpened(let request) = event {
                 lock.lock()
                 session.pendingRequestIds.insert(request.id)
@@ -767,8 +860,29 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             if case .requestResolved(let requestId, _) = event {
                 lock.lock()
                 session.pendingRequestIds.remove(requestId)
+                session.pendingPermissionMeta.removeValue(forKey: requestId)
                 lock.unlock()
                 emitSessionSnapshot(session: session, reason: "request_resolved")
+            }
+            // CLAUDE-CLI-007: after ExitPlanMode → proposedPlan, interrupt so the
+            // host owns Implement and the CLI cannot race into workspace mutation
+            // in the same stream turn (mirrors SDK bridge awaitingPlanReviewInterrupt).
+            // Only plan-mode sessions — non-plan ExitPlanMode must not get an interrupt.
+            if case .proposedPlan = event {
+                lock.lock()
+                let isPlanSession = session.interactionMode == .plan
+                lock.unlock()
+                if isPlanSession {
+                    let line = Self.controlInterruptLine()
+                    _ = session.writeQueue.sync {
+                        try? GuardedStdinWrite.write(
+                            line,
+                            to: session.stdinPipe.fileHandleForWriting,
+                            process: session.process,
+                            notFound: { AgentProviderAdapterError.sessionNotFound(session.threadId) }
+                        )
+                    }
+                }
             }
             if case .turnCompleted(_, let finalMessage) = event {
                 if case .turnCompleted(let turnId, _) = event {
@@ -915,6 +1029,8 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session.sawError = false
         session.pendingRequestIds.removeAll()
         session.pendingUserInputIds.removeAll()
+        session.pendingControlUserInputs.removeAll()
+        session.pendingPermissionMeta.removeAll()
         session.pendingBackgroundTaskIds.removeAll()
         session.sawDetachedShellSpawn = false
         lock.unlock()
@@ -1313,16 +1429,25 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     /// Builds the newline-terminated CLI control_response for a tool approval.
     /// Pure builder — no I/O. Agent SDK PermissionResult wire:
     /// allow → behavior "allow"; deny/cancel → behavior "deny" + message.
+    /// CLAUDE-CLI-006: approveForSession includes `updatedPermissions` (echo
+    /// suggestions when present, else synthesize addRules for tool_name → session).
     nonisolated static func controlPermissionResponseLine(
         requestId: String,
-        response: AgentProviderRequestResponse
+        response: AgentProviderRequestResponse,
+        toolName: String? = nil,
+        permissionSuggestionsJSON: String? = nil
     ) throws -> Data {
         let behavior: String
         let denyMessage: String?
+        var includeSessionPermissions = false
         switch response {
-        case .approve, .approveForSession:
+        case .approve:
             behavior = "allow"
             denyMessage = nil
+        case .approveForSession:
+            behavior = "allow"
+            denyMessage = nil
+            includeSessionPermissions = true
         case .decline(let reason):
             behavior = "deny"
             denyMessage = (reason?.isEmpty == false) ? reason : "Permission denied"
@@ -1333,6 +1458,14 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         var permissionResult: [String: Any] = ["behavior": behavior]
         if let denyMessage {
             permissionResult["message"] = denyMessage
+        }
+        if includeSessionPermissions {
+            if let updated = Self.updatedPermissionsForSessionAllow(
+                toolName: toolName,
+                permissionSuggestionsJSON: permissionSuggestionsJSON
+            ) {
+                permissionResult["updatedPermissions"] = updated
+            }
         }
         let payload: [String: Any] = [
             "type": "control_response",
@@ -1347,11 +1480,138 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         return line
     }
 
-    private func sendPermissionResponse(requestId: String, response: AgentProviderRequestResponse, to session: Session) throws {
+    /// PermissionUpdate[] for session-wide allow. Prefers CLI permission_suggestions;
+    /// otherwise synthesizes addRules for the tool with destination session.
+    nonisolated static func updatedPermissionsForSessionAllow(
+        toolName: String?,
+        permissionSuggestionsJSON: String?
+    ) -> [[String: Any]]? {
+        if let permissionSuggestionsJSON,
+           let data = permissionSuggestionsJSON.data(using: .utf8),
+           let parsed = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+           !parsed.isEmpty {
+            return parsed
+        }
+        let name = (toolName?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 } ?? "Tool"
+        // Agent SDK PermissionUpdate addRules shape (destination: session).
+        return [[
+            "type": "addRules",
+            "rules": [["toolName": name] as [String: Any]],
+            "behavior": "allow",
+            "destination": "session"
+        ]]
+    }
+
+    /// Decision for control-channel user-input replies.
+    enum ControlUserInputDecision: Sendable, Equatable {
+        case accept
+        case cancel
+        case decline
+    }
+
+    /// Pure builder: control_response for AskUserQuestion (PermissionResult + answers)
+    /// or elicitation (action accept/decline/cancel + content). Newline-terminated.
+    nonisolated static func controlUserInputResponseLine(
+        requestId: String,
+        kind: ClaudeControlUserInputKind,
+        text: String?,
+        decision: ControlUserInputDecision
+    ) throws -> Data {
+        let body: [String: Any]
+        switch kind {
+        case .askUserQuestion(let toolUseID):
+            switch decision {
+            case .accept:
+                body = Self.askUserQuestionPermissionResult(
+                    requestId: requestId,
+                    toolUseID: toolUseID,
+                    text: text ?? ""
+                )
+            case .cancel, .decline:
+                body = [
+                    "behavior": "deny",
+                    "message": decision == .cancel ? "Cancelled" : "Declined",
+                    "toolUseID": toolUseID ?? requestId
+                ]
+            }
+        case .elicitation:
+            switch decision {
+            case .accept:
+                body = [
+                    "action": "accept",
+                    "content": Self.elicitationContent(from: text ?? "")
+                ]
+            case .cancel:
+                body = ["action": "cancel"]
+            case .decline:
+                body = ["action": "decline"]
+            }
+        }
+        let payload: [String: Any] = [
+            "type": "control_response",
+            "response": [
+                "subtype": "success",
+                "request_id": requestId,
+                "response": body
+            ] as [String: Any]
+        ]
+        var line = try JSONSerialization.data(withJSONObject: payload)
+        line.append(0x0A)
+        return line
+    }
+
+    /// Mirrors bridge `askUserQuestionResult`: allow + updatedInput.answers (or response).
+    nonisolated static func askUserQuestionPermissionResult(
+        requestId: String,
+        toolUseID: String?,
+        text: String
+    ) -> [String: Any] {
+        var updatedInput: [String: Any] = [:]
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty,
+           let data = trimmed.data(using: .utf8),
+           let parsed = try? JSONSerialization.jsonObject(with: data),
+           let object = parsed as? [String: Any] {
+            updatedInput["answers"] = object
+        } else if !trimmed.isEmpty {
+            updatedInput["response"] = text
+        } else {
+            updatedInput["answers"] = [String: Any]()
+        }
+        return [
+            "behavior": "allow",
+            "updatedInput": updatedInput,
+            "toolUseID": toolUseID ?? requestId
+        ]
+    }
+
+    /// Mirrors bridge `elicitationContent`: JSON object if parseable, else `{answer: text}`.
+    nonisolated static func elicitationContent(from text: String) -> [String: Any] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty,
+           let data = trimmed.data(using: .utf8),
+           let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            return parsed
+        }
+        return ["answer": text]
+    }
+
+    private func sendPermissionResponse(
+        requestId: String,
+        response: AgentProviderRequestResponse,
+        permissionMeta: PendingPermissionMeta?,
+        to session: Session
+    ) throws {
         // CLI stream-json control channel (Agent SDK PermissionResult shape):
         // allow:  {"type":"control_response","response":{"subtype":"success","request_id":"…","response":{"behavior":"allow"}}}
         // deny:   same envelope with behavior "deny" + required message string
-        let line = try Self.controlPermissionResponseLine(requestId: requestId, response: response)
+        // session: allow + updatedPermissions (suggestions or synthesized addRules)
+        let line = try Self.controlPermissionResponseLine(
+            requestId: requestId,
+            response: response,
+            toolName: permissionMeta?.toolName,
+            permissionSuggestionsJSON: permissionMeta?.suggestionsJSON
+        )
         try session.writeQueue.sync {
             try GuardedStdinWrite.write(line,
                                         to: session.stdinPipe.fileHandleForWriting,
@@ -1364,9 +1624,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         lock.lock()
         let requestIds = Array(session.pendingRequestIds)
         session.pendingRequestIds.removeAll()
+        session.pendingPermissionMeta.removeAll()
         lock.unlock()
         for requestId in requestIds {
-        let resolved = AssistantEvent.requestResolved(requestId: requestId, state: .cancelled)
+            let resolved = AssistantEvent.requestResolved(requestId: requestId, state: .cancelled)
             record(resolved, session: session)
             emit(.event(resolved), session: session)
         }
@@ -1377,6 +1638,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         lock.lock()
         let requestIds = Array(session.pendingUserInputIds)
         session.pendingUserInputIds.removeAll()
+        session.pendingControlUserInputs.removeAll()
         lock.unlock()
         for requestId in requestIds {
             let resolved = AssistantEvent.userInputResolved(requestId: requestId, answer: nil)
@@ -1384,6 +1646,66 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             emit(.event(resolved), session: session)
         }
         emitSessionSnapshot(session: session, reason: "user_inputs_settled")
+    }
+
+    /// Capture control-channel ids + permission meta from the raw stream line so
+    /// respond paths know which control_response body to write (parser only emits
+    /// normalized AssistantEvents and cannot carry suggestions / kind tags).
+    private func trackControlChannelMeta(in rawObject: [String: Any], session: Session) {
+        let type = (rawObject["type"] as? String) ?? ""
+        if type == "control_request",
+           let request = rawObject["request"] as? [String: Any] {
+            let requestId = (rawObject["request_id"] as? String)
+                ?? (rawObject["requestId"] as? String)
+            guard let requestId, !requestId.isEmpty else { return }
+            let subtype = (request["subtype"] as? String) ?? ""
+            if subtype == "can_use_tool" {
+                let toolName = (request["tool_name"] as? String)
+                    ?? (request["toolName"] as? String)
+                    ?? (request["name"] as? String)
+                    ?? "Claude tool"
+                let toolUseID = (request["tool_use_id"] as? String)
+                    ?? (request["toolUseId"] as? String)
+                let normalized = toolName
+                    .replacingOccurrences(of: "_", with: "")
+                    .replacingOccurrences(of: "-", with: "")
+                    .lowercased()
+                if normalized == "askuserquestion" || normalized == "askuser" {
+                    lock.lock()
+                    session.pendingControlUserInputs[requestId] = .askUserQuestion(toolUseID: toolUseID)
+                    lock.unlock()
+                } else {
+                    var suggestionsJSON: String?
+                    if let suggestions = request["permission_suggestions"] ?? request["permissionSuggestions"],
+                       JSONSerialization.isValidJSONObject(suggestions),
+                       let data = try? JSONSerialization.data(withJSONObject: suggestions),
+                       let s = String(data: data, encoding: .utf8) {
+                        suggestionsJSON = s
+                    }
+                    lock.lock()
+                    session.pendingPermissionMeta[requestId] = PendingPermissionMeta(
+                        toolName: toolName,
+                        suggestionsJSON: suggestionsJSON,
+                        toolUseID: toolUseID
+                    )
+                    lock.unlock()
+                }
+            } else if subtype == "elicitation" {
+                lock.lock()
+                session.pendingControlUserInputs[requestId] = .elicitation
+                lock.unlock()
+            }
+            return
+        }
+        if type == "control_cancel_request" {
+            let requestId = (rawObject["request_id"] as? String)
+                ?? (rawObject["requestId"] as? String)
+            guard let requestId else { return }
+            lock.lock()
+            session.pendingControlUserInputs.removeValue(forKey: requestId)
+            session.pendingPermissionMeta.removeValue(forKey: requestId)
+            lock.unlock()
+        }
     }
 
     private func emit(_ event: AgentRunEvent, session: Session) {

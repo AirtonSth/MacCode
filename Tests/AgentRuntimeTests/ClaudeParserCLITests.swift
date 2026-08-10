@@ -549,6 +549,94 @@ final class ClaudeParserCLITests: XCTestCase {
                       "can_use_tool input must surface in approval detail for review")
     }
 
+    /// CLAUDE-CLI-004: AskUserQuestion on can_use_tool must open structured user
+    /// input (not a permission card) keyed by envelope request_id so answers can
+    /// complete via control_response updatedInput.
+    func test_controlRequestAskUserQuestionOpensUserInputWithEnvelopeRequestId() {
+        let line = #"{"type":"control_request","request_id":"req-ask-ctrl","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"toolu-ask","input":{"questions":[{"question":"Which auth?","header":"Auth","options":[{"label":"OAuth"},{"label":"API key"}],"multiSelect":false}]}}}"#
+        let evs = ClaudeParser().parseLine(line)
+        let openedPerms = evs.compactMap { event -> AssistantPendingRequest? in
+            if case .requestOpened(let request) = event { return request }
+            return nil
+        }
+        let userInputs = evs.compactMap { event -> AssistantUserInputRequest? in
+            if case .userInputRequested(let request) = event { return request }
+            return nil
+        }
+        XCTAssertTrue(openedPerms.isEmpty,
+                      "AskUserQuestion must not open a generic Approve/Deny permission card")
+        XCTAssertEqual(userInputs.count, 1)
+        XCTAssertEqual(userInputs.first?.id, "req-ask-ctrl",
+                       "control AskUserQuestion must key the card on envelope request_id")
+        XCTAssertTrue(userInputs.first?.isStructured == true)
+        XCTAssertEqual(userInputs.first?.questions.first?.prompt, "Which auth?")
+        XCTAssertEqual(userInputs.first?.questions.first?.options.map(\.label), ["OAuth", "API key"])
+    }
+
+    /// CLAUDE-CLI-004: when tool_use already opened a card, control_request must
+    /// resolve the tool_use id and prefer the envelope request_id (no dual pending).
+    func test_controlRequestAskUserQuestionPrefersEnvelopeIdOverPriorToolUseCard() {
+        let parser = ClaudeParser()
+        var events = parser.parseLine(
+            #"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-ask-dup","name":"AskUserQuestion","input":{"questions":[{"question":"Pick one","options":[{"label":"A"},{"label":"B"}],"multiSelect":false}]}}]}}"#
+        )
+        events += parser.parseLine(
+            #"{"type":"control_request","request_id":"req-ask-prefer","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"toolu-ask-dup","input":{"questions":[{"question":"Pick one","options":[{"label":"A"},{"label":"B"}],"multiSelect":false}]}}}"#
+        )
+        let opened = events.compactMap { event -> String? in
+            if case .userInputRequested(let request) = event { return request.id }
+            return nil
+        }
+        let resolved = events.compactMap { event -> String? in
+            if case .userInputResolved(let id, let answer) = event, answer == nil { return id }
+            return nil
+        }
+        XCTAssertEqual(opened, ["toolu-ask-dup", "req-ask-prefer"])
+        XCTAssertTrue(resolved.contains("toolu-ask-dup"),
+                      "prior tool_use card must be closed when control_request arrives")
+    }
+
+    /// CLAUDE-CLI-005: control_request subtype elicitation opens user input.
+    func test_controlRequestElicitationOpensUserInput() {
+        let line = #"{"type":"control_request","request_id":"req-elicit-1","request":{"subtype":"elicitation","message":"Configure deployment","title":"Deploy","requested_schema":{"type":"object","properties":{"environment":{"type":"string","title":"Environment","enum":["staging","production"]},"token":{"type":"string","title":"Token","format":"password"}}}}}"#
+        let evs = ClaudeParser().parseLine(line)
+        let request = evs.compactMap { event -> AssistantUserInputRequest? in
+            if case .userInputRequested(let request) = event { return request }
+            return nil
+        }.first
+        XCTAssertEqual(request?.id, "req-elicit-1")
+        XCTAssertEqual(request?.prompt, "Configure deployment")
+        XCTAssertEqual(Set(request?.questions.map(\.id) ?? []), Set(["environment", "token"]))
+        XCTAssertTrue(request?.isSecret == true)
+        XCTAssertTrue(evs.allSatisfy {
+            if case .requestOpened = $0 { return false }
+            return true
+        }, "elicitation must not open a tool permission card")
+    }
+
+    /// CLAUDE-CLI-008: control_cancel_request settles both approval and user-input pending.
+    func test_controlCancelRequestResolvesPendingApprovalAndUserInput() {
+        let line = #"{"type":"control_cancel_request","request_id":"req-cancel-me"}"#
+        let evs = ClaudeParser().parseLine(line)
+        var sawRequestCancelled = false
+        var sawUserInputResolved: String?
+        for event in evs {
+            if case .requestResolved(let id, let state) = event {
+                XCTAssertEqual(id, "req-cancel-me")
+                XCTAssertEqual(state, .cancelled)
+                sawRequestCancelled = true
+            }
+            if case .userInputResolved(let id, let answer) = event {
+                XCTAssertEqual(id, "req-cancel-me")
+                XCTAssertNil(answer)
+                sawUserInputResolved = id
+            }
+        }
+        XCTAssertTrue(sawRequestCancelled, "control_cancel_request must cancel open approval UI")
+        XCTAssertEqual(sawUserInputResolved, "req-cancel-me",
+                       "control_cancel_request must clear open user-input UI")
+    }
+
     func test_sdkElicitationPreservesObjectPropertyNamesTypesAndSecretPresentation() throws {
         let parser = ClaudeParser()
         let events = parser.parseLine(#"{"type":"user_input_request","request_id":"elicitation-typed","prompt":"Configure deployment","requested_schema":{"type":"object","required":["environment","replicas","dryRun","token"],"properties":{"environment":{"type":"string","title":"Environment","enum":["staging","production"]},"replicas":{"type":"integer","title":"Replicas"},"dryRun":{"type":"boolean","title":"Dry run"},"token":{"type":"string","title":"Token","format":"password"}}}}"#)
