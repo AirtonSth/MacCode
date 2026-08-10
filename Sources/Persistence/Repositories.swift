@@ -3414,6 +3414,39 @@ public final class AgentRunRepository: @unchecked Sendable {
         return rows
     }
 
+    /// Recent terminal runs for Active Threads → Last Finished.
+    ///
+    /// WHY: live ActiveRunProjection only holds in-flight runs. The shell
+    /// history tab needs durable finished rows without inventing a second
+    /// event bus. Cap keeps the list scannable (mirrors Pet active prefix 50).
+    public func listRecentFinished(limit: Int = 50) throws -> [AgentRun] {
+        let capped = max(1, min(limit, 500))
+        let st = try db.prepare("""
+            SELECT id, thread_id, provider, provider_instance_id, model, status, started_at, finished_at, error_message
+            FROM agent_runs
+            WHERE finished_at IS NOT NULL
+              AND status NOT IN ('pending', 'running')
+            ORDER BY finished_at DESC
+            LIMIT ?;
+            """)
+        try st.bind(1, Int64(capped))
+        var rows: [AgentRun] = []
+        while try st.step() {
+            rows.append(AgentRun(
+                id: AgentRunID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID()),
+                threadId: AgentThreadID(UUID(uuidString: st.columnText(1) ?? "") ?? UUID()),
+                provider: AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex,
+                providerInstanceId: st.columnText(3) ?? (AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex).rawValue,
+                model: st.columnText(4) ?? "",
+                status: AgentRunStatus(rawValue: st.columnText(5) ?? "") ?? .completed,
+                startedAt: parseDate(st.columnText(6)),
+                finishedAt: st.columnText(7).map(parseDate),
+                errorMessage: st.columnText(8)
+            ))
+        }
+        return rows
+    }
+
     public func reconcileRunningOnLaunch(preservingThreadIDs: Set<AgentThreadID> = []) throws -> Int {
         let countBefore = try countRunning()
         // Always stamp a durable reason so relaunch is never an unexplained terminal

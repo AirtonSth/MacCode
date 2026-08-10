@@ -338,8 +338,12 @@ public final class SidebarViewModel: ObservableObject {
     @Published public var selectedWorkspaceIDs: Set<WorkspaceID> = []
     /// True while the main content pane shows Schedule Tasks (not a workspace).
     @Published public var isScheduledTasksSelected: Bool = false
+    /// True while the main content pane shows Active Threads (not a workspace).
+    @Published public var isActiveThreadsSelected: Bool = false
+    /// Host-authoritative active agent thread count for the sidebar badge.
+    @Published public private(set) var activeThreadCount: Int = 0
     /// Fired when the user activates a workspace row so the shell can leave
-    /// the Schedule Tasks main-content destination.
+    /// the Schedule Tasks / Active Threads main-content destination.
     var onWorkspaceContentActivated: (() -> Void)?
     /// IMP-MAC_SHELL_WINDOW-009: free-text filter applied to the rendered
     /// workspace list. Empty string shows everything; matching is over
@@ -549,9 +553,10 @@ public final class SidebarViewModel: ObservableObject {
         let ordered = LayoutReducer.mostRecentlyUsedOrder(loaded)
         // Refresh the selection first so a workspace that completed AND became
         // selected this tick is correctly treated as "being viewed" (no dot).
-        // While Schedule Tasks owns the main content, keep every workspace row
-        // deselected so the shell destination is unambiguous.
-        if isScheduledTasksSelected {
+        // While a shell destination owns the main content, keep every workspace
+        // row deselected so the destination is unambiguous.
+        let shellDestinationSelected = isScheduledTasksSelected || isActiveThreadsSelected
+        if shellDestinationSelected {
             selectedWorkspaceID = nil
             selectedWorkspaceIDs.removeAll()
             selectionAnchorID = nil
@@ -562,8 +567,13 @@ public final class SidebarViewModel: ObservableObject {
         if ordered != workspaces {
             workspaces = ordered
         }
-        if !isScheduledTasksSelected {
+        if !shellDestinationSelected {
             selectedWorkspaceIDs = selectedWorkspaceIDs.intersection(Set(workspaces.map(\.id)))
+        }
+        // Live Active Threads badge: host projection count, same source as Pet.
+        let nextActiveCount = ctx.coordinator.activeThreadIdsSnapshot().count
+        if nextActiveCount != activeThreadCount {
+            activeThreadCount = nextActiveCount
         }
         reloadPrivateAccount()
     }
@@ -1497,6 +1507,7 @@ public final class SidebarViewModel: ObservableObject {
         selectionAnchorID = wid
         selectedWorkspaceID = wid
         isScheduledTasksSelected = false
+        isActiveThreadsSelected = false
         // UX-SIDEBAR-COMPLETED-DOT: opening a workspace clears its completed dot.
         completedWorkspaces.remove(wid)
         try? router?.selectWorkspace(wid)
@@ -2364,18 +2375,21 @@ public struct SidebarRootView: View {
     private let onOpenSettings: () -> Void
     private let onOpenAccount: () -> Void
     private let onOpenScheduledTasks: () -> Void
+    private let onOpenActiveThreads: () -> Void
     private let keyMapper = SidebarKeyIntentMapper()
 
     public init(
         vm: SidebarViewModel,
         onOpenSettings: @escaping () -> Void = {},
         onOpenAccount: @escaping () -> Void = {},
-        onOpenScheduledTasks: @escaping () -> Void = {}
+        onOpenScheduledTasks: @escaping () -> Void = {},
+        onOpenActiveThreads: @escaping () -> Void = {}
     ) {
         self.vm = vm
         self.onOpenSettings = onOpenSettings
         self.onOpenAccount = onOpenAccount
         self.onOpenScheduledTasks = onOpenScheduledTasks
+        self.onOpenActiveThreads = onOpenActiveThreads
     }
 
     public var body: some View {
@@ -2439,6 +2453,25 @@ public struct SidebarRootView: View {
                 .help("Create and manage scheduled Agent tasks")
                 .accessibilityIdentifier("sidebar.scheduleTasks")
                 .accessibilityAddTraits(vm.isScheduledTasksSelected ? .isSelected : [])
+
+                Button(action: onOpenActiveThreads) {
+                    sidebarActionRow(
+                        symbol: "bolt.horizontal.circle",
+                        title: "Active Threads",
+                        isSelected: vm.isActiveThreadsSelected,
+                        badgeText: PetActiveThreadCountFormatter.badgeText(count: vm.activeThreadCount),
+                        badgeIsBlue: true
+                    )
+                }
+                .buttonStyle(.plain)
+                .help(PetActiveThreadCountFormatter.accessibilityValue(count: vm.activeThreadCount))
+                .accessibilityIdentifier("sidebar.activeThreads")
+                .accessibilityLabel(
+                    vm.activeThreadCount > 0
+                        ? PetActiveThreadCountFormatter.accessibilityValue(count: vm.activeThreadCount)
+                        : "Active Threads"
+                )
+                .accessibilityAddTraits(vm.isActiveThreadsSelected ? .isSelected : [])
 
                 Button(action: reportBug) {
                     sidebarActionRow(symbol: "ladybug", title: "Report Bug")
@@ -2671,7 +2704,9 @@ public struct SidebarRootView: View {
         symbol: String,
         title: String,
         isEmphasized: Bool = false,
-        isSelected: Bool = false
+        isSelected: Bool = false,
+        badgeText: String? = nil,
+        badgeIsBlue: Bool = false
     ) -> some View {
         let highlight = isEmphasized || isSelected
         return HStack(spacing: DS.Space.md) {
@@ -2685,6 +2720,15 @@ public struct SidebarRootView: View {
                 .foregroundColor(isEmphasized ? DS.Palette.warning : (isSelected ? DS.Palette.text : DS.Palette.text))
                 .lineLimit(1)
             Spacer(minLength: 0)
+            if let badgeText {
+                Text(badgeText)
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, badgeText == "99+" ? 5 : 6)
+                    .frame(minWidth: 22, minHeight: 22)
+                    .background(Circle().fill(badgeIsBlue ? Color.blue : DS.Palette.danger))
+                    .accessibilityHidden(true)
+            }
         }
         .padding(.horizontal, DS.Space.sm)
         .frame(height: 42)
@@ -5198,7 +5242,9 @@ public final class SidebarView: NSObject {
     private let updater: AppUpdateChecking?
     /// Main window mounts Schedule Tasks in the workspace content column.
     public var onPresentScheduledTasks: (() -> Void)?
-    /// Fired when a workspace is selected so main content leaves Schedule Tasks.
+    /// Main window mounts Active Threads in the workspace content column.
+    public var onPresentActiveThreads: (() -> Void)?
+    /// Fired when a workspace is selected so main content leaves shell destinations.
     public var onWorkspaceContentActivated: (() -> Void)? {
         get { viewModel.onWorkspaceContentActivated }
         set { viewModel.onWorkspaceContentActivated = newValue }
@@ -5238,14 +5284,26 @@ public final class SidebarView: NSObject {
             vm: viewModel,
             onOpenSettings: { [weak self] in self?.showSettings() },
             onOpenAccount: { [weak self] in self?.showAccount() },
-            onOpenScheduledTasks: { [weak self] in self?.showScheduledTasks() }
+            onOpenScheduledTasks: { [weak self] in self?.showScheduledTasks() },
+            onOpenActiveThreads: { [weak self] in self?.showActiveThreads() }
         )
     }
 
     public func setScheduledTasksSelected(_ selected: Bool) {
         viewModel.isScheduledTasksSelected = selected
         if selected {
+            viewModel.isActiveThreadsSelected = false
             // Visual deselect of all workspace rows while Schedule Tasks is active.
+            viewModel.selectedWorkspaceID = nil
+            viewModel.selectedWorkspaceIDs.removeAll()
+            viewModel.clearSelectionAnchorForShellDestination()
+        }
+    }
+
+    public func setActiveThreadsSelected(_ selected: Bool) {
+        viewModel.isActiveThreadsSelected = selected
+        if selected {
+            viewModel.isScheduledTasksSelected = false
             viewModel.selectedWorkspaceID = nil
             viewModel.selectedWorkspaceIDs.removeAll()
             viewModel.clearSelectionAnchorForShellDestination()
@@ -5292,5 +5350,13 @@ public final class SidebarView: NSObject {
         guard let context, let router else { return }
         let controller = ScheduledTasksWindowController(context: context, router: router)
         controller.show()
+    }
+
+    @objc private func showActiveThreads() {
+        if let onPresentActiveThreads {
+            onPresentActiveThreads()
+            return
+        }
+        // No detached fallback: Active Threads is main-content only.
     }
 }

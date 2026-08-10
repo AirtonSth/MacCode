@@ -368,6 +368,9 @@ public final class AppContext {
     /// needs at most one lifecycle-time lookup even during large orchestrated bursts.
     private var activeAgentThreadContextByID: [AgentThreadID: ActiveAgentThreadContext] = [:]
     private var activeAgentThreadTitlesByWorkspace: [WorkspaceID: [String]] = [:]
+    /// Last count fanned out to sidebar chrome (Active Threads badge). Tracks
+    /// host snapshot size, not the workspace-title map size.
+    private var lastPublishedActiveThreadCount: Int = 0
     private var pendingRecoveredForkPrunedThreadIDs: Set<AgentThreadID> = []
     public var socketServer: UnixSocketServer?
     private let tokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefreshing
@@ -1487,6 +1490,8 @@ public final class AppContext {
 
     private func refreshActiveAgentWorkspaceProjection() {
         let activeThreadIDs = coordinator.activeThreadIdsSnapshot()
+        let activeCount = activeThreadIDs.count
+        let previousActiveCount = lastPublishedActiveThreadCount
         let cachedThreadIDs = Set(activeAgentThreadContextByID.keys)
 
         for threadID in cachedThreadIDs.subtracting(activeThreadIDs) {
@@ -1512,8 +1517,16 @@ public final class AppContext {
             guard let context = activeAgentThreadContextByID[threadID] else { continue }
             projected[context.workspaceID, default: []].append(context.title)
         }
-        guard projected != activeAgentThreadTitlesByWorkspace else { return }
-        activeAgentThreadTitlesByWorkspace = projected
+        // WHY: Active Threads sidebar badge uses host snapshot count, not the
+        // workspace-title map. Threads without workspaceId never enter the map,
+        // so count-only transitions must still refresh sidebar chrome.
+        let titlesChanged = projected != activeAgentThreadTitlesByWorkspace
+        let countChanged = previousActiveCount != activeCount
+        guard titlesChanged || countChanged else { return }
+        if titlesChanged {
+            activeAgentThreadTitlesByWorkspace = projected
+        }
+        lastPublishedActiveThreadCount = activeCount
         router?.windowController?.refreshSurfaceRuntimeState()
     }
 

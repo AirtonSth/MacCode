@@ -28,11 +28,13 @@ final class ScheduledTasksWindowTests: XCTestCase {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
         let newWorkspace = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.newWorkspace\")"))
         let scheduleTasks = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.scheduleTasks\")"))
+        let activeThreads = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.activeThreads\")"))
         let reportBug = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.reportBug\")"))
         let updateControl = try XCTUnwrap(source.range(of: "if vm.showsUpdateControl"))
 
         XCTAssertLessThan(newWorkspace.lowerBound, scheduleTasks.lowerBound)
-        XCTAssertLessThan(scheduleTasks.lowerBound, reportBug.lowerBound)
+        XCTAssertLessThan(scheduleTasks.lowerBound, activeThreads.lowerBound)
+        XCTAssertLessThan(activeThreads.lowerBound, reportBug.lowerBound)
         XCTAssertLessThan(reportBug.lowerBound, updateControl.lowerBound)
     }
 
