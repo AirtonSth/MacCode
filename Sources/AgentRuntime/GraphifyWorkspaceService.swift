@@ -452,7 +452,10 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
                     s.lastHead = head
                 }
             }
-            let needRerun = !cancelled && (s.rerunRequested || s.dirtyGeneration > s.builtGeneration)
+            // After a cancelled generation drains, still re-kick if enabled and dirty
+            // so resumeAfterDisable's replacement request is not lost.
+            let dirtyNow = s.rerunRequested || s.dirtyGeneration > s.builtGeneration
+            let needRerun = service.enabled && dirtyNow
             s.rerunRequested = false
             service.schedules[checkout.scheduleID] = s
             service.globalCLIInFlight = false
@@ -461,7 +464,19 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             if !service.schedules.values.contains(where: \.inFlight) {
                 service.activeRebuildCancelled = false
             }
-            let deferredIDs = cancelled ? [] : service.globalCLIRerunIDs
+            // On cancel drain, also re-kick any other deferred/dirty schedules while enabled.
+            let deferredIDs: Set<String>
+            if cancelled && service.enabled {
+                deferredIDs = service.globalCLIRerunIDs.union(
+                    Set(service.schedules.compactMap { id, sch in
+                        (sch.dirtyGeneration > sch.builtGeneration || sch.rerunRequested) ? id : nil
+                    })
+                )
+            } else if cancelled {
+                deferredIDs = []
+            } else {
+                deferredIDs = service.globalCLIRerunIDs
+            }
             service.globalCLIRerunIDs.removeAll(keepingCapacity: true)
             let deferredRoots = deferredIDs.compactMap { id -> String? in
                 guard id != checkout.scheduleID,
@@ -476,7 +491,6 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             if cancelled {
                 try? FileManager.default.removeItem(at: service.fingerprintPath(for: checkout))
             }
-            // Fingerprint is written only inside ensureSync when not cancelled.
             // Kick deferred checkouts that waited on the global gate (at most one
             // trailing ensure per id via startEnsureIfNeeded coalescing).
             for displayRoot in deferredRoots {
@@ -485,7 +499,7 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
                 }
             }
             if needRerun {
-                // Exactly one trailing update for changes during the build.
+                // Replacement after cancel or trailing dirty during build.
                 service.startEnsureIfNeeded(checkout: checkout)
             }
         }

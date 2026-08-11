@@ -163,6 +163,8 @@ final class WebSocketEventBatcher: @unchecked Sendable {
             } else {
                 // Non-delta: append after any buffered deltas (order preserved)
                 // and flush NOW so interactive events pay zero added latency.
+                // Aggregate admission applies: if pending deltas + this frame would
+                // exceed budget, flush pending first so we never roughly 2× the cap.
                 queue.async {
                     defer { releasePreQueue() }
                     guard !self.stopped else { return }
@@ -173,6 +175,18 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                         self.overflowCount += 1
                         self.preQueueLock.unlock()
                         self.onAdmissionOverflow?(lost, "frame_exceeds_budget")
+                        return
+                    }
+                    if self.wouldExceedAdmissionLocked(additionalBytes: data.count) {
+                        self.flushLocked()
+                    }
+                    if self.wouldExceedAdmissionLocked(additionalBytes: data.count) {
+                        var lost: [Int64] = []
+                        if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
+                        self.handleOverflowLocked(reason: "aggregate_after_non_delta")
+                        if !lost.isEmpty {
+                            self.onAdmissionOverflow?(lost, "aggregate_after_non_delta")
+                        }
                         return
                     }
                     self.noteEnqueueLocked(data)
