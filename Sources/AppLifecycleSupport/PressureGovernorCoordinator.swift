@@ -211,7 +211,23 @@ public final class PressureGovernorCoordinator: @unchecked Sendable {
                 skipped.append(action)
                 continue
             }
+            // Atomic claim: revalidate epoch/frozen under the same lock as mutation.
             lock.lock()
+            let epochOK = PressureGovernorStateMachine.isEpochFresh(
+                state: state,
+                expectedEpoch: plan.target.epoch
+            )
+            let frozenNow = state.frozenAccounting
+            if !epochOK || frozenNow {
+                lock.unlock()
+                skipped.append(action)
+                skipped.append(contentsOf: remaining)
+                return PressureMutationOutcome(
+                    applied: applied,
+                    skipped: skipped,
+                    reason: !epochOK ? "stale_epoch" : "frozen_accounting"
+                )
+            }
             if action == .pauseGraphifyEnsureAndWatchCallbacks {
                 lastGraphifyIdentity = liveTarget.graphifyChildIdentity
             }

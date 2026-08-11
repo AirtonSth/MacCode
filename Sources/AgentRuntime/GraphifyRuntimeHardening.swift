@@ -56,15 +56,28 @@ public enum GraphifyRuntimeHardening {
     }
 
     /// Bound process pipe capture. Prefer over unbounded `readDataToEndOfFile`.
+    /// Retains only the first `maxBytes` while continuing to drain the pipe so a
+    /// verbose child cannot block on a full pipe until timeout.
     public static func boundedRead(handle: FileHandle, maxBytes: Int) -> Data {
         let limit = max(0, maxBytes)
-        guard limit > 0 else { return Data() }
         var collected = Data()
-        collected.reserveCapacity(min(limit, 64 * 1024))
-        while collected.count < limit {
-            let chunk = handle.readData(ofLength: min(64 * 1024, limit - collected.count))
+        if limit > 0 {
+            collected.reserveCapacity(min(limit, 64 * 1024))
+        }
+        while true {
+            let want = limit == 0 ? 64 * 1024 : min(64 * 1024, max(1, limit - collected.count + 64 * 1024))
+            let chunk = handle.readData(ofLength: want)
             if chunk.isEmpty { break }
-            collected.append(chunk)
+            if collected.count < limit {
+                let room = limit - collected.count
+                if chunk.count <= room {
+                    collected.append(chunk)
+                } else {
+                    collected.append(chunk.prefix(room))
+                    // Keep draining remainder of this chunk and subsequent data.
+                }
+            }
+            // When already at cap, discard further bytes (drain only).
         }
         return collected
     }

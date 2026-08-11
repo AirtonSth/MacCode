@@ -2511,23 +2511,27 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     scheduleStickyBaselineFlush()
                     return
                 }
-                let accepted: Bool = {
+                enum EmitOutcome { case accepted, retryable, terminalClosed }
+                let outcome: EmitOutcome = {
                     switch outbound.enqueueApplication(baselineData) {
                     case .accepted:
-                        return true
+                        return .accepted
                     case .queueFull:
                         _ = outbound.degrade()
                         switch outbound.enqueueApplication(baselineData) {
                         case .accepted:
-                            return true
-                        case .queueFull, .closed:
-                            return false
+                            return .accepted
+                        case .queueFull:
+                            return .retryable
+                        case .closed:
+                            return .terminalClosed
                         }
                     case .closed:
-                        return false
+                        return .terminalClosed
                     }
                 }()
-                if accepted {
+                switch outcome {
+                case .accepted:
                     pressureBaselineGate.recordSuccess(forGeneration: generation)
                     NSLog(
                         "[RC2.WS] outbound pressure: baseline_required without close seq=%lld",
@@ -2538,19 +2542,21 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         "baseline_required": .bool(true),
                         "current_sequence": .number(Double(current))
                     ]))
-                    // If a newer overflow arrived during emission, re-arm once.
                     if pressureBaselineGate.hasPendingRecovery {
                         scheduleStickyBaselineFlush()
                     }
-                } else {
+                case .retryable:
                     pressureBaselineGate.markPending()
                     scheduleStickyBaselineFlush()
+                case .terminalClosed:
+                    // Connection gone: never re-arm sticky recovery.
+                    pressureBaselineGate.markClosed()
                 }
             }
-            scheduleStickyBaselineFlush = {
+            scheduleStickyBaselineFlush = { [pressureBaselineGate] in
                 // Single-flight: floods arm at most one delayed flush at a time.
                 guard pressureBaselineGate.armFlushIfNeeded() else { return }
-                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.05) {
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.05) { [pressureBaselineGate] in
                     pressureBaselineGate.clearFlushArm()
                     if pressureBaselineGate.hasPendingRecovery {
                         emitPressureBaseline()

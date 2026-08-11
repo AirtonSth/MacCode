@@ -977,15 +977,24 @@ final class OutboundPressureBaselineGate: @unchecked Sendable {
     private var pendingGeneration: UInt64 = 0
     private var issuedGeneration: UInt64 = 0
     private var flushScheduled = false
+    private var closed = false
 
     init(minInterval: TimeInterval = 1.0) {
         self.minInterval = max(0, minInterval)
     }
 
-    /// True when a recovery emission is still owed.
+    /// True when a recovery emission is still owed and the connection is open.
     var hasPendingRecovery: Bool {
         lock.lock(); defer { lock.unlock() }
-        return pendingGeneration > issuedGeneration
+        return !closed && pendingGeneration > issuedGeneration
+    }
+
+    /// Terminal: stop sticky recovery for this connection.
+    func markClosed() {
+        lock.lock(); defer { lock.unlock() }
+        closed = true
+        flushScheduled = false
+        pendingGeneration = issuedGeneration
     }
 
     /// Coalesce a recovery request (bumps generation so later success cannot
@@ -998,6 +1007,7 @@ final class OutboundPressureBaselineGate: @unchecked Sendable {
     /// Attempt to open the rate gate. Returns the generation acquired, or nil.
     func tryAcquireGeneration(now: TimeInterval = Date().timeIntervalSinceReferenceDate) -> UInt64? {
         lock.lock(); defer { lock.unlock() }
+        if closed { return nil }
         if lastEmitAt > 0, now - lastEmitAt < minInterval {
             if pendingGeneration == issuedGeneration {
                 pendingGeneration &+= 1
@@ -1037,6 +1047,7 @@ final class OutboundPressureBaselineGate: @unchecked Sendable {
     /// concurrent scheduler so floods do not enqueue unbounded tasks.
     func armFlushIfNeeded() -> Bool {
         lock.lock(); defer { lock.unlock() }
+        guard !closed else { return false }
         guard pendingGeneration > issuedGeneration else { return false }
         guard !flushScheduled else { return false }
         flushScheduled = true

@@ -343,11 +343,10 @@ public enum CapacitySemanticHarness {
                 markProgress()
                 return .terminal
             case .reorder:
-                // Requeue at end of active work (do NOT treat as terminal).
+                // Move to tail even if already queued (true reorder).
                 let id = nodes[nodeIdx].id
-                if !activeQueue.contains(id) {
-                    activeQueue.append(id)
-                }
+                activeQueue.removeAll { $0 == id }
+                activeQueue.append(id)
                 markFaultApplied(faultIndex)
                 markProgress()
                 return .requeue

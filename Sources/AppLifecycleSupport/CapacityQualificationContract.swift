@@ -361,6 +361,8 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
     public var warmedRuns: [CapacityWarmedRunObservation]
     /// Max relative range ((max-min)/max) across warmed runs per required metric.
     public var metricVarianceMax: [String: Double]
+    /// Prior same-machine baseline means for p95/p99 regression (empty = first run).
+    public var priorBaselineMeans: [String: Double]
 
     public init(
         manifestId: String,
@@ -371,7 +373,8 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
         createdAtISO8601: String,
         manifestDigest: String,
         warmedRuns: [CapacityWarmedRunObservation] = [],
-        metricVarianceMax: [String: Double] = [:]
+        metricVarianceMax: [String: Double] = [:],
+        priorBaselineMeans: [String: Double] = [:]
     ) {
         self.manifestId = manifestId
         self.schemaVersion = schemaVersion
@@ -382,6 +385,7 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
         self.manifestDigest = manifestDigest
         self.warmedRuns = warmedRuns
         self.metricVarianceMax = metricVarianceMax
+        self.priorBaselineMeans = priorBaselineMeans
     }
 
     public func validate(against manifest: CapacityQualificationManifest) throws {
@@ -505,12 +509,23 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
             if abs(declared - recomputed) > 1e-9 {
                 throw CapacityContractError.invalidEstimator("variance mismatch for \(key)")
             }
-            // ≤10% regression gate: relative range across warmed runs must stay ≤0.10
-            // for latency-class metrics (release-gates promotion policy).
+            // Estimator quality: relative range across current warmed runs ≤0.10.
             if key.hasSuffix("_p95") || key.hasSuffix("_p99") || key == CapacityRequiredMetricKey.lockWaitMsP95.rawValue {
                 if declared > 0.10 {
                     throw CapacityContractError.invalidEstimator(
-                        "regression gate: \(key) relative range \(declared) > 0.10"
+                        "variance gate: \(key) relative range \(declared) > 0.10"
+                    )
+                }
+            }
+            // Promotion regression: current mean vs prior same-machine baseline ≤10%.
+            if let prior = priorBaselineMeans[key],
+               prior > 0,
+               (key.hasSuffix("_p95") || key.hasSuffix("_p99") || key == CapacityRequiredMetricKey.lockWaitMsP95.rawValue) {
+                let currentMean = byName[key]?.value ?? 0
+                let regression = (currentMean - prior) / prior
+                if regression > 0.10 {
+                    throw CapacityContractError.invalidEstimator(
+                        "regression gate: \(key) \(regression) > 0.10 vs prior baseline"
                     )
                 }
             }

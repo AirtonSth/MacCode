@@ -607,15 +607,18 @@ enum AppDiagnostics {
             case .normal, .unknown: return .normal
             }
         }()
+        // Accounting completeness ≠ physical capacity qualification.
         CapacityUXStatusStore.shared.publish(
             CapacityUXStatus.from(
                 hardwareTierName: sample.profile.name,
                 hostPressure: hostLevel,
                 providerTreePressure: hostLevel,
-                envelopeMeasured: sample.isComplete,
+                envelopeMeasured: false, // physical canary not claimed from heartbeat alone
                 beyondEnvelope: sample.pressureDecision == .critical,
                 accountingAvailable: sample.isComplete,
-                degradationActions: sample.pressureDecision == .normal ? [] : [sample.pressureDecision.rawValue]
+                degradationActions: sample.pressureDecision == .normal || sample.pressureDecision == .unknown
+                    ? []
+                    : [sample.pressureDecision.rawValue]
             )
         )
     }
