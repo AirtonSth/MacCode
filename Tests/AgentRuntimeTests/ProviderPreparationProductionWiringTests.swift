@@ -334,6 +334,56 @@ final class ProviderPreparationProductionWiringTests: XCTestCase {
         )
     }
 
+    /// One Stop with two preexisting reservations must cancel both runs
+    /// (not only the first late registration that consumes pendingThreadStops).
+    func test_oneStop_cancelsEveryPreexistingReservation() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-one-stop-two")
+        let thread = AgentThread(title: "prep-one-stop", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let runner = CountingRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: runner]
+        )
+
+        let runA = AgentRunID()
+        let runB = AgentRunID()
+        coordinator.reserveProviderStart(threadId: thread.id, runId: runA)
+        coordinator.reserveProviderStart(threadId: thread.id, runId: runB)
+        // Single Stop while both are reserved — no second Stop for B.
+        coordinator.cancelPreparation(threadId: thread.id)
+
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                runId: runA,
+                threadId: thread.id,
+                provider: .codex,
+                model: "fake-model",
+                cwd: tmp,
+                prompt: "late A"
+            ))
+        } catch { /* cancelled */ }
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                runId: runB,
+                threadId: thread.id,
+                provider: .codex,
+                model: "fake-model",
+                cwd: tmp,
+                prompt: "late B after A consumed thread stop"
+            ))
+        } catch { /* cancelled */ }
+
+        XCTAssertEqual(
+            runner.startCount,
+            0,
+            "one Stop must cancel every preexisting reserved run, including the sibling after pendingThreadStops is consumed"
+        )
+    }
+
     /// Surface-only cancel before reserve must not leave pendingThreadStops that
     /// poison an immediate resend.
     func test_cancelWithoutReserve_doesNotPoisonResend() async throws {

@@ -959,6 +959,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// Keyed by runId so a late startRun for run A cannot clear run B's reservation
     /// on the same thread (multi-surface / resend overlap).
     private var reservedProviderStarts: [AgentRunID: AgentThreadID] = [:]
+    /// Run-scoped cancels: one thread-level Stop can mark every reserved run so
+    /// a late sibling registration cannot spawn after the first consumes
+    /// `pendingThreadStops`.
+    private var cancelledProviderStartRuns: Set<AgentRunID> = []
     /// Runs whose destructive caller is waiting for provider/process teardown.
     /// The matching terminal callback is recorded even when markStopRequested
     /// already made the durable run row terminal.
@@ -1386,6 +1390,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // Drop only this run's reservation — never a sibling resend's.
             if reservedProviderStarts[runId] == request.threadId {
                 reservedProviderStarts.removeValue(forKey: runId)
+            }
+            // Re-arm thread stop when this exact run was cancelled while reserved
+            // (sibling may already have consumed a prior pendingThreadStops entry).
+            if cancelledProviderStartRuns.remove(runId) != nil {
+                pendingThreadStops.insert(request.threadId)
             }
             rememberRunThreadOwnershipLocked(runId: runId, threadId: request.threadId)
             registeredPendingStart = true
@@ -2404,8 +2413,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public func cancelPreparation(threadId: AgentThreadID) {
         lock.lock()
         _ = applyPreparationLocked(threadId: threadId, event: .stopRequested)
-        let hasReservation = reservedProviderStarts.contains { $0.value == threadId }
-        if pendingProviderStarts[threadId] != nil || hasReservation {
+        let reservedForThread = reservedProviderStarts.filter { $0.value == threadId }
+        // Per-run cancel tokens so one Stop cancels every reserved run, not only
+        // the first late registration that consumes pendingThreadStops.
+        for runId in reservedForThread.keys {
+            cancelledProviderStartRuns.insert(runId)
+        }
+        if pendingProviderStarts[threadId] != nil || !reservedForThread.isEmpty {
             pendingThreadStops.insert(threadId)
         }
         reservedProviderStarts = reservedProviderStarts.filter { $0.value != threadId }
@@ -2419,6 +2433,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public func reserveProviderStart(threadId: AgentThreadID, runId: AgentRunID) {
         lock.lock()
         reservedProviderStarts[runId] = threadId
+        // A fresh reserve is a new attempt — clear any stale cancel token for this run.
+        cancelledProviderStartRuns.remove(runId)
         lock.unlock()
     }
 

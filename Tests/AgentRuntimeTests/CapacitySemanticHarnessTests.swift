@@ -40,8 +40,10 @@ final class CapacitySemanticHarnessTests: XCTestCase {
         XCTAssertTrue(result.queueDrained)
         XCTAssertTrue(result.rejoinExactlyOnce)
         XCTAssertTrue(result.terminalOwnershipExact)
-        // Smaller schedules may skip unreachable child faults; require drain + ownership.
-        XCTAssertTrue(result.queueDrained)
+        XCTAssertTrue(
+            result.allFaultsApplied,
+            "root-targeted faults must all apply: unknown=\(result.unknownFaultKinds) applied=\(result.appliedFaultIndices)"
+        )
         XCTAssertEqual(result.completedCount + result.cancelledCount + result.failedCount, schedule.nodes.count)
         XCTAssertGreaterThanOrEqual(result.longestNoProgressMs, 0)
     }
@@ -54,8 +56,17 @@ final class CapacitySemanticHarnessTests: XCTestCase {
         let result = CapacitySemanticHarness.run(schedule: schedule, clock: clock)
         XCTAssertTrue(result.queueDrained, "default workload must drain (no stranded active nodes)")
         XCTAssertTrue(result.terminalOwnershipExact)
-        // Prefer true application of the stop/resume pair at least.
-        XCTAssertFalse(result.appliedFaultIndices.isEmpty)
+        XCTAssertTrue(
+            result.allFaultsApplied,
+            "every declared fault must apply: unknown=\(result.unknownFaultKinds) applied=\(result.appliedFaultIndices)"
+        )
+        let appliedKinds = Set(result.appliedFaultIndices.map { schedule.faults[$0].kind })
+        let declaredKinds = Set(schedule.faults.map(\.kind))
+        XCTAssertEqual(
+            appliedKinds,
+            declaredKinds,
+            "applied kind set must match every declared schedule kind"
+        )
         XCTAssertTrue(result.unknownFaultKinds.isEmpty)
         XCTAssertFalse(result.nodes.contains(where: { $0.status == .active || $0.status == .waiting }))
     }
@@ -93,8 +104,13 @@ final class CapacitySemanticHarnessTests: XCTestCase {
         let result = CapacitySemanticHarness.run(schedule: schedule, clock: clock)
         XCTAssertTrue(result.unknownFaultKinds.isEmpty)
         XCTAssertTrue(result.queueDrained)
-        // stop/resume pair must both apply on the paired root.
-        XCTAssertGreaterThanOrEqual(result.appliedFaultIndices.count, 2)
+        XCTAssertTrue(result.allFaultsApplied, "applied=\(result.appliedFaultIndices)")
+        let appliedKinds = Set(result.appliedFaultIndices.map { schedule.faults[$0].kind })
+        XCTAssertEqual(
+            appliedKinds,
+            Set(kinds),
+            "every known fault kind must be exercised at least once"
+        )
     }
 
     func test_run_cancelNodes_neverSpawnTerminalAsCompleted() {

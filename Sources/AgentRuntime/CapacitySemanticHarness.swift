@@ -248,22 +248,29 @@ public enum CapacitySemanticHarness {
             parentsByDepth[level] = nextFrontier
         }
 
-        // Seeded fault plan: ensure stop_race+resume pair on one node so resume
-        // recovery is exercisable (not assigned to unrelated live nodes only).
+        // Seeded fault plan: place every declared kind on live roots so
+        // qualification cannot skip kinds that land on never-activated children.
+        // stop_race+resume pair on the first root; remaining kinds on other roots.
         var faults: [CapacityHarnessFault] = []
-        if let pairNode = nodes.first {
-            faults.append(CapacityHarnessFault(atMs: 50, nodeId: pairNode.id, kind: "stop_race"))
-            faults.append(CapacityHarnessFault(atMs: 150, nodeId: pairNode.id, kind: "resume"))
+        if let pairNode = rootIDs.first {
+            faults.append(CapacityHarnessFault(atMs: 50, nodeId: pairNode, kind: "stop_race"))
+            faults.append(CapacityHarnessFault(atMs: 150, nodeId: pairNode, kind: "resume"))
         }
         let remainingKinds = faultKinds.filter { $0 != "stop_race" && $0 != "resume" }
-        let faultBudget = min(6, max(0, nodes.count - 1))
-        for i in 0..<faultBudget {
-            let node = nodes[(i + 1) * max(1, nodes.count / max(1, faultBudget + 1)) % nodes.count]
+        // One deterministic root-targeted fault per remaining kind (reachable).
+        for (i, kind) in remainingKinds.enumerated() {
+            guard rootIDs.count > 1 else { break }
+            let node = rootIDs[(i + 1) % rootIDs.count]
+            faults.append(CapacityHarnessFault(atMs: Int64((i + 1) * 40), nodeId: node, kind: kind))
+        }
+        // Optional extras for stress, still root-only so they stay reachable.
+        let extraBudget = min(3, max(0, rootIDs.count - 1 - remainingKinds.count))
+        for i in 0..<extraBudget {
+            let node = rootIDs[(i + 1 + remainingKinds.count) % rootIDs.count]
             let kind = remainingKinds.isEmpty
-                ? faultKinds[i % faultKinds.count]
+                ? faultKinds[i % max(1, faultKinds.count)]
                 : remainingKinds[i % remainingKinds.count]
-            let atMs = Int64((i + 2) * 100)
-            faults.append(CapacityHarnessFault(atMs: atMs, nodeId: node.id, kind: kind))
+            faults.append(CapacityHarnessFault(atMs: Int64((i + 4) * 80), nodeId: node, kind: kind))
         }
 
         return CapacityHarnessSchedule(nodes: nodes, faults: faults, seed: seed)
