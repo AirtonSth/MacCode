@@ -592,6 +592,7 @@ final class TokenSaverCompressionTests: XCTestCase {
             runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
             providers: [.claude: runner]
         )
+        coordinator.tokenSaverRuntimeActive = { true }
 
         let humanized = "Os testes passaram, e o contador de tokens salvos foi atualizado."
         coordinator.finalResponseTranslator = { response, provider, threadId, _ in
@@ -610,10 +611,8 @@ final class TokenSaverCompressionTests: XCTestCase {
         ))
         let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
 
-        XCTAssertEqual(assistant.content, humanized,
-                       "the Agent App transcript must persist the human-language answer, not the SR1 compressed provider response")
-        XCTAssertFalse(assistant.content.contains("SR1"))
-        XCTAssertFalse(assistant.content.contains("S: tests green"))
+        XCTAssertEqual(assistant.content, sr1,
+                       "provider history must retain the SR1 wire text while the UI leg is persisted separately")
         let translation = try await waitForSR1Translation(
             coordinator,
             threadId: thread.id,
@@ -672,6 +671,7 @@ final class TokenSaverCompressionTests: XCTestCase {
             runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
             providers: [.claude: runner]
         )
+        coordinator.tokenSaverRuntimeActive = { true }
 
         coordinator.finalResponseTranslator = { _, _, _, _ in
             "Build passed. Raw log retained.\n[[rc:cafebabe]]"
@@ -686,9 +686,14 @@ final class TokenSaverCompressionTests: XCTestCase {
         ))
         let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
 
-        XCTAssertEqual(assistant.content, "Build passed. Raw log retained.",
-                       "translated final text must be sanitized before it reaches transcript persistence")
-        XCTAssertFalse(assistant.content.contains("[[rc:"))
+        XCTAssertEqual(assistant.content, sr1,
+                       "provider history must retain the original SR1 wire text")
+        let translation = try await waitForSR1Translation(
+            coordinator,
+            threadId: thread.id,
+            messageId: assistant.id.value.uuidString
+        )
+        XCTAssertEqual(translation.rewrittenText, "Build passed. Raw log retained.")
     }
 
     func test_sr1SemanticLineWithoutHeaderIsHumanizedBeforePersistence() async throws {
@@ -705,6 +710,7 @@ final class TokenSaverCompressionTests: XCTestCase {
             runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
             providers: [.codex: runner]
         )
+        coordinator.tokenSaverRuntimeActive = { true }
 
         coordinator.finalResponseTranslator = { response, provider, threadId, _ in
             XCTAssertEqual(provider, .codex)
@@ -723,8 +729,13 @@ final class TokenSaverCompressionTests: XCTestCase {
         ))
         let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
 
-        XCTAssertEqual(assistant.content, "Estado: humanizacao codex acionada")
-        XCTAssertFalse(assistant.content.contains("S:"))
+        XCTAssertEqual(assistant.content, compressed)
+        let translation = try await waitForSR1Translation(
+            coordinator,
+            threadId: thread.id,
+            messageId: assistant.id.value.uuidString
+        )
+        XCTAssertEqual(translation.rewrittenText, "Estado: humanizacao codex acionada")
     }
 
     func test_sr1SpaceDelimitedDistillLinesAreHumanizedBeforePersistence() async throws {
@@ -747,6 +758,7 @@ final class TokenSaverCompressionTests: XCTestCase {
             runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
             providers: [.claude: runner]
         )
+        coordinator.tokenSaverRuntimeActive = { true }
 
         coordinator.finalResponseTranslator = { response, provider, threadId, _ in
             XCTAssertEqual(provider, .claude)
@@ -765,10 +777,17 @@ final class TokenSaverCompressionTests: XCTestCase {
         ))
         let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
 
-        XCTAssertFalse(assistant.content.contains("O file:"),
-                       "the Agent App transcript must not persist raw /distill SR1 lines")
-        XCTAssertFalse(assistant.content.contains("P open:"))
-        XCTAssertTrue(assistant.content.contains("Snake game foi criado"))
+        XCTAssertEqual(assistant.content, compressed,
+                       "provider history must retain the SR1 wire text")
+        let translation = try await waitForSR1Translation(
+            coordinator,
+            threadId: thread.id,
+            messageId: assistant.id.value.uuidString
+        )
+        XCTAssertEqual(
+            translation.rewrittenText,
+            "O Snake game foi criado em /Users/samuelfajreldines/snake.html e pode ser aberto no navegador."
+        )
     }
 
     func test_mixedSR1AndHumanDistillAnswerIsHumanizedBeforePersistence() async throws {
@@ -797,6 +816,7 @@ final class TokenSaverCompressionTests: XCTestCase {
             runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
             providers: [.codex: runner]
         )
+        coordinator.tokenSaverRuntimeActive = { true }
 
         coordinator.finalResponseTranslator = { response, provider, threadId, _ in
             XCTAssertEqual(provider, .codex)
@@ -815,11 +835,14 @@ final class TokenSaverCompressionTests: XCTestCase {
         ))
         let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
 
-        XCTAssertEqual(assistant.content, "O jogo Snake foi criado em /tmp/index.html e verificado com sucesso.")
-        XCTAssertFalse(assistant.content.contains("S done."))
-        XCTAssertFalse(assistant.content.contains("O created"))
-        XCTAssertFalse(assistant.content.contains("P verified"))
-        XCTAssertFalse(assistant.content.contains("C controls"))
+        XCTAssertEqual(assistant.content, compressed,
+                       "provider history must retain the mixed SR1 wire text")
+        let translation = try await waitForSR1Translation(
+            coordinator,
+            threadId: thread.id,
+            messageId: assistant.id.value.uuidString
+        )
+        XCTAssertEqual(translation.rewrittenText, "O jogo Snake foi criado em /tmp/index.html e verificado com sucesso.")
     }
 
     func test_sr1AssistantMessageStreamIsHumanizedBeforeTimelinePersistence() async throws {
@@ -889,6 +912,63 @@ final class TokenSaverCompressionTests: XCTestCase {
         XCTAssertTrue(persistedBodies.contains(expected),
                       "replayed Agent App timelines must also use the humanized stream text")
         XCTAssertFalse(persistedBodies.contains("Dict: S=state"))
+    }
+
+    func test_bufferedSR1AndDeferredTerminalRecordComplianceOnce() async throws {
+        // WHY: A buffered SR1 item is translated before the provider terminal
+        // is released, so both the item completion and the deferred final can
+        // build a dual-channel plan for one run. Compliance owns the terminal
+        // plan only; the run must contribute exactly one provider turn.
+        SR2WirePolicy.sharedCompliance.reset()
+        defer { SR2WirePolicy.sharedCompliance.reset() }
+
+        let tmp = NSTemporaryDirectory() + "rc2-ts-buffered-sr1-compliance-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let compressed = "S state loaded.\nD run tests.\nO passed."
+        let runner = ScriptedStreamRunner(
+            provider: .claude,
+            body: compressed,
+            finalMessage: compressed
+        )
+        let thread = AgentThread(title: "buffered SR1 compliance", provider: .claude, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.claude: runner]
+        )
+        coordinator.tokenSaverRuntimeActive = { true }
+        coordinator.finalResponseTranslator = { response, provider, threadId, _ in
+            XCTAssertEqual(provider, .claude)
+            XCTAssertEqual(threadId, thread.id)
+            XCTAssertTrue(SR1ResponseDetector.isSR1(response))
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            return "Tests passed successfully."
+        }
+
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .claude,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "/distill run the tests"
+        ))
+        let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
+        XCTAssertEqual(assistant.content, compressed)
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline,
+              SR2WirePolicy.sharedCompliance.snapshot()["claude"]?.turns != 1 {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let snapshot = SR2WirePolicy.sharedCompliance.snapshot()
+        XCTAssertEqual(snapshot["claude"]?.turns, 1,
+                       "buffered SR1 item plus deferred terminal must export one compliance turn")
+        XCTAssertEqual(snapshot["claude"]?.misses, 0)
     }
 
     func test_inlineSR1AssistantMessageStreamIsHumanizedBeforeTimelinePersistence() async throws {
@@ -1047,6 +1127,9 @@ final class TokenSaverCompressionTests: XCTestCase {
             providers: [.codex: runner]
         )
 
+        // The translator hook is installed for the process lifetime, but this
+        // fixture models Token Saver being OFF explicitly.
+        coordinator.tokenSaverRuntimeActive = { false }
         coordinator.finalResponseTranslator = { _, _, _, _ in
             XCTFail("normal prose must not be sent through the SR1 humanizer")
             return "wrong"
@@ -1062,6 +1145,129 @@ final class TokenSaverCompressionTests: XCTestCase {
         let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
 
         XCTAssertEqual(assistant.content, normal)
+    }
+
+    func test_shortFreeProseUsesActiveTokenSaverDualChannel() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-ts-short-free-prose-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let shortReply = "Done."
+        let runner = ScriptedFinalRunner(provider: .codex, finalMessage: shortReply)
+        let thread = AgentThread(title: "short free prose", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providers: [.codex: runner]
+        )
+        coordinator.tokenSaverRuntimeActive = { true }
+        coordinator.finalResponseTranslator = { response, _, _, _ in
+            XCTAssertEqual(response, shortReply)
+            return response
+        }
+        coordinator.reversibleProseStore = { prose in
+            XCTAssertEqual(prose, shortReply)
+            return "deadbeef"
+        }
+
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "Confirm completion."
+        ))
+        let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
+
+        XCTAssertTrue(SR2WirePolicy.isSR2(assistant.content), assistant.content)
+        XCTAssertTrue(assistant.content.contains("[[rc:deadbeef]]"), assistant.content)
+        XCTAssertFalse(assistant.content.contains(shortReply))
+        let translation = try await waitForSR1Translation(
+            coordinator,
+            threadId: thread.id,
+            messageId: assistant.id.value.uuidString
+        )
+        XCTAssertEqual(translation.rewrittenText, shortReply)
+    }
+
+    func test_concurrentMixedProviderDualChannelRecordsExactRunOnce() async throws {
+        // WHY: compliance must be attributed to the run that produced the
+        // response. Concurrent Claude/Codex turns must not use an arbitrary
+        // active-run provider, and the same dual-channel plan must not be
+        // counted by both AppContext and the coordinator.
+        SR2WirePolicy.sharedCompliance.reset()
+        defer { SR2WirePolicy.sharedCompliance.reset() }
+
+        func makeFixture(
+            provider: AgentProvider,
+            finalMessage: String,
+            handle: String?
+        ) throws -> (AgentRunCoordinator, AgentMessageRepository, AgentThread, String) {
+            let tmp = NSTemporaryDirectory() + "rc2-ts-compliance-" + provider.rawValue + "-" + UUID().uuidString
+            let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+            let threadRepo = AgentThreadRepository(db: db)
+            let messageRepo = AgentMessageRepository(db: db)
+            let runRepo = AgentRunRepository(db: db)
+            let thread = AgentThread(title: "compliance", provider: provider, model: "fake-model")
+            try threadRepo.upsert(thread)
+            let runner = ScriptedFinalRunner(provider: provider, finalMessage: finalMessage)
+            let coordinator = AgentRunCoordinator(
+                runRepo: runRepo,
+                messageRepo: messageRepo,
+                threadRepo: threadRepo,
+                providers: [provider: runner]
+            )
+            coordinator.tokenSaverRuntimeActive = { true }
+            coordinator.finalResponseTranslator = { response, resolvedProvider, resolvedThread, _ in
+                XCTAssertEqual(resolvedProvider, provider)
+                XCTAssertEqual(resolvedThread, thread.id)
+                return provider == .claude ? "Claude UI text" : response
+            }
+            if let handle {
+                coordinator.reversibleProseStore = { _ in handle }
+            }
+            return (coordinator, messageRepo, thread, tmp)
+        }
+
+        let claudeWire = "@sr2 v0\no:ok\np:claude.swift:1"
+        let (claude, claudeMessages, claudeThread, claudeCwd) = try makeFixture(
+            provider: .claude,
+            finalMessage: claudeWire,
+            handle: nil
+        )
+        let (codex, codexMessages, codexThread, codexCwd) = try makeFixture(
+            provider: .codex,
+            finalMessage: "Codex returned a free prose answer.",
+            handle: "codex-handle"
+        )
+
+        async let claudeRun = claude.startRun(AgentRunRequest(
+            threadId: claudeThread.id,
+            provider: .claude,
+            model: "fake-model",
+            cwd: claudeCwd,
+            prompt: "Claude compliance turn"
+        ))
+        async let codexRun = codex.startRun(AgentRunRequest(
+            threadId: codexThread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: codexCwd,
+            prompt: "Codex compliance turn"
+        ))
+        _ = try await (claudeRun, codexRun)
+
+        _ = try await waitForAssistantMessage(claudeMessages, threadId: claudeThread.id)
+        _ = try await waitForAssistantMessage(codexMessages, threadId: codexThread.id)
+
+        let snapshot = SR2WirePolicy.sharedCompliance.snapshot()
+        XCTAssertEqual(snapshot["claude"]?.turns, 1)
+        XCTAssertEqual(snapshot["claude"]?.misses, 0)
+        XCTAssertEqual(snapshot["codex"]?.turns, 1)
+        XCTAssertEqual(snapshot["codex"]?.misses, 1)
+        XCTAssertEqual(snapshot["codex"]?.enforced, 1)
+        XCTAssertNil(snapshot["unknown"], "provider attribution must not fall back to an arbitrary concurrent run")
     }
 
     private func waitForAssistantMessage(

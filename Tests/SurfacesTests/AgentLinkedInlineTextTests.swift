@@ -8,6 +8,75 @@ import DesignSystemKit
 /// into NSAttributedString and assert every link carries `NSCursor.pointingHand`.
 final class AgentLinkedInlineTextTests: XCTestCase {
 
+    /// WHY: This is the smallest reproducible proxy for the reported hang. It
+    /// keeps one linked transcript cell at a stable width, warms the AppKit
+    /// text system, and repeats the exact intrinsic-size query that SwiftUI
+    /// asks while placing a stable row. It is intentionally labelled a CPU
+    /// layout proxy; it does not claim first-paint or end-to-end UI latency.
+    @MainActor
+    func test_intrinsicHeightCacheBenchmark() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["RC2_INLINE_TEXT_BENCHMARK"] == "1",
+            "benchmark is opt-in; set RC2_INLINE_TEXT_BENCHMARK=1"
+        )
+
+        let textView = IntrinsicHeightTextView(usingTextLayoutManager: false)
+        textView.frame = NSRect(x: 0, y: 0, width: 360, height: 500)
+        textView.textContainerInset = .zero
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.containerSize = NSSize(width: 360, height: CGFloat.greatestFiniteMagnitude)
+        let attributed = AgentLinkedInlineTextRepresentable.makeNSAttributedString(
+            attributed: AgentMessageMarkdown.attributedInline(
+                String(repeating: "Stable linked transcript content with `Package.swift` and https://example.com/docs. ", count: 8)
+            ),
+            font: .systemFont(ofSize: 13),
+            textColor: DS.NS.text,
+            lineSpacing: 2
+        )
+        AgentLinkedInlineTextRepresentable.applyTextStorage(attributed, to: textView)
+        textView.layoutSubtreeIfNeeded()
+
+        let queryCount = 16_384
+        func measuredBatch() -> Int {
+            let start = DispatchTime.now().uptimeNanoseconds
+            for _ in 0..<queryCount {
+                _ = textView.intrinsicContentSize
+            }
+            let elapsed = DispatchTime.now().uptimeNanoseconds - start
+            return max(1, Int((elapsed + 999_999) / 1_000_000))
+        }
+
+        _ = measuredBatch()
+        _ = measuredBatch()
+        var samples: [[String: Int]] = []
+        for _ in 0..<7 {
+            textView.invalidateIntrinsicContentSize()
+            let settled = measuredBatch()
+            samples.append([
+                "feedback_ms": settled,
+                "meaningful_ms": settled,
+                "settled_ms": settled,
+                "dead_time_ms": 0,
+                "query_count": queryCount,
+            ])
+        }
+        let sortedSettled = samples.compactMap { $0["settled_ms"] }.sorted()
+        let median = sortedSettled[sortedSettled.count / 2]
+        let payload: [String: Any] = [
+            "fixture": "intrinsic_height_cpu_layout_proxy",
+            "width": 360,
+            "warmup_samples": 2,
+            "query_count_per_sample": queryCount,
+            "samples": samples,
+            "feedback_ms": median,
+            "meaningful_ms": median,
+            "settled_ms": median,
+            "dead_time_ms": 0,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        print("AGENT_LINKED_INLINE_BENCHMARK \(String(decoding: data, as: UTF8.self))")
+    }
+
     func test_makeNSAttributedString_appliesPointingHandOnFileLinks() {
         let attributed = AgentMessageMarkdown.attributedInline(
             "Changed files — backend: `plan-proposal.service.ts` and Sources/App/Main.swift today"
@@ -81,6 +150,100 @@ final class AgentLinkedInlineTextTests: XCTestCase {
         XCTAssertEqual(textView.selectedRange(), NSRange(location: 0, length: value.length),
                        "routine SwiftUI updates with unchanged text must not collapse an in-progress multiline transcript selection")
     }
+
+    /// WHY: Stable transcript rows can receive many intrinsic-size queries
+    /// during a parent refresh. Equal content and width must reuse the exact
+    /// measured height instead of re-entering TextKit layout.
+    @MainActor
+    func test_intrinsicHeight_repeatedQueryUsesCacheAndPreservesExactHeight() {
+        let textView = IntrinsicHeightTextView(usingTextLayoutManager: false)
+        textView.frame = NSRect(x: 0, y: 0, width: 220, height: 400)
+        textView.textContainerInset = .zero
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.containerSize = NSSize(
+            width: 220,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        let value = AgentLinkedInlineTextRepresentable.makeNSAttributedString(
+            attributed: AgentMessageMarkdown.attributedInline(
+                "Stable row with `Package.swift` and https://example.com/docs."
+            ),
+            font: .systemFont(ofSize: 13),
+            textColor: DS.NS.text,
+            lineSpacing: 2
+        )
+        AgentLinkedInlineTextRepresentable.applyTextStorage(value, to: textView)
+        textView.layoutSubtreeIfNeeded()
+
+        let first = textView.intrinsicContentSize
+        let computations = textView.intrinsicHeightComputationCount
+        let second = textView.intrinsicContentSize
+
+        XCTAssertEqual(second, first, "cached intrinsic size must preserve exact height and width semantics")
+        XCTAssertEqual(
+            textView.intrinsicHeightComputationCount,
+            computations,
+            "a stable content+width query must not repeat TextKit layout computation"
+        )
+    }
+
+    /// WHY: Width, content, typography, line limits, and padding are all
+    /// height inputs. Each change must evict the cache while preserving the
+    /// existing selection/link conversion contract.
+    @MainActor
+    func test_intrinsicHeight_changesEvictCacheAndKeepSelectionAndLinks() {
+        let textView = IntrinsicHeightTextView(usingTextLayoutManager: false)
+        textView.frame = NSRect(x: 0, y: 0, width: 180, height: 400)
+        textView.textContainerInset = .zero
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.containerSize = NSSize(
+            width: 180,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        let firstValue = AgentLinkedInlineTextRepresentable.makeNSAttributedString(
+            attributed: AgentMessageMarkdown.attributedInline(
+                "First row with `Package.swift` and https://example.com/docs."
+            ),
+            font: .systemFont(ofSize: 13),
+            textColor: DS.NS.text,
+            lineSpacing: 2
+        )
+        AgentLinkedInlineTextRepresentable.applyTextStorage(firstValue, to: textView)
+        textView.layoutSubtreeIfNeeded()
+        _ = textView.intrinsicContentSize
+        let firstComputations = textView.intrinsicHeightComputationCount
+
+        textView.setFrameSize(NSSize(width: 280, height: 400))
+        textView.layoutSubtreeIfNeeded()
+        _ = textView.intrinsicContentSize
+        XCTAssertGreaterThan(textView.intrinsicHeightComputationCount, firstComputations)
+
+        let selected = NSRange(location: 0, length: min(5, firstValue.length))
+        textView.setSelectedRange(selected)
+        let secondValue = AgentLinkedInlineTextRepresentable.makeNSAttributedString(
+            attributed: AgentMessageMarkdown.attributedInline(
+                "Updated row with `Sources/App/Main.swift` and https://example.com/updated."
+            ),
+            font: .systemFont(ofSize: 15),
+            textColor: DS.NS.text,
+            lineSpacing: 4
+        )
+        AgentLinkedInlineTextRepresentable.applyTextStorage(secondValue, to: textView)
+        textView.font = .systemFont(ofSize: 15)
+        textView.textContainer?.maximumNumberOfLines = 2
+        textView.textContainer?.lineFragmentPadding = 4
+        textView.invalidateIntrinsicContentSize()
+        _ = textView.intrinsicContentSize
+
+        XCTAssertEqual(textView.selectedRange(), selected, "content replacement must preserve selection bounds")
+        XCTAssertGreaterThan(textView.intrinsicHeightComputationCount, firstComputations + 1)
+        var links = 0
+        secondValue.enumerateAttribute(.link, in: NSRange(location: 0, length: secondValue.length)) { value, _, _ in
+            if value != nil { links += 1 }
+        }
+        XCTAssertGreaterThan(links, 0, "cache invalidation must not remove converted links")
+    }
+
 
     // MARK: - Update plan (skip redundant AppKit rebuilds)
 

@@ -358,14 +358,34 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
 
 /// NSTextView that reports vertical intrinsic size for SwiftUI layout.
 final class IntrinsicHeightTextView: NSTextView {
+    private var cachedIntrinsicContentSize: NSSize?
+    private var cachedIntrinsicContentWidth: CGFloat?
+    private(set) var intrinsicHeightComputationCount = 0
+
+    override func invalidateIntrinsicContentSize() {
+        cachedIntrinsicContentSize = nil
+        cachedIntrinsicContentWidth = nil
+        super.invalidateIntrinsicContentSize()
+    }
+
     override var intrinsicContentSize: NSSize {
         guard let layoutManager, let textContainer else {
             return NSSize(width: NSView.noIntrinsicMetric, height: 0)
         }
+        let width = textContainer.containerSize.width
+        if let cachedIntrinsicContentSize,
+           let cachedIntrinsicContentWidth,
+           abs(cachedIntrinsicContentWidth - width) <= 0.5 {
+            return cachedIntrinsicContentSize
+        }
+        intrinsicHeightComputationCount += 1
         layoutManager.ensureLayout(for: textContainer)
         let used = layoutManager.usedRect(for: textContainer)
         let height = max(ceil(used.height + textContainerInset.height * 2), font?.boundingRectForFont.height ?? 14)
-        return NSSize(width: NSView.noIntrinsicMetric, height: height)
+        let size = NSSize(width: NSView.noIntrinsicMetric, height: height)
+        cachedIntrinsicContentSize = size
+        cachedIntrinsicContentWidth = width
+        return size
     }
 
     override func layout() {
