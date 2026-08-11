@@ -20,7 +20,9 @@ public func unixSocketListenerEventPayload(bound: Bool, path: String) -> [String
 /// transport identity or durable transport receipts.
 public final class UnixSocketServer: @unchecked Sendable {
     private static let maxClientLineBytes = 1024 * 1024
-    static let maxStreamQueuedBytes = 1024 * 1024
+    /// Peak per-connection outbound EventBus stream backlog. Was 1 MiB; 512 KiB
+    /// matches LineBuffer / provider pipe ceilings (memory-loop tip).
+    static let maxStreamQueuedBytes = 512 * 1024
     static let maxConnectedClients = 64
     static let maxActiveRequests = 64
     private static let defaultLocalRequestTimeout: DispatchTimeInterval = .seconds(5)

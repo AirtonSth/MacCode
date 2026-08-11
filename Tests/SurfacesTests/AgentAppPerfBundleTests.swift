@@ -243,7 +243,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
         let before = vm.sr1TranslatedMessageIds
         XCTAssertEqual(before.count, 50)
 
-        // Production aggregateHotTextByteLimit is now 96 MiB, so this small fixture no
+        // Production aggregateHotTextByteLimit is now 32 MiB, so this small fixture no
         // longer evicts under the default. Force eviction with an explicit sub-production
         // 8 MiB budget (mirrors test_timelineAggregateBudgetIncludesRequestsInputsPlansAndWorkLog).
         let testBudget = 8 * 1_024 * 1_024

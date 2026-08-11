@@ -860,9 +860,10 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     // (per-line UUID fallbacks, items evicted by trimTurnItems) never pair, so
     // without a cap the buffer grows monotonically for the life of the timeline.
     public static let pendingItemDeltaLimit = 64
-    /// Aggregate live timeline text for a 16 GB MacBook class machine.
+    /// Aggregate live timeline text ceiling for one selected thread.
     /// Keeps multi-turn tool storms visible without letting one tab pin multi-GB.
-    public static let aggregateHotTextByteLimit = 96 * 1_024 * 1_024
+    /// Was 96 MiB; 32 MiB matches hot-replay payload ceiling (memory-loop tip).
+    public static let aggregateHotTextByteLimit = 32 * 1_024 * 1_024
     private static let aggregateHotElementOverhead = 128
 
     public var threadId: String?

@@ -4432,10 +4432,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// Hot replay is bounded independently by encoded bytes and row count. Durable
     /// messages and compact ActiveThreadState preserve completed output and resume
     /// correctness when the evictable event prefix is outside this window.
-    /// Sized for a 16 GB MacBook class machine so long Full Access / Chrome turns
-    /// rehydrate without clipping the recent window the UI just buffered.
-    public static let hotReplayEventCount = 16_384
-    public static let hotReplayEventBytes: Int64 = 256 * 1_024 * 1_024
+    /// Was 16_384 / 256 MiB; 4_096 / 32 MiB still rehydrates recent Full Access /
+    /// Chrome turns without multi-hundred-MB event arrays (memory-loop tip).
+    public static let hotReplayEventCount = 4_096
+    public static let hotReplayEventBytes: Int64 = 32 * 1_024 * 1_024
 
     public func latestStreamEvents(threadId: AgentThreadID) -> [AssistantEvent] {
         (try? runRepo.listLatestStreamEvents(
@@ -7244,12 +7244,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     nonisolated static let streamFlushCountThreshold = 16
     /// Large provider frames (Chrome dumps, shell output) flush by bytes before
     /// the count threshold so the in-memory batch stays bounded.
-    nonisolated static let streamFlushByteThreshold = 8 * 1_024 * 1_024
-    /// Absolute per-frame ceiling for a 16 GB MacBook class machine (~0.1% of RAM).
-    /// Frames under this limit always admit; older history is reclaimed by
-    /// retention prune. Only pathological frames above this are soft-truncated —
-    /// never replaced with a recoverable "omitted" error banner.
-    nonisolated static let maximumBufferedEventBytes = 16 * 1_024 * 1_024
+    /// Was 8 MiB; 2 MiB keeps the in-memory batch small under multi-thread streams.
+    nonisolated static let streamFlushByteThreshold = 2 * 1_024 * 1_024
+    /// Absolute per-frame ceiling. Frames under this limit always admit; older
+    /// history is reclaimed by retention prune. Only pathological frames above
+    /// this are soft-truncated — never replaced with a recoverable "omitted"
+    /// error banner. Was 16 MiB, then 8 MiB; 4 MiB still exceeds
+    /// streamFlushByteThreshold (2 MiB).
+    nonisolated static let maximumBufferedEventBytes = 4 * 1_024 * 1_024
     /// Max latency (ms) a buffered stream event may wait before being flushed,
     /// so a slow trickle still reaches the DB (and survives reload/crash).
     nonisolated static let streamFlushTimeThresholdMs: Int64 = 250

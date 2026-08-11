@@ -192,7 +192,7 @@ final class AgentAppRenderCacheFixesTests: XCTestCase {
 
     func test_hotMessageFirstPaint_isAggressiveForFluidOpen() {
         XCTAssertLessThanOrEqual(AgentAppViewModel.messageHistoryPageLimit, 30)
-        XCTAssertLessThanOrEqual(AgentAppViewModel.fullLoadBodyBudgetBytes, 400 * 1024)
+        XCTAssertLessThanOrEqual(AgentAppViewModel.fullLoadBodyBudgetBytes, 128 * 1024)
     }
 
     /// WHY: older durable rows must prepend into the hot window without
