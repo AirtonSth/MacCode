@@ -2098,6 +2098,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     }
 
     public func stopRun(threadId: AgentThreadID) {
+        // RPC/iOS Stop must cancel surface-preflight reservations even when no
+        // durable/pending/active run exists yet (Graphify await window).
+        cancelPreparation(threadId: threadId)
         lock.lock()
         let runId = activeThreads[threadId]
         let handle = runId.flatMap { active[$0] }

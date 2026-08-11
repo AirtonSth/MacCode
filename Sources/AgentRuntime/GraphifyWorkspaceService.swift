@@ -445,6 +445,12 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         let fp = loadFingerprint(checkout)
 
         lock.lock()
+        // Revalidate gates under the same lock as inFlight claim. Token Saver /
+        // Graphify may be disabled during unlocked probes above — fail open.
+        if !enabled || !autoEnsure {
+            lock.unlock()
+            return
+        }
         // Re-check pressure under the same lock as inFlight claim (S7): pause
         // may land during unlocked probes above; preserve dirty for unpause.
         if pressurePauseEnsureAndWatch {

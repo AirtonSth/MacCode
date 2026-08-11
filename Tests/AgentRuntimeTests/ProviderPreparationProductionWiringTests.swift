@@ -506,6 +506,44 @@ final class ProviderPreparationProductionWiringTests: XCTestCase {
         )
     }
 
+    /// RPC-style stopRun during reservation-only preflight must cancel the run
+    /// so a late startRun cannot spawn (Graphify await window).
+    func test_stopRun_cancelsReservedPreflight_beforePendingRegister() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-rpc-stop")
+        let thread = AgentThread(title: "prep-rpc-stop", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let runner = CountingRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: runner]
+        )
+
+        let runId = AgentRunID()
+        coordinator.reserveProviderStart(threadId: thread.id, runId: runId)
+        // No durable pending/active yet — pure Graphify preflight reservation.
+        coordinator.stopRun(threadId: thread.id)
+
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                runId: runId,
+                threadId: thread.id,
+                provider: .codex,
+                model: "fake-model",
+                cwd: tmp,
+                prompt: "must not spawn after RPC stop"
+            ))
+        } catch { /* cancelled */ }
+
+        XCTAssertEqual(
+            runner.startCount,
+            0,
+            "stopRun during reservation-only preflight must cancel that run"
+        )
+    }
+
     /// Surface-only cancel before reserve must not leave pendingThreadStops that
     /// poison an immediate resend.
     func test_cancelWithoutReserve_doesNotPoisonResend() async throws {

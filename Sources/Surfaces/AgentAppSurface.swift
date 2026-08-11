@@ -5977,6 +5977,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         surfacePreparationStates[tid] = surfaceAccept.state
         let acceptedGeneration = surfaceAccept.state.generation
         beginSurfacePreparation(threadId: tid, generation: acceptedGeneration)
+        // Coordinator-owned reservation before Graphify await so RPC/iOS Stop
+        // during root resolution can cancel this run (not only local UI Stop).
+        coordinator.reserveProviderStart(threadId: tid, runId: runId)
         defer {
             endSurfacePreparationIfOwned(threadId: tid, generation: acceptedGeneration)
         }
@@ -6077,9 +6080,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return nil
         }
         surfacePreparationStates[tid] = claimedState
-        // Close Stop race: surface claimed, startRun not yet registered.
-        // Run-scoped so a late cancelled sibling cannot clear this reservation.
-        coordinator.reserveProviderStart(threadId: tid, runId: runId)
+        // Reservation already published before Graphify; keep it until startRun
+        // registers or failure paths release it.
         let req = AgentRunRequest(
             runId: runId,
             threadId: tid,

@@ -265,6 +265,42 @@ final class GraphifyWorkspaceServiceTests: XCTestCase {
         service.checkoutIdentityProbe = nil
     }
 
+    /// startEnsureIfNeeded must not launch CLI if disabled during unlocked head probe.
+    func test_startEnsure_abortsWhenDisabledDuringHeadProbe() {
+        service.enabled = true
+        service.autoEnsure = true
+        let probeEntered = expectation(description: "head probe entered")
+        let releaseProbe = DispatchSemaphore(value: 0)
+        service.headProbe = { _ in
+            probeEntered.fulfill()
+            releaseProbe.wait()
+            return "head-during-disable"
+        }
+        var cliStarts = 0
+        let cliLock = NSLock()
+        service.runProcess = { _, _, _ in
+            cliLock.lock(); cliStarts += 1; cliLock.unlock()
+            return (0, "", "")
+        }
+        let displayRoot = tempRoot.appendingPathComponent("disable-mid-head", isDirectory: true)
+        try? FileManager.default.createDirectory(at: displayRoot, withIntermediateDirectories: true)
+        let checkout = GraphifyCheckout(
+            key: GraphifyRepoKey(commonDir: displayRoot.appendingPathComponent(".git").path),
+            displayRoot: displayRoot.path
+        )
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.service.requestRefresh(checkout: checkout, force: true)
+        }
+        wait(for: [probeEntered], timeout: 2.0)
+        service.enabled = false
+        releaseProbe.signal()
+        let deadline = Date().addingTimeInterval(0.4)
+        while Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
+        cliLock.lock(); let starts = cliStarts; cliLock.unlock()
+        XCTAssertEqual(starts, 0, "disabled mid-headProbe must not launch graphify CLI")
+    }
+
     func test_pressureUnpause_reKickRunsWhenStillEnabled() {
         service.enabled = true
         service.autoEnsure = true
