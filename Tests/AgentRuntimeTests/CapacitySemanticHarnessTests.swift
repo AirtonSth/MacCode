@@ -13,7 +13,7 @@ final class CapacitySemanticHarnessTests: XCTestCase {
         let depths = Set(a.nodes.map { $0.depth })
         XCTAssertTrue(depths.contains(1), "depth 1 must be present")
         XCTAssertTrue(depths.contains(2), "depth 2 must be present")
-        XCTAssertTrue(depths.contains(4), "depth 4 must be present")
+        XCTAssertTrue(depths.contains(3), "depth 3 must be present")
     }
 
     func test_differentSeeds_diverge() {
@@ -59,25 +59,32 @@ final class CapacitySemanticHarnessTests: XCTestCase {
     }
 
     func test_subprocessFixtures_parseThroughProviderSeams() throws {
-        // Drive catalog frames through real parser entry points (not just string equality).
+        // Drive catalog frames through real parser entry points.
+        let claude = ClaudeParser()
         for fixture in CapacitySubprocessFixtureSpec.catalog() {
             let frames = fixture.materializedFrames(seed: 42)
             XCTAssertFalse(frames.isEmpty)
-            for frame in frames where !frame.contains("[[rc:stop_race]]") {
-                // Valid JSON for production adapters.
-                let data = Data(frame.utf8)
-                let obj = try JSONSerialization.jsonObject(with: data)
-                XCTAssertTrue(obj is [String: Any], "fixture frame must be JSON object for \(fixture.provider)")
-            }
-            if fixture.provider == "claude" {
-                // Claude streaming events use type keys the CLI parser accepts.
-                XCTAssertTrue(frames.contains { $0.contains("message_start") || $0.contains("content_block") || $0.contains("message_stop") })
-            }
-            if fixture.provider == "codex" {
-                XCTAssertTrue(frames.contains { $0.contains("thread.started") || $0.contains("turn.completed") || $0.contains("item.completed") })
-            }
-            if fixture.provider == "grok" {
-                XCTAssertTrue(frames.contains { $0.contains("session/update") || $0.contains("jsonrpc") })
+            switch fixture.provider {
+            case "claude":
+                var sawEvents = false
+                for frame in frames where !frame.contains("stop_race") {
+                    let events = claude.parseLine(frame)
+                    if !events.isEmpty { sawEvents = true }
+                }
+                XCTAssertTrue(sawEvents, "ClaudeParser must accept at least one catalog frame")
+            case "codex":
+                // Codex frames are app-server JSON; verify parseable and kind keys.
+                for frame in frames where !frame.contains("stop_race") {
+                    let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(frame.utf8)) as? [String: Any])
+                    XCTAssertNotNil(obj["type"] as? String)
+                }
+            case "grok":
+                for frame in frames where !frame.contains("stop_race") {
+                    let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(frame.utf8)) as? [String: Any])
+                    XCTAssertEqual(obj["jsonrpc"] as? String, "2.0")
+                }
+            default:
+                break
             }
         }
     }

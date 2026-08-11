@@ -403,7 +403,10 @@ final class CapacityContractAndPressureTests: XCTestCase {
     ) throws -> CapacityQualificationArtifact {
         let runs = (0..<warmedRuns).map { idx -> CapacityWarmedRunObservation in
             let metrics = Dictionary(uniqueKeysWithValues: manifest.requiredMetrics.map { name -> (String, Double) in
-                (name, 1.0 + Double(idx) * 0.01)
+                if name == CapacityRequiredMetricKey.ownershipCoverageFraction.rawValue {
+                    return (name, 0.90 + Double(idx) * 0.01) // stays in [0,1]
+                }
+                return (name, 1.0 + Double(idx) * 0.01)
             })
             return CapacityWarmedRunObservation(runIndex: idx, metrics: metrics)
         }

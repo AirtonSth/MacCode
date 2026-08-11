@@ -171,7 +171,7 @@ public enum CapacitySemanticHarness {
     public static func buildSchedule(
         roots: Int = 32,
         nestedNodes: Int = 64,
-        depths: [Int] = [1, 2, 4],
+        depths: [Int] = [1, 2, 3],
         fanOut: [Int] = [1, 2, 4],
         providers: [String] = defaultProviders,
         faultKinds: [String] = ["malformed_frame", "reorder", "pipe_pressure", "stop_race", "resume"],
@@ -188,19 +188,18 @@ public enum CapacitySemanticHarness {
             rootIDs.append(id)
         }
 
-        // Reserve nested nodes across configured depths so each depth is represented.
+        // Place nested nodes at sequential depths 1..depths.count so ancestry length
+        // matches the depth label (root→d1→d2→d3).
         var remaining = nestedNodes
         var parentsByDepth: [Int: [String]] = [0: rootIDs]
-        let targetDepths = depths.filter { $0 > 0 }.sorted()
-        let slices = max(1, targetDepths.count)
-        var perDepth = Array(repeating: nestedNodes / slices, count: slices)
-        for i in 0..<(nestedNodes % slices) { perDepth[i] += 1 }
+        let levels = max(1, depths.filter { $0 > 0 }.count)
+        var perLevel = Array(repeating: nestedNodes / levels, count: levels)
+        for i in 0..<(nestedNodes % levels) { perLevel[i] += 1 }
 
-        for (depthIdx, depth) in targetDepths.enumerated() {
+        for level in 1...levels {
             guard remaining > 0 else { break }
-            let budget = min(remaining, perDepth[depthIdx])
-            let parentDepth = depthIdx == 0 ? 0 : targetDepths[depthIdx - 1]
-            var parentFrontier = parentsByDepth[parentDepth] ?? rootIDs
+            let budget = min(remaining, perLevel[level - 1])
+            var parentFrontier = parentsByDepth[level - 1] ?? rootIDs
             if parentFrontier.isEmpty { parentFrontier = rootIDs }
             var nextFrontier: [String] = []
             var placed = 0
@@ -209,14 +208,14 @@ public enum CapacitySemanticHarness {
                 let parent = parentFrontier[parentCursor % parentFrontier.count]
                 parentCursor += 1
                 let fan = fanOut[rng.nextInt(in: 0...(fanOut.count - 1))]
-                let childCount = min(fan, budget - placed)
+                let childCount = min(max(1, fan), budget - placed)
                 for _ in 0..<childCount {
                     let id = rng.deterministicID(prefix: "node")
                     let provider = providers[rng.nextInt(in: 0...(providers.count - 1))]
                     nodes.append(CapacityHarnessNode(
                         id: id,
                         parentId: parent,
-                        depth: depth,
+                        depth: level,
                         kind: .nested,
                         provider: provider
                     ))
@@ -225,7 +224,7 @@ public enum CapacitySemanticHarness {
                     remaining -= 1
                 }
             }
-            parentsByDepth[depth] = nextFrontier
+            parentsByDepth[level] = nextFrontier
         }
 
         // Seeded fault plan against a deterministic subset of nodes.
@@ -427,8 +426,10 @@ public struct CapacitySubprocessFixtureSpec: Sendable, Equatable {
             CapacitySubprocessFixtureSpec(
                 provider: "claude",
                 frames: [
-                    #"{"type":"message_start","message":{"id":"m1"}}"#,
-                    #"{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}"#,
+                    #"{"type":"message_start","message":{"id":"m1","role":"assistant","content":[]}}"#,
+                    #"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                    #"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+                    #"{"type":"content_block_stop","index":0}"#,
                     #"{"type":"message_stop"}"#,
                 ],
                 exitCode: 0

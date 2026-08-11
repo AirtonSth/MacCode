@@ -360,4 +360,39 @@ final class ProcessLifecycleHardeningTests: XCTestCase {
             "Grok model discovery must not opt out of the crash-recovery ownership ledger"
         )
     }
+
+    func test_ownershipLedger_flockSerializesConcurrentAppendsWithoutLostUpdates() throws {
+        // Differential proof: concurrent appends under the store lock+flock must
+        // retain every distinct pgid (no lost update from unlocked RMW).
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("provider-ledger-concurrent-\(UUID().uuidString).json")
+        let store = ProviderProcessOwnershipStore(fileURL: file)
+        let identity = ProviderProcessStartIdentity(seconds: 1, microseconds: 1)
+        let base = Date(timeIntervalSince1970: 9_000)
+        let group = DispatchGroup()
+        let queue = DispatchQueue(label: "ownership-concurrent", attributes: .concurrent)
+        for pid in 1...40 {
+            group.enter()
+            queue.async {
+                defer { group.leave() }
+                let tag = SpawnedProcessTag(
+                    pgid: pid_t(pid),
+                    spawnedAt: base.addingTimeInterval(TimeInterval(pid)),
+                    ownerStartIdentity: identity,
+                    provider: .codex,
+                    managedKind: .provider,
+                    executablePath: "/opt/codex",
+                    startIdentity: identity,
+                    isolatedProcessGroup: pid_t(pid)
+                )
+                try? store.append(tag)
+            }
+        }
+        XCTAssertEqual(group.wait(timeout: .now() + 10), .success)
+        let loaded = try store.load()
+        XCTAssertEqual(loaded.count, 40, "concurrent appends under flock must not lose rows")
+        XCTAssertEqual(Set(loaded.map(\.pgid)).count, 40)
+        let perms = try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? NSNumber
+        XCTAssertEqual(perms?.intValue, 0o600)
+    }
 }

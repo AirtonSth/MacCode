@@ -3329,9 +3329,30 @@ public final class AgentRunRepository: @unchecked Sendable {
         let limit = max(1, byteLimit)
         let originalBytes = payloadJSON.utf8.count
         guard originalBytes > limit else { return payloadJSON }
-        // Already an owned S3 presentation — do not double-wrap (coordinator+repo).
-        if payloadJSON.contains(AuthoritativePayloadRecovery.ownedTrailerToken) {
-            return payloadJSON
+        // Already an owned S3 presentation: re-trim prefix to new limit, keep exact trailer.
+        if let tokenRange = payloadJSON.range(of: AuthoritativePayloadRecovery.ownedTrailerToken),
+           let trailerStart = payloadJSON.range(of: "…[truncated ", options: [], range: payloadJSON.startIndex..<tokenRange.lowerBound)?.lowerBound
+            ?? payloadJSON.range(of: "…[truncated ")?.lowerBound {
+            // Find trailer start near the token
+            let search = payloadJSON
+            if let tStart = search.range(of: "…[truncated \(AuthoritativePayloadRecovery.ownedTrailerToken)")?.lowerBound {
+                let trailer = String(search[tStart...])
+                if originalBytes <= limit { return payloadJSON }
+                let headBudget = max(0, limit - trailer.utf8.count)
+                if headBudget == 0 { return trailer }
+                var utf8End = payloadJSON.utf8.index(
+                    payloadJSON.utf8.startIndex,
+                    offsetBy: headBudget,
+                    limitedBy: payloadJSON.utf8.endIndex
+                ) ?? payloadJSON.utf8.endIndex
+                while utf8End > payloadJSON.utf8.startIndex {
+                    if let end = utf8End.samePosition(in: payloadJSON) {
+                        return String(payloadJSON[..<end]) + trailer
+                    }
+                    payloadJSON.utf8.formIndex(before: &utf8End)
+                }
+                return trailer
+            }
         }
         // S3: store-before-loss is mandatory when a store is provided. Fail open
         // only by raising — callers must not silently drop the original.
@@ -3364,14 +3385,17 @@ public final class AgentRunRepository: @unchecked Sendable {
     /// Rehydrate a store-before-loss presentation form back to the original UTF-8 payload.
     /// Recognizes `[[rc:handle]]` markers and legacy `rc_oversized` JSON envelopes.
     public func rehydrateOversizedPayloadIfNeeded(_ payloadJSON: String) throws -> String {
-        // Only owned S3 trailers are recovered — avoid false positives on provider content.
-        guard payloadJSON.contains(AuthoritativePayloadRecovery.ownedTrailerToken) else {
+        // Require owned trailer as a true suffix: "...[truncated rc_oversized_v1 N→M bytes][[rc:handle]]"
+        let pattern = #"…\[truncated rc_oversized_v1 (\d+)→(\d+) bytes\]\[\[rc:([0-9a-fA-F]+)\]\]$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return payloadJSON }
+        let ns = payloadJSON as NSString
+        let full = NSRange(location: 0, length: ns.length)
+        guard let match = regex.firstMatch(in: payloadJSON, options: [], range: full),
+              match.numberOfRanges >= 4,
+              let handleRange = Range(match.range(at: 3), in: payloadJSON) else {
             return payloadJSON
         }
-        guard let range = payloadJSON.range(of: #"\[\[rc:([0-9a-fA-F]+)\]\]"#, options: .regularExpression) else {
-            throw PersistenceDataError.corruptStreamEvent("owned oversized trailer missing handle")
-        }
-        let handle = ReversibleContentStore.normalize(String(payloadJSON[range]))
+        let handle = ReversibleContentStore.normalize(String(payloadJSON[handleRange]))
         guard !handle.isEmpty else {
             throw PersistenceDataError.corruptStreamEvent("owned oversized trailer empty handle")
         }

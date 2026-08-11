@@ -408,8 +408,15 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
             if sample.value == nil {
                 throw CapacityContractError.requiredMetricNull(key)
             }
-            guard let claimed = sample.value, claimed.isFinite, claimed >= 0 else {
-                throw CapacityContractError.invalidWorkload("metric \(key) must be finite and >= 0")
+            guard let claimed = sample.value, claimed.isFinite else {
+                throw CapacityContractError.invalidWorkload("metric \(key) must be finite")
+            }
+            if key == CapacityRequiredMetricKey.ownershipCoverageFraction.rawValue {
+                guard claimed >= 0, claimed <= 1 else {
+                    throw CapacityContractError.invalidWorkload("ownership_coverage_fraction must be in [0,1]")
+                }
+            } else if claimed < 0 {
+                throw CapacityContractError.invalidWorkload("metric \(key) must be >= 0")
             }
             // Each required metric must appear in every warmed run; sample is the mean.
             var sum = 0.0

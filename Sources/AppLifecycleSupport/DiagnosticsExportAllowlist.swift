@@ -123,9 +123,15 @@ public enum DiagnosticsExportAllowlist {
              (.ownershipCoverage, "coverage_fraction"):
             guard let n = Double(value), n.isFinite, n >= 0, n <= 1 else { return false }
             return true
-        case (.capacityMetrics, _),
-             (.managedRSSTrend, "slope_kb_per_minute"):
-            // Latency / slope: finite non-negative
+        case (.managedRSSTrend, "slope_kb_per_minute"):
+            // Signed slope (falling RSS is negative).
+            guard let n = Double(value), n.isFinite else { return false }
+            return true
+        case (.capacityMetrics, "metric_variance_max"):
+            guard let n = Double(value), n.isFinite, n >= 0, n <= 1 else { return false }
+            return true
+        case (.capacityMetrics, _):
+            // Latency and other capacity metrics: finite non-negative
             guard let n = Double(value), n.isFinite, n >= 0 else { return false }
             return true
         case (.hangWatchdog, "gap_kind"):
