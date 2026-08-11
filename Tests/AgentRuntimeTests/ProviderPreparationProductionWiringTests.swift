@@ -384,6 +384,63 @@ final class ProviderPreparationProductionWiringTests: XCTestCase {
         )
     }
 
+    /// reserve A → Stop → reserve/start C → late-start A: C must spawn, A must not.
+    /// (Stale thread-level pendingThreadStops must not cancel a fresh resend.)
+    func test_freshResend_notPoisonedByStaleThreadStop_beforeLateCancelledA() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-fresh-resend")
+        let thread = AgentThread(title: "prep-fresh", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let runner = CountingRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: runner]
+        )
+
+        let runA = AgentRunID()
+        let runC = AgentRunID()
+        coordinator.reserveProviderStart(threadId: thread.id, runId: runA)
+        coordinator.cancelPreparation(threadId: thread.id)
+        coordinator.reserveProviderStart(threadId: thread.id, runId: runC)
+
+        let startedC = try await coordinator.startRun(AgentRunRequest(
+            runId: runC,
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "fresh resend C"
+        ))
+        XCTAssertNotNil(startedC)
+        XCTAssertEqual(runner.startCount, 1, "fresh resend C must start after Stop of A")
+
+        // Wait for C terminal so exclusive mutation admits late A attempt.
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if let row = try runRepo.get(id: startedC), row.finishedAt != nil { break }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                runId: runA,
+                threadId: thread.id,
+                provider: .codex,
+                model: "fake-model",
+                cwd: tmp,
+                prompt: "late cancelled A"
+            ))
+        } catch { /* cancelled expected */ }
+
+        XCTAssertEqual(
+            runner.startCount,
+            1,
+            "late cancelled A must not spawn; C alone must have started"
+        )
+    }
+
     /// Surface-only cancel before reserve must not leave pendingThreadStops that
     /// poison an immediate resend.
     func test_cancelWithoutReserve_doesNotPoisonResend() async throws {

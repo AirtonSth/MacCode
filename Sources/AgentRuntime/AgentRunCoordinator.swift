@@ -2414,12 +2414,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.lock()
         _ = applyPreparationLocked(threadId: threadId, event: .stopRequested)
         let reservedForThread = reservedProviderStarts.filter { $0.value == threadId }
-        // Per-run cancel tokens so one Stop cancels every reserved run, not only
-        // the first late registration that consumes pendingThreadStops.
+        // Per-run cancel tokens so one Stop cancels every reserved run. Do not
+        // arm thread-level pendingThreadStops for reservation-only gaps — a
+        // fresh resend reserved after Stop must not consume a stale thread stop.
         for runId in reservedForThread.keys {
             cancelledProviderStartRuns.insert(runId)
         }
-        if pendingProviderStarts[threadId] != nil || !reservedForThread.isEmpty {
+        if pendingProviderStarts[threadId] != nil {
             pendingThreadStops.insert(threadId)
         }
         reservedProviderStarts = reservedProviderStarts.filter { $0.value != threadId }
