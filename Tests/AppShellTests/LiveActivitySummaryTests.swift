@@ -173,6 +173,74 @@ final class LiveActivitySummaryTests: XCTestCase {
         XCTAssertNil(store.summary(for: a))
     }
 
+    // MARK: - Cardinality cap (PERF)
+
+    /// PERF: card-key churn must not pin unbounded summary sentences / attempt
+    /// rows until process exit (reset only fires when the surface goes empty).
+    func testBuiltInCountLimitMatchesDiscoveryCacheOrder() {
+        XCTAssertEqual(LiveActivitySummaryStore.countLimit, 32)
+    }
+
+    func testNoteCardKeyedEntryCapsDistinctKeys() {
+        var map: [String: String] = [:]
+        let limit = 6
+        var newest = ""
+        for i in 0..<(limit + 15) {
+            newest = "active:\(i)"
+            LiveActivitySummaryStore.noteCardKeyedEntry(
+                &map, key: newest, value: "summary-\(i)", countLimit: limit
+            )
+        }
+        XCTAssertEqual(map.count, limit)
+        XCTAssertEqual(map[newest], "summary-\(limit + 14)")
+    }
+
+    func testStoreEnforcesCountLimitOnInstance() {
+        let store = LiveActivitySummaryStore(countLimit: 4)
+        var last = source("x")
+        for i in 0..<12 {
+            last = LiveActivitySummary.Source(
+                key: "active:\(i)",
+                text: "work \(i)",
+                fingerprint: LiveActivitySummary.fingerprint("work \(i)")
+            )
+            store.store("Doing thing \(i).", for: last)
+        }
+        XCTAssertEqual(store.entryCountForTesting, 4)
+        XCTAssertEqual(store.summary(for: last), "Doing thing 11.")
+    }
+
+    func testShouldGenerateEnforcesAttemptCountLimit() {
+        let store = LiveActivitySummaryStore(countLimit: 3)
+        let t0 = Date(timeIntervalSince1970: 5_000)
+        for i in 0..<10 {
+            let s = LiveActivitySummary.Source(
+                key: "card-\(i)",
+                text: "t-\(i)",
+                fingerprint: LiveActivitySummary.fingerprint("t-\(i)")
+            )
+            _ = store.shouldGenerate(for: s, now: t0.addingTimeInterval(Double(i) * 100))
+        }
+        XCTAssertEqual(store.attemptCountForTesting, 3)
+    }
+
+    func testRetentionEstimate2kCardsTo32Window() {
+        let uncapped = 2_000
+        let limit = LiveActivitySummaryStore.countLimit
+        let reduction = Double(uncapped - limit) / Double(uncapped)
+        XCTAssertGreaterThan(reduction, 0.98)
+        XCTAssertEqual(limit, 32)
+        // Basis: ~200 B/entry (key + sentence + fingerprint) × 2 maps →
+        // 2k ≈ 800 KB; 32 ≈ 12.8 KB (−98.4%).
+        let perKey = 200
+        let maps = 2
+        let before = uncapped * perKey * maps
+        let after = limit * perKey * maps
+        XCTAssertEqual(before, 800_000)
+        XCTAssertEqual(after, 12_800)
+        XCTAssertLessThan(Double(after) / Double(before), 0.02)
+    }
+
     // MARK: - Placement in the card
 
     func testSummaryBecomesTheDescriptionOnTheRunningCard() throws {

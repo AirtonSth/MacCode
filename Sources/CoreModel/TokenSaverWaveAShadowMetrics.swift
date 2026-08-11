@@ -88,6 +88,12 @@ public enum TokenSaverWaveAShadowMetrics {
         }
     }
 
+    /// Peak shadow-observation records retained process-wide in `sharedLedger`.
+    /// Each entry holds a BindingID digest plus optional paired-control evidence
+    /// (several trajectory IDs / token counters). 128 matches other agent/Token
+    /// Saver count windows — was 256 (and 4_096 before that).
+    public static let ledgerRecordCountLimit = 128
+
     public final class Ledger: @unchecked Sendable {
         private let lock = NSLock()
         private var records: [Record] = []
@@ -95,7 +101,7 @@ public enum TokenSaverWaveAShadowMetrics {
         private let maxRecords: Int
         private var _droppedRecords: Int = 0
         public var droppedRecords: Int { lock.lock(); defer { lock.unlock() }; return _droppedRecords }
-        public init(maxRecords: Int = 4_096) {
+        public init(maxRecords: Int = TokenSaverWaveAShadowMetrics.ledgerRecordCountLimit) {
             self.maxRecords = max(1, maxRecords)
         }
         public func append(_ r: Record) {

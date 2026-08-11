@@ -14,11 +14,17 @@ import CoreModel
 /// Legacy callers omit `response_version` and keep the previous shapes exactly.
 public enum AgentThreadReadV1: Sendable {
     public static let version = 1
-    public static let defaultEventLimit = 500
+    /// Peak stream events admitted per agent.thread.read v1 response.
+    /// 128 matches other agent surface caps and hot-replay windows — was 500,
+    /// then 256.
+    public static let defaultEventLimit = 128
     public static let minEventLimit = 1
-    public static let maxEventLimit = 500
+    public static let maxEventLimit = 128
     public static let minMaxBytes = 32 * 1_024
-    public static let maxMaxBytes = 512 * 1_024
+    /// Peak JSON-RPC envelope size for agent.thread.read v1. 128 KiB matches
+    /// the event count window class and other agent surface byte budgets —
+    /// was 256 KiB (512 KiB before that).
+    public static let maxMaxBytes = 128 * 1_024
     public static let defaultMaxBytes = maxMaxBytes
 
     public enum TruncationReason: String, Sendable, Equatable {
@@ -151,7 +157,7 @@ public enum AgentThreadReadV1: Sendable {
     /// the wire cap after the fact.
     ///
     /// PERF: envelope measurement re-encodes the full JSON-RPC frame. A linear
-    /// drop-oldest loop paid up to `eventLimit` (500) encodes per read. Once the
+    /// drop-oldest loop paid up to `eventLimit` (default 128) encodes per read. Once the
     /// full window is known not to fit, size is non-increasing as older events
     /// are dropped (byte-truncation metadata is stable for `start >= 1`), so a
     /// binary search finds the longest newest suffix in ~log2(N) measures.

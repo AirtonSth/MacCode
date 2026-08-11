@@ -198,6 +198,30 @@ public struct CodexForkProtocolSupport: Sendable, Equatable {
         let modificationDate: Date
     }
 
+    /// Peak distinct Codex binary identities retained in the fork-protocol
+    /// probe cache. Binary path churn would otherwise pin unbounded reason
+    /// strings process-wide; 32 matches catalog/discovery cache order.
+    public static let probeCacheCountLimit = 32
+
+    /// Pure insert/evict for probe-cache style maps (unit tests). Keeps `key`;
+    /// drops arbitrary other keys when over `countLimit`.
+    public static func noteProbeCacheEntry<Key: Hashable>(
+        _ values: inout [Key: CodexForkProtocolSupport],
+        key: Key,
+        value: CodexForkProtocolSupport,
+        countLimit: Int = probeCacheCountLimit
+    ) {
+        values[key] = value
+        let cap = max(1, countLimit)
+        while values.count > cap {
+            if let victim = values.keys.first(where: { $0 != key }) ?? values.keys.first {
+                values.removeValue(forKey: victim)
+            } else {
+                break
+            }
+        }
+    }
+
     private final class ProbeCache: @unchecked Sendable {
         static let shared = ProbeCache()
         private let lock = NSLock()
@@ -210,7 +234,9 @@ public struct CodexForkProtocolSupport: Sendable, Equatable {
 
         func store(_ value: CodexForkProtocolSupport, for key: ProbeKey) {
             lock.lock(); defer { lock.unlock() }
-            values[key] = value
+            CodexForkProtocolSupport.noteProbeCacheEntry(
+                &values, key: key, value: value
+            )
         }
     }
 }

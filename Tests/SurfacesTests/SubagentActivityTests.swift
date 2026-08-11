@@ -609,6 +609,17 @@ final class SubagentActivityTests: XCTestCase {
         XCTAssertEqual(snapshot.hiddenActiveCount(expanded: true), 0)
     }
 
+    // MARK: - Activity receipt fetch window (memory)
+
+    func test_defaultReceiptFetchLimit_matchesRuntimeActivityWindow() {
+        XCTAssertEqual(SubagentActivityProjection.defaultReceiptFetchLimit, 128)
+        XCTAssertEqual(
+            SubagentActivityProjection.defaultReceiptFetchLimit,
+            AgentOrchestrationRuntime.defaultActivityReceiptLimit,
+            "Agent App poll limit must match runtime activity default"
+        )
+    }
+
     // MARK: - Helpers
 
     private func makeReceipt(

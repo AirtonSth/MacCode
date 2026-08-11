@@ -1551,10 +1551,42 @@ public struct ChatSessionCacheKey: Hashable, Sendable {
 /// The caller is responsible for calling `session.clear()` before reusing a
 /// session so prior KV history never leaks into an independent distill call.
 actor ChatSessionStore {
+    /// Peak live ChatSession objects retained between idle reclaim. Each key
+    /// holds full system instructions and a session that can retain Metal/KV
+    /// working-set references; mode/maxTokens churn without a ceiling can pin
+    /// multi-MB sessions process-wide until `reclaimIdleMemory`. 8 covers the
+    /// common mode×budget combinations without multi-dozen growth.
+    static let capacity = 8
+
     private var sessions: [ChatSessionCacheKey: ChatSession] = [:]
+    private let limit: Int
+
+    init(capacity: Int = ChatSessionStore.capacity) {
+        self.limit = max(1, capacity)
+    }
+
+    /// Pure insert/evict for session-map style stores (unit tests). Keeps `key`;
+    /// drops arbitrary other keys when over `capacity`.
+    static func noteSessionEntry<Value>(
+        _ sessions: inout [ChatSessionCacheKey: Value],
+        key: ChatSessionCacheKey,
+        value: Value,
+        capacity: Int = ChatSessionStore.capacity
+    ) {
+        sessions[key] = value
+        let cap = max(1, capacity)
+        while sessions.count > cap {
+            if let victim = sessions.keys.first(where: { $0 != key }) ?? sessions.keys.first {
+                sessions.removeValue(forKey: victim)
+            } else {
+                break
+            }
+        }
+    }
 
     /// Return the cached session for `key`, or create-and-store one using
-    /// `factory()`.  The `factory` closure is called at most once per key.
+    /// `factory()`.  The `factory` closure is called at most once per key while
+    /// that key remains under the capacity ceiling.
     func session(
         for key: ChatSessionCacheKey,
         creating factory: () -> ChatSession
@@ -1563,7 +1595,7 @@ actor ChatSessionStore {
             return existing
         }
         let fresh = factory()
-        sessions[key] = fresh
+        Self.noteSessionEntry(&sessions, key: key, value: fresh, capacity: limit)
         return fresh
     }
 

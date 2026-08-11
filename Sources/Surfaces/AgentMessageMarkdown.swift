@@ -38,24 +38,36 @@ enum AgentMessageMarkdown {
 
     /// Soft byte budget for cached markdown parse results (blocks + inline share
     /// independent budgets). Large finished messages still cache once; streaming
-    /// partial thrash cannot unbounded-grow occupancy.
-    private static let blocksCacheCostLimit = 2 * 1_024 * 1_024
-    private static let inlineCacheCostLimit = 2 * 1_024 * 1_024
+    /// partial thrash cannot unbounded-grow occupancy. 128 KiB each matches other
+    /// agent paint budgets after count limits were already 128 — was 256 KiB each
+    /// (512 KiB / 1 MiB / 2 MiB before that).
+    static let blocksCacheCostLimit = 128 * 1_024
+    static let inlineCacheCostLimit = 128 * 1_024
     /// Skip storing partials above this band even when `cache: true` — finished
     /// large bodies still benefit if they re-render with identical text (hit path
     /// after first store under cost limit). Below this, every intermediate stream
     /// length used to pin a slot under countLimit-only.
     private static let maxCachedTextUTF8Bytes = 48 * 1_024
 
+    /// Peak block-parse results retained process-wide (NSCache countLimit).
+    /// Each value is a full `[AgentMessageMarkdownBlock]` tree (can be multi-KB).
+    /// 128 matches inline + other agent surface caps — was 512, then 256.
+    /// Cost limit still bounds total bytes.
+    static let blocksCacheCountLimit = 128
+    /// Peak inline AttributedString results retained process-wide.
+    /// Each value is a full attributed parse (can be multi-KB). 128 matches other
+    /// agent surface caps — was 2_048, then 256. Cost limit still bounds bytes.
+    static let inlineCacheCountLimit = 128
+
     private static let blocksCache: NSCache<NSString, BlocksBox> = {
         let cache = NSCache<NSString, BlocksBox>()
-        cache.countLimit = 512
+        cache.countLimit = blocksCacheCountLimit
         cache.totalCostLimit = blocksCacheCostLimit
         return cache
     }()
     private static let inlineCache: NSCache<NSString, AttributedBox> = {
         let cache = NSCache<NSString, AttributedBox>()
-        cache.countLimit = 2_048
+        cache.countLimit = inlineCacheCountLimit
         cache.totalCostLimit = inlineCacheCostLimit
         return cache
     }()

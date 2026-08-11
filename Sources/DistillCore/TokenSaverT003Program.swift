@@ -646,13 +646,22 @@ public enum TokenSaverFileFingerprintAction: Sendable, Equatable {
 }
 
 public struct TokenSaverFileFingerprintRegistry: Sendable, Equatable {
+    /// Peak distinct path/scope fingerprint keys retained. Multi-file agent
+    /// sessions otherwise pin unbounded key→sha maps until process exit.
+    /// 128 matches other agent/Token Saver count windows — was 256.
+    public static let defaultCountLimit = 128
+
     private let protectedRecentCount: Int
+    private let countLimit: Int
     private var fingerprints: [String: String] = [:]
     private var recentKeys: [String] = []
 
-    public init(protectedRecentCount: Int) {
+    public init(protectedRecentCount: Int, countLimit: Int = defaultCountLimit) {
         self.protectedRecentCount = max(0, protectedRecentCount)
+        self.countLimit = max(1, countLimit)
     }
+
+    public var count: Int { fingerprints.count }
 
     public mutating func register(
         path: String,
@@ -666,10 +675,46 @@ public struct TokenSaverFileFingerprintRegistry: Sendable, Equatable {
         let fingerprint = DistillSHA256.hex(bytes)
         let prior = fingerprints[key]
         let protected = recentKeys.suffix(protectedRecentCount).contains(key)
-        fingerprints[key] = fingerprint
-        recentKeys.removeAll { $0 == key }
-        recentKeys.append(key)
+        let pruned = Self.prunedMaps(
+            fingerprints: fingerprints,
+            recentKeys: recentKeys,
+            inserting: key,
+            fingerprint: fingerprint,
+            countLimit: countLimit
+        )
+        fingerprints = pruned.fingerprints
+        recentKeys = pruned.recentKeys
         return prior == fingerprint && !protected ? .unchanged(fingerprint: fingerprint) : .sendFull
+    }
+
+    /// Pure insert/evict for unit tests. Keeps `key` as newest; FIFO-drops
+    /// oldest other keys when over `countLimit`. `protectedRecentCount` is
+    /// applied by the caller before/after — this only bounds cardinality.
+    public static func prunedMaps(
+        fingerprints: [String: String],
+        recentKeys: [String],
+        inserting key: String,
+        fingerprint: String,
+        countLimit: Int = defaultCountLimit
+    ) -> (fingerprints: [String: String], recentKeys: [String]) {
+        var nextPrints = fingerprints
+        var nextRecent = recentKeys
+        nextPrints[key] = fingerprint
+        nextRecent.removeAll { $0 == key }
+        nextRecent.append(key)
+        let cap = max(1, countLimit)
+        while nextRecent.count > cap {
+            let oldest = nextRecent.removeFirst()
+            if oldest != key {
+                nextPrints.removeValue(forKey: oldest)
+            }
+        }
+        // Defensive: drop any fingerprint not tracked in recentKeys.
+        if nextPrints.count > nextRecent.count {
+            let live = Set(nextRecent)
+            nextPrints = nextPrints.filter { live.contains($0.key) }
+        }
+        return (nextPrints, nextRecent)
     }
 }
 
@@ -1082,9 +1127,20 @@ public enum TokenSaverImageDedupAction: String, Codable, Sendable, Equatable {
 }
 
 public struct TokenSaverImageDedupRegistry: Sendable, Equatable {
-    private var hashesByThread: Set<String> = []
+    /// Peak distinct image hash keys retained (scope+hash). Attachment storms
+    /// otherwise pin unbounded exact-dedup membership until process exit.
+    /// 128 matches other agent/Token Saver count windows — was 256.
+    public static let defaultCountLimit = 128
 
-    public init() {}
+    private var hashesByThread: Set<String> = []
+    private var recentKeys: [String] = []
+    private let countLimit: Int
+
+    public init(countLimit: Int = defaultCountLimit) {
+        self.countLimit = max(1, countLimit)
+    }
+
+    public var count: Int { hashesByThread.count }
 
     public mutating func register(
         hash: String,
@@ -1093,12 +1149,63 @@ public struct TokenSaverImageDedupRegistry: Sendable, Equatable {
     ) -> TokenSaverImageDedupAction {
         let key = [scope.workspaceID, scope.projectID, scope.threadID, scope.provider, hash].joined(separator: "\u{1f}")
         if explicitResend {
-            hashesByThread.insert(key)
+            let pruned = Self.prunedMembership(
+                set: hashesByThread,
+                order: recentKeys,
+                inserting: key,
+                countLimit: countLimit
+            )
+            hashesByThread = pruned.set
+            recentKeys = pruned.order
             return .sendOriginal
         }
-        if hashesByThread.contains(key) { return .deduplicateExact }
-        hashesByThread.insert(key)
+        if hashesByThread.contains(key) {
+            // Touch recency so hot hashes stay under the FIFO window.
+            let pruned = Self.prunedMembership(
+                set: hashesByThread,
+                order: recentKeys,
+                inserting: key,
+                countLimit: countLimit
+            )
+            hashesByThread = pruned.set
+            recentKeys = pruned.order
+            return .deduplicateExact
+        }
+        let pruned = Self.prunedMembership(
+            set: hashesByThread,
+            order: recentKeys,
+            inserting: key,
+            countLimit: countLimit
+        )
+        hashesByThread = pruned.set
+        recentKeys = pruned.order
         return .sendOriginal
+    }
+
+    /// Pure insert/evict for unit tests. Keeps `key` as newest; FIFO-drops
+    /// oldest other keys when over `countLimit`.
+    public static func prunedMembership(
+        set: Set<String>,
+        order: [String],
+        inserting key: String,
+        countLimit: Int = defaultCountLimit
+    ) -> (set: Set<String>, order: [String]) {
+        var nextSet = set
+        var nextOrder = order
+        nextSet.insert(key)
+        nextOrder.removeAll { $0 == key }
+        nextOrder.append(key)
+        let cap = max(1, countLimit)
+        while nextOrder.count > cap {
+            let oldest = nextOrder.removeFirst()
+            if oldest != key {
+                nextSet.remove(oldest)
+            }
+        }
+        if nextSet.count > nextOrder.count {
+            nextSet = Set(nextOrder)
+        }
+        return (nextSet, nextOrder)
     }
 }
 

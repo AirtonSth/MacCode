@@ -221,7 +221,8 @@ public enum SubagentActivityProjection {
     // Primary thread window for the scoped activity fetch. Nested workers use a
     // separate child bound on the runtime (`defaultChildActivityReceiptLimit`).
     // Projection still scopes by selected thread + parent-chain as defense in depth.
-    public static let defaultReceiptFetchLimit = 10_000
+    // Matches AgentOrchestrationRuntime.defaultActivityReceiptLimit (was 10_000, then 500, then 256).
+    public static let defaultReceiptFetchLimit = 128
 
     public static func project(
         receipts: [AgentOrchestrationAdmissionReceipt],

@@ -150,9 +150,18 @@ public final class EventBus: @unchecked Sendable {
         public let metadata: SnapshotMetadata
     }
 
+    /// Peak events retained in the in-process recent ring (and encode cache).
+    /// Bounds reconnect catch-up / agent host-state flood memory. 128 matches
+    /// other agent surface caps — was 512, then 256.
+    public static let defaultRecentLimit = 128
+    /// Peak payload bytes retained alongside `defaultRecentLimit`.
+    /// 128 KiB matches the compact count window (128) and control-path
+    /// budgets — was 2 MiB, then 1 MiB, then 512 KiB, then 256 KiB.
+    public static let defaultRecentByteLimit = 128 * 1024
+
     public init(
-        recentLimit: Int = 512,
-        recentByteLimit: Int = 2 * 1024 * 1024,
+        recentLimit: Int = EventBus.defaultRecentLimit,
+        recentByteLimit: Int = EventBus.defaultRecentByteLimit,
         clock: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.recentLimit = max(0, recentLimit)

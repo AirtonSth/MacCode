@@ -11,8 +11,18 @@ import CryptoKit
 public struct DeterministicSkipSet: Sendable {
     private var entries: [String: Int] = [:]   // inputSHA -> turnRecorded (logical clock)
     private let ttlTurns: Int
+    private let countLimit: Int
 
-    public init(ttlTurns: Int = 60) { self.ttlTurns = max(1, ttlTurns) }
+    /// Peak distinct input SHAs retained after TTL prune. Without a ceiling,
+    /// long Token Saver sessions with many unique non-compressible tool outputs
+    /// pin unbounded (sha → turn) rows; expired keys were never dropped on write.
+    /// 128 matches other agent/Token Saver count windows — was 256.
+    public static let defaultCountLimit = 128
+
+    public init(ttlTurns: Int = 60, countLimit: Int = defaultCountLimit) {
+        self.ttlTurns = max(1, ttlTurns)
+        self.countLimit = max(1, countLimit)
+    }
 
     public static func key(_ input: String) -> String {
         DistillSHA256.hex(input)
@@ -20,9 +30,44 @@ public struct DeterministicSkipSet: Sendable {
 
     /// Record a DETERMINISTIC non-compressible verdict. `routerReturnedNil` must be the
     /// pure router's outcome; `belowGainFloor` a deterministic size check.
+    /// Drops TTL-expired keys first, then oldest turns until within `countLimit`.
     public mutating func recordIfDeterministic(input: String, routerReturnedNil: Bool, belowGainFloor: Bool, now: Int) {
         guard routerReturnedNil, belowGainFloor else { return }
-        entries[Self.key(input)] = now
+        entries = Self.prunedEntries(
+            entries,
+            inserting: now,
+            for: Self.key(input),
+            now: now,
+            ttlTurns: ttlTurns,
+            countLimit: countLimit
+        )
+    }
+
+    /// Pure insert + TTL prune + cardinality bound for unit tests.
+    /// Keeps `key` at `recordedAt`; drops expired then oldest other keys.
+    public static func prunedEntries(
+        _ entries: [String: Int],
+        inserting recordedAt: Int,
+        for key: String,
+        now: Int,
+        ttlTurns: Int,
+        countLimit: Int = defaultCountLimit
+    ) -> [String: Int] {
+        let window = max(1, ttlTurns)
+        var next = entries.filter { now - $0.value < window }
+        next[key] = recordedAt
+        let cap = max(1, countLimit)
+        guard next.count > cap else { return next }
+        // Evict oldest recorded turns first so the just-inserted key stays.
+        let victims = next
+            .filter { $0.key != key }
+            .sorted { $0.value < $1.value }
+        var drop = next.count - cap
+        for victim in victims where drop > 0 {
+            next.removeValue(forKey: victim.key)
+            drop -= 1
+        }
+        return next
     }
 
     /// Transient errors must never poison the skip-set — this is an explicit no-op so the

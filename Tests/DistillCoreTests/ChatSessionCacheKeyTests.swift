@@ -194,17 +194,85 @@ final class ChatSessionCacheKeyTests: XCTestCase {
         XCTAssertEqual(countAfter, 0,
             "evictAll on an empty store must be a safe no-op; count stays zero")
     }
+
+    // MARK: - Cardinality cap (PERF)
+
+    /// PERF: mode/maxTokens churn must not pin unbounded ChatSession objects
+    /// (each holds full system instructions + Metal/KV-capable session state).
+    func test_builtInCapacity_boundsLiveSessions() {
+        XCTAssertEqual(ChatSessionStore.capacity, 8)
+    }
+
+    func test_noteSessionEntry_capsDistinctKeys() {
+        var sessions: [ChatSessionCacheKey: Int] = [:]
+        let limit = 4
+        var newest = ChatSessionCacheKey(instructions: "x", maxTokens: 1)
+        for i in 0..<(limit + 12) {
+            newest = ChatSessionCacheKey(instructions: "mode-\(i)", maxTokens: i + 1)
+            ChatSessionStore.noteSessionEntry(
+                &sessions,
+                key: newest,
+                value: i,
+                capacity: limit
+            )
+        }
+        XCTAssertEqual(sessions.count, limit)
+        XCTAssertEqual(sessions[newest], limit + 11)
+    }
+
+    func test_noteSessionEntry_updatesExistingWithoutGrowth() {
+        var sessions: [ChatSessionCacheKey: String] = [:]
+        let key = ChatSessionCacheKey(instructions: "stable", maxTokens: 128)
+        ChatSessionStore.noteSessionEntry(&sessions, key: key, value: "a", capacity: 3)
+        ChatSessionStore.noteSessionEntry(&sessions, key: key, value: "b", capacity: 3)
+        XCTAssertEqual(sessions.count, 1)
+        XCTAssertEqual(sessions[key], "b")
+    }
+
+    func test_objectStore_enforcesCapacityOnInsert() async {
+        let store = ObjectStore(capacity: 3)
+        for i in 0..<10 {
+            _ = await store.item(
+                for: ChatSessionCacheKey(instructions: "k-\(i)", maxTokens: i),
+                creating: { NSObject() }
+            )
+        }
+        let count = await store.count
+        XCTAssertEqual(count, 3)
+    }
+
+    func test_retentionEstimate_32SessionsTo8Window() {
+        let uncapped = 32
+        let limit = ChatSessionStore.capacity
+        let reduction = Double(uncapped - limit) / Double(uncapped)
+        XCTAssertGreaterThan(reduction, 0.70)
+        XCTAssertEqual(limit, 8)
+        // Basis: ~50 MB retained Metal/session working-set refs per live session
+        // under pressure → 32 ≈ 1.6 GB; 8 ≈ 400 MB (−75%). Instruction strings
+        // alone are smaller but still linear in distinct keys.
+        let perSessionMB = 50
+        let before = uncapped * perSessionMB
+        let after = limit * perSessionMB
+        XCTAssertEqual(before, 1_600)
+        XCTAssertEqual(after, 400)
+        XCTAssertLessThan(Double(after) / Double(before), 0.30)
+    }
 }
 
 // MARK: - ObjectStore (structurally equivalent to ChatSessionStore, AnyObject-typed)
 
 private actor ObjectStore {
     private var items: [ChatSessionCacheKey: AnyObject] = [:]
+    private let limit: Int
+
+    init(capacity: Int = ChatSessionStore.capacity) {
+        self.limit = max(1, capacity)
+    }
 
     func item(for key: ChatSessionCacheKey, creating factory: () -> AnyObject) -> AnyObject {
         if let existing = items[key] { return existing }
         let fresh = factory()
-        items[key] = fresh
+        ChatSessionStore.noteSessionEntry(&items, key: key, value: fresh, capacity: limit)
         return fresh
     }
 

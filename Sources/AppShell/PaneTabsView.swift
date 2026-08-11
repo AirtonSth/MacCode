@@ -71,6 +71,9 @@ public final class PaneTabsView: NSObject {
     // Key present => state known (true=dirty). Key absent => unknown (async resolve pending or not yet triggered).
     // Staleness window: up to one event-loop turn after tab construction before the async RPC result arrives
     // and updates the button; subsequent updates arrive via files.state.updated events (no polling needed).
+    // Peak keys retained (closed-tab churn otherwise pins SurfaceID→Bool forever;
+    // structural rebuild also prunes to live surface ids).
+    nonisolated static let dirtyStateCacheCountLimit = 256
     private var dirtyStateCache: [SurfaceID: Bool] = [:]
 
     public init(pane: PaneNode, router: AppCommandRouter?, showsWorkspaceControls: Bool = true, splitContext: PaneSplitContext? = nil, workspaceID: WorkspaceID? = nil) {
@@ -423,6 +426,9 @@ public final class PaneTabsView: NSObject {
                 insertIndex += 1
             }
             currentSelectedID = selectedID
+            // Drop dirty-cache entries for closed surfaces so tab churn cannot
+            // pin unbounded SurfaceID→Bool pairs across structural rebuilds.
+            Self.pruneDirtyStateCache(&dirtyStateCache, retaining: Set(currentSurfaceIDs))
             installSelectedContent(selectedID: selectedID, in: pane)
             DispatchQueue.main.async { [weak self] in self?.scrollSelectedTabIntoView(selectedID) }
             return false
@@ -606,6 +612,34 @@ public final class PaneTabsView: NSObject {
         return cachedDirty // nil => unknown; caller must async-resolve
     }
 
+    /// Pure insert/evict for files-tab dirty memo. Keeps `id`; drops arbitrary
+    /// other surface ids when over `countLimit`.
+    nonisolated static func noteDirtyStateCacheEntry(
+        _ cache: inout [SurfaceID: Bool],
+        id: SurfaceID,
+        isDirty: Bool,
+        countLimit: Int = dirtyStateCacheCountLimit
+    ) {
+        cache[id] = isDirty
+        let cap = max(1, countLimit)
+        while cache.count > cap {
+            if let victim = cache.keys.first(where: { $0 != id }) ?? cache.keys.first {
+                cache.removeValue(forKey: victim)
+            } else {
+                break
+            }
+        }
+    }
+
+    /// Drop cache entries for surfaces no longer present in the strip.
+    nonisolated static func pruneDirtyStateCache(
+        _ cache: inout [SurfaceID: Bool],
+        retaining liveIDs: Set<SurfaceID>
+    ) {
+        guard !cache.isEmpty else { return }
+        cache = cache.filter { liveIDs.contains($0.key) }
+    }
+
     private func surfaceIsUnsaved(_ id: SurfaceID) -> Bool {
         guard let desc = pane.surfaces.first(where: { $0.id == id }) else { return false }
         // Fast path: pure decision from descriptor flags + cache. No RPC.
@@ -640,7 +674,7 @@ public final class PaneTabsView: NSObject {
             }
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                self.dirtyStateCache[id] = isDirty
+                Self.noteDirtyStateCacheEntry(&self.dirtyStateCache, id: id, isDirty: isDirty)
                 self.tabButtons[id]?.setDirty(isDirty)
             }
         }
@@ -666,7 +700,7 @@ public final class PaneTabsView: NSObject {
         guard let state = payload["state"]?.objectValue,
               case .array(let values) = state["dirty_paths"] ?? .array([]) else { return }
         let isDirty = values.contains { $0.stringValue != nil }
-        dirtyStateCache[surfaceID] = isDirty
+        Self.noteDirtyStateCacheEntry(&dirtyStateCache, id: surfaceID, isDirty: isDirty)
         tabButtons[surfaceID]?.setDirty(isDirty)
     }
 

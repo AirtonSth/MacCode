@@ -336,6 +336,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private var providerProbeCache: [ProviderProbeCacheKey: ProviderProbeCapabilities] = [:]
     private var providerUpdateLocks = Set<ProviderProbeCacheKey>()
     private let providerProbeCacheTTL: TimeInterval = 30
+    /// Peak distinct provider probe keys retained on this long-lived router.
+    /// Env/run-as fingerprint churn otherwise pins unbounded capability
+    /// structs (slash commands + skills). 32 matches Grok ACP discovery /
+    /// Codex fork probe / catalog verification order of magnitude.
+    nonisolated static let providerProbeCacheCountLimit = 32
     private var suppressedLayoutEventDepth = 0
     private var closedTabBuffer = ClosedTabRingBuffer(capacity: 10)
     private var restartingSurfaceIDs = Set<SurfaceID>()
@@ -5207,8 +5212,32 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 capturedAt: now
             )
         }.value
-        providerProbeCache[key] = capabilities
+        Self.noteProviderProbeCacheEntry(
+            &providerProbeCache,
+            key: key,
+            value: capabilities
+        )
         return capabilities
+    }
+
+    /// Pure insert/evict for the in-memory provider CLI probe cache.
+    /// Keeps `key`; drops arbitrary other keys when over `countLimit`.
+    /// Extracted for unit tests (TTL still applied by the call site on read).
+    nonisolated static func noteProviderProbeCacheEntry<Key: Hashable, Value>(
+        _ cache: inout [Key: Value],
+        key: Key,
+        value: Value,
+        countLimit: Int = providerProbeCacheCountLimit
+    ) {
+        cache[key] = value
+        let cap = max(1, countLimit)
+        while cache.count > cap {
+            if let victim = cache.keys.first(where: { $0 != key }) ?? cache.keys.first {
+                cache.removeValue(forKey: victim)
+            } else {
+                break
+            }
+        }
     }
 
     private func providerSkills(provider: AgentProvider, environment: [String: String]) -> [String] {

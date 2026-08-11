@@ -15,7 +15,10 @@ public enum TokenSaverWaveAShadowBridge {
     private static var priorByKey: [ReplayKey: Data] = [:]
     private static var pointerCounts: [ReplayKey: Int] = [:]
     private static var replayInsertionOrder: [ReplayKey] = []
-    private static let maxReplayKeys = 2_048
+    /// Peak distinct BindingID+tool exact-replay priors retained process-wide.
+    /// Each value holds prior tool-output `Data` (can be multi-KB/MB). 128 matches
+    /// other agent/Token Saver count windows — was 256 (and 2_048 before that).
+    public static let maxReplayKeys = 128
     // PERF: observeToolOutput runs on every Token Saver tool observation.
     // Array-literal membership reallocated per call; share process-wide Set.
     private static let shellLikeToolNames: Set<String> = [

@@ -173,4 +173,78 @@ final class FileTreeStoreTests: XCTestCase {
         XCTAssertEqual(lister.calls, [],
             "uncached subtree lookup must stay read-only so failed drops do not trigger hidden listings")
     }
+
+    func test_childCacheCountLimit_matchesDiscoveryOrder() {
+        XCTAssertEqual(FileTreeStore<StubItem>.childCacheCountLimit, 256)
+    }
+
+    func test_noteChildCacheEntry_capsDistinctPaths() {
+        var cache: [String: [StubItem]] = [:]
+        let limit = 4
+        for i in 0..<(limit + 10) {
+            FileTreeStore<StubItem>.noteChildCacheEntry(
+                &cache,
+                path: "dir-\(i)",
+                items: [StubItem("dir-\(i)/f.swift", isDirectory: false)],
+                countLimit: limit
+            )
+        }
+        XCTAssertEqual(cache.count, limit)
+        XCTAssertNotNil(cache["dir-\(limit + 9)"])
+        let evictedCount = (0..<(limit + 10)).filter {
+            cache["dir-\($0)"] == nil
+        }.count
+        XCTAssertEqual(evictedCount, 10)
+    }
+
+    func test_noteChildCacheEntry_updatesExistingWithoutGrowth() {
+        var cache: [String: [StubItem]] = [:]
+        FileTreeStore<StubItem>.noteChildCacheEntry(
+            &cache, path: "src", items: [StubItem("src/a", isDirectory: false)], countLimit: 3
+        )
+        FileTreeStore<StubItem>.noteChildCacheEntry(
+            &cache, path: "src", items: [StubItem("src/b", isDirectory: false)], countLimit: 3
+        )
+        XCTAssertEqual(cache.count, 1)
+        XCTAssertEqual(cache["src"]?.map(\.relativePath), ["src/b"])
+    }
+
+    func test_fetch_enforcesCapOnLiveStore() {
+        var listings: [String: [StubItem]] = [:]
+        for i in 0..<20 {
+            listings["d\(i)"] = [StubItem("d\(i)/f", isDirectory: false)]
+        }
+        let lister = FakeLister(listings)
+        let store = FileTreeStore<StubItem>(lister: lister.list, childCacheCountLimit: 5)
+        store.setRoots((0..<20).map { StubItem("d\($0)", isDirectory: true) })
+        for node in store.roots {
+            _ = store.expand(node)
+        }
+        XCTAssertEqual(store.childCacheCountForTesting, 5)
+        // Newest still cached (no re-list)
+        let callsBefore = lister.calls.count
+        _ = store.children(at: "d19")
+        XCTAssertEqual(lister.calls.count, callsBefore, "hot path must stay cached under the cap")
+        // At least the 15 paths outside the five-entry window must re-list.
+        // The cache intentionally makes no promise about which old key is evicted.
+        let callsBeforeScan = lister.calls.count
+        for index in 0..<19 {
+            _ = store.children(at: "d\(index)")
+        }
+        XCTAssertGreaterThanOrEqual(lister.calls.count - callsBeforeScan, 15)
+    }
+
+    func test_retentionEstimate_2kDirsTo256Window() {
+        let uncapped = 2_000
+        let limit = FileTreeStore<StubItem>.childCacheCountLimit
+        let reduction = Double(uncapped - limit) / Double(uncapped)
+        XCTAssertGreaterThan(reduction, 0.87)
+        XCTAssertEqual(limit, 256)
+        // Basis: path key (~40B) + modest listing (~20 entries × ~80B) ≈ ~1.6KB/dir.
+        // 2k × 1.6KB ≈ 3.2MB → 256 × 1.6KB ≈ 410KB (−87.2%). Large listings
+        // scale with the same path ceiling.
+        let perDir = 1_600
+        XCTAssertEqual(uncapped * perDir, 3_200_000)
+        XCTAssertEqual(limit * perDir, 409_600)
+    }
 }

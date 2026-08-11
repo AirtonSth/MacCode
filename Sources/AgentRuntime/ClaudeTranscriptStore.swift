@@ -5,9 +5,18 @@ import CoreModel
 /// Not thread-safe by itself. `ClaudeTranscriptStore` serializes get/set with
 /// `pathIndexLock` so concurrent `readSession` cannot race Dictionary mutation.
 public struct TranscriptPathIndex {
+    /// Peak distinct providerThreadId paths retained process-wide. Misses only
+    /// re-enumerate the projects tree (same as cold start); multi-session
+    /// churn without process exit must not pin unbounded path strings.
+    /// 128 matches session-map ceilings — was 256.
+    public static let defaultCountLimit = 128
+
     private var storage: [String: URL] = [:]
 
     public init() {}
+
+    /// Current entry count (tests / diagnostics).
+    public var count: Int { storage.count }
 
     /// Returns the cached path for `providerThreadId`, or nil on a miss.
     public func path(forProviderThreadId id: String) -> URL? {
@@ -17,9 +26,38 @@ public struct TranscriptPathIndex {
 
     /// Stores or replaces the path for `providerThreadId`.
     /// Silently ignores empty ids to match ClaudeTranscriptStore's guard.
-    public mutating func setPath(_ url: URL, forProviderThreadId id: String) {
+    /// When over `countLimit`, drops arbitrary other keys while keeping `id`.
+    public mutating func setPath(
+        _ url: URL,
+        forProviderThreadId id: String,
+        countLimit: Int = defaultCountLimit
+    ) {
+        guard !id.isEmpty else { return }
+        Self.notePath(
+            &storage,
+            id: id,
+            url: url,
+            countLimit: countLimit
+        )
+    }
+
+    /// Pure insert/evict for unit tests. Empty ids are ignored.
+    public static func notePath(
+        _ storage: inout [String: URL],
+        id: String,
+        url: URL,
+        countLimit: Int = defaultCountLimit
+    ) {
         guard !id.isEmpty else { return }
         storage[id] = url
+        let cap = max(1, countLimit)
+        while storage.count > cap {
+            if let victim = storage.keys.first(where: { $0 != id }) ?? storage.keys.first {
+                storage.removeValue(forKey: victim)
+            } else {
+                break
+            }
+        }
     }
 }
 
