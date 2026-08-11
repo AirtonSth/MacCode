@@ -644,7 +644,8 @@ public enum CapacitySubprocessFixtureRunner {
     public static func run(
         spec: CapacitySubprocessFixtureSpec,
         seed: UInt64 = 1,
-        stopAfterMs: Int? = nil
+        stopAfterMs: Int? = nil,
+        requireOwnershipTag: Bool = false
     ) throws -> CapacitySubprocessRunResult {
         let frames = spec.materializedFrames(seed: seed).filter { !$0.contains("stop_race") }
         var scriptParts: [String] = ["set -e"]
@@ -657,6 +658,10 @@ public enum CapacitySubprocessFixtureRunner {
         for line in spec.stderrLines {
             let escaped = line.replacingOccurrences(of: "'", with: "'\\''")
             scriptParts.append("printf '%s\\n' '\(escaped)' 1>&2")
+        }
+        // Keep the child alive briefly so stopAfterMs can race.
+        if stopAfterMs != nil {
+            scriptParts.append("sleep 2")
         }
         scriptParts.append("exit \(spec.exitCode)")
         let script = scriptParts.joined(separator: "; ")
@@ -671,8 +676,28 @@ public enum CapacitySubprocessFixtureRunner {
         try process.run()
         let pid = process.processIdentifier
         var ownershipTag: SpawnedProcessTag?
-        if ProviderProcessOwnership.shared.store() != nil {
-            ownershipTag = try? ProcessSpawnTagger.tagProcess(process, managedKind: .sidecar)
+        if requireOwnershipTag {
+            guard ProviderProcessOwnership.shared.store() != nil else {
+                process.terminate()
+                throw ProviderProcessOwnershipError.storeNotConfigured
+            }
+            ownershipTag = try ProcessSpawnTagger.tagProcess(process, managedKind: .sidecar)
+        } else if ProviderProcessOwnership.shared.store() != nil {
+            ownershipTag = try ProcessSpawnTagger.tagProcess(process, managedKind: .sidecar)
+        }
+        // Concurrent drain while the process runs (pipe-pressure safe).
+        let outBox = CapacitySubprocessDrainBox()
+        let errBox = CapacitySubprocessDrainBox()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            outBox.set(out.fileHandleForReading.readDataToEndOfFile())
+            group.leave()
+        }
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            errBox.set(err.fileHandleForReading.readDataToEndOfFile())
+            group.leave()
         }
         var stoppedByCaller = false
         if let stopAfterMs, stopAfterMs >= 0 {
@@ -683,16 +708,15 @@ public enum CapacitySubprocessFixtureRunner {
             }
         }
         process.waitUntilExit()
+        _ = group.wait(timeout: .now() + 2)
         if let ownershipTag {
-            try? ProviderProcessOwnership.shared.store()?.removeExact(ownershipTag)
+            try ProviderProcessOwnership.shared.store()?.removeExact(ownershipTag)
         }
-        let outData = out.fileHandleForReading.readDataToEndOfFile()
-        let errData = err.fileHandleForReading.readDataToEndOfFile()
-        let outLines = String(data: outData, encoding: .utf8)?
+        let outLines = String(data: outBox.get(), encoding: .utf8)?
             .split(separator: "\n", omittingEmptySubsequences: false)
             .map(String.init)
             .filter { !$0.isEmpty } ?? []
-        let errLines = String(data: errData, encoding: .utf8)?
+        let errLines = String(data: errBox.get(), encoding: .utf8)?
             .split(separator: "\n", omittingEmptySubsequences: false)
             .map(String.init)
             .filter { !$0.isEmpty } ?? []
@@ -704,6 +728,13 @@ public enum CapacitySubprocessFixtureRunner {
             stoppedByCaller: stoppedByCaller
         )
     }
+}
+
+private final class CapacitySubprocessDrainBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+    func set(_ data: Data) { lock.lock(); self.data = data; lock.unlock() }
+    func get() -> Data { lock.lock(); defer { lock.unlock() }; return data }
 }
 
 /// Describes a controlled stdout/stderr fixture for one real adapter seam.

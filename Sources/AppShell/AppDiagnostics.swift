@@ -687,16 +687,12 @@ enum AppDiagnostics {
             }
             return Double(total) / physicalKB
         }()
-        let osSignal: PressureOSSignal = {
-            switch sample.pressureDecision {
-            case .critical: return .critical
-            case .warning: return .warning
-            case .normal, .unknown: return .normal
-            }
-        }()
+        // S7: managed-RSS samples must NOT be promoted to OS critical/warning.
+        // RSS hysteresis is two complete samples; OS signals are immediate only
+        // when a real dispatch/OS source says so (not yet wired → always normal).
         let pressureSample = PressureSample(
             date: Date(),
-            osSignal: osSignal,
+            osSignal: .normal,
             managedRSSFraction: managedFraction,
             isComplete: sample.isComplete,
             isStale: !sample.isComplete
@@ -732,11 +728,13 @@ enum AppDiagnostics {
 #if DEBUG
             lastPressureExecuteOutcomeForTesting = outcome
 #endif
-            applyPressureActions(outcome.applied)
-            // Only report mutations that actually applied (not skipped/no-ops).
-            lastAppliedPressureActionsForUX = outcome.applied.map(\.rawValue)
-        } else {
-            lastAppliedPressureActionsForUX = []
+            let acknowledged = applyPressureActions(outcome.applied)
+            // Sticky UX: union newly acknowledged with still-active effects.
+            lastAppliedPressureActionsForUX = Array(
+                Set(acknowledged.map(\.rawValue)).union(activePressureEffects.map(\.rawValue))
+            ).sorted()
+        } else if !activePressureEffects.isEmpty {
+            lastAppliedPressureActionsForUX = activePressureEffects.map(\.rawValue).sorted()
         }
 
         // S7: paced recovery only fires once level is already normal (resume
@@ -746,8 +744,12 @@ enum AppDiagnostics {
             GraphifyWorkspaceService.shared.setPressurePauseEnsureAndWatch(false)
             let recovered = pressureGovernor.pacedRecovery(at: Date())
             if !recovered.emittedActions.isEmpty {
-                applyPressureActions(recovered.emittedActions)
-                lastAppliedPressureActionsForUX.append(contentsOf: recovered.emittedActions.map(\.rawValue))
+                let acknowledged = applyPressureActions(recovered.emittedActions)
+                lastAppliedPressureActionsForUX = acknowledged.map(\.rawValue)
+            } else if !activePressureEffects.isEmpty {
+                // Ensure resume clears sticky Graphify/maintenance even without tick emit.
+                _ = applyPressureActions([.resumeOptionalWorkUnit])
+                lastAppliedPressureActionsForUX = []
             }
         }
 
@@ -785,42 +787,53 @@ enum AppDiagnostics {
 
     /// Live flags for optional-work actions so UX only reports real mutations.
     @MainActor private static var maintenancePruneDeferred = false
+    /// Sticky active effects until recovery (not cleared on every heartbeat).
+    @MainActor private static var activePressureEffects: Set<PressureActionKind> = []
     @MainActor private static var lastAppliedPressureActionsForUX: [String] = []
     /// Hooks installed by AppShell (Distill reclaim, idle session shortener, UI reclaim).
     static var pressureActionHandlers: [PressureActionKind: @Sendable () -> Void] = [:]
 
+    /// Returns only mutations that actually executed (not notional notifications).
     @MainActor
-    private static func applyPressureActions(_ actions: [PressureActionKind]) {
+    @discardableResult
+    private static func applyPressureActions(_ actions: [PressureActionKind]) -> [PressureActionKind] {
+        var acknowledged: [PressureActionKind] = []
         for action in actions {
             switch action {
             case .pauseGraphifyEnsureAndWatchCallbacks:
                 GraphifyWorkspaceService.shared.setPressurePauseEnsureAndWatch(true)
+                activePressureEffects.insert(action)
+                acknowledged.append(action)
             case .resumeOptionalWorkUnit:
                 GraphifyWorkspaceService.shared.setPressurePauseEnsureAndWatch(false)
                 maintenancePruneDeferred = false
+                activePressureEffects.removeAll()
+                acknowledged.append(action)
             case .deferMaintenancePrune:
                 maintenancePruneDeferred = true
+                activePressureEffects.insert(action)
+                acknowledged.append(action)
             case .reclaimHiddenRecomputableUI,
                  .shortenCompletedIdleProviderSessions,
                  .releaseDistillIdleModelGPU:
-                // Production handlers registered by AppDelegate / Distill controller.
+                // Only count as applied when a real handler is registered.
                 if let handler = pressureActionHandlers[action] {
                     handler()
-                } else {
-                    NotificationCenter.default.post(
-                        name: .rcPressureOptionalWork,
-                        object: nil,
-                        userInfo: ["action": action.rawValue]
-                    )
+                    activePressureEffects.insert(action)
+                    acknowledged.append(action)
                 }
             case .neverKillActiveTurn, .neverDeferScheduledOccurrence:
                 break
             }
         }
+        return acknowledged
     }
 
     @MainActor
     static var isMaintenancePruneDeferred: Bool { maintenancePruneDeferred }
+
+    @MainActor
+    static var activePressureEffectsForTesting: Set<PressureActionKind> { activePressureEffects }
 
     static func currentProcessFootprintKB() -> Int {
         var info = task_vm_info_data_t()

@@ -1402,9 +1402,24 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             if pendingProviderStarts[request.threadId] === pendingProviderStart {
                 pendingProviderStarts.removeValue(forKey: request.threadId)
             }
+            // S5: any exit from startRun that never claimed spawn must terminalize
+            // the accepted generation so isPreparingProviderStart cannot stick.
+            if let prep = preparationStates[request.threadId],
+               prep.phase == .preparing || prep.phase == .providerStarting {
+                _ = applyPreparationLocked(
+                    threadId: request.threadId,
+                    event: .preparationFailed(
+                        generation: prep.generation,
+                        reason: .failed
+                    )
+                )
+            }
             discardRunThreadOwnershipIfReleasedLocked(runId)
             lock.unlock()
             pendingProviderStart.complete()
+            CapacityGaugeRecorder.shared.noteTerminalized(
+                threadKey: request.threadId.value.uuidString
+            )
         }
         guard !hasProviderSession(threadId: request.threadId) else {
             throw AgentProviderAdapterError.unsupported("Provider session already has an in-flight turn")

@@ -2167,8 +2167,25 @@ public struct SettingsView: View {
                 .buttonStyle(DSSecondaryButtonStyle())
                 .accessibilityIdentifier("settings.keybindingsConfig.reveal")
             }
-            // S12: capacity UX status + explicit diagnostics export.
-            let capacity = CapacityUXStatusStore.shared.current()
+            // S12: capacity UX status + explicit diagnostics export (live via notification).
+            CapacityStatusSettingsRow(exportAction: exportCapacityDiagnostics)
+        }
+        .dsPanel(padding: DS.Space.lg)
+    }
+
+    private func exportCapacityDiagnostics() {
+        CapacityStatusSettingsRow.exportCapacityDiagnostics()
+    }
+}
+
+/// S12: observes CapacityUXStatusStore publications so open Settings repaints.
+private struct CapacityStatusSettingsRow: View {
+    let exportAction: () -> Void
+    @State private var capacity = CapacityUXStatusStore.shared.current()
+    @State private var generation = CapacityUXStatusStore.shared.generation()
+
+    var body: some View {
+        Group {
             Text("Capacity")
                 .font(DS.Font.caption2.weight(.semibold)).foregroundColor(DS.Palette.textTertiary)
             Text(capacity.accessibleSummary)
@@ -2177,19 +2194,26 @@ public struct SettingsView: View {
                 .accessibilityIdentifier("settings.capacity.status")
                 .textSelection(.enabled)
             HStack(spacing: DS.Space.md) {
-                Button("Export capacity diagnostics") {
-                    exportCapacityDiagnostics()
-                }
-                .buttonStyle(DSSecondaryButtonStyle())
-                .disabled(!capacity.canExportDiagnostics)
-                .accessibilityIdentifier("settings.capacity.export")
+                Button("Export capacity diagnostics", action: exportAction)
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .disabled(!capacity.canExportDiagnostics)
+                    .accessibilityIdentifier("settings.capacity.export")
                 Spacer(minLength: 0)
             }
         }
-        .dsPanel(padding: DS.Space.lg)
+        .onReceive(NotificationCenter.default.publisher(for: CapacityUXStatusStore.didChangeNotification)) { note in
+            let gen = (note.userInfo?["generation"] as? UInt64) ?? CapacityUXStatusStore.shared.generation()
+            generation = gen
+            capacity = CapacityUXStatusStore.shared.current()
+        }
+        .onAppear {
+            capacity = CapacityUXStatusStore.shared.current()
+            generation = CapacityUXStatusStore.shared.generation()
+        }
+        .accessibilityValue("gen-\(generation)")
     }
 
-    private func exportCapacityDiagnostics() {
+    static func exportCapacityDiagnostics() {
         let status = CapacityUXStatusStore.shared.current()
         let gauges = CapacityGaugeRecorder.shared.current()
         var fields: [DiagnosticsExportField] = [
@@ -2225,10 +2249,13 @@ public struct SettingsView: View {
                 value: String(sidecar)
             ))
         }
+        let unavailable: [DiagnosticsExportSection] = status.unavailableSections.compactMap {
+            DiagnosticsExportSection(rawValue: $0)
+        }
         do {
             let data = try DiagnosticsExportAllowlist.buildExportDocument(
                 fields: fields,
-                unavailableSections: [],
+                unavailableSections: unavailable,
                 sessionSalt: Data(UUID().uuidString.utf8)
             )
             let dir = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
@@ -2239,14 +2266,15 @@ public struct SettingsView: View {
             try DiagnosticsExportAllowlist.writeExportFile(data: data, to: url)
             NSWorkspace.shared.activateFileViewerSelecting([url])
         } catch {
-            // Loud failure via alert is enough for Settings export.
             let alert = NSAlert()
             alert.messageText = "Capacity export failed"
             alert.informativeText = error.localizedDescription
             alert.runModal()
         }
     }
+}
 
+extension SettingsView {
     private var appUpdatesRow: some View {
         VStack(alignment: .leading, spacing: DS.Space.xs) {
             HStack(spacing: DS.Space.md) {

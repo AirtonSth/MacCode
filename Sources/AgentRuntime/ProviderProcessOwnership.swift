@@ -192,10 +192,17 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
         try data.write(to: temp, options: .atomic)
         try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temp.path)
         // Explicit file fsync before rename so a crash cannot leave a partial target.
+        // Open/fsync failures are hard errors (S4) — never claim success without them.
         let tempFD = open(temp.path, O_RDONLY)
-        if tempFD >= 0 {
-            _ = fsync(tempFD)
-            close(tempFD)
+        guard tempFD >= 0 else {
+            try? fm.removeItem(at: temp)
+            throw ProviderProcessOwnershipError.processListFailed("ownership temp open for fsync failed")
+        }
+        let tempSync = fsync(tempFD)
+        close(tempFD)
+        guard tempSync == 0 else {
+            try? fm.removeItem(at: temp)
+            throw ProviderProcessOwnershipError.processListFailed("ownership temp fsync failed")
         }
         // Atomic replace when destination exists; first write uses rename.
         if fm.fileExists(atPath: fileURL.path) {
@@ -205,9 +212,13 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
         }
         try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
         let dirFD = open(parent.path, O_RDONLY)
-        if dirFD >= 0 {
-            _ = fsync(dirFD)
-            close(dirFD)
+        guard dirFD >= 0 else {
+            throw ProviderProcessOwnershipError.processListFailed("ownership directory open for fsync failed")
+        }
+        let dirSync = fsync(dirFD)
+        close(dirFD)
+        guard dirSync == 0 else {
+            throw ProviderProcessOwnershipError.processListFailed("ownership directory fsync failed")
         }
         // Recover abandoned temps from any prior PID once mtime is old enough that
         // a concurrent writer is unlikely (stale-owner cleanup after relaunch).

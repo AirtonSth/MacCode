@@ -1177,10 +1177,16 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
 
     private func run(_ args: [String], cwd: String, env: [String: String]?) -> (exit: Int32, stdout: String, stderr: String) {
         if let runProcess { return runProcess(args, cwd, env) }
+        // Only the graphify CLI child is generation-owned for cancel. Helper
+        // probes (`which`, `git rev-parse`) must not overwrite that slot.
+        let isGraphifyCLI = args.contains { arg in
+            let base = URL(fileURLWithPath: arg).lastPathComponent
+            return base == "graphify" || base.hasPrefix("graphify")
+        }
         lock.lock()
         // Generation-owned cancel: any bump after launch also aborts mid-run via
         // ensureSync checks; pre-spawn still honors sticky cancel flag.
-        if activeRebuildCancelled {
+        if isGraphifyCLI, activeRebuildCancelled {
             lock.unlock()
             return (-15, "", "graphify rebuild cancelled before spawn")
         }
@@ -1200,7 +1206,7 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         // S9: durable ownership tag before acceptance (tagProcess also records).
         // Fail-open when ownership store is unconfigured (tests / early boot).
         var ownershipTag: SpawnedProcessTag?
-        if ProviderProcessOwnership.shared.store() != nil {
+        if isGraphifyCLI, ProviderProcessOwnership.shared.store() != nil {
             do {
                 ownershipTag = try ProcessSpawnTagger.tagProcess(p, managedKind: .graphify)
             } catch {
@@ -1208,12 +1214,15 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
                 return (-1, "", "graphify ownership tag failed: \(error)")
             }
         }
-        lock.lock()
-        activeRebuildProcess = p
-        let alreadyCancelled = activeRebuildCancelled
-        lock.unlock()
-        if alreadyCancelled {
-            p.terminate()
+        let trackedPID = p.processIdentifier
+        if isGraphifyCLI {
+            lock.lock()
+            activeRebuildProcess = p
+            let alreadyCancelled = activeRebuildCancelled
+            lock.unlock()
+            if alreadyCancelled {
+                p.terminate()
+            }
         }
         // Concurrent capped drain while the process runs so a verbose child cannot
         // fill pipes and hang until the full process timeout (S9).
@@ -1306,7 +1315,14 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             if Date() >= hardJoinDeadline { break }
             if outBox.isFinished && errBox.isFinished { break }
         }
-        lock.lock(); activeRebuildProcess = nil; lock.unlock()
+        if isGraphifyCLI {
+            // Clear by exact PID so a concurrent helper cannot clobber a newer CLI child.
+            lock.lock()
+            if activeRebuildProcess?.processIdentifier == trackedPID {
+                activeRebuildProcess = nil
+            }
+            lock.unlock()
+        }
         // S9: exact removal after reap so relaunch does not treat a dead child as live.
         if let ownershipTag {
             try? ProviderProcessOwnership.shared.store()?.removeExact(ownershipTag)

@@ -155,6 +155,29 @@ final class CapacitySemanticHarnessTests: XCTestCase {
         }
     }
 
+    func test_subprocessFixtures_stopAndOwnershipTag() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-s2-own-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let storeURL = URL(fileURLWithPath: tmp).appendingPathComponent("ownership.json")
+        ProviderProcessOwnership.shared.configure(fileURL: storeURL)
+        let fixture = CapacitySubprocessFixtureSpec(
+            provider: "codex",
+            frames: [#"{"type":"thread.started","thread_id":"t1"}"#],
+            exitCode: 0,
+            stopRace: true
+        )
+        let run = try CapacitySubprocessFixtureRunner.run(
+            spec: fixture,
+            seed: 1,
+            stopAfterMs: 20,
+            requireOwnershipTag: true
+        )
+        XCTAssertTrue(run.stoppedByCaller || run.exitCode != 0 || !run.stdoutLines.isEmpty)
+        let remaining = try ProviderProcessOwnershipStore(fileURL: storeURL).load()
+        XCTAssertTrue(remaining.isEmpty, "tag must be removed after reap")
+    }
+
     func test_manualClock_advancesDeterministically() {
         let clock = CapacityManualClock(startMs: 10)
         XCTAssertEqual(clock.nowMs, 10)

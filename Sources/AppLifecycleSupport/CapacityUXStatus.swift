@@ -121,6 +121,7 @@ public struct CapacityUXStatus: Sendable, Equatable {
 /// Production code publishes here so status is not test-only.
 public final class CapacityUXStatusStore: @unchecked Sendable {
     public static let shared = CapacityUXStatusStore()
+    public static let didChangeNotification = Notification.Name("io.remotecode.capacityUX.didChange")
 
     private let lock = NSLock()
     private var _status: CapacityUXStatus = CapacityUXStatus.from(
@@ -132,15 +133,31 @@ public final class CapacityUXStatusStore: @unchecked Sendable {
         accountingAvailable: true,
         degradationActions: []
     )
+    private var _generation: UInt64 = 0
 
     public func current() -> CapacityUXStatus {
         lock.lock(); defer { lock.unlock() }
         return _status
     }
 
-    public func publish(_ status: CapacityUXStatus) {
+    public func generation() -> UInt64 {
         lock.lock(); defer { lock.unlock() }
+        return _generation
+    }
+
+    public func publish(_ status: CapacityUXStatus) {
+        lock.lock()
         _status = status
+        _generation &+= 1
+        let gen = _generation
+        lock.unlock()
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(
+                name: CapacityUXStatusStore.didChangeNotification,
+                object: nil,
+                userInfo: ["generation": gen]
+            )
+        }
     }
 
     public func publishFromPressure(

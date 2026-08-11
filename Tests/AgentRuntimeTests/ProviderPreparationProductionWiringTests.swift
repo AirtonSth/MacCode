@@ -139,6 +139,35 @@ final class ProviderPreparationProductionWiringTests: XCTestCase {
         XCTAssertFalse(coordinator.isPreparingProviderStart(threadId: threadId))
     }
 
+    func test_missingRunner_terminalizesPreparation() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-miss")
+        let thread = AgentThread(title: "prep-miss", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [:] // no runner
+        )
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                threadId: thread.id,
+                provider: .codex,
+                model: "fake-model",
+                cwd: tmp,
+                prompt: "no runner"
+            ))
+            XCTFail("expected missing runner failure")
+        } catch {
+            // expected
+        }
+        XCTAssertFalse(
+            coordinator.isPreparingProviderStart(threadId: thread.id),
+            "pre-spawn failure must terminalize preparation"
+        )
+    }
+
     func test_twoSequentialTurns_acceptNotPoisoned() async throws {
         let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-seq")
         let thread = AgentThread(title: "prep-seq", provider: .codex, model: "fake-model")

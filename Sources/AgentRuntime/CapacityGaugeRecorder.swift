@@ -72,6 +72,7 @@ public final class CapacityGaugeRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var snapshot = CapacityGaugeSnapshot()
     private var acceptStartedAt: [String: Date] = [:]
+    private var prepareStartedAt: [String: Date] = [:]
 
     public func current() -> CapacityGaugeSnapshot {
         lock.lock(); defer { lock.unlock() }
@@ -79,11 +80,15 @@ public final class CapacityGaugeRecorder: @unchecked Sendable {
     }
 
     public func noteAcceptStarted(threadKey: String, at date: Date = Date()) {
-        lock.lock(); acceptStartedAt[threadKey] = date; lock.unlock()
+        lock.lock()
+        acceptStartedAt[threadKey] = date
+        prepareStartedAt.removeValue(forKey: threadKey)
+        lock.unlock()
     }
 
     public func notePrepareStarted(threadKey: String, at date: Date = Date()) {
         lock.lock()
+        prepareStartedAt[threadKey] = date
         if let start = acceptStartedAt[threadKey] {
             snapshot.acceptToPrepareMs = date.timeIntervalSince(start) * 1000
         }
@@ -92,15 +97,24 @@ public final class CapacityGaugeRecorder: @unchecked Sendable {
 
     public func noteSpawned(threadKey: String, at date: Date = Date()) {
         lock.lock()
-        if let start = acceptStartedAt.removeValue(forKey: threadKey) {
-            if snapshot.acceptToPrepareMs == nil {
-                snapshot.acceptToPrepareMs = date.timeIntervalSince(start) * 1000
+        let acceptAt = acceptStartedAt.removeValue(forKey: threadKey)
+        let prepareAt = prepareStartedAt.removeValue(forKey: threadKey) ?? acceptAt
+        if let acceptAt {
+            let acceptToPrepare = (prepareAt ?? date).timeIntervalSince(acceptAt) * 1000
+            snapshot.acceptToPrepareMs = acceptToPrepare
+            if let prepareAt {
+                snapshot.prepareToSpawnMs = max(0, date.timeIntervalSince(prepareAt) * 1000)
+            } else {
+                snapshot.prepareToSpawnMs = max(0, date.timeIntervalSince(acceptAt) * 1000 - acceptToPrepare)
             }
-            snapshot.prepareToSpawnMs = max(
-                0,
-                date.timeIntervalSince(start) * 1000 - (snapshot.acceptToPrepareMs ?? 0)
-            )
         }
+        lock.unlock()
+    }
+
+    public func noteTerminalized(threadKey: String) {
+        lock.lock()
+        acceptStartedAt.removeValue(forKey: threadKey)
+        prepareStartedAt.removeValue(forKey: threadKey)
         lock.unlock()
     }
 
