@@ -4015,6 +4015,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// affordance therefore needs a run identity, not status alone; otherwise a
     /// never-started thread is rendered as busy and its first prompt is queued.
     public func isThreadStartingOrRunning(_ threadId: AgentThreadID) -> Bool {
+        // S5: surface preparation (Graphify/preflight) is a stoppable busy state.
+        if preparingRunThreadId == threadId { return true }
+        if coordinator.isPreparingProviderStart(threadId: threadId) { return true }
         if trackedRunId(for: threadId) != nil { return true }
         // LaunchAgent-owned scheduled runs have no local coordinator session.
         return isScheduledThreadRunning?(threadId) == true
@@ -5538,6 +5541,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let sendThreadId = selectedThreadId
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
+        // S5: refuse concurrent prep/run on the same thread so generations cannot
+        // replace each other; user uses Stop/Escape to cancel preparation.
+        if let sendThreadId, isThreadStartingOrRunning(sendThreadId) {
+            statusMessage = "A run is already preparing or active. Stop it first, or wait."
+            return
+        }
         // Auto is still resolving providers/models — refuse send (button is also
         // disabled) so a half-ready routing snapshot cannot start a provider.
         if Self.isComposerSendBlockedByAutoRoutingLoad(
@@ -15241,7 +15250,9 @@ public struct AgentAppView: View {
     private var sendIdleDisabled: Bool {
         let empty =
             vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && vm.attachments.isEmpty
-        return empty || autoRoutingPillLoading
+        // S5: block concurrent same-thread prep; Stop/Escape handle cancellation.
+        return empty || autoRoutingPillLoading || vm.selectedThreadIsPreparingRun
+            || vm.selectedThreadRunIsStartingOrRunning
     }
 
     private func selectThreadRow(_ thread: AgentThread) {
