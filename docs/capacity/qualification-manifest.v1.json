@@ -1,0 +1,53 @@
+{
+  "schemaVersion" : "1.0.0",
+  "id" : "hardcore-swarm-v1",
+  "notes" : "Frozen hardcore multi-agent workload for plan-optimize-swift T-003. Publish only tiers with physicallyExecuted=true.",
+  "workload" : {
+    "roots" : 32,
+    "nestedNodes" : 64,
+    "depths" : [1, 2, 4],
+    "fanOut" : [1, 2, 4],
+    "providerMix" : ["claude", "codex", "grok", "fake"],
+    "explicitStarts" : 32,
+    "scheduledStarts" : 8,
+    "activeNodes" : 48,
+    "waitingNodes" : 16,
+    "eventRatePerSecond" : 200,
+    "byteRatePerSecond" : 2000000,
+    "terminalCount" : 8,
+    "clientCount" : 4,
+    "faultKinds" : ["malformed_frame", "reorder", "pipe_pressure", "stop_race", "resume"],
+    "tokenSaverMode" : "on_and_off",
+    "graphifyMode" : "on_and_off"
+  },
+  "estimator" : {
+    "minWarmedSamples" : 3,
+    "warmUpSeconds" : 30,
+    "measurementWindowSeconds" : 120,
+    "plateauMaxRelativeSlope" : 0.05,
+    "p95Definition" : "empirical_0.95_order_statistic",
+    "p99Definition" : "empirical_0.99_order_statistic"
+  },
+  "abortLimits" : {
+    "maxTokenUnits" : null,
+    "maxSpendMicros" : null,
+    "maxWallSeconds" : 1800,
+    "maxMainActorStallMs" : 2000
+  },
+  "requiredMetrics" : [
+    "accept_to_prepare_ms_p95",
+    "prepare_to_spawn_ms_p95",
+    "event_to_visible_paint_ms_p95",
+    "stop_dispatch_ms_p95",
+    "dag_longest_no_progress_ms",
+    "app_rss_kb",
+    "provider_tree_rss_kb",
+    "sidecar_rss_kb",
+    "ownership_coverage_fraction",
+    "batcher_pending_bytes",
+    "batcher_pending_count",
+    "lock_wait_ms_p95",
+    "main_actor_stall_ms_max"
+  ],
+  "hardwareTier" : []
+}
