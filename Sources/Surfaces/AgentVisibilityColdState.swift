@@ -1,0 +1,133 @@
+import Foundation
+
+/// Agent visibility cold-state protocol (S6 / T-003).
+///
+/// Local hide/reveal reclamation precedes any host-wide LRU. Global LRU is not
+/// implemented until a measured residual breach is recorded.
+
+public enum AgentVisibilityState: String, Sendable, Equatable {
+    case visible
+    case hidden
+    case restoring
+}
+
+public struct AgentPresentationCheckpoint: Sendable, Equatable, Codable {
+    public var durableSequence: Int64
+    public var lastAppliedDurableSequence: Int64
+    public var selectedThreadId: String?
+    public var selectedTabId: String?
+    public var composerText: String
+    public var attachmentIds: [String]
+    public var scrollPinIntent: String?
+    public var disclosureIntent: String?
+    public var planSidebarIntent: String?
+    public var browserURL: String?
+    public var browserTitle: String?
+    public var surfaceMetadataJSON: String?
+    public var unreadOwned: Bool
+    public var stopOwned: Bool
+
+    public init(
+        durableSequence: Int64 = 0,
+        lastAppliedDurableSequence: Int64 = 0,
+        selectedThreadId: String? = nil,
+        selectedTabId: String? = nil,
+        composerText: String = "",
+        attachmentIds: [String] = [],
+        scrollPinIntent: String? = nil,
+        disclosureIntent: String? = nil,
+        planSidebarIntent: String? = nil,
+        browserURL: String? = nil,
+        browserTitle: String? = nil,
+        surfaceMetadataJSON: String? = nil,
+        unreadOwned: Bool = false,
+        stopOwned: Bool = false
+    ) {
+        self.durableSequence = durableSequence
+        self.lastAppliedDurableSequence = lastAppliedDurableSequence
+        self.selectedThreadId = selectedThreadId
+        self.selectedTabId = selectedTabId
+        self.composerText = composerText
+        self.attachmentIds = attachmentIds
+        self.scrollPinIntent = scrollPinIntent
+        self.disclosureIntent = disclosureIntent
+        self.planSidebarIntent = planSidebarIntent
+        self.browserURL = browserURL
+        self.browserTitle = browserTitle
+        self.surfaceMetadataJSON = surfaceMetadataJSON
+        self.unreadOwned = unreadOwned
+        self.stopOwned = stopOwned
+    }
+}
+
+public struct AgentVisibilitySession: Sendable, Equatable {
+    public var state: AgentVisibilityState
+    public var generation: UInt64
+    public var checkpoint: AgentPresentationCheckpoint
+    public var retainsCompactDirtyOnly: Bool
+
+    public init(
+        state: AgentVisibilityState = .visible,
+        generation: UInt64 = 0,
+        checkpoint: AgentPresentationCheckpoint = AgentPresentationCheckpoint(),
+        retainsCompactDirtyOnly: Bool = false
+    ) {
+        self.state = state
+        self.generation = generation
+        self.checkpoint = checkpoint
+        self.retainsCompactDirtyOnly = retainsCompactDirtyOnly
+    }
+}
+
+public enum AgentVisibilityColdState {
+    /// Memory save threshold to promote reclamation (plan S6).
+    public static let minSaveBytes = 128 * 1024 * 1024
+    public static let minSaveFractionOfAppFootprint = 0.10
+    public static let revealP95BudgetMs: Double = 500
+    public static let revealP99BudgetMs: Double = 1_000
+    public static let mainActorStallBudgetMs: Double = 2_000
+
+    public static func shouldPromoteReclamation(
+        savedBytes: Int64,
+        appFootprintBytes: Int64
+    ) -> Bool {
+        let fractionFloor = Int64(Double(appFootprintBytes) * minSaveFractionOfAppFootprint)
+        let threshold = max(Int64(minSaveBytes), fractionFloor)
+        return savedBytes >= threshold
+    }
+
+    public static func didBecomeHidden(
+        session: AgentVisibilitySession,
+        checkpoint: AgentPresentationCheckpoint
+    ) -> AgentVisibilitySession {
+        var next = session
+        next.state = .hidden
+        next.generation &+= 1
+        next.checkpoint = checkpoint
+        next.retainsCompactDirtyOnly = true
+        return next
+    }
+
+    public static func beginReveal(session: AgentVisibilitySession) -> AgentVisibilitySession {
+        var next = session
+        next.state = .restoring
+        next.generation &+= 1
+        return next
+    }
+
+    public static func completeReveal(
+        session: AgentVisibilitySession,
+        expectedGeneration: UInt64,
+        appliedThroughSequence: Int64
+    ) -> AgentVisibilitySession? {
+        guard session.generation == expectedGeneration else { return nil }
+        var next = session
+        next.state = .visible
+        next.retainsCompactDirtyOnly = false
+        next.checkpoint.lastAppliedDurableSequence = appliedThroughSequence
+        return next
+    }
+
+    /// Explicit product decision: no host-wide Agent LRU until residual breach.
+    public static let globalAgentLRUEnabled = false
+}
