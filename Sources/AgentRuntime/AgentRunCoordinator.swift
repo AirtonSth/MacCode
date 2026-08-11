@@ -1430,6 +1430,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lock.lock()
             if pendingProviderStarts[request.threadId] === pendingProviderStart {
                 pendingProviderStarts.removeValue(forKey: request.threadId)
+                // Registered-start cancellation is thread-scoped. If this start
+                // exits before claimPreparationSpawnOrCancel consumes the stop
+                // (e.g. providerAdmissionCheck throws after Stop), drop the
+                // marker so a fresh resend is not poisoned.
+                pendingThreadStops.remove(request.threadId)
             }
             // S5: any exit from startRun that never claimed spawn must terminalize
             // the accepted generation so isPreparingProviderStart cannot stick.

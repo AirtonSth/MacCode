@@ -441,6 +441,71 @@ final class ProviderPreparationProductionWiringTests: XCTestCase {
         )
     }
 
+    /// Registered start exits before claim after Stop must not leave a thread
+    /// stop that poisons a fresh resend (Codex IMPORTANT).
+    func test_registeredStartFailAfterStop_doesNotPoisonResend() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-admit-fail")
+        let thread = AgentThread(title: "prep-admit-fail", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let runner = CountingRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: runner]
+        )
+
+        let runA = AgentRunID()
+        let gate = NSLock()
+        var admitCalls = 0
+        coordinator.providerAdmissionCheck = { _, _ in
+            gate.lock()
+            admitCalls += 1
+            let n = admitCalls
+            gate.unlock()
+            if n == 1 {
+                // Pause after registration so Stop can arm pendingThreadStops,
+                // then fail before claimPreparationSpawnOrCancel.
+                coordinator.cancelPreparation(threadId: thread.id)
+                throw NSError(
+                    domain: "RemoteCode.Test",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "admission refused after Stop"]
+                )
+            }
+        }
+
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                runId: runA,
+                threadId: thread.id,
+                provider: .codex,
+                model: "fake-model",
+                cwd: tmp,
+                prompt: "A fails after Stop mid-admit"
+            ))
+            XCTFail("expected admission failure for A")
+        } catch {
+            // expected
+        }
+        XCTAssertEqual(runner.startCount, 0, "A must not spawn")
+
+        let runC = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "fresh C after A failed with stop armed"
+        ))
+        XCTAssertNotNil(runC)
+        XCTAssertEqual(
+            runner.startCount,
+            1,
+            "fresh resend must reach sendTurn after registered-start stop cleanup"
+        )
+    }
+
     /// Surface-only cancel before reserve must not leave pendingThreadStops that
     /// poison an immediate resend.
     func test_cancelWithoutReserve_doesNotPoisonResend() async throws {
