@@ -739,7 +739,6 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
                 try? FileManager.default.removeItem(at: previousBackup)
                 return .missing
             }
-            try? FileManager.default.removeItem(at: previousBackup)
             var s = schedules[checkout.scheduleID] ?? RefreshSchedule()
             let previousBuilt = s.builtGeneration
             let previousStatus = s.status
@@ -775,14 +774,23 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
                 lock.unlock()
                 // Best-effort: remove fingerprint so restart does not warm cancelled gen.
                 try? FileManager.default.removeItem(at: fingerprintPath(for: checkout))
+                // Restore previous graph.json or delete cancelled promote (backup kept until here).
+                if hadPreviousCanonical, FileManager.default.fileExists(atPath: previousBackup.path) {
+                    _ = try? FileManager.default.replaceItemAt(dest, withItemAt: previousBackup)
+                } else {
+                    try? FileManager.default.removeItem(at: dest)
+                }
+                try? FileManager.default.removeItem(at: previousBackup)
                 return .missing
             }
             // Confirm generation still matches our commit (no intervening ensure).
             if schedules[checkout.scheduleID]?.builtGeneration != committedBuilt {
                 lock.unlock()
+                try? FileManager.default.removeItem(at: previousBackup)
                 return .missing
             }
             lock.unlock()
+            try? FileManager.default.removeItem(at: previousBackup)
             return .fresh
         }
         return .missing

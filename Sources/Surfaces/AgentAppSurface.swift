@@ -4005,22 +4005,35 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     /// True only while the selected thread is still assembling its turn and no
     /// run is tracked yet. Deliberately yields to the running state so the two
-    /// status lines can never both render.
+    /// status lines can never both render. Does NOT use isThreadStartingOrRunning
+    /// because that includes preparation for Stop/Escape chrome.
     public var selectedThreadIsPreparingRun: Bool {
         guard let preparingRunThreadId, preparingRunThreadId == selectedThreadId else { return false }
-        return !selectedThreadRunIsStartingOrRunning
+        // Yield only when a tracked/scheduled run has taken over the status line.
+        if trackedRunId(for: preparingRunThreadId) != nil { return false }
+        if isScheduledThreadRunning?(preparingRunThreadId) == true { return false }
+        return true
+    }
+
+    /// Busy for Stop/Escape: tracked runs, scheduled runs, or in-flight preparation.
+    public var selectedThreadIsStoppableBusy: Bool {
+        selectedThreadId.map(isThreadStoppableBusy) ?? false
     }
 
     /// A fresh thread also uses `.pending` as its persisted idle state. A Stop
     /// affordance therefore needs a run identity, not status alone; otherwise a
     /// never-started thread is rendered as busy and its first prompt is queued.
     public func isThreadStartingOrRunning(_ threadId: AgentThreadID) -> Bool {
-        // S5: surface preparation (Graphify/preflight) is a stoppable busy state.
-        if preparingRunThreadId == threadId { return true }
-        if coordinator.isPreparingProviderStart(threadId: threadId) { return true }
         if trackedRunId(for: threadId) != nil { return true }
         // LaunchAgent-owned scheduled runs have no local coordinator session.
         return isScheduledThreadRunning?(threadId) == true
+    }
+
+    /// S5: Stop/Escape/Send concurrency — includes pre-run preparation.
+    public func isThreadStoppableBusy(_ threadId: AgentThreadID) -> Bool {
+        if preparingRunThreadId == threadId { return true }
+        if coordinator.isPreparingProviderStart(threadId: threadId) { return true }
+        return isThreadStartingOrRunning(threadId)
     }
 
     private func trackedRunId(for threadId: AgentThreadID) -> AgentRunID? {
@@ -5543,7 +5556,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
         // S5: refuse concurrent prep/run on the same thread so generations cannot
         // replace each other; user uses Stop/Escape to cancel preparation.
-        if let sendThreadId, isThreadStartingOrRunning(sendThreadId) {
+        if let sendThreadId, isThreadStoppableBusy(sendThreadId) {
             statusMessage = "A run is already preparing or active. Stop it first, or wait."
             return
         }
@@ -11001,7 +11014,7 @@ public struct AgentAppView: View {
         }
         .background(DS.Palette.bg)
         // C6: Esc interrupts an in-flight run (remotecode.io parity).
-        .onExitCommand { if vm.selectedThreadRunIsStartingOrRunning { vm.stop() } }
+        .onExitCommand { if vm.selectedThreadIsStoppableBusy { vm.stop() } }
         // IMP-MAC_AGENT-006: power-user shortcut to cycle reasoning effort
         // without opening the model popover; the composer model pill reflects
         // the new effort immediately. Hidden control carries the shortcut.
@@ -14044,11 +14057,11 @@ public struct AgentAppView: View {
                 executionMenu
             }
             Spacer(minLength: DS.Space.xs)
-            if vm.selectedThreadRunIsStartingOrRunning {
+            if vm.selectedThreadIsStoppableBusy {
                 Image(systemName: "arrow.triangle.2.circlepath")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(DS.Palette.textTertiary)
-                    .accessibilityLabel("Running")
+                    .accessibilityLabel(vm.selectedThreadIsPreparingRun ? "Preparing" : "Running")
                 stopButton
                 // UX-MAC_AGENT-007: separate the red Stop circle from the accent
                 // Queue circle so the two adjacent buttons don't read as one
@@ -15251,8 +15264,7 @@ public struct AgentAppView: View {
         let empty =
             vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && vm.attachments.isEmpty
         // S5: block concurrent same-thread prep; Stop/Escape handle cancellation.
-        return empty || autoRoutingPillLoading || vm.selectedThreadIsPreparingRun
-            || vm.selectedThreadRunIsStartingOrRunning
+        return empty || autoRoutingPillLoading || vm.selectedThreadIsStoppableBusy
     }
 
     private func selectThreadRow(_ thread: AgentThread) {
