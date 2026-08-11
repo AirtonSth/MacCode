@@ -251,7 +251,7 @@ public struct CapacityQualificationManifest: Sendable, Codable, Equatable {
         guard schemaVersion == Self.currentSchemaVersion else {
             throw CapacityContractError.unsupportedSchemaVersion(schemaVersion)
         }
-        guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard !id.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty else {
             throw CapacityContractError.missingRequiredField("id")
         }
         if workload.roots < 1 {
@@ -297,10 +297,36 @@ public struct CapacityQualificationManifest: Sendable, Codable, Equatable {
             let missing = required.subtracting(declared).sorted().joined(separator: ",")
             throw CapacityContractError.missingRequiredField("requiredMetrics:\(missing)")
         }
-        for tier in hardwareTier where tier.physicallyExecuted && tier.physicalMemoryBytes == 0 {
-            throw CapacityContractError.invalidWorkload(
-                "physicallyExecuted tier \(tier.tierName) must declare physicalMemoryBytes"
-            )
+        for tier in hardwareTier where tier.physicallyExecuted {
+            if tier.physicalMemoryBytes == 0 {
+                throw CapacityContractError.invalidWorkload(
+                    "physicallyExecuted tier \(tier.tierName) must declare physicalMemoryBytes"
+                )
+            }
+            // Freshness: physical claims must carry a parseable future-or-present expiry.
+            let expiry = tier.artifactExpiryISO8601.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+            if expiry.isEmpty {
+                throw CapacityContractError.invalidWorkload(
+                    "physicallyExecuted tier \(tier.tierName) must declare artifactExpiryISO8601"
+                )
+            }
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            var expiryDate = formatter.date(from: expiry)
+            if expiryDate == nil {
+                formatter.formatOptions = [.withInternetDateTime]
+                expiryDate = formatter.date(from: expiry)
+            }
+            guard let expiryDate else {
+                throw CapacityContractError.invalidWorkload(
+                    "physicallyExecuted tier \(tier.tierName) has unparseable artifactExpiryISO8601"
+                )
+            }
+            if expiryDate < Date() {
+                throw CapacityContractError.invalidWorkload(
+                    "physicallyExecuted tier \(tier.tierName) artifact is expired"
+                )
+            }
         }
     }
 
@@ -413,7 +439,7 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
                 throw CapacityContractError.invalidWorkload("duplicate metric \(sample.name)")
             }
             seen.insert(sample.name)
-            if sample.unit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if sample.unit.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty {
                 throw CapacityContractError.invalidWorkload("metric \(sample.name) missing unit")
             }
         }

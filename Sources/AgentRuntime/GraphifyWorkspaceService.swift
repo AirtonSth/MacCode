@@ -519,65 +519,70 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         let scanRoot = checkout.displayRoot
         if mode == .verify { return verify(checkout) }
 
-        // Output location:
-        // - default writeInRepo=false → GRAPHIFY_OUT=<ArtifactRoot> (absolute). Graphify writes
-        //   graph.json/cache/report there and does NOT create repo/graphify-out/.
-        // - writeInRepo=true → default relative graphify-out under the checkout (team-commit layout).
+        // Build into a generation-owned staging directory; promote graph.json only
+        // after the final ownership check so a cancelled build cannot replace the
+        // canonical artifact consumed by agents.
+        let stagingName = "staging-\(launchRebuildGeneration ?? rebuildGeneration)"
+        let staging = artifact.appendingPathComponent(stagingName, isDirectory: true)
+        try? FileManager.default.removeItem(at: staging)
+        try? FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+
         var env = processEnvironment()
         let repoOut = URL(fileURLWithPath: scanRoot).appendingPathComponent("graphify-out")
         if writeInRepo {
             env.removeValue(forKey: "GRAPHIFY_OUT")
         } else {
-            env["GRAPHIFY_OUT"] = artifact.path
+            env["GRAPHIFY_OUT"] = staging.path
         }
 
         let result = run([binary, "update", scanRoot], cwd: scanRoot, env: env)
-        // Cancel / generation ownership is authoritative after the process returns.
-        lock.lock()
-        let generationStale = launchRebuildGeneration.map { $0 != rebuildGeneration } ?? false
-        let cancelledAfterRun = generationStale
-            || activeRebuildCancelled
-            || (schedules[checkout.scheduleID]?.rebuildCancelled == true)
-        lock.unlock()
-        if cancelledAfterRun {
+
+        func discardStaging() {
+            try? FileManager.default.removeItem(at: staging)
+            if writeInRepo {
+                // Do not delete user repoOut wholesale; only skip promote.
+            }
+        }
+        func isCancelledNow() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            let generationStale = launchRebuildGeneration.map { $0 != rebuildGeneration } ?? false
+            return generationStale
+                || activeRebuildCancelled
+                || (schedules[checkout.scheduleID]?.rebuildCancelled == true)
+        }
+
+        if isCancelledNow() {
+            discardStaging()
             lock.lock()
             var s = schedules[checkout.scheduleID] ?? RefreshSchedule()
             s.displayRoot = checkout.displayRoot
             s.status = .missing
             s.rebuildCancelled = false
-            // Do not advance builtGeneration / fingerprint on cancelled work.
             schedules[checkout.scheduleID] = s
             lock.unlock()
             return .missing
         }
         let dest = graphJSONPath(for: checkout)
 
-        if writeInRepo {
-            // CLI wrote to checkout/graphify-out/; mirror into ArtifactRoot for stable agent paths.
-            let produced = repoOut.appendingPathComponent("graph.json")
-            if FileManager.default.fileExists(atPath: produced.path) {
-                if !atomicallyPublish(from: produced, to: dest, stagingDir: artifact) {
-                    if FileManager.default.fileExists(atPath: dest.path) { return .stale }
-                    return .error
-                }
+        // Locate produced graph under staging (or repoOut when writeInRepo).
+        let producedCandidates: [URL] = {
+            if writeInRepo {
+                return [
+                    repoOut.appendingPathComponent("graph.json"),
+                    staging.appendingPathComponent("graph.json"),
+                    staging.appendingPathComponent("graphify-out/graph.json"),
+                ]
             }
-        } else {
-            // GRAPHIFY_OUT absolute: graph.json already lives at ArtifactRoot/graph.json.
-            // Never leave a stray graphify-out in the user tree from this host path.
-            // (Do not delete user-created graphify-out; only avoid creating one.)
-            if !FileManager.default.fileExists(atPath: dest.path) {
-                // Some CLI versions may still nest under GRAPHIFY_OUT/graphify-out/
-                let nested = artifact.appendingPathComponent("graphify-out/graph.json")
-                if FileManager.default.fileExists(atPath: nested.path) {
-                    _ = atomicallyPublish(from: nested, to: dest, stagingDir: artifact)
-                }
-            }
-        }
+            return [
+                staging.appendingPathComponent("graph.json"),
+                staging.appendingPathComponent("graphify-out/graph.json"),
+            ]
+        }()
+        let produced = producedCandidates.first { FileManager.default.fileExists(atPath: $0.path) }
 
-        // Only advance fingerprint/generations on a successful CLI update that
-        // left a usable graph. Non-zero exit with a previous graph stays .stale
-        // so the agent gets RC_GRAPHIFY_STALE (never silently "fresh" on failure).
         if result.exit != 0 {
+            discardStaging()
             if FileManager.default.fileExists(atPath: dest.path) {
                 lock.lock()
                 var s = schedules[checkout.scheduleID] ?? RefreshSchedule()
@@ -589,6 +594,41 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             }
             return .error
         }
+
+        guard let produced else {
+            discardStaging()
+            if FileManager.default.fileExists(atPath: dest.path) { return .stale }
+            return .missing
+        }
+
+        // Enforce artifact size bound before promotion; keep previous valid graph.
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: produced.path),
+           let size = attrs[.size] as? NSNumber,
+           size.intValue > GraphifyRuntimeHardening.maxArtifactBytes {
+            discardStaging()
+            if FileManager.default.fileExists(atPath: dest.path) { return .stale }
+            return .error
+        }
+
+        // Final ownership check immediately before atomic promote.
+        if isCancelledNow() {
+            discardStaging()
+            lock.lock()
+            var s = schedules[checkout.scheduleID] ?? RefreshSchedule()
+            s.displayRoot = checkout.displayRoot
+            s.status = .missing
+            s.rebuildCancelled = false
+            schedules[checkout.scheduleID] = s
+            lock.unlock()
+            return .missing
+        }
+
+        if !atomicallyPublish(from: produced, to: dest, stagingDir: artifact) {
+            discardStaging()
+            if FileManager.default.fileExists(atPath: dest.path) { return .stale }
+            return .error
+        }
+        discardStaging()
 
         if FileManager.default.fileExists(atPath: dest.path) {
             // Probe HEAD outside the scheduler lock (run() also takes the lock).

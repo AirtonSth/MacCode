@@ -3388,8 +3388,9 @@ public final class AgentRunRepository: @unchecked Sendable {
     /// Rehydrate a store-before-loss presentation form back to the original UTF-8 payload.
     /// Recognizes `[[rc:handle]]` markers and legacy `rc_oversized` JSON envelopes.
     public func rehydrateOversizedPayloadIfNeeded(_ payloadJSON: String) throws -> String {
-        // Require owned trailer as a true suffix: "...[truncated rc_oversized_v1 N→M bytes][[rc:handle]]"
-        let pattern = #"…\[truncated rc_oversized_v1 (\d+)→(\d+) bytes\]\[\[rc:([0-9a-fA-F]+)\]\]$"#
+        // Require owned trailer as a true suffix (\\z, not $) so a trailing newline
+        // cannot promote a mid-payload lookalike into recovery.
+        let pattern = #"…\[truncated rc_oversized_v1 (\d+)→(\d+) bytes\]\[\[rc:([0-9a-fA-F]+)\]\]\z"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return payloadJSON }
         let ns = payloadJSON as NSString
         let full = NSRange(location: 0, length: ns.length)
