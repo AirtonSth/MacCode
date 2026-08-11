@@ -18,6 +18,12 @@ final class GraphifyWorkspaceServiceTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        service?.runProcess = nil
+        service?.headProbe = nil
+        service?.checkoutIdentityProbe = nil
+        service?.setPressurePauseEnsureAndWatch(false)
+        service?.enabled = false
+        service?.autoEnsure = false
         try? FileManager.default.removeItem(at: tempRoot)
         tempRoot = nil
         service = nil
@@ -197,6 +203,106 @@ final class GraphifyWorkspaceServiceTests: XCTestCase {
         service.writeInRepo = false
         let status = service.ensureSync(checkout: checkout, mode: .update)
         XCTAssertEqual(status, .stale, "failed CLI must not advance fingerprint as fresh")
+    }
+
+    /// Codex IMPORTANT: pressure unpause must not block the caller with git Process I/O,
+    /// and must revalidate enabled before ensure (Token Saver-off fail-open).
+    func test_pressureUnpause_asyncReKick_abortsWhenDisabledMidProbe() {
+        service.enabled = true
+        service.autoEnsure = true
+        service.headProbe = { _ in "deadbeef" }
+        var ensureCLIStarts = 0
+        let ensureLock = NSLock()
+        service.runProcess = { _, _, _ in
+            ensureLock.lock(); ensureCLIStarts += 1; ensureLock.unlock()
+            return (0, "", "")
+        }
+
+        let displayRoot = tempRoot.appendingPathComponent("paused-proj", isDirectory: true)
+        try? FileManager.default.createDirectory(at: displayRoot, withIntermediateDirectories: true)
+        let checkout = GraphifyCheckout(
+            key: GraphifyRepoKey(commonDir: displayRoot.appendingPathComponent(".git").path),
+            displayRoot: displayRoot.path
+        )
+
+        let probeEntered = expectation(description: "identity probe entered")
+        let releaseProbe = DispatchSemaphore(value: 0)
+        service.checkoutIdentityProbe = { root in
+            probeEntered.fulfill()
+            releaseProbe.wait()
+            return GraphifyCheckout(
+                key: GraphifyRepoKey(commonDir: root + "/.git"),
+                displayRoot: root
+            )
+        }
+
+        service.setPressurePauseEnsureAndWatch(true)
+        service.requestRefresh(checkout: checkout, force: true)
+
+        let started = Date()
+        service.setPressurePauseEnsureAndWatch(false)
+        XCTAssertLessThan(
+            Date().timeIntervalSince(started),
+            0.25,
+            "unpause must return without waiting on blocking identity probe"
+        )
+
+        wait(for: [probeEntered], timeout: 2.0)
+        // Disable Graphify while async re-kick is mid-probe (Token Saver-off).
+        service.enabled = false
+        releaseProbe.signal()
+        // Allow async queue to finish.
+        let deadline = Date().addingTimeInterval(0.5)
+        while Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
+
+        ensureLock.lock(); let starts = ensureCLIStarts; ensureLock.unlock()
+        XCTAssertEqual(
+            starts,
+            0,
+            "after disable mid-probe, pressure re-kick must not start ensure CLI"
+        )
+        service.setPressurePauseEnsureAndWatch(false)
+        service.checkoutIdentityProbe = nil
+    }
+
+    func test_pressureUnpause_reKickRunsWhenStillEnabled() {
+        service.enabled = true
+        service.autoEnsure = true
+        service.headProbe = { _ in "cafebabe" }
+        let ensureStarted = expectation(description: "ensure CLI started")
+        ensureStarted.assertForOverFulfill = false
+        let fulfillLock = NSLock()
+        var fulfilled = false
+        service.runProcess = { _, _, _ in
+            fulfillLock.lock()
+            if !fulfilled {
+                fulfilled = true
+                fulfillLock.unlock()
+                ensureStarted.fulfill()
+            } else {
+                fulfillLock.unlock()
+            }
+            return (0, "", "")
+        }
+
+        let displayRoot = tempRoot.appendingPathComponent("live-proj", isDirectory: true)
+        try? FileManager.default.createDirectory(at: displayRoot, withIntermediateDirectories: true)
+        let checkout = GraphifyCheckout(
+            key: GraphifyRepoKey(commonDir: displayRoot.appendingPathComponent(".git").path),
+            displayRoot: displayRoot.path
+        )
+        service.checkoutIdentityProbe = { root in
+            GraphifyCheckout(
+                key: GraphifyRepoKey(commonDir: root + "/.git"),
+                displayRoot: root
+            )
+        }
+
+        service.setPressurePauseEnsureAndWatch(true)
+        service.requestRefresh(checkout: checkout, force: true)
+        service.setPressurePauseEnsureAndWatch(false)
+
+        wait(for: [ensureStarted], timeout: 3.0)
     }
 
     // MARK: helpers

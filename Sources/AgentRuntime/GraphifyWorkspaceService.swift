@@ -47,6 +47,8 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     /// S7: pressure governor may pause ensure + watch callbacks without killing
     /// active rebuilds. Resumed by `resumeOptionalWorkUnit` / clear.
     private var pressurePauseEnsureAndWatch = false
+    /// Bumped on each unpause/resume schedule so stale async re-kicks abort.
+    private var pressureUnpauseGeneration: UInt64 = 0
 
     public var appSupportDirectory: URL
     public var binaryPathOverride: String?
@@ -66,6 +68,8 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     public var runProcess: (@Sendable ([String], String, [String: String]?) -> (exit: Int32, stdout: String, stderr: String))?
     /// Test seam: inject git HEAD probe.
     public var headProbe: (@Sendable (String) -> String?)?
+    /// Test seam: resolve display-root → checkout without blocking Process I/O.
+    public var checkoutIdentityProbe: (@Sendable (String) -> GraphifyCheckout?)?
 
     private struct RefreshSchedule {
         var dirtyGeneration: UInt64 = 0
@@ -106,13 +110,16 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
 
     /// S7 non-destructive pressure action: pause ensure/watch scheduling.
     /// On true→false, re-kick dirty/deferred checkouts that may have missed
-    /// debounce/ensure while paused.
+    /// debounce/ensure while paused. Git probes + ensure start off MainActor.
     public func setPressurePauseEnsureAndWatch(_ paused: Bool) {
         let rootsToKick: [String]
+        let unpauseGeneration: UInt64
         lock.lock()
         let wasPaused = pressurePauseEnsureAndWatch
         pressurePauseEnsureAndWatch = paused
         if wasPaused && !paused {
+            pressureUnpauseGeneration &+= 1
+            unpauseGeneration = pressureUnpauseGeneration
             var roots: [String] = []
             for id in schedules.keys {
                 guard var schedule = schedules[id], !schedule.displayRoot.isEmpty else { continue }
@@ -130,22 +137,51 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             })
             rootsToKick = Array(Set(roots))
         } else {
+            unpauseGeneration = pressureUnpauseGeneration
             rootsToKick = []
         }
         lock.unlock()
-        for root in rootsToKick {
-            // Resolve a real checkout for this display root (correct scheduleID).
-            if let identity = GraphifyGitProbe.identity(at: root) {
-                startEnsureIfNeeded(checkout: identity.checkout)
-            } else {
-                // Fail-open fallback: use displayRoot as commonDir identity.
-                let checkout = GraphifyCheckout(
-                    key: GraphifyRepoKey(commonDir: root),
-                    displayRoot: root
-                )
-                startEnsureIfNeeded(checkout: checkout)
+        scheduleAsyncRootReKicks(roots: rootsToKick, unpauseGeneration: unpauseGeneration)
+    }
+
+    /// Shared async re-kick path for pressure unpause / resume-after-disable.
+    /// Never blocks the caller with git Process I/O; revalidates Token Saver /
+    /// Graphify enabled + pressure pause + unpause generation before probe and ensure.
+    private func scheduleAsyncRootReKicks(roots: [String], unpauseGeneration: UInt64) {
+        guard !roots.isEmpty else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            for root in roots {
+                guard self.shouldContinuePressureReKick(unpauseGeneration: unpauseGeneration) else {
+                    return
+                }
+                let checkout: GraphifyCheckout
+                if let probe = self.checkoutIdentityProbe, let resolved = probe(root) {
+                    checkout = resolved
+                } else if let identity = GraphifyGitProbe.identity(at: root) {
+                    checkout = identity.checkout
+                } else {
+                    checkout = GraphifyCheckout(
+                        key: GraphifyRepoKey(commonDir: root),
+                        displayRoot: root
+                    )
+                }
+                guard self.shouldContinuePressureReKick(unpauseGeneration: unpauseGeneration) else {
+                    return
+                }
+                self.startEnsureIfNeeded(checkout: checkout)
             }
         }
+    }
+
+    private func shouldContinuePressureReKick(unpauseGeneration: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        // Fail-open when Graphify/Token Saver is off: never probe or ensure.
+        return enabled
+            && autoEnsure
+            && !pressurePauseEnsureAndWatch
+            && pressureUnpauseGeneration == unpauseGeneration
     }
 
     public var isPressurePauseEnsureAndWatch: Bool {
@@ -1015,6 +1051,8 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     /// while watchers were down force a rebuild. Does **not** uncancel an
     /// in-flight old generation — rebuildGeneration ownership handles that.
     public func resumeAfterDisable() {
+        let roots: [String]
+        let unpauseGeneration: UInt64
         lock.lock()
         // Do not clear cancellation while an old process may still complete;
         // only clear when nothing is in flight.
@@ -1034,13 +1072,12 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             s.rerunRequested = true
             schedules[id] = s
         }
-        let roots = schedules.values.map(\.displayRoot).filter { !$0.isEmpty }
+        roots = schedules.values.map(\.displayRoot).filter { !$0.isEmpty }
+        // Treat as a new re-kick generation so stale async work aborts.
+        pressureUnpauseGeneration &+= 1
+        unpauseGeneration = pressureUnpauseGeneration
         lock.unlock()
-        for root in roots {
-            if let checkout = GraphifyGitProbe.identity(at: root)?.checkout {
-                startEnsureIfNeeded(checkout: checkout)
-            }
-        }
+        scheduleAsyncRootReKicks(roots: roots, unpauseGeneration: unpauseGeneration)
     }
 
     // MARK: Sticky
