@@ -102,7 +102,14 @@ final class GraphifyOutputLocationTests: XCTestCase {
         let status = service.ensureSync(checkout: checkout, mode: .update)
         XCTAssertTrue(called, "runProcess must be invoked")
         XCTAssertEqual(status, .fresh)
-        XCTAssertEqual(capturedEnv?["GRAPHIFY_OUT"], service.artifactRoot(for: checkout).path)
+        // Generation-owned staging: GRAPHIFY_OUT is artifactRoot/staging-<gen>, not the
+        // canonical root. Canonical graph.json is promoted only after ownership check.
+        let out = capturedEnv?["GRAPHIFY_OUT"] ?? ""
+        let artifactRoot = service.artifactRoot(for: checkout).path
+        XCTAssertTrue(
+            out.hasPrefix(artifactRoot + "/staging-") || out.hasPrefix(artifactRoot + "/staging"),
+            "GRAPHIFY_OUT should be under staging-*, got \(out)"
+        )
         XCTAssertFalse(FileManager.default.fileExists(atPath: proj.appendingPathComponent("graphify-out").path))
     }
 

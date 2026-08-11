@@ -610,25 +610,58 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             return .error
         }
 
-        // Final ownership check immediately before atomic promote.
-        if isCancelledNow() {
+        // Prepare a generation-specific publish file outside the scheduler lock.
+        let publishStaging = artifact.appendingPathComponent(
+            "graph.json.promote-\(launchRebuildGeneration ?? rebuildGeneration)"
+        )
+        try? FileManager.default.removeItem(at: publishStaging)
+        do {
+            try FileManager.default.copyItem(at: produced, to: publishStaging)
+        } catch {
             discardStaging()
-            lock.lock()
+            try? FileManager.default.removeItem(at: publishStaging)
+            if FileManager.default.fileExists(atPath: dest.path) { return .stale }
+            return .error
+        }
+        discardStaging()
+
+        // Hold the cancellation lock across final ownership check + atomic rename
+        // so a concurrent cancel cannot replace canonical graph.json with a
+        // superseded generation's bytes.
+        lock.lock()
+        let generationStaleAtPromote = launchRebuildGeneration.map { $0 != rebuildGeneration } ?? false
+        let cancelledAtPromote = generationStaleAtPromote
+            || activeRebuildCancelled
+            || (schedules[checkout.scheduleID]?.rebuildCancelled == true)
+        if cancelledAtPromote {
             var s = schedules[checkout.scheduleID] ?? RefreshSchedule()
             s.displayRoot = checkout.displayRoot
             s.status = .missing
             s.rebuildCancelled = false
             schedules[checkout.scheduleID] = s
             lock.unlock()
+            try? FileManager.default.removeItem(at: publishStaging)
             return .missing
         }
-
-        if !atomicallyPublish(from: produced, to: dest, stagingDir: artifact) {
-            discardStaging()
+        let promoted: Bool = {
+            do {
+                if FileManager.default.fileExists(atPath: dest.path) {
+                    _ = try FileManager.default.replaceItemAt(dest, withItemAt: publishStaging)
+                } else {
+                    try FileManager.default.moveItem(at: publishStaging, to: dest)
+                }
+                return true
+            } catch {
+                try? FileManager.default.removeItem(at: publishStaging)
+                return false
+            }
+        }()
+        if !promoted {
+            lock.unlock()
             if FileManager.default.fileExists(atPath: dest.path) { return .stale }
             return .error
         }
-        discardStaging()
+        lock.unlock()
 
         if FileManager.default.fileExists(atPath: dest.path) {
             // Probe HEAD outside the scheduler lock (run() also takes the lock).
