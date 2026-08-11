@@ -4054,7 +4054,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         svc.pinnedRoots = settings.graphifyPinnedRoots
         let path = settings.graphifyBinaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
         svc.binaryPathOverride = path.isEmpty ? nil : path
-        if !active { svc.stopWatchingAll() }
+        if !active {
+            svc.stopWatchingAll()
+        } else {
+            // Dirty schedules + clear cancel so edits during disable force rebuild.
+            svc.resumeAfterDisable()
+        }
     }
 
     /// Full host environment for an orchestrated Agent App worker (nested child).

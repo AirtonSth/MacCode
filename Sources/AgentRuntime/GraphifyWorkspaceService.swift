@@ -424,9 +424,14 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             if cancelled {
                 s.status = .missing
                 s.rebuildCancelled = false
-                // Drop any generation advanced inside ensureSync for this target.
-                if s.builtGeneration == targetGen {
-                    s.builtGeneration = max(0, targetGen &- 1)
+                // Unconditionally leave built below dirty so a cancelled build
+                // never verifies fresh (even if dirtyGeneration advanced mid-build).
+                if s.dirtyGeneration <= s.builtGeneration {
+                    s.dirtyGeneration = s.builtGeneration &+ 1
+                }
+                // Force built behind dirty regardless of targetGen match.
+                if s.builtGeneration >= s.dirtyGeneration {
+                    s.builtGeneration = s.dirtyGeneration &- 1
                 }
             } else {
                 s.status = status
@@ -753,13 +758,14 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     /// Cancel the active graphify child and mark rebuilds cancelled (S9).
     /// Only sticky while a rebuild is actually in flight; idle cancel is a no-op
     /// so Token Saver off/on does not poison PATH/HEAD probes forever.
+    /// Process terminate/kill wait runs off the calling thread so MainActor
+    /// settings/lifecycle paths are not blocked for up to 1s.
     public func cancelInFlightRebuildIfNeeded() {
         lock.lock()
         let anyInFlight = globalCLIInFlight
             || schedules.values.contains(where: \.inFlight)
             || activeRebuildProcess != nil
         if !anyInFlight {
-            // No live rebuild: clear sticky cancel so re-enable works.
             activeRebuildCancelled = false
             lock.unlock()
             return
@@ -770,10 +776,16 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             guard var s = schedules[id], s.inFlight else { continue }
             s.rebuildCancelled = true
             s.rerunRequested = false
+            // Invalidate freshness immediately under the same lock.
+            if s.dirtyGeneration <= s.builtGeneration {
+                s.dirtyGeneration = s.builtGeneration &+ 1
+            }
             schedules[id] = s
         }
         lock.unlock()
-        if let process, process.isRunning {
+        guard let process, process.isRunning else { return }
+        // Publish cancel state first; escalate off-caller-thread.
+        DispatchQueue.global(qos: .utility).async {
             process.terminate()
             let killDeadline = Date().addingTimeInterval(1)
             while process.isRunning && Date() < killDeadline {
@@ -786,15 +798,25 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     }
 
     /// Call when Graphify runtime becomes active again after disable.
+    /// Clears cancel flags and dirties all known schedules so edits made while
+    /// watchers were down force a rebuild (FSEvents starts at "now").
     public func resumeAfterDisable() {
         lock.lock()
         activeRebuildCancelled = false
         for id in Array(schedules.keys) {
             guard var s = schedules[id] else { continue }
             s.rebuildCancelled = false
+            s.dirtyGeneration = max(s.dirtyGeneration &+ 1, s.builtGeneration &+ 1)
+            s.rerunRequested = true
             schedules[id] = s
         }
+        let roots = schedules.values.map(\.displayRoot).filter { !$0.isEmpty }
         lock.unlock()
+        for root in roots {
+            if let checkout = GraphifyGitProbe.identity(at: root)?.checkout {
+                startEnsureIfNeeded(checkout: checkout)
+            }
+        }
     }
 
     // MARK: Sticky
