@@ -429,6 +429,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// events on thread open so the badge survives restarts.
     @Published public private(set) var sr1TranslatedMessageIds: Set<AgentMessageID> = []
     @Published public private(set) var sr1OriginalTextsByMessageId: [AgentMessageID: String] = [:]
+    /// UI body when message.content holds the dense wire/stub (dual-channel).
+    @Published public private(set) var sr1RewrittenTextsByMessageId: [AgentMessageID: String] = [:]
     /// The UI holds only a bounded recent message page. Older durable messages
     /// remain in SQLite and are intentionally outside the hot screen-memory set.
     @Published public private(set) var messageHistoryIsPartial = false
@@ -537,6 +539,89 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func sr1OriginalText(for id: AgentMessageID) -> String? {
         sr1OriginalTextsByMessageId[id]
+    }
+
+    public func sr1RewrittenText(for id: AgentMessageID) -> String? {
+        sr1RewrittenTextsByMessageId[id]
+    }
+
+    private static let deterministicWireDisplayCharacterLimit = 4_000
+
+    private static func boundedDeterministicWireDisplay(_ text: String) -> String {
+        guard text.count > deterministicWireDisplayCharacterLimit else { return text }
+        return String(text.prefix(deterministicWireDisplayCharacterLimit)) + "\n…"
+    }
+
+    /// Deterministic last-resort display for persisted wire. Translation events
+    /// are intentionally prunable, so reopening a thread must not make the
+    /// machine protocol the user-facing answer. This path is bounded by the
+    /// persisted message itself and never calls the provider or sidecar.
+    private static func deterministicWireDisplayText(_ text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        if SR2WirePolicy.isSR2(trimmed) {
+            var outcomes: [String] = []
+            var paths: [String] = []
+            var errors: [String] = []
+            for raw in trimmed.split(whereSeparator: \.isNewline) {
+                let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+                let lower = line.lowercased()
+                if lower.hasPrefix("o:") || lower.hasPrefix("o=") {
+                    let value = String(line.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !value.isEmpty {
+                        outcomes.append(value == "cont" ? "Continuing (tools)." : value)
+                    }
+                } else if lower.hasPrefix("p:") || lower.hasPrefix("p=") {
+                    let value = String(line.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !value.isEmpty { paths.append(value) }
+                } else if lower.hasPrefix("e:") || lower.hasPrefix("e=") {
+                    let value = String(line.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !value.isEmpty { errors.append(value) }
+                }
+            }
+            var pieces = outcomes
+            pieces.append(contentsOf: errors.prefix(2))
+            if !paths.isEmpty { pieces.append(paths.joined(separator: ", ")) }
+            let display = pieces.isEmpty ? "I could not expand the SR2 response." : pieces.joined(separator: "\n")
+            return Self.boundedDeterministicWireDisplay(display)
+        }
+
+        guard SR1ResponseDetector.isSR1(trimmed) else { return nil }
+        let segments = SR1ResponseDetector.parseSemanticSegments(trimmed)
+        guard !segments.isEmpty else { return nil }
+        let outcomes = segments.filter { $0.prefix == "O" }.map(\.content)
+        let extras = segments
+            .filter { $0.prefix == "R" || $0.prefix == "P" }
+            .prefix(2)
+            .map(\.content)
+        let pieces = outcomes.isEmpty ? Array(extras) : outcomes + Array(extras)
+        guard !pieces.isEmpty else { return nil }
+        let display = SR1ResponseDetector.expandVariables(
+            in: pieces.joined(separator: "\n"),
+            from: trimmed
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        return Self.boundedDeterministicWireDisplay(display)
+    }
+
+    /// Dual-channel display: prefer humanized rewrite when content is wire/stub.
+    public func assistantDisplayText(for message: AgentMessage) -> String {
+        if let rewritten = sr1RewrittenTextsByMessageId[message.id], !rewritten.isEmpty {
+            return rewritten
+        }
+        // Translation stream events are intentionally prunable. When a replay
+        // no longer contains that event, resolve the durable prose marker from
+        // the persisted history stub before showing raw SR2 wire to the user.
+        if let marker = SR2WirePolicy.recoveryMarker(in: message.content),
+           let recovered = coordinator.reversibleProseRetriever?(marker),
+           !recovered.isEmpty {
+            return recovered
+        }
+        if let fallback = Self.deterministicWireDisplayText(message.content),
+           !fallback.isEmpty {
+            return fallback
+        }
+        return message.content
     }
 
     public init(
@@ -774,6 +859,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         timeline = AssistantTimelineState()
         sr1TranslatedMessageIds = []
         sr1OriginalTextsByMessageId = [:]
+        sr1RewrittenTextsByMessageId = [:]
     }
 
     /// Used by the multi-surface rail reload hub (EventBus fan-out).
@@ -1433,6 +1519,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // from the opened thread's replayed timeline.
         sr1TranslatedMessageIds = []
         sr1OriginalTextsByMessageId = [:]
+        sr1RewrittenTextsByMessageId = [:]
         // Per-thread provider state: the opened thread republishes its own
         // count on its next snapshot, so carrying the previous thread's
         // shell count over would advertise work that isn't this thread's.
@@ -4909,6 +4996,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         historyReplayNotice = nil
         sr1TranslatedMessageIds = []
         sr1OriginalTextsByMessageId = [:]
+        sr1RewrittenTextsByMessageId = [:]
         providerThreadSnapshotStatusMessage = nil
         providerThreadSnapshotLastConfirmedAt = nil
         selectedThreadHasRecoverableContext = false
@@ -7598,11 +7686,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let sourceTimeline = sourceTimeline ?? timeline
         var ids: Set<AgentMessageID> = []
         var originals: [AgentMessageID: String] = [:]
+        var rewrites: [AgentMessageID: String] = [:]
         for (rawId, translation) in sourceTimeline.sr1TranslationsByMessageId {
             guard let uuid = UUID(uuidString: rawId) else { continue }
             let id = AgentMessageID(uuid)
             ids.insert(id)
             originals[id] = translation.originalText
+            rewrites[id] = translation.rewrittenText
         }
         // Two callers, two semantics:
         // - Live-stream batches REPLACE, so translations evicted by the hot-text
@@ -7615,12 +7705,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if preservingExisting {
             ids.formUnion(sr1TranslatedMessageIds)
             originals.merge(sr1OriginalTextsByMessageId) { fromTimeline, _ in fromTimeline }
+            rewrites.merge(sr1RewrittenTextsByMessageId) { fromTimeline, _ in fromTimeline }
         }
         if ids != sr1TranslatedMessageIds {
             sr1TranslatedMessageIds = ids
         }
         if originals != sr1OriginalTextsByMessageId {
             sr1OriginalTextsByMessageId = originals
+        }
+        if rewrites != sr1RewrittenTextsByMessageId {
+            sr1RewrittenTextsByMessageId = rewrites
         }
     }
 }
@@ -13056,6 +13150,8 @@ public struct AgentAppView: View {
                     let showBadge = Self.showsTranslatedBadge(
                         wasSR1Translated: vm.sr1TranslatedMessageIds.contains(msg.id)
                     )
+                    // Dual-channel: content may be wire/stub; prefer rewritten UI text.
+                    let displayBody = vm.assistantDisplayText(for: msg)
                     VStack(alignment: .leading, spacing: DS.Space.xs) {
                         if showBadge {
                             if let original = vm.sr1OriginalText(for: msg.id) {
@@ -13081,8 +13177,8 @@ public struct AgentAppView: View {
                                     .accessibilityIdentifier("agent.assistantMessage.sr1Badge.\(msg.id.value.uuidString)")
                             }
                         }
-                        assistantProse(msg.content)
-                        assistantCopyBar(text: BackgroundAwaitContinuation.strippingAwaitingMarker(msg.content), identifierSuffix: msg.id.value.uuidString)
+                        assistantProse(displayBody)
+                        assistantCopyBar(text: BackgroundAwaitContinuation.strippingAwaitingMarker(displayBody), identifierSuffix: msg.id.value.uuidString)
                     }
                 }
             }

@@ -262,6 +262,52 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
     }
 
+    func test_prunedCompliantSR1AndSR2MessagesRemainReadableFromPersistedWire() throws {
+        let (vm, _) = try makeVM()
+        let threadId = AgentThreadID()
+
+        let sr2 = AgentMessage(
+            threadId: threadId,
+            role: .assistant,
+            content: "@sr2 v0\no:ok\np:Sources/App.swift:12"
+        )
+        let sr1 = AgentMessage(
+            threadId: threadId,
+            role: .assistant,
+            content: "SR1\nO: tests green\nP: suite passed"
+        )
+        var translations = AssistantTimelineState()
+        translations.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: sr2.id.value.uuidString,
+            originalText: sr2.content,
+            rewrittenText: "Fixed Sources/App.swift line 12."
+        )))
+        vm.refreshSR1TranslationStateFromTimeline(translations)
+        XCTAssertEqual(vm.assistantDisplayText(for: sr2), "Fixed Sources/App.swift line 12.")
+
+        // Simulate hot-budget/event pruning, then render from the durable
+        // assistant message as a reopened thread would.
+        vm.refreshSR1TranslationStateFromTimeline(AssistantTimelineState())
+        let sr2Fallback = vm.assistantDisplayText(for: sr2)
+        XCTAssertFalse(sr2Fallback.contains("@sr2"), sr2Fallback)
+        XCTAssertTrue(sr2Fallback.contains("ok"), sr2Fallback)
+        let sr1Fallback = vm.assistantDisplayText(for: sr1)
+        XCTAssertFalse(sr1Fallback.contains("SR1"), sr1Fallback)
+        XCTAssertTrue(sr1Fallback.contains("tests green"), sr1Fallback)
+
+        let oversizedSR2 = AgentMessage(
+            threadId: threadId,
+            role: .assistant,
+            content: "@sr2 v0\no:ok\np:" + String(repeating: "path/", count: 2_000)
+        )
+        let boundedFallback = vm.assistantDisplayText(for: oversizedSR2)
+        XCTAssertLessThanOrEqual(
+            boundedFallback.count,
+            4_002,
+            "wire fallback must stay bounded even when durable fields are oversized"
+        )
+    }
+
     func test_hiddenTranscriptRevealWindowKeepsLargeHistoryRevealBounded() {
         let threadId = AgentThreadID()
         let entries = (0..<140).map { index in

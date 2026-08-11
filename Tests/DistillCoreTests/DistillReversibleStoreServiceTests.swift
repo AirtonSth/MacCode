@@ -1,5 +1,6 @@
 import XCTest
 import CryptoKit
+import CoreModel
 @testable import DistillCore
 
 final class DistillReversibleStoreServiceTests: XCTestCase {
@@ -18,6 +19,8 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
         private(set) var preparedLane: String?
         /// Test seam: force prepareOriginal to throw so command-output unscoped fallback runs.
         var failPrepare = false
+        /// Test seam: force the store's verified readback bit to fail.
+        var failReadback = false
 
         private struct ForcedPrepareError: Error {}
 
@@ -46,7 +49,11 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
                 state: .prepared,
                 outcome: .notSent
             )
-            return .init(capability: capability, idempotencyKey: context.invocationID, readBackVerified: true)
+            return .init(
+                capability: capability,
+                idempotencyKey: context.invocationID,
+                readBackVerified: !failReadback
+            )
         }
 
         func retrieveOriginal(capability: String, context: TokenSaverRecoveryRequestContext) throws -> Data? {
@@ -409,6 +416,179 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
         let incomplete = await incompleteCLI.run()
         XCTAssertEqual(incomplete.exitCode, 0)
         XCTAssertEqual(incomplete.stdout, incompleteInput)
+    }
+
+    /// F4 production path: the managed CLI cannot own a process-local Wave B store.
+    /// The sidecar must therefore apply the Bash budget only after scoped durable
+    /// prepare + byte-exact readback, and the emitted marker must retrieve the exact
+    /// original through the same `/v1/retrieve` authority.
+    func test_managedCLI_bashLineBudgetUsesScopedSidecarStoreAndRetrievesExactOriginal() async throws {
+        let store = InMemoryScopedStore()
+        let configuration = try DistillServiceConfiguration(
+            authToken: "tok",
+            appSupportDirectory: NSTemporaryDirectory()
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: DiscardingRuntime(), maxConcurrentRequests: 1),
+            scopedRecoveryStore: store
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let original = (0..<200)
+            .map { "bash output line \($0) \(String(repeating: "x", count: 8))" }
+            .joined(separator: "\n")
+        let originalData = Data(original.utf8)
+        let context = TokenSaverRecoveryRequestContext(
+            workspaceID: "workspace",
+            projectID: "project",
+            threadID: "thread",
+            provider: "codex",
+            attemptID: "attempt",
+            operationID: ""
+        )
+        let state = ManagedDistillCLI.State(baseURL: ready.baseURL, authToken: "tok")
+
+        func sidecarTransport(_ request: URLRequest) async -> (data: Data, status: Int)? {
+            guard let result = try? await URLSession.shared.data(for: request) else { return nil }
+            return (result.0, (result.1 as? HTTPURLResponse)?.statusCode ?? 0)
+        }
+
+        let cli = ManagedDistillCLI(
+            arguments: ["bash"],
+            stdin: originalData,
+            state: state,
+            provider: "codex",
+            recoveryContext: context,
+            reversibleStoreMinBytes: 1
+        ) { request in
+            await sidecarTransport(request)
+        }
+        let result = await cli.run()
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertLessThan(result.stdout.count, originalData.count)
+        let emitted = String(decoding: result.stdout, as: UTF8.self)
+        XCTAssertTrue(emitted.contains("bash output line 0"))
+        XCTAssertTrue(emitted.contains("bash output line 199"))
+        XCTAssertFalse(emitted.contains("bash output line 100"))
+        let marker = try XCTUnwrap(SR2WirePolicy.recoveryMarker(in: emitted))
+        let handle = String(marker.dropFirst("[[rc:".count).dropLast("]]".count))
+        XCTAssertEqual(handle, store.capability)
+        XCTAssertEqual(store.preparedLane, "bash_line_budget")
+
+        let retrieveCLI = ManagedDistillCLI(
+            arguments: ["retrieve", handle],
+            stdin: Data(),
+            state: state,
+            provider: "codex",
+            recoveryContext: context
+        ) { request in
+            await sidecarTransport(request)
+        }
+        let retrieved = await retrieveCLI.run()
+        XCTAssertEqual(retrieved.exitCode, 0)
+        XCTAssertEqual(retrieved.stdout, originalData, "marker retrieval must be byte-exact")
+
+        // Missing scope, store failure, and failed readback all fail open to the
+        // exact provider bytes; none may leak the discarding runtime's `X` output.
+        let noScope = ManagedDistillCLI(
+            arguments: ["bash"], stdin: originalData, state: state
+        ) { request in
+            await sidecarTransport(request)
+        }
+        let noScopeResult = await noScope.run()
+        XCTAssertEqual(noScopeResult.stdout, originalData, "missing scope must preserve exact stdin")
+
+        store.failPrepare = true
+        let prepareFailure = ManagedDistillCLI(
+            arguments: ["bash"], stdin: originalData, state: state,
+            provider: "codex", recoveryContext: context
+        ) { request in
+            await sidecarTransport(request)
+        }
+        let prepareFailureResult = await prepareFailure.run()
+        XCTAssertEqual(prepareFailureResult.stdout, originalData, "store failure must preserve exact stdin")
+
+        store.failPrepare = false
+        store.failReadback = true
+        let readbackFailure = ManagedDistillCLI(
+            arguments: ["bash"], stdin: originalData, state: state,
+            provider: "codex", recoveryContext: context
+        ) { request in
+            await sidecarTransport(request)
+        }
+        let readbackFailureResult = await readbackFailure.run()
+        XCTAssertEqual(readbackFailureResult.stdout, originalData, "readback failure must preserve exact stdin")
+
+        let admissionFailure = ManagedDistillCLI(
+            arguments: ["bash"], stdin: originalData, state: state,
+            distillAdmission: { false }
+        ) { _ in
+            XCTFail("admission denial must not transport")
+            return nil
+        }
+        let admissionFailureResult = await admissionFailure.run()
+        XCTAssertEqual(admissionFailureResult.stdout, originalData, "admission denial must preserve exact stdin")
+
+        let transportFailure = ManagedDistillCLI(
+            arguments: ["bash"], stdin: originalData, state: state
+        ) { _ in nil }
+        let transportFailureResult = await transportFailure.run()
+        XCTAssertEqual(transportFailureResult.stdout, originalData, "transport failure must preserve exact stdin")
+
+        let missingState = ManagedDistillCLI(
+            arguments: ["bash"], stdin: originalData, state: nil
+        ) { _ in
+            XCTFail("missing state must not transport")
+            return nil
+        }
+        let missingStateResult = await missingState.run()
+        XCTAssertEqual(missingStateResult.stdout, originalData, "missing state must preserve exact stdin")
+    }
+
+    /// Direct non-Bash tool contracts are exact-output surfaces. A large result
+    /// must not be head/tail-budgeted merely because it travels through the
+    /// command-output request mode.
+    func test_directGrepReadAndWebFetchOver80LinesRemainByteComplete() async throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "tok",
+            appSupportDirectory: NSTemporaryDirectory()
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: DiscardingRuntime(), maxConcurrentRequests: 1),
+            scopedRecoveryStore: InMemoryScopedStore()
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let original = (0..<120)
+            .map { "match line \($0) /tmp/Exact.swift:\($0 + 1)" }
+            .joined(separator: "\n")
+        let policy = ToolOutputCompressionPolicy(minBytes: 1, minLines: 1)
+        let contracts = ["Grep", "Read", "WebFetch"].map { tool in
+            policy.decision(toolName: tool, output: original).contractQuestion
+        }
+
+        for question in contracts {
+            let result = try await http(
+                ready.baseURL + "/v1/distill",
+                method: "POST",
+                token: "tok",
+                body: try JSONEncoder().encode(DistillRequest(
+                    mode: .commandOutput,
+                    input: original,
+                    question: question,
+                    runMode: .optimize
+                ))
+            )
+            XCTAssertEqual(result.status, 200)
+            let response = try JSONDecoder().decode(DistillResponse.self, from: result.data)
+            XCTAssertEqual(response.output, original, "non-Bash tool output must stay byte-complete")
+            XCTAssertEqual(response.routeStage, .verbatim)
+            XCTAssertNil(response.originalHandle)
+        }
     }
 
     func test_scopedUnchangedCandidateLeavesNoRecoveryRecord() async throws {

@@ -1094,6 +1094,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// persisted and shown to users. Must fail open by returning the input
     /// unchanged on any error.
     public var finalResponseTranslator: (@Sendable (_ response: String, _ provider: AgentProvider, _ threadId: AgentThreadID, _ runId: AgentRunID) async -> String)?
+    /// Content-addressed store for free-prose enforcement (`[[rc:<handle>]]`).
+    /// Returns the bare handle hex, or nil when storage/readback is unavailable.
+    /// Callers must preserve the original prose when no handle is returned.
+    public var reversibleProseStore: (@Sendable (_ prose: String) -> String?)?
+    /// Synchronous durable readback for replayed free-prose history stubs.
+    /// A missing value is intentionally surfaced as nil so the UI can retain the
+    /// persisted wire text rather than inventing a human-readable substitute.
+    public var reversibleProseRetriever: (@Sendable (_ marker: String) -> String?)?
+    /// True only when Token Saver runtime is actually active (paid gate + enabled).
+    /// Must not be inferred from `finalResponseTranslator != nil` — that hook is
+    /// wired for the process lifetime and would enforce free prose even with TS OFF.
+    public var tokenSaverRuntimeActive: (@Sendable () -> Bool)?
 
     /// Token Saver hook for RECOVERED sessions. The coordinator rebuilds the run request for a
     /// resumed session itself (`recoverAdapterSessionIfNeeded`), bypassing the app shell's
@@ -5115,11 +5127,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // Shared provider-agnostic choke point for final assistant text: strip
         // leaked model control tokens (e.g. Grok `<|eos|>`), then unresolved CCR
         // handles, then raw tool-invocation markup (leaving the uncalled-tool
-        // incomplete-turn signal). Covers claude / codex / grok.
-        AssistantToolMarkupSanitizer.sanitize(
-            RetrieveHandleSanitizer.strip(
-                ProviderControlTokenSanitizer.strip(text)
-            )
+        // incomplete-turn signal). Durable SR2 history is the exception: its
+        // `[[rc:...]]` marker is the message-owned recovery key and must survive
+        // terminal event sanitization. Covers claude / codex / grok.
+        let withoutControlTokens = ProviderControlTokenSanitizer.strip(text)
+        let withoutHandles = SR2WirePolicy.isSR2(withoutControlTokens)
+            ? withoutControlTokens
+            : RetrieveHandleSanitizer.strip(withoutControlTokens)
+        return AssistantToolMarkupSanitizer.sanitize(
+            withoutHandles
         )
     }
 
@@ -5435,24 +5451,32 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     Task { [weak self] in
                         guard let self else { return }
                         let translated = await self.translateSR1Response(text, runId: runId, threadId: threadId)
-                        if translated != text {
+                        let plan = self.dualChannelPlan(
+                            runId: runId,
+                            modelOutput: text,
+                            humanizeOutput: translated,
+                            recordCompliance: false
+                        )
+                        if plan.shouldEmitTranslation {
                             self.handle(
                                 event: .event(.sr1Translation(AssistantSR1Translation(
                                     itemId: itemId,
-                                    originalText: text,
-                                    rewrittenText: translated
+                                    originalText: plan.historyText,
+                                    rewrittenText: plan.uiText
                                 ))),
                                 runId: runId,
                                 threadId: threadId,
                                 allowFinalResponseTranslation: false
                             )
                         }
+                        // Stream surface shows UI text; history body is finalized on turnCompleted.
+                        let display = plan.uiText
                         let delta: AssistantEvent
                         switch target {
                         case .body:
-                            delta = .itemDelta(itemId: itemId, bodyAppend: translated, outputAppend: nil, summary: nil)
+                            delta = .itemDelta(itemId: itemId, bodyAppend: display, outputAppend: nil, summary: nil)
                         case .output:
-                            delta = .itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: translated, summary: nil)
+                            delta = .itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: display, summary: nil)
                         }
                         self.handle(
                             event: .event(delta),
@@ -5900,9 +5924,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 Task { [weak self] in
                     guard let self else { return }
                     let translated = await self.translateFinalResponse(finalMessage, runId: runId, threadId: threadId)
+                    let plan = self.dualChannelPlan(
+                        runId: runId,
+                        modelOutput: finalMessage,
+                        humanizeOutput: translated
+                    )
+                    // historyText (wire/stub) is what re-enters next-turn context;
+                    // uiText is attached via sr1Translation.rewritten for UI.
+                    let historyBody = plan.historyText
                     if let completedTurnId = self.completedTurnId(runId: runId) {
                         self.handle(
-                            event: .event(.turnCompleted(turnId: completedTurnId, finalMessage: translated)),
+                            event: .event(.turnCompleted(turnId: completedTurnId, finalMessage: historyBody)),
                             runId: runId,
                             threadId: threadId,
                             allowFinalResponseTranslation: false
@@ -5911,12 +5943,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     self.lock.lock()
                     let translatedMsgId = self.activeAssistantMessageIds[runId]
                     self.lock.unlock()
-                    if let mid = translatedMsgId, translated != finalMessage {
+                    if let mid = translatedMsgId, plan.shouldEmitTranslation {
                         self.handle(
                             event: .event(.sr1Translation(AssistantSR1Translation(
                                 messageId: mid.value.uuidString,
-                                originalText: finalMessage,
-                                rewrittenText: translated
+                                originalText: plan.historyText,
+                                rewrittenText: plan.uiText
                             ))),
                             runId: runId,
                             threadId: threadId,
@@ -5924,7 +5956,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                         )
                     }
                     self.handle(
-                        event: .finished(reportedStatus, finalMessage: translated, providerThreadId: providerThreadId),
+                        event: .finished(reportedStatus, finalMessage: historyBody, providerThreadId: providerThreadId),
                         runId: runId,
                         threadId: threadId,
                         allowFinalResponseTranslation: false
@@ -6647,8 +6679,67 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return pending
     }
 
+    private func isTokenSaverRuntimeActiveNow() -> Bool {
+        // AppContext installs this callback in production. A missing callback
+        // is not evidence of admission: standalone hosts must explicitly
+        // model Token Saver being active before free-prose enforcement runs.
+        tokenSaverRuntimeActive?() == true
+    }
+
     private func shouldTranslateFinalResponse(_ text: String) -> Bool {
-        finalResponseTranslator != nil && SR1ResponseDetector.isSR1(text)
+        guard finalResponseTranslator != nil else { return false }
+        // Never dual-channel / enforce when Token Saver is OFF — translator may
+        // still be wired for the process lifetime.
+        guard isTokenSaverRuntimeActiveNow() else { return false }
+        // Token Saver dual-channel: humanize SR2/SR1 wire, and enforce free prose
+        // so monologue cannot become the only leg (host maps via SR2WirePolicy).
+        if SR2WirePolicy.isSR2(text) { return true }
+        if SR1ResponseDetector.isSR1(text) { return true }
+        // Free prose: still route through translator when Token Saver is active so
+        // AppContext can enforce stub+handle and record compliance per provider.
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmed.isEmpty
+    }
+
+    /// Apply dual-channel after humanize: provider history = wire/stub, UI = prose.
+    private func dualChannelPlan(
+        runId: AgentRunID,
+        modelOutput: String,
+        humanizeOutput: String,
+        recordCompliance: Bool = true
+    ) -> SR2WirePolicy.DualChannelPersistPlan {
+        let store = reversibleProseStore
+        let plan = SR2WirePolicy.dualChannelPersistPlan(
+            modelOutput: modelOutput,
+            humanizeOutput: humanizeOutput,
+            tokenSaverOn: isTokenSaverRuntimeActiveNow(),
+            isSR1: { SR1ResponseDetector.isSR1($0) },
+            storeProse: store.map { storeFn in
+                { prose in storeFn(prose) }
+            }
+        )
+        if recordCompliance {
+            // Terminal translation is the sole compliance-event owner. Resolve
+            // the provider by the exact run identity; never use an arbitrary
+            // concurrent run's metadata. The durable row is the narrow fallback
+            // when terminal cleanup has already released the in-memory entry.
+            lock.lock()
+            let activeProvider = activeRunMetadata[runId]?.provider
+            lock.unlock()
+            let providerRaw = activeProvider?.rawValue
+                ?? (try? runRepo.get(id: runId))?.provider.rawValue
+            if let providerRaw {
+                SR2WirePolicy.sharedCompliance.record(
+                    SR2WirePolicy.ComplianceEvent(
+                        provider: providerRaw,
+                        kind: plan.kind,
+                        wasEnforced: plan.wasEnforced,
+                        complianceMiss: plan.complianceMiss
+                    )
+                )
+            }
+        }
+        return plan
     }
 
     private func completeProviderTextTranslation(runId: AgentRunID) -> DeferredProviderTerminalEvent? {

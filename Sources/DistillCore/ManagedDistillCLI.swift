@@ -421,12 +421,14 @@ public struct ManagedDistillCLI: Sendable {
         guard let input = String(data: stdin, encoding: .utf8) else { return failOpen() }
         guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return failOpen() }
 
-        // Live Wave A/B lossless pre-pass: shrink before (or without) the sidecar.
+        // Live byte-exact Wave A pre-pass: shrink before (or without) the sidecar.
+        // Recoverable lossy Wave B routes, including Bash line budgets, are owned by
+        // the sidecar so store-before-loss uses its scoped durable store.
         // Only when Token Saver env is present (hint) so free builds never save tokens.
         let tokenSaverHintOn = ProcessInfo.processInfo.environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
             || ProcessInfo.processInfo.environment["RC_TOKEN_SAVER_WAVE_LIVE"] != nil
         if tokenSaverHintOn,
-           let pre = TokenSaverWaveLosslessPrepass.apply(input: input, toolHint: prompt) {
+           let pre = TokenSaverWaveLosslessPrepass.applyLossless(input: input, toolHint: prompt) {
             guard distillAdmission() else { return failOpen() }
             FileHandle.standardError.write(Data(
                 "rc-wave-prepass wave=\(pre.waveID) trigger=\(pre.trigger) saved_bytes=\(pre.savedBytes) frac=\(String(format: "%.3f", pre.savedFraction))\n".utf8

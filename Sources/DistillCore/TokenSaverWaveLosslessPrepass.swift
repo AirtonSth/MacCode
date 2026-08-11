@@ -44,7 +44,12 @@ public enum TokenSaverWaveLosslessPrepass {
         let raw = ProcessInfo.processInfo.environment[lossyCrushersOptInEnvKey]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        return raw == "1" || raw == "true" || raw == "yes"
+        if raw == "1" || raw == "true" || raw == "yes" { return true }
+        // T-TO-01/02: when Token Saver distill is admitted, allow lossy prepass
+        // with a durable store (still refused for process-local MemoryStore).
+        let hint = ProcessInfo.processInfo.environment["RC_TOKEN_SAVER_DISTILL_HINT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return hint == "1"
     }
 
     /// Test hook: force opt-in on/off; pass `nil` to re-read the environment.
@@ -86,9 +91,52 @@ public enum TokenSaverWaveLosslessPrepass {
             ) {
                 return r
             }
+            // T-TO-01: bash/build line budget when crushers miss but line count explodes.
+            if let r = applyBashLineBudget(
+                input: input,
+                originalBytes: originalBytes,
+                store: store
+            ) {
+                return r
+            }
         }
 
         return nil
+    }
+
+    /// Apply only the byte-exact local prepass.
+    ///
+    /// The managed CLI runs in a short-lived process and cannot inject the sidecar's
+    /// scoped durable store. Keeping its local fast path explicitly lossless prevents
+    /// it from accidentally attempting a process-local Wave B store; recoverable lossy
+    /// routes belong to the sidecar's scoped `/v1/distill` path.
+    public static func applyLossless(input: String, toolHint: String? = nil) -> Result? {
+        let originalBytes = input.utf8.count
+        guard originalBytes > 0, TokenSaverWaveLiveRollout.isLive(.waveA) else { return nil }
+        return applyWaveA(input: input, originalBytes: originalBytes)
+    }
+
+    /// Head/tail line budget with durable store-before-loss (T-TO-01).
+    private static func applyBashLineBudget(
+        input: String,
+        originalBytes: Int,
+        store: TokenSaverTypedCrushers.BlobStore
+    ) -> Result? {
+        let lineCount = input.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).count
+        guard lineCount > BashStdoutLineBudget.defaultMaxLines else { return nil }
+        let data = Data(input.utf8)
+        guard let handle = TokenSaverTypedCrushers.storeVerified(data, store: store) else { return nil }
+        let budgeted = BashStdoutLineBudget.apply(input, handle: handle)
+        guard budgeted.applied else { return nil }
+        let compressedBytes = budgeted.text.utf8.count
+        guard compressedBytes < originalBytes else { return nil }
+        return Result(
+            output: budgeted.text,
+            waveID: TokenSaverWaveLiveRollout.WaveID.waveBCrushers.rawValue,
+            trigger: "bash_line_budget",
+            originalBytes: originalBytes,
+            compressedBytes: compressedBytes
+        )
     }
 
     // MARK: - Wave A

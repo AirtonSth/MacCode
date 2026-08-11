@@ -1075,6 +1075,138 @@ public final class DistillHTTPServer: @unchecked Sendable {
         return false
     }
 
+    /// The line budget is intentionally narrower than the command-output mode.
+    /// The request model predates tool-origin metadata, so only the contracts
+    /// emitted by the Bash/build/test wrapper are trusted here. Unknown or
+    /// non-Bash origins decline this lossy route and continue through the
+    /// established lossless/fail-open path.
+    private static func isSummarySafeBashBudgetRequest(_ request: DistillRequest) -> Bool {
+        guard let question = request.question?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !question.isEmpty else {
+            return false
+        }
+        let lower = question.lowercased()
+        if lower == "bash" || lower.hasPrefix("compress command output.") {
+            return true
+        }
+        guard let wrapperQuestion = CommandWrapPolicy.extractionQuery(forCommand: "") else {
+            return false
+        }
+        return lower == wrapperQuestion.lowercased()
+    }
+
+    /// Direct Grep/Read/WebFetch requests carry their own non-Bash contract
+    /// question. They are exact-output surfaces and must never reach either
+    /// the generic line budget or a later lossy command-output route.
+    private static func isKnownNonBashToolOutputRequest(_ request: DistillRequest) -> Bool {
+        guard request.mode == .commandOutput,
+              let question = request.question?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !question.isEmpty else {
+            return false
+        }
+        let lower = question.lowercased()
+        return lower.hasPrefix("compress search output without dropping any match line.")
+            || lower.hasPrefix("compress file read output for the current task.")
+            || lower.hasPrefix("compress fetched web content for the current task.")
+    }
+
+    /// Apply the Bash head/tail budget only after the sidecar has prepared and
+    /// read back the scoped original. The managed CLI cannot own this store: its
+    /// process is short-lived, while this scoped store is the `/v1/retrieve`
+    /// authority that survives the CLI invocation.
+    private func tryScopedBashLineBudget(
+        request: DistillRequest,
+        scopedContext: TokenSaverRecoveryRequestContext?,
+        scopedRecoveryStore: TokenSaverScopedRecoveryStoring?
+    ) -> DistillResponse? {
+        guard request.mode == .commandOutput,
+              request.effectiveRunMode == .optimize else {
+            return nil
+        }
+        guard Self.isSummarySafeBashBudgetRequest(request) else {
+            return nil
+        }
+        // Hook policy already rejects exact-output Bash commands. Preserve the
+        // same fail-open rule when a caller includes the command in its question.
+        if let question = request.question,
+           ToolOutputCompressionPolicy().isExactOutputShellTool(
+               toolName: "Bash",
+               toolArgumentsSummary: question
+           ) {
+            return nil
+        }
+        let input = request.input
+        guard Self.newlineSeparatedComponentCount(
+            input,
+            atLeast: BashStdoutLineBudget.defaultMaxLines + 1
+        ) else {
+            return nil
+        }
+        guard distillAdmission() else { return nil }
+
+        // A budgeted response is lossy. Without scoped authority, decline only
+        // this lossy budget so the established byte-exact route can still run.
+        guard let scopedContext, let scopedRecoveryStore else {
+            return nil
+        }
+
+        do {
+            let originalBytes = Data(input.utf8)
+            let preparation = try scopedRecoveryStore.prepareOriginal(
+                originalBytes,
+                context: scopedContext,
+                lane: "bash_line_budget"
+            )
+            guard preparation.readBackVerified,
+                  try scopedRecoveryStore.retrieveOriginal(
+                      capability: preparation.capability,
+                      context: scopedContext
+                  ) == originalBytes else {
+                throw DistillError.invalidOutput
+            }
+            let budgeted = BashStdoutLineBudget.apply(
+                input,
+                handle: preparation.capability
+            )
+            guard budgeted.applied,
+                  budgeted.text.utf8.count < input.utf8.count,
+                  try scopedRecoveryStore.markDelivered(
+                      capability: preparation.capability,
+                      idempotencyKey: preparation.idempotencyKey,
+                      context: scopedContext,
+                      outcome: .sentUnknown
+                  ) else {
+                throw DistillError.invalidOutput
+            }
+            let inputTokens = TokenEstimator.estimate(input)
+            let outputTokens = TokenEstimator.estimate(budgeted.text)
+            return DistillResponse(
+                requestID: request.id,
+                output: budgeted.text,
+                inputCharacters: input.count,
+                inputTokens: inputTokens,
+                outputTokens: outputTokens,
+                originalHandle: preparation.capability,
+                recoveryIdempotencyKey: preparation.idempotencyKey,
+                runMode: .optimize,
+                routeStage: .deterministic
+            )
+        } catch {
+            // Any prepare/readback/marker-delivery failure is terminal for this
+            // lossy route: return the exact input instead of trying another loss.
+            let tokens = TokenEstimator.estimate(input)
+            return DistillResponse(
+                requestID: request.id,
+                output: input,
+                inputCharacters: input.count,
+                inputTokens: tokens,
+                outputTokens: tokens,
+                runMode: .optimize,
+                routeStage: .verbatim
+            )
+        }
+    }
+
     /// Lossy deterministic crushers with store-before-loss (command-output only).
     /// Returns a ready response when stack/test/source/diff/HTML crushers win; nil to
     /// fall through to EncoderFirst (lossless → BERT → E4B).
@@ -1084,9 +1216,17 @@ public final class DistillHTTPServer: @unchecked Sendable {
         scopedRecoveryStore: TokenSaverScopedRecoveryStoring?
     ) async -> DistillResponse? {
         guard request.mode == .commandOutput,
-              request.effectiveRunMode == .optimize,
-              let scopedContext,
-              let scopedRecoveryStore else {
+              request.effectiveRunMode == .optimize else {
+            return nil
+        }
+        if let budgeted = tryScopedBashLineBudget(
+            request: request,
+            scopedContext: scopedContext,
+            scopedRecoveryStore: scopedRecoveryStore
+        ) {
+            return budgeted
+        }
+        guard let scopedContext, let scopedRecoveryStore else {
             return nil
         }
         // Cheap size + shape gate: avoid prepareOriginal on tiny / non-lossy payloads.
@@ -1322,6 +1462,26 @@ public final class DistillHTTPServer: @unchecked Sendable {
                 if distillRequest.mode == .commandOutput, response.output != distillRequest.input {
                     await metrics.recordToolOutputCompressed()
                 }
+                if let onSuccess { await onSuccess(distillRequest, response, savingsThreadID) }
+                await metrics.recordSuccess()
+                send(status: 200, body: response, connection: connection)
+                return
+            }
+            // The request shape does not carry an origin enum. These explicit
+            // non-Bash contracts are the conservative integration seam for
+            // direct Grep/Read/WebFetch calls; preserve their bytes before any
+            // generic command-output scheduler can rewrite them.
+            if Self.isKnownNonBashToolOutputRequest(distillRequest) {
+                let tokens = TokenEstimator.estimate(distillRequest.input)
+                let response = DistillResponse(
+                    requestID: distillRequest.id,
+                    output: distillRequest.input,
+                    inputCharacters: distillRequest.input.count,
+                    inputTokens: tokens,
+                    outputTokens: tokens,
+                    runMode: distillRequest.effectiveRunMode,
+                    routeStage: .verbatim
+                )
                 if let onSuccess { await onSuccess(distillRequest, response, savingsThreadID) }
                 await metrics.recordSuccess()
                 send(status: 200, body: response, connection: connection)

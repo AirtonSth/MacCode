@@ -465,6 +465,11 @@ public final class AppContext {
     private var tokenSaverEntitlementReconcileTask: Task<Void, Never>?
     private var lastTokenSaverAccountIdentity: TokenSaverAccountIdentity?
     private var tokenSaverRuntimeAdmitted = false
+    /// Cross-thread snapshot for coordinator dual-channel gate (must not call
+    /// MainActor methods from Sendable hooks). Updated whenever runtime active
+    /// is evaluated or Token Saver is enabled/disabled.
+    private let tokenSaverRuntimeActiveLock = NSLock()
+    private nonisolated(unsafe) var tokenSaverRuntimeActiveCached = false
     /// Test seam for account-change readiness without installing multi-GB models.
     /// Production leaves this nil and validates the real on-disk manifests.
     var tokenSaverEntitlementModelValidationOverrideForTesting: TokenSaverModelValidation?
@@ -906,6 +911,26 @@ public final class AppContext {
                 return response
             }
             return await self.tokenSaverHumanizeSR1Response(response, provider: provider, threadId: threadId, runId: runId)
+        }
+        // Free-prose enforcement: store full monologue content-addressed so
+        // `[[rc:<handle>]]` in the history wire stub is recoverable (bare SHA).
+        self.coordinator.reversibleProseStore = { [weak self] prose in
+            guard let self else { return nil }
+            do {
+                return try ReversibleContentStore(db: self.db).store(prose)
+            } catch {
+                NSLog("RemoteCode Token Saver free-prose store failed: \(error)")
+                return nil
+            }
+        }
+        self.coordinator.reversibleProseRetriever = { [weak self] marker in
+            guard let self else { return nil }
+            return try? ReversibleContentStore(db: self.db).retrieveText(marker)
+        }
+        // Gate dual-channel on real Token Saver runtime — not translator hook presence.
+        // Snapshot is updated from MainActor paths; hook is nonisolated-safe.
+        self.coordinator.tokenSaverRuntimeActive = { [weak self] in
+            self?.tokenSaverRuntimeActiveSnapshot() == true
         }
         // Recovered sessions rebuild their own request env in the coordinator, bypassing
         // providerEnvironment; feed them the same Token Saver env so distill survives resume.
@@ -2107,6 +2132,7 @@ public final class AppContext {
 
         func disableRuntime() -> String? {
             tokenSaverRuntimeAdmitted = false
+            publishTokenSaverRuntimeActiveCache(false)
             if persistPreference {
                 settingsStore.update { $0.tokenSaverEnabled = false }
             }
@@ -2160,6 +2186,7 @@ public final class AppContext {
             settingsStore.update { $0.tokenSaverEnabled = true }
         }
         tokenSaverRuntimeAdmitted = true
+        publishTokenSaverRuntimeActiveCache(true)
         tokenSaverDistillServiceController.startIfEligible(
             session: session,
             settings: enabledSettings,
@@ -2179,15 +2206,32 @@ public final class AppContext {
     /// direct-settings seam; production and lifecycle tests always use the real gate.
     func isTokenSaverRuntimeActive(settings: AppSettings? = nil) -> Bool {
         let stored = settings ?? SettingsStore(db: db).load()
-        guard stored.tokenSaverEnabled else { return false }
-        if Self.isRunningUnitTests, agentSkillsHomeOverrideForTesting == nil {
-            return true
+        let active: Bool
+        if !stored.tokenSaverEnabled {
+            active = false
+        } else if Self.isRunningUnitTests, agentSkillsHomeOverrideForTesting == nil {
+            active = true
+        } else if tokenSaverRuntimeAdmitted,
+                  PrivateAccountSessionStore(repo: settingsRepo).load()?.user.subscribed == true {
+            active = true
+        } else {
+            active = false
         }
-        guard tokenSaverRuntimeAdmitted,
-              PrivateAccountSessionStore(repo: settingsRepo).load()?.user.subscribed == true else {
-            return false
-        }
-        return true
+        publishTokenSaverRuntimeActiveCache(active)
+        return active
+    }
+
+    /// Thread-safe read of Token Saver runtime gate for coordinator dual-channel.
+    nonisolated func tokenSaverRuntimeActiveSnapshot() -> Bool {
+        tokenSaverRuntimeActiveLock.lock()
+        defer { tokenSaverRuntimeActiveLock.unlock() }
+        return tokenSaverRuntimeActiveCached
+    }
+
+    private nonisolated func publishTokenSaverRuntimeActiveCache(_ active: Bool) {
+        tokenSaverRuntimeActiveLock.lock()
+        tokenSaverRuntimeActiveCached = active
+        tokenSaverRuntimeActiveLock.unlock()
     }
 
     private func currentTokenSaverAccountIdentity() -> TokenSaverAccountIdentity {
@@ -2470,6 +2514,16 @@ public final class AppContext {
             settings: settings,
             modelValidation: modelValidation
         )
+        // tool_out P0: promote lossless + typed crushers while Token Saver is live.
+        // Fail-open remains per-wave; exact-output catalog is unchanged.
+        if settings.tokenSaverEnabled {
+            TokenSaverWaveLiveRollout.activate(.waveA)
+            TokenSaverWaveLiveRollout.activate(.waveBCrushers)
+            TokenSaverWaveLiveRollout.activate(.waveBRecovery)
+            TokenSaverWaveALossless.defaults[.unchangedFileReread] = .active
+            TokenSaverWaveALossless.defaults[.repeatedLog] = .active
+            TokenSaverWaveALossless.defaults[.structuredJSON] = .active
+        }
         activatePreferredTokenSaverModelIfDownloaded(settings: settings, session: session)
     }
 
@@ -3592,52 +3646,74 @@ public final class AppContext {
     }
 
     func tokenSaverHumanizeSR1Response(_ response: String, provider: AgentProvider, threadId: AgentThreadID, runId: AgentRunID? = nil) async -> String {
-        // Token Saver owns every SR1 rewrite, including the deterministic fallback.
+        // Token Saver owns SR2/SR1 humanize and free-prose enforcement (dual-channel).
         // Check the live paid-feature gate before detection, fallback construction,
         // or resolving a client that may still be alive during toggle teardown.
         guard isTokenSaverRuntimeActive() else {
             return response
         }
-        guard SR1ResponseDetector.isSR1(response) else { return response }
 
+        let classified = SR2WirePolicy.classifyForTokenSaver(
+            response: response,
+            tokenSaverOn: true,
+            isSR1: { SR1ResponseDetector.isSR1($0) },
+            recoveryHandle: (runId?.value.uuidString ?? threadId.value.uuidString).replacingOccurrences(of: "-", with: "").prefix(16).description
+        )
+
+        // Free prose: coordinator dual-channel plan stores prose + writes wire stub
+        // as history. Translator returns UI prose (humanize is a no-op). Do not Distill.
+        if classified.wasEnforced {
+            // Best-effort store here too so humanize path alone still recovers;
+            // dualChannelPersistPlan will store again (content-addressed, same handle).
+            _ = try? ReversibleContentStore(db: db).store(classified.uiSourceText)
+            return classified.uiSourceText
+        }
+        guard classified.needsHumanize else {
+            return response
+        }
+
+        let wire = classified.providerHistoryText
         let targetLanguage = inferredUserLanguage(threadId: threadId)
-        let fallback = Self.fallbackHumanizeSR1(response, targetLanguage: targetLanguage)
+        let fallback = Self.fallbackHumanizeSR1(wire, targetLanguage: targetLanguage)
         guard let client = await currentDistillClientWaitingForStartup() else {
-            NSLog("RemoteCode Token Saver SR1 humanize fallback used (provider=\(provider.rawValue)): distill client unavailable (status=\(Self.describe(tokenSaverDistillServiceController.status)))")
-            recordTokenSaverSR1HumanizeSavings(sr1: response, humanized: fallback, provider: provider, threadId: threadId)
+            NSLog("RemoteCode Token Saver SR2/SR1 humanize fallback used (provider=\(provider.rawValue)): distill client unavailable (status=\(Self.describe(tokenSaverDistillServiceController.status)))")
+            recordTokenSaverSR1HumanizeSavings(sr1: wire, humanized: fallback, provider: provider, threadId: threadId)
             return fallback
         }
 
         let input = """
         TARGET_LANGUAGE: \(targetLanguage)
         USER_FACING_RULES:
-        Expand any SR1 variables such as #g1 using their definitions from SR1_RESPONSE before answering.
-        Never show unresolved # variables to the user.
+        Expand any SR1 variables such as #g1 using their definitions from the wire before answering.
+        Expand @sr2 / SR2 Opaque Agent IR fields (o/g/d/p/e/h) into natural language for the user.
+        Never show unresolved # variables or raw @sr2 field dumps to the user.
 
         SR1_RESPONSE:
-        \(response)
+        \(wire)
         """
         let request = DistillRequest(
             mode: .sr1Humanize,
             priority: .interactive,
             input: input,
-            maxOutputCharacters: max(1_200, min(12_000, response.count * 4))
+            maxOutputCharacters: max(1_200, min(12_000, wire.count * 4))
         )
         do {
             let translated = try await client.distill(request).output.trimmingCharacters(in: .whitespacesAndNewlines)
-            let expanded = SR1ResponseDetector.expandVariables(in: translated, from: response)
+            let expanded = SR1ResponseDetector.expandVariables(in: translated, from: wire)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let humanized: String
-            if !expanded.isEmpty, !SR1ResponseDetector.isSR1(expanded) {
+            if !expanded.isEmpty,
+               !SR1ResponseDetector.isSR1(expanded),
+               !SR2WirePolicy.isSR2(expanded) {
                 humanized = expanded
             } else {
                 humanized = fallback
             }
-            recordTokenSaverSR1HumanizeSavings(sr1: response, humanized: humanized, provider: provider, threadId: threadId)
+            recordTokenSaverSR1HumanizeSavings(sr1: wire, humanized: humanized, provider: provider, threadId: threadId)
             return humanized
         } catch {
-            NSLog("RemoteCode Token Saver SR1 humanize fallback used (provider=\(provider.rawValue)): \(error)")
-            recordTokenSaverSR1HumanizeSavings(sr1: response, humanized: fallback, provider: provider, threadId: threadId)
+            NSLog("RemoteCode Token Saver SR2/SR1 humanize fallback used (provider=\(provider.rawValue)): \(error)")
+            recordTokenSaverSR1HumanizeSavings(sr1: wire, humanized: fallback, provider: provider, threadId: threadId)
             return fallback
         }
     }
@@ -3736,6 +3812,44 @@ public final class AppContext {
     private static func fallbackHumanizeSR1(_ response: String, targetLanguage: String) -> String {
         let portuguese = targetLanguage.localizedCaseInsensitiveContains("Portuguese")
         let spanish = targetLanguage.localizedCaseInsensitiveContains("Spanish")
+
+        // SR2 Opaque Agent IR (T-FF-01 fail-open without Fieldfare): expand o:/p:/e: fields.
+        if SR2WirePolicy.isSR2(response) {
+            var outcomes: [String] = []
+            var paths: [String] = []
+            var errors: [String] = []
+            for raw in response.split(whereSeparator: \.isNewline) {
+                let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !line.isEmpty else { continue }
+                let lower = line.lowercased()
+                if lower.hasPrefix("@sr2") { continue }
+                if lower.hasPrefix("o:") || lower.hasPrefix("o=") {
+                    let v = String(line.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                    if !v.isEmpty, v != "cont" { outcomes.append(v) }
+                    else if v == "cont" {
+                        if portuguese { outcomes.append("Continuando (tools).") }
+                        else if spanish { outcomes.append("Continuando (tools).") }
+                        else { outcomes.append("Continuing (tools).") }
+                    }
+                } else if lower.hasPrefix("p:") {
+                    let v = String(line.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                    if !v.isEmpty { paths.append(v) }
+                } else if lower.hasPrefix("e:") {
+                    let v = String(line.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                    if !v.isEmpty { errors.append(v) }
+                }
+                // g/d/h are ops chrome in fail-open UI.
+            }
+            var pieces = outcomes
+            if !errors.isEmpty { pieces.append(contentsOf: errors.prefix(2)) }
+            if !paths.isEmpty { pieces.append(paths.joined(separator: ", ")) }
+            if pieces.isEmpty {
+                if portuguese { return "Nao consegui expandir a resposta SR2." }
+                if spanish { return "No pude expandir la respuesta SR2." }
+                return "I could not expand the SR2 response."
+            }
+            return pieces.joined(separator: "\n")
+        }
 
         // Prefer O (outcome) as the user-facing answer. Do not rename every
         // prefix to Estado/Contexto — that is not human and wastes UI tokens.
