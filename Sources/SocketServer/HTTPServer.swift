@@ -2494,12 +2494,21 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // connection teardown can nil it and markClosed without a cycle.
             final class StickyBaselineBox: @unchecked Sendable {
                 let gate = OutboundPressureBaselineGate()
-                var emitBody: (@Sendable () -> Void)?
+                private let lock = NSLock()
+                private var emitBody: (@Sendable () -> Void)?
+                func setEmitBody(_ body: (@Sendable () -> Void)?) {
+                    lock.lock(); defer { lock.unlock() }
+                    emitBody = body
+                }
                 func close() {
                     gate.markClosed()
-                    emitBody = nil
+                    setEmitBody(nil)
                 }
-                func emit() { emitBody?() }
+                func emit() {
+                    let body: (@Sendable () -> Void)?
+                    lock.lock(); body = emitBody; lock.unlock()
+                    body?()
+                }
                 func scheduleFlush() {
                     guard gate.armFlushIfNeeded() else { return }
                     DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.05) { [weak self] in
@@ -2512,7 +2521,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 }
             }
             let stickyBaseline = StickyBaselineBox()
-            stickyBaseline.emitBody = { [weak self, weak stickyBaseline] in
+            stickyBaseline.setEmitBody { [weak self, weak stickyBaseline] in
                 guard let self, let stickyBaseline else { return }
                 let gate = stickyBaseline.gate
                 gate.markPending()

@@ -607,12 +607,25 @@ enum AppDiagnostics {
             case .normal, .unknown: return .normal
             }
         }()
+        // Host vs provider-tree pressure: use app footprint vs provider-tree RSS when available.
+        let providerLevel: PressureLevel = {
+            guard sample.isComplete,
+                  let appKB = sample.appFootprintKB,
+                  let providerKB = sample.providerRSSKB,
+                  appKB > 0 else {
+                return hostLevel
+            }
+            let fraction = Double(providerKB) / Double(appKB + providerKB)
+            if fraction >= 0.75 { return .critical }
+            if fraction >= 0.50 { return .warning }
+            return .normal
+        }()
         // Accounting completeness ≠ physical capacity qualification.
         CapacityUXStatusStore.shared.publish(
             CapacityUXStatus.from(
                 hardwareTierName: sample.profile.name,
                 hostPressure: hostLevel,
-                providerTreePressure: hostLevel,
+                providerTreePressure: providerLevel,
                 envelopeMeasured: false, // physical canary not claimed from heartbeat alone
                 beyondEnvelope: sample.pressureDecision == .critical,
                 accountingAvailable: sample.isComplete,

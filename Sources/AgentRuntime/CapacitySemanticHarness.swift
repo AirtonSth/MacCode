@@ -575,9 +575,10 @@ public enum CapacitySemanticHarness {
                 return false
             }
         }
-        // Every fault must be either truly applied or explicitly skipped unreachable.
-        let allFaultsApplied = (appliedFaultIndices.count + skippedFaultIndices.count) == schedule.faults.count
+        // Qualification requires true application (not skip accounting).
+        let allFaultsApplied = appliedFaultIndices.count == schedule.faults.count
             && unknownFaultKinds.isEmpty
+            && skippedFaultIndices.isEmpty
 
         return CapacityHarnessRunResult(
             nodes: nodes,
