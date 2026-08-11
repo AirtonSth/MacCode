@@ -128,8 +128,22 @@ public final class TokenSaverMemoryOnlyProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var memoryBlobs: [String: Data] = [:]
     private(set) public var refusedProductionPaths: [String] = []
+    private let blobLimit: Int
+    private let refusedPathLimit: Int
 
-    public init() {}
+    /// Peak distinct memory-only probe envelopes. Synthetic id churn would
+    /// otherwise pin unbounded Data blobs for the life of the probe instance.
+    public static let memoryBlobCountLimit = 32
+    /// Peak retained refused production path strings (diagnostics only).
+    public static let refusedPathCountLimit = 64
+
+    public init(
+        memoryBlobCountLimit: Int = TokenSaverMemoryOnlyProbe.memoryBlobCountLimit,
+        refusedPathCountLimit: Int = TokenSaverMemoryOnlyProbe.refusedPathCountLimit
+    ) {
+        self.blobLimit = max(1, memoryBlobCountLimit)
+        self.refusedPathLimit = max(1, refusedPathCountLimit)
+    }
 
     /// Production path patterns that must never be written by the probe.
     public static let forbiddenPathSubstrings: [String] = [
@@ -146,17 +160,49 @@ public final class TokenSaverMemoryOnlyProbe: @unchecked Sendable {
         return Self.forbiddenPathSubstrings.contains { lower.contains($0.lowercased()) }
     }
 
+    /// Pure insert/evict for memory blob maps. Keeps `id`; drops arbitrary other
+    /// keys when over `countLimit`.
+    public static func noteMemoryBlob(
+        _ blobs: inout [String: Data],
+        id: String,
+        bytes: Data,
+        countLimit: Int = memoryBlobCountLimit
+    ) {
+        blobs[id] = bytes
+        let cap = max(1, countLimit)
+        while blobs.count > cap {
+            if let victim = blobs.keys.first(where: { $0 != id }) ?? blobs.keys.first {
+                blobs.removeValue(forKey: victim)
+            } else {
+                break
+            }
+        }
+    }
+
+    /// Pure tail-cap for refused path diagnostics (keeps newest).
+    public static func noteRefusedPath(
+        _ paths: inout [String],
+        path: String,
+        countLimit: Int = refusedPathCountLimit
+    ) {
+        paths.append(path)
+        let cap = max(1, countLimit)
+        if paths.count > cap {
+            paths.removeFirst(paths.count - cap)
+        }
+    }
+
     /// Attempt to persist probe envelope. Production-like paths are refused; memory-only succeeds.
     @discardableResult
     public func storeEnvelope(id: String, bytes: Data, pathHint: String?) -> Bool {
         if let pathHint, isForbiddenProductionPath(pathHint) {
             lock.lock()
-            refusedProductionPaths.append(pathHint)
+            Self.noteRefusedPath(&refusedProductionPaths, path: pathHint, countLimit: refusedPathLimit)
             lock.unlock()
             return false
         }
         lock.lock()
-        memoryBlobs[id] = bytes
+        Self.noteMemoryBlob(&memoryBlobs, id: id, bytes: bytes, countLimit: blobLimit)
         lock.unlock()
         return true
     }

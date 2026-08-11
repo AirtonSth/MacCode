@@ -287,10 +287,18 @@ public enum ModelChecksumPolicy {
 /// has not changed. Only `needsRehash` decides whether the cached entry is
 /// still valid; the cache itself performs no I/O.
 public final class ModelChecksumCache: @unchecked Sendable {
+    /// Peak distinct model file URLs retained. Path churn under Models/ would
+    /// otherwise pin unbounded (size, mtime, sha256) rows process-wide; 32
+    /// matches discovery / probe cache order of magnitude.
+    public static let countLimit = 32
+
     private var entries: [URL: ModelChecksumCacheEntry] = [:]
     private let lock = NSLock()
+    private let limit: Int
 
-    public init() {}
+    public init(countLimit: Int = ModelChecksumCache.countLimit) {
+        self.limit = max(1, countLimit)
+    }
 
     public func entry(for url: URL) -> ModelChecksumCacheEntry? {
         lock.lock()
@@ -301,7 +309,32 @@ public final class ModelChecksumCache: @unchecked Sendable {
     public func store(_ entry: ModelChecksumCacheEntry, for url: URL) {
         lock.lock()
         defer { lock.unlock() }
+        Self.noteEntry(&entries, url: url, entry: entry, countLimit: limit)
+    }
+
+    /// Test-only: retained URL count under the lock.
+    public var countForTesting: Int {
+        lock.lock(); defer { lock.unlock() }
+        return entries.count
+    }
+
+    /// Pure insert/evict for unit tests. Keeps `url`; drops arbitrary other
+    /// keys when over `countLimit`.
+    public static func noteEntry(
+        _ entries: inout [URL: ModelChecksumCacheEntry],
+        url: URL,
+        entry: ModelChecksumCacheEntry,
+        countLimit: Int = ModelChecksumCache.countLimit
+    ) {
         entries[url] = entry
+        let cap = max(1, countLimit)
+        while entries.count > cap {
+            if let victim = entries.keys.first(where: { $0 != url }) ?? entries.keys.first {
+                entries.removeValue(forKey: victim)
+            } else {
+                break
+            }
+        }
     }
 }
 

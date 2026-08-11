@@ -66,7 +66,7 @@ final class AgentThreadReadV1Tests: XCTestCase {
             ["response_version": .number(1), "thread_id": .string(tid), "include_event_watermark": .bool(true), "event_limit": .number(1.5)],
             ["response_version": .number(1), "thread_id": .string(tid), "include_event_watermark": .bool(true), "event_limit": .number(Double.infinity)],
             ["response_version": .number(1), "thread_id": .string(tid), "include_event_watermark": .bool(true), "max_bytes": .number(1024)],
-            ["response_version": .number(1), "thread_id": .string(tid), "include_event_watermark": .bool(true), "max_bytes": .number(Double(512 * 1024 + 1))],
+            ["response_version": .number(1), "thread_id": .string(tid), "include_event_watermark": .bool(true), "max_bytes": .number(Double(256 * 1024 + 1))],
             ["response_version": .number(1), "thread_id": .string(tid), "include_event_watermark": .bool(true), "max_bytes": .string("65536")],
             ["response_version": .number(1), "thread_id": .string(tid), "include_event_watermark": .bool(true), "max_bytes": .number(Double.nan)],
         ]
@@ -85,8 +85,10 @@ final class AgentThreadReadV1Tests: XCTestCase {
             "response_version": .number(1),
         ]))
         XCTAssertEqual(defaults.threadId.value, tid)
-        XCTAssertEqual(defaults.eventLimit, 500)
-        XCTAssertEqual(defaults.maxBytes, 512 * 1024)
+        XCTAssertEqual(defaults.eventLimit, AgentThreadReadV1.defaultEventLimit)
+        XCTAssertEqual(defaults.eventLimit, 128)
+        XCTAssertEqual(defaults.maxBytes, AgentThreadReadV1.maxMaxBytes)
+        XCTAssertEqual(defaults.maxBytes, 128 * 1024)
 
         let custom = try XCTUnwrap(try AgentThreadReadV1.parseCaps([
             "thread_id": .string(tid.uuidString),
@@ -187,7 +189,7 @@ final class AgentThreadReadV1Tests: XCTestCase {
             encodedEvents: encoded,
             sourceHadOlderEvents: true,
             blockedEvent: nil,
-            maxBytes: 512 * 1024,
+            maxBytes: AgentThreadReadV1.maxMaxBytes,
             eventWatermark: 1,
             responseId: id,
             measureEnvelope: { self.measureEnvelope(id: id, result: $0) }
@@ -314,7 +316,7 @@ final class AgentThreadReadV1Tests: XCTestCase {
                 "include_event_watermark": .bool(true),
                 "response_version": .number(1),
                 "event_limit": .number(2),
-                "max_bytes": .number(Double(512 * 1024)),
+                "max_bytes": .number(Double(AgentThreadReadV1.maxMaxBytes)),
             ]
         ))
 
@@ -337,12 +339,12 @@ final class AgentThreadReadV1Tests: XCTestCase {
         XCTAssertEqual(body["blocked_event"], .null)
         XCTAssertEqual(router.readAgentThreadMirrorSnapshotCallCount, 1)
         XCTAssertEqual(router.lastMirrorSnapshotEventRowLimit, 2)
-        XCTAssertEqual(router.lastMirrorSnapshotMaxPayloadBytes, Int64(512 * 1024))
+        XCTAssertEqual(router.lastMirrorSnapshotMaxPayloadBytes, Int64(AgentThreadReadV1.maxMaxBytes))
 
         // Full response must fit the requested max_bytes.
         let envelope = JSONRPCResponse(id: .number(1), result: response.result)
         let size = try encoder.encode(envelope).count
-        XCTAssertLessThanOrEqual(size, 512 * 1024)
+        XCTAssertLessThanOrEqual(size, AgentThreadReadV1.maxMaxBytes)
     }
 
     func test_v1MalformedParamsNeverCallRouter() async {
@@ -485,7 +487,7 @@ final class AgentThreadReadV1Tests: XCTestCase {
                 "include_event_watermark": .bool(true),
                 "response_version": .number(1),
                 "event_limit": .number(3),
-                "max_bytes": .number(Double(512 * 1024)),
+                "max_bytes": .number(Double(AgentThreadReadV1.maxMaxBytes)),
             ]
         ))
         let events = try XCTUnwrap(response.result?.objectValue?["events"]?.arrayValue)
@@ -532,4 +534,41 @@ final class AgentThreadReadV1Tests: XCTestCase {
             .objectValue?["error"]?.objectValue?["message"]?.stringValue
         XCTAssertEqual(lastMessage?.hasPrefix("e5-"), true)
     }
+
+    func test_defaultEventLimitIs128() {
+        XCTAssertEqual(AgentThreadReadV1.defaultEventLimit, 128)
+        XCTAssertEqual(AgentThreadReadV1.maxEventLimit, 128)
+        XCTAssertEqual(AgentThreadReadV1.defaultEventLimit, AgentThreadReadV1.maxEventLimit)
+    }
+
+    func test_retentionEstimate_256EventsTo128Window() {
+        let uncapped = 256 // prior default/max event limit
+        let limit = AgentThreadReadV1.defaultEventLimit
+        let reduction = Double(uncapped - limit) / Double(uncapped)
+        XCTAssertGreaterThan(reduction, 0.49)
+        XCTAssertEqual(limit, 128)
+        // Basis: typical agent stream event payload ≈ 1KB after SQLite decode +
+        // envelope encode work. Prior default/max was 256 events per read.
+        // 256 × 1KB ≈ 256KB → 128 × 1KB ≈ 128KB (−50%) peak decode window.
+        // Byte envelope still hard-caps at maxMaxBytes (128 KiB).
+        let perEvent = 1_024
+        XCTAssertEqual(uncapped * perEvent, 262_144)
+        XCTAssertEqual(limit * perEvent, 131_072)
+    }
+
+
+    func test_retentionEstimate_maxMaxBytes_256KiBTo128KiB() {
+        let prior = 256 * 1_024
+        let limit = AgentThreadReadV1.maxMaxBytes
+        let reduction = Double(prior - limit) / Double(prior)
+        XCTAssertGreaterThan(reduction, 0.49)
+        XCTAssertEqual(limit, 128 * 1_024)
+        XCTAssertEqual(AgentThreadReadV1.defaultMaxBytes, limit)
+
+        // Basis: peak JSON-RPC agent.thread.read v1 envelope budget.
+        // 256 KiB → 128 KiB (−50%) per read response.
+        XCTAssertEqual(prior, 262_144)
+        XCTAssertEqual(limit, 131_072)
+    }
+
 }

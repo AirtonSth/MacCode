@@ -123,6 +123,66 @@ final class AgentMessageMarkdownTests: XCTestCase {
         )
     }
 
+    func test_inlineCacheCountLimitIs128() {
+        XCTAssertEqual(AgentMessageMarkdown.inlineCacheCountLimit, 128)
+        XCTAssertEqual(AgentMessageMarkdown.blocksCacheCountLimit, 128)
+        // Both process-wide markdown caches share the agent surface ceiling.
+        XCTAssertEqual(
+            AgentMessageMarkdown.inlineCacheCountLimit,
+            AgentMessageMarkdown.blocksCacheCountLimit
+        )
+    }
+
+    func test_markdownCacheCostLimits_are128KiB() {
+        XCTAssertEqual(AgentMessageMarkdown.blocksCacheCostLimit, 128 * 1_024)
+        XCTAssertEqual(AgentMessageMarkdown.inlineCacheCostLimit, 128 * 1_024)
+    }
+
+    func test_retentionEstimate_markdownCost_256KiBTo128KiBEach() {
+        let prior = 256 * 1_024
+        let blocks = AgentMessageMarkdown.blocksCacheCostLimit
+        let inline = AgentMessageMarkdown.inlineCacheCostLimit
+        let reductionBlocks = Double(prior - blocks) / Double(prior)
+        let reductionInline = Double(prior - inline) / Double(prior)
+        XCTAssertGreaterThan(reductionBlocks, 0.49)
+        XCTAssertGreaterThan(reductionInline, 0.49)
+        XCTAssertEqual(blocks, 128 * 1_024)
+        XCTAssertEqual(inline, 128 * 1_024)
+
+        // Basis: process-wide NSCache totalCostLimit for agent markdown paint.
+        // Prior: 2×256 KiB = 512 KiB → 2×128 KiB = 256 KiB (−50%) combined peak budget.
+        XCTAssertEqual(prior * 2, 512 * 1_024)
+        XCTAssertEqual(blocks + inline, 256 * 1_024)
+    }
+
+    func test_retentionEstimate_256InlineMarkdownTo128Window() {
+        let uncapped = 256 // prior inlineCache.countLimit
+        let limit = AgentMessageMarkdown.inlineCacheCountLimit
+        let reduction = Double(uncapped - limit) / Double(uncapped)
+        XCTAssertGreaterThan(reduction, 0.49)
+        XCTAssertEqual(limit, 128)
+        // Basis: modest attributed inline parse ≈ 1KB (long code spans scale
+        // with cost limit). Prior countLimit was 256.
+        // 256 × 1KB ≈ 256KB → 128 × 1KB ≈ 128KB (−50%).
+        let perEntry = 1_024
+        XCTAssertEqual(uncapped * perEntry, 262_144)
+        XCTAssertEqual(limit * perEntry, 131_072)
+    }
+
+    func test_retentionEstimate_256BlocksMarkdownTo128Window() {
+        let uncapped = 256 // prior blocksCache.countLimit
+        let limit = AgentMessageMarkdown.blocksCacheCountLimit
+        let reduction = Double(uncapped - limit) / Double(uncapped)
+        XCTAssertGreaterThan(reduction, 0.49)
+        XCTAssertEqual(limit, 128)
+        // Basis: modest finished-message block tree ≈ 2KB (large docs scale
+        // with cost limit). Prior countLimit was 256.
+        // 256 × 2KB ≈ 512KB → 128 × 2KB ≈ 256KB (−50%).
+        let perEntry = 2_048
+        XCTAssertEqual(uncapped * perEntry, 524_288)
+        XCTAssertEqual(limit * perEntry, 262_144)
+    }
+
     /// cache:true still memoizes identical finished content (regression pin for F3).
     func test_blocks_cacheTrue_stillMemoizesFinishedContent() {
         let probe = "R4-B finished body memo \(UUID().uuidString)"

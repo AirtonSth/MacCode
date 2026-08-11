@@ -183,6 +183,11 @@ enum LiveActivitySummary {
 /// background generation task. A lock keeps that honest without forcing the
 /// publish path to await.
 final class LiveActivitySummaryStore: @unchecked Sendable {
+    /// Peak distinct card keys retained in summary + attempt maps. Thread/
+    /// multi-active card churn would otherwise pin unbounded summary sentences
+    /// process-wide until `reset`; 32 matches discovery-cache order.
+    static let countLimit = 32
+
     private struct Entry {
         let text: String
         let fingerprint: String
@@ -194,6 +199,40 @@ final class LiveActivitySummaryStore: @unchecked Sendable {
     /// Fingerprints already in flight or already attempted, so a source that
     /// the model declines is not retried on every single publish.
     private var attempts: [String: (fingerprint: String, at: Date)] = [:]
+    private let limit: Int
+
+    init(countLimit: Int = LiveActivitySummaryStore.countLimit) {
+        self.limit = max(1, countLimit)
+    }
+
+    /// Pure insert/evict for card-keyed maps. Keeps `key`; drops arbitrary other
+    /// keys when over `countLimit`. Extracted for unit tests.
+    static func noteCardKeyedEntry<Value>(
+        _ map: inout [String: Value],
+        key: String,
+        value: Value,
+        countLimit: Int = LiveActivitySummaryStore.countLimit
+    ) {
+        map[key] = value
+        let cap = max(1, countLimit)
+        while map.count > cap {
+            if let victim = map.keys.first(where: { $0 != key }) ?? map.keys.first {
+                map.removeValue(forKey: victim)
+            } else {
+                break
+            }
+        }
+    }
+
+    /// Test-only: retained summary entry count.
+    var entryCountForTesting: Int {
+        lock.withLock { entries.count }
+    }
+
+    /// Test-only: retained attempt count.
+    var attemptCountForTesting: Int {
+        lock.withLock { attempts.count }
+    }
 
     /// Cached summary for this exact source, or nil when the source changed.
     func summary(for source: LiveActivitySummary.Source) -> String? {
@@ -223,17 +262,27 @@ final class LiveActivitySummaryStore: @unchecked Sendable {
                now.timeIntervalSince(attempt.at) < minimumInterval {
                 return false
             }
-            attempts[source.key] = (fingerprint: source.fingerprint, at: now)
+            Self.noteCardKeyedEntry(
+                &attempts,
+                key: source.key,
+                value: (fingerprint: source.fingerprint, at: now),
+                countLimit: limit
+            )
             return true
         }
     }
 
     func store(_ text: String, for source: LiveActivitySummary.Source, now: Date = Date()) {
         lock.withLock {
-            entries[source.key] = Entry(
-                text: text,
-                fingerprint: source.fingerprint,
-                generatedAt: now
+            Self.noteCardKeyedEntry(
+                &entries,
+                key: source.key,
+                value: Entry(
+                    text: text,
+                    fingerprint: source.fingerprint,
+                    generatedAt: now
+                ),
+                countLimit: limit
             )
         }
     }

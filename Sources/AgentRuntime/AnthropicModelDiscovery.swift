@@ -77,9 +77,39 @@ public enum AnthropicModelDiscovery {
     // Actor-isolated mutable cache; avoids data races under Swift 6 strict concurrency.
     private static let _cache = ModelDiscoveryCache()
 
+    /// Peak distinct credential fingerprints retained in the process-wide
+    /// Anthropic model-list cache. Key churn (API key / OAuth rotation, multi
+    /// account) would otherwise pin unbounded model arrays process-wide; 32
+    /// matches Grok ACP / catalog verification cache order of magnitude.
+    public static let modelDiscoveryCacheCountLimit = 32
+
+    /// Pure insert/evict for the Anthropic model discovery cache. Keeps `key`;
+    /// drops arbitrary other keys when over `countLimit`. Extracted for unit tests.
+    public static func noteModelDiscoveryCacheEntry(
+        _ entries: inout [String: ModelDiscoveryCacheEntry],
+        key: String,
+        entry: ModelDiscoveryCacheEntry,
+        countLimit: Int = modelDiscoveryCacheCountLimit
+    ) {
+        entries[key] = entry
+        let cap = max(1, countLimit)
+        while entries.count > cap {
+            if let victim = entries.keys.first(where: { $0 != key }) ?? entries.keys.first {
+                entries.removeValue(forKey: victim)
+            } else {
+                break
+            }
+        }
+    }
+
     // For testing only: clears the static in-process cache so each test starts clean.
     static func _resetCacheForTesting() async {
         await _cache.reset()
+    }
+
+    /// Test-only: number of retained credential fingerprints in the shared cache.
+    static func _cacheCountForTesting() async -> Int {
+        await _cache.countForTesting
     }
 
     /// Returns live models or empty on failure. Callers that need the
@@ -243,10 +273,16 @@ actor ModelDiscoveryCache {
     }
 
     func store(_ e: ModelDiscoveryCacheEntry, for key: String) {
-        entries[key] = e
+        AnthropicModelDiscovery.noteModelDiscoveryCacheEntry(
+            &entries,
+            key: key,
+            entry: e
+        )
     }
 
     func reset() {
         entries.removeAll()
     }
+
+    var countForTesting: Int { entries.count }
 }

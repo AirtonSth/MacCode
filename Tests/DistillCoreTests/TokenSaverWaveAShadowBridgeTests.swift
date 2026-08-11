@@ -84,13 +84,30 @@ final class TokenSaverWaveAShadowBridgeTests: XCTestCase {
 
     func test_exactReplayStateIsBoundedAcrossDistinctBindings() {
         TokenSaverWaveAShadowBridge.resetReplayStateForTesting()
-        for index in 0..<2_100 {
+        let limit = TokenSaverWaveAShadowBridge.maxReplayKeys
+        for index in 0..<(limit + 50) {
             TokenSaverWaveAShadowBridge.observeExactReplay(
                 bindingDigest: "binding-\(index)",
                 toolName: "Bash",
                 current: Data("payload".utf8)
             )
         }
-        XCTAssertLessThanOrEqual(TokenSaverWaveAShadowBridge.replayStateCountForTesting(), 2_048)
+        XCTAssertEqual(TokenSaverWaveAShadowBridge.replayStateCountForTesting(), limit)
+        XCTAssertEqual(TokenSaverWaveAShadowBridge.maxReplayKeys, 128)
+    }
+
+
+    func test_retentionEstimate_256KeysTo128Window() {
+        let uncapped = 256 // prior maxReplayKeys
+        let limit = TokenSaverWaveAShadowBridge.maxReplayKeys
+        let reduction = Double(uncapped - limit) / Double(uncapped)
+        XCTAssertGreaterThan(reduction, 0.49)
+        XCTAssertEqual(limit, 128)
+        // Basis: modest tool prior ~4KB (pathological multi-MB dumps scale
+        // with the same key ceiling).
+        // 256 × 4KB ≈ 1MB → 128 × 4KB ≈ 512KB (−50%).
+        let perKey = 4_096
+        XCTAssertEqual(uncapped * perKey, 1_048_576)
+        XCTAssertEqual(limit * perKey, 524_288)
     }
 }

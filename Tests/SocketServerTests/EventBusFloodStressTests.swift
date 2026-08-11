@@ -6,7 +6,7 @@ import XCTest
 /// WHY: an unbounded recent buffer is a memory DoS vector. A single fast publisher
 /// can grow recent[] and recentBytes without limit if trimRecent() is not invoked
 /// on every publish path.  These tests drive EventBus directly (in-process) with
-/// >512 events / >2 MB of payload and assert:
+/// >512 events / >1 MB of payload and assert:
 ///   (a) recent count never exceeds recentLimit (capacity DoS prevention)
 ///   (b) accumulated bytes never exceed recentByteLimit (byte DoS prevention)
 ///   (c) recentEvents() sets requiresBaseline when it cannot replay all events
@@ -41,28 +41,30 @@ final class EventBusFloodStressTests: XCTestCase {
     /// Publish events whose total encoded size exceeds recentByteLimit and assert
     /// recentBytes stays at or below the cap.
     func test_flood_recentBytesStayAtOrBelowByteLimit() {
-        let byteLimit = 2 * 1024 * 1024   // 2 MB — matches the production default
+        let byteLimit = EventBus.defaultRecentByteLimit  // 128 KiB production default
         let bus = EventBus(recentLimit: 4096, recentByteLimit: byteLimit)
 
-        // each payload ~4 KB; 600 events = ~2.4 MB raw, well above the 2 MB cap
+        // each payload ~4 KB; 400 events = ~1.6 MB raw, well above the 128 KiB cap
         let chunk = String(repeating: "x", count: 4_000)
-        for i in 0..<600 {
+        for i in 0..<400 {
             bus.publish(kind: "flood.\(i)", payload: .string(chunk))
         }
 
         let bytes = bus.recentBytesForTests
         XCTAssertLessThanOrEqual(bytes, byteLimit,
             "recentBytes (\(bytes)) exceeds recentByteLimit (\(byteLimit)); " +
-            "a 2 MB flood must not pin more than 2 MB in the in-process buffer")
+            "a multi-MB flood must not pin more than the production byte budget")
     }
 
     // MARK: - Both caps simultaneously (default limits, >512 events)
 
-    /// Publish 600 events (> default recentLimit=512) with small payloads and
+    /// Publish 600 events (> default recentLimit) with small payloads and
     /// assert both count and byte invariants hold simultaneously.
     func test_flood_defaultLimits_countAndByteBothBounded() {
         // use default limits to verify production config is correctly wired
-        let bus = EventBus()   // recentLimit=512, recentByteLimit=2 MB
+        let bus = EventBus()
+        let limit = EventBus.defaultRecentLimit
+        let byteLimit = EventBus.defaultRecentByteLimit
 
         for i in 0..<600 {
             bus.publish(kind: "e\(i)", payload: .number(Double(i)))
@@ -71,10 +73,10 @@ final class EventBusFloodStressTests: XCTestCase {
         let count = bus.recentCountForTests
         let bytes = bus.recentBytesForTests
 
-        XCTAssertLessThanOrEqual(count, 512,
-            "recent count (\(count)) exceeds default recentLimit=512 after 600-event flood")
-        XCTAssertLessThanOrEqual(bytes, 2 * 1024 * 1024,
-            "recentBytes (\(bytes)) exceeds default recentByteLimit=2MB after 600-event flood")
+        XCTAssertLessThanOrEqual(count, limit,
+            "recent count (\(count)) exceeds default recentLimit=\(limit) after 600-event flood")
+        XCTAssertLessThanOrEqual(bytes, byteLimit,
+            "recentBytes (\(bytes)) exceeds default recentByteLimit after 600-event flood")
     }
 
     // MARK: - requiresBaseline flag
@@ -83,7 +85,7 @@ final class EventBusFloodStressTests: XCTestCase {
     /// requiresBaseline so iOS knows it cannot replay from cache alone and must
     /// fetch a fresh snapshot instead of showing partial/stale state.
     func test_flood_recentEvents_requiresBaselineWhenCapExceeded() {
-        let bus = EventBus(recentLimit: 512, recentByteLimit: 2 * 1024 * 1024)
+        let bus = EventBus(recentLimit: 512, recentByteLimit: EventBus.defaultRecentByteLimit)
 
         // each payload ~3 KB; 100 events = ~300 KB stored
         let chunk = String(repeating: "y", count: 3_000)
@@ -126,4 +128,39 @@ final class EventBusFloodStressTests: XCTestCase {
             "oldest events (seq <= \(limit - 1)) must be evicted first; " +
             "keeping stale state over fresh state defeats the replay buffer's purpose")
     }
+
+    func test_defaultRecentLimitIs128() {
+        XCTAssertEqual(EventBus.defaultRecentLimit, 128)
+        XCTAssertEqual(EventBus.defaultRecentByteLimit, 128 * 1024)
+    }
+
+    func test_retentionEstimate_256EventsTo128Window() {
+        let uncapped = 256 // prior defaultRecentLimit
+        let limit = EventBus.defaultRecentLimit
+        let reduction = Double(uncapped - limit) / Double(uncapped)
+        XCTAssertGreaterThan(reduction, 0.49)
+        XCTAssertEqual(limit, 128)
+        // Basis: typical EventBus payload + encode-cache entry ≈ 1KB.
+        // Prior default 256 events (encode cache mirrors the ring).
+        // 256 × 1KB ≈ 256KB → 128 × 1KB ≈ 128KB (−50%) for ring+cache keys;
+        // recentByteLimit (128 KiB) still bounds large payloads.
+        let perEvent = 1_024
+        XCTAssertEqual(uncapped * perEvent, 262_144)
+        XCTAssertEqual(limit * perEvent, 131_072)
+    }
+
+    func test_retentionEstimate_recentByteLimit_256KiBTo128KiB() {
+        let prior = 256 * 1024 // prior defaultRecentByteLimit
+        let limit = EventBus.defaultRecentByteLimit
+        let reduction = Double(prior - limit) / Double(prior)
+        XCTAssertGreaterThan(reduction, 0.49)
+        XCTAssertEqual(limit, 128 * 1024)
+
+        // Basis: peak in-process EventBus recent[] payload retention.
+        // 256 KiB → 128 KiB (−50%) after count already at 128.
+        XCTAssertEqual(prior, 262_144)
+        XCTAssertEqual(limit, 131_072)
+        XCTAssertLessThan(limit, prior)
+    }
+
 }

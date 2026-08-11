@@ -2131,16 +2131,24 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         }
     }
 
+    /// Default row window for activity/recent receipt reads (global or selected-thread).
+    /// Was 10_000, then 500, then 256; now 128 to match session-map / compact agent windows.
+    /// Nested workers use `defaultChildActivityReceiptLimit` (must stay below this).
+    public static let defaultActivityReceiptLimit = 128
+
     /// Read-only recent admission receipts for activity surfaces (Subagents badge/panel).
     /// Newest `lifecycleUpdatedAt` first. Does not mutate ledger or lifecycle state.
-    public func recentReceipts(limit: Int = 10_000) throws -> [AgentOrchestrationAdmissionReceipt] {
+    public func recentReceipts(
+        limit: Int = AgentOrchestrationRuntime.defaultActivityReceiptLimit
+    ) throws -> [AgentOrchestrationAdmissionReceipt] {
         try repository.receipts(limit: max(1, limit))
     }
 
     /// Default bound for nested-worker (`parentReceiptId`) rows in a thread-scoped
     /// activity fetch. Separate from the selected-thread window so children cannot
-    /// starve the thread's own history (and vice versa).
-    public static let defaultChildActivityReceiptLimit = 2_000
+    /// starve the thread's own history (and vice versa). Must stay strictly below
+    /// `defaultActivityReceiptLimit`. Was 2_000, then 256, then 128; now 64.
+    public static let defaultChildActivityReceiptLimit = 64
 
     /// Bounded activity read used by the Subagents surface (global window).
     ///
@@ -2148,8 +2156,8 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     /// Reconcile a dead owner, missing owner, expired deadline, or inactive
     /// ancestor to persisted `unknown` before returning the snapshot so every
     /// app process and subsequent launch observes the same honest state.
-    /// The same UI history bound limits every two-second poll; it intentionally
-    /// exceeds the older 500-row launch-reconciliation window.
+    /// The global default remains large enough for launch-style reconciliation.
+    /// High-frequency UI polls use the thread-scoped overload and its bounded default.
     ///
     /// Prefer `activityReceipts(threadIds:limit:)` for the live badge poll — the
     /// global form still mutates every accepted row in the window and is kept
@@ -2177,7 +2185,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     /// ledger append). Periodic mutating calls still persist demotions.
     public func activityReceipts(
         threadIds: Set<AgentThreadID>,
-        limit: Int = 10_000,
+        limit: Int = AgentOrchestrationRuntime.defaultActivityReceiptLimit,
         childRecordLimit: Int = AgentOrchestrationRuntime.defaultChildActivityReceiptLimit,
         persistLifecycleReconciliation: Bool = true
     ) throws -> [AgentOrchestrationAdmissionReceipt] {

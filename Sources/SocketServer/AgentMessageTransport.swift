@@ -9,11 +9,20 @@ import Persistence
 /// escaping, including their JSON-RPC wrapper, so a large body can never consume
 /// the live WebSocket frame budget.
 public enum AgentMessageTransport {
-    public static let listMaxBodyBytesCap = 1_048_576
-    public static let getMaxBytesCap = 256 * 1_024
+    /// Peak fully-encoded `agent.message.list` v1 response budget clients may
+    /// request via `max_body_bytes`. Was 1 MiB, then 512 KiB; 256 KiB still pages
+    /// multi-message lists while halving worst-case list envelope retention.
+    public static let listMaxBodyBytesCap = 256 * 1_024
+    /// Peak encoded `agent.message.get` v1 response envelope (after JSON
+    /// escape + RPC wrapper). Matched to `AgentThreadReadV1.maxMaxBytes`
+    /// (128 KiB) so one message-get cannot pin more than a thread-read page.
+    public static let getMaxBytesCap = 128 * 1_024
     public static let minimumResponseBytes = 1_024
     public static let eventContentMaxBytes = 2_048
-    public static let eventPayloadMaxBytes = 64 * 1_024
+    /// Peak encoded agent.message.* event payload on the wire (content is
+    /// already prefix-capped at `eventContentMaxBytes`). 32 KiB matches
+    /// compact control-path budgets — was 64 KiB.
+    public static let eventPayloadMaxBytes = 32 * 1_024
     public static let attachmentJSONMaxBytes = 16 * 1_024
     public static let attachmentWireMaxBytes = 4 * 1_024
     public static let attachmentCountLimit = 32

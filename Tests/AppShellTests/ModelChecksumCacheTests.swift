@@ -154,4 +154,67 @@ final class ModelChecksumCacheTests: XCTestCase {
         XCTAssertEqual(cache.entry(for: url), updatedEntry,
             "Storing a new entry for the same URL must overwrite the old one")
     }
+
+    // MARK: - Cardinality cap (PERF)
+
+    /// PERF: Models/ path churn must not pin unbounded checksum rows process-wide.
+    /// Misses only re-hash once (same as cold start / mtime drift).
+    func test_builtInCountLimit_matchesDiscoveryCacheOrder() {
+        XCTAssertEqual(ModelChecksumCache.countLimit, 32)
+    }
+
+    func test_noteEntry_capsDistinctURLs() {
+        var entries: [URL: ModelChecksumCacheEntry] = [:]
+        let limit = 8
+        var newest = URL(fileURLWithPath: "/tmp/x")
+        for i in 0..<(limit + 20) {
+            newest = URL(fileURLWithPath: "/tmp/model-\(i)/weights.bin")
+            ModelChecksumCache.noteEntry(
+                &entries,
+                url: newest,
+                entry: ModelChecksumCacheEntry(
+                    sizeBytes: Int64(i),
+                    mtime: Date(timeIntervalSince1970: Double(i)),
+                    sha256Hex: "sha-\(i)"
+                ),
+                countLimit: limit
+            )
+        }
+        XCTAssertEqual(entries.count, limit)
+        XCTAssertEqual(entries[newest]?.sha256Hex, "sha-\(limit + 19)")
+    }
+
+    func test_store_enforcesCountLimitOnInstance() {
+        let cache = ModelChecksumCache(countLimit: 4)
+        var newest = URL(fileURLWithPath: "/tmp/x")
+        for i in 0..<12 {
+            newest = URL(fileURLWithPath: "/Models/v\(i)/weights.bin")
+            cache.store(
+                ModelChecksumCacheEntry(
+                    sizeBytes: Int64(i),
+                    mtime: Date(timeIntervalSince1970: Double(i)),
+                    sha256Hex: String(repeating: "a", count: 64)
+                ),
+                for: newest
+            )
+        }
+        XCTAssertEqual(cache.countForTesting, 4)
+        XCTAssertNotNil(cache.entry(for: newest))
+    }
+
+    func test_retentionEstimate_2kURLsTo32Window() {
+        let uncapped = 2_000
+        let limit = ModelChecksumCache.countLimit
+        let reduction = Double(uncapped - limit) / Double(uncapped)
+        XCTAssertGreaterThan(reduction, 0.98)
+        XCTAssertEqual(limit, 32)
+        // Basis: ~200 B/entry (URL path + size + mtime + 64-hex sha) →
+        // 2k ≈ 400 KB; 32 ≈ 6.4 KB (−98.4%).
+        let perKey = 200
+        let before = uncapped * perKey
+        let after = limit * perKey
+        XCTAssertEqual(before, 400_000)
+        XCTAssertEqual(after, 6_400)
+        XCTAssertLessThan(Double(after) / Double(before), 0.02)
+    }
 }

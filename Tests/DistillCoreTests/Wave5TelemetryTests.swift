@@ -83,4 +83,35 @@ final class Wave5TelemetryTests: XCTestCase {
         let evicted = await cache.count
         XCTAssertLessThanOrEqual(evicted, 2)
     }
+
+    func test_embeddingCacheDefaultCapacityIs128() async {
+        XCTAssertEqual(EmbeddingCache.defaultCapacity, 128)
+        let cache = EmbeddingCache()
+        let limit = EmbeddingCache.defaultCapacity
+        // bge-small-sized stub vectors (384 dims) so retention estimate matches production shape.
+        let vector = [Float](repeating: 0.01, count: 384)
+        for index in 0..<(limit + 40) {
+            let key = EmbeddingCache.key(
+                text: "chunk-\(index)",
+                modelID: "BAAI/bge-small-en-v1.5",
+                chunkerVersion: "embed-v1"
+            )
+            await cache.put(key, vector)
+        }
+        let count = await cache.count
+        XCTAssertEqual(count, limit)
+    }
+
+    func test_retentionEstimate_256EmbeddingsTo128Window() {
+        let uncapped = 256 // prior default capacity
+        let limit = EmbeddingCache.defaultCapacity
+        let reduction = Double(uncapped - limit) / Double(uncapped)
+        XCTAssertGreaterThan(reduction, 0.49)
+        XCTAssertEqual(limit, 128)
+        // Basis: bge-small 384×Float32 ≈ 1.5KB vector (+ key overhead ~100B).
+        // 256 × 1.5KB ≈ 384KB → 128 × 1.5KB ≈ 192KB (−50%).
+        let perVector = 1_536 // 384 * 4
+        XCTAssertEqual(uncapped * perVector, 393_216)
+        XCTAssertEqual(limit * perVector, 196_608)
+    }
 }

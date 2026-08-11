@@ -131,4 +131,77 @@ final class TokenSaverAddressabilityGateTests: XCTestCase {
         let decision = TokenSaverAddressabilityGate.authorizeBuild(sortedByPriority: [highOverlap])
         XCTAssertEqual(decision, .denyNonPositiveNetValue)
     }
+
+    // MARK: - Cardinality caps (PERF)
+
+    /// PERF: synthetic probe id / refused-path churn must not pin unbounded
+    /// Data blobs or path strings for the life of the probe instance.
+    func test_probe_builtInCountLimits() {
+        XCTAssertEqual(TokenSaverMemoryOnlyProbe.memoryBlobCountLimit, 32)
+        XCTAssertEqual(TokenSaverMemoryOnlyProbe.refusedPathCountLimit, 64)
+    }
+
+    func test_noteMemoryBlob_capsDistinctIds() {
+        var blobs: [String: Data] = [:]
+        let limit = 5
+        var newest = ""
+        for i in 0..<(limit + 10) {
+            newest = "id-\(i)"
+            TokenSaverMemoryOnlyProbe.noteMemoryBlob(
+                &blobs, id: newest, bytes: Data([UInt8(i)]), countLimit: limit
+            )
+        }
+        XCTAssertEqual(blobs.count, limit)
+        XCTAssertEqual(blobs[newest], Data([UInt8(limit + 9)]))
+    }
+
+    func test_storeEnvelope_enforcesBlobCap() {
+        let probe = TokenSaverMemoryOnlyProbe(memoryBlobCountLimit: 4)
+        for i in 0..<12 {
+            XCTAssertTrue(probe.storeEnvelope(id: "b-\(i)", bytes: Data("x\(i)".utf8), pathHint: nil))
+        }
+        XCTAssertEqual(probe.memoryBlobCount, 4)
+        XCTAssertEqual(probe.loadEnvelope(id: "b-11"), Data("x11".utf8))
+    }
+
+    func test_noteRefusedPath_tailCapsNewest() {
+        var paths: [String] = []
+        let limit = 3
+        for i in 0..<(limit + 5) {
+            TokenSaverMemoryOnlyProbe.noteRefusedPath(
+                &paths, path: "/tmp/backup/\(i).sqlite", countLimit: limit
+            )
+        }
+        XCTAssertEqual(paths.count, limit)
+        XCTAssertEqual(paths.last, "/tmp/backup/\(limit + 4).sqlite")
+        XCTAssertFalse(paths.contains("/tmp/backup/0.sqlite"))
+    }
+
+    func test_storeEnvelope_enforcesRefusedPathCap() {
+        let probe = TokenSaverMemoryOnlyProbe(refusedPathCountLimit: 3)
+        for i in 0..<10 {
+            _ = probe.storeEnvelope(
+                id: "x-\(i)",
+                bytes: Data(),
+                pathHint: "/Users/me/Library/Application Support/RemoteCode/db-\(i).sqlite"
+            )
+        }
+        XCTAssertEqual(probe.refusedProductionPaths.count, 3)
+        XCTAssertTrue(probe.refusedProductionPaths.last?.contains("db-9.sqlite") == true)
+    }
+
+    func test_retentionEstimate_2kBlobsTo32Window() {
+        let uncapped = 2_000
+        let limit = TokenSaverMemoryOnlyProbe.memoryBlobCountLimit
+        let reduction = Double(uncapped - limit) / Double(uncapped)
+        XCTAssertGreaterThan(reduction, 0.98)
+        XCTAssertEqual(limit, 32)
+        // Basis: ~1 KB/blob envelope → 2k ≈ 2 MB; 32 ≈ 32 KB (−98.4%).
+        let perKey = 1_024
+        let before = uncapped * perKey
+        let after = limit * perKey
+        XCTAssertEqual(before, 2_048_000)
+        XCTAssertEqual(after, 32_768)
+        XCTAssertLessThan(Double(after) / Double(before), 0.02)
+    }
 }

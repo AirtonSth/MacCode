@@ -210,15 +210,26 @@ final class FileTreeNode<Item: FileTreeItem>: Identifiable {
 /// on first expand. Owns no IO itself: the `lister` closure (path -> entries) is injected, so the
 /// real fetch path (security-scoped `fsWorkspaceList`) is unchanged and the logic stays testable.
 final class FileTreeStore<Item: FileTreeItem> {
+    /// Peak distinct directory paths retained in the lazy child listing cache.
+    /// Deep monorepo expand storms otherwise pin unbounded path→entries maps
+    /// until `setRoots` (cwd change). 256 matches discovery/probe cache order
+    /// of magnitude for long-lived path-keyed maps.
+    static var childCacheCountLimit: Int { 256 }
+
     /// path (relative; "" = directory whose children these are) -> entries directly under it.
     private let lister: (String) throws -> [Item]
     private(set) var roots: [FileTreeNode<Item>] = []
     /// Path-keyed cache of fetched children, shared with the node API so the SwiftUI tree (which
     /// renders by path) and the node-based contract both consult one fetch + one cache.
     private var childCache: [String: [Item]] = [:]
+    private let cacheCountLimit: Int
 
-    init(lister: @escaping (String) throws -> [Item]) {
+    init(
+        lister: @escaping (String) throws -> [Item],
+        childCacheCountLimit: Int = FileTreeStore.childCacheCountLimit
+    ) {
         self.lister = lister
+        self.cacheCountLimit = max(1, childCacheCountLimit)
     }
 
     /// Seed the top level from an already-fetched flat listing (the directory currently shown),
@@ -228,6 +239,9 @@ final class FileTreeStore<Item: FileTreeItem> {
         roots = items.map { FileTreeNode(item: $0) }
         childCache = [:]
     }
+
+    /// Test seam: number of path keys currently held in the child listing cache.
+    var childCacheCountForTesting: Int { childCache.count }
 
     /// Expand a directory node, fetching its children the first time only. A node already carrying
     /// `children` is not re-fetched (`force` re-lists, e.g. after a mutation in that directory).
@@ -282,8 +296,33 @@ final class FileTreeStore<Item: FileTreeItem> {
     private func fetch(_ path: String, force: Bool) throws -> [Item] {
         if !force, let cached = childCache[path] { return cached }
         let fetched = try lister(path)
-        childCache[path] = fetched
+        Self.noteChildCacheEntry(
+            &childCache,
+            path: path,
+            items: fetched,
+            countLimit: cacheCountLimit
+        )
         return fetched
+    }
+
+    /// Pure insert/evict for the path→children listing cache. Keeps `path`;
+    /// drops arbitrary other directory keys when over `countLimit`. Evicted
+    /// paths re-list on next expand (cold-start / force parity).
+    static func noteChildCacheEntry(
+        _ cache: inout [String: [Item]],
+        path: String,
+        items: [Item],
+        countLimit: Int = FileTreeStore.childCacheCountLimit
+    ) {
+        cache[path] = items
+        let cap = max(1, countLimit)
+        while cache.count > cap {
+            if let victim = cache.keys.first(where: { $0 != path }) ?? cache.keys.first {
+                cache.removeValue(forKey: victim)
+            } else {
+                break
+            }
+        }
     }
 }
 
