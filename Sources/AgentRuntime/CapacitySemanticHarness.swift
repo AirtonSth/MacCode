@@ -392,8 +392,21 @@ public enum CapacitySemanticHarness {
         }
         activeQueue = activeQueue.filter { !cancelNodeIds.contains($0) }
 
+        func hasPendingResumableFaults() -> Bool {
+            for (fi, fault) in schedule.faults.enumerated()
+            where !appliedFaultIndices.contains(fi) && !skippedFaultIndices.contains(fi) {
+                guard fault.kind == CapacityHarnessKnownFaultKind.resume.rawValue,
+                      let idx = byId[fault.nodeId] else { continue }
+                if nodes[idx].status == .cancelled || nodes[idx].status == .failed {
+                    return true
+                }
+            }
+            return false
+        }
+
         var safety = 0
-        while nodes.contains(where: { $0.status == .waiting || $0.status == .active }) {
+        while nodes.contains(where: { $0.status == .waiting || $0.status == .active })
+            || hasPendingResumableFaults() {
             safety += 1
             if safety > 100_000 { break }
 
