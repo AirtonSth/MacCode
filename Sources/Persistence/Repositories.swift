@@ -3329,13 +3329,31 @@ public final class AgentRunRepository: @unchecked Sendable {
         let limit = max(1, byteLimit)
         let originalBytes = payloadJSON.utf8.count
         guard originalBytes > limit else { return payloadJSON }
-        if let reversibleStore,
-           let recovered = try? AuthoritativePayloadRecovery.prepareForPresentation(
-            text: payloadJSON,
-            store: reversibleStore,
-            limit: limit
-           ) {
-            return recovered.presentationText
+        // S3: store-before-loss is mandatory when a store is provided. Fail open
+        // only by raising — callers must not silently drop the original.
+        if let reversibleStore {
+            do {
+                return try AuthoritativePayloadRecovery.prepareForPresentation(
+                    text: payloadJSON,
+                    store: reversibleStore,
+                    limit: limit
+                ).presentationText
+            } catch {
+                // Last-resort: still attempt to store raw bytes and emit envelope.
+                // If store itself fails, rethrow as empty with marker is unsafe —
+                // return a durable failure envelope that decode paths reject loudly.
+                let failure: [String: Any] = [
+                    "rc_oversized": true,
+                    "store_failed": true,
+                    "original_bytes": originalBytes,
+                    "error": String(describing: error),
+                ]
+                if let data = try? JSONSerialization.data(withJSONObject: failure),
+                   let text = String(data: data, encoding: .utf8) {
+                    return text
+                }
+                return #"{"rc_oversized":true,"store_failed":true}"#
+            }
         }
         let trailer = "…[truncated \(originalBytes)→\(limit) bytes]"
         let headBudget = max(0, limit - trailer.utf8.count)
@@ -3352,6 +3370,28 @@ public final class AgentRunRepository: @unchecked Sendable {
             payloadJSON.utf8.formIndex(before: &utf8End)
         }
         return trailer
+    }
+
+    /// Rehydrate an oversized recovery envelope back to the original UTF-8 payload.
+    public func rehydrateOversizedPayloadIfNeeded(_ payloadJSON: String) throws -> String {
+        guard payloadJSON.contains("rc_oversized"),
+              let data = payloadJSON.data(using: .utf8),
+              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["rc_oversized"] as? Bool == true else {
+            return payloadJSON
+        }
+        if object["store_failed"] as? Bool == true {
+            throw PersistenceDataError.corruptStreamEvent("oversized payload store failed; original unavailable")
+        }
+        guard let handle = object["handle"] as? String else {
+            throw PersistenceDataError.corruptStreamEvent("oversized payload missing handle")
+        }
+        let store = ReversibleContentStore(db: db)
+        let original = try AuthoritativePayloadRecovery.rehydrate(handle: handle, store: store)
+        guard let text = String(data: original, encoding: .utf8) else {
+            throw PersistenceDataError.corruptStreamEvent("oversized original is not UTF-8")
+        }
+        return text
     }
 
     public func upsert(_ r: AgentRun) throws {
@@ -4449,7 +4489,11 @@ public final class AgentRunRepository: @unchecked Sendable {
         events.reserveCapacity(payloads.count)
         for payload in payloads {
             do {
-                events.append(try streamEventDecoder.decode(AssistantEvent.self, from: payload.data))
+                // S3: rehydrate oversized recovery envelopes before AssistantEvent decode.
+                let rawText = String(decoding: payload.data, as: UTF8.self)
+                let resolvedText = try rehydrateOversizedPayloadIfNeeded(rawText)
+                let resolvedData = Data(resolvedText.utf8)
+                events.append(try streamEventDecoder.decode(AssistantEvent.self, from: resolvedData))
             } catch {
                 if strictDecoding {
                     throw PersistenceDataError.corruptStreamEvent(

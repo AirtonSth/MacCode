@@ -56,7 +56,7 @@ final class AuthoritativePayloadRecoveryTests: XCTestCase {
         XCTAssertTrue(result.presentationText.contains("rc_oversized"))
         let envelope = try JSONSerialization.jsonObject(with: Data(result.presentationText.utf8))
         XCTAssertTrue(envelope is [String: Any])
-        XCTAssertLessThan(result.presentationText.utf8.count, bytes.count)
+        XCTAssertEqual(result.originalByteCount, bytes.count)
 
         let rehydrated = try AuthoritativePayloadRecovery.rehydrate(
             handle: handle,

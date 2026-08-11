@@ -52,6 +52,11 @@ final class WebSocketEventBatcher: @unchecked Sendable {
     private var pendingBytes: Int = 0
     private var oldestEnqueueUptime: TimeInterval?
     private var overflowCount: Int = 0
+    /// Synchronous pre-queue admission so the DispatchQueue backlog cannot grow
+    /// unboundedly before per-frame admission runs (S10).
+    private let preQueueLock = NSLock()
+    private var preQueueBytes: Int = 0
+    private var preQueueCount: Int = 0
 
     init(enabled: Bool,
          filter: EventStreamFilter,
@@ -84,9 +89,36 @@ final class WebSocketEventBatcher: @unchecked Sendable {
     }
 
     func enqueue(event: EventBus.Event, data: Data) {
+        // Synchronous pre-queue bound (bytes + count) before capturing data on the
+        // serial queue. Prevents unbounded Dispatch backlog under flood.
+        preQueueLock.lock()
+        let wouldExceedPre =
+            preQueueCount + 1 > maxPendingCount
+            || preQueueBytes + data.count > maxPendingBytes
+        if wouldExceedPre {
+            preQueueLock.unlock()
+            overflowCount += 1
+            var lost: [Int64] = []
+            if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
+            onAdmissionOverflow?(lost, "pre_queue_admission")
+            return
+        }
+        preQueueCount += 1
+        preQueueBytes += data.count
+        preQueueLock.unlock()
+
+        let releasePreQueue: @Sendable () -> Void = { [weak self] in
+            guard let self else { return }
+            self.preQueueLock.lock()
+            self.preQueueCount = max(0, self.preQueueCount - 1)
+            self.preQueueBytes = max(0, self.preQueueBytes - data.count)
+            self.preQueueLock.unlock()
+        }
+
         guard enabled else {
             guard coalescesStreamingDeltas else {
                 queue.async {
+                    defer { releasePreQueue() }
                     guard !self.stopped else { return }
                     self.send(data)
                 }
@@ -94,6 +126,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
             }
             if Self.fullStreamCoalescedKinds.contains(event.kind) {
                 queue.async {
+                    defer { releasePreQueue() }
                     guard !self.stopped else { return }
                     if self.wouldExceedAdmissionLocked(additionalBytes: data.count) {
                         self.handleOverflowLocked(reason: "admission_bytes_or_count")
@@ -122,7 +155,15 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                 // Non-delta: append after any buffered deltas (order preserved)
                 // and flush NOW so interactive events pay zero added latency.
                 queue.async {
+                    defer { releasePreQueue() }
                     guard !self.stopped else { return }
+                    guard self.canAdmitSingleFrameLocked(byteCount: data.count) else {
+                        var lost: [Int64] = []
+                        if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
+                        self.overflowCount += 1
+                        self.onAdmissionOverflow?(lost, "frame_exceeds_budget")
+                        return
+                    }
                     self.noteEnqueueLocked(data)
                     self.nilKeyQueue.append(data)
                     self.flushLocked()
@@ -133,6 +174,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
 
         if let key = filter.coalescingKey(for: event) {
             queue.async {
+                defer { releasePreQueue() }
                 guard !self.stopped else { return }
                 if self.wouldExceedAdmissionLocked(additionalBytes: data.count) {
                     self.handleOverflowLocked(reason: "admission_bytes_or_count")
@@ -181,9 +223,17 @@ final class WebSocketEventBatcher: @unchecked Sendable {
             // mixed events (incl. agent.item.delta on Wi-Fi) coalesce into
             // fewer frames; C-16 also concatenates same-item deltas on flush.
             queue.async {
+                defer { releasePreQueue() }
                 guard !self.stopped else { return }
                 if self.wouldExceedAdmissionLocked(additionalBytes: data.count) {
                     self.handleOverflowLocked(reason: "admission_bytes_or_count")
+                }
+                guard self.canAdmitSingleFrameLocked(byteCount: data.count) else {
+                    var lost: [Int64] = []
+                    if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
+                    self.overflowCount += 1
+                    self.onAdmissionOverflow?(lost, "frame_exceeds_budget")
+                    return
                 }
                 self.noteEnqueueLocked(data)
                 self.nilKeyQueue.append(data)

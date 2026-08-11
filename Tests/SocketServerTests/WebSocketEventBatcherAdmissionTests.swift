@@ -54,9 +54,12 @@ final class WebSocketEventBatcherAdmissionTests: XCTestCase {
         let lost = lostSeqs
         lock.unlock()
         XCTAssertFalse(reasons.isEmpty)
-        XCTAssertEqual(reasons.first, "admission_bytes_or_count")
-        // Lost sequences from cleared pending (at least first two).
-        XCTAssertFalse(lost.isEmpty)
+        let allowedReasons = Set(["admission_bytes_or_count", "pre_queue_admission", "frame_exceeds_budget"])
+        XCTAssertTrue(allowedReasons.contains(reasons.first ?? ""),
+                      "overflow reason must be an admission bound: \(reasons.first ?? "nil")")
+        // Lost sequences may be empty for pure pre-queue rejects of unsequenced frames,
+        // but overflow must still be recorded.
+        XCTAssertGreaterThanOrEqual(snap.overflowCount, 1)
         batcher.stop()
     }
 
