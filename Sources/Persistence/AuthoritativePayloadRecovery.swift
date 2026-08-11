@@ -13,6 +13,26 @@ public enum AuthoritativePayloadRecovery {
     /// Owned trailer prefix so recovery detection cannot collide with provider content.
     public static let ownedTrailerToken = "rc_oversized_v1"
 
+    /// Parse original byte count from an owned presentation trailer when present.
+    /// Used for hot-replay admission so rehydrate cannot expand past the budget.
+    public static func authoritativeByteCount(forStoredPayload payload: String) -> Int {
+        let presentation = payload.utf8.count
+        let pattern = #"…\[truncated rc_oversized_v1 (\d+)→(\d+) bytes\]\[\[rc:[0-9a-fA-F]+\]\]\z"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(
+                in: payload,
+                options: [],
+                range: NSRange(payload.startIndex..., in: payload)
+              ),
+              match.numberOfRanges >= 2,
+              let originalRange = Range(match.range(at: 1), in: payload),
+              let original = Int(payload[originalRange]),
+              original > 0 else {
+            return presentation
+        }
+        return original
+    }
+
 
     public struct RecoveryResult: Sendable, Equatable {
         public var presentationText: String

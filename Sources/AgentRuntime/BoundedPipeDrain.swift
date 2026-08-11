@@ -4,12 +4,16 @@ import Darwin
 /// Drains bytes already buffered in a provider pipe without waiting forever
 /// for descendants that inherited the write descriptor. The read descriptor is
 /// always closed at EOF or at the deadline so crash teardown is bounded.
+///
+/// When `maxBytes` is set, only the first N bytes are retained; remaining
+/// pipe data is still drained (discarded) so a verbose child cannot block.
 enum BoundedPipeDrain {
     static let defaultTimeout: TimeInterval = 0.25
 
     static func readRemaining(
         from handle: FileHandle,
-        timeout: TimeInterval = defaultTimeout
+        timeout: TimeInterval = defaultTimeout,
+        maxBytes: Int = Int.max
     ) -> Data {
         let fd = handle.fileDescriptor
         defer { try? handle.close() }
@@ -21,13 +25,29 @@ enum BoundedPipeDrain {
         }
 
         let deadline = Date().addingTimeInterval(max(0, timeout))
+        let cap = max(0, maxBytes)
         var result = Data()
+        if cap > 0 && cap < Int.max {
+            result.reserveCapacity(min(cap, 64 * 1024))
+        }
         var buffer = [UInt8](repeating: 0, count: 16 * 1_024)
 
         while true {
+            // Absolute deadline checked on every loop (including after successful reads)
+            // so a continuously writing descendant cannot allocate forever.
+            guard Date() < deadline else { return result }
+
             let count = Darwin.read(fd, &buffer, buffer.count)
             if count > 0 {
-                result.append(contentsOf: buffer.prefix(count))
+                if result.count < cap {
+                    let room = cap - result.count
+                    if count <= room {
+                        result.append(contentsOf: buffer.prefix(count))
+                    } else {
+                        result.append(contentsOf: buffer.prefix(room))
+                        // Keep draining (discard) past the cap.
+                    }
+                }
                 continue
             }
             if count == 0 { return result }
@@ -46,7 +66,7 @@ enum BoundedPipeDrain {
             }
             if descriptor.revents & Int16(POLLNVAL) != 0 { return result }
             // POLLHUP may still have buffered bytes. Loop once more and read
-            // until read(2) returns EOF.
+            // until read(2) returns EOF or deadline.
         }
     }
 }

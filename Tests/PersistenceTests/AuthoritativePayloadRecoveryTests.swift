@@ -83,4 +83,26 @@ final class AuthoritativePayloadRecoveryTests: XCTestCase {
             XCTAssertEqual(error as? AuthoritativePayloadRecovery.RecoveryError, .unresolvedHandle("00"))
         }
     }
+
+    func test_authoritativeByteCount_usesOriginalFromOwnedTrailer() throws {
+        let limit = 64
+        let original = Data(repeating: 0x61, count: 500)
+        let result = try AuthoritativePayloadRecovery.prepareForPresentation(
+            data: original,
+            store: store,
+            limit: limit
+        )
+        XCTAssertTrue(result.truncatedForPresentation)
+        let presentationBytes = result.presentationText.utf8.count
+        XCTAssertLessThan(presentationBytes, original.count)
+        // Admission must charge the original size, not the presentation size.
+        XCTAssertEqual(
+            AuthoritativePayloadRecovery.authoritativeByteCount(forStoredPayload: result.presentationText),
+            original.count
+        )
+        XCTAssertEqual(
+            AuthoritativePayloadRecovery.authoritativeByteCount(forStoredPayload: "small"),
+            5
+        )
+    }
 }

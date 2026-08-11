@@ -4378,6 +4378,30 @@ public final class AgentRunRepository: @unchecked Sendable {
             }
             payloads.append((eventId, data))
         }
+        // When a byte budget is set, re-admit using original sizes so rehydrate
+        // cannot expand past the hot-replay ceiling.
+        if let maxPayloadBytes {
+            var admitted: [(eventId: Int64, data: Data)] = []
+            var used: Int64 = 0
+            // payloads are chronological (oldest→newest); admit newest-first.
+            for payload in payloads.reversed() {
+                let text = String(decoding: payload.data, as: UTF8.self)
+                let original = Int64(AuthoritativePayloadRecovery.authoritativeByteCount(forStoredPayload: text))
+                if admitted.isEmpty && original > maxPayloadBytes {
+                    // Newest alone exceeds budget: return empty (same as ThreadReadV1).
+                    return []
+                }
+                if used + original > maxPayloadBytes { break }
+                admitted.append(payload)
+                used += original
+            }
+            payloads = admitted.reversed()
+            return try decodeStreamEventPayloads(
+                payloads,
+                strictDecoding: strictDecoding,
+                remainingByteBudget: maxPayloadBytes
+            )
+        }
         return try decodeStreamEventPayloads(payloads, strictDecoding: strictDecoding)
     }
 
@@ -4435,22 +4459,26 @@ public final class AgentRunRepository: @unchecked Sendable {
         }
     }
 
-    /// Metadata-only newest rows: `id`, `seq`, and `LENGTH(payload_json)` — never the blob.
+    /// Metadata-only newest rows: `id`, `seq`, and authoritative payload bytes.
+    /// For owned oversized trailers, uses the original byte count from the trailer
+    /// so hot-replay admission cannot admit a small presentation then expand a
+    /// multi-gigabyte recovery blob (S3).
     public func listLatestStreamEventMetadata(
         threadId: AgentThreadID,
         limit: Int
     ) throws -> [StreamEventRowMeta] {
         let safeLimit = max(0, limit)
         guard safeLimit > 0 else { return [] }
-        // `payload_json` is referenced only inside LENGTH(...) and is not projected,
-        // so the Swift binding never allocates the stored blob.
+        // Project trailing slice for original-size parse without full blob when possible.
+        // SQLite SUBSTR with negative length is not portable; fetch payload_json only for
+        // the candidate window (limit is small: eventLimit+1) and parse trailer in Swift.
         let st = try db.prepare("""
-            SELECT id, seq, payload_bytes
+            SELECT id, seq, payload_json
             FROM (
                 SELECT e.id AS id,
                        e.seq AS seq,
                        r.started_at AS started_at,
-                       LENGTH(CAST(e.payload_json AS BLOB)) AS payload_bytes
+                       e.payload_json AS payload_json
                 FROM agent_stream_events e
                 JOIN agent_runs r ON r.id = e.run_id
                 WHERE r.thread_id = ?
@@ -4463,11 +4491,11 @@ public final class AgentRunRepository: @unchecked Sendable {
         try st.bind(2, Int64(safeLimit))
         var rows: [StreamEventRowMeta] = []
         while try st.step() {
-            rows.append(StreamEventRowMeta(
-                id: st.columnInt64(0),
-                seq: Int(st.columnInt64(1)),
-                payloadBytes: st.columnInt64(2)
-            ))
+            let id = st.columnInt64(0)
+            let seq = Int(st.columnInt64(1))
+            let payload = st.columnText(2) ?? ""
+            let bytes = Int64(AuthoritativePayloadRecovery.authoritativeByteCount(forStoredPayload: payload))
+            rows.append(StreamEventRowMeta(id: id, seq: seq, payloadBytes: bytes))
         }
         return rows
     }
@@ -4475,7 +4503,8 @@ public final class AgentRunRepository: @unchecked Sendable {
     /// Fetch + decode only the given row ids (chronological). Does not scan peers.
     public func listStreamEventsByIds(
         _ ids: [Int64],
-        strictDecoding: Bool = true
+        strictDecoding: Bool = true,
+        remainingByteBudget: Int64? = nil
     ) throws -> [AssistantEvent] {
         guard !ids.isEmpty else { return [] }
         let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
@@ -4501,21 +4530,41 @@ public final class AgentRunRepository: @unchecked Sendable {
             }
             payloads.append((eventId, data))
         }
-        return try decodeStreamEventPayloads(payloads, strictDecoding: strictDecoding)
+        return try decodeStreamEventPayloads(
+            payloads,
+            strictDecoding: strictDecoding,
+            remainingByteBudget: remainingByteBudget
+        )
     }
 
     private func decodeStreamEventPayloads(
         _ payloads: [(eventId: Int64, data: Data)],
-        strictDecoding: Bool
+        strictDecoding: Bool,
+        remainingByteBudget: Int64? = nil
     ) throws -> [AssistantEvent] {
         streamEventCodecLock.lock()
         defer { streamEventCodecLock.unlock() }
         var events: [AssistantEvent] = []
         events.reserveCapacity(payloads.count)
+        var budget = remainingByteBudget
         for payload in payloads {
             do {
                 // S3: rehydrate oversized recovery envelopes before AssistantEvent decode.
+                // Admission already used original size when budget was provided; re-check
+                // before expanding the recovery blob.
                 let rawText = String(decoding: payload.data, as: UTF8.self)
+                let originalBytes = Int64(AuthoritativePayloadRecovery.authoritativeByteCount(forStoredPayload: rawText))
+                if let remaining = budget {
+                    if originalBytes > remaining {
+                        if strictDecoding {
+                            throw PersistenceDataError.corruptStreamEvent(
+                                "row \(payload.eventId) original \(originalBytes) exceeds remaining budget \(remaining)"
+                            )
+                        }
+                        continue
+                    }
+                    budget = remaining - originalBytes
+                }
                 let resolvedText = try rehydrateOversizedPayloadIfNeeded(rawText)
                 let resolvedData = Data(resolvedText.utf8)
                 events.append(try streamEventDecoder.decode(AssistantEvent.self, from: resolvedData))
@@ -4588,7 +4637,11 @@ public final class AgentRunRepository: @unchecked Sendable {
         let droppedFromInspected = selected.count < meta.count
         let hasMoreOlder = droppedFromInspected
 
-        let events = try listStreamEventsByIds(selectedIds, strictDecoding: strictDecoding)
+        let events = try listStreamEventsByIds(
+            selectedIds,
+            strictDecoding: strictDecoding,
+            remainingByteBudget: safeMaxBytes
+        )
         return BoundedStreamEventSelection(
             events: events,
             hasMoreOlder: hasMoreOlder,

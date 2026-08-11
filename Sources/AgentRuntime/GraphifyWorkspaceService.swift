@@ -447,9 +447,8 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             }
             service.lock.unlock()
 
-            if status == .fresh {
-                service.saveFingerprint(checkout, head: service.currentHead(checkout.displayRoot))
-            }
+            // Fingerprint is written only inside ensureSync when not cancelled.
+            // Do not re-save here: that raced with cancel and could publish fresh.
             // Kick deferred checkouts that waited on the global gate (at most one
             // trailing ensure per id via startEnsureIfNeeded coalescing).
             for displayRoot in deferredRoots {
@@ -496,6 +495,22 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         }
 
         let result = run([binary, "update", scanRoot], cwd: scanRoot, env: env)
+        // Cancel is authoritative: never publish fingerprint/generation after cancel.
+        lock.lock()
+        let cancelledAfterRun = activeRebuildCancelled
+            || (schedules[checkout.scheduleID]?.rebuildCancelled == true)
+        lock.unlock()
+        if cancelledAfterRun {
+            lock.lock()
+            var s = schedules[checkout.scheduleID] ?? RefreshSchedule()
+            s.displayRoot = checkout.displayRoot
+            s.status = .missing
+            s.rebuildCancelled = false
+            // Do not advance builtGeneration / fingerprint on cancelled work.
+            schedules[checkout.scheduleID] = s
+            lock.unlock()
+            return .missing
+        }
         let dest = graphJSONPath(for: checkout)
 
         if writeInRepo {
@@ -537,9 +552,34 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         }
 
         if FileManager.default.fileExists(atPath: dest.path) {
-            let head = currentHead(checkout.displayRoot)
-            saveFingerprint(checkout, head: head)
+            // Re-check cancel immediately before durable freshness commit.
             lock.lock()
+            let cancelledBeforeCommit = activeRebuildCancelled
+                || (schedules[checkout.scheduleID]?.rebuildCancelled == true)
+            if cancelledBeforeCommit {
+                var s = schedules[checkout.scheduleID] ?? RefreshSchedule()
+                s.displayRoot = checkout.displayRoot
+                s.status = .missing
+                s.rebuildCancelled = false
+                schedules[checkout.scheduleID] = s
+                lock.unlock()
+                return .missing
+            }
+            lock.unlock()
+            let head = currentHead(checkout.displayRoot)
+            // Generation + fingerprint are committed only when still not cancelled.
+            lock.lock()
+            let stillCancelled = activeRebuildCancelled
+                || (schedules[checkout.scheduleID]?.rebuildCancelled == true)
+            if stillCancelled {
+                var s = schedules[checkout.scheduleID] ?? RefreshSchedule()
+                s.displayRoot = checkout.displayRoot
+                s.status = .missing
+                s.rebuildCancelled = false
+                schedules[checkout.scheduleID] = s
+                lock.unlock()
+                return .missing
+            }
             var s = schedules[checkout.scheduleID] ?? RefreshSchedule()
             s.displayRoot = checkout.displayRoot
             s.lastSuccessfulUpdate = Date()
@@ -549,6 +589,7 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             s.builtGeneration = s.dirtyGeneration
             schedules[checkout.scheduleID] = s
             lock.unlock()
+            saveFingerprint(checkout, head: head)
             return .fresh
         }
         return .missing
@@ -936,10 +977,37 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         if alreadyCancelled {
             p.terminate()
         }
-        // Wait for process first; then deadline-bound nonblocking drain so a
-        // descendant holding pipe ends cannot hang Graphify forever (S9).
+        // Concurrent capped drain while the process runs so a verbose child cannot
+        // fill pipes and hang until the full process timeout (S9).
         let timeout = processTimeoutSeconds > 0 ? processTimeoutSeconds : 180
         let deadline = Date().addingTimeInterval(timeout)
+        let maxOut = GraphifyRuntimeHardening.maxStdoutCaptureBytes
+        let maxErr = GraphifyRuntimeHardening.maxStderrCaptureBytes
+        final class Box: @unchecked Sendable { var data = Data() }
+        let outBox = Box()
+        let errBox = Box()
+        let q = DispatchQueue(label: "io.remotecode.graphify.pipe.drain", attributes: .concurrent)
+        let outHandle = out.fileHandleForReading
+        let errHandle = err.fileHandleForReading
+        let drainGroup = DispatchGroup()
+        drainGroup.enter()
+        q.async {
+            outBox.data = BoundedPipeDrain.readRemaining(
+                from: outHandle,
+                timeout: timeout + 0.5,
+                maxBytes: maxOut
+            )
+            drainGroup.leave()
+        }
+        drainGroup.enter()
+        q.async {
+            errBox.data = BoundedPipeDrain.readRemaining(
+                from: errHandle,
+                timeout: timeout + 0.5,
+                maxBytes: maxErr
+            )
+            drainGroup.leave()
+        }
         while p.isRunning && Date() < deadline {
             lock.lock()
             let cancelled = activeRebuildCancelled
@@ -962,23 +1030,20 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         } else {
             p.waitUntilExit()
         }
-        // Close write ends so EOF can arrive; drain with deadline (not EOF forever).
+        // Unblock drains: close write ends so EOF can arrive.
         try? out.fileHandleForWriting.close()
         try? err.fileHandleForWriting.close()
-        let maxOut = GraphifyRuntimeHardening.maxStdoutCaptureBytes
-        let maxErr = GraphifyRuntimeHardening.maxStderrCaptureBytes
-        var oData = BoundedPipeDrain.readRemaining(from: out.fileHandleForReading, timeout: 0.25)
-        var eData = BoundedPipeDrain.readRemaining(from: err.fileHandleForReading, timeout: 0.25)
-        if oData.count > maxOut { oData = oData.prefix(maxOut) + Data() }
-        if eData.count > maxErr { eData = eData.prefix(maxErr) + Data() }
+        // Readers enforce their own absolute deadlines; join with remaining margin.
+        let remainingMs = max(50, Int((deadline.timeIntervalSinceNow + 0.5) * 1000))
+        _ = drainGroup.wait(timeout: .now() + .milliseconds(remainingMs))
         lock.lock(); activeRebuildProcess = nil; lock.unlock()
         if timedOut {
-            return (-9, String(data: oData, encoding: .utf8) ?? "", "graphify process timed out after \(Int(timeout))s")
+            return (-9, String(data: outBox.data, encoding: .utf8) ?? "", "graphify process timed out after \(Int(timeout))s")
         }
         return (
             p.terminationStatus,
-            String(data: oData, encoding: .utf8) ?? "",
-            String(data: eData, encoding: .utf8) ?? ""
+            String(data: outBox.data, encoding: .utf8) ?? "",
+            String(data: errBox.data, encoding: .utf8) ?? ""
         )
     }
 }
