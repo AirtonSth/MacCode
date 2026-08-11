@@ -5554,10 +5554,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let sendThreadId = selectedThreadId
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
-        // S5: refuse concurrent prep/run on the same thread so generations cannot
-        // replace each other; user uses Stop/Escape to cancel preparation.
-        if let sendThreadId, isThreadStoppableBusy(sendThreadId) {
-            statusMessage = "A run is already preparing or active. Stop it first, or wait."
+        // S5: refuse concurrent preparation only (active runs may still queue).
+        if let sendThreadId,
+           preparingRunThreadId == sendThreadId
+            || coordinator.isPreparingProviderStart(threadId: sendThreadId) {
+            statusMessage = "A run is already preparing. Stop it first, or wait."
             return
         }
         // Auto is still resolving providers/models — refuse send (button is also
@@ -15264,7 +15265,8 @@ public struct AgentAppView: View {
         let empty =
             vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && vm.attachments.isEmpty
         // S5: block concurrent same-thread prep; Stop/Escape handle cancellation.
-        return empty || autoRoutingPillLoading || vm.selectedThreadIsStoppableBusy
+        // Disable Send while preparing; active runs keep queue/send affordances.
+        return empty || autoRoutingPillLoading || vm.selectedThreadIsPreparingRun
     }
 
     private func selectThreadRow(_ thread: AgentThread) {

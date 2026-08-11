@@ -750,15 +750,13 @@ enum AppDiagnostics {
         if transition.state.level == .normal {
             // Clear pressure-only Graphify pause as soon as the governor is normal.
             GraphifyWorkspaceService.shared.setPressurePauseEnsureAndWatch(false)
-            let recovered = pressureGovernor.pacedRecovery(at: Date())
-            if !recovered.emittedActions.isEmpty {
-                let acknowledged = applyPressureActions(recovered.emittedActions)
-                lastAppliedPressureActionsForUX = acknowledged.map(\.rawValue)
-            } else if !activePressureEffects.isEmpty {
-                // Ensure resume clears sticky Graphify/maintenance even without tick emit.
+            if !activePressureEffects.isEmpty || maintenancePruneDeferred {
                 _ = applyPressureActions([.resumeOptionalWorkUnit])
-                lastAppliedPressureActionsForUX = []
             }
+            // Healthy normal operation must not show degradation actions.
+            lastAppliedPressureActionsForUX = []
+            // pacedRecovery still advances recovery accounting without UX noise.
+            _ = pressureGovernor.pacedRecovery(at: Date())
         }
 
         // S1: production gauge recording from live heartbeat RSS samples.

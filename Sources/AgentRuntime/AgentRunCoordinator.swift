@@ -5703,7 +5703,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 emitPersistenceIssue("run.stream_event.retry_saturated", error: error, runId: runId, threadId: threadId)
                 return
             case .storeBeforeLossFailure(let error):
-                // S3: never publish or advance terminal over a missing authoritative event.
+                // S3: never publish an undurable event. mirrorPersistenceFailures is
+                // already set so terminal/snapshot barriers fail closed until cleared.
                 emitPersistenceIssue("run.stream_event.store_before_loss", error: error, runId: runId, threadId: threadId)
                 return
             case .ownerConflict(let error):
