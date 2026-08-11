@@ -409,6 +409,19 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         let fp = loadFingerprint(checkout)
 
         lock.lock()
+        // Re-check pressure under the same lock as inFlight claim (S7): pause
+        // may land during unlocked probes above; preserve dirty for unpause.
+        if pressurePauseEnsureAndWatch {
+            var schedule = schedules[checkout.scheduleID] ?? RefreshSchedule()
+            schedule.displayRoot = checkout.displayRoot
+            schedule.rerunRequested = true
+            if schedule.dirtyGeneration == schedule.builtGeneration {
+                schedule.dirtyGeneration &+= 1
+            }
+            schedules[checkout.scheduleID] = schedule
+            lock.unlock()
+            return
+        }
         var schedule = schedules[checkout.scheduleID] ?? RefreshSchedule()
         schedule.displayRoot = checkout.displayRoot
 

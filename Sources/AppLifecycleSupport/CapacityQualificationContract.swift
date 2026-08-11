@@ -462,6 +462,12 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
                     )
                 }
             } else if key == CapacityRequiredMetricKey.mainActorStallMsMax.rawValue {
+                // Nonnegative before abort ceiling (impossible -1 must not validate).
+                guard claimed >= 0 else {
+                    throw CapacityContractError.invalidWorkload(
+                        "main_actor_stall_ms_max must be >= 0 (got \(claimed))"
+                    )
+                }
                 guard claimed < manifest.abortLimits.maxMainActorStallMs else {
                     throw CapacityContractError.invalidWorkload(
                         "main_actor_stall_ms_max \(claimed) >= abort \(manifest.abortLimits.maxMainActorStallMs)"
@@ -483,6 +489,11 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
                         )
                     }
                 } else if key == CapacityRequiredMetricKey.mainActorStallMsMax.rawValue {
+                    guard v >= 0 else {
+                        throw CapacityContractError.invalidWorkload(
+                            "warmed main_actor_stall_ms_max must be >= 0 (got \(v))"
+                        )
+                    }
                     guard v < manifest.abortLimits.maxMainActorStallMs else {
                         throw CapacityContractError.invalidWorkload(
                             "warmed main_actor_stall_ms_max \(v) exceeds abort"
