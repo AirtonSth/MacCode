@@ -1311,7 +1311,8 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             let cancelled = activeRebuildCancelled
             lock.unlock()
             if cancelled {
-                p.terminate()
+                // Signal whole process group so descendants cannot outlive the root.
+                ProcessTerminator.terminateTreeImmediately(p)
                 break
             }
             Thread.sleep(forTimeInterval: 0.05)
@@ -1319,12 +1320,16 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         var timedOut = false
         if p.isRunning {
             timedOut = true
-            p.terminate()
+            ProcessTerminator.terminateTreeImmediately(p)
             let killDeadline = Date().addingTimeInterval(1)
             while p.isRunning && Date() < killDeadline {
                 Thread.sleep(forTimeInterval: 0.05)
             }
-            if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+            if p.isRunning {
+                kill(p.processIdentifier, SIGKILL)
+                // Negative PID = process group (when isolated).
+                kill(-p.processIdentifier, SIGKILL)
+            }
         }
         // Always reap; SIGKILL path still needs waitUntilExit when possible.
         if p.isRunning {
@@ -1336,6 +1341,19 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         }
         if !p.isRunning {
             p.waitUntilExit()
+        }
+        // Extra group drain: any surviving same-pgid descendants are signalled.
+        if let group = ownershipTag?.isolatedProcessGroup ?? (isGraphifyCLI ? p.processIdentifier : nil) {
+            let members = ProcessTerminator.processGroupPIDs(group)
+            for member in members where member != p.processIdentifier && member > 0 {
+                kill(member, SIGTERM)
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+            for member in members where member != p.processIdentifier && member > 0 {
+                if kill(member, 0) == 0 {
+                    kill(member, SIGKILL)
+                }
+            }
         }
         // Unblock drains: close write ends so EOF can arrive.
         try? out.fileHandleForWriting.close()
@@ -1359,9 +1377,17 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             }
             lock.unlock()
         }
-        // S9: exact removal after reap so relaunch does not treat a dead child as live.
+        // S9: remove ownership only when the certified group/tree is fully dead.
+        // Surviving descendants keep the row so relaunch sweep can reap them.
         if let ownershipTag {
-            try? ProviderProcessOwnership.shared.store()?.removeExact(ownershipTag)
+            let group = ownershipTag.isolatedProcessGroup ?? ownershipTag.pgid
+            let survivors = ProcessTerminator.processGroupPIDs(group).filter { pid in
+                pid > 0 && kill(pid, 0) == 0
+            }
+            if survivors.isEmpty {
+                try? ProviderProcessOwnership.shared.store()?.removeExact(ownershipTag)
+            }
+            // else: retain tag for ProviderProcessSweeper on relaunch
         }
         let oData = outBox.get()
         let eData = errBox.get()
