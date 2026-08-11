@@ -361,11 +361,24 @@ final class RetentionCapTests: XCTestCase {
                 receivedAtMs: 2
             )
         )
+        // Stored row stays presentation-bounded (soft-truncate + handle).
+        let st = try db.prepare(
+            "SELECT payload_json FROM agent_provider_event_logs WHERE event_id = ? LIMIT 1;"
+        )
+        try st.bind(1, "pathological-provider")
+        XCTAssertTrue(try st.step(), "pathological provider row must be persisted")
+        let stored = try XCTUnwrap(st.columnText(0))
+        XCTAssertLessThanOrEqual(stored.utf8.count, AgentRunRepository.maximumPersistedEventRowBytes)
+        XCTAssertTrue(stored.contains("truncated"),
+                      "stored form soft-truncates only above the absolute ceiling")
+        XCTAssertTrue(stored.contains("[[rc:"),
+                      "stored form must embed recoverable handle")
+
+        // List path rehydrates to the byte-identical original (S3).
         let big = try XCTUnwrap(try runs.listLatestProviderEventLogs(threadId: thread.id, limit: 2)
             .first(where: { $0.id == "pathological-provider" }))
-        XCTAssertLessThanOrEqual(big.payloadJSON.utf8.count, AgentRunRepository.maximumPersistedEventRowBytes)
-        XCTAssertTrue(big.payloadJSON.contains("truncated"),
-                      "only frames above the absolute ceiling are soft-truncated")
+        XCTAssertEqual(big.payloadJSON, pathological,
+                       "provider-log list must rehydrate oversized originals byte-identically")
     }
 
     func test_hotReplay_appliesEncodedByteAndCountHighWaterInFIFOOrder() throws {

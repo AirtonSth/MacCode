@@ -3850,6 +3850,15 @@ public final class AgentRunRepository: @unchecked Sendable {
             guard let payload = st.columnText(7) else {
                 throw PersistenceDataError.corruptProviderEventLog("missing payload for event \(id)")
             }
+            // S3: rehydrate store-before-loss presentation (or fail loud on store_failed).
+            let resolvedPayload: String
+            do {
+                resolvedPayload = try rehydrateOversizedPayloadIfNeeded(payload)
+            } catch {
+                throw PersistenceDataError.corruptProviderEventLog(
+                    "event \(id) oversized recovery failed: \(error)"
+                )
+            }
             events.append(ProviderRuntimeEvent(
                 id: id,
                 provider: provider,
@@ -3858,7 +3867,7 @@ public final class AgentRunRepository: @unchecked Sendable {
                 providerTurnId: st.columnText(4),
                 providerItemId: st.columnText(5),
                 providerRequestId: st.columnText(6),
-                payloadJSON: payload,
+                payloadJSON: resolvedPayload,
                 receivedAtMs: Int64(st.columnInt64(8))
             ))
         }
