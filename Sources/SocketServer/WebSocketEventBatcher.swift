@@ -231,38 +231,55 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                     }
                 } else if additionalBytes > 0 {
                     if self.wouldExceedAdmissionLocked(additionalBytes: additionalBytes) {
+                        // Overflow clears pending; re-admit as a brand-new full frame.
                         self.handleOverflowLocked(reason: "admission_bytes_or_count")
-                    }
-                    // Replacement that still fits after netting previous is admitted.
-                    if self.wouldExceedAdmissionLocked(additionalBytes: additionalBytes) {
-                        var lost: [Int64] = []
-                        if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
-                        self.preQueueLock.lock()
-                        self.overflowCount += 1
-                        self.preQueueLock.unlock()
-                        self.onAdmissionOverflow?(lost, "replacement_exceeds_budget")
+                        guard self.canAdmitSingleFrameLocked(byteCount: candidate.count),
+                              !self.wouldExceedAdmissionLocked(additionalBytes: candidate.count)
+                        else {
+                            var lost: [Int64] = []
+                            if let seq = WebSocketOutboundQueue.eventSequence(in: data) {
+                                lost.append(seq)
+                            }
+                            self.preQueueLock.lock()
+                            self.overflowCount += 1
+                            self.preQueueLock.unlock()
+                            self.onAdmissionOverflow?(lost, "replacement_after_overflow")
+                            return
+                        }
+                        self.order.append(key)
+                        self.noteEnqueueLocked(candidate)
+                        self.pending[key] = candidate
+                        if self.isAdmissionAgedLocked() {
+                            self.flushLocked()
+                            return
+                        }
+                        guard !self.scheduled else { return }
+                        self.scheduled = true
+                        self.queue.asyncAfter(deadline: .now() + self.delay) {
+                            self.flushLocked()
+                        }
                         return
                     }
                 }
-                if let previous {
+                // Re-read live previous after possible overflow of other keys.
+                if let livePrevious = self.pending[key] {
                     if self.filter.coalescingMergesByConcatenation(for: event),
-                       let merged = Self.mergeAgentItemDeltaFrames(previous, data),
-                       merged == candidate {
-                        self.onCoalescedAway?(previous)
-                        self.pendingBytes -= previous.count
+                       let merged = Self.mergeAgentItemDeltaFrames(livePrevious, data) {
+                        self.onCoalescedAway?(livePrevious)
+                        self.pendingBytes -= livePrevious.count
                         self.noteEnqueueLocked(merged)
                         self.pending[key] = merged
                     } else {
                         // Last-write-wins: superseded summary never hits the socket.
-                        self.onCoalescedAway?(previous)
-                        self.pendingBytes -= previous.count
+                        self.onCoalescedAway?(livePrevious)
+                        self.pendingBytes -= livePrevious.count
                         self.noteEnqueueLocked(data)
                         self.pending[key] = data
                     }
                 } else {
                     self.order.append(key)
-                    self.noteEnqueueLocked(data)
-                    self.pending[key] = data
+                    self.noteEnqueueLocked(candidate)
+                    self.pending[key] = candidate
                 }
                 if self.isAdmissionAgedLocked() {
                     self.flushLocked()

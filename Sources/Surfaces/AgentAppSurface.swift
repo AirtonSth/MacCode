@@ -6110,11 +6110,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             if let index = threads.firstIndex(where: { $0.id == tid }) {
                 threads[index] = pendingThread
             }
-            status = .pending
-            currentRunId = runId
+            // Per-run mapping is always safe; selection-facing fields only if still selected.
             runThreads[runId] = tid
-            runStartedAt = nil
-            isStopping = false
+            if selectedThreadId == tid {
+                status = .pending
+                currentRunId = runId
+                runStartedAt = nil
+                isStopping = false
+            }
             onRunStateChange?()
         } catch {
             // S5: only mutate prep state for *this* accepted generation.
@@ -6135,8 +6138,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                         threads[index] = rolled
                     }
                 }
-                statusMessage = "Failed to prepare run: \(error)"
-                status = .failed
+                if selectedThreadId == tid {
+                    statusMessage = "Failed to prepare run: \(error)"
+                    status = .failed
+                }
             }
             runThreads[runId] = nil
             if currentRunId == runId {
@@ -6162,38 +6167,40 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             if !done.suppressLateCallback {
                 surfacePreparationStates[tid] = done.state
             }
-            do {
-                try clearComposerDraft(threadId: tid, providerInstanceId: providerInstanceId)
-                attachments = []
-                prompt = ""
-            } catch {
-                // Provider already started — do not drop the visible recovery draft.
-                // send() clears the composer optimistically before start; only blank it
-                // after durable delete succeeds. Attachments were not cleared yet.
-                // Prefer the pre-normalization visible input (`$goal`/whitespace) so
-                // recovery matches what the user typed, not the provider-run command.
-                if prompt.isEmpty {
-                    prompt = recoveryDisplayText ?? text
+            // Never wipe another tab's composer when this prep finishes off-selection.
+            if selectedThreadId == tid {
+                do {
+                    try clearComposerDraft(threadId: tid, providerInstanceId: providerInstanceId)
+                    attachments = []
+                    prompt = ""
+                } catch {
+                    if prompt.isEmpty {
+                        prompt = recoveryDisplayText ?? text
+                    }
+                    statusMessage = "Provider started, but draft cleanup failed: \(error)"
                 }
-                statusMessage = "Provider started, but draft cleanup failed: \(error)"
+            } else {
+                try? clearComposerDraft(threadId: tid, providerInstanceId: providerInstanceId)
             }
             let runStatus = (try? coordinator.runStatus(runId)) ?? .running
             await MainActor.run {
                 self.terminalRunIds.remove(runId)
-                if runStatus == .running || runStatus == .pending {
-                    self.currentRunId = runId
-                    self.runThreads[runId] = tid
-                    self.status = .running
-                    self.runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
-                        current: self.runStartedAt,
-                        persisted: (try? self.coordinator.runStartedAt(threadId: tid)) ?? (try? self.coordinator.runStartedAt(runId: runId))
-                    )
-                    self.isStopping = false  // UX-MAC_AGENT-STOP: fresh run; clear stale stopping flag
-                } else {
-                    self.currentRunId = nil
-                    self.runThreads[runId] = nil
-                    self.status = runStatus
-                    self.runStartedAt = nil
+                self.runThreads[runId] = tid
+                if self.selectedThreadId == tid {
+                    if runStatus == .running || runStatus == .pending {
+                        self.currentRunId = runId
+                        self.status = .running
+                        self.runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
+                            current: self.runStartedAt,
+                            persisted: (try? self.coordinator.runStartedAt(threadId: tid))
+                                ?? (try? self.coordinator.runStartedAt(runId: runId))
+                        )
+                        self.isStopping = false
+                    } else {
+                        self.currentRunId = nil
+                        self.status = runStatus
+                        self.runStartedAt = nil
+                    }
                 }
                 self.reloadThreads()
                 self.onRunStateChange?()
@@ -6210,19 +6217,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             if !failed.suppressLateCallback {
                 surfacePreparationStates[tid] = failed.state
             }
-            // Only surface failure UI if this generation still owns prep (not a
-            // superseded late failure after Stop + resend).
+            runThreads[runId] = nil
             if preparingRunGeneration[tid] == acceptedGeneration
                 || preparingRunGeneration[tid] == nil {
                 await MainActor.run {
-                    let detail = (error as? LocalizedError)?.errorDescription
-                        ?? error.localizedDescription
-                    self.statusMessage = "Failed to start: \(detail)"
-                    self.status = .failed
-                    self.currentRunId = nil
-                    self.runThreads[runId] = nil
-                    self.runStartedAt = nil
-                    self.clearActivePlanFollowUpSuppressionIfSafe()
+                    if self.selectedThreadId == tid {
+                        let detail = (error as? LocalizedError)?.errorDescription
+                            ?? error.localizedDescription
+                        self.statusMessage = "Failed to start: \(detail)"
+                        self.status = .failed
+                        if self.currentRunId == runId {
+                            self.currentRunId = nil
+                            self.runStartedAt = nil
+                        }
+                        self.clearActivePlanFollowUpSuppressionIfSafe()
+                    }
                     self.reloadThreads()
                     self.onRunStateChange?()
                 }
@@ -6463,7 +6472,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func stop() {
         let tid = selectedThreadId
-        let localRunId = currentRunId ?? tid.flatMap { trackedRunId(for: $0) }
+        // Only trust currentRunId when it maps to the selected thread (parallel prep).
+        let localRunId: AgentRunID? = {
+            if let c = currentRunId, let tid, runThreads[c] == tid { return c }
+            return tid.flatMap { trackedRunId(for: $0) }
+        }()
         // S5: cancel generation-owned surface preparation even when no run is
         // tracked yet (Graphify / preflight window before coordinator.startRun).
         if let tid, preparingRunThreads.contains(tid) {
