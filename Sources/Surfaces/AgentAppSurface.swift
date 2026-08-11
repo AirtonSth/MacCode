@@ -6149,6 +6149,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             if currentRunId == runId {
                 currentRunId = nil
             }
+            coordinator.releaseProviderStartReservation(threadId: tid)
             return nil
         }
         do {

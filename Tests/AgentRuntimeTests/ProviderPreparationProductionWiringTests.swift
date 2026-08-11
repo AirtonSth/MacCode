@@ -234,4 +234,73 @@ final class ProviderPreparationProductionWiringTests: XCTestCase {
         XCTAssertEqual(runner.startCount, 2, "second turn must claimSpawn after terminalize")
         XCTAssertNotEqual(first, second)
     }
+
+    /// Codex IMPORTANT: Stop after surface claim but before startRun registers
+    /// pendingProviderStarts must still block spawn. Reservation closes that gap.
+    func test_reserveProviderStart_stopInClaimGap_blocksSpawn() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-reserve")
+        let thread = AgentThread(title: "prep-reserve", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let runner = CountingRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: runner]
+        )
+
+        // Surface-side claim finished; startRun not registered yet.
+        coordinator.reserveProviderStart(threadId: thread.id)
+        coordinator.cancelPreparation(threadId: thread.id)
+
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                threadId: thread.id,
+                provider: .codex,
+                model: "fake-model",
+                cwd: tmp,
+                prompt: "must not spawn after gap Stop"
+            ))
+            // startRun may return if it registered then cancelled the handle
+            // without throwing; provider must still not start.
+        } catch {
+            // Cancelled / acceptance rejection also OK.
+        }
+
+        XCTAssertEqual(
+            runner.startCount,
+            0,
+            "Stop in claim→startRun gap must prevent provider start"
+        )
+    }
+
+    /// Surface-only cancel before reserve must not leave pendingThreadStops that
+    /// poison an immediate resend.
+    func test_cancelWithoutReserve_doesNotPoisonResend() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-no-poison")
+        let thread = AgentThread(title: "prep-no-poison", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let runner = CountingRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: runner]
+        )
+
+        // Graphify-only cancel: no reserve, no pending start.
+        coordinator.cancelPreparation(threadId: thread.id)
+
+        let runId = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "resend after surface-only cancel"
+        ))
+        XCTAssertEqual(runner.startCount, 1, "surface-only cancel must not poison next send")
+        XCTAssertNotNil(runId)
+    }
 }
