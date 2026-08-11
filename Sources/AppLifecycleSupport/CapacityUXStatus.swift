@@ -21,7 +21,18 @@ public struct CapacityUXStatus: Sendable, Equatable {
     public var degradationActions: [String]
     public var unavailableSections: [String]
     public var canExportDiagnostics: Bool
-    public var accessibleSummary: String
+
+    /// Always derived from current fields so VoiceOver cannot announce stale text.
+    public var accessibleSummary: String {
+        Self.buildAccessibleSummary(
+            tier: hardwareTierName,
+            envelope: envelope,
+            host: hostPressure,
+            provider: providerTreePressure,
+            actions: degradationActions,
+            unavailable: unavailableSections
+        )
+    }
 
     public init(
         hardwareTierName: String,
@@ -39,14 +50,6 @@ public struct CapacityUXStatus: Sendable, Equatable {
         self.degradationActions = degradationActions
         self.unavailableSections = unavailableSections
         self.canExportDiagnostics = canExportDiagnostics
-        self.accessibleSummary = Self.buildAccessibleSummary(
-            tier: hardwareTierName,
-            envelope: envelope,
-            host: hostPressure,
-            provider: providerTreePressure,
-            actions: degradationActions,
-            unavailable: unavailableSections
-        )
     }
 
     public static func buildAccessibleSummary(
@@ -85,4 +88,75 @@ public struct CapacityUXStatus: Sendable, Equatable {
 
     /// Explicit release is only for completed idle sessions.
     public static let userMayReleaseLiveProviderRSS = false
+
+    /// Build status from live pressure governor + envelope measurement honesty.
+    public static func from(
+        hardwareTierName: String,
+        hostPressure: PressureLevel,
+        providerTreePressure: PressureLevel,
+        envelopeMeasured: Bool,
+        beyondEnvelope: Bool,
+        accountingAvailable: Bool,
+        degradationActions: [String],
+        unavailableSections: [String] = []
+    ) -> CapacityUXStatus {
+        let envelope: CapacityEnvelopeStatus = {
+            if !accountingAvailable { return .accountingUnavailable }
+            if !envelopeMeasured { return .unmeasured }
+            return beyondEnvelope ? .beyondMeasuredEnvelope : .withinMeasuredEnvelope
+        }()
+        return CapacityUXStatus(
+            hardwareTierName: hardwareTierName,
+            envelope: envelope,
+            hostPressure: hostPressure,
+            providerTreePressure: providerTreePressure,
+            degradationActions: degradationActions,
+            unavailableSections: unavailableSections,
+            canExportDiagnostics: true
+        )
+    }
+}
+
+/// Process-wide capacity UX snapshot for Settings / diagnostics (S12).
+/// Production code publishes here so status is not test-only.
+public final class CapacityUXStatusStore: @unchecked Sendable {
+    public static let shared = CapacityUXStatusStore()
+
+    private let lock = NSLock()
+    private var _status: CapacityUXStatus = CapacityUXStatus.from(
+        hardwareTierName: "unmeasured",
+        hostPressure: .normal,
+        providerTreePressure: .normal,
+        envelopeMeasured: false,
+        beyondEnvelope: false,
+        accountingAvailable: true,
+        degradationActions: []
+    )
+
+    public func current() -> CapacityUXStatus {
+        lock.lock(); defer { lock.unlock() }
+        return _status
+    }
+
+    public func publish(_ status: CapacityUXStatus) {
+        lock.lock(); defer { lock.unlock() }
+        _status = status
+    }
+
+    public func publishFromPressure(
+        host: PressureLevel,
+        providerTree: PressureLevel = .normal,
+        actions: [String] = []
+    ) {
+        let next = CapacityUXStatus.from(
+            hardwareTierName: current().hardwareTierName,
+            hostPressure: host,
+            providerTreePressure: providerTree,
+            envelopeMeasured: false,
+            beyondEnvelope: false,
+            accountingAvailable: true,
+            degradationActions: actions
+        )
+        publish(next)
+    }
 }

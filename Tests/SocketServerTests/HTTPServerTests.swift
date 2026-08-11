@@ -1230,10 +1230,28 @@ final class HTTPServerTests: XCTestCase {
     func test_outboundPressureBaselineGate_rateLimitsToOnePerSecond() {
         let gate = OutboundPressureBaselineGate(minInterval: 1.0)
         XCTAssertTrue(gate.tryAcquire(now: 100))
+        gate.recordSuccess()
         XCTAssertFalse(gate.tryAcquire(now: 100.5),
                        "second acquire inside 1s must be rejected")
+        XCTAssertTrue(gate.hasPendingRecovery, "rate-suppressed request must stay sticky")
         XCTAssertTrue(gate.tryAcquire(now: 101.0),
                       "acquire at the interval boundary must succeed")
+        gate.recordSuccess()
+        XCTAssertFalse(gate.hasPendingRecovery)
+    }
+
+    func test_outboundPressureBaselineGate_stickyUntilSuccess() {
+        let gate = OutboundPressureBaselineGate(minInterval: 1.0)
+        gate.markPending()
+        XCTAssertTrue(gate.tryAcquire(now: 10))
+        // Enqueue failure path: re-mark pending without recordSuccess.
+        gate.markPending()
+        XCTAssertTrue(gate.hasPendingRecovery)
+        XCTAssertFalse(gate.tryAcquire(now: 10.2))
+        XCTAssertTrue(gate.hasPendingRecovery)
+        XCTAssertTrue(gate.tryAcquire(now: 11.1))
+        gate.recordSuccess()
+        XCTAssertFalse(gate.hasPendingRecovery)
     }
 
     func test_connectionOutboundOwner_writeFailureClosesOnceAndClearsQueueAccounting() {

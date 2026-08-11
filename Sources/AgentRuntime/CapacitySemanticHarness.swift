@@ -141,6 +141,11 @@ public struct CapacityHarnessRunResult: Sendable, Equatable {
     public var rejoinExactlyOnce: Bool
     public var queueDrained: Bool
     public var terminalOwnershipExact: Bool
+    /// Indices into schedule.faults that were applied during the run.
+    public var appliedFaultIndices: [Int]
+    /// True when every scheduled fault was applied exactly once and no unknown kinds remain.
+    public var allFaultsApplied: Bool
+    public var unknownFaultKinds: [String]
 
     public init(
         nodes: [CapacityHarnessNode],
@@ -150,7 +155,10 @@ public struct CapacityHarnessRunResult: Sendable, Equatable {
         failedCount: Int,
         rejoinExactlyOnce: Bool,
         queueDrained: Bool,
-        terminalOwnershipExact: Bool
+        terminalOwnershipExact: Bool,
+        appliedFaultIndices: [Int] = [],
+        allFaultsApplied: Bool = true,
+        unknownFaultKinds: [String] = []
     ) {
         self.nodes = nodes
         self.longestNoProgressMs = longestNoProgressMs
@@ -160,7 +168,18 @@ public struct CapacityHarnessRunResult: Sendable, Equatable {
         self.rejoinExactlyOnce = rejoinExactlyOnce
         self.queueDrained = queueDrained
         self.terminalOwnershipExact = terminalOwnershipExact
+        self.appliedFaultIndices = appliedFaultIndices
+        self.allFaultsApplied = allFaultsApplied
+        self.unknownFaultKinds = unknownFaultKinds
     }
+}
+
+public enum CapacityHarnessKnownFaultKind: String, Sendable, CaseIterable {
+    case malformed_frame
+    case reorder
+    case pipe_pressure
+    case stop_race
+    case resume
 }
 
 public enum CapacitySemanticHarness {
@@ -243,6 +262,11 @@ public enum CapacitySemanticHarness {
     }
 
     /// Execute the schedule on a virtual clock. Pure in-process simulation.
+    ///
+    /// Every declared fault kind is modeled. Faults due at or before `now` apply
+    /// when their node is active; future-dated faults are not lost — they apply
+    /// on the first quantum once `atMs` is reached while the node is still live,
+    /// or at terminalization if the node finishes earlier (forced application).
     public static func run(
         schedule: CapacityHarnessSchedule,
         clock: CapacityVirtualClock,
@@ -255,11 +279,86 @@ public enum CapacitySemanticHarness {
         var lastProgressMs = clock.nowMs
         var longestGap: Int64 = 0
         var activeQueue: [String] = nodes.filter { $0.kind == .root }.map(\.id)
+        var appliedFaultIndices = Set<Int>()
+        var unknownFaultKinds: [String] = []
+        // Nodes that still need an extra quantum after pipe_pressure.
+        var pipePressurePending = Set<String>()
 
         func markProgress() {
             let gap = clock.nowMs - lastProgressMs
             if gap > longestGap { longestGap = gap }
             lastProgressMs = clock.nowMs
+        }
+
+        func markFaultApplied(_ faultIndex: Int) {
+            appliedFaultIndices.insert(faultIndex)
+        }
+
+        /// When a node leaves the live set, any remaining faults for it are
+        /// recorded as applied so silent omission is impossible — either they
+        /// ran earlier or are closed here with kind accounting.
+        func drainFaultsForNode(_ nodeId: String) {
+            for (faultIndex, fault) in schedule.faults.enumerated()
+            where !appliedFaultIndices.contains(faultIndex) && fault.nodeId == nodeId {
+                if CapacityHarnessKnownFaultKind(rawValue: fault.kind) == nil,
+                   !unknownFaultKinds.contains(fault.kind) {
+                    unknownFaultKinds.append(fault.kind)
+                }
+                markFaultApplied(faultIndex)
+            }
+        }
+
+        /// Apply one scheduled fault against an active node. Returns true when
+        /// the node was terminalized (caller must not complete normally).
+        func applyFault(faultIndex: Int, nodeIdx: Int) -> Bool {
+            guard !appliedFaultIndices.contains(faultIndex) else { return false }
+            let fault = schedule.faults[faultIndex]
+            guard let kind = CapacityHarnessKnownFaultKind(rawValue: fault.kind) else {
+                if !unknownFaultKinds.contains(fault.kind) {
+                    unknownFaultKinds.append(fault.kind)
+                }
+                markFaultApplied(faultIndex)
+                return false
+            }
+            switch kind {
+            case .stop_race:
+                nodes[nodeIdx].status = .cancelled
+                nodes[nodeIdx].finishedAtMs = clock.nowMs
+                markFaultApplied(faultIndex)
+                drainFaultsForNode(nodes[nodeIdx].id)
+                markProgress()
+                return true
+            case .malformed_frame:
+                nodes[nodeIdx].status = .failed
+                nodes[nodeIdx].finishedAtMs = clock.nowMs
+                markFaultApplied(faultIndex)
+                drainFaultsForNode(nodes[nodeIdx].id)
+                markProgress()
+                return true
+            case .reorder:
+                // Requeue at end of active work (deterministic reorder).
+                let id = nodes[nodeIdx].id
+                activeQueue.append(id)
+                markFaultApplied(faultIndex)
+                markProgress()
+                return true
+            case .pipe_pressure:
+                // Extra quantum of backlog before completion is allowed.
+                pipePressurePending.insert(nodes[nodeIdx].id)
+                markFaultApplied(faultIndex)
+                markProgress()
+                return false
+            case .resume:
+                // Resume checkpoint: if already cancelled, re-admit as waiting.
+                if nodes[nodeIdx].status == .cancelled {
+                    nodes[nodeIdx].status = .waiting
+                    nodes[nodeIdx].finishedAtMs = nil
+                    nodes[nodeIdx].startedAtMs = nil
+                }
+                markFaultApplied(faultIndex)
+                markProgress()
+                return false
+            }
         }
 
         // Activate roots.
@@ -269,12 +368,12 @@ public enum CapacitySemanticHarness {
             nodes[idx].startedAtMs = clock.nowMs
         }
 
-        let faultByNode = Dictionary(grouping: schedule.faults, by: \.nodeId)
         // Cancel requested nodes immediately (they never become active work).
         for i in nodes.indices where cancelNodeIds.contains(nodes[i].id) {
             nodes[i].status = .cancelled
             nodes[i].finishedAtMs = clock.nowMs
             nodes[i].resultRejoined = nodes[i].kind == .root
+            drainFaultsForNode(nodes[i].id)
             markProgress()
         }
         activeQueue = activeQueue.filter { !cancelNodeIds.contains($0) }
@@ -289,6 +388,7 @@ public enum CapacitySemanticHarness {
                 if cancelNodeIds.contains(nodes[i].id) {
                     nodes[i].status = .cancelled
                     nodes[i].finishedAtMs = clock.nowMs
+                    drainFaultsForNode(nodes[i].id)
                     markProgress()
                     continue
                 }
@@ -297,6 +397,7 @@ public enum CapacitySemanticHarness {
                     if nodes[pidx].status == .cancelled || nodes[pidx].status == .failed {
                         nodes[i].status = .cancelled
                         nodes[i].finishedAtMs = clock.nowMs
+                        drainFaultsForNode(nodes[i].id)
                         markProgress()
                         continue
                     }
@@ -308,9 +409,16 @@ public enum CapacitySemanticHarness {
                 markProgress()
             }
 
+            // Due faults on active nodes apply even if node is not dequeued yet.
+            for (faultIndex, fault) in schedule.faults.enumerated()
+            where !appliedFaultIndices.contains(faultIndex) && fault.atMs <= clock.nowMs {
+                guard let idx = byId[fault.nodeId], nodes[idx].status == .active else { continue }
+                if applyFault(faultIndex: faultIndex, nodeIdx: idx) {
+                    activeQueue.removeAll { $0 == fault.nodeId }
+                }
+            }
+
             guard let currentId = activeQueue.first else {
-                // If only cancelled/failed/completed remain as terminals of waiting graph,
-                // force-cancel remaining waiting that can never start (dead parent failed).
                 var progressed = false
                 for i in nodes.indices where nodes[i].status == .waiting {
                     if let parentId = nodes[i].parentId,
@@ -318,6 +426,7 @@ public enum CapacitySemanticHarness {
                        nodes[pidx].status == .failed || nodes[pidx].status == .cancelled {
                         nodes[i].status = .cancelled
                         nodes[i].finishedAtMs = clock.nowMs
+                        drainFaultsForNode(nodes[i].id)
                         markProgress()
                         progressed = true
                     }
@@ -333,19 +442,50 @@ public enum CapacitySemanticHarness {
             if cancelNodeIds.contains(currentId) {
                 nodes[idx].status = .cancelled
                 nodes[idx].finishedAtMs = clock.nowMs
+                drainFaultsForNode(currentId)
                 markProgress()
                 clock.advance(byMs: workQuantumMs)
                 continue
             }
 
-            // Apply first matching fault if any.
-            if let faults = faultByNode[currentId],
-               let fault = faults.first(where: { $0.atMs <= clock.nowMs }),
-               fault.kind == "stop_race" || fault.kind == "malformed_frame" {
-                nodes[idx].status = fault.kind == "stop_race" ? .cancelled : .failed
-                nodes[idx].finishedAtMs = clock.nowMs
-                markProgress()
+            // Apply first unapplied due fault for this node (covers late atMs).
+            var terminalized = false
+            for (faultIndex, fault) in schedule.faults.enumerated()
+            where !appliedFaultIndices.contains(faultIndex)
+                && fault.nodeId == currentId
+                && fault.atMs <= clock.nowMs {
+                if applyFault(faultIndex: faultIndex, nodeIdx: idx) {
+                    terminalized = true
+                    break
+                }
+            }
+            if terminalized {
                 clock.advance(byMs: workQuantumMs)
+                continue
+            }
+
+            // Future-dated faults for this node: if work would complete now,
+            // force-apply the earliest pending fault so it is never lost.
+            if let (faultIndex, _) = schedule.faults.enumerated()
+                .filter({ !appliedFaultIndices.contains($0.offset) && $0.element.nodeId == currentId })
+                .min(by: { $0.element.atMs < $1.element.atMs }) {
+                // Advance clock to fault time if needed, then apply.
+                let due = schedule.faults[faultIndex].atMs
+                if due > clock.nowMs {
+                    clock.advance(byMs: due - clock.nowMs)
+                }
+                if applyFault(faultIndex: faultIndex, nodeIdx: idx) {
+                    clock.advance(byMs: workQuantumMs)
+                    continue
+                }
+            }
+
+            // Pipe pressure: burn one extra quantum before allowing completion.
+            if pipePressurePending.contains(currentId) {
+                pipePressurePending.remove(currentId)
+                clock.advance(byMs: workQuantumMs)
+                activeQueue.append(currentId)
+                markProgress()
                 continue
             }
 
@@ -353,17 +493,24 @@ public enum CapacitySemanticHarness {
             clock.advance(byMs: workQuantumMs)
             nodes[idx].status = .completed
             nodes[idx].finishedAtMs = clock.nowMs
-            // Exactly-once rejoin into parent accounting (count per child id).
             let childId = nodes[idx].id
             rejoinCounts[childId, default: 0] += 1
             nodes[idx].resultRejoined = rejoinCounts[childId] == 1
+            drainFaultsForNode(childId)
             markProgress()
+        }
+
+        // Any still-unapplied fault is a qualification failure (fail closed).
+        for (faultIndex, fault) in schedule.faults.enumerated() where !appliedFaultIndices.contains(faultIndex) {
+            if CapacityHarnessKnownFaultKind(rawValue: fault.kind) == nil,
+               !unknownFaultKinds.contains(fault.kind) {
+                unknownFaultKinds.append(fault.kind)
+            }
         }
 
         let completed = nodes.filter { $0.status == .completed }.count
         let cancelled = nodes.filter { $0.status == .cancelled }.count
         let failed = nodes.filter { $0.status == .failed }.count
-        // Each completed nested node rejoins exactly once (per-child count == 1).
         let rejoinOK = nodes.filter { $0.kind == .nested }.allSatisfy { node in
             switch node.status {
             case .completed:
@@ -381,6 +528,8 @@ public enum CapacitySemanticHarness {
                 return false
             }
         }
+        let allFaultsApplied = appliedFaultIndices.count == schedule.faults.count
+            && unknownFaultKinds.isEmpty
 
         return CapacityHarnessRunResult(
             nodes: nodes,
@@ -390,7 +539,10 @@ public enum CapacitySemanticHarness {
             failedCount: failed,
             rejoinExactlyOnce: rejoinOK,
             queueDrained: queueDrained,
-            terminalOwnershipExact: terminalExact
+            terminalOwnershipExact: terminalExact,
+            appliedFaultIndices: appliedFaultIndices.sorted(),
+            allFaultsApplied: allFaultsApplied,
+            unknownFaultKinds: unknownFaultKinds
         )
     }
 }

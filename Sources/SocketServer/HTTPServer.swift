@@ -2490,34 +2490,72 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 }
             )
             // C-04: pressure baseline_required ≤1/s, never as a close reason.
+            // S10: sticky recovery — rate suppression / enqueue failure leave a
+            // pending flag so a later flush (or post-interval timer) still delivers.
             let pressureBaselineGate = OutboundPressureBaselineGate()
             let emitPressureBaseline: @Sendable () -> Void = { [weak self] in
                 guard let self else { return }
+                // Always coalesce the recovery request before attempting emit.
+                pressureBaselineGate.markPending()
                 guard pressureBaselineGate.tryAcquire() else { return }
                 let current = sequenceWatermark.value
                 guard let baselineData = self.connectionBaselineRequiredData(
                     connectionId: connectionId,
                     requestedAfterSequence: current,
                     currentSequence: current
-                ) else { return }
-                switch outbound.enqueueApplication(baselineData) {
-                case .accepted:
-                    break
-                case .queueFull:
-                    _ = outbound.degrade()
-                    _ = outbound.enqueueApplication(baselineData)
-                case .closed:
+                ) else {
+                    // Keep pending so a subsequent call can retry.
+                    pressureBaselineGate.markPending()
                     return
                 }
-                NSLog(
-                    "[RC2.WS] outbound pressure: baseline_required without close seq=%lld",
-                    current
-                )
-                EventBus.shared.publish(kind: "diagnostic.ws_outbound_pressure", payload: .object([
-                    "reason": .string("outbound_queue_pressure"),
-                    "baseline_required": .bool(true),
-                    "current_sequence": .number(Double(current))
-                ]))
+                let accepted: Bool = {
+                    switch outbound.enqueueApplication(baselineData) {
+                    case .accepted:
+                        return true
+                    case .queueFull:
+                        _ = outbound.degrade()
+                        switch outbound.enqueueApplication(baselineData) {
+                        case .accepted:
+                            return true
+                        case .queueFull, .closed:
+                            return false
+                        }
+                    case .closed:
+                        return false
+                    }
+                }()
+                if accepted {
+                    pressureBaselineGate.recordSuccess()
+                    NSLog(
+                        "[RC2.WS] outbound pressure: baseline_required without close seq=%lld",
+                        current
+                    )
+                    EventBus.shared.publish(kind: "diagnostic.ws_outbound_pressure", payload: .object([
+                        "reason": .string("outbound_queue_pressure"),
+                        "baseline_required": .bool(true),
+                        "current_sequence": .number(Double(current))
+                    ]))
+                } else {
+                    // Enqueue failed: keep sticky pending for a later flush.
+                    pressureBaselineGate.markPending()
+                }
+            }
+            // Trailing sticky flush: if recovery was rate-suppressed, retry after
+            // the gate interval so two overflow bursts cannot leave iOS stale.
+            let stickyBaselineFlush: @Sendable () -> Void = {
+                guard pressureBaselineGate.hasPendingRecovery else { return }
+                emitPressureBaseline()
+            }
+            let scheduleStickyBaselineFlush: @Sendable () -> Void = {
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.05) {
+                    stickyBaselineFlush()
+                    // Re-arm while still owed so enqueue failure cannot strand recovery.
+                    if pressureBaselineGate.hasPendingRecovery {
+                        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.05) {
+                            stickyBaselineFlush()
+                        }
+                    }
+                }
             }
             let recordAcceptedEvent: @Sendable (Data) -> Void = { data in
                 if case .event(let frame) = try? ConnectionTransportFrame.decodeStrict(data) {
@@ -2621,6 +2659,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         sequenceWatermark.recordFilteredEvent(sequence: sequence)
                     }
                     emitPressureBaseline()
+                    if pressureBaselineGate.hasPendingRecovery {
+                        scheduleStickyBaselineFlush()
+                    }
                 }
             ) { data in
                 enqueueApplicationOrDegrade(data)

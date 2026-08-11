@@ -966,22 +966,48 @@ final class LockedQueuedBytesSample: @unchecked Sendable {
 
 /// Rate-limits in-band `baseline_required` emissions under outbound pressure
 /// so a busy agent cannot flood the client (acceptance: ≤1/s).
+///
+/// Sticky recovery (S10): when a request is rate-suppressed or enqueue fails,
+/// `markPending()` coalesces work so a later flush is guaranteed once the gate
+/// opens. Only successful emissions call `recordSuccess`.
 final class OutboundPressureBaselineGate: @unchecked Sendable {
     private let lock = NSLock()
     private var lastEmitAt: TimeInterval = 0
     private let minInterval: TimeInterval
+    private var pendingRecovery = false
 
     init(minInterval: TimeInterval = 1.0) {
         self.minInterval = max(0, minInterval)
     }
 
+    /// True when a recovery emission is still owed.
+    var hasPendingRecovery: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return pendingRecovery
+    }
+
+    /// Coalesce a recovery request that could not emit immediately.
+    func markPending() {
+        lock.lock(); defer { lock.unlock() }
+        pendingRecovery = true
+    }
+
+    /// Attempt to open the rate gate. On success the caller must enqueue and
+    /// then either `recordSuccess` or re-`markPending` on failure.
     func tryAcquire(now: TimeInterval = Date().timeIntervalSinceReferenceDate) -> Bool {
         lock.lock(); defer { lock.unlock() }
         if lastEmitAt > 0, now - lastEmitAt < minInterval {
+            pendingRecovery = true
             return false
         }
         lastEmitAt = now
         return true
+    }
+
+    /// Clear pending only after baseline was accepted by the outbound queue.
+    func recordSuccess() {
+        lock.lock(); defer { lock.unlock() }
+        pendingRecovery = false
     }
 }
 

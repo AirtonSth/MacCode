@@ -95,4 +95,53 @@ final class ProviderPreparationStateMachineTests: XCTestCase {
         XCTAssertEqual(t.state.phase, .stopping)
         XCTAssertEqual(t.state.accessibleStatus, "Stopping")
     }
+
+    func test_spawnPermit_revokedAfterStopAtWriteBoundary() {
+        var state = ProviderPreparationState()
+        state = ProviderPreparationStateMachine.apply(
+            state: state,
+            event: .accept(draftMessageId: "d", atMs: 1)
+        ).state
+        let gen = state.generation
+        let prepDone = ProviderPreparationStateMachine.apply(
+            state: state,
+            event: .preparationFinished(generation: gen)
+        )
+        XCTAssertTrue(prepDone.allowProviderSpawn)
+        XCTAssertEqual(prepDone.spawnPermitGeneration, gen)
+        XCTAssertTrue(
+            ProviderPreparationStateMachine.claimSpawn(
+                state: prepDone.state,
+                permitGeneration: prepDone.spawnPermitGeneration
+            )
+        )
+        // Stop after preparationFinished revokes the retained permit.
+        let stopped = ProviderPreparationStateMachine.apply(
+            state: prepDone.state,
+            event: .stopRequested
+        )
+        XCTAssertFalse(
+            ProviderPreparationStateMachine.claimSpawn(
+                state: stopped.state,
+                permitGeneration: prepDone.spawnPermitGeneration
+            ),
+            "retained allowProviderSpawn must not spawn after generation cancel"
+        )
+    }
+
+    func test_preparationFailed_leavesPreparing() {
+        var state = ProviderPreparationState()
+        state = ProviderPreparationStateMachine.apply(
+            state: state,
+            event: .accept(draftMessageId: "d", atMs: 1)
+        ).state
+        let gen = state.generation
+        let failed = ProviderPreparationStateMachine.apply(
+            state: state,
+            event: .preparationFailed(generation: gen, reason: .durabilityFailure)
+        )
+        XCTAssertEqual(failed.state.phase, .terminal)
+        XCTAssertEqual(failed.state.terminalReason, .durabilityFailure)
+        XCTAssertFalse(failed.allowProviderSpawn)
+    }
 }

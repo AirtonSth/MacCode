@@ -45,12 +45,28 @@ public enum GraphifyRuntimeHardening {
             && pin.approvedVersion != "unpinned-pending-canary"
             && sha.count == 64
             && sha.unicodeScalars.allSatisfy { hex.contains($0) }
+            && !pin.license.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !pin.bomNote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     /// Active rebuild must be cancellable before watchers stop.
     public static func mayStopWatchers(rebuildInFlight: Bool, rebuildCancelled: Bool) -> Bool {
         if rebuildInFlight { return rebuildCancelled }
         return true
+    }
+
+    /// Bound process pipe capture. Prefer over unbounded `readDataToEndOfFile`.
+    public static func boundedRead(handle: FileHandle, maxBytes: Int) -> Data {
+        let limit = max(0, maxBytes)
+        guard limit > 0 else { return Data() }
+        var collected = Data()
+        collected.reserveCapacity(min(limit, 64 * 1024))
+        while collected.count < limit {
+            let chunk = handle.readData(ofLength: min(64 * 1024, limit - collected.count))
+            if chunk.isEmpty { break }
+            collected.append(chunk)
+        }
+        return collected
     }
 }
 

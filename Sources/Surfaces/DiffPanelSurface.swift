@@ -797,7 +797,20 @@ public final class DiffPanelViewModel: ObservableObject {
         fsStream = stream
     }
 
+    /// Stop the FSEvents watcher without waiting for deinit. Required because
+    /// `passRetained(self)` keeps the VM alive until the stream is released,
+    /// so hidden/closed panels must explicitly stop (S11).
+    func stopFSWatcher() {
+        if let s = fsStream {
+            FSEventStreamStop(s)
+            FSEventStreamInvalidate(s)
+            FSEventStreamRelease(s)
+            fsStream = nil
+        }
+    }
+
     deinit {
+        // deinit is nonisolated; mirror stopFSWatcher without calling it.
         if let s = fsStream {
             FSEventStreamStop(s)
             FSEventStreamInvalidate(s)
@@ -2022,7 +2035,11 @@ public final class DiffPanelSurface: NSObject, Surface {
 
     public func focus() { view.window?.makeFirstResponder(view) }
     public func unfocus() {}
-    public func close() {}
+    public func close() {
+        // S11: release FSEvents watcher so passRetained(self) can drop and
+        // closed panels stop refreshing Git after hide/close.
+        viewModel.stopFSWatcher()
+    }
     /// Called by the shell when the panel becomes visible so stale state is
     /// never the first thing the user sees after switching tabs or windows.
     public func didBecomeVisible() { viewModel.didBecomeVisible() }

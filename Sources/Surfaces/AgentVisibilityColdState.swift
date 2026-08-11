@@ -89,11 +89,20 @@ public enum AgentVisibilityColdState {
 
     public static func shouldPromoteReclamation(
         savedBytes: Int64,
-        appFootprintBytes: Int64
+        appFootprintBytes: Int64,
+        revealP95Ms: Double,
+        revealP99Ms: Double,
+        mainActorStallMs: Double,
+        duplicateOrMissingEvents: Bool
     ) -> Bool {
         let fractionFloor = Int64(Double(appFootprintBytes) * minSaveFractionOfAppFootprint)
         let threshold = max(Int64(minSaveBytes), fractionFloor)
-        return savedBytes >= threshold
+        guard savedBytes >= threshold else { return false }
+        guard revealP95Ms <= revealP95BudgetMs else { return false }
+        guard revealP99Ms <= revealP99BudgetMs else { return false }
+        guard mainActorStallMs < mainActorStallBudgetMs else { return false }
+        guard !duplicateOrMissingEvents else { return false }
+        return true
     }
 
     public static func didBecomeHidden(
@@ -121,6 +130,14 @@ public enum AgentVisibilityColdState {
         appliedThroughSequence: Int64
     ) -> AgentVisibilitySession? {
         guard session.generation == expectedGeneration else { return nil }
+        // Must still be restoring; duplicate completion after visible is rejected.
+        guard session.state == .restoring else { return nil }
+        // Monotonic catch-up through durable checkpoint and prior applied watermark.
+        let floor = max(
+            session.checkpoint.durableSequence,
+            session.checkpoint.lastAppliedDurableSequence
+        )
+        guard appliedThroughSequence >= floor else { return nil }
         var next = session
         next.state = .visible
         next.retainsCompactDirtyOnly = false

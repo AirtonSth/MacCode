@@ -88,6 +88,11 @@ public final class PressureGovernorCoordinator: @unchecked Sendable {
             now: now
         )
         state = result.state
+        // S12: keep Capacity UX reachable from production pressure path.
+        CapacityUXStatusStore.shared.publishFromPressure(
+            host: result.state.level,
+            actions: result.emittedActions.map(\.rawValue)
+        )
         return result
     }
 
@@ -96,35 +101,77 @@ public final class PressureGovernorCoordinator: @unchecked Sendable {
         plan: PressureMutationPlan,
         liveTarget: PressureMutationTarget
     ) -> PressureMutationOutcome {
+        execute(plan: plan, liveTargetProvider: { liveTarget })
+    }
+
+    /// Same as `execute(plan:liveTarget:)` but re-reads identity immediately
+    /// before each mutation so sidecar/Graphify/provider drift is observed (S7).
+    public func execute(
+        plan: PressureMutationPlan,
+        liveTargetProvider: () -> PressureMutationTarget
+    ) -> PressureMutationOutcome {
         lock.lock()
-        defer { lock.unlock() }
         guard !inFlight else {
+            lock.unlock()
             return PressureMutationOutcome(skipped: plan.actions, reason: "single_flight")
         }
-        guard PressureGovernorStateMachine.isEpochFresh(state: state, expectedEpoch: plan.target.epoch) else {
+        // Reserve single-flight under the lock, then release so concurrent
+        // callers observe inFlight without serializing the whole mutation body.
+        inFlight = true
+        let epochFresh = PressureGovernorStateMachine.isEpochFresh(
+            state: state,
+            expectedEpoch: plan.target.epoch
+        )
+        let frozen = state.frozenAccounting
+        lock.unlock()
+
+        defer {
+            lock.lock()
+            inFlight = false
+            lock.unlock()
+        }
+
+        guard epochFresh else {
             return PressureMutationOutcome(skipped: plan.actions, reason: "stale_epoch")
         }
-        guard plan.target.epoch == liveTarget.epoch else {
-            return PressureMutationOutcome(skipped: plan.actions, reason: "target_epoch_mismatch")
-        }
-        // Revalidate sidecar request generation and Graphify child identity (S7).
-        if plan.target.sidecarRequestGeneration != liveTarget.sidecarRequestGeneration {
-            return PressureMutationOutcome(skipped: plan.actions, reason: "sidecar_generation_mismatch")
-        }
-        if plan.target.graphifyChildIdentity != liveTarget.graphifyChildIdentity {
-            return PressureMutationOutcome(skipped: plan.actions, reason: "graphify_identity_mismatch")
-        }
-        // Never act on incomplete accounting.
-        if state.frozenAccounting {
+        if frozen {
             return PressureMutationOutcome(skipped: plan.actions, reason: "frozen_accounting")
         }
 
-        inFlight = true
-        defer { inFlight = false }
-
         var applied: [PressureActionKind] = []
         var skipped: [PressureActionKind] = []
-        for action in plan.actions {
+        var remaining = plan.actions
+        while !remaining.isEmpty {
+            let action = remaining.removeFirst()
+            // Re-read live identity at the mutation boundary (not a snapshot).
+            let liveTarget = liveTargetProvider()
+            if plan.target.epoch != liveTarget.epoch {
+                skipped.append(action)
+                skipped.append(contentsOf: remaining)
+                return PressureMutationOutcome(
+                    applied: applied,
+                    skipped: skipped,
+                    reason: "target_epoch_mismatch"
+                )
+            }
+            if plan.target.sidecarRequestGeneration != liveTarget.sidecarRequestGeneration {
+                skipped.append(action)
+                skipped.append(contentsOf: remaining)
+                return PressureMutationOutcome(
+                    applied: applied,
+                    skipped: skipped,
+                    reason: "sidecar_generation_mismatch"
+                )
+            }
+            if plan.target.graphifyChildIdentity != liveTarget.graphifyChildIdentity {
+                skipped.append(action)
+                skipped.append(contentsOf: remaining)
+                return PressureMutationOutcome(
+                    applied: applied,
+                    skipped: skipped,
+                    reason: "graphify_identity_mismatch"
+                )
+            }
             // Hard cuts: these never execute as live mutations.
             if action == .neverKillActiveTurn || action == .neverDeferScheduledOccurrence {
                 skipped.append(action)
@@ -136,16 +183,17 @@ public final class PressureGovernorCoordinator: @unchecked Sendable {
                 continue
             }
             if action == .shortenCompletedIdleProviderSessions && liveTarget.providerSessionActive {
-                // Only idle completed sessions — active provider sessions are skipped.
                 skipped.append(action)
                 continue
             }
+            lock.lock()
             if action == .pauseGraphifyEnsureAndWatchCallbacks {
                 lastGraphifyIdentity = liveTarget.graphifyChildIdentity
             }
             if action == .releaseDistillIdleModelGPU {
                 lastSidecarGeneration = liveTarget.sidecarRequestGeneration
             }
+            lock.unlock()
             applied.append(action)
         }
         return PressureMutationOutcome(applied: applied, skipped: skipped)

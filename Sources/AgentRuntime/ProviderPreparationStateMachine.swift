@@ -52,6 +52,8 @@ public enum ProviderPreparationEvent: Sendable, Equatable {
     case accept(draftMessageId: String, atMs: Int64)
     /// Completions must name the generation that started the work (S5).
     case preparationFinished(generation: UInt64)
+    /// Pre-spawn failure (durability / prep) for a named generation.
+    case preparationFailed(generation: UInt64, reason: ProviderPreparationTerminalReason)
     case providerSpawned(generation: UInt64)
     case providerRunning(generation: UInt64)
     case stopRequested
@@ -62,6 +64,10 @@ public enum ProviderPreparationEvent: Sendable, Equatable {
 public struct ProviderPreparationTransition: Sendable, Equatable {
     public var state: ProviderPreparationState
     public var allowProviderSpawn: Bool
+    /// Generation-owned spawn permit. Callers must pass this to `claimSpawn`
+    /// at the provider-write boundary so Stop after preparationFinished cannot
+    /// spawn a revoked generation (S5).
+    public var spawnPermitGeneration: UInt64?
     public var suppressLateCallback: Bool
     public var clearComposer: Bool
     public var ignoredReason: String?
@@ -69,12 +75,14 @@ public struct ProviderPreparationTransition: Sendable, Equatable {
     public init(
         state: ProviderPreparationState,
         allowProviderSpawn: Bool = false,
+        spawnPermitGeneration: UInt64? = nil,
         suppressLateCallback: Bool = false,
         clearComposer: Bool = false,
         ignoredReason: String? = nil
     ) {
         self.state = state
         self.allowProviderSpawn = allowProviderSpawn
+        self.spawnPermitGeneration = spawnPermitGeneration
         self.suppressLateCallback = suppressLateCallback
         self.clearComposer = clearComposer
         self.ignoredReason = ignoredReason
@@ -111,7 +119,32 @@ public enum ProviderPreparationStateMachine {
             }
             next.phase = .providerStarting
             next.accessibleStatus = "Starting provider"
-            return ProviderPreparationTransition(state: next, allowProviderSpawn: true)
+            // Permit is generation-tagged; claimSpawn revalidates at write boundary.
+            return ProviderPreparationTransition(
+                state: next,
+                allowProviderSpawn: true,
+                spawnPermitGeneration: next.generation
+            )
+
+        case .preparationFailed(let generation, let reason):
+            guard generation == state.generation else {
+                return ProviderPreparationTransition(state: state, suppressLateCallback: true, ignoredReason: "stale_generation")
+            }
+            guard state.phase == .preparing || state.phase == .providerStarting else {
+                return ProviderPreparationTransition(state: state, ignoredReason: "not_preparing")
+            }
+            next.phase = .terminal
+            next.terminalReason = reason
+            next.accessibleStatus = {
+                switch reason {
+                case .completed: return "Completed"
+                case .cancelled: return "Cancelled"
+                case .failed, .providerFailure: return "Failed"
+                case .durabilityFailure: return "Durability failure"
+                }
+            }()
+            next.generation &+= 1
+            return ProviderPreparationTransition(state: next, allowProviderSpawn: false)
 
         case .providerSpawned(let generation):
             guard generation == state.generation else {
@@ -138,12 +171,12 @@ public enum ProviderPreparationStateMachine {
         case .stopRequested:
             switch state.phase {
             case .preparing, .providerStarting:
-                // Cancel preparation — never spawn.
+                // Cancel preparation — never spawn. Bump generation to revoke permits.
                 next.phase = .terminal
                 next.terminalReason = .cancelled
                 next.accessibleStatus = "Cancelled"
                 next.generation &+= 1
-                return ProviderPreparationTransition(state: next, allowProviderSpawn: false)
+                return ProviderPreparationTransition(state: next, allowProviderSpawn: false, spawnPermitGeneration: nil)
             case .running:
                 next.phase = .stopping
                 next.accessibleStatus = "Stopping"
@@ -156,7 +189,7 @@ public enum ProviderPreparationStateMachine {
             guard generation == state.generation else {
                 return ProviderPreparationTransition(state: state, suppressLateCallback: true, ignoredReason: "stale_generation")
             }
-            guard state.phase == .running || state.phase == .stopping || state.phase == .providerStarting else {
+            guard state.phase == .running || state.phase == .stopping || state.phase == .providerStarting || state.phase == .preparing else {
                 return ProviderPreparationTransition(state: state, ignoredReason: "not_live")
             }
             next.phase = .terminal
@@ -197,5 +230,17 @@ public enum ProviderPreparationStateMachine {
 
     public static func maySpawnProvider(_ state: ProviderPreparationState) -> Bool {
         state.phase == .providerStarting
+    }
+
+    /// Atomic check-and-act at the provider-write boundary. A retained
+    /// `allowProviderSpawn` from a prior transition is not enough — the live
+    /// generation and phase must still authorize the permit.
+    public static func claimSpawn(
+        state: ProviderPreparationState,
+        permitGeneration: UInt64?
+    ) -> Bool {
+        guard let permitGeneration else { return false }
+        guard permitGeneration == state.generation else { return false }
+        return state.phase == .providerStarting
     }
 }

@@ -3,7 +3,7 @@ import XCTest
 
 /// S2: deterministic semantic harness + subprocess fixture catalog.
 final class CapacitySemanticHarnessTests: XCTestCase {
-    func test_sameSeed_producesIdenticalSchedule() {
+    func test_sameSeed_producesIdenticalSchedule() throws {
         let a = CapacitySemanticHarness.buildSchedule(seed: 0xC0FFEE)
         let b = CapacitySemanticHarness.buildSchedule(seed: 0xC0FFEE)
         XCTAssertEqual(a, b)
@@ -13,7 +13,18 @@ final class CapacitySemanticHarnessTests: XCTestCase {
         let depths = Set(a.nodes.map { $0.depth })
         XCTAssertTrue(depths.contains(1), "depth 1 must be present")
         XCTAssertTrue(depths.contains(2), "depth 2 must be present")
+        XCTAssertTrue(depths.contains(3), "depth 3 intermediate must exist for ancestry")
         XCTAssertTrue(depths.contains(4), "depth 4 must be present")
+        let byId = Dictionary(uniqueKeysWithValues: a.nodes.map { ($0.id, $0) })
+        for node in a.nodes where node.kind == .nested {
+            let parentId = try XCTUnwrap(node.parentId)
+            let parent = try XCTUnwrap(byId[parentId])
+            XCTAssertEqual(
+                parent.depth,
+                node.depth - 1,
+                "parent depth must be child.depth - 1 (node \(node.id))"
+            )
+        }
     }
 
     func test_differentSeeds_diverge() {
@@ -29,8 +40,26 @@ final class CapacitySemanticHarnessTests: XCTestCase {
         XCTAssertTrue(result.queueDrained)
         XCTAssertTrue(result.rejoinExactlyOnce)
         XCTAssertTrue(result.terminalOwnershipExact)
+        XCTAssertTrue(result.allFaultsApplied, "every declared fault must be applied: unknown=\(result.unknownFaultKinds)")
+        XCTAssertEqual(result.appliedFaultIndices.count, schedule.faults.count)
         XCTAssertEqual(result.completedCount + result.cancelledCount + result.failedCount, schedule.nodes.count)
         XCTAssertGreaterThanOrEqual(result.longestNoProgressMs, 0)
+    }
+
+    func test_run_modelsAllDeclaredFaultKinds() {
+        let kinds = CapacityHarnessKnownFaultKind.allCases.map(\.rawValue)
+        let schedule = CapacitySemanticHarness.buildSchedule(
+            roots: 5,
+            nestedNodes: 5,
+            faultKinds: kinds,
+            seed: 99
+        )
+        XCTAssertTrue(Set(schedule.faults.map(\.kind)).isSuperset(of: Set(kinds)))
+        let clock = CapacityManualClock()
+        let result = CapacitySemanticHarness.run(schedule: schedule, clock: clock)
+        XCTAssertTrue(result.allFaultsApplied)
+        XCTAssertTrue(result.unknownFaultKinds.isEmpty)
+        XCTAssertTrue(result.queueDrained)
     }
 
     func test_run_cancelNodes_neverSpawnTerminalAsCompleted() {

@@ -3329,12 +3329,18 @@ public final class AgentRunRepository: @unchecked Sendable {
         let limit = max(1, byteLimit)
         let originalBytes = payloadJSON.utf8.count
         guard originalBytes > limit else { return payloadJSON }
-        // Already an owned S3 presentation (suffix): re-trim prefix to new limit.
-        let ownedSuffixPattern = #"…\[truncated rc_oversized_v1 \d+→\d+ bytes\]\[\[rc:[0-9a-fA-F]+\]\]$"#
+        // Already an owned S3 presentation (true suffix): re-trim prefix only.
+        // Anchor with \\z and slice from the regex match range so an earlier
+        // lookalike token inside provider content cannot steal the cut point.
+        let ownedSuffixPattern = #"…\[truncated rc_oversized_v1 \d+→\d+ bytes\]\[\[rc:[0-9a-fA-F]+\]\]\z"#
         if let regex = try? NSRegularExpression(pattern: ownedSuffixPattern),
-           regex.firstMatch(in: payloadJSON, range: NSRange(payloadJSON.startIndex..., in: payloadJSON)) != nil,
-           let tStart = payloadJSON.range(of: "…[truncated rc_oversized_v1")?.lowerBound {
-            let trailer = String(payloadJSON[tStart...])
+           let match = regex.firstMatch(
+            in: payloadJSON,
+            options: [],
+            range: NSRange(payloadJSON.startIndex..., in: payloadJSON)
+           ),
+           let trailerRange = Range(match.range, in: payloadJSON) {
+            let trailer = String(payloadJSON[trailerRange])
             if originalBytes <= limit { return payloadJSON }
             let headBudget = max(0, limit - trailer.utf8.count)
             if headBudget == 0 { return trailer }

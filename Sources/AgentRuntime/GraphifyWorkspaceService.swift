@@ -38,6 +38,9 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     /// (or worktrees) from double-taxing CPU/RAM during multi-thread sessions.
     private var globalCLIInFlight = false
     private var globalCLIRerunIDs: Set<String> = []
+    /// Live graphify/git child retained for cancel-before-watcher-stop (S9).
+    private var activeRebuildProcess: Process?
+    private var activeRebuildCancelled = false
 
     public var appSupportDirectory: URL
     public var binaryPathOverride: String?
@@ -62,6 +65,7 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         var dirtyGeneration: UInt64 = 0
         var builtGeneration: UInt64 = 0
         var inFlight: Bool = false
+        var rebuildCancelled: Bool = false
         var rerunRequested: Bool = false
         var lastSuccessfulUpdate: Date?
         var lastEnsureStarted: Date?
@@ -122,6 +126,13 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
 
     @discardableResult
     public func ensureBinaryInstalledIfNeeded() -> String? {
+        // S9: refuse floating install when pin is incomplete; operators must pin first.
+        let pin = GraphifyRuntimeHardening.defaultPin
+        if !GraphifyRuntimeHardening.isPinComplete(pin) {
+            // Still allow a pre-installed binary if present (dev machines), but
+            // never perform an unpinned network install.
+            return resolveBinary()
+        }
         if let existing = resolveBinary() { return existing }
         lock.lock()
         let already = binaryInstallAttempted
@@ -130,9 +141,10 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         guard !already else { return resolveBinary() }
         LoginShellEnvironment.prewarm()
         let env = processEnvironment()
+        // Pinned install only — no floating --upgrade of an unpinned package.
         let attempts: [[String]] = [
-            ["/usr/bin/env", "uv", "tool", "install", "--upgrade", "graphifyy", "-q"],
-            ["/usr/bin/env", "pipx", "install", "graphifyy"],
+            ["/usr/bin/env", "uv", "tool", "install", "graphifyy==\(pin.approvedVersion)", "-q"],
+            ["/usr/bin/env", "pipx", "install", "graphifyy==\(pin.approvedVersion)"],
         ]
         for args in attempts {
             let which = run(["/usr/bin/env", "which", args[1]], cwd: NSHomeDirectory(), env: env)
@@ -385,7 +397,9 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             schedule.dirtyGeneration &+= 1
         }
         schedule.inFlight = true
+        schedule.rebuildCancelled = false
         globalCLIInFlight = true
+        activeRebuildCancelled = false
         schedule.lastEnsureStarted = Date()
         schedule.status = .building
         let targetGen = schedule.dirtyGeneration
@@ -398,17 +412,25 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             service.lock.lock()
             var s = service.schedules[checkout.scheduleID] ?? RefreshSchedule()
             s.inFlight = false
-            s.status = status
-            if status == .fresh {
-                s.builtGeneration = targetGen
-                s.lastSuccessfulUpdate = Date()
-                s.lastHead = service.currentHead(checkout.displayRoot)
+            let cancelled = s.rebuildCancelled || service.activeRebuildCancelled
+            // Never publish fresh after cancel / Token Saver disable.
+            if cancelled {
+                s.status = .missing
+                s.rebuildCancelled = false
+            } else {
+                s.status = status
+                if status == .fresh {
+                    s.builtGeneration = targetGen
+                    s.lastSuccessfulUpdate = Date()
+                    s.lastHead = service.currentHead(checkout.displayRoot)
+                }
             }
-            let needRerun = s.rerunRequested || s.dirtyGeneration > s.builtGeneration
+            let needRerun = !cancelled && (s.rerunRequested || s.dirtyGeneration > s.builtGeneration)
             s.rerunRequested = false
             service.schedules[checkout.scheduleID] = s
             service.globalCLIInFlight = false
-            let deferredIDs = service.globalCLIRerunIDs
+            service.activeRebuildProcess = nil
+            let deferredIDs = cancelled ? [] : service.globalCLIRerunIDs
             service.globalCLIRerunIDs.removeAll(keepingCapacity: true)
             let deferredRoots = deferredIDs.compactMap { id -> String? in
                 guard id != checkout.scheduleID,
@@ -631,11 +653,45 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     }
 
     public func stopWatchingAll() {
+        // S9: cancel any in-flight rebuild before tearing down watchers so a
+        // late Process completion cannot mark the graph fresh after Token Saver off.
+        cancelInFlightRebuildIfNeeded()
         lock.lock()
         let all = watchers
         watchers.removeAll()
+        // Mark every in-flight schedule cancelled so completion cannot publish fresh.
+        for id in Array(schedules.keys) {
+            guard var s = schedules[id] else { continue }
+            s.rebuildCancelled = true
+            s.rerunRequested = false
+            schedules[id] = s
+        }
         lock.unlock()
         for w in all.values { w.stop() }
+    }
+
+    /// Cancel the active graphify child and mark rebuilds cancelled (S9).
+    public func cancelInFlightRebuildIfNeeded() {
+        lock.lock()
+        activeRebuildCancelled = true
+        let process = activeRebuildProcess
+        for id in Array(schedules.keys) {
+            guard var s = schedules[id], s.inFlight else { continue }
+            s.rebuildCancelled = true
+            s.rerunRequested = false
+            schedules[id] = s
+        }
+        lock.unlock()
+        if let process, process.isRunning {
+            process.terminate()
+            let killDeadline = Date().addingTimeInterval(1)
+            while process.isRunning && Date() < killDeadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+            }
+        }
     }
 
     // MARK: Sticky
@@ -848,6 +904,12 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
 
     private func run(_ args: [String], cwd: String, env: [String: String]?) -> (exit: Int32, stdout: String, stderr: String) {
         if let runProcess { return runProcess(args, cwd, env) }
+        lock.lock()
+        if activeRebuildCancelled {
+            lock.unlock()
+            return (-15, "", "graphify rebuild cancelled before spawn")
+        }
+        lock.unlock()
         let p = Process()
         p.executableURL = URL(fileURLWithPath: args[0])
         p.arguments = Array(args.dropFirst())
@@ -860,34 +922,54 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         do { try p.run() } catch {
             return (-1, "", String(describing: error))
         }
-        // Parallel drain avoids classic Process deadlock when stderr fills the pipe.
+        lock.lock()
+        activeRebuildProcess = p
+        let alreadyCancelled = activeRebuildCancelled
+        lock.unlock()
+        if alreadyCancelled {
+            p.terminate()
+        }
+        // Parallel bounded drain: never unbounded readDataToEndOfFile (S9).
         final class Box: @unchecked Sendable { var data = Data() }
         let errBox = Box()
-        let q = DispatchQueue(label: "io.remotecode.graphify.pipe.drain")
+        let outBox = Box()
+        let q = DispatchQueue(label: "io.remotecode.graphify.pipe.drain", attributes: .concurrent)
         let errHandle = err.fileHandleForReading
-        q.async { errBox.data = errHandle.readDataToEndOfFile() }
-        let oData = out.fileHandleForReading.readDataToEndOfFile()
-        q.sync {}
+        let outHandle = out.fileHandleForReading
+        let maxOut = GraphifyRuntimeHardening.maxStdoutCaptureBytes
+        let maxErr = GraphifyRuntimeHardening.maxStderrCaptureBytes
+        q.async { errBox.data = GraphifyRuntimeHardening.boundedRead(handle: errHandle, maxBytes: maxErr) }
+        q.async { outBox.data = GraphifyRuntimeHardening.boundedRead(handle: outHandle, maxBytes: maxOut) }
         // Bounded wait: wedged graphify/git must not leave schedule inFlight forever.
         let timeout = processTimeoutSeconds > 0 ? processTimeoutSeconds : 180
         let deadline = Date().addingTimeInterval(timeout)
         while p.isRunning && Date() < deadline {
+            lock.lock()
+            let cancelled = activeRebuildCancelled
+            lock.unlock()
+            if cancelled {
+                p.terminate()
+                break
+            }
             Thread.sleep(forTimeInterval: 0.05)
         }
         if p.isRunning {
             p.terminate()
-            // brief grace then kill
             let killDeadline = Date().addingTimeInterval(1)
             while p.isRunning && Date() < killDeadline {
                 Thread.sleep(forTimeInterval: 0.05)
             }
             if p.isRunning { kill(p.processIdentifier, SIGKILL) }
-            return (-9, String(data: oData, encoding: .utf8) ?? "", "graphify process timed out after \(Int(timeout))s")
+            q.sync(flags: .barrier) {}
+            lock.lock(); activeRebuildProcess = nil; lock.unlock()
+            return (-9, String(data: outBox.data, encoding: .utf8) ?? "", "graphify process timed out after \(Int(timeout))s")
         }
         p.waitUntilExit()
+        q.sync(flags: .barrier) {}
+        lock.lock(); activeRebuildProcess = nil; lock.unlock()
         return (
             p.terminationStatus,
-            String(data: oData, encoding: .utf8) ?? "",
+            String(data: outBox.data, encoding: .utf8) ?? "",
             String(data: errBox.data, encoding: .utf8) ?? ""
         )
     }

@@ -29,8 +29,8 @@
     "p99Definition" : "empirical_0.99_order_statistic"
   },
   "abortLimits" : {
-    "maxTokenUnits" : null,
-    "maxSpendMicros" : null,
+    "maxTokenUnits" : 500000,
+    "maxSpendMicros" : 5000000,
     "maxWallSeconds" : 1800,
     "maxMainActorStallMs" : 2000
   },

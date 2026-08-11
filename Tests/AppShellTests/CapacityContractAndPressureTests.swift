@@ -196,6 +196,68 @@ final class CapacityContractAndPressureTests: XCTestCase {
         XCTAssertEqual(c2.state.level, .critical)
     }
 
+    func test_pressure_warningThenCritical_fromNormal_countsForWarning() {
+        // Alternating/increasing tiers above normal must not erase the streak.
+        let thresholds = PressureThresholds.default
+        var state = PressureGovernorState(level: .normal, epoch: 0, levelEnteredAt: Date(timeIntervalSince1970: 0))
+        let t0 = Date(timeIntervalSince1970: 3_000)
+        let a = PressureGovernorStateMachine.apply(
+            state: state,
+            sample: PressureSample(
+                date: t0,
+                osSignal: .normal,
+                managedRSSFraction: thresholds.warningFraction + 0.01,
+                isComplete: true
+            ),
+            thresholds: thresholds,
+            now: t0
+        )
+        state = a.state
+        let b = PressureGovernorStateMachine.apply(
+            state: state,
+            sample: PressureSample(
+                date: t0.addingTimeInterval(1),
+                osSignal: .normal,
+                managedRSSFraction: thresholds.criticalFraction + 0.01,
+                isComplete: true
+            ),
+            thresholds: thresholds,
+            now: t0.addingTimeInterval(1)
+        )
+        XCTAssertEqual(b.state.level, .warning, "warning then critical from normal escalates to warning")
+        XCTAssertEqual(b.state.escalateTargetLevel, nil)
+    }
+
+    func test_pressure_criticalThenWarning_fromNormal_countsForWarning() {
+        let thresholds = PressureThresholds.default
+        var state = PressureGovernorState(level: .normal, epoch: 0, levelEnteredAt: Date(timeIntervalSince1970: 0))
+        let t0 = Date(timeIntervalSince1970: 4_000)
+        let a = PressureGovernorStateMachine.apply(
+            state: state,
+            sample: PressureSample(
+                date: t0,
+                osSignal: .normal,
+                managedRSSFraction: thresholds.criticalFraction + 0.01,
+                isComplete: true
+            ),
+            thresholds: thresholds,
+            now: t0
+        )
+        state = a.state
+        let b = PressureGovernorStateMachine.apply(
+            state: state,
+            sample: PressureSample(
+                date: t0.addingTimeInterval(1),
+                osSignal: .normal,
+                managedRSSFraction: thresholds.warningFraction + 0.01,
+                isComplete: true
+            ),
+            thresholds: thresholds,
+            now: t0.addingTimeInterval(1)
+        )
+        XCTAssertEqual(b.state.level, .warning, "critical then warning from normal escalates to warning")
+    }
+
     func test_pressure_incompleteSample_freezesAndNeverClears() {
         let t0 = Date(timeIntervalSince1970: 3_000)
         var state = PressureGovernorState(level: .warning, epoch: 3, levelEnteredAt: t0.addingTimeInterval(-120))
@@ -404,9 +466,13 @@ final class CapacityContractAndPressureTests: XCTestCase {
         let runs = (0..<warmedRuns).map { idx -> CapacityWarmedRunObservation in
             let metrics = Dictionary(uniqueKeysWithValues: manifest.requiredMetrics.map { name -> (String, Double) in
                 if name == CapacityRequiredMetricKey.ownershipCoverageFraction.rawValue {
-                    return (name, 0.90 + Double(idx) * 0.01) // stays in [0,1]
+                    return (name, 1.0) // complete ownership required for promotion
                 }
-                return (name, 1.0 + Double(idx) * 0.01)
+                if name == CapacityRequiredMetricKey.mainActorStallMsMax.rawValue {
+                    return (name, 100.0 + Double(idx)) // well under 2s abort
+                }
+                // Keep relative range ≤10% for p95 regression gate.
+                return (name, 100.0 + Double(idx))
             })
             return CapacityWarmedRunObservation(runIndex: idx, metrics: metrics)
         }

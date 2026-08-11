@@ -14,4 +14,9 @@ No warmed n≥3 hardcore-swarm physical canary was executed in this sandbox (see
 
 ## Next promotion step
 
-Rank S2 signpost intervals under a physical canary; promote **exactly one** branch if breached; rerun unchanged manifest.
+Prerequisite (must exist before ranking): a physical canary collector that records
+coordinator no-progress, SQLite lock/transaction wait, and MainActor stall intervals
+via production gauges (`CapacityGaugeSnapshot` / process health) — **not** the S2
+virtual-clock semantic harness (S2 has no signposts). Breach criteria remain the
+frozen thresholds in `release-gates.md` (MainActor stall ≥2s, ownership failure,
+unbounded queues). Promote **exactly one** branch if breached; rerun unchanged manifest.

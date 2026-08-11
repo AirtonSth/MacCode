@@ -238,8 +238,8 @@ public struct CapacityQualificationManifest: Sendable, Codable, Equatable {
                 plateauMaxRelativeSlope: 0.05
             ),
             abortLimits: CapacityAbortLimits(
-                maxTokenUnits: nil,
-                maxSpendMicros: nil,
+                maxTokenUnits: 500_000,
+                maxSpendMicros: 5_000_000,
                 maxWallSeconds: 1_800,
                 maxMainActorStallMs: 2_000
             ),
@@ -278,6 +278,19 @@ public struct CapacityQualificationManifest: Sendable, Codable, Equatable {
         if abortLimits.maxMainActorStallMs <= 0 {
             throw CapacityContractError.invalidAbortLimit("maxMainActorStallMs must be > 0")
         }
+        // Paid real-provider canaries fail closed: token/spend ceilings required.
+        guard let maxTokens = abortLimits.maxTokenUnits, maxTokens > 0 else {
+            throw CapacityContractError.invalidAbortLimit(
+                "maxTokenUnits must be declared and > 0 for fail-closed canary"
+            )
+        }
+        guard let maxSpend = abortLimits.maxSpendMicros, maxSpend > 0 else {
+            throw CapacityContractError.invalidAbortLimit(
+                "maxSpendMicros must be declared and > 0 for fail-closed canary"
+            )
+        }
+        _ = maxTokens
+        _ = maxSpend
         let required = Set(CapacityRequiredMetricKey.allCases.map(\.rawValue))
         let declared = Set(requiredMetrics)
         if !required.isSubset(of: declared) {
@@ -412,8 +425,17 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
                 throw CapacityContractError.invalidWorkload("metric \(key) must be finite")
             }
             if key == CapacityRequiredMetricKey.ownershipCoverageFraction.rawValue {
-                guard claimed >= 0, claimed <= 1 else {
-                    throw CapacityContractError.invalidWorkload("ownership_coverage_fraction must be in [0,1]")
+                // Promotion requires complete ownership (release-gates).
+                guard claimed == 1.0 else {
+                    throw CapacityContractError.invalidWorkload(
+                        "ownership_coverage_fraction must be 1.0 for promotion (got \(claimed))"
+                    )
+                }
+            } else if key == CapacityRequiredMetricKey.mainActorStallMsMax.rawValue {
+                guard claimed < manifest.abortLimits.maxMainActorStallMs else {
+                    throw CapacityContractError.invalidWorkload(
+                        "main_actor_stall_ms_max \(claimed) >= abort \(manifest.abortLimits.maxMainActorStallMs)"
+                    )
                 }
             } else if claimed < 0 {
                 throw CapacityContractError.invalidWorkload("metric \(key) must be >= 0")
@@ -425,8 +447,16 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
                     throw CapacityContractError.missingRequiredField("warmedRun.\(run.runIndex).\(key)")
                 }
                 if key == CapacityRequiredMetricKey.ownershipCoverageFraction.rawValue {
-                    guard v >= 0, v <= 1 else {
-                        throw CapacityContractError.invalidWorkload("warmed ownership_coverage_fraction out of [0,1]")
+                    guard v == 1.0 else {
+                        throw CapacityContractError.invalidWorkload(
+                            "warmed ownership_coverage_fraction must be 1.0 (got \(v))"
+                        )
+                    }
+                } else if key == CapacityRequiredMetricKey.mainActorStallMsMax.rawValue {
+                    guard v < manifest.abortLimits.maxMainActorStallMs else {
+                        throw CapacityContractError.invalidWorkload(
+                            "warmed main_actor_stall_ms_max \(v) exceeds abort"
+                        )
                     }
                 } else if v < 0 {
                     throw CapacityContractError.invalidWorkload("warmed metric \(key) must be >= 0")
@@ -474,6 +504,15 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
             }
             if abs(declared - recomputed) > 1e-9 {
                 throw CapacityContractError.invalidEstimator("variance mismatch for \(key)")
+            }
+            // ≤10% regression gate: relative range across warmed runs must stay ≤0.10
+            // for latency-class metrics (release-gates promotion policy).
+            if key.hasSuffix("_p95") || key.hasSuffix("_p99") || key == CapacityRequiredMetricKey.lockWaitMsP95.rawValue {
+                if declared > 0.10 {
+                    throw CapacityContractError.invalidEstimator(
+                        "regression gate: \(key) relative range \(declared) > 0.10"
+                    )
+                }
             }
         }
         // Bind artifact to immutable manifest content digest.

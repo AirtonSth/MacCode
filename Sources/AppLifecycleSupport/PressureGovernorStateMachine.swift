@@ -253,15 +253,20 @@ public enum PressureGovernorStateMachine {
 
         if observed > next.level {
             next.consecutiveRecoverSamples = 0
-            // Tier-specific streak: only accumulate toward the same target.
-            if next.escalateTargetLevel != observed {
+            // Consecutive samples *above current* accumulate toward the lowest
+            // sustained tier (warning then critical still counts for warning).
+            // Alternating tiers must not erase a valid streak (Codex S1).
+            if let prior = next.escalateTargetLevel, prior > next.level {
+                let sustained = min(prior, observed)
+                next.escalateTargetLevel = sustained
+                next.consecutiveEscalateSamples += 1
+            } else {
                 next.escalateTargetLevel = observed
                 next.consecutiveEscalateSamples = 1
-            } else {
-                next.consecutiveEscalateSamples += 1
             }
-            if next.consecutiveEscalateSamples >= thresholds.escalateSampleCount {
-                return escalate(state: next, to: observed, at: clock, reason: "rss_samples")
+            if next.consecutiveEscalateSamples >= thresholds.escalateSampleCount,
+               let target = next.escalateTargetLevel, target > next.level {
+                return escalate(state: next, to: target, at: clock, reason: "rss_samples")
             }
             return PressureTransitionResult(state: next)
         }
