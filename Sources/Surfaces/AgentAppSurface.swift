@@ -6077,6 +6077,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return nil
         }
         surfacePreparationStates[tid] = claimedState
+        // Close Stop race: surface claimed, startRun not yet registered.
+        coordinator.reserveProviderStart(threadId: tid)
         let req = AgentRunRequest(
             runId: runId,
             threadId: tid,
@@ -6155,6 +6157,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 routingSnapshot: routingSnapshot,
                 recordUserMessage: !resumeInterrupted
             )
+            coordinator.releaseProviderStartReservation(threadId: tid)
             // Surface claim consumed the permit; coordinator owns the live run.
             // Terminalize *this* generation so a second send can accept again.
             let done = ProviderPreparationStateMachine.apply(
@@ -6245,6 +6248,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     self.onRunStateChange?()
                 }
             }
+            coordinator.releaseProviderStartReservation(threadId: tid)
             return nil
         }
     }
@@ -6493,6 +6497,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // Only fall through to stopRun when the coordinator already owns a
             // pending start or live run — otherwise stopRun arms pendingThreadStops
             // on a never-started thread and poisons the immediate resend.
+            // cancelSurfacePreparation already called cancelPreparation; if a
+            // start was reserved/pending, pendingThreadStops is armed — still
+            // fall through to stopRun when a live/pending start exists.
             let coordinatorOwns = coordinator.hasPendingProviderStart(threadId: tid)
                 || coordinator.isPreparingProviderStart(threadId: tid)
                 || coordinator.activeRunId(threadId: tid) != nil
