@@ -317,6 +317,16 @@ public struct CapacityMetricSample: Sendable, Codable, Equatable {
     }
 }
 
+public struct CapacityWarmedRunObservation: Sendable, Codable, Equatable {
+    public var runIndex: Int
+    public var metrics: [String: Double]
+
+    public init(runIndex: Int, metrics: [String: Double]) {
+        self.runIndex = runIndex
+        self.metrics = metrics
+    }
+}
+
 public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
     public var manifestId: String
     public var schemaVersion: String
@@ -324,6 +334,10 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
     public var warmedSampleCount: Int
     public var physicallyExecutedTier: [String]
     public var createdAtISO8601: String
+    /// Per-run metric observations used to prove warmed n>=3 variance.
+    public var warmedRuns: [CapacityWarmedRunObservation]
+    /// Max relative range ((max-min)/max) across warmed runs per required metric.
+    public var metricVarianceMax: [String: Double]
 
     public init(
         manifestId: String,
@@ -331,7 +345,9 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
         samples: [CapacityMetricSample],
         warmedSampleCount: Int,
         physicallyExecutedTier: [String],
-        createdAtISO8601: String
+        createdAtISO8601: String,
+        warmedRuns: [CapacityWarmedRunObservation] = [],
+        metricVarianceMax: [String: Double] = [:]
     ) {
         self.manifestId = manifestId
         self.schemaVersion = schemaVersion
@@ -339,6 +355,8 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
         self.warmedSampleCount = warmedSampleCount
         self.physicallyExecutedTier = physicallyExecutedTier
         self.createdAtISO8601 = createdAtISO8601
+        self.warmedRuns = warmedRuns
+        self.metricVarianceMax = metricVarianceMax
     }
 
     public func validate(against manifest: CapacityQualificationManifest) throws {
@@ -346,10 +364,29 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
         guard schemaVersion == manifest.schemaVersion else {
             throw CapacityContractError.unsupportedSchemaVersion(schemaVersion)
         }
+        guard manifestId == manifest.id else {
+            throw CapacityContractError.missingRequiredField("manifestId mismatch")
+        }
         if warmedSampleCount < manifest.estimator.minWarmedSamples {
             throw CapacityContractError.invalidEstimator(
                 "warmedSampleCount \(warmedSampleCount) < min \(manifest.estimator.minWarmedSamples)"
             )
+        }
+        if warmedRuns.count < manifest.estimator.minWarmedSamples {
+            throw CapacityContractError.invalidEstimator(
+                "warmedRuns \(warmedRuns.count) < min \(manifest.estimator.minWarmedSamples)"
+            )
+        }
+        // Duplicate metric names fail loud (no Dictionary trap).
+        var seen = Set<String>()
+        for sample in samples {
+            if seen.contains(sample.name) {
+                throw CapacityContractError.invalidWorkload("duplicate metric \(sample.name)")
+            }
+            seen.insert(sample.name)
+            if sample.unit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                throw CapacityContractError.invalidWorkload("metric \(sample.name) missing unit")
+            }
         }
         let byName = Dictionary(uniqueKeysWithValues: samples.map { ($0.name, $0) })
         for key in manifest.requiredMetrics {
@@ -359,9 +396,27 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
             if sample.value == nil {
                 throw CapacityContractError.requiredMetricNull(key)
             }
+            // Each required metric must appear in every warmed run.
+            for run in warmedRuns {
+                guard let v = run.metrics[key] else {
+                    throw CapacityContractError.missingRequiredField("warmedRun.\(run.runIndex).\(key)")
+                }
+                _ = v
+            }
+            guard metricVarianceMax[key] != nil else {
+                throw CapacityContractError.missingRequiredField("metricVarianceMax.\(key)")
+            }
+        }
+        // Physical tier claims must match manifest (or be empty when none claimed).
+        let claimed = Set(manifest.hardwareTier.filter(\.physicallyExecuted).map(\.tierName))
+        for name in physicallyExecutedTier {
+            if !claimed.isEmpty && !claimed.contains(name) {
+                throw CapacityContractError.invalidWorkload("unclaimed physical tier \(name)")
+            }
         }
     }
 }
+
 
 /// Content-free gauge snapshot for signpost-style capacity instrumentation.
 public struct CapacityGaugeSnapshot: Sendable, Codable, Equatable {

@@ -114,36 +114,46 @@ public struct PressureGovernorState: Sendable, Equatable {
     public var level: PressureLevel
     public var epoch: UInt64
     public var levelEnteredAt: Date
+    /// Consecutive complete RSS samples observed at/above `escalateTargetLevel`.
     public var consecutiveEscalateSamples: Int
+    /// The pressure tier currently being accumulated toward (tier-specific).
+    public var escalateTargetLevel: PressureLevel?
+    /// Consecutive complete samples below the exit band of `level` (for one-step recovery).
     public var consecutiveRecoverSamples: Int
     public var lastActionKey: String?
     public var lastActionAt: Date?
     public var lastRecoveryAt: Date?
     public var frozenAccounting: Bool
     public var actionCount: Int
+    /// Actions emitted for the current epoch (bounded; holds do not re-emit).
+    public var actionsEmittedThisEpoch: Int
 
     public init(
         level: PressureLevel = .normal,
         epoch: UInt64 = 0,
         levelEnteredAt: Date = Date(timeIntervalSince1970: 0),
         consecutiveEscalateSamples: Int = 0,
+        escalateTargetLevel: PressureLevel? = nil,
         consecutiveRecoverSamples: Int = 0,
         lastActionKey: String? = nil,
         lastActionAt: Date? = nil,
         lastRecoveryAt: Date? = nil,
         frozenAccounting: Bool = false,
-        actionCount: Int = 0
+        actionCount: Int = 0,
+        actionsEmittedThisEpoch: Int = 0
     ) {
         self.level = level
         self.epoch = epoch
         self.levelEnteredAt = levelEnteredAt
         self.consecutiveEscalateSamples = consecutiveEscalateSamples
+        self.escalateTargetLevel = escalateTargetLevel
         self.consecutiveRecoverSamples = consecutiveRecoverSamples
         self.lastActionKey = lastActionKey
         self.lastActionAt = lastActionAt
         self.lastRecoveryAt = lastRecoveryAt
         self.frozenAccounting = frozenAccounting
         self.actionCount = actionCount
+        self.actionsEmittedThisEpoch = actionsEmittedThisEpoch
     }
 }
 
@@ -197,6 +207,11 @@ public enum PressureGovernorStateMachine {
     }
 
     /// Apply one sample. Pure: no I/O, no process signals.
+    ///
+    /// RSS escalation is **tier-specific**: two consecutive complete samples at
+    /// or above a given target tier are required before entering that tier.
+    /// Recovery steps **one level at a time** (critical→warning→normal), each
+    /// requiring dwell + three fresh samples below that level's exit band.
     public static func apply(
         state: PressureGovernorState,
         sample: PressureSample,
@@ -209,6 +224,8 @@ public enum PressureGovernorStateMachine {
         // Incomplete/stale: freeze actions; never clear pressure; never escalate on RSS.
         if sample.isStale || !sample.isComplete || sample.managedRSSFraction == nil {
             next.frozenAccounting = true
+            next.consecutiveEscalateSamples = 0
+            next.escalateTargetLevel = nil
             // OS signal still has immediate precedence for escalation.
             let osLevel = levelFromOS(sample.osSignal)
             if osLevel > next.level {
@@ -233,11 +250,13 @@ public enum PressureGovernorStateMachine {
         let observed = max(osLevel, rssLevel)
 
         if observed > next.level {
-            next.consecutiveEscalateSamples += 1
             next.consecutiveRecoverSamples = 0
-            // OS already handled above for immediate; RSS needs two samples.
-            if sample.osSignal != .normal && osLevel == observed {
-                return escalate(state: next, to: observed, at: clock, reason: "os_signal")
+            // Tier-specific streak: only accumulate toward the same target.
+            if next.escalateTargetLevel != observed {
+                next.escalateTargetLevel = observed
+                next.consecutiveEscalateSamples = 1
+            } else {
+                next.consecutiveEscalateSamples += 1
             }
             if next.consecutiveEscalateSamples >= thresholds.escalateSampleCount {
                 return escalate(state: next, to: observed, at: clock, reason: "rss_samples")
@@ -245,38 +264,56 @@ public enum PressureGovernorStateMachine {
             return PressureTransitionResult(state: next)
         }
 
+        // Observed is not higher — reset escalate streak for any other tier.
+        next.consecutiveEscalateSamples = 0
+        next.escalateTargetLevel = nil
+
         if observed < next.level {
-            // Recovery requires dwell + hysteresis band + recoverSampleCount fresh samples.
-            let dwell = clock.timeIntervalSince(next.levelEnteredAt)
-            let exitThreshold: Double = {
+            // One-step recovery only (critical→warning or warning→normal).
+            let stepDown: PressureLevel = {
                 switch next.level {
-                case .critical:
-                    return thresholds.criticalFraction - thresholds.exitHysteresisPoints
-                case .warning:
-                    return thresholds.warningFraction - thresholds.exitHysteresisPoints
-                case .normal:
-                    return 0
+                case .critical: return .warning
+                case .warning: return .normal
+                case .normal: return .normal
                 }
             }()
+            let dwell = clock.timeIntervalSince(next.levelEnteredAt)
+            let exitThreshold = exitBand(for: next.level, thresholds: thresholds)
             let fraction = sample.managedRSSFraction!
-            let belowBand = fraction < exitThreshold && osLevel == .normal
-            if dwell >= thresholds.minDwellSeconds && belowBand {
+            // Sample must be strictly below current level's exit band; OS normal.
+            // For critical→warning, observed may still be warning (fraction in warning band).
+            let eligibleForStepDown: Bool = {
+                guard osLevel == .normal else { return false }
+                guard fraction < exitThreshold else { return false }
+                // Must not still be at current level by RSS.
+                return rssLevel < next.level
+            }()
+            if dwell >= thresholds.minDwellSeconds && eligibleForStepDown {
                 next.consecutiveRecoverSamples += 1
-                next.consecutiveEscalateSamples = 0
                 if next.consecutiveRecoverSamples >= thresholds.recoverSampleCount {
-                    return recover(state: next, to: observed, at: clock)
+                    return recover(state: next, to: stepDown, at: clock)
                 }
             } else {
                 next.consecutiveRecoverSamples = 0
             }
-            // Still under pressure: re-emit ladder idempotently.
+            // Still under pressure: actions already bound to epoch (no re-emit).
             return revalidateActions(state: next, at: clock, thresholds: thresholds)
         }
 
-        // Same level: reset recover streak; keep escalate streak reset.
+        // Same level: reset recover streak.
         next.consecutiveRecoverSamples = 0
-        next.consecutiveEscalateSamples = 0
         return revalidateActions(state: next, at: clock, thresholds: thresholds)
+    }
+
+    private static func exitBand(for level: PressureLevel, thresholds: PressureThresholds) -> Double {
+        switch level {
+        case .critical:
+            return thresholds.criticalFraction - thresholds.exitHysteresisPoints
+        case .warning:
+            return thresholds.warningFraction - thresholds.exitHysteresisPoints
+        case .normal:
+            return 0
+        }
     }
 
     /// Emit a paced recovery tick (one optional unit) when level is normal.
@@ -308,6 +345,13 @@ public enum PressureGovernorStateMachine {
         state.epoch == expectedEpoch
     }
 
+    /// Max actions counted per epoch (enter ladder once; holds are silent).
+    public static let maxActionsPerEpoch = 5
+
+    private static func bumpEpoch(_ epoch: UInt64) -> UInt64 {
+        epoch == UInt64.max ? UInt64.max : epoch + 1
+    }
+
     private static func escalate(
         state: PressureGovernorState,
         to level: PressureLevel,
@@ -318,22 +362,30 @@ public enum PressureGovernorStateMachine {
         let changed = next.level != level
         if changed {
             next.level = level
-            next.epoch &+= 1
+            next.epoch = bumpEpoch(next.epoch)
             next.levelEnteredAt = clock
+            next.actionsEmittedThisEpoch = 0
         }
         next.consecutiveEscalateSamples = 0
+        next.escalateTargetLevel = nil
         next.consecutiveRecoverSamples = 0
         let actions = actionsFor(level: level)
-        let actionKey = "\(level.rawValue):\(reason):\(next.epoch)"
-        // Idempotent: same action key does not double-count.
-        if next.lastActionKey != actionKey {
+        let actionKey = "\(level.rawValue):enter:\(next.epoch)"
+        // Exactly once per epoch: enter actions only.
+        if next.actionsEmittedThisEpoch == 0 {
             next.lastActionKey = actionKey
             next.lastActionAt = clock
             next.actionCount += actions.count
+            next.actionsEmittedThisEpoch = actions.count
+            return PressureTransitionResult(
+                state: next,
+                emittedActions: actions,
+                levelChanged: changed
+            )
         }
         return PressureTransitionResult(
             state: next,
-            emittedActions: actions,
+            emittedActions: [],
             levelChanged: changed
         )
     }
@@ -347,10 +399,12 @@ public enum PressureGovernorStateMachine {
         let changed = next.level != level
         if changed {
             next.level = level
-            next.epoch &+= 1
+            next.epoch = bumpEpoch(next.epoch)
             next.levelEnteredAt = clock
+            next.actionsEmittedThisEpoch = 0
         }
         next.consecutiveEscalateSamples = 0
+        next.escalateTargetLevel = nil
         next.consecutiveRecoverSamples = 0
         return PressureTransitionResult(
             state: next,
@@ -364,20 +418,10 @@ public enum PressureGovernorStateMachine {
         at clock: Date,
         thresholds: PressureThresholds
     ) -> PressureTransitionResult {
-        guard state.level != .normal else {
-            return PressureTransitionResult(state: state)
-        }
-        let actions = actionsFor(level: state.level)
-        let actionKey = "\(state.level.rawValue):hold:\(state.epoch)"
-        var next = state
-        // Idempotent hold: do not inflate actionCount on every sample.
-        if next.lastActionKey != actionKey {
-            next.lastActionKey = actionKey
-            next.lastActionAt = clock
-            next.actionCount += actions.count
-            return PressureTransitionResult(state: next, emittedActions: actions)
-        }
-        return PressureTransitionResult(state: next, emittedActions: [])
+        // Holds never re-emit; actions are bound to epoch entry only.
+        _ = clock
+        _ = thresholds
+        return PressureTransitionResult(state: state, emittedActions: [])
     }
 
     private static func actionsFor(level: PressureLevel) -> [PressureActionKind] {

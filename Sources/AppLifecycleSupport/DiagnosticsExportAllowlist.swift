@@ -3,8 +3,8 @@ import CryptoKit
 
 /// Typed allowlist for capacity/diagnostics export (plan-optimize-swift S1 / T-003).
 ///
-/// Never includes prompts, tool output, filesystem paths, env, tokens,
-/// capabilities, reversible-content handles, or raw upstream errors.
+/// Only exact (section, key) pairs from `allowedKeys` may be exported. Values are
+/// restricted to non-secret scalars (numbers, pressure levels, short enums).
 /// Correlation IDs are salted session-local. Explicit export is 0600.
 
 public enum DiagnosticsExportSection: String, Sendable, Codable, Equatable, CaseIterable {
@@ -31,52 +31,96 @@ public struct DiagnosticsExportField: Sendable, Equatable {
     }
 }
 
-public enum DiagnosticsExportAllowlist {
-    /// Keys that must never appear in export payload or diagnostic logs under this contract.
-    public static let forbiddenKeySubstrings: [String] = [
-        "prompt",
-        "tool_output",
-        "stdout",
-        "stderr",
-        "path",
-        "cwd",
-        "env",
-        "token",
-        "authorization",
-        "password",
-        "secret",
-        "capability",
-        "handle",
-        "[[rc:",
-        "raw_error",
-        "api_key",
-    ]
+public enum DiagnosticsExportError: Error, Equatable, LocalizedError {
+    case exceedsSizeCap(Int)
+    case unknownKey(String)
+    case invalidValue(String)
+    case duplicateKey(String)
 
+    public var errorDescription: String? {
+        switch self {
+        case .exceedsSizeCap(let n):
+            return "Diagnostics export exceeds size cap (\(n) bytes)"
+        case .unknownKey(let k):
+            return "Diagnostics export key not on allowlist: \(k)"
+        case .invalidValue(let v):
+            return "Diagnostics export value rejected: \(v)"
+        case .duplicateKey(let k):
+            return "Diagnostics export duplicate key: \(k)"
+        }
+    }
+}
+
+public enum DiagnosticsExportAllowlist {
     public static let maxExportBytes = 512 * 1024
     public static let defaultRetentionHours = 72
+    public static let maxValueLength = 64
 
-    public static func isAllowedKey(_ key: String) -> Bool {
-        let lower = key.lowercased()
-        for needle in forbiddenKeySubstrings {
-            if lower.contains(needle) { return false }
-        }
-        return true
+    /// Exact allowlisted keys per section (true allowlist, not denylist).
+    public static let allowedKeys: [DiagnosticsExportSection: Set<String>] = [
+        .capacityManifest: ["schema_version", "manifest_id", "warmed_sample_count"],
+        .capacityMetrics: [
+            "app_rss_kb", "provider_tree_rss_kb", "sidecar_rss_kb",
+            "accept_to_prepare_ms_p95", "prepare_to_spawn_ms_p95",
+            "event_to_visible_paint_ms_p95", "stop_dispatch_ms_p95",
+            "dag_longest_no_progress_ms", "ownership_coverage_fraction",
+            "batcher_pending_bytes", "batcher_pending_count",
+            "lock_wait_ms_p95", "main_actor_stall_ms_max",
+            "metric_variance_max",
+        ],
+        .pressureState: ["level", "epoch", "frozen_accounting", "action_count"],
+        .managedRSSTrend: [
+            "total_managed_rss_kb", "slope_kb_per_minute", "high_water_managed_rss_kb",
+            "sample_complete",
+        ],
+        .hangWatchdog: ["gap_kind", "hang_likely_count"],
+        .ownershipCoverage: ["coverage_fraction", "live_row_count"],
+        .transportQueueDepths: [
+            "batcher_pending_bytes", "batcher_pending_count", "outbound_queue_bytes",
+        ],
+        .hardwareTier: ["tier_name", "physically_executed", "physical_memory_bytes"],
+        .unavailableManifest: ["section_name", "reason"],
+    ]
+
+    public static func isAllowed(section: DiagnosticsExportSection, key: String) -> Bool {
+        allowedKeys[section]?.contains(key) == true
+    }
+
+    /// Values must be short scalars: digits, optional decimal, or known enums.
+    public static func isAllowedValue(_ value: String) -> Bool {
+        if value.isEmpty || value.count > maxValueLength { return false }
+        if value.contains("[[rc:") { return false }
+        if value.contains("/") || value.contains("\\") { return false }
+        if value.contains("@") { return false }
+        if value.lowercased().contains("bearer") { return false }
+        if value.lowercased().contains("sk-") { return false }
+        // Allow numeric, bool-ish, and pressure/enum tokens.
+        let allowedScalars = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+        return value.unicodeScalars.allSatisfy { allowedScalars.contains($0) }
     }
 
     public static func filter(_ fields: [DiagnosticsExportField]) -> [DiagnosticsExportField] {
-        fields.filter { isAllowedKey($0.key) && isAllowedValue($0.value) }
+        fields.filter { isAllowed(section: $0.section, key: $0.key) && isAllowedValue($0.value) }
     }
 
-    public static func isAllowedValue(_ value: String) -> Bool {
-        let lower = value.lowercased()
-        if lower.contains("[[rc:") { return false }
-        for needle in ["api_key=", "authorization:", "password=", "secret="] {
-            if lower.contains(needle) { return false }
+    public static func validate(_ fields: [DiagnosticsExportField]) throws {
+        var seen = Set<String>()
+        for field in fields {
+            let composite = "\(field.section.rawValue).\(field.key)"
+            guard isAllowed(section: field.section, key: field.key) else {
+                throw DiagnosticsExportError.unknownKey(composite)
+            }
+            guard isAllowedValue(field.value) else {
+                throw DiagnosticsExportError.invalidValue(field.value)
+            }
+            if seen.contains(composite) {
+                throw DiagnosticsExportError.duplicateKey(composite)
+            }
+            seen.insert(composite)
         }
-        return true
     }
 
-    /// Session-local correlation id: HMAC-like salted hash, not a raw UUID/path.
+    /// Session-local correlation id: salted hash, not a raw UUID/path.
     public static func correlationID(sessionSalt: Data, eventSeed: String) -> String {
         var hasher = SHA256()
         hasher.update(data: sessionSalt)
@@ -91,14 +135,19 @@ public enum DiagnosticsExportAllowlist {
         sessionSalt: Data,
         now: Date = Date()
     ) throws -> Data {
+        try validate(fields)
         let allowed = filter(fields)
+        var sections: [String: [String: String]] = [:]
+        for field in allowed {
+            var bucket = sections[field.section.rawValue] ?? [:]
+            bucket[field.key] = field.value
+            sections[field.section.rawValue] = bucket
+        }
         let object: [String: Any] = [
             "schema_version": "1.0.0",
             "exported_at": ISO8601DateFormatter().string(from: now),
             "correlation_prefix": correlationID(sessionSalt: sessionSalt, eventSeed: "export"),
-            "sections": Dictionary(grouping: allowed, by: \.section.rawValue).mapValues { rows in
-                Dictionary(uniqueKeysWithValues: rows.map { ($0.key, $0.value) })
-            },
+            "sections": sections,
             "unavailable_sections": unavailableSections.map(\.rawValue).sorted(),
             "retention_hours": defaultRetentionHours,
         ]
@@ -128,7 +177,7 @@ public enum DiagnosticsExportAllowlist {
         try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
-    /// Secret canary: synthetic secrets must not survive filtering.
+    /// Secret canary: synthetic secrets must not survive filtering / validation.
     public static func secretCanaryPayload() -> [DiagnosticsExportField] {
         [
             DiagnosticsExportField(section: .capacityMetrics, key: "app_rss_kb", value: "12345"),
@@ -138,17 +187,8 @@ public enum DiagnosticsExportAllowlist {
             DiagnosticsExportField(section: .capacityMetrics, key: "tool_handle", value: "[[rc:abc]]"),
             DiagnosticsExportField(section: .capacityMetrics, key: "raw_error", value: "boom"),
             DiagnosticsExportField(section: .pressureState, key: "level", value: "warning"),
+            // Allowed key with secret-like value must also be rejected.
+            DiagnosticsExportField(section: .pressureState, key: "level", value: "bearer-xyz"),
         ]
-    }
-}
-
-public enum DiagnosticsExportError: Error, Equatable, LocalizedError {
-    case exceedsSizeCap(Int)
-
-    public var errorDescription: String? {
-        switch self {
-        case .exceedsSizeCap(let n):
-            return "Diagnostics export exceeds size cap (\(n) bytes)"
-        }
     }
 }
