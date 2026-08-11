@@ -6185,7 +6185,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             let runStatus = (try? coordinator.runStatus(runId)) ?? .running
             await MainActor.run {
                 self.terminalRunIds.remove(runId)
-                self.runThreads[runId] = tid
+                // Never reinsert a synchronously-finished run as "active".
+                if runStatus == .running || runStatus == .pending {
+                    self.runThreads[runId] = tid
+                } else {
+                    self.runThreads[runId] = nil
+                    self.terminalRunIds = Self.boundedTerminalRunIds(
+                        existing: self.terminalRunIds,
+                        adding: runId
+                    )
+                }
                 if self.selectedThreadId == tid {
                     if runStatus == .running || runStatus == .pending {
                         self.currentRunId = runId
@@ -6481,7 +6490,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // tracked yet (Graphify / preflight window before coordinator.startRun).
         if let tid, preparingRunThreads.contains(tid) {
             cancelSurfacePreparation(threadId: tid)
-            // Fall through so a pending coordinator start also receives stopRun.
+            // Only fall through to stopRun when the coordinator already owns a
+            // pending start or live run — otherwise stopRun arms pendingThreadStops
+            // on a never-started thread and poisons the immediate resend.
+            let coordinatorOwns = coordinator.hasPendingProviderStart(threadId: tid)
+                || coordinator.isPreparingProviderStart(threadId: tid)
+                || coordinator.activeRunId(threadId: tid) != nil
+            if !coordinatorOwns {
+                return
+            }
         }
         // Second click while already Stopping: hard-await termination so a
         // stuck soft interrupt cannot leave the button disabled forever. This must
@@ -6611,6 +6628,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func stopThread(_ id: AgentThreadID) {
         if preparingRunThreads.contains(id) {
             cancelSurfacePreparation(threadId: id)
+            let coordinatorOwns = coordinator.hasPendingProviderStart(threadId: id)
+                || coordinator.isPreparingProviderStart(threadId: id)
+                || coordinator.activeRunId(threadId: id) != nil
+            if !coordinatorOwns {
+                return
+            }
         }
         if isScheduledThreadRunning?(id) == true, let stopScheduledThread {
             Task { @MainActor in
