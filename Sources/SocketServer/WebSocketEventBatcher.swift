@@ -6,6 +6,11 @@ final class WebSocketEventBatcher: @unchecked Sendable {
     /// perceptible latency. Cellular uses the larger `delay` window (100ms).
     static let crossKindDelay: TimeInterval = 0.015
 
+    /// S10: admission bounds before dispatch backlog (bytes / count / time).
+    static let defaultMaxPendingBytes: Int = 1_048_576
+    static let defaultMaxPendingCount: Int = 512
+    static let defaultMaxPendingAge: TimeInterval = 0.250
+
     /// PERF (token-delta frame churn): high-frequency streaming kinds that are
     /// safe to hold for the coalesce window. One provider token = one
     /// agent.item.delta event; without buffering, every token wakes the socket
@@ -29,7 +34,12 @@ final class WebSocketEventBatcher: @unchecked Sendable {
     /// C-14: caller must `recordFilteredEvent` so collapsed summary seqs do not
     /// surface as spurious 1012 gaps.
     private let onCoalescedAway: (@Sendable (Data) -> Void)?
+    /// S10: overflow records lost sequences and signals baseline recovery.
+    private let onAdmissionOverflow: (@Sendable (_ lostSequences: [Int64], _ reason: String) -> Void)?
     private let send: @Sendable (Data) -> Void
+    private let maxPendingBytes: Int
+    private let maxPendingCount: Int
+    private let maxPendingAge: TimeInterval
     private let queue = DispatchQueue(label: "io.remotecode.ws-event-batcher")
     // Keyed (coalescing) state
     private var pending: [String: Data] = [:]
@@ -39,12 +49,19 @@ final class WebSocketEventBatcher: @unchecked Sendable {
     private var nilKeyQueue: [Data] = []
     private var nilKeyScheduled = false
     private var stopped = false
+    private var pendingBytes: Int = 0
+    private var oldestEnqueueUptime: TimeInterval?
+    private var overflowCount: Int = 0
 
     init(enabled: Bool,
          filter: EventStreamFilter,
          delay: TimeInterval = 0.075,
          coalescesStreamingDeltas: Bool = false,
+         maxPendingBytes: Int = WebSocketEventBatcher.defaultMaxPendingBytes,
+         maxPendingCount: Int = WebSocketEventBatcher.defaultMaxPendingCount,
+         maxPendingAge: TimeInterval = WebSocketEventBatcher.defaultMaxPendingAge,
          onCoalescedAway: (@Sendable (Data) -> Void)? = nil,
+         onAdmissionOverflow: (@Sendable (_ lostSequences: [Int64], _ reason: String) -> Void)? = nil,
          send: @escaping @Sendable (Data) -> Void) {
         self.enabled = enabled
         self.filter = filter
@@ -53,8 +70,17 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         // Wi-Fi keeps the short cross-kind default so interactive latency stays low.
         self.nilKeyDelay = filter.isCellularSafe ? max(0, delay) : Self.crossKindDelay
         self.coalescesStreamingDeltas = coalescesStreamingDeltas
+        self.maxPendingBytes = max(1, maxPendingBytes)
+        self.maxPendingCount = max(1, maxPendingCount)
+        self.maxPendingAge = max(0, maxPendingAge)
         self.onCoalescedAway = onCoalescedAway
+        self.onAdmissionOverflow = onAdmissionOverflow
         self.send = send
+    }
+
+    /// Test/telemetry seam: current bounded pending admission footprint.
+    func admissionSnapshot() -> (bytes: Int, count: Int, overflowCount: Int) {
+        queue.sync { (pendingBytes, pending.count + nilKeyQueue.count, overflowCount) }
     }
 
     func enqueue(event: EventBus.Event, data: Data) {
@@ -69,7 +95,15 @@ final class WebSocketEventBatcher: @unchecked Sendable {
             if Self.fullStreamCoalescedKinds.contains(event.kind) {
                 queue.async {
                     guard !self.stopped else { return }
+                    if self.wouldExceedAdmissionLocked(additionalBytes: data.count) {
+                        self.handleOverflowLocked(reason: "admission_bytes_or_count")
+                    }
+                    self.noteEnqueueLocked(data)
                     self.nilKeyQueue.append(data)
+                    if self.isAdmissionAgedLocked() {
+                        self.flushLocked()
+                        return
+                    }
                     guard !self.nilKeyScheduled else { return }
                     self.nilKeyScheduled = true
                     self.queue.asyncAfter(deadline: .now() + self.nilKeyDelay) {
@@ -81,6 +115,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                 // and flush NOW so interactive events pay zero added latency.
                 queue.async {
                     guard !self.stopped else { return }
+                    self.noteEnqueueLocked(data)
                     self.nilKeyQueue.append(data)
                     self.flushLocked()
                 }
@@ -91,6 +126,9 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         if let key = filter.coalescingKey(for: event) {
             queue.async {
                 guard !self.stopped else { return }
+                if self.wouldExceedAdmissionLocked(additionalBytes: data.count) {
+                    self.handleOverflowLocked(reason: "admission_bytes_or_count")
+                }
                 if let previous = self.pending[key] {
                     if self.filter.coalescingMergesByConcatenation(for: event),
                        let merged = Self.mergeAgentItemDeltaFrames(previous, data) {
@@ -98,15 +136,24 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                         // client watermark advances without a 1012 gap, then keep
                         // the higher-sequence merged frame.
                         self.onCoalescedAway?(previous)
+                        self.pendingBytes -= previous.count
+                        self.noteEnqueueLocked(merged)
                         self.pending[key] = merged
                     } else {
                         // Last-write-wins: superseded summary never hits the socket.
                         self.onCoalescedAway?(previous)
+                        self.pendingBytes -= previous.count
+                        self.noteEnqueueLocked(data)
                         self.pending[key] = data
                     }
                 } else {
                     self.order.append(key)
+                    self.noteEnqueueLocked(data)
                     self.pending[key] = data
+                }
+                if self.isAdmissionAgedLocked() {
+                    self.flushLocked()
+                    return
                 }
                 guard !self.scheduled else { return }
                 self.scheduled = true
@@ -120,7 +167,15 @@ final class WebSocketEventBatcher: @unchecked Sendable {
             // fewer frames; C-16 also concatenates same-item deltas on flush.
             queue.async {
                 guard !self.stopped else { return }
+                if self.wouldExceedAdmissionLocked(additionalBytes: data.count) {
+                    self.handleOverflowLocked(reason: "admission_bytes_or_count")
+                }
+                self.noteEnqueueLocked(data)
                 self.nilKeyQueue.append(data)
+                if self.isAdmissionAgedLocked() {
+                    self.flushLocked()
+                    return
+                }
                 guard !self.nilKeyScheduled else { return }
                 self.nilKeyScheduled = true
                 self.queue.asyncAfter(deadline: .now() + self.nilKeyDelay) {
@@ -128,6 +183,48 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                 }
             }
         }
+    }
+
+    private func noteEnqueueLocked(_ data: Data) {
+        pendingBytes += data.count
+        if oldestEnqueueUptime == nil {
+            oldestEnqueueUptime = ProcessInfo.processInfo.systemUptime
+        }
+    }
+
+    private func wouldExceedAdmissionLocked(additionalBytes: Int) -> Bool {
+        let count = pending.count + nilKeyQueue.count
+        if count + 1 > maxPendingCount { return true }
+        if pendingBytes + additionalBytes > maxPendingBytes { return true }
+        return false
+    }
+
+    private func isAdmissionAgedLocked() -> Bool {
+        guard maxPendingAge > 0, let oldest = oldestEnqueueUptime else { return false }
+        return ProcessInfo.processInfo.systemUptime - oldest >= maxPendingAge
+    }
+
+    private func handleOverflowLocked(reason: String) {
+        overflowCount += 1
+        var lost: [Int64] = []
+        for data in pending.values {
+            if let seq = WebSocketOutboundQueue.eventSequence(in: data) {
+                lost.append(seq)
+            }
+        }
+        for data in nilKeyQueue {
+            if let seq = WebSocketOutboundQueue.eventSequence(in: data) {
+                lost.append(seq)
+            }
+        }
+        pending.removeAll(keepingCapacity: false)
+        order.removeAll(keepingCapacity: false)
+        nilKeyQueue.removeAll(keepingCapacity: false)
+        pendingBytes = 0
+        oldestEnqueueUptime = nil
+        scheduled = false
+        nilKeyScheduled = false
+        onAdmissionOverflow?(lost, reason)
     }
 
     func flush() {
@@ -144,6 +241,8 @@ final class WebSocketEventBatcher: @unchecked Sendable {
             pending.removeAll(keepingCapacity: false)
             order.removeAll(keepingCapacity: false)
             nilKeyQueue.removeAll(keepingCapacity: false)
+            pendingBytes = 0
+            oldestEnqueueUptime = nil
         }
     }
 
@@ -169,6 +268,8 @@ final class WebSocketEventBatcher: @unchecked Sendable {
             frames.append(contentsOf: merged)
             nilKeyQueue.removeAll(keepingCapacity: true)
         }
+        pendingBytes = 0
+        oldestEnqueueUptime = nil
         // C-14: emit by event sequence when present so keyed LWW + nil-key
         // events in the same window cannot invent host-side 1012 gaps.
         // Frames without a parseable sequence keep relative order (stable sort).
