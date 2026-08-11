@@ -45,6 +45,18 @@ final class CapacitySemanticHarnessTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(result.longestNoProgressMs, 0)
     }
 
+    func test_frozenDefaultWorkload_drainsWithAllFaultKinds() {
+        // Frozen hardcore shape: 32 roots / 64 nested — catches reorder stranding.
+        let schedule = CapacitySemanticHarness.buildSchedule(seed: 0xC0FFEE)
+        XCTAssertEqual(schedule.nodes.count, 96)
+        let clock = CapacityManualClock()
+        let result = CapacitySemanticHarness.run(schedule: schedule, clock: clock)
+        XCTAssertTrue(result.queueDrained, "default workload must drain (no stranded active nodes)")
+        XCTAssertTrue(result.terminalOwnershipExact)
+        XCTAssertTrue(result.allFaultsApplied, "unknown=\(result.unknownFaultKinds)")
+        XCTAssertFalse(result.nodes.contains(where: { $0.status == .active || $0.status == .waiting }))
+    }
+
     func test_run_modelsAllDeclaredFaultKinds() {
         let kinds = CapacityHarnessKnownFaultKind.allCases.map(\.rawValue)
         let schedule = CapacitySemanticHarness.buildSchedule(
