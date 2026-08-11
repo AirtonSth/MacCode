@@ -489,6 +489,15 @@ enum AppDiagnostics {
 
     @MainActor private static var providerScanInFlight = false
     @MainActor private static var managedTrendState = ManagedTrendState()
+    /// S7: single process-wide pressure coordinator driven by live heartbeat samples.
+    static let pressureGovernor = PressureGovernorCoordinator()
+    /// Sidecar request generation for mutation revalidation (bumped when Distill admits work).
+    private static let sidecarGenerationLock = NSLock()
+    private static var _sidecarRequestGeneration: UInt64 = 0
+#if DEBUG
+    @MainActor static var lastPressureIngestEmittedForTesting: [PressureActionKind] = []
+    @MainActor static var lastPressureExecuteOutcomeForTesting: PressureMutationOutcome?
+#endif
 
     enum ProviderScanDecision: Equatable {
         case start
@@ -497,6 +506,32 @@ enum AppDiagnostics {
 
     @MainActor static func beginProviderScanForTests() -> ProviderScanDecision { beginProviderScan() }
     @MainActor static func finishProviderScanForTests() { finishProviderScan() }
+
+    /// Production + tests: advance Distill sidecar request generation for S7 revalidation.
+    static func noteSidecarRequestGenerationBump() {
+        sidecarGenerationLock.lock()
+        _sidecarRequestGeneration &+= 1
+        sidecarGenerationLock.unlock()
+    }
+
+    static func sidecarRequestGeneration() -> UInt64 {
+        sidecarGenerationLock.lock(); defer { sidecarGenerationLock.unlock() }
+        return _sidecarRequestGeneration
+    }
+
+    /// Test seam: drive the same ingest→execute path as heartbeat without OS scans.
+    @MainActor
+    static func ingestPressureFromHeartbeatSampleForTesting(
+        sample: ManagedAggregateSample,
+        activeAgentThreads: Int,
+        surface: SurfaceSnapshot
+    ) {
+        drivePressureGovernor(
+            sample: sample,
+            activeAgentThreads: activeAgentThreads,
+            surface: surface
+        )
+    }
 
     @MainActor
     private static func beginProviderScan() -> ProviderScanDecision {
@@ -599,7 +634,22 @@ enum AppDiagnostics {
         appDiagnosticsLog.info(
             "app.heartbeat reason=\(reason, privacy: .public) pid=\(pid, privacy: .public) managedScan=\(scanState, privacy: .public) complete=\(sample.isComplete, privacy: .public) appRSSKB=\(value(sample.appFootprintKB), privacy: .public) providerProcesses=\(value(sample.providerProcessCount), privacy: .public) providerRoots=\(value(sample.providerRootCount), privacy: .public) providerRSSKB=\(value(sample.providerRSSKB), privacy: .public) sidecarProcesses=\(value(sample.sidecarProcessCount), privacy: .public) sidecarRoots=\(value(sample.sidecarRootCount), privacy: .public) sidecarRSSKB=\(value(sample.sidecarRSSKB), privacy: .public) totalManagedRSSKB=\(value(sample.totalManagedRSSKB), privacy: .public) previousManagedRSSKB=\(value(sample.previousTotalManagedRSSKB), privacy: .public) sampleIntervalSeconds=\(doubleValue(sample.sampleIntervalSeconds), privacy: .public) deltaManagedRSSKB=\(value(sample.deltaManagedRSSKB), privacy: .public) slopeKBPerMinute=\(doubleValue(sample.slopeKBPerMinute), privacy: .public) highWaterManagedRSSKB=\(value(sample.highWaterManagedRSSKB), privacy: .public) memoryProfile=\(sample.profile.name, privacy: .public) physicalMemoryBytes=\(sample.profile.physicalMemoryBytes, privacy: .public) providerRootCap=\(value(sample.profile.providerRootCap), privacy: .public) hostProcessCeilingKB=\(value(sample.profile.hostProcessCeilingKB), privacy: .public) managedTreeCeilingKB=\(value(sample.profile.managedTreeCeilingKB), privacy: .public) admission=\(sample.admissionDecision.telemetryReason, privacy: .public) sidecarRequestCap=\(sample.profile.sidecarMaxConcurrentRequests, privacy: .public) sidecarQueueCap=\(sample.profile.sidecarMaxQueueDepth, privacy: .public) ownershipLedgerCap=\(ProviderProcessOwnershipStore.defaultMaxRecords, privacy: .public) pressure=\(sample.pressureDecision.rawValue, privacy: .public) surfaces=\(surface.surfaceCount, privacy: .public) terminals=\(surface.terminalCount, privacy: .public) runningTerminals=\(surface.runningTerminals, privacy: .public) activeAgentThreads=\(activeAgentThreads, privacy: .public) terminalPendingBytes=\(surface.pendingBytes, privacy: .public) terminalDroppedBytes=\(surface.droppedBytes, privacy: .public) terminalHistoryFailures=\(surface.historyFailures, privacy: .public)"
         )
-        // S12: publish capacity UX from the live heartbeat path (not test-only).
+        // S7 + S12: drive pressure coordinator (ingest/execute) and publish Capacity UX.
+        drivePressureGovernor(
+            sample: sample,
+            activeAgentThreads: activeAgentThreads,
+            surface: surface
+        )
+    }
+
+    /// Shared production path: heartbeat samples → PressureGovernorCoordinator
+    /// ingest → non-destructive execute with live target revalidation.
+    @MainActor
+    private static func drivePressureGovernor(
+        sample: ManagedAggregateSample,
+        activeAgentThreads: Int,
+        surface: SurfaceSnapshot
+    ) {
         let hostLevel: PressureLevel = {
             switch sample.pressureDecision {
             case .critical: return .critical
@@ -629,20 +679,113 @@ enum AppDiagnostics {
             if fraction >= 0.70 { return .warning }
             return .normal
         }()
-        // Accounting completeness ≠ physical capacity qualification.
+
+        let physicalKB = Double(sample.profile.physicalMemoryBytes) / 1_024
+        let managedFraction: Double? = {
+            guard sample.isComplete, let total = sample.totalManagedRSSKB, physicalKB > 0 else {
+                return nil
+            }
+            return Double(total) / physicalKB
+        }()
+        let osSignal: PressureOSSignal = {
+            switch sample.pressureDecision {
+            case .critical: return .critical
+            case .warning: return .warning
+            case .normal, .unknown: return .normal
+            }
+        }()
+        let pressureSample = PressureSample(
+            date: Date(),
+            osSignal: osSignal,
+            managedRSSFraction: managedFraction,
+            isComplete: sample.isComplete,
+            isStale: !sample.isComplete
+        )
+        let transition = pressureGovernor.ingest(sample: pressureSample)
+#if DEBUG
+        lastPressureIngestEmittedForTesting = transition.emittedActions
+#endif
+        if !transition.emittedActions.isEmpty {
+            let planEpoch = transition.state.epoch
+            let planTarget = PressureMutationTarget(
+                epoch: planEpoch,
+                surfaceVisible: surface.surfaceCount > 0,
+                providerSessionActive: activeAgentThreads > 0
+                    || (sample.providerRootCount ?? 0) > 0,
+                sidecarRequestGeneration: sidecarRequestGeneration(),
+                graphifyChildIdentity: GraphifyWorkspaceService.shared.pressureChildIdentity
+            )
+            let plan = PressureMutationPlan(
+                actions: transition.emittedActions,
+                target: planTarget
+            )
+            let outcome = pressureGovernor.execute(plan: plan, liveTargetProvider: {
+                PressureMutationTarget(
+                    epoch: planEpoch,
+                    surfaceVisible: SurfaceRegistry.shared.all().isEmpty == false,
+                    providerSessionActive: activeAgentThreads > 0
+                        || (sample.providerRootCount ?? 0) > 0,
+                    sidecarRequestGeneration: sidecarRequestGeneration(),
+                    graphifyChildIdentity: GraphifyWorkspaceService.shared.pressureChildIdentity
+                )
+            })
+#if DEBUG
+            lastPressureExecuteOutcomeForTesting = outcome
+#endif
+            applyPressureActions(outcome.applied)
+        }
+
+        // When recovering toward normal, still run paced recovery ticks.
+        if transition.state.level != .normal, transition.emittedActions.isEmpty {
+            let recovered = pressureGovernor.pacedRecovery(at: Date())
+            if recovered.emittedActions.contains(.resumeOptionalWorkUnit) {
+                applyPressureActions([.resumeOptionalWorkUnit])
+            }
+        }
+
+        // Capacity UX: prefer coordinator level when ingest advanced state; else
+        // host-level from sample (ingest already published via CapacityUXStatusStore).
+        let coordLevel = pressureGovernor.currentState().level
         CapacityUXStatusStore.shared.publish(
             CapacityUXStatus.from(
                 hardwareTierName: sample.profile.name,
-                hostPressure: hostLevel,
+                hostPressure: max(hostLevel, coordLevel),
                 providerTreePressure: providerLevel,
                 envelopeMeasured: false, // physical canary not claimed from heartbeat alone
-                beyondEnvelope: sample.pressureDecision == .critical,
+                beyondEnvelope: sample.pressureDecision == .critical || coordLevel == .critical,
                 accountingAvailable: sample.isComplete,
-                degradationActions: sample.pressureDecision == .normal || sample.pressureDecision == .unknown
-                    ? []
-                    : [sample.pressureDecision.rawValue]
+                degradationActions: {
+                    var actions = transition.emittedActions.map(\.rawValue)
+                    if actions.isEmpty,
+                       sample.pressureDecision != .normal,
+                       sample.pressureDecision != .unknown {
+                        actions = [sample.pressureDecision.rawValue]
+                    }
+                    return actions
+                }()
             )
         )
+    }
+
+    @MainActor
+    private static func applyPressureActions(_ actions: [PressureActionKind]) {
+        for action in actions {
+            switch action {
+            case .pauseGraphifyEnsureAndWatchCallbacks:
+                GraphifyWorkspaceService.shared.setPressurePauseEnsureAndWatch(true)
+            case .resumeOptionalWorkUnit:
+                GraphifyWorkspaceService.shared.setPressurePauseEnsureAndWatch(false)
+            case .reclaimHiddenRecomputableUI,
+                 .shortenCompletedIdleProviderSessions,
+                 .releaseDistillIdleModelGPU,
+                 .deferMaintenancePrune,
+                 .neverKillActiveTurn,
+                 .neverDeferScheduledOccurrence:
+                // Non-destructive accounting / future hooks. Distill GPU reclaim
+                // stays process-resident; never kill turns or defer schedules.
+                break
+            }
+        }
     }
 
     static func currentProcessFootprintKB() -> Int {

@@ -44,6 +44,9 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     /// Monotonic rebuild ownership. Cancel and disable bump this so an in-flight
     /// build started under an older generation can never publish freshness.
     private var rebuildGeneration: UInt64 = 0
+    /// S7: pressure governor may pause ensure + watch callbacks without killing
+    /// active rebuilds. Resumed by `resumeOptionalWorkUnit` / clear.
+    private var pressurePauseEnsureAndWatch = false
 
     public var appSupportDirectory: URL
     public var binaryPathOverride: String?
@@ -93,6 +96,24 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
                 .appendingPathComponent("RemoteCode", isDirectory: true)
                 .appendingPathComponent("graphify-graphs", isDirectory: true)
         }
+    }
+
+    /// Identity string for S7 pressure mutation revalidation (rebuild generation).
+    public var pressureChildIdentity: String {
+        lock.lock(); defer { lock.unlock() }
+        return "graphify-rebuild-\(rebuildGeneration)"
+    }
+
+    /// S7 non-destructive pressure action: pause ensure/watch scheduling.
+    public func setPressurePauseEnsureAndWatch(_ paused: Bool) {
+        lock.lock()
+        pressurePauseEnsureAndWatch = paused
+        lock.unlock()
+    }
+
+    public var isPressurePauseEnsureAndWatch: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return pressurePauseEnsureAndWatch
     }
 
     // MARK: Artifact root (worktree-aware)
@@ -339,6 +360,11 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
 
     private func startEnsureIfNeeded(checkout: GraphifyCheckout) {
         guard enabled, autoEnsure else { return }
+        // S7: pressure may pause ensure without disabling the feature gate.
+        lock.lock()
+        let pressurePaused = pressurePauseEnsureAndWatch
+        lock.unlock()
+        if pressurePaused { return }
 
         // Cheap disk/git probes OUTSIDE the lock (avoid holding NSLock across Process I/O).
         let graphExists = FileManager.default.fileExists(atPath: graphJSONPath(for: checkout).path)

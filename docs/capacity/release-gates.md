@@ -20,9 +20,9 @@ Those gates are **not invented**. Artifacts below are the in-repo mandatory proo
 | Semantic harness | `Sources/AgentRuntime/CapacitySemanticHarness.swift` | present + unit tests |
 | Oversized payload recovery | `Sources/Persistence/AuthoritativePayloadRecovery.swift` | present + unit tests |
 | Ownership elastic ledger | `Sources/AgentRuntime/ProviderProcessOwnership.swift` | present + unit tests (257 rows) |
-| Preparation cancellable SM | `Sources/AgentRuntime/ProviderPreparationStateMachine.swift` | present + unit tests |
+| Preparation cancellable SM | `Sources/AgentRuntime/ProviderPreparationStateMachine.swift` + `AgentRunCoordinator` claimSpawn + `AgentAppSurface` Stop cancel | wired into accept→spawn + unit/production-wiring tests |
 | Visibility cold-state | `Sources/Surfaces/AgentVisibilityColdState.swift` | present |
-| Pressure coordinator | `Sources/AppLifecycleSupport/PressureGovernorCoordinator.swift` | present |
+| Pressure coordinator | `Sources/AppLifecycleSupport/PressureGovernorCoordinator.swift` + `AppDiagnostics.heartbeat` ingest/execute | wired into live heartbeat + unit/production-wiring tests |
 | Batcher admission bounds | `Sources/SocketServer/WebSocketEventBatcher.swift` | present + unit tests |
 | Graphify/TS hardening pins | `Sources/AgentRuntime/GraphifyRuntimeHardening.swift` | present (default pin incomplete until physical canary; install refuses floating upgrade when unpinned) |
 | Capacity UX model | `Sources/AppLifecycleSupport/CapacityUXStatus.swift` | present |

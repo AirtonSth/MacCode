@@ -396,6 +396,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// run is tracked. Thread-scoped so switching tabs mid-prepare cannot show
     /// a sibling thread as loading.
     @Published public private(set) var preparingRunThreadId: AgentThreadID?
+    /// S5: generation-owned surface preparation (accept → Graphify/preflight →
+    /// coordinator start). Stop/Escape applies `.stopRequested` so a late
+    /// claim cannot call `coordinator.startRun`.
+    private var surfacePreparationStates: [AgentThreadID: ProviderPreparationState] = [:]
     /// UX-MAC_AGENT-009: true while the last surfaced error is recoverable, so
     /// the transcript can offer a Retry of the last prompt instead of forcing a
     /// retype. Cleared when a run starts or any non-error event arrives.
@@ -5892,7 +5896,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // cannot see (Graphify roots, prompt compression, provider spawn). Show
         // "Loading…" for it; the defer covers the failure exits so a thread can
         // never be left permanently loading.
+        // Run identity is fixed at acceptance so Stop can cancel this generation.
+        let runId = requestedRunId ?? AgentRunID()
         preparingRunThreadId = tid
+        // S5: accept surface-owned preparation generation before any Graphify work.
+        let surfaceAccept = ProviderPreparationStateMachine.apply(
+            state: surfacePreparationStates[tid] ?? ProviderPreparationState(),
+            event: .accept(
+                draftMessageId: runId.value.uuidString,
+                atMs: Int64(Date().timeIntervalSince1970 * 1000)
+            )
+        )
+        surfacePreparationStates[tid] = surfaceAccept.state
         defer {
             if preparingRunThreadId == tid { preparingRunThreadId = nil }
         }
@@ -5911,7 +5926,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // The coordinator is the single writer of run messages — mirror
         // the user message in-memory only (no double-persist). Queue drain
         // passes the same UUID as runId, so the optimistic bubble is stable.
-        let runId = requestedRunId ?? AgentRunID()
         let durableUserMessageExists = (try? messageRepo.get(id: AgentMessageID(runId.value))) != nil
         if !resumeInterrupted && !durableUserMessageExists {
             presentOutgoingUserMessage(
@@ -6004,6 +6018,28 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         } catch {
             statusMessage = "Failed to prepare run: \(error)"
             status = .failed
+            return nil
+        }
+        // S5: finish surface prep and claim spawn before coordinator.startRun.
+        // Stop/Escape during Graphify/preflight revokes this generation.
+        let surfacePrep = surfacePreparationStates[tid] ?? ProviderPreparationState()
+        let surfaceFinished = ProviderPreparationStateMachine.apply(
+            state: surfacePrep,
+            event: .preparationFinished(generation: surfacePrep.generation)
+        )
+        surfacePreparationStates[tid] = surfaceFinished.state
+        let surfaceClaimed = ProviderPreparationStateMachine.claimSpawn(
+            state: surfaceFinished.state,
+            permitGeneration: surfaceFinished.spawnPermitGeneration
+        )
+        surfacePreparationStates[tid] = surfaceClaimed.state
+        guard surfaceClaimed.state.phase == .running, surfaceClaimed.ignoredReason == nil else {
+            coordinator.cancelPreparation(threadId: tid)
+            statusMessage = "Run cancelled during preparation"
+            status = .cancelled
+            currentRunId = nil
+            runThreads[runId] = nil
+            preparingRunThreadId = nil
             return nil
         }
         do {
@@ -6300,6 +6336,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func stop() {
         let tid = selectedThreadId
         let localRunId = currentRunId ?? tid.flatMap { trackedRunId(for: $0) }
+        // S5: cancel generation-owned surface preparation even when no run is
+        // tracked yet (Graphify / preflight window before coordinator.startRun).
+        if let tid, preparingRunThreadId == tid {
+            let current = surfacePreparationStates[tid] ?? ProviderPreparationState()
+            let stopped = ProviderPreparationStateMachine.apply(
+                state: current,
+                event: .stopRequested
+            )
+            surfacePreparationStates[tid] = stopped.state
+            preparingRunThreadId = nil
+            coordinator.cancelPreparation(threadId: tid)
+            // Fall through so a pending coordinator start also receives stopRun.
+        }
         // Second click while already Stopping: hard-await termination so a
         // stuck soft interrupt cannot leave the button disabled forever. This must
         // stay AHEAD of the stale-projection branch below: the first Stop can
@@ -6386,6 +6435,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// resolve to "nothing to stop" instead of a permanent Stopping… latch.
     private func hasStoppableRun(threadId: AgentThreadID) -> Bool {
         if isScheduledThreadRunning?(threadId) == true { return true }
+        // S5: surface preparation is stoppable before a run id is tracked.
+        if preparingRunThreadId == threadId { return true }
+        if coordinator.isPreparingProviderStart(threadId: threadId) { return true }
         if coordinator.activeRunId(threadId: threadId) != nil { return true }
         if coordinator.hasPendingProviderStart(threadId: threadId) { return true }
         // A failed durable read must not be reported as "idle": attempting a real
@@ -6423,6 +6475,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Stop a specific thread by id, regardless of which thread is currently selected.
     /// Allows the thread rail to stop any running thread without switching selection.
     public func stopThread(_ id: AgentThreadID) {
+        if preparingRunThreadId == id {
+            let current = surfacePreparationStates[id] ?? ProviderPreparationState()
+            surfacePreparationStates[id] = ProviderPreparationStateMachine.apply(
+                state: current,
+                event: .stopRequested
+            ).state
+            preparingRunThreadId = nil
+            coordinator.cancelPreparation(threadId: id)
+        }
         if isScheduledThreadRunning?(id) == true, let stopScheduledThread {
             Task { @MainActor in
                 _ = await stopScheduledThread(id, trackedRunId(for: id))

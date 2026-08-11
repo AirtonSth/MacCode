@@ -952,6 +952,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// `activeThreads[thread] == nil` as terminal while one of these exists.
     private var pendingProviderStarts: [AgentThreadID: PendingProviderStart] = [:]
     private var pendingThreadStops: Set<AgentThreadID> = []
+    /// S5: generation-owned preparation lifecycle for the accept→spawn window.
+    /// Stop/Escape applies `.stopRequested` so a late `claimSpawn` cannot write.
+    private var preparationStates: [AgentThreadID: ProviderPreparationState] = [:]
     /// Runs whose destructive caller is waiting for provider/process teardown.
     /// The matching terminal callback is recorded even when markStopRequested
     /// already made the durable run row terminal.
@@ -1370,6 +1373,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             pendingProviderStarts[request.threadId] = pendingProviderStart
             rememberRunThreadOwnershipLocked(runId: runId, threadId: request.threadId)
             registeredPendingStart = true
+            // S5: accept generation-owned preparation as soon as the start is admitted.
+            _ = applyPreparationLocked(
+                threadId: request.threadId,
+                event: .accept(
+                    draftMessageId: request.runId.value.uuidString,
+                    atMs: Int64(Date().timeIntervalSince1970 * 1000)
+                )
+            )
+            // Stop that raced ahead of accept still wins: cancel prep immediately.
+            if pendingThreadStops.contains(request.threadId) {
+                _ = applyPreparationLocked(threadId: request.threadId, event: .stopRequested)
+            }
         } else {
             registeredPendingStart = false
         }
@@ -1595,10 +1610,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             )
         }
         await onRunPrepared?(effectiveRequest, preservedUserContent)
-        lock.lock()
-        let stoppedBeforeProviderWrite = pendingThreadStops.remove(effectiveRequest.threadId) != nil
-        lock.unlock()
-        if stoppedBeforeProviderWrite {
+        // S5: preparationFinished + one-shot claimSpawn under lock. Stop/Escape
+        // that arrived during durable prep revokes the generation so sendTurn
+        // never starts the provider.
+        guard claimPreparationSpawnOrCancel(
+            threadId: effectiveRequest.threadId,
+            runId: runId
+        ) else {
             markStopRequested(threadId: effectiveRequest.threadId, runId: runId)
             throw AgentRunAcceptanceError.cancelled
         }
@@ -1621,6 +1639,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lock.unlock()
         } catch {
             clearDistillOutputMode(runId)
+            lock.lock()
+            let gen = preparationStates[effectiveRequest.threadId]?.generation ?? 0
+            // claimSpawn already advanced to running; terminalize that generation.
+            _ = applyPreparationLocked(
+                threadId: effectiveRequest.threadId,
+                event: .providerFinished(generation: gen, reason: .providerFailure)
+            )
+            lock.unlock()
             markStartFailure(
                 error,
                 request: effectiveRequest,
@@ -2080,6 +2106,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         if pendingStart != nil && !hasDurableRunningState {
             lock.lock()
+            _ = applyPreparationLocked(threadId: threadId, event: .stopRequested)
             pendingThreadStops.insert(threadId)
             lock.unlock()
             return
@@ -2127,6 +2154,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
         }
         lock.lock()
+        _ = applyPreparationLocked(threadId: threadId, event: .stopRequested)
         pendingThreadStops.insert(threadId)
         lock.unlock()
         markStopRequested(threadId: threadId, runId: nil)
@@ -2312,6 +2340,78 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public func hasPendingProviderStart(threadId: AgentThreadID) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return pendingProviderStarts[threadId] != nil
+    }
+
+    /// S5: true while accept→spawn preparation is live (preparing/providerStarting).
+    public func isPreparingProviderStart(threadId: AgentThreadID) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let phase = preparationStates[threadId]?.phase else { return false }
+        return phase == .preparing || phase == .providerStarting
+    }
+
+    /// Snapshot of preparation phase for tests / UI accessibility.
+    public func preparationPhase(threadId: AgentThreadID) -> ProviderPreparationPhase? {
+        lock.lock(); defer { lock.unlock() }
+        return preparationStates[threadId]?.phase
+    }
+
+    /// S5: Stop/Escape cancels generation-owned preparation and arms pending stop
+    /// so a late claimSpawn/sendTurn cannot start the provider.
+    public func cancelPreparation(threadId: AgentThreadID) {
+        lock.lock()
+        _ = applyPreparationLocked(threadId: threadId, event: .stopRequested)
+        pendingThreadStops.insert(threadId)
+        lock.unlock()
+    }
+
+    @discardableResult
+    private func applyPreparationLocked(
+        threadId: AgentThreadID,
+        event: ProviderPreparationEvent
+    ) -> ProviderPreparationTransition {
+        let current = preparationStates[threadId] ?? ProviderPreparationState()
+        let transition = ProviderPreparationStateMachine.apply(state: current, event: event)
+        preparationStates[threadId] = transition.state
+        return transition
+    }
+
+    /// Completes durable prep and one-shot claims the spawn permit under the
+    /// coordinator lock. Returns false when Stop revoked the generation.
+    private func claimPreparationSpawnOrCancel(
+        threadId: AgentThreadID,
+        runId: AgentRunID
+    ) -> Bool {
+        lock.lock()
+        if pendingThreadStops.remove(threadId) != nil {
+            _ = applyPreparationLocked(threadId: threadId, event: .stopRequested)
+            lock.unlock()
+            return false
+        }
+        let current = preparationStates[threadId] ?? ProviderPreparationState()
+        let finished = ProviderPreparationStateMachine.apply(
+            state: current,
+            event: .preparationFinished(generation: current.generation)
+        )
+        preparationStates[threadId] = finished.state
+        // Re-check Stop after preparationFinished so a concurrent cancel that
+        // arrived mid-apply cannot be overtaken by a retained permit.
+        if pendingThreadStops.remove(threadId) != nil {
+            _ = applyPreparationLocked(threadId: threadId, event: .stopRequested)
+            lock.unlock()
+            return false
+        }
+        let claimed = ProviderPreparationStateMachine.claimSpawn(
+            state: preparationStates[threadId] ?? finished.state,
+            permitGeneration: finished.spawnPermitGeneration
+        )
+        preparationStates[threadId] = claimed.state
+        let ok = claimed.state.phase == .running && claimed.ignoredReason == nil
+        if !ok {
+            _ = applyPreparationLocked(threadId: threadId, event: .stopRequested)
+            pendingThreadStops.remove(threadId)
+        }
+        lock.unlock()
+        return ok
     }
 
     private func providerSessionIsLive(
@@ -3193,6 +3293,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     }
 
     private func markStopRequested(threadId: AgentThreadID, runId: AgentRunID?) {
+        // S5: always revoke generation-owned prep/spawn permits on Stop.
+        lock.lock()
+        _ = applyPreparationLocked(threadId: threadId, event: .stopRequested)
+        lock.unlock()
         // F17: handle.cancel() can finish the run synchronously (the codex adapter
         // emits .finished(.cancelled) inside cancel), and the .finished path has
         // then already run the FULL terminal sequence — run row, thread row,
