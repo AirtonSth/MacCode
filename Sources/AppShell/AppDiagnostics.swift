@@ -599,6 +599,25 @@ enum AppDiagnostics {
         appDiagnosticsLog.info(
             "app.heartbeat reason=\(reason, privacy: .public) pid=\(pid, privacy: .public) managedScan=\(scanState, privacy: .public) complete=\(sample.isComplete, privacy: .public) appRSSKB=\(value(sample.appFootprintKB), privacy: .public) providerProcesses=\(value(sample.providerProcessCount), privacy: .public) providerRoots=\(value(sample.providerRootCount), privacy: .public) providerRSSKB=\(value(sample.providerRSSKB), privacy: .public) sidecarProcesses=\(value(sample.sidecarProcessCount), privacy: .public) sidecarRoots=\(value(sample.sidecarRootCount), privacy: .public) sidecarRSSKB=\(value(sample.sidecarRSSKB), privacy: .public) totalManagedRSSKB=\(value(sample.totalManagedRSSKB), privacy: .public) previousManagedRSSKB=\(value(sample.previousTotalManagedRSSKB), privacy: .public) sampleIntervalSeconds=\(doubleValue(sample.sampleIntervalSeconds), privacy: .public) deltaManagedRSSKB=\(value(sample.deltaManagedRSSKB), privacy: .public) slopeKBPerMinute=\(doubleValue(sample.slopeKBPerMinute), privacy: .public) highWaterManagedRSSKB=\(value(sample.highWaterManagedRSSKB), privacy: .public) memoryProfile=\(sample.profile.name, privacy: .public) physicalMemoryBytes=\(sample.profile.physicalMemoryBytes, privacy: .public) providerRootCap=\(value(sample.profile.providerRootCap), privacy: .public) hostProcessCeilingKB=\(value(sample.profile.hostProcessCeilingKB), privacy: .public) managedTreeCeilingKB=\(value(sample.profile.managedTreeCeilingKB), privacy: .public) admission=\(sample.admissionDecision.telemetryReason, privacy: .public) sidecarRequestCap=\(sample.profile.sidecarMaxConcurrentRequests, privacy: .public) sidecarQueueCap=\(sample.profile.sidecarMaxQueueDepth, privacy: .public) ownershipLedgerCap=\(ProviderProcessOwnershipStore.defaultMaxRecords, privacy: .public) pressure=\(sample.pressureDecision.rawValue, privacy: .public) surfaces=\(surface.surfaceCount, privacy: .public) terminals=\(surface.terminalCount, privacy: .public) runningTerminals=\(surface.runningTerminals, privacy: .public) activeAgentThreads=\(activeAgentThreads, privacy: .public) terminalPendingBytes=\(surface.pendingBytes, privacy: .public) terminalDroppedBytes=\(surface.droppedBytes, privacy: .public) terminalHistoryFailures=\(surface.historyFailures, privacy: .public)"
         )
+        // S12: publish capacity UX from the live heartbeat path (not test-only).
+        let hostLevel: PressureLevel = {
+            switch sample.pressureDecision {
+            case .critical: return .critical
+            case .warning: return .warning
+            case .normal, .unknown: return .normal
+            }
+        }()
+        CapacityUXStatusStore.shared.publish(
+            CapacityUXStatus.from(
+                hardwareTierName: sample.profile.name,
+                hostPressure: hostLevel,
+                providerTreePressure: hostLevel,
+                envelopeMeasured: sample.isComplete,
+                beyondEnvelope: sample.pressureDecision == .critical,
+                accountingAvailable: sample.isComplete,
+                degradationActions: sample.pressureDecision == .normal ? [] : [sample.pressureDecision.rawValue]
+            )
+        )
     }
 
     static func currentProcessFootprintKB() -> Int {

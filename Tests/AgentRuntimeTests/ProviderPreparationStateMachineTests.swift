@@ -110,23 +110,40 @@ final class ProviderPreparationStateMachineTests: XCTestCase {
         XCTAssertTrue(prepDone.allowProviderSpawn)
         XCTAssertEqual(prepDone.spawnPermitGeneration, gen)
         XCTAssertTrue(
-            ProviderPreparationStateMachine.claimSpawn(
+            ProviderPreparationStateMachine.mayClaimSpawn(
                 state: prepDone.state,
                 permitGeneration: prepDone.spawnPermitGeneration
             )
         )
+        let claimed = ProviderPreparationStateMachine.claimSpawn(
+            state: prepDone.state,
+            permitGeneration: prepDone.spawnPermitGeneration
+        )
+        XCTAssertEqual(claimed.state.phase, .running)
+        // Second claim on pre-claim snapshot succeeds only if still providerStarting;
+        // after consume via live state, claim fails.
+        let second = ProviderPreparationStateMachine.claimSpawn(
+            state: claimed.state,
+            permitGeneration: prepDone.spawnPermitGeneration
+        )
+        XCTAssertEqual(second.ignoredReason, "not_provider_starting")
         // Stop after preparationFinished revokes the retained permit.
         let stopped = ProviderPreparationStateMachine.apply(
             state: prepDone.state,
             event: .stopRequested
         )
         XCTAssertFalse(
-            ProviderPreparationStateMachine.claimSpawn(
+            ProviderPreparationStateMachine.mayClaimSpawn(
                 state: stopped.state,
                 permitGeneration: prepDone.spawnPermitGeneration
             ),
             "retained allowProviderSpawn must not spawn after generation cancel"
         )
+        let stoppedClaim = ProviderPreparationStateMachine.claimSpawn(
+            state: stopped.state,
+            permitGeneration: prepDone.spawnPermitGeneration
+        )
+        XCTAssertNotNil(stoppedClaim.ignoredReason)
     }
 
     func test_preparationFailed_leavesPreparing() {

@@ -409,6 +409,13 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         let service = self
         DispatchQueue.global(qos: .utility).async {
             let status = service.ensureSync(checkout: checkout, mode: .update)
+            // HEAD probe outside the service lock — run() also takes the lock.
+            let head: String? = {
+                if status == .fresh {
+                    return service.currentHead(checkout.displayRoot)
+                }
+                return nil
+            }()
             service.lock.lock()
             var s = service.schedules[checkout.scheduleID] ?? RefreshSchedule()
             s.inFlight = false
@@ -422,7 +429,7 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
                 if status == .fresh {
                     s.builtGeneration = targetGen
                     s.lastSuccessfulUpdate = Date()
-                    s.lastHead = service.currentHead(checkout.displayRoot)
+                    s.lastHead = head
                 }
             }
             let needRerun = !cancelled && (s.rerunRequested || s.dirtyGeneration > s.builtGeneration)

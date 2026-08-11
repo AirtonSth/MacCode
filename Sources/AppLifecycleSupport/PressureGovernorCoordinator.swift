@@ -143,8 +143,33 @@ public final class PressureGovernorCoordinator: @unchecked Sendable {
         var remaining = plan.actions
         while !remaining.isEmpty {
             let action = remaining.removeFirst()
-            // Re-read live identity at the mutation boundary (not a snapshot).
+            // Re-read live identity + coordinator accounting at each mutation.
             let liveTarget = liveTargetProvider()
+            lock.lock()
+            let epochStillFresh = PressureGovernorStateMachine.isEpochFresh(
+                state: state,
+                expectedEpoch: plan.target.epoch
+            )
+            let stillFrozen = state.frozenAccounting
+            lock.unlock()
+            if !epochStillFresh {
+                skipped.append(action)
+                skipped.append(contentsOf: remaining)
+                return PressureMutationOutcome(
+                    applied: applied,
+                    skipped: skipped,
+                    reason: "stale_epoch"
+                )
+            }
+            if stillFrozen {
+                skipped.append(action)
+                skipped.append(contentsOf: remaining)
+                return PressureMutationOutcome(
+                    applied: applied,
+                    skipped: skipped,
+                    reason: "frozen_accounting"
+                )
+            }
             if plan.target.epoch != liveTarget.epoch {
                 skipped.append(action)
                 skipped.append(contentsOf: remaining)

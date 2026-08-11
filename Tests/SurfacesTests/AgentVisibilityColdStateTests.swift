@@ -111,4 +111,84 @@ final class AgentVisibilityColdStateTests: XCTestCase {
             )
         )
     }
+
+    func test_promotion_allSafetyGates() {
+        // 10%-of-footprint branch (footprint large → threshold = 10%).
+        XCTAssertFalse(
+            AgentVisibilityColdState.shouldPromoteReclamation(
+                savedBytes: 50 * 1024 * 1024,
+                appFootprintBytes: 2_000 * 1024 * 1024, // 10% = 200 MiB
+                revealP95Ms: 10,
+                revealP99Ms: 10,
+                mainActorStallMs: 10,
+                duplicateOrMissingEvents: false
+            )
+        )
+        XCTAssertTrue(
+            AgentVisibilityColdState.shouldPromoteReclamation(
+                savedBytes: 200 * 1024 * 1024,
+                appFootprintBytes: 2_000 * 1024 * 1024,
+                revealP95Ms: 10,
+                revealP99Ms: 10,
+                mainActorStallMs: 10,
+                duplicateOrMissingEvents: false
+            )
+        )
+        // p99 boundary
+        XCTAssertFalse(
+            AgentVisibilityColdState.shouldPromoteReclamation(
+                savedBytes: 200 * 1024 * 1024,
+                appFootprintBytes: 1_000 * 1024 * 1024,
+                revealP95Ms: 10,
+                revealP99Ms: 1_001,
+                mainActorStallMs: 10,
+                duplicateOrMissingEvents: false
+            )
+        )
+        // MainActor stall exact boundary (≥2s fails)
+        XCTAssertFalse(
+            AgentVisibilityColdState.shouldPromoteReclamation(
+                savedBytes: 200 * 1024 * 1024,
+                appFootprintBytes: 1_000 * 1024 * 1024,
+                revealP95Ms: 10,
+                revealP99Ms: 10,
+                mainActorStallMs: 2_000,
+                duplicateOrMissingEvents: false
+            )
+        )
+        // Duplicate/missing events
+        XCTAssertFalse(
+            AgentVisibilityColdState.shouldPromoteReclamation(
+                savedBytes: 200 * 1024 * 1024,
+                appFootprintBytes: 1_000 * 1024 * 1024,
+                revealP95Ms: 10,
+                revealP99Ms: 10,
+                mainActorStallMs: 10,
+                duplicateOrMissingEvents: true
+            )
+        )
+    }
+
+    func test_completeReveal_lastAppliedWatermarkFloor() {
+        var session = AgentVisibilitySession()
+        session = AgentVisibilityColdState.didBecomeHidden(
+            session: session,
+            checkpoint: AgentPresentationCheckpoint(durableSequence: 5, lastAppliedDurableSequence: 20)
+        )
+        session = AgentVisibilityColdState.beginReveal(session: session)
+        // Floor is max(durable=5, lastApplied=20) = 20.
+        XCTAssertNil(
+            AgentVisibilityColdState.completeReveal(
+                session: session,
+                expectedGeneration: session.generation,
+                appliedThroughSequence: 19
+            )
+        )
+        let ok = AgentVisibilityColdState.completeReveal(
+            session: session,
+            expectedGeneration: session.generation,
+            appliedThroughSequence: 20
+        )
+        XCTAssertEqual(ok?.checkpoint.lastAppliedDurableSequence, 20)
+    }
 }

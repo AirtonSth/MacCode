@@ -232,10 +232,35 @@ public enum ProviderPreparationStateMachine {
         state.phase == .providerStarting
     }
 
-    /// Atomic check-and-act at the provider-write boundary. A retained
-    /// `allowProviderSpawn` from a prior transition is not enough — the live
-    /// generation and phase must still authorize the permit.
+    /// One-shot claim at the provider-write boundary. Consumes the spawn permit
+    /// by advancing into `running` only when generation+phase still authorize.
+    /// Concurrent callers cannot both claim the same generation.
     public static func claimSpawn(
+        state: ProviderPreparationState,
+        permitGeneration: UInt64?
+    ) -> ProviderPreparationTransition {
+        guard let permitGeneration else {
+            return ProviderPreparationTransition(state: state, ignoredReason: "no_permit")
+        }
+        guard permitGeneration == state.generation else {
+            return ProviderPreparationTransition(
+                state: state,
+                suppressLateCallback: true,
+                ignoredReason: "stale_generation"
+            )
+        }
+        guard state.phase == .providerStarting else {
+            return ProviderPreparationTransition(state: state, ignoredReason: "not_provider_starting")
+        }
+        var next = state
+        next.phase = .running
+        next.accessibleStatus = "Running"
+        // Return transition with allowProviderSpawn false — permit is consumed.
+        return ProviderPreparationTransition(state: next, allowProviderSpawn: false)
+    }
+
+    /// Predicate-only check (does not consume). Prefer `claimSpawn` at write boundary.
+    public static func mayClaimSpawn(
         state: ProviderPreparationState,
         permitGeneration: UInt64?
     ) -> Bool {

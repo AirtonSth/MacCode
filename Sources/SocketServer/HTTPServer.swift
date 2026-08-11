@@ -2490,22 +2490,25 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 }
             )
             // C-04: pressure baseline_required ≤1/s, never as a close reason.
-            // S10: sticky recovery — rate suppression / enqueue failure leave a
-            // pending flag so a later flush (or post-interval timer) still delivers.
+            // S10: generation-aware sticky recovery + single-flight trailing flush.
             let pressureBaselineGate = OutboundPressureBaselineGate()
+            var scheduleStickyBaselineFlush: (@Sendable () -> Void)!
             let emitPressureBaseline: @Sendable () -> Void = { [weak self] in
                 guard let self else { return }
                 // Always coalesce the recovery request before attempting emit.
                 pressureBaselineGate.markPending()
-                guard pressureBaselineGate.tryAcquire() else { return }
+                guard let generation = pressureBaselineGate.tryAcquireGeneration() else {
+                    scheduleStickyBaselineFlush()
+                    return
+                }
                 let current = sequenceWatermark.value
                 guard let baselineData = self.connectionBaselineRequiredData(
                     connectionId: connectionId,
                     requestedAfterSequence: current,
                     currentSequence: current
                 ) else {
-                    // Keep pending so a subsequent call can retry.
                     pressureBaselineGate.markPending()
+                    scheduleStickyBaselineFlush()
                     return
                 }
                 let accepted: Bool = {
@@ -2525,7 +2528,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     }
                 }()
                 if accepted {
-                    pressureBaselineGate.recordSuccess()
+                    pressureBaselineGate.recordSuccess(forGeneration: generation)
                     NSLog(
                         "[RC2.WS] outbound pressure: baseline_required without close seq=%lld",
                         current
@@ -2535,25 +2538,22 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         "baseline_required": .bool(true),
                         "current_sequence": .number(Double(current))
                     ]))
+                    // If a newer overflow arrived during emission, re-arm once.
+                    if pressureBaselineGate.hasPendingRecovery {
+                        scheduleStickyBaselineFlush()
+                    }
                 } else {
-                    // Enqueue failed: keep sticky pending for a later flush.
                     pressureBaselineGate.markPending()
+                    scheduleStickyBaselineFlush()
                 }
             }
-            // Trailing sticky flush: if recovery was rate-suppressed, retry after
-            // the gate interval so two overflow bursts cannot leave iOS stale.
-            let stickyBaselineFlush: @Sendable () -> Void = {
-                guard pressureBaselineGate.hasPendingRecovery else { return }
-                emitPressureBaseline()
-            }
-            let scheduleStickyBaselineFlush: @Sendable () -> Void = {
+            scheduleStickyBaselineFlush = {
+                // Single-flight: floods arm at most one delayed flush at a time.
+                guard pressureBaselineGate.armFlushIfNeeded() else { return }
                 DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.05) {
-                    stickyBaselineFlush()
-                    // Re-arm while still owed so enqueue failure cannot strand recovery.
+                    pressureBaselineGate.clearFlushArm()
                     if pressureBaselineGate.hasPendingRecovery {
-                        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.05) {
-                            stickyBaselineFlush()
-                        }
+                        emitPressureBaseline()
                     }
                 }
             }
@@ -2659,9 +2659,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         sequenceWatermark.recordFilteredEvent(sequence: sequence)
                     }
                     emitPressureBaseline()
-                    if pressureBaselineGate.hasPendingRecovery {
-                        scheduleStickyBaselineFlush()
-                    }
                 }
             ) { data in
                 enqueueApplicationOrDegrade(data)

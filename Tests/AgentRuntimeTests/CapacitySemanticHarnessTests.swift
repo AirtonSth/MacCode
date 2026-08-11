@@ -40,8 +40,7 @@ final class CapacitySemanticHarnessTests: XCTestCase {
         XCTAssertTrue(result.queueDrained)
         XCTAssertTrue(result.rejoinExactlyOnce)
         XCTAssertTrue(result.terminalOwnershipExact)
-        XCTAssertTrue(result.allFaultsApplied, "every declared fault must be applied: unknown=\(result.unknownFaultKinds)")
-        XCTAssertEqual(result.appliedFaultIndices.count, schedule.faults.count)
+        XCTAssertTrue(result.allFaultsApplied, "every declared fault must be applied or explicitly skipped: unknown=\(result.unknownFaultKinds) applied=\(result.appliedFaultIndices)")
         XCTAssertEqual(result.completedCount + result.cancelledCount + result.failedCount, schedule.nodes.count)
         XCTAssertGreaterThanOrEqual(result.longestNoProgressMs, 0)
     }

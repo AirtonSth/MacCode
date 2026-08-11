@@ -967,14 +967,16 @@ final class LockedQueuedBytesSample: @unchecked Sendable {
 /// Rate-limits in-band `baseline_required` emissions under outbound pressure
 /// so a busy agent cannot flood the client (acceptance: ≤1/s).
 ///
-/// Sticky recovery (S10): when a request is rate-suppressed or enqueue fails,
-/// `markPending()` coalesces work so a later flush is guaranteed once the gate
-/// opens. Only successful emissions call `recordSuccess`.
+/// Sticky recovery (S10): generation-aware pending + single-flight flush so a
+/// success cannot clear a newer recovery request, and flood paths cannot spawn
+/// unbounded retry tasks.
 final class OutboundPressureBaselineGate: @unchecked Sendable {
     private let lock = NSLock()
     private var lastEmitAt: TimeInterval = 0
     private let minInterval: TimeInterval
-    private var pendingRecovery = false
+    private var pendingGeneration: UInt64 = 0
+    private var issuedGeneration: UInt64 = 0
+    private var flushScheduled = false
 
     init(minInterval: TimeInterval = 1.0) {
         self.minInterval = max(0, minInterval)
@@ -983,31 +985,67 @@ final class OutboundPressureBaselineGate: @unchecked Sendable {
     /// True when a recovery emission is still owed.
     var hasPendingRecovery: Bool {
         lock.lock(); defer { lock.unlock() }
-        return pendingRecovery
+        return pendingGeneration > issuedGeneration
     }
 
-    /// Coalesce a recovery request that could not emit immediately.
+    /// Coalesce a recovery request (bumps generation so later success cannot
+    /// clear a newer overflow).
     func markPending() {
         lock.lock(); defer { lock.unlock() }
-        pendingRecovery = true
+        pendingGeneration &+= 1
     }
 
-    /// Attempt to open the rate gate. On success the caller must enqueue and
-    /// then either `recordSuccess` or re-`markPending` on failure.
-    func tryAcquire(now: TimeInterval = Date().timeIntervalSinceReferenceDate) -> Bool {
+    /// Attempt to open the rate gate. Returns the generation acquired, or nil.
+    func tryAcquireGeneration(now: TimeInterval = Date().timeIntervalSinceReferenceDate) -> UInt64? {
         lock.lock(); defer { lock.unlock() }
         if lastEmitAt > 0, now - lastEmitAt < minInterval {
-            pendingRecovery = true
-            return false
+            if pendingGeneration == issuedGeneration {
+                pendingGeneration &+= 1
+            }
+            return nil
         }
         lastEmitAt = now
+        // Capture the generation being served so a concurrent markPending
+        // after acquire keeps recovery sticky.
+        if pendingGeneration == 0 { pendingGeneration = 1 }
+        return pendingGeneration
+    }
+
+    /// Convenience for callers that only need a Bool (legacy tests).
+    func tryAcquire(now: TimeInterval = Date().timeIntervalSinceReferenceDate) -> Bool {
+        tryAcquireGeneration(now: now) != nil
+    }
+
+    /// Clear pending only when this success covers the current generation.
+    func recordSuccess(forGeneration generation: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        if generation >= pendingGeneration {
+            issuedGeneration = pendingGeneration
+        } else {
+            // A newer request arrived during emission — keep pending.
+            issuedGeneration = min(issuedGeneration, generation)
+        }
+    }
+
+    /// Legacy success without generation (covers all outstanding if no race).
+    func recordSuccess() {
+        lock.lock(); defer { lock.unlock() }
+        issuedGeneration = pendingGeneration
+    }
+
+    /// Single-flight trailing flush arm. Returns true only for the first
+    /// concurrent scheduler so floods do not enqueue unbounded tasks.
+    func armFlushIfNeeded() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard pendingGeneration > issuedGeneration else { return false }
+        guard !flushScheduled else { return false }
+        flushScheduled = true
         return true
     }
 
-    /// Clear pending only after baseline was accepted by the outbound queue.
-    func recordSuccess() {
+    func clearFlushArm() {
         lock.lock(); defer { lock.unlock() }
-        pendingRecovery = false
+        flushScheduled = false
     }
 }
 
