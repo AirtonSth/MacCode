@@ -85,7 +85,12 @@ final class WebSocketEventBatcher: @unchecked Sendable {
 
     /// Test/telemetry seam: current bounded pending admission footprint.
     func admissionSnapshot() -> (bytes: Int, count: Int, overflowCount: Int) {
-        queue.sync { (pendingBytes, pending.count + nilKeyQueue.count, overflowCount) }
+        queue.sync {
+            self.preQueueLock.lock()
+            let overflows = self.overflowCount
+            self.preQueueLock.unlock()
+            return (pendingBytes, pending.count + nilKeyQueue.count, overflows)
+        }
     }
 
     func enqueue(event: EventBus.Event, data: Data) {
@@ -96,11 +101,13 @@ final class WebSocketEventBatcher: @unchecked Sendable {
             preQueueCount + 1 > maxPendingCount
             || preQueueBytes + data.count > maxPendingBytes
         if wouldExceedPre {
-            preQueueLock.unlock()
             overflowCount += 1
+            let count = overflowCount
+            preQueueLock.unlock()
             var lost: [Int64] = []
             if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
             onAdmissionOverflow?(lost, "pre_queue_admission")
+            _ = count
             return
         }
         preQueueCount += 1
@@ -135,7 +142,9 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                         // Frame alone exceeds budget: record its sequence as lost and drop.
                         var lost: [Int64] = []
                         if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
+                        self.preQueueLock.lock()
                         self.overflowCount += 1
+                        self.preQueueLock.unlock()
                         self.onAdmissionOverflow?(lost, "frame_exceeds_budget")
                         return
                     }
@@ -160,7 +169,9 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                     guard self.canAdmitSingleFrameLocked(byteCount: data.count) else {
                         var lost: [Int64] = []
                         if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
+                        self.preQueueLock.lock()
                         self.overflowCount += 1
+                        self.preQueueLock.unlock()
                         self.onAdmissionOverflow?(lost, "frame_exceeds_budget")
                         return
                     }
@@ -182,7 +193,9 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                 guard self.canAdmitSingleFrameLocked(byteCount: data.count) else {
                     var lost: [Int64] = []
                     if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
+                    self.preQueueLock.lock()
                     self.overflowCount += 1
+                    self.preQueueLock.unlock()
                     self.onAdmissionOverflow?(lost, "frame_exceeds_budget")
                     return
                 }
@@ -231,7 +244,9 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                 guard self.canAdmitSingleFrameLocked(byteCount: data.count) else {
                     var lost: [Int64] = []
                     if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
+                    self.preQueueLock.lock()
                     self.overflowCount += 1
+                    self.preQueueLock.unlock()
                     self.onAdmissionOverflow?(lost, "frame_exceeds_budget")
                     return
                 }
@@ -270,7 +285,9 @@ final class WebSocketEventBatcher: @unchecked Sendable {
     }
 
     private func handleOverflowLocked(reason: String) {
+        preQueueLock.lock()
         overflowCount += 1
+        preQueueLock.unlock()
         var lost: [Int64] = []
         for data in pending.values {
             if let seq = WebSocketOutboundQueue.eventSequence(in: data) {

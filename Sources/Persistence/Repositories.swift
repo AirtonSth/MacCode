@@ -3372,20 +3372,25 @@ public final class AgentRunRepository: @unchecked Sendable {
         return trailer
     }
 
-    /// Rehydrate an oversized recovery envelope back to the original UTF-8 payload.
+    /// Rehydrate a store-before-loss presentation form back to the original UTF-8 payload.
+    /// Recognizes `[[rc:handle]]` markers and legacy `rc_oversized` JSON envelopes.
     public func rehydrateOversizedPayloadIfNeeded(_ payloadJSON: String) throws -> String {
-        guard payloadJSON.contains("rc_oversized"),
-              let data = payloadJSON.data(using: .utf8),
-              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              object["rc_oversized"] as? Bool == true else {
-            return payloadJSON
-        }
-        if object["store_failed"] as? Bool == true {
+        if payloadJSON.contains("store_failed") && payloadJSON.contains("rc_oversized") {
             throw PersistenceDataError.corruptStreamEvent("oversized payload store failed; original unavailable")
         }
-        guard let handle = object["handle"] as? String else {
-            throw PersistenceDataError.corruptStreamEvent("oversized payload missing handle")
+        let handle: String?
+        if let range = payloadJSON.range(of: #"\[\[rc:([0-9a-fA-F]+)\]\]"#, options: .regularExpression) {
+            let marker = String(payloadJSON[range])
+            handle = ReversibleContentStore.normalize(marker)
+        } else if payloadJSON.contains("rc_oversized"),
+                  let data = payloadJSON.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let h = object["handle"] as? String {
+            handle = h
+        } else {
+            handle = nil
         }
+        guard let handle, !handle.isEmpty else { return payloadJSON }
         let store = ReversibleContentStore(db: db)
         let original = try AuthoritativePayloadRecovery.rehydrate(handle: handle, store: store)
         guard let text = String(data: original, encoding: .utf8) else {

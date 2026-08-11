@@ -53,9 +53,8 @@ final class AuthoritativePayloadRecoveryTests: XCTestCase {
         XCTAssertTrue(result.truncatedForPresentation)
         let handle = try XCTUnwrap(result.handle)
         XCTAssertTrue(result.presentationText.contains(handle))
-        XCTAssertTrue(result.presentationText.contains("rc_oversized"))
-        let envelope = try JSONSerialization.jsonObject(with: Data(result.presentationText.utf8))
-        XCTAssertTrue(envelope is [String: Any])
+        XCTAssertTrue(result.presentationText.contains("truncated"))
+        XCTAssertTrue(result.presentationText.contains(ReversibleContentStore.marker(for: handle)))
         XCTAssertEqual(result.originalByteCount, bytes.count)
 
         let rehydrated = try AuthoritativePayloadRecovery.rehydrate(

@@ -76,19 +76,30 @@ public enum AuthoritativePayloadRecovery {
             throw RecoveryError.storeFailed(String(describing: error))
         }
 
-        // Emit a compact, valid JSON envelope (not a truncated JSON prefix).
-        // Replay paths decode JSON; the original is recovered via the handle.
+        // Soft-truncated the presentation form (keeps legacy "truncated" trailer
+        // semantics) while the exact original is recoverable via [[rc:handle]].
         let marker = ReversibleContentStore.marker(for: handle)
-        let envelope: [String: Any] = [
-            "rc_oversized": true,
-            "original_bytes": byteCount,
-            "handle": handle,
-            "marker": marker,
-            "preview_utf8_prefix": String(decoding: data.prefix(min(256, limit)), as: UTF8.self),
-        ]
-        guard let envelopeData = try? JSONSerialization.data(withJSONObject: envelope),
-              let presentation = String(data: envelopeData, encoding: .utf8) else {
-            throw RecoveryError.storeFailed("envelope_encode")
+        let trailer = "…[truncated \(byteCount)→\(limit) bytes]\(marker)"
+        let headBudget = max(0, limit - trailer.utf8.count)
+        let text = String(decoding: data, as: UTF8.self)
+        let presentation: String
+        if headBudget <= 0 {
+            presentation = trailer
+        } else {
+            var utf8End = text.utf8.index(
+                text.utf8.startIndex,
+                offsetBy: headBudget,
+                limitedBy: text.utf8.endIndex
+            ) ?? text.utf8.endIndex
+            var head: String?
+            while utf8End > text.utf8.startIndex {
+                if let end = utf8End.samePosition(in: text) {
+                    head = String(text[..<end])
+                    break
+                }
+                text.utf8.formIndex(before: &utf8End)
+            }
+            presentation = (head ?? "") + trailer
         }
 
         return RecoveryResult(
