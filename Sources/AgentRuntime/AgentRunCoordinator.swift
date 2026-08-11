@@ -1205,7 +1205,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             },
             usageForRun: { [runRepo] runId in
                 guard let run = try runRepo.get(id: runId) else { return nil }
-                return try runRepo.listLatestStreamEvents(threadId: run.threadId, limit: .max)
+                // S3: never rehydrate full history on relaunch — bound the scan
+                // (newest window + byte budget) so oversized recovery cannot OOM.
+                let bound = 64
+                let byteBudget: Int64 = 4 * 1024 * 1024
+                return try runRepo.listLatestStreamEvents(
+                    threadId: run.threadId,
+                    limit: bound,
+                    maxPayloadBytes: byteBudget
+                )
                     .reversed()
                     .compactMap { event in
                         if case .tokenUsage(let usage) = event { return usage }
