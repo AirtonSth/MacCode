@@ -38,8 +38,15 @@ public enum ProviderProcessExecutablePath {
 }
 
 public final class ProviderProcessOwnershipStore: @unchecked Sendable {
+    /// Historical default retained for telemetry/downgrade preflight only.
+    /// Live/unknown ownership rows are never suffix-evicted at this bound (S4).
     public static let defaultMaxRecords = 256
+    /// Soft guidance for downgrade preflight: safe only after a verified sweep
+    /// reduces records to ≤ this value. Not an admission or eviction cap.
+    public static let downgradeSafeRecordCeiling = 256
     public let fileURL: URL
+    /// Optional soft ceiling used only by `isWithinDowngradeSafeCeiling`.
+    /// Append never evicts live/unknown rows for size (S4 / T-003).
     public let maxRecords: Int
     private let lock = NSLock()
     // PERF: every provider spawn/remove/sweep load+replace allocated
@@ -47,10 +54,19 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
     // instance pair is safe and avoids per-mutation codec construction.
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
+    /// Cross-process advisory lock path (same directory, `.lock` sibling).
+    private var lockFileURL: URL {
+        fileURL.deletingPathExtension().appendingPathExtension("lock")
+    }
 
     public init(fileURL: URL, maxRecords: Int = defaultMaxRecords) {
         self.fileURL = fileURL
         self.maxRecords = max(1, maxRecords)
+    }
+
+    /// True when a verified sweep has reduced records to the downgrade ceiling.
+    public func isWithinDowngradeSafeCeiling() throws -> Bool {
+        try load().count <= Self.downgradeSafeRecordCeiling
     }
 
     public func load() throws -> [SpawnedProcessTag] {
@@ -71,13 +87,10 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
         // A corrupt/unreadable ledger is evidence, not an empty ledger. Never
         // overwrite it while appending a newly spawned provider.
         let existing = try loadUnlocked()
-        var next = existing.filter { $0.pgid != tag.pgid } + [tag]
-        // Never refuse a user spawn for ledger size. Drop the oldest ownership
-        // rows first so concurrent sessions stay under the safety bound without
-        // a hard session cap surface to the user.
-        if next.count > maxRecords {
-            next = Array(next.sorted { $0.spawnedAt < $1.spawnedAt }.suffix(maxRecords))
-        }
+        // Replace only the same pgid row; never suffix-evict live/unknown
+        // ownership for size (S4). Authoritative metadata is proportional to
+        // live/unknown roots. Spawns are never refused solely due to row count.
+        let next = existing.filter { $0.pgid != tag.pgid } + [tag]
         try replaceUnlocked(next)
     }
 
@@ -118,13 +131,37 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
     }
 
     private func replaceUnlocked(_ tags: [SpawnedProcessTag]) throws {
-        try FileManager.default.createDirectory(
-            at: fileURL.deletingLastPathComponent(),
+        let fm = FileManager.default
+        let parent = fileURL.deletingLastPathComponent()
+        try fm.createDirectory(
+            at: parent,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        try encoder.encode(tags).write(to: fileURL, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+        // 0600 temp inode under 0700 directory, write+fsync, atomic rename, fsync dir.
+        let temp = parent.appendingPathComponent(
+            ".\(fileURL.lastPathComponent).tmp-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString)"
+        )
+        let data = try encoder.encode(tags)
+        try data.write(to: temp, options: .atomic)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temp.path)
+        if fm.fileExists(atPath: fileURL.path) {
+            try fm.removeItem(at: fileURL)
+        }
+        try fm.moveItem(at: temp, to: fileURL)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+        // Best-effort directory fsync for crash durability.
+        let dirFD = open(parent.path, O_RDONLY)
+        if dirFD >= 0 {
+            _ = fsync(dirFD)
+            close(dirFD)
+        }
+        // Recover abandoned temp files from prior crashes.
+        if let entries = try? fm.contentsOfDirectory(at: parent, includingPropertiesForKeys: nil) {
+            for url in entries where url.lastPathComponent.hasPrefix(".\(fileURL.lastPathComponent).tmp-") {
+                try? fm.removeItem(at: url)
+            }
+        }
     }
 }
 

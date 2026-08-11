@@ -24,7 +24,10 @@ final class ProcessLifecycleHardeningTests: XCTestCase {
                        "sidecar exit disposition must not erase a newer lifetime that reused its PID")
     }
 
-    func test_ownershipLedgerDropsOldestRowsInsteadOfRefusingSpawn() throws {
+    func test_ownershipLedgerNeverSuffixEvictsLiveRowsAndNeverRefusesSpawn() throws {
+        // S4: live/unknown ownership is proportional to live roots — never
+        // suffix-evicted at 256 (or any maxRecords soft ceiling). Spawns must
+        // never be refused solely due to row count.
         let file = FileManager.default.temporaryDirectory
             .appendingPathComponent("provider-ledger-capacity-\(UUID().uuidString).json")
         let store = ProviderProcessOwnershipStore(fileURL: file, maxRecords: 2)
@@ -47,9 +50,38 @@ final class ProcessLifecycleHardeningTests: XCTestCase {
         try store.append(tags[2])
 
         let loaded = try store.load()
-        XCTAssertEqual(loaded.count, 2)
-        XCTAssertEqual(loaded.map(\.pgid), [2, 3],
-                       "overflow must keep the newest ownership rows and never refuse spawn")
+        XCTAssertEqual(loaded.count, 3, "append must retain all live ownership rows past soft ceiling")
+        XCTAssertEqual(Set(loaded.map(\.pgid)), Set([1, 2, 3]))
+        // Still within downgrade ceiling (256) with 3 rows.
+        XCTAssertTrue(try store.isWithinDowngradeSafeCeiling())
+    }
+
+    func test_ownershipLedgerRetains257LiveRows() throws {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("provider-ledger-257-\(UUID().uuidString).json")
+        let store = ProviderProcessOwnershipStore(fileURL: file)
+        let identity = ProviderProcessStartIdentity(seconds: 1, microseconds: 1)
+        let base = Date(timeIntervalSince1970: 2_000)
+        for pid in 1...257 {
+            try store.append(SpawnedProcessTag(
+                pgid: pid_t(pid),
+                spawnedAt: base.addingTimeInterval(TimeInterval(pid)),
+                ownerStartIdentity: identity,
+                provider: .codex,
+                managedKind: .provider,
+                executablePath: "/opt/codex",
+                startIdentity: identity,
+                isolatedProcessGroup: pid_t(pid)
+            ))
+        }
+        let loaded = try store.load()
+        XCTAssertEqual(loaded.count, 257)
+        XCTAssertFalse(try store.isWithinDowngradeSafeCeiling(),
+                       "257 live rows must fail downgrade preflight until swept")
+        // File mode must stay owner-only.
+        let attrs = try FileManager.default.attributesOfItem(atPath: file.path)
+        let perms = attrs[.posixPermissions] as? NSNumber
+        XCTAssertEqual(perms?.intValue, 0o600)
     }
 
     func test_periodicSweepPrunesExitedCurrentOwnerRowsButRetainsLateGroupMembers() throws {
