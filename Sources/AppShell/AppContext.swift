@@ -2063,6 +2063,7 @@ public final class AppContext {
         let s = settings ?? SettingsStore(db: db).load()
         let active = isTokenSaverRuntimeActive(settings: s) && s.isGraphifyRuntimeActive
         let svc = GraphifyWorkspaceService.shared
+        let wasActive = svc.enabled
         svc.enabled = active
         svc.autoEnsure = active && s.graphifyAutoEnsure
         svc.writeInRepo = s.graphifyWriteInRepo
@@ -2072,6 +2073,10 @@ public final class AppContext {
         guard active else {
             svc.stopWatchingAll()
             return
+        }
+        if !wasActive {
+            // Settings/Token Saver enable path: dirty schedules after disable.
+            svc.resumeAfterDisable()
         }
         LoginShellEnvironment.prewarm()
         DispatchQueue.global(qos: .utility).async {

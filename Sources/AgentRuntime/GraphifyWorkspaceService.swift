@@ -41,6 +41,9 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     /// Live graphify/git child retained for cancel-before-watcher-stop (S9).
     private var activeRebuildProcess: Process?
     private var activeRebuildCancelled = false
+    /// Monotonic rebuild ownership. Cancel and disable bump this so an in-flight
+    /// build started under an older generation can never publish freshness.
+    private var rebuildGeneration: UInt64 = 0
 
     public var appSupportDirectory: URL
     public var binaryPathOverride: String?
@@ -399,7 +402,8 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         schedule.inFlight = true
         schedule.rebuildCancelled = false
         globalCLIInFlight = true
-        activeRebuildCancelled = false
+        // Capture ownership generation for this launch; cancel bumps rebuildGeneration.
+        let launchRebuildGeneration = rebuildGeneration
         schedule.lastEnsureStarted = Date()
         schedule.status = .building
         let targetGen = schedule.dirtyGeneration
@@ -408,7 +412,11 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
 
         let service = self
         DispatchQueue.global(qos: .utility).async {
-            let status = service.ensureSync(checkout: checkout, mode: .update)
+            let status = service.ensureSync(
+                checkout: checkout,
+                mode: .update,
+                launchRebuildGeneration: launchRebuildGeneration
+            )
             // HEAD probe outside the service lock — run() also takes the lock.
             let head: String? = {
                 if status == .fresh {
@@ -419,8 +427,12 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             service.lock.lock()
             var s = service.schedules[checkout.scheduleID] ?? RefreshSchedule()
             s.inFlight = false
-            let cancelled = s.rebuildCancelled || service.activeRebuildCancelled
-            // Never publish fresh after cancel / Token Saver disable.
+            // Ownership: old launch is cancelled if rebuildGeneration advanced.
+            let generationCancelled = launchRebuildGeneration != service.rebuildGeneration
+            let cancelled = generationCancelled
+                || s.rebuildCancelled
+                || service.activeRebuildCancelled
+            // Never publish fresh after cancel / Token Saver disable / superseded gen.
             if cancelled {
                 s.status = .missing
                 s.rebuildCancelled = false
@@ -429,7 +441,6 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
                 if s.dirtyGeneration <= s.builtGeneration {
                     s.dirtyGeneration = s.builtGeneration &+ 1
                 }
-                // Force built behind dirty regardless of targetGen match.
                 if s.builtGeneration >= s.dirtyGeneration {
                     s.builtGeneration = s.dirtyGeneration &- 1
                 }
@@ -446,9 +457,8 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             service.schedules[checkout.scheduleID] = s
             service.globalCLIInFlight = false
             service.activeRebuildProcess = nil
-            // Clear process-wide cancel once this in-flight rebuild is drained so
-            // a later re-enable can resolve binaries / HEAD probes again.
-            if cancelled {
+            // Clear sticky cancel only when no generation-owned work remains.
+            if !service.schedules.values.contains(where: \.inFlight) {
                 service.activeRebuildCancelled = false
             }
             let deferredIDs = cancelled ? [] : service.globalCLIRerunIDs
@@ -489,6 +499,15 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
 
     @discardableResult
     public func ensureSync(checkout: GraphifyCheckout, mode: GraphifyEnsureMode = .update) -> GraphifyRootStatus {
+        ensureSync(checkout: checkout, mode: mode, launchRebuildGeneration: nil)
+    }
+
+    @discardableResult
+    public func ensureSync(
+        checkout: GraphifyCheckout,
+        mode: GraphifyEnsureMode = .update,
+        launchRebuildGeneration: UInt64?
+    ) -> GraphifyRootStatus {
         guard let binary = resolveBinary() else { return .unavailable }
         let artifact = artifactRoot(for: checkout)
         do {
@@ -513,9 +532,11 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         }
 
         let result = run([binary, "update", scanRoot], cwd: scanRoot, env: env)
-        // Cancel is authoritative: never publish fingerprint/generation after cancel.
+        // Cancel / generation ownership is authoritative after the process returns.
         lock.lock()
-        let cancelledAfterRun = activeRebuildCancelled
+        let generationStale = launchRebuildGeneration.map { $0 != rebuildGeneration } ?? false
+        let cancelledAfterRun = generationStale
+            || activeRebuildCancelled
             || (schedules[checkout.scheduleID]?.rebuildCancelled == true)
         lock.unlock()
         if cancelledAfterRun {
@@ -575,7 +596,9 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             // Single cancellation-owned commit boundary: schedule state + fingerprint
             // decision under lock; if cancelled before/while writing, roll back.
             lock.lock()
-            let cancelledBeforeCommit = activeRebuildCancelled
+            let generationStaleBeforeCommit = launchRebuildGeneration.map { $0 != rebuildGeneration } ?? false
+            let cancelledBeforeCommit = generationStaleBeforeCommit
+                || activeRebuildCancelled
                 || (schedules[checkout.scheduleID]?.rebuildCancelled == true)
             if cancelledBeforeCommit {
                 var s = schedules[checkout.scheduleID] ?? RefreshSchedule()
@@ -606,7 +629,9 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             // If cancel landed after schedule update, roll back freshness so a
             // cancelled build cannot survive restart as fresh.
             lock.lock()
-            let cancelledAfterFingerprint = activeRebuildCancelled
+            let generationStaleAfter = launchRebuildGeneration.map { $0 != rebuildGeneration } ?? false
+            let cancelledAfterFingerprint = generationStaleAfter
+                || activeRebuildCancelled
                 || (schedules[checkout.scheduleID]?.rebuildCancelled == true)
             if cancelledAfterFingerprint {
                 var rolled = schedules[checkout.scheduleID] ?? RefreshSchedule()
@@ -770,13 +795,14 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             lock.unlock()
             return
         }
+        // Bump ownership generation so old launches cannot publish after this point.
+        rebuildGeneration &+= 1
         activeRebuildCancelled = true
         let process = activeRebuildProcess
         for id in Array(schedules.keys) {
             guard var s = schedules[id], s.inFlight else { continue }
             s.rebuildCancelled = true
             s.rerunRequested = false
-            // Invalidate freshness immediately under the same lock.
             if s.dirtyGeneration <= s.builtGeneration {
                 s.dirtyGeneration = s.builtGeneration &+ 1
             }
@@ -784,7 +810,6 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         }
         lock.unlock()
         guard let process, process.isRunning else { return }
-        // Publish cancel state first; escalate off-caller-thread.
         DispatchQueue.global(qos: .utility).async {
             process.terminate()
             let killDeadline = Date().addingTimeInterval(1)
@@ -797,15 +822,25 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         }
     }
 
-    /// Call when Graphify runtime becomes active again after disable.
-    /// Clears cancel flags and dirties all known schedules so edits made while
-    /// watchers were down force a rebuild (FSEvents starts at "now").
+    /// Inactive→active transition only. Dirties known schedules so edits made
+    /// while watchers were down force a rebuild. Does **not** uncancel an
+    /// in-flight old generation — rebuildGeneration ownership handles that.
     public func resumeAfterDisable() {
         lock.lock()
-        activeRebuildCancelled = false
+        // Do not clear cancellation while an old process may still complete;
+        // only clear when nothing is in flight.
+        let anyInFlight = globalCLIInFlight
+            || schedules.values.contains(where: \.inFlight)
+            || activeRebuildProcess != nil
+        if !anyInFlight {
+            activeRebuildCancelled = false
+        }
         for id in Array(schedules.keys) {
             guard var s = schedules[id] else { continue }
-            s.rebuildCancelled = false
+            // Keep rebuildCancelled on in-flight rows until they drain.
+            if !s.inFlight {
+                s.rebuildCancelled = false
+            }
             s.dirtyGeneration = max(s.dirtyGeneration &+ 1, s.builtGeneration &+ 1)
             s.rerunRequested = true
             schedules[id] = s
@@ -1030,6 +1065,8 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     private func run(_ args: [String], cwd: String, env: [String: String]?) -> (exit: Int32, stdout: String, stderr: String) {
         if let runProcess { return runProcess(args, cwd, env) }
         lock.lock()
+        // Generation-owned cancel: any bump after launch also aborts mid-run via
+        // ensureSync checks; pre-spawn still honors sticky cancel flag.
         if activeRebuildCancelled {
             lock.unlock()
             return (-15, "", "graphify rebuild cancelled before spawn")

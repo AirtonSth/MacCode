@@ -4048,6 +4048,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let svc = GraphifyWorkspaceService.shared
         let active = context?.isTokenSaverRuntimeActive(settings: settings) == true
             && settings.isGraphifyRuntimeActive
+        let wasActive = svc.enabled
         svc.enabled = active
         svc.autoEnsure = active && settings.graphifyAutoEnsure
         svc.writeInRepo = settings.graphifyWriteInRepo
@@ -4056,8 +4057,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         svc.binaryPathOverride = path.isEmpty ? nil : path
         if !active {
             svc.stopWatchingAll()
-        } else {
-            // Dirty schedules + clear cancel so edits during disable force rebuild.
+        } else if !wasActive {
+            // Transition-only: inactive → active. Do not dirty every hot send.
             svc.resumeAfterDisable()
         }
     }
