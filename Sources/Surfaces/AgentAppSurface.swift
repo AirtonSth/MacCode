@@ -6022,8 +6022,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 state: surfacePreparationStates[tid] ?? ProviderPreparationState(),
                 event: .preparationFailed(generation: gen, reason: .durabilityFailure)
             ).state
+            // Roll back premature pending write so reload is not phantom-active.
+            if var rolled = try? threadRepo.get(id: tid), rolled.status == .pending {
+                rolled.status = .failed
+                rolled.updatedAt = Date()
+                try? threadRepo.upsert(rolled)
+                if let index = threads.firstIndex(where: { $0.id == tid }) {
+                    threads[index] = rolled
+                }
+            }
             statusMessage = "Failed to prepare run: \(error)"
             status = .failed
+            currentRunId = nil
+            runThreads[runId] = nil
             return nil
         }
         // S5: finish surface prep and claim spawn before coordinator.startRun.
@@ -6040,12 +6051,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         )
         surfacePreparationStates[tid] = surfaceClaimed.state
         guard surfaceClaimed.state.phase == .running, surfaceClaimed.ignoredReason == nil else {
-            coordinator.cancelPreparation(threadId: tid)
+            // Do NOT arm coordinator pendingThreadStops before startRun admitted.
             let gen = surfaceClaimed.state.generation
             surfacePreparationStates[tid] = ProviderPreparationStateMachine.apply(
                 state: surfaceClaimed.state,
                 event: .providerFinished(generation: gen, reason: .cancelled)
             ).state
+            if var rolled = try? threadRepo.get(id: tid), rolled.status == .pending {
+                rolled.status = .cancelled
+                rolled.updatedAt = Date()
+                try? threadRepo.upsert(rolled)
+                if let index = threads.firstIndex(where: { $0.id == tid }) {
+                    threads[index] = rolled
+                }
+            }
             statusMessage = "Run cancelled during preparation"
             status = .cancelled
             currentRunId = nil

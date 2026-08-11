@@ -697,7 +697,15 @@ enum AppDiagnostics {
             isComplete: sample.isComplete,
             isStale: !sample.isComplete
         )
-        let transition = pressureGovernor.ingest(sample: pressureSample)
+        // Align governor thresholds with the host memory profile (S7).
+        let profileThresholds = PressureThresholds(
+            warningFraction: sample.profile.warningFraction,
+            criticalFraction: sample.profile.criticalFraction
+        )
+        let transition = pressureGovernor.ingest(
+            sample: pressureSample,
+            thresholds: profileThresholds
+        )
 #if DEBUG
         lastPressureIngestEmittedForTesting = transition.emittedActions
 #endif
@@ -810,9 +818,8 @@ enum AppDiagnostics {
                 activePressureEffects.removeAll()
                 acknowledged.append(action)
             case .deferMaintenancePrune:
+                // No production consumer yet — do not acknowledge as applied.
                 maintenancePruneDeferred = true
-                activePressureEffects.insert(action)
-                acknowledged.append(action)
             case .reclaimHiddenRecomputableUI,
                  .shortenCompletedIdleProviderSessions,
                  .releaseDistillIdleModelGPU:

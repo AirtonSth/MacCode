@@ -77,14 +77,18 @@ public final class PressureGovernorCoordinator: @unchecked Sendable {
 
     public func ingest(
         sample: PressureSample,
-        now: Date? = nil
+        now: Date? = nil,
+        thresholds: PressureThresholds? = nil
     ) -> PressureTransitionResult {
         lock.lock()
         defer { lock.unlock() }
+        if let thresholds {
+            self.thresholds = thresholds
+        }
         let result = PressureGovernorStateMachine.apply(
             state: state,
             sample: sample,
-            thresholds: thresholds,
+            thresholds: self.thresholds,
             now: now
         )
         state = result.state

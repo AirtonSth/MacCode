@@ -1384,6 +1384,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             CapacityGaugeRecorder.shared.noteAcceptStarted(
                 threadKey: request.threadId.value.uuidString
             )
+            // Prepare boundary = SM preparing (accept).
+            CapacityGaugeRecorder.shared.notePrepareStarted(
+                threadKey: request.threadId.value.uuidString
+            )
             // Stop that raced ahead of accept still wins: cancel prep immediately.
             if pendingThreadStops.contains(request.threadId) {
                 _ = applyPreparationLocked(threadId: request.threadId, event: .stopRequested)
@@ -1631,9 +1635,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // S5: preparationFinished + one-shot claimSpawn under lock. Stop/Escape
         // that arrived during durable prep revokes the generation so sendTurn
         // never starts the provider.
-        CapacityGaugeRecorder.shared.notePrepareStarted(
-            threadKey: effectiveRequest.threadId.value.uuidString
-        )
         guard claimPreparationSpawnOrCancel(
             threadId: effectiveRequest.threadId,
             runId: runId
@@ -1641,9 +1642,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             markStopRequested(threadId: effectiveRequest.threadId, runId: runId)
             throw AgentRunAcceptanceError.cancelled
         }
-        CapacityGaugeRecorder.shared.noteSpawned(
-            threadKey: effectiveRequest.threadId.value.uuidString
-        )
         agentRunLog.info("run.started thread=\(effectiveRequest.threadId.value.uuidString, privacy: .public) run=\(effectiveRequest.runId.value.uuidString, privacy: .public) provider=\(effectiveRequest.provider.rawValue, privacy: .public) model=\(effectiveRequest.model, privacy: .public)")
 
         let coordinator = self
@@ -1657,6 +1655,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             handle = try await runner.sendTurn(effectiveRequest) { ev in
                 coordinator.handle(event: ev, runId: runId, threadId: effectiveRequest.threadId)
             }
+            // Spawn boundary = first proven provider handle (not pre-sendTurn).
+            CapacityGaugeRecorder.shared.noteSpawned(
+                threadKey: effectiveRequest.threadId.value.uuidString
+            )
             pendingProviderStart.record(handle: handle)
             lock.lock()
             providerTurnScopes[effectiveRequest.threadId] = ProviderTurnScope(environment: effectiveRequest.environment)
@@ -2381,10 +2383,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     /// S5: Stop/Escape cancels generation-owned preparation and arms pending stop
     /// so a late claimSpawn/sendTurn cannot start the provider.
+    /// Only arms `pendingThreadStops` when this coordinator already admitted a
+    /// pending start — surface pre-start cancel must not poison the next send.
     public func cancelPreparation(threadId: AgentThreadID) {
         lock.lock()
         _ = applyPreparationLocked(threadId: threadId, event: .stopRequested)
-        pendingThreadStops.insert(threadId)
+        if pendingProviderStarts[threadId] != nil {
+            pendingThreadStops.insert(threadId)
+        }
         lock.unlock()
     }
 

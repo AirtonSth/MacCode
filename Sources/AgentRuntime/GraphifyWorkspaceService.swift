@@ -683,6 +683,15 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             try? FileManager.default.removeItem(at: publishStaging)
             return .missing
         }
+        // Backup previous canonical bytes so cancel-before-commit can restore.
+        let previousBackup = artifact.appendingPathComponent(
+            "graph.json.prev-\(launchRebuildGeneration ?? rebuildGeneration)"
+        )
+        try? FileManager.default.removeItem(at: previousBackup)
+        let hadPreviousCanonical = FileManager.default.fileExists(atPath: dest.path)
+        if hadPreviousCanonical {
+            try? FileManager.default.copyItem(at: dest, to: previousBackup)
+        }
         let promoted: Bool = {
             do {
                 if FileManager.default.fileExists(atPath: dest.path) {
@@ -697,6 +706,7 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             }
         }()
         if !promoted {
+            try? FileManager.default.removeItem(at: previousBackup)
             lock.unlock()
             if FileManager.default.fileExists(atPath: dest.path) { return .stale }
             return .error
@@ -720,8 +730,16 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
                 s.rebuildCancelled = false
                 schedules[checkout.scheduleID] = s
                 lock.unlock()
+                // Restore previous canonical or remove cancelled promote.
+                if hadPreviousCanonical, FileManager.default.fileExists(atPath: previousBackup.path) {
+                    _ = try? FileManager.default.replaceItemAt(dest, withItemAt: previousBackup)
+                } else {
+                    try? FileManager.default.removeItem(at: dest)
+                }
+                try? FileManager.default.removeItem(at: previousBackup)
                 return .missing
             }
+            try? FileManager.default.removeItem(at: previousBackup)
             var s = schedules[checkout.scheduleID] ?? RefreshSchedule()
             let previousBuilt = s.builtGeneration
             let previousStatus = s.status
@@ -1175,14 +1193,25 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
 
     // MARK: Process
 
+    /// True only for a direct graphify binary or `env graphify …` launch.
+    /// False for `which graphify`, package pins containing "graphify", git, etc.
+    static func isGraphifyCLIInvocation(_ args: [String]) -> Bool {
+        guard let first = args.first else { return false }
+        let firstBase = URL(fileURLWithPath: first).lastPathComponent
+        if firstBase == "graphify" { return true }
+        // `/usr/bin/env graphify …`
+        if firstBase == "env", args.count >= 2 {
+            let secondBase = URL(fileURLWithPath: args[1]).lastPathComponent
+            return secondBase == "graphify"
+        }
+        return false
+    }
+
     private func run(_ args: [String], cwd: String, env: [String: String]?) -> (exit: Int32, stdout: String, stderr: String) {
         if let runProcess { return runProcess(args, cwd, env) }
         // Only the graphify CLI child is generation-owned for cancel. Helper
-        // probes (`which`, `git rev-parse`) must not overwrite that slot.
-        let isGraphifyCLI = args.contains { arg in
-            let base = URL(fileURLWithPath: arg).lastPathComponent
-            return base == "graphify" || base.hasPrefix("graphify")
-        }
+        // probes (`which graphify`, pip install args) must not match.
+        let isGraphifyCLI = Self.isGraphifyCLIInvocation(args)
         lock.lock()
         // Generation-owned cancel: any bump after launch also aborts mid-run via
         // ensureSync checks; pre-spawn still honors sticky cancel flag.
@@ -1210,7 +1239,14 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             do {
                 ownershipTag = try ProcessSpawnTagger.tagProcess(p, managedKind: .graphify)
             } catch {
-                p.terminate()
+                // Bounded terminate/kill/reap so an untagged child cannot leak.
+                ProcessTerminator.terminateTreeImmediately(p)
+                let killDeadline = Date().addingTimeInterval(1)
+                while p.isRunning && Date() < killDeadline {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+                if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+                if !p.isRunning { p.waitUntilExit() }
                 return (-1, "", "graphify ownership tag failed: \(error)")
             }
         }
