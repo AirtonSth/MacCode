@@ -24,17 +24,17 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertEqual(task.nextRunAt, Date(timeIntervalSince1970: 200))
     }
 
-    func test_sidebarPlacesScheduleTasksImmediatelyAfterNewWorkspace_becauseNavigationOrderIsContractual() throws {
+    func test_sidebarPlacesScheduleTasksAfterActiveThreads_becauseNavigationOrderIsContractual() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
         let newWorkspace = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.newWorkspace\")"))
-        let scheduleTasks = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.scheduleTasks\")"))
         let activeThreads = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.activeThreads\")"))
+        let scheduleTasks = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.scheduleTasks\")"))
         let reportBug = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.reportBug\")"))
         let updateControl = try XCTUnwrap(source.range(of: "if vm.showsUpdateControl"))
 
-        XCTAssertLessThan(newWorkspace.lowerBound, scheduleTasks.lowerBound)
-        XCTAssertLessThan(scheduleTasks.lowerBound, activeThreads.lowerBound)
-        XCTAssertLessThan(activeThreads.lowerBound, reportBug.lowerBound)
+        XCTAssertLessThan(newWorkspace.lowerBound, activeThreads.lowerBound)
+        XCTAssertLessThan(activeThreads.lowerBound, scheduleTasks.lowerBound)
+        XCTAssertLessThan(scheduleTasks.lowerBound, reportBug.lowerBound)
         XCTAssertLessThan(reportBug.lowerBound, updateControl.lowerBound)
     }
 

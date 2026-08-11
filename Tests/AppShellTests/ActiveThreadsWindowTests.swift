@@ -12,13 +12,15 @@ final class ActiveThreadsWindowTests: XCTestCase {
             .appendingPathComponent(relative)
     }
 
-    func test_sidebarPlacesActiveThreadsBetweenScheduleTasksAndReportBug() throws {
+    func test_sidebarPlacesActiveThreadsImmediatelyAfterNewWorkspace_beforeScheduleTasks() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
-        let scheduleTasks = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.scheduleTasks\")"))
+        let newWorkspace = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.newWorkspace\")"))
         let activeThreads = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.activeThreads\")"))
+        let scheduleTasks = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.scheduleTasks\")"))
         let reportBug = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.reportBug\")"))
-        XCTAssertLessThan(scheduleTasks.lowerBound, activeThreads.lowerBound)
-        XCTAssertLessThan(activeThreads.lowerBound, reportBug.lowerBound)
+        XCTAssertLessThan(newWorkspace.lowerBound, activeThreads.lowerBound)
+        XCTAssertLessThan(activeThreads.lowerBound, scheduleTasks.lowerBound)
+        XCTAssertLessThan(scheduleTasks.lowerBound, reportBug.lowerBound)
     }
 
     func test_sidebarActiveThreadsBadgeUsesPetFormatter_becauseCountMustMatchPetBlueBadge() throws {

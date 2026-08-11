@@ -2442,18 +2442,6 @@ public struct SidebarRootView: View {
                 .help("Create new workspace")
                 .accessibilityIdentifier("sidebar.newWorkspace")
 
-                Button(action: onOpenScheduledTasks) {
-                    sidebarActionRow(
-                        symbol: "calendar.badge.clock",
-                        title: "Schedule Tasks",
-                        isSelected: vm.isScheduledTasksSelected
-                    )
-                }
-                .buttonStyle(.plain)
-                .help("Create and manage scheduled Agent tasks")
-                .accessibilityIdentifier("sidebar.scheduleTasks")
-                .accessibilityAddTraits(vm.isScheduledTasksSelected ? .isSelected : [])
-
                 Button(action: onOpenActiveThreads) {
                     sidebarActionRow(
                         symbol: "bolt.horizontal.circle",
@@ -2472,6 +2460,18 @@ public struct SidebarRootView: View {
                         : "Active Threads"
                 )
                 .accessibilityAddTraits(vm.isActiveThreadsSelected ? .isSelected : [])
+
+                Button(action: onOpenScheduledTasks) {
+                    sidebarActionRow(
+                        symbol: "calendar.badge.clock",
+                        title: "Schedule Tasks",
+                        isSelected: vm.isScheduledTasksSelected
+                    )
+                }
+                .buttonStyle(.plain)
+                .help("Create and manage scheduled Agent tasks")
+                .accessibilityIdentifier("sidebar.scheduleTasks")
+                .accessibilityAddTraits(vm.isScheduledTasksSelected ? .isSelected : [])
 
                 Button(action: reportBug) {
                     sidebarActionRow(symbol: "ladybug", title: "Report Bug")
