@@ -265,6 +265,52 @@ final class GraphifyWorkspaceServiceTests: XCTestCase {
         service.checkoutIdentityProbe = nil
     }
 
+    /// FSEvents/dirty during pressure pause must not schedule ensure work.
+    func test_markDirtyDuringPressurePause_doesNotStartEnsure() {
+        service.enabled = true
+        service.autoEnsure = true
+        service.headProbe = { _ in "paused-head" }
+        var cliStarts = 0
+        let cliLock = NSLock()
+        service.runProcess = { _, _, _ in
+            cliLock.lock(); cliStarts += 1; cliLock.unlock()
+            return (0, "", "")
+        }
+        let displayRoot = tempRoot.appendingPathComponent("fsevents-paused", isDirectory: true)
+        try? FileManager.default.createDirectory(at: displayRoot, withIntermediateDirectories: true)
+        let checkout = GraphifyCheckout(
+            key: GraphifyRepoKey(commonDir: displayRoot.appendingPathComponent(".git").path),
+            displayRoot: displayRoot.path
+        )
+
+        service.setPressurePauseEnsureAndWatch(true)
+        service.markDirtyFromFilesystem(checkout: checkout)
+        service.requestRefresh(checkout: checkout, force: true)
+        Thread.sleep(forTimeInterval: 0.15)
+        cliLock.lock(); let duringPause = cliStarts; cliLock.unlock()
+        XCTAssertEqual(duringPause, 0, "pressure pause must not run ensure from dirty/refresh")
+
+        // Unpause should re-kick the preserved dirty work.
+        let ensureStarted = expectation(description: "ensure after unpause")
+        ensureStarted.assertForOverFulfill = false
+        var fulfilled = false
+        service.runProcess = { _, _, _ in
+            if !fulfilled {
+                fulfilled = true
+                ensureStarted.fulfill()
+            }
+            return (0, "", "")
+        }
+        service.checkoutIdentityProbe = { root in
+            GraphifyCheckout(
+                key: GraphifyRepoKey(commonDir: root + "/.git"),
+                displayRoot: root
+            )
+        }
+        service.setPressurePauseEnsureAndWatch(false)
+        wait(for: [ensureStarted], timeout: 3.0)
+    }
+
     /// startEnsureIfNeeded must not launch CLI if disabled during unlocked head probe.
     func test_startEnsure_abortsWhenDisabledDuringHeadProbe() {
         service.enabled = true

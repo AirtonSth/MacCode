@@ -339,6 +339,20 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     /// O(1)-ish hot path used on every send: mark dirty when needed and kick async update.
     public func requestRefresh(checkout: GraphifyCheckout, force: Bool = false) {
         guard enabled, autoEnsure else { return }
+        // Pressure pause: record dirty only — no watch install, verify probes, or ensure.
+        lock.lock()
+        let pressurePaused = pressurePauseEnsureAndWatch
+        if pressurePaused {
+            var schedule = schedules[checkout.scheduleID] ?? RefreshSchedule()
+            schedule.displayRoot = checkout.displayRoot
+            schedule.dirtyGeneration &+= 1
+            schedule.rerunRequested = true
+            schedules[checkout.scheduleID] = schedule
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+
         watchCheckout(checkout)
 
         let status = verify(checkout)
@@ -374,6 +388,14 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         var schedule = schedules[checkout.scheduleID] ?? RefreshSchedule()
         schedule.displayRoot = checkout.displayRoot
         schedule.dirtyGeneration &+= 1
+        // Under pressure pause: keep dirty for unpause re-kick, but do not
+        // schedule debounce/ensure work (pauseGraphifyEnsureAndWatchCallbacks).
+        if pressurePauseEnsureAndWatch {
+            schedule.rerunRequested = true
+            schedules[checkout.scheduleID] = schedule
+            lock.unlock()
+            return
+        }
         schedules[checkout.scheduleID] = schedule
         lock.unlock()
 
