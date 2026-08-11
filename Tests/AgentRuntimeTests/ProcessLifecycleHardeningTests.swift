@@ -362,19 +362,22 @@ final class ProcessLifecycleHardeningTests: XCTestCase {
     }
 
     func test_ownershipLedger_flockSerializesConcurrentAppendsWithoutLostUpdates() throws {
-        // Differential proof: concurrent appends under the store lock+flock must
-        // retain every distinct pgid (no lost update from unlocked RMW).
+        // Differential proof: independent store instances share one ledger file and
+        // must contend on flock (not a single NSLock). Every distinct pgid is retained.
         let file = FileManager.default.temporaryDirectory
             .appendingPathComponent("provider-ledger-concurrent-\(UUID().uuidString).json")
-        let store = ProviderProcessOwnershipStore(fileURL: file)
         let identity = ProviderProcessStartIdentity(seconds: 1, microseconds: 1)
         let base = Date(timeIntervalSince1970: 9_000)
         let group = DispatchGroup()
         let queue = DispatchQueue(label: "ownership-concurrent", attributes: .concurrent)
+        var errors = 0
+        let errLock = NSLock()
         for pid in 1...40 {
             group.enter()
             queue.async {
                 defer { group.leave() }
+                // Independent instances so NSLock does not serialize flock contention.
+                let store = ProviderProcessOwnershipStore(fileURL: file)
                 let tag = SpawnedProcessTag(
                     pgid: pid_t(pid),
                     spawnedAt: base.addingTimeInterval(TimeInterval(pid)),
@@ -385,11 +388,16 @@ final class ProcessLifecycleHardeningTests: XCTestCase {
                     startIdentity: identity,
                     isolatedProcessGroup: pid_t(pid)
                 )
-                try? store.append(tag)
+                do {
+                    try store.append(tag)
+                } catch {
+                    errLock.lock(); errors += 1; errLock.unlock()
+                }
             }
         }
         XCTAssertEqual(group.wait(timeout: .now() + 10), .success)
-        let loaded = try store.load()
+        XCTAssertEqual(errors, 0, "no concurrent append should fail")
+        let loaded = try ProviderProcessOwnershipStore(fileURL: file).load()
         XCTAssertEqual(loaded.count, 40, "concurrent appends under flock must not lose rows")
         XCTAssertEqual(Set(loaded.map(\.pgid)).count, 40)
         let perms = try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? NSNumber

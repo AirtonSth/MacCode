@@ -13,7 +13,7 @@ final class CapacitySemanticHarnessTests: XCTestCase {
         let depths = Set(a.nodes.map { $0.depth })
         XCTAssertTrue(depths.contains(1), "depth 1 must be present")
         XCTAssertTrue(depths.contains(2), "depth 2 must be present")
-        XCTAssertTrue(depths.contains(3), "depth 3 must be present")
+        XCTAssertTrue(depths.contains(4), "depth 4 must be present")
     }
 
     func test_differentSeeds_diverge() {

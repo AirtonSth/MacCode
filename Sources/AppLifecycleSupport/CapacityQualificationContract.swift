@@ -421,8 +421,15 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
             // Each required metric must appear in every warmed run; sample is the mean.
             var sum = 0.0
             for run in warmedRuns {
-                guard let v = run.metrics[key], v.isFinite, v >= 0 else {
+                guard let v = run.metrics[key], v.isFinite else {
                     throw CapacityContractError.missingRequiredField("warmedRun.\(run.runIndex).\(key)")
+                }
+                if key == CapacityRequiredMetricKey.ownershipCoverageFraction.rawValue {
+                    guard v >= 0, v <= 1 else {
+                        throw CapacityContractError.invalidWorkload("warmed ownership_coverage_fraction out of [0,1]")
+                    }
+                } else if v < 0 {
+                    throw CapacityContractError.invalidWorkload("warmed metric \(key) must be >= 0")
                 }
                 sum += v
             }

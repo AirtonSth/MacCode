@@ -3329,30 +3329,27 @@ public final class AgentRunRepository: @unchecked Sendable {
         let limit = max(1, byteLimit)
         let originalBytes = payloadJSON.utf8.count
         guard originalBytes > limit else { return payloadJSON }
-        // Already an owned S3 presentation: re-trim prefix to new limit, keep exact trailer.
-        if let tokenRange = payloadJSON.range(of: AuthoritativePayloadRecovery.ownedTrailerToken),
-           let trailerStart = payloadJSON.range(of: "…[truncated ", options: [], range: payloadJSON.startIndex..<tokenRange.lowerBound)?.lowerBound
-            ?? payloadJSON.range(of: "…[truncated ")?.lowerBound {
-            // Find trailer start near the token
-            let search = payloadJSON
-            if let tStart = search.range(of: "…[truncated \(AuthoritativePayloadRecovery.ownedTrailerToken)")?.lowerBound {
-                let trailer = String(search[tStart...])
-                if originalBytes <= limit { return payloadJSON }
-                let headBudget = max(0, limit - trailer.utf8.count)
-                if headBudget == 0 { return trailer }
-                var utf8End = payloadJSON.utf8.index(
-                    payloadJSON.utf8.startIndex,
-                    offsetBy: headBudget,
-                    limitedBy: payloadJSON.utf8.endIndex
-                ) ?? payloadJSON.utf8.endIndex
-                while utf8End > payloadJSON.utf8.startIndex {
-                    if let end = utf8End.samePosition(in: payloadJSON) {
-                        return String(payloadJSON[..<end]) + trailer
-                    }
-                    payloadJSON.utf8.formIndex(before: &utf8End)
+        // Already an owned S3 presentation (suffix): re-trim prefix to new limit.
+        let ownedSuffixPattern = #"…\[truncated rc_oversized_v1 \d+→\d+ bytes\]\[\[rc:[0-9a-fA-F]+\]\]$"#
+        if let regex = try? NSRegularExpression(pattern: ownedSuffixPattern),
+           regex.firstMatch(in: payloadJSON, range: NSRange(payloadJSON.startIndex..., in: payloadJSON)) != nil,
+           let tStart = payloadJSON.range(of: "…[truncated rc_oversized_v1")?.lowerBound {
+            let trailer = String(payloadJSON[tStart...])
+            if originalBytes <= limit { return payloadJSON }
+            let headBudget = max(0, limit - trailer.utf8.count)
+            if headBudget == 0 { return trailer }
+            var utf8End = payloadJSON.utf8.index(
+                payloadJSON.utf8.startIndex,
+                offsetBy: headBudget,
+                limitedBy: payloadJSON.utf8.endIndex
+            ) ?? payloadJSON.utf8.endIndex
+            while utf8End > payloadJSON.utf8.startIndex {
+                if let end = utf8End.samePosition(in: payloadJSON) {
+                    return String(payloadJSON[..<end]) + trailer
                 }
-                return trailer
+                payloadJSON.utf8.formIndex(before: &utf8End)
             }
+            return trailer
         }
         // S3: store-before-loss is mandatory when a store is provided. Fail open
         // only by raising — callers must not silently drop the original.

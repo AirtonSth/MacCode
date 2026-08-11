@@ -171,7 +171,7 @@ public enum CapacitySemanticHarness {
     public static func buildSchedule(
         roots: Int = 32,
         nestedNodes: Int = 64,
-        depths: [Int] = [1, 2, 3],
+        depths: [Int] = [1, 2, 4],
         fanOut: [Int] = [1, 2, 4],
         providers: [String] = defaultProviders,
         faultKinds: [String] = ["malformed_frame", "reorder", "pipe_pressure", "stop_race", "resume"],
@@ -192,11 +192,13 @@ public enum CapacitySemanticHarness {
         // matches the depth label (root→d1→d2→d3).
         var remaining = nestedNodes
         var parentsByDepth: [Int: [String]] = [0: rootIDs]
-        let levels = max(1, depths.filter { $0 > 0 }.count)
-        var perLevel = Array(repeating: nestedNodes / levels, count: levels)
-        for i in 0..<(nestedNodes % levels) { perLevel[i] += 1 }
+        let maxDepth = max(1, depths.filter { $0 > 0 }.max() ?? 1)
+        // Continuous levels 1...maxDepth so depth labels match ancestry length and
+        // include configured peaks such as 4 (with intermediate 3 parents).
+        var perLevel = Array(repeating: nestedNodes / maxDepth, count: maxDepth)
+        for i in 0..<(nestedNodes % maxDepth) { perLevel[i] += 1 }
 
-        for level in 1...levels {
+        for level in 1...maxDepth {
             guard remaining > 0 else { break }
             let budget = min(remaining, perLevel[level - 1])
             var parentFrontier = parentsByDepth[level - 1] ?? rootIDs
