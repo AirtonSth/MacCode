@@ -6011,6 +6011,39 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 attachmentPaths: graphifyAttachmentPaths
             ).environment
         }.value
+        // S5: claim spawn immediately after Graphify, *before* durable pending /
+        // currentRunId/runThreads. A late cancelled generation must not leave
+        // surface ownership that poisons trackedRunId for a newer send.
+        let surfacePrep = surfacePreparationStates[tid] ?? ProviderPreparationState()
+        guard let claimedState = ProviderPreparationStateMachine.finishAndClaimCapturedGeneration(
+            state: surfacePrep,
+            acceptedGeneration: acceptedGeneration
+        ) else {
+            // Always drop this runId's projection; never leave stale runThreads[A].
+            runThreads[runId] = nil
+            if currentRunId == runId {
+                currentRunId = nil
+                runStartedAt = nil
+            }
+            if preparingRunGeneration[tid] == acceptedGeneration {
+                let cancelled = ProviderPreparationStateMachine.apply(
+                    state: surfacePrep,
+                    event: .providerFinished(
+                        generation: acceptedGeneration,
+                        reason: .cancelled
+                    )
+                )
+                if !cancelled.suppressLateCallback {
+                    surfacePreparationStates[tid] = cancelled.state
+                }
+                statusMessage = "Run cancelled during preparation"
+                status = .cancelled
+                preparingRunThreadId = nil
+                preparingRunGeneration.removeValue(forKey: tid)
+            }
+            return nil
+        }
+        surfacePreparationStates[tid] = claimedState
         let req = AgentRunRequest(
             runId: runId,
             threadId: tid,
@@ -6061,7 +6094,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             )
             if !failed.suppressLateCallback {
                 surfacePreparationStates[tid] = failed.state
-                // Roll back premature pending write so reload is not phantom-active.
                 if var rolled = try? threadRepo.get(id: tid), rolled.status == .pending {
                     rolled.status = .failed
                     rolled.updatedAt = Date()
@@ -6072,47 +6104,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 }
                 statusMessage = "Failed to prepare run: \(error)"
                 status = .failed
+            }
+            runThreads[runId] = nil
+            if currentRunId == runId {
                 currentRunId = nil
-                runThreads[runId] = nil
             }
             return nil
         }
-        // S5: finish + claim using generation captured at accept (not live map).
-        let surfacePrep = surfacePreparationStates[tid] ?? ProviderPreparationState()
-        guard let claimedState = ProviderPreparationStateMachine.finishAndClaimCapturedGeneration(
-            state: surfacePrep,
-            acceptedGeneration: acceptedGeneration
-        ) else {
-            // Stale (Stop + resend) or cancelled: never mutate a newer generation.
-            if preparingRunGeneration[tid] == acceptedGeneration {
-                let cancelled = ProviderPreparationStateMachine.apply(
-                    state: surfacePrep,
-                    event: .providerFinished(
-                        generation: acceptedGeneration,
-                        reason: .cancelled
-                    )
-                )
-                if !cancelled.suppressLateCallback {
-                    surfacePreparationStates[tid] = cancelled.state
-                }
-                if var rolled = try? threadRepo.get(id: tid), rolled.status == .pending {
-                    rolled.status = .cancelled
-                    rolled.updatedAt = Date()
-                    try? threadRepo.upsert(rolled)
-                    if let index = threads.firstIndex(where: { $0.id == tid }) {
-                        threads[index] = rolled
-                    }
-                }
-                statusMessage = "Run cancelled during preparation"
-                status = .cancelled
-                currentRunId = nil
-                runThreads[runId] = nil
-                preparingRunThreadId = nil
-                preparingRunGeneration.removeValue(forKey: tid)
-            }
-            return nil
-        }
-        surfacePreparationStates[tid] = claimedState
         do {
             let runId = try await coordinator.startRun(
                 req,
