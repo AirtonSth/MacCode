@@ -82,15 +82,17 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(
             try GrokACPClient.launchArguments(for: request),
             [
-                "--model", "grok-4.5",
-                "--reasoning-effort", "max",
                 "--no-memory",
                 "--no-subagents",
                 "--disallowed-tools", "Agent",
-                "--always-approve",
                 "--no-auto-update",
                 "--sandbox", "workspace",
-                "agent", "--no-leader", "stdio"
+                "agent",
+                "--model", "grok-4.5",
+                "--reasoning-effort", "max",
+                "--always-approve",
+                "--no-leader",
+                "stdio"
             ]
         )
     }
@@ -117,9 +119,9 @@ final class GrokACPProtocolTests: XCTestCase {
     }
 
     func test_regularACPLaunchIncludesModelAndReasoningEffort() throws {
-        // WHY: Agent App Grok picker model + effort must reach process argv for
-        // ordinary (non sam-grok-worker) ACP sessions. Bare ["agent","--no-leader","stdio"]
-        // left picker selections with no effect (GROK-ACP-006).
+        // WHY: Agent App Grok picker model + effort must reach AgentArgs under
+        // `agent` (GROK-ACP-008). Flags before `agent` bind top-level PagerArgs
+        // and are discarded by run_agent_command (live: effort stays default).
         let request = AgentRunRequest(
             threadId: AgentThreadID(),
             provider: .grok,
@@ -133,11 +135,19 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(
             try GrokACPClient.launchArguments(for: request),
             [
+                "agent",
                 "--model", "grok-4.5",
                 "--reasoning-effort", "high",
-                "agent", "--no-leader", "stdio"
+                "--no-leader",
+                "stdio"
             ]
         )
+        let argv = try GrokACPClient.launchArguments(for: request)
+        let agentIdx = try XCTUnwrap(argv.firstIndex(of: "agent"))
+        let modelIdx = try XCTUnwrap(argv.firstIndex(of: "--model"))
+        let effortIdx = try XCTUnwrap(argv.firstIndex(of: "--reasoning-effort"))
+        XCTAssertLessThan(agentIdx, modelIdx, "AgentArgs flags must follow `agent`")
+        XCTAssertLessThan(agentIdx, effortIdx, "AgentArgs flags must follow `agent`")
     }
 
     func test_regularACPLaunchEmptyModelOmitsModelFlagAndMatchesEffortSemantics() throws {
@@ -158,8 +168,10 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(
             try GrokACPClient.launchArguments(for: request),
             [
+                "agent",
                 "--reasoning-effort", "medium",
-                "agent", "--no-leader", "stdio"
+                "--no-leader",
+                "stdio"
             ]
         )
     }
@@ -181,8 +193,10 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(
             try GrokACPClient.launchArguments(for: request),
             [
+                "agent",
                 "--model", "grok-composer-2.5-fast",
-                "agent", "--no-leader", "stdio"
+                "--no-leader",
+                "stdio"
             ]
         )
     }

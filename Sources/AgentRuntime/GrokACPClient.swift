@@ -460,11 +460,13 @@ public final class GrokACPClient: @unchecked Sendable {
     static func launchArguments(for request: AgentRunRequest) throws -> [String] {
         guard request.environment[AgentAppRuntimeProfile.environmentKey]
                 == AgentAppRuntimeProfile.samGrokWorkerV1.rawValue else {
-            // Regular ACP path: bind UI model/effort on process argv (global flags
-            // before `agent`), matching GrokRunner.buildArgs. Bare launchArguments
-            // previously dropped both, so picker selections had no effect when
-            // session/new did not return currentModelId (GROK-ACP-006).
-            var args: [String] = []
+            // Regular ACP path: model/effort are AgentArgs under the `agent`
+            // subcommand (grok-build cli.rs + run_agent_command). Flags before
+            // `agent` bind top-level PagerArgs and are discarded on dispatch —
+            // live: `grok --reasoning-effort low agent …` stays default high;
+            // `grok agent --reasoning-effort low …` seeds low (GROK-ACP-008).
+            // Shape: agent [--model M] [--reasoning-effort E] --no-leader stdio.
+            var args: [String] = ["agent"]
             let model = request.model.trimmingCharacters(in: .whitespacesAndNewlines)
             if !model.isEmpty {
                 args.append(contentsOf: ["--model", model])
@@ -473,7 +475,8 @@ public final class GrokACPClient: @unchecked Sendable {
                GrokRunner.modelSupportsReasoningEffort(model) {
                 args.append(contentsOf: GrokRunner.effortArgs(effort))
             }
-            return args + launchArguments
+            args.append(contentsOf: ["--no-leader", "stdio"])
+            return args
         }
         let model = request.model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard request.provider == .grok,
@@ -486,16 +489,22 @@ public final class GrokACPClient: @unchecked Sendable {
                 "invalid sam-grok-worker Agent App runtime profile"
             )
         }
+        // Top-level-only flags stay before `agent` (PagerArgs / main.rs
+        // no_auto_update handoff). AgentArgs-owned model/effort/yolo must
+        // follow `agent` or they never seed the stdio session.
         return [
-            "--model", model,
-            "--reasoning-effort", effort.rawValue,
             "--no-memory",
             "--no-subagents",
             "--disallowed-tools", "Agent",
-            "--always-approve",
             "--no-auto-update",
-            "--sandbox", "workspace"
-        ] + launchArguments
+            "--sandbox", "workspace",
+            "agent",
+            "--model", model,
+            "--reasoning-effort", effort.rawValue,
+            "--always-approve",
+            "--no-leader",
+            "stdio"
+        ]
     }
 
     public init(
