@@ -98,8 +98,13 @@ public enum ProviderPreparationStateMachine {
 
         switch event {
         case .accept(let draftId, let atMs):
-            guard state.phase == .accepting || state.phase == .terminal else {
-                return ProviderPreparationTransition(state: state, ignoredReason: "not_accepting")
+            // Accept is allowed from idle/terminal. If a prior turn left phase in
+            // preparing/running/stopping without providerFinished (caller bug or
+            // crash), heal into terminal first so sequential prompts are not poisoned.
+            if state.phase != .accepting && state.phase != .terminal {
+                next.phase = .terminal
+                next.terminalReason = state.terminalReason ?? .completed
+                next.accessibleStatus = next.terminalReason == .cancelled ? "Cancelled" : "Completed"
             }
             next.generation &+= 1
             next.phase = .preparing

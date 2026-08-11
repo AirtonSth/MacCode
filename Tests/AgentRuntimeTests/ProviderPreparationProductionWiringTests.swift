@@ -138,4 +138,40 @@ final class ProviderPreparationProductionWiringTests: XCTestCase {
         // No accept yet → stop is noop or terminal; isPreparing must be false.
         XCTAssertFalse(coordinator.isPreparingProviderStart(threadId: threadId))
     }
+
+    func test_twoSequentialTurns_acceptNotPoisoned() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-seq")
+        let thread = AgentThread(title: "prep-seq", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let runner = CountingRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: runner]
+        )
+        let first = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "first"
+        ))
+        // Wait for terminal so exclusive mutation admits the next turn.
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if let row = try runRepo.get(id: first), row.finishedAt != nil { break }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let second = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "second"
+        ))
+        XCTAssertEqual(runner.startCount, 2, "second turn must claimSpawn after terminalize")
+        XCTAssertNotEqual(first, second)
+    }
 }

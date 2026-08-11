@@ -5,6 +5,7 @@ import CoreImage
 import CoreModel
 import Persistence
 import AgentRuntime
+import AppLifecycleSupport
 import SocketServer
 import DesignSystemKit
 import Surfaces
@@ -2166,8 +2167,84 @@ public struct SettingsView: View {
                 .buttonStyle(DSSecondaryButtonStyle())
                 .accessibilityIdentifier("settings.keybindingsConfig.reveal")
             }
+            // S12: capacity UX status + explicit diagnostics export.
+            let capacity = CapacityUXStatusStore.shared.current()
+            Text("Capacity")
+                .font(DS.Font.caption2.weight(.semibold)).foregroundColor(DS.Palette.textTertiary)
+            Text(capacity.accessibleSummary)
+                .font(DS.Font.monoSmall)
+                .foregroundColor(DS.Palette.textSecondary)
+                .accessibilityIdentifier("settings.capacity.status")
+                .textSelection(.enabled)
+            HStack(spacing: DS.Space.md) {
+                Button("Export capacity diagnostics") {
+                    exportCapacityDiagnostics()
+                }
+                .buttonStyle(DSSecondaryButtonStyle())
+                .disabled(!capacity.canExportDiagnostics)
+                .accessibilityIdentifier("settings.capacity.export")
+                Spacer(minLength: 0)
+            }
         }
         .dsPanel(padding: DS.Space.lg)
+    }
+
+    private func exportCapacityDiagnostics() {
+        let status = CapacityUXStatusStore.shared.current()
+        let gauges = CapacityGaugeRecorder.shared.current()
+        var fields: [DiagnosticsExportField] = [
+            DiagnosticsExportField(
+                section: .hardwareTier,
+                key: "tier_name",
+                value: String(status.hardwareTierName.prefix(64))
+            ),
+            DiagnosticsExportField(
+                section: .pressureState,
+                key: "level",
+                value: status.hostPressure.rawValue
+            ),
+        ]
+        if let app = gauges.appRSSKB {
+            fields.append(DiagnosticsExportField(
+                section: .capacityMetrics,
+                key: "app_rss_kb",
+                value: String(app)
+            ))
+        }
+        if let provider = gauges.providerTreeRSSKB {
+            fields.append(DiagnosticsExportField(
+                section: .capacityMetrics,
+                key: "provider_tree_rss_kb",
+                value: String(provider)
+            ))
+        }
+        if let sidecar = gauges.sidecarRSSKB {
+            fields.append(DiagnosticsExportField(
+                section: .capacityMetrics,
+                key: "sidecar_rss_kb",
+                value: String(sidecar)
+            ))
+        }
+        do {
+            let data = try DiagnosticsExportAllowlist.buildExportDocument(
+                fields: fields,
+                unavailableSections: [],
+                sessionSalt: Data(UUID().uuidString.utf8)
+            )
+            let dir = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+                ?? URL(fileURLWithPath: NSTemporaryDirectory())
+            let url = dir.appendingPathComponent(
+                "RemoteCode-capacity-\(Int(Date().timeIntervalSince1970)).json"
+            )
+            try DiagnosticsExportAllowlist.writeExportFile(data: data, to: url)
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } catch {
+            // Loud failure via alert is enough for Settings export.
+            let alert = NSAlert()
+            alert.messageText = "Capacity export failed"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
     }
 
     private var appUpdatesRow: some View {

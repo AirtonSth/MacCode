@@ -6016,6 +6016,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             isStopping = false
             onRunStateChange?()
         } catch {
+            // S5: terminalize so the next send is not stuck in preparing.
+            let gen = surfacePreparationStates[tid]?.generation ?? 0
+            surfacePreparationStates[tid] = ProviderPreparationStateMachine.apply(
+                state: surfacePreparationStates[tid] ?? ProviderPreparationState(),
+                event: .preparationFailed(generation: gen, reason: .durabilityFailure)
+            ).state
             statusMessage = "Failed to prepare run: \(error)"
             status = .failed
             return nil
@@ -6035,6 +6041,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         surfacePreparationStates[tid] = surfaceClaimed.state
         guard surfaceClaimed.state.phase == .running, surfaceClaimed.ignoredReason == nil else {
             coordinator.cancelPreparation(threadId: tid)
+            let gen = surfaceClaimed.state.generation
+            surfacePreparationStates[tid] = ProviderPreparationStateMachine.apply(
+                state: surfaceClaimed.state,
+                event: .providerFinished(generation: gen, reason: .cancelled)
+            ).state
             statusMessage = "Run cancelled during preparation"
             status = .cancelled
             currentRunId = nil
@@ -6048,6 +6059,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 routingSnapshot: routingSnapshot,
                 recordUserMessage: !resumeInterrupted
             )
+            // Surface claim consumed the permit; coordinator owns the live run.
+            // Terminalize surface prep so a second send can accept again.
+            let gen = surfacePreparationStates[tid]?.generation ?? 0
+            surfacePreparationStates[tid] = ProviderPreparationStateMachine.apply(
+                state: surfacePreparationStates[tid] ?? ProviderPreparationState(),
+                event: .providerFinished(generation: gen, reason: .completed)
+            ).state
             do {
                 try clearComposerDraft(threadId: tid, providerInstanceId: providerInstanceId)
                 attachments = []
@@ -6086,6 +6104,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             return runId
         } catch {
+            let gen = surfacePreparationStates[tid]?.generation ?? 0
+            surfacePreparationStates[tid] = ProviderPreparationStateMachine.apply(
+                state: surfacePreparationStates[tid] ?? ProviderPreparationState(),
+                event: .providerFinished(generation: gen, reason: .providerFailure)
+            ).state
             await MainActor.run {
                 // Prefer LocalizedError copy so ManagedProviderAdmissionError shows
                 // the human message instead of the raw enum case name in the banner.

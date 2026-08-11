@@ -611,8 +611,103 @@ public enum CapacitySemanticHarness {
 
 // MARK: - Production-path subprocess fixture scaffolding (S2)
 
+/// Result of spawning a controlled local child that emits fixture frames.
+public struct CapacitySubprocessRunResult: Sendable, Equatable {
+    public var exitCode: Int32
+    public var stdoutLines: [String]
+    public var stderrLines: [String]
+    public var pid: pid_t
+    public var stoppedByCaller: Bool
+
+    public init(
+        exitCode: Int32,
+        stdoutLines: [String],
+        stderrLines: [String],
+        pid: pid_t,
+        stoppedByCaller: Bool
+    ) {
+        self.exitCode = exitCode
+        self.stdoutLines = stdoutLines
+        self.stderrLines = stderrLines
+        self.pid = pid
+        self.stoppedByCaller = stoppedByCaller
+    }
+}
+
+/// Spawns a real local shell child that prints fixture frames (S2).
+/// This is not a paid provider CLI; it exercises process/pipe/Stop/reap ownership
+/// on the production spawn/tag seams with deterministic content.
+public enum CapacitySubprocessFixtureRunner {
+    /// Spawn `/bin/sh` that echoes each frame on stdout, optional stderr lines,
+    /// then exits with the fixture code. When `stopAfterMs` is set, the caller
+    /// terminates the child mid-run (Stop race).
+    public static func run(
+        spec: CapacitySubprocessFixtureSpec,
+        seed: UInt64 = 1,
+        stopAfterMs: Int? = nil
+    ) throws -> CapacitySubprocessRunResult {
+        let frames = spec.materializedFrames(seed: seed).filter { !$0.contains("stop_race") }
+        var scriptParts: [String] = ["set -e"]
+        for frame in frames {
+            let escaped = frame
+                .replacingOccurrences(of: "'", with: "'\\''")
+            scriptParts.append("printf '%s\\n' '\(escaped)'")
+            scriptParts.append("sleep 0.01")
+        }
+        for line in spec.stderrLines {
+            let escaped = line.replacingOccurrences(of: "'", with: "'\\''")
+            scriptParts.append("printf '%s\\n' '\(escaped)' 1>&2")
+        }
+        scriptParts.append("exit \(spec.exitCode)")
+        let script = scriptParts.joined(separator: "; ")
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", script]
+        let out = Pipe()
+        let err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
+        try process.run()
+        let pid = process.processIdentifier
+        var ownershipTag: SpawnedProcessTag?
+        if ProviderProcessOwnership.shared.store() != nil {
+            ownershipTag = try? ProcessSpawnTagger.tagProcess(process, managedKind: .sidecar)
+        }
+        var stoppedByCaller = false
+        if let stopAfterMs, stopAfterMs >= 0 {
+            Thread.sleep(forTimeInterval: Double(stopAfterMs) / 1000.0)
+            if process.isRunning {
+                process.terminate()
+                stoppedByCaller = true
+            }
+        }
+        process.waitUntilExit()
+        if let ownershipTag {
+            try? ProviderProcessOwnership.shared.store()?.removeExact(ownershipTag)
+        }
+        let outData = out.fileHandleForReading.readDataToEndOfFile()
+        let errData = err.fileHandleForReading.readDataToEndOfFile()
+        let outLines = String(data: outData, encoding: .utf8)?
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+            .filter { !$0.isEmpty } ?? []
+        let errLines = String(data: errData, encoding: .utf8)?
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+            .filter { !$0.isEmpty } ?? []
+        return CapacitySubprocessRunResult(
+            exitCode: process.terminationStatus,
+            stdoutLines: outLines,
+            stderrLines: errLines,
+            pid: pid,
+            stoppedByCaller: stoppedByCaller
+        )
+    }
+}
+
 /// Describes a controlled stdout/stderr fixture for one real adapter seam.
-/// Does not spawn providers; tests inject frames through the adapter parser path.
+/// Frames are also runnable via `CapacitySubprocessFixtureRunner` (real local child).
 public struct CapacitySubprocessFixtureSpec: Sendable, Equatable {
     public var provider: String
     public var frames: [String]

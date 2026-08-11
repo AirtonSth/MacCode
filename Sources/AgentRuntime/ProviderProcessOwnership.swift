@@ -183,6 +183,7 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
             }
         }
 
+        // S4 crash-safe protocol: write → file-fsync → rename → directory-fsync.
         // 0600 temp under 0700 dir; atomic rename WITHOUT removing destination first.
         let temp = parent.appendingPathComponent(
             ".\(fileURL.lastPathComponent).tmp-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString)"
@@ -190,6 +191,12 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
         let data = try encoder.encode(tags)
         try data.write(to: temp, options: .atomic)
         try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temp.path)
+        // Explicit file fsync before rename so a crash cannot leave a partial target.
+        let tempFD = open(temp.path, O_RDONLY)
+        if tempFD >= 0 {
+            _ = fsync(tempFD)
+            close(tempFD)
+        }
         // Atomic replace when destination exists; first write uses rename.
         if fm.fileExists(atPath: fileURL.path) {
             _ = try fm.replaceItemAt(fileURL, withItemAt: temp)
@@ -202,13 +209,24 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
             _ = fsync(dirFD)
             close(dirFD)
         }
-        // Recover abandoned temps older than this process only (do not delete in-flight peers).
-        if let entries = try? fm.contentsOfDirectory(at: parent, includingPropertiesForKeys: [.contentModificationDateKey]) {
+        // Recover abandoned temps from any prior PID once mtime is old enough that
+        // a concurrent writer is unlikely (stale-owner cleanup after relaunch).
+        if let entries = try? fm.contentsOfDirectory(
+            at: parent,
+            includingPropertiesForKeys: [.contentModificationDateKey]
+        ) {
             let prefix = ".\(fileURL.lastPathComponent).tmp-"
             let mine = "-\(ProcessInfo.processInfo.processIdentifier)-"
+            let staleAge: TimeInterval = 60
+            let now = Date()
             for url in entries where url.lastPathComponent.hasPrefix(prefix) {
-                // Only clean temps that clearly belong to this PID and still exist after replace.
                 if url.lastPathComponent.contains(mine) {
+                    try? fm.removeItem(at: url)
+                    continue
+                }
+                let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey])
+                    .contentModificationDate) ?? .distantPast
+                if now.timeIntervalSince(mtime) >= staleAge {
                     try? fm.removeItem(at: url)
                 }
             }

@@ -33,6 +33,8 @@ public struct ProviderProcessStartIdentity: Codable, Sendable, Equatable {
 public enum ManagedProcessKind: String, Codable, Sendable, Equatable {
     case provider
     case sidecar
+    /// Host Graphify CLI child (S9 ownership ledger).
+    case graphify
 }
 
 public struct SpawnedProcessTag: Codable, Sendable, Equatable {

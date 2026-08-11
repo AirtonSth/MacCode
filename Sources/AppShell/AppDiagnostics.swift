@@ -733,15 +733,30 @@ enum AppDiagnostics {
             lastPressureExecuteOutcomeForTesting = outcome
 #endif
             applyPressureActions(outcome.applied)
+            // Only report mutations that actually applied (not skipped/no-ops).
+            lastAppliedPressureActionsForUX = outcome.applied.map(\.rawValue)
+        } else {
+            lastAppliedPressureActionsForUX = []
         }
 
-        // When recovering toward normal, still run paced recovery ticks.
-        if transition.state.level != .normal, transition.emittedActions.isEmpty {
+        // S7: paced recovery only fires once level is already normal (resume
+        // optional work after step-down). Calling it while elevated is a no-op.
+        if transition.state.level == .normal {
+            // Clear pressure-only Graphify pause as soon as the governor is normal.
+            GraphifyWorkspaceService.shared.setPressurePauseEnsureAndWatch(false)
             let recovered = pressureGovernor.pacedRecovery(at: Date())
-            if recovered.emittedActions.contains(.resumeOptionalWorkUnit) {
-                applyPressureActions([.resumeOptionalWorkUnit])
+            if !recovered.emittedActions.isEmpty {
+                applyPressureActions(recovered.emittedActions)
+                lastAppliedPressureActionsForUX.append(contentsOf: recovered.emittedActions.map(\.rawValue))
             }
         }
+
+        // S1: production gauge recording from live heartbeat RSS samples.
+        CapacityGaugeRecorder.shared.noteRSS(
+            appKB: sample.appFootprintKB.map(Int64.init),
+            providerKB: sample.providerRSSKB.map(Int64.init),
+            sidecarKB: sample.sidecarRSSKB.map(Int64.init)
+        )
 
         // Capacity UX: prefer coordinator level when ingest advanced state; else
         // host-level from sample (ingest already published via CapacityUXStatusStore).
@@ -755,17 +770,24 @@ enum AppDiagnostics {
                 beyondEnvelope: sample.pressureDecision == .critical || coordLevel == .critical,
                 accountingAvailable: sample.isComplete,
                 degradationActions: {
-                    var actions = transition.emittedActions.map(\.rawValue)
-                    if actions.isEmpty,
-                       sample.pressureDecision != .normal,
-                       sample.pressureDecision != .unknown {
-                        actions = [sample.pressureDecision.rawValue]
+                    if !lastAppliedPressureActionsForUX.isEmpty {
+                        return lastAppliedPressureActionsForUX
                     }
-                    return actions
+                    if sample.pressureDecision != .normal,
+                       sample.pressureDecision != .unknown {
+                        return [sample.pressureDecision.rawValue]
+                    }
+                    return []
                 }()
             )
         )
     }
+
+    /// Live flags for optional-work actions so UX only reports real mutations.
+    @MainActor private static var maintenancePruneDeferred = false
+    @MainActor private static var lastAppliedPressureActionsForUX: [String] = []
+    /// Hooks installed by AppShell (Distill reclaim, idle session shortener, UI reclaim).
+    static var pressureActionHandlers: [PressureActionKind: @Sendable () -> Void] = [:]
 
     @MainActor
     private static func applyPressureActions(_ actions: [PressureActionKind]) {
@@ -775,18 +797,30 @@ enum AppDiagnostics {
                 GraphifyWorkspaceService.shared.setPressurePauseEnsureAndWatch(true)
             case .resumeOptionalWorkUnit:
                 GraphifyWorkspaceService.shared.setPressurePauseEnsureAndWatch(false)
+                maintenancePruneDeferred = false
+            case .deferMaintenancePrune:
+                maintenancePruneDeferred = true
             case .reclaimHiddenRecomputableUI,
                  .shortenCompletedIdleProviderSessions,
-                 .releaseDistillIdleModelGPU,
-                 .deferMaintenancePrune,
-                 .neverKillActiveTurn,
-                 .neverDeferScheduledOccurrence:
-                // Non-destructive accounting / future hooks. Distill GPU reclaim
-                // stays process-resident; never kill turns or defer schedules.
+                 .releaseDistillIdleModelGPU:
+                // Production handlers registered by AppDelegate / Distill controller.
+                if let handler = pressureActionHandlers[action] {
+                    handler()
+                } else {
+                    NotificationCenter.default.post(
+                        name: .rcPressureOptionalWork,
+                        object: nil,
+                        userInfo: ["action": action.rawValue]
+                    )
+                }
+            case .neverKillActiveTurn, .neverDeferScheduledOccurrence:
                 break
             }
         }
     }
+
+    @MainActor
+    static var isMaintenancePruneDeferred: Bool { maintenancePruneDeferred }
 
     static func currentProcessFootprintKB() -> Int {
         var info = task_vm_info_data_t()
@@ -799,4 +833,9 @@ enum AppDiagnostics {
         guard result == KERN_SUCCESS else { return -1 }
         return Int(info.phys_footprint / 1_024)
     }
+}
+
+extension Notification.Name {
+    /// S7: non-destructive pressure optional-work (UI reclaim, idle session, Distill GPU).
+    static let rcPressureOptionalWork = Notification.Name("io.remotecode.pressure.optionalWork")
 }

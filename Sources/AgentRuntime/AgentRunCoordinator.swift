@@ -1381,6 +1381,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     atMs: Int64(Date().timeIntervalSince1970 * 1000)
                 )
             )
+            CapacityGaugeRecorder.shared.noteAcceptStarted(
+                threadKey: request.threadId.value.uuidString
+            )
             // Stop that raced ahead of accept still wins: cancel prep immediately.
             if pendingThreadStops.contains(request.threadId) {
                 _ = applyPreparationLocked(threadId: request.threadId, event: .stopRequested)
@@ -1613,6 +1616,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // S5: preparationFinished + one-shot claimSpawn under lock. Stop/Escape
         // that arrived during durable prep revokes the generation so sendTurn
         // never starts the provider.
+        CapacityGaugeRecorder.shared.notePrepareStarted(
+            threadKey: effectiveRequest.threadId.value.uuidString
+        )
         guard claimPreparationSpawnOrCancel(
             threadId: effectiveRequest.threadId,
             runId: runId
@@ -1620,6 +1626,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             markStopRequested(threadId: effectiveRequest.threadId, runId: runId)
             throw AgentRunAcceptanceError.cancelled
         }
+        CapacityGaugeRecorder.shared.noteSpawned(
+            threadKey: effectiveRequest.threadId.value.uuidString
+        )
         agentRunLog.info("run.started thread=\(effectiveRequest.threadId.value.uuidString, privacy: .public) run=\(effectiveRequest.runId.value.uuidString, privacy: .public) provider=\(effectiveRequest.provider.rawValue, privacy: .public) model=\(effectiveRequest.model, privacy: .public)")
 
         let coordinator = self
@@ -5429,6 +5438,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 case ownerConflict(Error)
                 case activePlanBudget(Error)
                 case resumeCursorFailure(Error)
+                /// S3: store-before-loss failed — do not allocate seq or notify observers.
+                case storeBeforeLossFailure(Error)
             }
             let postAction: MirrorEventPostAction = {
                 mirrorEventLock.lock()
@@ -5436,6 +5447,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
                 var deferredPersistenceIssues: [DeferredPersistenceIssue] = []
                 var appendedMessages: [AgentMessage] = []
+
+                // S3: when encode succeeded but reversible store/bound failed,
+                // never allocate a sequence or publish an undurable event.
+                if data != nil, preparedWrite == nil {
+                    let error = NSError(
+                        domain: "RemoteCode.AgentRunCoordinator",
+                        code: 507,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "Authoritative stream payload could not be stored before presentation loss."]
+                    )
+                    recordMirrorPersistenceFailure(error, threadId: threadId)
+                    return .storeBeforeLossFailure(error)
+                }
 
                 lock.lock()
                 let priorBufferedRunId = pendingStreamRunIds[threadId].flatMap { owner in
@@ -5649,6 +5673,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 // Keep the run alive with a deferred-persistence issue; retry later.
                 emitPersistenceIssue("run.stream_event.retry_saturated", error: error, runId: runId, threadId: threadId)
                 return
+            case .storeBeforeLossFailure(let error):
+                // S3: never publish or advance terminal over a missing authoritative event.
+                emitPersistenceIssue("run.stream_event.store_before_loss", error: error, runId: runId, threadId: threadId)
+                return
             case .ownerConflict(let error):
                 emitPersistenceIssue("run.stream_event.owner", error: error, runId: runId, threadId: threadId)
                 return
@@ -5672,6 +5700,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
             // Preserve prior EventBus contract: publish whenever encode produced
             // Data (even if UTF-8 conversion failed and no buffer row was written).
+            // Store-before-loss failures return above and never reach this path.
             if data != nil {
                 onAssistantEvent?(ev, threadId, runId)
             }
@@ -6044,6 +6073,22 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 return Int64(finished.timeIntervalSince(row.startedAt) * 1000)
             } ?? -1
             agentRunLog.info("run.finished thread=\(threadId.value.uuidString, privacy: .public) run=\(runId.value.uuidString, privacy: .public) status=\(status.rawValue, privacy: .public) durationMs=\(durationMs, privacy: .public)")
+            // S5: terminalize generation-owned prep so the next accept is not poisoned.
+            lock.lock()
+            let prepGen = preparationStates[threadId]?.generation ?? 0
+            let prepReason: ProviderPreparationTerminalReason = {
+                switch status {
+                case .completed: return .completed
+                case .cancelled: return .cancelled
+                case .failed, .interrupted: return .providerFailure
+                case .pending, .running: return .completed
+                }
+            }()
+            _ = applyPreparationLocked(
+                threadId: threadId,
+                event: .providerFinished(generation: prepGen, reason: prepReason)
+            )
+            lock.unlock()
             for observer in observersSnapshot() {
                 observer.runCoordinator(self, didFinish: runId, threadId: threadId, status: status, finalMessage: finalMessage, providerThreadId: providerThreadId)
             }

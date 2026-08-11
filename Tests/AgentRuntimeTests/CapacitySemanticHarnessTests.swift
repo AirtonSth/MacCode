@@ -122,28 +122,30 @@ final class CapacitySemanticHarnessTests: XCTestCase {
         XCTAssertTrue(catalog[2].materializedFrames(seed: seed).contains("[[rc:stop_race]]"))
     }
 
-    func test_subprocessFixtures_parseThroughProviderSeams() throws {
-        // Drive catalog frames through real parser entry points.
+    func test_subprocessFixtures_spawnRealChildAndParseSeams() throws {
+        // S2: real local child emits catalog frames; then parse through seams.
         let claude = ClaudeParser()
         for fixture in CapacitySubprocessFixtureSpec.catalog() {
-            let frames = fixture.materializedFrames(seed: 42)
-            XCTAssertFalse(frames.isEmpty)
+            let run = try CapacitySubprocessFixtureRunner.run(spec: fixture, seed: 42)
+            XCTAssertFalse(run.stdoutLines.isEmpty, "\(fixture.provider) child must emit frames")
+            XCTAssertGreaterThan(run.pid, 0)
             switch fixture.provider {
             case "claude":
                 var sawEvents = false
-                for frame in frames where !frame.contains("stop_race") {
+                for frame in run.stdoutLines {
                     let events = claude.parseLine(frame)
                     if !events.isEmpty { sawEvents = true }
                 }
                 XCTAssertTrue(sawEvents, "ClaudeParser must accept at least one catalog frame")
+                XCTAssertEqual(run.exitCode, 0)
             case "codex":
-                // Codex frames are app-server JSON; verify parseable and kind keys.
-                for frame in frames where !frame.contains("stop_race") {
+                for frame in run.stdoutLines {
                     let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(frame.utf8)) as? [String: Any])
                     XCTAssertNotNil(obj["type"] as? String)
                 }
+                XCTAssertEqual(run.exitCode, 0)
             case "grok":
-                for frame in frames where !frame.contains("stop_race") {
+                for frame in run.stdoutLines {
                     let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(frame.utf8)) as? [String: Any])
                     XCTAssertEqual(obj["jsonrpc"] as? String, "2.0")
                 }

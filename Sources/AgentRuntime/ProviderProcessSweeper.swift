@@ -141,7 +141,8 @@ public enum ProviderProcessSweeper {
                 case .provider:
                     providerRoots += 1
                     for row in tree { providerByPID[row.pid] = row }
-                case .sidecar:
+                case .sidecar, .graphify:
+                    // Graphify CLI children account under sidecar tree RSS.
                     sidecarRoots += 1
                     for row in tree { sidecarByPID[row.pid] = row }
                 }
@@ -187,7 +188,7 @@ public enum ProviderProcessSweeper {
             case .provider:
                 providerRoots += 1
                 for row in tree { providerByPID[row.pid] = row }
-            case .sidecar:
+            case .sidecar, .graphify:
                 sidecarRoots += 1
                 for row in tree { sidecarByPID[row.pid] = row }
             }

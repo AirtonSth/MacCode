@@ -1197,6 +1197,17 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         do { try p.run() } catch {
             return (-1, "", String(describing: error))
         }
+        // S9: durable ownership tag before acceptance (tagProcess also records).
+        // Fail-open when ownership store is unconfigured (tests / early boot).
+        var ownershipTag: SpawnedProcessTag?
+        if ProviderProcessOwnership.shared.store() != nil {
+            do {
+                ownershipTag = try ProcessSpawnTagger.tagProcess(p, managedKind: .graphify)
+            } catch {
+                p.terminate()
+                return (-1, "", "graphify ownership tag failed: \(error)")
+            }
+        }
         lock.lock()
         activeRebuildProcess = p
         let alreadyCancelled = activeRebuildCancelled
@@ -1296,6 +1307,10 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             if outBox.isFinished && errBox.isFinished { break }
         }
         lock.lock(); activeRebuildProcess = nil; lock.unlock()
+        // S9: exact removal after reap so relaunch does not treat a dead child as live.
+        if let ownershipTag {
+            try? ProviderProcessOwnership.shared.store()?.removeExact(ownershipTag)
+        }
         let oData = outBox.get()
         let eData = errBox.get()
         if timedOut {
