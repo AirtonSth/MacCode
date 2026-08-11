@@ -395,12 +395,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Drives the "Loading…" line; `workingStatus` takes over the instant the
     /// run is tracked. Thread-scoped so switching tabs mid-prepare cannot show
     /// a sibling thread as loading.
+    /// Thread whose turn is being prepared for the *selected* thread UI (Loading…).
+    /// Backed by `preparingRunThreads` so multi-thread prep is not a singleton race.
     @Published public private(set) var preparingRunThreadId: AgentThreadID?
+    /// S5: all threads currently in surface preparation (Graphify/preflight).
+    /// Stop/Escape must target the selected/owning thread, not a single global slot.
+    private var preparingRunThreads: Set<AgentThreadID> = []
     /// S5: generation-owned surface preparation (accept → Graphify/preflight →
     /// coordinator start). Stop/Escape applies `.stopRequested` so a late
     /// claim cannot call `coordinator.startRun`.
     private var surfacePreparationStates: [AgentThreadID: ProviderPreparationState] = [:]
-    /// Generation that currently owns `preparingRunThreadId` for each thread.
+    /// Generation that currently owns prep for each thread.
     /// A superseded/cancelled prep must not clear a newer generation's marker.
     private var preparingRunGeneration: [AgentThreadID: UInt64] = [:]
     /// UX-MAC_AGENT-009: true while the last surfaced error is recoverable, so
@@ -4011,11 +4016,46 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// status lines can never both render. Does NOT use isThreadStartingOrRunning
     /// because that includes preparation for Stop/Escape chrome.
     public var selectedThreadIsPreparingRun: Bool {
-        guard let preparingRunThreadId, preparingRunThreadId == selectedThreadId else { return false }
+        guard let tid = selectedThreadId, preparingRunThreads.contains(tid) else { return false }
         // Yield only when a tracked/scheduled run has taken over the status line.
-        if trackedRunId(for: preparingRunThreadId) != nil { return false }
-        if isScheduledThreadRunning?(preparingRunThreadId) == true { return false }
+        if trackedRunId(for: tid) != nil { return false }
+        if isScheduledThreadRunning?(tid) == true { return false }
         return true
+    }
+
+    private func beginSurfacePreparation(threadId: AgentThreadID, generation: UInt64) {
+        preparingRunThreads.insert(threadId)
+        preparingRunGeneration[threadId] = generation
+        if selectedThreadId == threadId {
+            preparingRunThreadId = threadId
+        }
+    }
+
+    private func endSurfacePreparationIfOwned(threadId: AgentThreadID, generation: UInt64) {
+        guard preparingRunGeneration[threadId] == generation else { return }
+        preparingRunThreads.remove(threadId)
+        preparingRunGeneration.removeValue(forKey: threadId)
+        if preparingRunThreadId == threadId {
+            preparingRunThreadId = selectedThreadId.flatMap {
+                preparingRunThreads.contains($0) ? $0 : nil
+            }
+        }
+    }
+
+    private func cancelSurfacePreparation(threadId: AgentThreadID) {
+        let current = surfacePreparationStates[threadId] ?? ProviderPreparationState()
+        surfacePreparationStates[threadId] = ProviderPreparationStateMachine.apply(
+            state: current,
+            event: .stopRequested
+        ).state
+        preparingRunThreads.remove(threadId)
+        preparingRunGeneration.removeValue(forKey: threadId)
+        if preparingRunThreadId == threadId {
+            preparingRunThreadId = selectedThreadId.flatMap {
+                preparingRunThreads.contains($0) ? $0 : nil
+            }
+        }
+        coordinator.cancelPreparation(threadId: threadId)
     }
 
     /// Busy for Stop/Escape: tracked runs, scheduled runs, or in-flight preparation.
@@ -4034,7 +4074,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     /// S5: Stop/Escape/Send concurrency — includes pre-run preparation.
     public func isThreadStoppableBusy(_ threadId: AgentThreadID) -> Bool {
-        if preparingRunThreadId == threadId { return true }
+        if preparingRunThreads.contains(threadId) { return true }
         if coordinator.isPreparingProviderStart(threadId: threadId) { return true }
         return isThreadStartingOrRunning(threadId)
     }
@@ -5559,7 +5599,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
         // S5: refuse concurrent preparation only (active runs may still queue).
         if let sendThreadId,
-           preparingRunThreadId == sendThreadId
+           preparingRunThreads.contains(sendThreadId)
             || coordinator.isPreparingProviderStart(threadId: sendThreadId) {
             statusMessage = "A run is already preparing. Stop it first, or wait."
             return
@@ -5936,15 +5976,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         )
         surfacePreparationStates[tid] = surfaceAccept.state
         let acceptedGeneration = surfaceAccept.state.generation
-        preparingRunThreadId = tid
-        preparingRunGeneration[tid] = acceptedGeneration
+        beginSurfacePreparation(threadId: tid, generation: acceptedGeneration)
         defer {
-            // Only clear the Loading marker if we still own this generation.
-            if preparingRunThreadId == tid,
-               preparingRunGeneration[tid] == acceptedGeneration {
-                preparingRunThreadId = nil
-                preparingRunGeneration.removeValue(forKey: tid)
-            }
+            endSurfacePreparationIfOwned(threadId: tid, generation: acceptedGeneration)
         }
         // B5: title a still-default thread from its first message.
         if let t = threads.first(where: { $0.id == tid }),
@@ -6038,8 +6072,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 }
                 statusMessage = "Run cancelled during preparation"
                 status = .cancelled
-                preparingRunThreadId = nil
-                preparingRunGeneration.removeValue(forKey: tid)
+                endSurfacePreparationIfOwned(threadId: tid, generation: acceptedGeneration)
             }
             return nil
         }
@@ -6433,16 +6466,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let localRunId = currentRunId ?? tid.flatMap { trackedRunId(for: $0) }
         // S5: cancel generation-owned surface preparation even when no run is
         // tracked yet (Graphify / preflight window before coordinator.startRun).
-        if let tid, preparingRunThreadId == tid {
-            let current = surfacePreparationStates[tid] ?? ProviderPreparationState()
-            let stopped = ProviderPreparationStateMachine.apply(
-                state: current,
-                event: .stopRequested
-            )
-            surfacePreparationStates[tid] = stopped.state
-            preparingRunThreadId = nil
-            preparingRunGeneration.removeValue(forKey: tid)
-            coordinator.cancelPreparation(threadId: tid)
+        if let tid, preparingRunThreads.contains(tid) {
+            cancelSurfacePreparation(threadId: tid)
             // Fall through so a pending coordinator start also receives stopRun.
         }
         // Second click while already Stopping: hard-await termination so a
@@ -6532,7 +6557,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private func hasStoppableRun(threadId: AgentThreadID) -> Bool {
         if isScheduledThreadRunning?(threadId) == true { return true }
         // S5: surface preparation is stoppable before a run id is tracked.
-        if preparingRunThreadId == threadId { return true }
+        if preparingRunThreads.contains(threadId) { return true }
         if coordinator.isPreparingProviderStart(threadId: threadId) { return true }
         if coordinator.activeRunId(threadId: threadId) != nil { return true }
         if coordinator.hasPendingProviderStart(threadId: threadId) { return true }
@@ -6571,15 +6596,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Stop a specific thread by id, regardless of which thread is currently selected.
     /// Allows the thread rail to stop any running thread without switching selection.
     public func stopThread(_ id: AgentThreadID) {
-        if preparingRunThreadId == id {
-            let current = surfacePreparationStates[id] ?? ProviderPreparationState()
-            surfacePreparationStates[id] = ProviderPreparationStateMachine.apply(
-                state: current,
-                event: .stopRequested
-            ).state
-            preparingRunThreadId = nil
-            preparingRunGeneration.removeValue(forKey: id)
-            coordinator.cancelPreparation(threadId: id)
+        if preparingRunThreads.contains(id) {
+            cancelSurfacePreparation(threadId: id)
         }
         if isScheduledThreadRunning?(id) == true, let stopScheduledThread {
             Task { @MainActor in

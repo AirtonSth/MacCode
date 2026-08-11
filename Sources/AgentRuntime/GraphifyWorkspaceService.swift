@@ -105,10 +105,47 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     }
 
     /// S7 non-destructive pressure action: pause ensure/watch scheduling.
+    /// On true→false, re-kick dirty/deferred checkouts that may have missed
+    /// debounce/ensure while paused.
     public func setPressurePauseEnsureAndWatch(_ paused: Bool) {
+        let rootsToKick: [String]
         lock.lock()
+        let wasPaused = pressurePauseEnsureAndWatch
         pressurePauseEnsureAndWatch = paused
+        if wasPaused && !paused {
+            var roots: [String] = []
+            for id in schedules.keys {
+                guard var schedule = schedules[id], !schedule.displayRoot.isEmpty else { continue }
+                if schedule.dirtyGeneration > schedule.builtGeneration
+                    || schedule.rerunRequested {
+                    schedule.rerunRequested = true
+                    schedule.dirtyGeneration &+= 1
+                    schedules[id] = schedule
+                    roots.append(schedule.displayRoot)
+                }
+            }
+            // Also drain process-wide deferred IDs so unpause is not a silent drop.
+            roots.append(contentsOf: globalCLIRerunIDs.compactMap { id in
+                schedules[id]?.displayRoot
+            })
+            rootsToKick = Array(Set(roots))
+        } else {
+            rootsToKick = []
+        }
         lock.unlock()
+        for root in rootsToKick {
+            // Resolve a real checkout for this display root (correct scheduleID).
+            if let identity = GraphifyGitProbe.identity(at: root) {
+                startEnsureIfNeeded(checkout: identity.checkout)
+            } else {
+                // Fail-open fallback: use displayRoot as commonDir identity.
+                let checkout = GraphifyCheckout(
+                    key: GraphifyRepoKey(commonDir: root),
+                    displayRoot: root
+                )
+                startEnsureIfNeeded(checkout: checkout)
+            }
+        }
     }
 
     public var isPressurePauseEnsureAndWatch: Bool {

@@ -201,24 +201,53 @@ final class WebSocketEventBatcher: @unchecked Sendable {
             queue.async {
                 defer { releasePreQueue() }
                 guard !self.stopped else { return }
-                if self.wouldExceedAdmissionLocked(additionalBytes: data.count) {
-                    self.handleOverflowLocked(reason: "admission_bytes_or_count")
+                // Net-delta admission for last-write-wins / merge replacement:
+                // charge only the growth vs any existing keyed entry so a fitting
+                // replacement does not trip the aggregate cap as a new frame.
+                let previous = self.pending[key]
+                let candidate: Data
+                if let previous,
+                   self.filter.coalescingMergesByConcatenation(for: event),
+                   let merged = Self.mergeAgentItemDeltaFrames(previous, data) {
+                    candidate = merged
+                } else {
+                    candidate = data
                 }
-                guard self.canAdmitSingleFrameLocked(byteCount: data.count) else {
-                    var lost: [Int64] = []
-                    if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
-                    self.preQueueLock.lock()
-                    self.overflowCount += 1
-                    self.preQueueLock.unlock()
-                    self.onAdmissionOverflow?(lost, "frame_exceeds_budget")
-                    return
+                let previousBytes = previous?.count ?? 0
+                let additionalBytes = max(0, candidate.count - previousBytes)
+                let isReplacement = previous != nil
+                if !isReplacement {
+                    if self.wouldExceedAdmissionLocked(additionalBytes: candidate.count) {
+                        self.handleOverflowLocked(reason: "admission_bytes_or_count")
+                    }
+                    guard self.canAdmitSingleFrameLocked(byteCount: candidate.count) else {
+                        var lost: [Int64] = []
+                        if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
+                        self.preQueueLock.lock()
+                        self.overflowCount += 1
+                        self.preQueueLock.unlock()
+                        self.onAdmissionOverflow?(lost, "frame_exceeds_budget")
+                        return
+                    }
+                } else if additionalBytes > 0 {
+                    if self.wouldExceedAdmissionLocked(additionalBytes: additionalBytes) {
+                        self.handleOverflowLocked(reason: "admission_bytes_or_count")
+                    }
+                    // Replacement that still fits after netting previous is admitted.
+                    if self.wouldExceedAdmissionLocked(additionalBytes: additionalBytes) {
+                        var lost: [Int64] = []
+                        if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
+                        self.preQueueLock.lock()
+                        self.overflowCount += 1
+                        self.preQueueLock.unlock()
+                        self.onAdmissionOverflow?(lost, "replacement_exceeds_budget")
+                        return
+                    }
                 }
-                if let previous = self.pending[key] {
+                if let previous {
                     if self.filter.coalescingMergesByConcatenation(for: event),
-                       let merged = Self.mergeAgentItemDeltaFrames(previous, data) {
-                        // C-16: absorb previous sequence via onCoalescedAway so the
-                        // client watermark advances without a 1012 gap, then keep
-                        // the higher-sequence merged frame.
+                       let merged = Self.mergeAgentItemDeltaFrames(previous, data),
+                       merged == candidate {
                         self.onCoalescedAway?(previous)
                         self.pendingBytes -= previous.count
                         self.noteEnqueueLocked(merged)
