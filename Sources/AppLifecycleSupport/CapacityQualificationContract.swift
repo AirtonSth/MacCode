@@ -517,10 +517,14 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
                     )
                 }
             }
-            // Promotion regression: current mean vs prior same-machine baseline ≤10%.
-            if let prior = priorBaselineMeans[key],
-               prior > 0,
+            // Promotion mode (any physical tier claimed): prior baseline required
+            // for latency metrics. Bootstrap/first-run uses empty physical tiers.
+            let promotionMode = !self.physicallyExecutedTier.isEmpty
+            if promotionMode,
                (key.hasSuffix("_p95") || key.hasSuffix("_p99") || key == CapacityRequiredMetricKey.lockWaitMsP95.rawValue) {
+                guard let prior = self.priorBaselineMeans[key], prior > 0 else {
+                    throw CapacityContractError.missingRequiredField("priorBaselineMeans.\(key)")
+                }
                 let currentMean = byName[key]?.value ?? 0
                 let regression = (currentMean - prior) / prior
                 if regression > 0.10 {

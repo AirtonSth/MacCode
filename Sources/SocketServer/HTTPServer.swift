@@ -2490,15 +2490,34 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 }
             )
             // C-04: pressure baseline_required ≤1/s, never as a close reason.
-            // S10: generation-aware sticky recovery + single-flight trailing flush.
-            let pressureBaselineGate = OutboundPressureBaselineGate()
-            var scheduleStickyBaselineFlush: (@Sendable () -> Void)!
-            let emitPressureBaseline: @Sendable () -> Void = { [weak self] in
-                guard let self else { return }
-                // Always coalesce the recovery request before attempting emit.
-                pressureBaselineGate.markPending()
-                guard let generation = pressureBaselineGate.tryAcquireGeneration() else {
-                    scheduleStickyBaselineFlush()
+            // S10: generation-aware sticky recovery. Emit body is held weakly so
+            // connection teardown can nil it and markClosed without a cycle.
+            final class StickyBaselineBox: @unchecked Sendable {
+                let gate = OutboundPressureBaselineGate()
+                var emitBody: (@Sendable () -> Void)?
+                func close() {
+                    gate.markClosed()
+                    emitBody = nil
+                }
+                func emit() { emitBody?() }
+                func scheduleFlush() {
+                    guard gate.armFlushIfNeeded() else { return }
+                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.05) { [weak self] in
+                        guard let self else { return }
+                        self.gate.clearFlushArm()
+                        if self.gate.hasPendingRecovery {
+                            self.emit()
+                        }
+                    }
+                }
+            }
+            let stickyBaseline = StickyBaselineBox()
+            stickyBaseline.emitBody = { [weak self, weak stickyBaseline] in
+                guard let self, let stickyBaseline else { return }
+                let gate = stickyBaseline.gate
+                gate.markPending()
+                guard let generation = gate.tryAcquireGeneration() else {
+                    stickyBaseline.scheduleFlush()
                     return
                 }
                 let current = sequenceWatermark.value
@@ -2507,32 +2526,27 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     requestedAfterSequence: current,
                     currentSequence: current
                 ) else {
-                    pressureBaselineGate.markPending()
-                    scheduleStickyBaselineFlush()
+                    gate.markPending()
+                    stickyBaseline.scheduleFlush()
                     return
                 }
                 enum EmitOutcome { case accepted, retryable, terminalClosed }
                 let outcome: EmitOutcome = {
                     switch outbound.enqueueApplication(baselineData) {
-                    case .accepted:
-                        return .accepted
+                    case .accepted: return .accepted
                     case .queueFull:
                         _ = outbound.degrade()
                         switch outbound.enqueueApplication(baselineData) {
-                        case .accepted:
-                            return .accepted
-                        case .queueFull:
-                            return .retryable
-                        case .closed:
-                            return .terminalClosed
+                        case .accepted: return .accepted
+                        case .queueFull: return .retryable
+                        case .closed: return .terminalClosed
                         }
-                    case .closed:
-                        return .terminalClosed
+                    case .closed: return .terminalClosed
                     }
                 }()
                 switch outcome {
                 case .accepted:
-                    pressureBaselineGate.recordSuccess(forGeneration: generation)
+                    gate.recordSuccess(forGeneration: generation)
                     NSLog(
                         "[RC2.WS] outbound pressure: baseline_required without close seq=%lld",
                         current
@@ -2542,27 +2556,15 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         "baseline_required": .bool(true),
                         "current_sequence": .number(Double(current))
                     ]))
-                    if pressureBaselineGate.hasPendingRecovery {
-                        scheduleStickyBaselineFlush()
-                    }
+                    if gate.hasPendingRecovery { stickyBaseline.scheduleFlush() }
                 case .retryable:
-                    pressureBaselineGate.markPending()
-                    scheduleStickyBaselineFlush()
+                    gate.markPending()
+                    stickyBaseline.scheduleFlush()
                 case .terminalClosed:
-                    // Connection gone: never re-arm sticky recovery.
-                    pressureBaselineGate.markClosed()
+                    stickyBaseline.close()
                 }
             }
-            scheduleStickyBaselineFlush = { [pressureBaselineGate] in
-                // Single-flight: floods arm at most one delayed flush at a time.
-                guard pressureBaselineGate.armFlushIfNeeded() else { return }
-                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.05) { [pressureBaselineGate] in
-                    pressureBaselineGate.clearFlushArm()
-                    if pressureBaselineGate.hasPendingRecovery {
-                        emitPressureBaseline()
-                    }
-                }
-            }
+            let emitPressureBaseline: @Sendable () -> Void = { stickyBaseline.emit() }
             let recordAcceptedEvent: @Sendable (Data) -> Void = { data in
                 if case .event(let frame) = try? ConnectionTransportFrame.decodeStrict(data) {
                     if case .gap(let expected, let received) = sequenceWatermark.recordEnqueuedEvent(
@@ -2830,6 +2832,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             )
             heartbeatTimer.cancel()
             batcher.stop()
+            stickyBaseline.close()
             outbound.close()
             outbound.finish()
             // Remove this connection's last sampled contribution (not post-close

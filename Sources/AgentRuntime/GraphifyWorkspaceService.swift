@@ -936,18 +936,8 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         if alreadyCancelled {
             p.terminate()
         }
-        // Parallel bounded drain: never unbounded readDataToEndOfFile (S9).
-        final class Box: @unchecked Sendable { var data = Data() }
-        let errBox = Box()
-        let outBox = Box()
-        let q = DispatchQueue(label: "io.remotecode.graphify.pipe.drain", attributes: .concurrent)
-        let errHandle = err.fileHandleForReading
-        let outHandle = out.fileHandleForReading
-        let maxOut = GraphifyRuntimeHardening.maxStdoutCaptureBytes
-        let maxErr = GraphifyRuntimeHardening.maxStderrCaptureBytes
-        q.async { errBox.data = GraphifyRuntimeHardening.boundedRead(handle: errHandle, maxBytes: maxErr) }
-        q.async { outBox.data = GraphifyRuntimeHardening.boundedRead(handle: outHandle, maxBytes: maxOut) }
-        // Bounded wait: wedged graphify/git must not leave schedule inFlight forever.
+        // Wait for process first; then deadline-bound nonblocking drain so a
+        // descendant holding pipe ends cannot hang Graphify forever (S9).
         let timeout = processTimeoutSeconds > 0 ? processTimeoutSeconds : 180
         let deadline = Date().addingTimeInterval(timeout)
         while p.isRunning && Date() < deadline {
@@ -960,24 +950,35 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             }
             Thread.sleep(forTimeInterval: 0.05)
         }
+        var timedOut = false
         if p.isRunning {
+            timedOut = true
             p.terminate()
             let killDeadline = Date().addingTimeInterval(1)
             while p.isRunning && Date() < killDeadline {
                 Thread.sleep(forTimeInterval: 0.05)
             }
             if p.isRunning { kill(p.processIdentifier, SIGKILL) }
-            q.sync(flags: .barrier) {}
-            lock.lock(); activeRebuildProcess = nil; lock.unlock()
-            return (-9, String(data: outBox.data, encoding: .utf8) ?? "", "graphify process timed out after \(Int(timeout))s")
+        } else {
+            p.waitUntilExit()
         }
-        p.waitUntilExit()
-        q.sync(flags: .barrier) {}
+        // Close write ends so EOF can arrive; drain with deadline (not EOF forever).
+        try? out.fileHandleForWriting.close()
+        try? err.fileHandleForWriting.close()
+        let maxOut = GraphifyRuntimeHardening.maxStdoutCaptureBytes
+        let maxErr = GraphifyRuntimeHardening.maxStderrCaptureBytes
+        var oData = BoundedPipeDrain.readRemaining(from: out.fileHandleForReading, timeout: 0.25)
+        var eData = BoundedPipeDrain.readRemaining(from: err.fileHandleForReading, timeout: 0.25)
+        if oData.count > maxOut { oData = oData.prefix(maxOut) + Data() }
+        if eData.count > maxErr { eData = eData.prefix(maxErr) + Data() }
         lock.lock(); activeRebuildProcess = nil; lock.unlock()
+        if timedOut {
+            return (-9, String(data: oData, encoding: .utf8) ?? "", "graphify process timed out after \(Int(timeout))s")
+        }
         return (
             p.terminationStatus,
-            String(data: outBox.data, encoding: .utf8) ?? "",
-            String(data: errBox.data, encoding: .utf8) ?? ""
+            String(data: oData, encoding: .utf8) ?? "",
+            String(data: eData, encoding: .utf8) ?? ""
         )
     }
 }

@@ -248,13 +248,21 @@ public enum CapacitySemanticHarness {
             parentsByDepth[level] = nextFrontier
         }
 
-        // Seeded fault plan against a deterministic subset of nodes.
+        // Seeded fault plan: ensure stop_race+resume pair on one node so resume
+        // recovery is exercisable (not assigned to unrelated live nodes only).
         var faults: [CapacityHarnessFault] = []
-        let faultBudget = min(8, nodes.count)
+        if let pairNode = nodes.first {
+            faults.append(CapacityHarnessFault(atMs: 50, nodeId: pairNode.id, kind: "stop_race"))
+            faults.append(CapacityHarnessFault(atMs: 150, nodeId: pairNode.id, kind: "resume"))
+        }
+        let remainingKinds = faultKinds.filter { $0 != "stop_race" && $0 != "resume" }
+        let faultBudget = min(6, max(0, nodes.count - 1))
         for i in 0..<faultBudget {
-            let node = nodes[i * max(1, nodes.count / faultBudget) % nodes.count]
-            let kind = faultKinds[i % faultKinds.count]
-            let atMs = Int64((i + 1) * 100)
+            let node = nodes[(i + 1) * max(1, nodes.count / max(1, faultBudget + 1)) % nodes.count]
+            let kind = remainingKinds.isEmpty
+                ? faultKinds[i % faultKinds.count]
+                : remainingKinds[i % remainingKinds.count]
+            let atMs = Int64((i + 2) * 100)
             faults.append(CapacityHarnessFault(atMs: atMs, nodeId: node.id, kind: kind))
         }
 
@@ -413,21 +421,29 @@ public enum CapacitySemanticHarness {
                 markProgress()
             }
 
-            // Due faults: active nodes + resume on cancelled (time-ordered).
+            // Due faults: active nodes; resume also on cancelled/failed terminals.
             for (faultIndex, fault) in schedule.faults.enumerated()
-            where !appliedFaultIndices.contains(faultIndex) && fault.atMs <= clock.nowMs {
+            where !appliedFaultIndices.contains(faultIndex)
+                && !skippedFaultIndices.contains(faultIndex)
+                && fault.atMs <= clock.nowMs {
                 guard let idx = byId[fault.nodeId] else { continue }
                 let status = nodes[idx].status
                 let isResume = fault.kind == CapacityHarnessKnownFaultKind.resume.rawValue
-                guard status == .active || (isResume && (status == .cancelled || status == .failed)) else {
-                    continue
+                if isResume {
+                    guard status == .cancelled || status == .failed || status == .active else { continue }
+                } else {
+                    guard status == .active else { continue }
                 }
                 switch applyFault(faultIndex: faultIndex, nodeIdx: idx) {
                 case .terminal:
                     activeQueue.removeAll { $0 == fault.nodeId }
                 case .requeue:
-                    break // already appended once
+                    break
                 case .none:
+                    // Resume may re-admit as waiting — ensure it can start.
+                    if isResume, nodes[idx].status == .waiting {
+                        // parent completed or root: activate next loop
+                    }
                     break
                 }
             }
