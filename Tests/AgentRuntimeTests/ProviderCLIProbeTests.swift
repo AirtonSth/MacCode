@@ -169,4 +169,30 @@ final class ProviderCLIProbeTests: XCTestCase {
         XCTAssertEqual(result.stdout, "updated claude\n",
                        "provider update actions must execute the provider-native update command with the selected instance environment")
     }
+
+    func test_failingUpdatePreservesTerminalStderrDiagnosticAndVisibleTruncationNotice() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let binary = dir.appendingPathComponent("claude")
+        try """
+        #!/bin/sh
+        if [ "$1" = "update" ]; then
+          python3 -c "import sys; sys.stderr.write('STALE UPDATE PREFIX\\n'); sys.stderr.write('x' * 200000); sys.stderr.write('\\nFINAL UPDATE STDERR DIAGNOSTIC\\n')"
+          exit 23
+        fi
+        exit 1
+        """.write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+
+        let result = ProviderCLIProbe.update(provider: .claude, binaryPath: binary.path, timeoutSeconds: 5.0)
+
+        XCTAssertFalse(result.ok)
+        XCTAssertEqual(result.status, 23)
+        XCTAssertTrue(result.stderr.contains("FINAL UPDATE STDERR DIAGNOSTIC"),
+                      "a failed update must preserve the provider's terminal stderr diagnostic, not just the beginning of a noisy stream")
+        XCTAssertTrue(result.stderr.contains("provider update output truncated"),
+                      "bounded update output must disclose that earlier bytes were discarded")
+        XCTAssertFalse(result.stderr.contains("STALE UPDATE PREFIX"),
+                       "suffix retention must discard stale prefix bytes while keeping the terminal failure marker")
+    }
 }

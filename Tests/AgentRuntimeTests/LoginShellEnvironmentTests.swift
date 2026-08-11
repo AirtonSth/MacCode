@@ -40,6 +40,29 @@ final class LoginShellEnvironmentTests: XCTestCase {
         XCTAssertNil(LoginShellEnvironment.parse(data("FOO=bar\u{0}oops no sentinel")))
     }
 
+    func test_captureOnce_drainsOverCapStdout_andRejectsPartialEnvironment() throws {
+        // Exercise the real Process reader: a child that emits beyond the cap
+        // must still reach EOF, or it can block forever on the pipe before the
+        // parser gets a chance to reject its incomplete environment.
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let shell = dir.appendingPathComponent("noisy-login-shell")
+        try """
+        #!/bin/sh
+        /usr/bin/printf '\\000__RC_LOGIN_ENV_V1__\\000PARTIAL=kept\\000'
+        /bin/dd if=/dev/zero bs=1048576 count=2 2>/dev/null
+        """.write(to: shell, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shell.path)
+
+        let result = LoginShellEnvironment.captureOnce(
+            parentEnvironment: [:],
+            shellPath: shell.path
+        )
+
+        XCTAssertNil(result,
+                     "an over-cap child must be drained to completion and then rejected instead of caching its sentinel-bearing prefix")
+    }
+
     func test_parse_skipsRecordsWithNoEquals() {
         let s = LoginShellEnvironment.sentinel
         let env = LoginShellEnvironment.parse(data("\u{0}\(s)\u{0}garbage\u{0}OK=1\u{0}"))

@@ -30,7 +30,9 @@ public enum LoginShellEnvironment {
 
     private static let maxAttempts = 2
     private static let captureTimeout: TimeInterval = 6
-    private static let outputCap = 4 * 1024 * 1024
+    /// Peak retained login-shell capture stdout (env -0 + startup noise).
+    /// 1 MiB is enough for large profiles; was 4 MiB (memory-loop tip).
+    static let outputCap = 1 * 1024 * 1024
 
     private static let lock = NSLock()
     private static var attempts = 0
@@ -151,8 +153,10 @@ public enum LoginShellEnvironment {
     }
 
     /// Default spawn: own stdin from /dev/null, discard stderr (so a flooding rc
-    /// cannot deadlock the stdout pipe), read stdout up to a cap on a background
-    /// queue, and hard-timeout by terminating then SIGKILLing the shell.
+    /// cannot deadlock the stdout pipe), drain stdout to EOF on a background queue
+    /// while retaining only a bounded prefix, and hard-timeout by terminating then
+    /// SIGKILLing the shell. A truncated or timed-out capture is rejected rather
+    /// than passed to `parse` as a partial environment.
     ///
     /// NOTE: uses `Process` (SIGTERM/SIGKILL to the shell). A daemon the rc detaches
     /// with `setsid`/`disown` can outlive the shell; this is a documented residual —
@@ -171,13 +175,13 @@ public enum LoginShellEnvironment {
         proc.standardOutput = outPipe
         let handle = outPipe.fileHandleForReading
 
-        var out = Data()
+        var accumulator = PipeAccumulator(maxBytes: outputCap)
         let readDone = DispatchSemaphore(value: 0)
         DispatchQueue.global(qos: .userInitiated).async {
-            while out.count < outputCap {
+            while true {
                 let chunk = handle.availableData
                 if chunk.isEmpty { break }
-                out.append(chunk)
+                accumulator.append(chunk)
             }
             readDone.signal()
         }
@@ -187,18 +191,28 @@ public enum LoginShellEnvironment {
         do {
             try proc.run()
         } catch {
+            try? handle.close()
             return nil
         }
 
+        var timedOut = false
         if exited.wait(timeout: .now() + timeout) == .timedOut {
+            timedOut = true
             proc.terminate()
             if exited.wait(timeout: .now() + 1) == .timedOut {
                 kill(proc.processIdentifier, SIGKILL)
                 _ = exited.wait(timeout: .now() + 1)
             }
         }
-        _ = readDone.wait(timeout: .now() + 2)
+        let drained = readDone.wait(timeout: .now() + 2) != .timedOut
+        if !drained {
+            // A detached descendant may retain stdout after the shell is killed.
+            // Closing our end releases the reader; this capture fails open instead
+            // of caching a prefix.
+            timedOut = true
+        }
         try? handle.close()
-        return out.isEmpty ? nil : out
+        guard drained, !timedOut, !accumulator.truncated else { return nil }
+        return accumulator.data.isEmpty ? nil : accumulator.data
     }
 }

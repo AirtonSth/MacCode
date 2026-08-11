@@ -2477,7 +2477,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// (Was 96 MB — too large for huge threads; older rows load via keyset pages.)
     /// First-paint / hot UI body budget. Lower than durable retention so opening
     /// a fat thread does not re-render multi-MiB of markdown on MainActor.
-    nonisolated static let fullLoadBodyBudgetBytes = 400 * 1024
+    /// Was 400 KiB; 128 KiB matches memory-loop tip first-paint aggressiveness.
+    nonisolated static let fullLoadBodyBudgetBytes = 128 * 1024
     /// Hot message page (newest first). Older durable rows remain outside the
     /// hot UI window (`messageHistoryIsPartial`) and load on demand via scroll.
     nonisolated static let messageHistoryPageLimit = 25
@@ -7692,8 +7693,10 @@ final class StreamEventBatch: @unchecked Sendable {
         /// Hot UI queue only — durable stream history is bounded separately.
         /// Smaller quanta keep each MainActor hop short so scrolling/composer
         /// stay responsive during tool storms (rehydrate fills gaps after).
-        var maxBufferedCount: Int = 8_192
-        var maxBufferedBytes: Int = 32 * 1_024 * 1_024
+        /// Was 8_192; 4_096 still covers tool storms without multi-thread queue bloat.
+        var maxBufferedCount: Int = 4_096
+        /// Was 32 MiB; 2 MiB keeps each MainActor hop short under multi-thread streams.
+        var maxBufferedBytes: Int = 2 * 1_024 * 1_024
         var drainCount: Int = 48
         var drainBytes: Int = 512 * 1_024
     }
@@ -9754,16 +9757,22 @@ public struct AgentAppView: View {
     // `utf8 ≤ limit` is a safe under-limit admission for the byte-budgeted cache
     // (slightly more eager to skip cache for multi-byte text — still correct).
     private static let dedupeCacheCharacterLimit = 16_384
+    /// Peak entries retained per assistant-text NSCache (normalized + compact).
+    /// Was 512; 128 matches other agent window caps (memory-loop tip).
+    nonisolated static let assistantTextDedupeCacheCountLimit = 128
+    /// Peak UTF-8 cost retained per assistant-text NSCache (normalized + compact).
+    /// Was 8 MiB; 128 KiB bounds stream-paint dedupe occupancy (memory-loop tip).
+    nonisolated static let assistantTextDedupeCacheCostLimit = 128 * 1024
     private static let normalizedTextCache: NSCache<NSString, NSString> = {
         let cache = NSCache<NSString, NSString>()
-        cache.countLimit = 512
-        cache.totalCostLimit = 8 * 1024 * 1024
+        cache.countLimit = assistantTextDedupeCacheCountLimit
+        cache.totalCostLimit = assistantTextDedupeCacheCostLimit
         return cache
     }()
     private static let compactTextCache: NSCache<NSString, NSString> = {
         let cache = NSCache<NSString, NSString>()
-        cache.countLimit = 512
-        cache.totalCostLimit = 8 * 1024 * 1024
+        cache.countLimit = assistantTextDedupeCacheCountLimit
+        cache.totalCostLimit = assistantTextDedupeCacheCostLimit
         return cache
     }()
 

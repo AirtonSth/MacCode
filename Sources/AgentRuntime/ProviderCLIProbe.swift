@@ -3,15 +3,73 @@ import CoreModel
 
 /// Accumulates pipe chunks drained concurrently and decodes to a UTF-8 String.
 /// Pure value helper — no actor state, safe to use on any thread.
+///
+/// PERF: version/auth probes use a prefix cap so a misbehaving CLI cannot pin
+/// multi-MB Data. User-triggered updates use the same bound as a suffix so their
+/// terminal diagnostics survive; truncation is surfaced by `update`.
 struct PipeAccumulator: Sendable {
+    enum Retention: Sendable {
+        case prefix
+        case suffix
+    }
+
+    /// Peak retained stdout/stderr per probe. Matches Token Saver /usage PTY
+    /// and Claude SDK npm install tails in order of magnitude; far above any
+    /// legitimate `--version` / auth JSON payload. Was unbounded, then 256 KiB.
+    static let defaultMaxBytes = 128 * 1_024
+
     private(set) var data: Data = Data()
+    private let maxBytes: Int
+    private let retention: Retention
+    private(set) var truncated = false
+
+    init(maxBytes: Int = defaultMaxBytes, retention: Retention = .prefix) {
+        self.maxBytes = max(1, maxBytes)
+        self.retention = retention
+    }
+
+    var isFull: Bool { data.count >= maxBytes }
 
     mutating func append(_ chunk: Data) {
-        data.append(chunk)
+        guard !chunk.isEmpty else { return }
+        if retention == .suffix {
+            data.append(chunk)
+            if data.count > maxBytes {
+                data.removeFirst(data.count - maxBytes)
+                truncated = true
+            }
+            return
+        }
+        let room = maxBytes - data.count
+        if room <= 0 {
+            truncated = true
+            return
+        }
+        if chunk.count <= room {
+            data.append(chunk)
+        } else {
+            data.append(chunk.prefix(room))
+            truncated = true
+        }
     }
 
     var string: String {
         String(decoding: data, as: UTF8.self)
+    }
+
+    static let truncationNotice = "[RemoteCode] provider update output truncated; showing the final diagnostic tail.\n"
+
+    /// User-facing update output makes bounded suffix retention explicit.
+    var renderedString: String {
+        guard truncated, retention == .suffix else { return string }
+        return "\(Self.truncationNotice)\(string)"
+    }
+
+    /// Pure prefix retention decision for unit tests (mirrors append policy).
+    static func retainedPrefix(_ data: Data, maxBytes: Int = defaultMaxBytes) -> Data {
+        let limit = max(1, maxBytes)
+        if data.count <= limit { return data }
+        return data.prefix(limit)
     }
 }
 
@@ -51,6 +109,10 @@ public enum ProviderCLIProbe {
         let status: Int32
         let stdout: String
         let stderr: String
+        let stdoutTruncated: Bool
+        let stderrTruncated: Bool
+        let renderedStdout: String
+        let renderedStderr: String
     }
 
     public static func version(binaryPath: String, environment: [String: String] = [:], timeoutSeconds: TimeInterval = 2.0) -> String? {
@@ -163,24 +225,26 @@ public enum ProviderCLIProbe {
         case .codex, .claude, .grok:
             arguments = ["update"]
         }
-        guard let result = run(binaryPath: binaryPath, arguments: arguments, environment: environment, timeoutSeconds: timeoutSeconds) else {
+        guard let result = run(binaryPath: binaryPath, arguments: arguments, environment: environment, timeoutSeconds: timeoutSeconds, retention: .suffix) else {
             return UpdateResult(ok: false, status: -1, stdout: "", stderr: "provider update command failed to start or timed out")
         }
-        return UpdateResult(ok: result.status == 0, status: result.status, stdout: result.stdout, stderr: result.stderr)
+        return UpdateResult(ok: result.status == 0, status: result.status, stdout: result.renderedStdout, stderr: result.renderedStderr)
     }
 
     static func run(
         binaryPath: String,
         arguments: [String],
         environment: [String: String],
-        timeoutSeconds: TimeInterval
+        timeoutSeconds: TimeInterval,
+        retention: PipeAccumulator.Retention = .prefix
     ) -> CommandResult? {
         run(
             binaryPath: binaryPath,
             arguments: arguments,
             environment: environment,
             runAsUser: nil,
-            timeoutSeconds: timeoutSeconds
+            timeoutSeconds: timeoutSeconds,
+            retention: retention
         )
     }
 
@@ -189,7 +253,8 @@ public enum ProviderCLIProbe {
         arguments: [String],
         environment: [String: String],
         runAsUser: AgentRunAsUser?,
-        timeoutSeconds: TimeInterval
+        timeoutSeconds: TimeInterval,
+        retention: PipeAccumulator.Retention = .prefix
     ) -> CommandResult? {
         let trimmed = binaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -226,28 +291,39 @@ public enum ProviderCLIProbe {
         // macOS), stall, and prevent the process from exiting — which would
         // burn the full timeout before SIGTERM.
         //
-        // Each background thread calls readDataToEndOfFile() which blocks
-        // inside the kernel until EOF (pipe closed by child exit). The
-        // terminationHandler semaphore is signalled only after the child has
-        // exited, at which point the pipe write-ends are closed and the reads
-        // unblock. drainDone.wait() then collects the results safely because
-        // no concurrent mutation occurs after that point.
+        // Chunked drain keeps at most PipeAccumulator.defaultMaxBytes according
+        // to the probe's retention mode while still reading to EOF, so multi-MB
+        // floods cannot pin process memory and the pipe never back-pressures the
+        // child. Version/auth use the prefix; updates use the diagnostic suffix.
         let drainDone = DispatchGroup()
         let resultLock = NSLock()
         var stdoutData = Data()
         var stderrData = Data()
+        let outputByteLimit = PipeAccumulator.defaultMaxBytes
+        var stdoutTruncated = false
+        var stderrTruncated = false
+        var renderedStdout = ""
+        var renderedStderr = ""
 
         drainDone.enter()
         DispatchQueue.global(qos: .userInitiated).async {
-            let data = out.fileHandleForReading.readDataToEndOfFile()
-            resultLock.lock(); stdoutData = data; resultLock.unlock()
+            let drained = Self.drainCappedResult(
+                from: out.fileHandleForReading,
+                maxBytes: outputByteLimit,
+                retention: retention
+            )
+            resultLock.lock(); stdoutData = drained.data; stdoutTruncated = drained.truncated; renderedStdout = drained.renderedString; resultLock.unlock()
             drainDone.leave()
         }
 
         drainDone.enter()
         DispatchQueue.global(qos: .userInitiated).async {
-            let data = err.fileHandleForReading.readDataToEndOfFile()
-            resultLock.lock(); stderrData = data; resultLock.unlock()
+            let drained = Self.drainCappedResult(
+                from: err.fileHandleForReading,
+                maxBytes: outputByteLimit,
+                retention: retention
+            )
+            resultLock.lock(); stderrData = drained.data; stderrTruncated = drained.truncated; renderedStderr = drained.renderedString; resultLock.unlock()
             drainDone.leave()
         }
 
@@ -267,12 +343,47 @@ public enum ProviderCLIProbe {
         }
 
         // Child has exited; pipe write-ends are now closed; drain tasks will
-        // return readDataToEndOfFile imminently. Wait for them before reading.
+        // finish reading to EOF imminently. Wait for them before reading.
         drainDone.wait()
 
         let stdout = String(decoding: stdoutData, as: UTF8.self)
         let stderr = String(decoding: stderrData, as: UTF8.self)
-        return CommandResult(status: proc.terminationStatus, stdout: stdout, stderr: stderr)
+        return CommandResult(
+            status: proc.terminationStatus,
+            stdout: stdout,
+            stderr: stderr,
+            stdoutTruncated: stdoutTruncated,
+            stderrTruncated: stderrTruncated,
+            renderedStdout: renderedStdout,
+            renderedStderr: renderedStderr
+        )
+    }
+
+    /// Drain a pipe handle to EOF, retaining a bounded prefix or suffix.
+    /// Continues reading after the cap so the child cannot block on a full pipe.
+    struct DrainedOutput {
+        let data: Data
+        let truncated: Bool
+        let renderedString: String
+    }
+
+    static func drainCapped(from handle: FileHandle, maxBytes: Int) -> Data {
+        drainCappedResult(from: handle, maxBytes: maxBytes, retention: .prefix).data
+    }
+
+    static func drainCappedResult(
+        from handle: FileHandle,
+        maxBytes: Int,
+        retention: PipeAccumulator.Retention
+    ) -> DrainedOutput {
+        var acc = PipeAccumulator(maxBytes: maxBytes, retention: retention)
+        let chunkSize = 16 * 1_024
+        while true {
+            let chunk = handle.readData(ofLength: chunkSize)
+            if chunk.isEmpty { break }
+            acc.append(chunk)
+        }
+        return DrainedOutput(data: acc.data, truncated: acc.truncated, renderedString: acc.renderedString)
     }
 
     private static func authBoolean(from text: String) -> Bool? {
