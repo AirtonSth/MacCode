@@ -544,6 +544,33 @@ final class ProviderPreparationProductionWiringTests: XCTestCase {
         )
     }
 
+    /// Cancelled preflight without startRun must not leave residual bookkeeping.
+    func test_discardReservation_clearsCancelTokens() {
+        let tmp = NSTemporaryDirectory() + "rc2-prep-discard-" + UUID().uuidString
+        let (_, db) = try! Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: AgentThreadRepository(db: db),
+            providers: [:]
+        )
+        let threadId = AgentThreadID()
+        let runId = AgentRunID()
+        coordinator.reserveProviderStart(threadId: threadId, runId: runId)
+        coordinator.cancelPreparation(threadId: threadId)
+        XCTAssertGreaterThan(
+            coordinator.residualProviderStartBookkeepingCount(threadId: threadId),
+            0,
+            "cancel while reserved should leave a cancel token until discarded"
+        )
+        coordinator.discardProviderStartReservation(threadId: threadId, runId: runId)
+        XCTAssertEqual(
+            coordinator.residualProviderStartBookkeepingCount(threadId: threadId),
+            0,
+            "abandoned preflight must leave zero residual cancel/reserve entries"
+        )
+    }
+
     /// Surface-only cancel before reserve must not leave pendingThreadStops that
     /// poison an immediate resend.
     func test_cancelWithoutReserve_doesNotPoisonResend() async throws {

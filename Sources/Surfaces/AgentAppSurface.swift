@@ -408,6 +408,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Generation that currently owns prep for each thread.
     /// A superseded/cancelled prep must not clear a newer generation's marker.
     private var preparingRunGeneration: [AgentThreadID: UInt64] = [:]
+    /// Run identity accepted for in-flight surface preparation (Stop abandon cleanup).
+    private var preparingRunId: [AgentThreadID: AgentRunID] = [:]
     /// UX-MAC_AGENT-009: true while the last surfaced error is recoverable, so
     /// the transcript can offer a Retry of the last prompt instead of forcing a
     /// retype. Cleared when a run starts or any non-error event arrives.
@@ -4023,9 +4025,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return true
     }
 
-    private func beginSurfacePreparation(threadId: AgentThreadID, generation: UInt64) {
+    private func beginSurfacePreparation(threadId: AgentThreadID, generation: UInt64, runId: AgentRunID) {
         preparingRunThreads.insert(threadId)
         preparingRunGeneration[threadId] = generation
+        preparingRunId[threadId] = runId
         if selectedThreadId == threadId {
             preparingRunThreadId = threadId
         }
@@ -4035,6 +4038,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard preparingRunGeneration[threadId] == generation else { return }
         preparingRunThreads.remove(threadId)
         preparingRunGeneration.removeValue(forKey: threadId)
+        preparingRunId.removeValue(forKey: threadId)
         if preparingRunThreadId == threadId {
             preparingRunThreadId = selectedThreadId.flatMap {
                 preparingRunThreads.contains($0) ? $0 : nil
@@ -4048,14 +4052,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             state: current,
             event: .stopRequested
         ).state
+        let abandonedRunId = preparingRunId[threadId]
         preparingRunThreads.remove(threadId)
         preparingRunGeneration.removeValue(forKey: threadId)
+        preparingRunId.removeValue(forKey: threadId)
         if preparingRunThreadId == threadId {
             preparingRunThreadId = selectedThreadId.flatMap {
                 preparingRunThreads.contains($0) ? $0 : nil
             }
         }
         coordinator.cancelPreparation(threadId: threadId)
+        // Local Stop does not reach startRun — drop cancel tokens so they cannot leak.
+        if let abandonedRunId {
+            coordinator.discardProviderStartReservation(threadId: threadId, runId: abandonedRunId)
+        }
     }
 
     /// Busy for Stop/Escape: tracked runs, scheduled runs, or in-flight preparation.
@@ -4976,6 +4986,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             lastPersistedFinalIdByThread.removeValue(forKey: id)
             queueStatusByThread.removeValue(forKey: id)
             providerThreadSnapshotConfirmedAtByThread.removeValue(forKey: id)
+            surfacePreparationStates.removeValue(forKey: id)
+            preparingRunThreads.remove(id)
+            preparingRunGeneration.removeValue(forKey: id)
+            preparingRunId.removeValue(forKey: id)
             coordinator.forgetThread(id)
         }
     }
@@ -5976,7 +5990,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         )
         surfacePreparationStates[tid] = surfaceAccept.state
         let acceptedGeneration = surfaceAccept.state.generation
-        beginSurfacePreparation(threadId: tid, generation: acceptedGeneration)
+        beginSurfacePreparation(threadId: tid, generation: acceptedGeneration, runId: runId)
         // Coordinator-owned reservation before Graphify await so RPC/iOS Stop
         // during root resolution can cancel this run (not only local UI Stop).
         coordinator.reserveProviderStart(threadId: tid, runId: runId)
@@ -6223,25 +6237,37 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             return runId
         } catch {
-            let failed = ProviderPreparationStateMachine.apply(
+            let wasCancelled: Bool = {
+                if let acceptance = error as? AgentRunAcceptanceError,
+                   case .cancelled = acceptance {
+                    return true
+                }
+                return false
+            }()
+            let finished = ProviderPreparationStateMachine.apply(
                 state: surfacePreparationStates[tid] ?? ProviderPreparationState(),
                 event: .providerFinished(
                     generation: acceptedGeneration,
-                    reason: .providerFailure
+                    reason: wasCancelled ? .cancelled : .providerFailure
                 )
             )
-            if !failed.suppressLateCallback {
-                surfacePreparationStates[tid] = failed.state
+            if !finished.suppressLateCallback {
+                surfacePreparationStates[tid] = finished.state
             }
             runThreads[runId] = nil
             if preparingRunGeneration[tid] == acceptedGeneration
                 || preparingRunGeneration[tid] == nil {
                 await MainActor.run {
                     if self.selectedThreadId == tid {
-                        let detail = (error as? LocalizedError)?.errorDescription
-                            ?? error.localizedDescription
-                        self.statusMessage = "Failed to start: \(detail)"
-                        self.status = .failed
+                        if wasCancelled {
+                            self.statusMessage = "Run cancelled during preparation"
+                            self.status = .cancelled
+                        } else {
+                            let detail = (error as? LocalizedError)?.errorDescription
+                                ?? error.localizedDescription
+                            self.statusMessage = "Failed to start: \(detail)"
+                            self.status = .failed
+                        }
                         if self.currentRunId == runId {
                             self.currentRunId = nil
                             self.runStartedAt = nil

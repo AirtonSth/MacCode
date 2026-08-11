@@ -961,8 +961,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private var reservedProviderStarts: [AgentRunID: AgentThreadID] = [:]
     /// Run-scoped cancels: one thread-level Stop can mark every reserved run so
     /// a late sibling registration cannot spawn after the first consumes
-    /// `pendingThreadStops`.
-    private var cancelledProviderStartRuns: Set<AgentRunID> = []
+    /// `pendingThreadStops`. Value is the thread so deletion can evict tokens.
+    private var cancelledProviderStartRuns: [AgentRunID: AgentThreadID] = [:]
     /// Runs whose destructive caller is waiting for provider/process teardown.
     /// The matching terminal callback is recorded even when markStopRequested
     /// already made the durable run row terminal.
@@ -1393,7 +1393,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
             // Re-arm thread stop when this exact run was cancelled while reserved
             // (sibling may already have consumed a prior pendingThreadStops entry).
-            if cancelledProviderStartRuns.remove(runId) != nil {
+            if cancelledProviderStartRuns.removeValue(forKey: runId) != nil {
                 pendingThreadStops.insert(request.threadId)
             }
             rememberRunThreadOwnershipLocked(runId: runId, threadId: request.threadId)
@@ -2426,7 +2426,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // arm thread-level pendingThreadStops for reservation-only gaps — a
         // fresh resend reserved after Stop must not consume a stale thread stop.
         for runId in reservedForThread.keys {
-            cancelledProviderStartRuns.insert(runId)
+            cancelledProviderStartRuns[runId] = threadId
         }
         if pendingProviderStarts[threadId] != nil {
             pendingThreadStops.insert(threadId)
@@ -2443,7 +2443,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.lock()
         reservedProviderStarts[runId] = threadId
         // A fresh reserve is a new attempt — clear any stale cancel token for this run.
-        cancelledProviderStartRuns.remove(runId)
+        cancelledProviderStartRuns.removeValue(forKey: runId)
         lock.unlock()
     }
 
@@ -2452,7 +2452,29 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         if reservedProviderStarts[runId] == threadId {
             reservedProviderStarts.removeValue(forKey: runId)
         }
+        cancelledProviderStartRuns.removeValue(forKey: runId)
         lock.unlock()
+    }
+
+    /// Local Stop abandoned this run without startRun — drop cancel tokens so
+    /// process-lifetime state does not grow from cancelled preflights.
+    public func discardProviderStartReservation(threadId: AgentThreadID, runId: AgentRunID) {
+        lock.lock()
+        if reservedProviderStarts[runId] == threadId {
+            reservedProviderStarts.removeValue(forKey: runId)
+        }
+        if cancelledProviderStartRuns[runId] == threadId {
+            cancelledProviderStartRuns.removeValue(forKey: runId)
+        }
+        lock.unlock()
+    }
+
+    /// Test/telemetry: residual cancellation/reservation bookkeeping for a thread.
+    public func residualProviderStartBookkeepingCount(threadId: AgentThreadID) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let reserved = reservedProviderStarts.values.filter { $0 == threadId }.count
+        let cancelled = cancelledProviderStartRuns.values.filter { $0 == threadId }.count
+        return reserved + cancelled
     }
 
     @discardableResult
@@ -2902,6 +2924,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         autoContinuationCounts.removeValue(forKey: threadId)
         autoContinuationTokens.removeValue(forKey: threadId)
         lastPersistedAssistantContent.removeValue(forKey: threadId)
+        preparationStates.removeValue(forKey: threadId)
+        pendingProviderStarts.removeValue(forKey: threadId)
+        pendingThreadStops.remove(threadId)
+        reservedProviderStarts = reservedProviderStarts.filter { $0.value != threadId }
+        cancelledProviderStartRuns = cancelledProviderStartRuns.filter { $0.value != threadId }
         if lastCheckpointRevertUndo?.threadId == threadId {
             lastCheckpointRevertUndo = nil
         }
