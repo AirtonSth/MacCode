@@ -251,11 +251,13 @@ final class ProviderPreparationProductionWiringTests: XCTestCase {
         )
 
         // Surface-side claim finished; startRun not registered yet.
-        coordinator.reserveProviderStart(threadId: thread.id)
+        let reservedRunId = AgentRunID()
+        coordinator.reserveProviderStart(threadId: thread.id, runId: reservedRunId)
         coordinator.cancelPreparation(threadId: thread.id)
 
         do {
             _ = try await coordinator.startRun(AgentRunRequest(
+                runId: reservedRunId,
                 threadId: thread.id,
                 provider: .codex,
                 model: "fake-model",
@@ -272,6 +274,63 @@ final class ProviderPreparationProductionWiringTests: XCTestCase {
             runner.startCount,
             0,
             "Stop in claim→startRun gap must prevent provider start"
+        )
+    }
+
+    /// Overlapping same-thread reservations: late registration of cancelled run A
+    /// must not clear run B's reservation (Codex multi-surface race).
+    func test_runScopedReserve_lateSiblingCannotClearResend() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-reserve-scope")
+        let thread = AgentThread(title: "prep-scope", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let runner = CountingRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: runner]
+        )
+
+        let runA = AgentRunID()
+        let runB = AgentRunID()
+        coordinator.reserveProviderStart(threadId: thread.id, runId: runA)
+        coordinator.cancelPreparation(threadId: thread.id) // arms stop, clears A
+        coordinator.reserveProviderStart(threadId: thread.id, runId: runB)
+
+        // Late A registration: must not drop B's reservation.
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                runId: runA,
+                threadId: thread.id,
+                provider: .codex,
+                model: "fake-model",
+                cwd: tmp,
+                prompt: "late A"
+            ))
+        } catch {
+            // cancelled expected
+        }
+        XCTAssertEqual(runner.startCount, 0, "cancelled A must not spawn")
+
+        // Stop B while still reserved (no pending yet) must arm again.
+        coordinator.cancelPreparation(threadId: thread.id)
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                runId: runB,
+                threadId: thread.id,
+                provider: .codex,
+                model: "fake-model",
+                cwd: tmp,
+                prompt: "B after Stop"
+            ))
+        } catch {
+            // cancelled expected
+        }
+        XCTAssertEqual(
+            runner.startCount,
+            0,
+            "Stop B after late A must still block B spawn (run-scoped reserve)"
         )
     }
 

@@ -217,7 +217,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                 let additionalBytes = max(0, candidate.count - previousBytes)
                 let isReplacement = previous != nil
                 if !isReplacement {
-                    if self.wouldExceedAdmissionLocked(additionalBytes: candidate.count) {
+                    if self.wouldExceedAdmissionLocked(additionalBytes: candidate.count, additionalCount: 1) {
                         self.handleOverflowLocked(reason: "admission_bytes_or_count")
                     }
                     guard self.canAdmitSingleFrameLocked(byteCount: candidate.count) else {
@@ -230,11 +230,15 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                         return
                     }
                 } else if additionalBytes > 0 {
-                    if self.wouldExceedAdmissionLocked(additionalBytes: additionalBytes) {
+                    // Replacement does not consume an extra count slot — only byte growth.
+                    if self.wouldExceedAdmissionLocked(additionalBytes: additionalBytes, additionalCount: 0) {
                         // Overflow clears pending; re-admit as a brand-new full frame.
                         self.handleOverflowLocked(reason: "admission_bytes_or_count")
                         guard self.canAdmitSingleFrameLocked(byteCount: candidate.count),
-                              !self.wouldExceedAdmissionLocked(additionalBytes: candidate.count)
+                              !self.wouldExceedAdmissionLocked(
+                                additionalBytes: candidate.count,
+                                additionalCount: 1
+                              )
                         else {
                             var lost: [Int64] = []
                             if let seq = WebSocketOutboundQueue.eventSequence(in: data) {
@@ -332,9 +336,11 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         }
     }
 
-    private func wouldExceedAdmissionLocked(additionalBytes: Int) -> Bool {
+    /// - Parameter additionalCount: 1 for a new entry; 0 for last-write-wins /
+    ///   merge replacement of an existing key (count is unchanged).
+    private func wouldExceedAdmissionLocked(additionalBytes: Int, additionalCount: Int = 1) -> Bool {
         let count = pending.count + nilKeyQueue.count
-        if count + 1 > maxPendingCount { return true }
+        if additionalCount > 0, count + additionalCount > maxPendingCount { return true }
         if pendingBytes + additionalBytes > maxPendingBytes { return true }
         return false
     }

@@ -4403,7 +4403,33 @@ public final class AgentRunRepository: @unchecked Sendable {
                 remainingByteBudget: maxPayloadBytes
             )
         }
-        return try decodeStreamEventPayloads(payloads, strictDecoding: strictDecoding)
+        // Legacy / unbounded-callers still admit by authoritative original size
+        // under the presentation ceiling so rehydrate cannot expand a single
+        // recovery blob past maximumPersistedEventRowBytes under the mirror lock.
+        let rehydrateBudget = Int64(Self.maximumPersistedEventRowBytes)
+        var admitted: [(eventId: Int64, data: Data)] = []
+        var used: Int64 = 0
+        for payload in payloads.reversed() {
+            let text = String(decoding: payload.data, as: UTF8.self)
+            let original = Int64(AuthoritativePayloadRecovery.authoritativeByteCount(forStoredPayload: text))
+            if admitted.isEmpty && original > rehydrateBudget {
+                if strictDecoding {
+                    throw PersistenceDataError.corruptStreamEvent(
+                        "row \(payload.eventId) original \(original) exceeds presentation ceiling \(rehydrateBudget)"
+                    )
+                }
+                return []
+            }
+            if used + original > rehydrateBudget { break }
+            admitted.append(payload)
+            used += original
+        }
+        payloads = admitted.reversed()
+        return try decodeStreamEventPayloads(
+            payloads,
+            strictDecoding: strictDecoding,
+            remainingByteBudget: rehydrateBudget
+        )
     }
 
     // MARK: - agent.thread.read response_version=1 (metadata-first)

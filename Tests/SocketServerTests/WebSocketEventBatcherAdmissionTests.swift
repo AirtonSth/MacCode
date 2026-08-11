@@ -102,6 +102,48 @@ final class WebSocketEventBatcherAdmissionTests: XCTestCase {
         batcher.stop()
     }
 
+    /// Growing keyed replacement must not consume an extra count slot (Codex IMPORTANT).
+    func test_keyedReplacement_doesNotConsumeExtraCountSlot() {
+        let lock = NSLock()
+        var overflowCount = 0
+        // cellularSafe coalesces agent.item.delta by item_id (concat merge).
+        let batcher = WebSocketEventBatcher(
+            enabled: true,
+            filter: .cellularSafe(),
+            delay: 10,
+            maxPendingBytes: 1_000_000,
+            maxPendingCount: 1,
+            maxPendingAge: 60,
+            onAdmissionOverflow: { _, _ in
+                lock.lock(); overflowCount += 1; lock.unlock()
+            },
+            send: { _ in }
+        )
+
+        let itemId = "item-count-delta"
+        let first = makeItemDeltaFrame(sequence: 1, itemId: itemId, text: "a")
+        let second = makeItemDeltaFrame(sequence: 2, itemId: itemId, text: "b")
+        batcher.enqueue(event: first.event, data: first.data)
+        // Wait until first is pending.
+        let deadline1 = Date().addingTimeInterval(0.5)
+        while Date() < deadline1 {
+            if batcher.admissionSnapshot().count >= 1 { break }
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        batcher.enqueue(event: second.event, data: second.data)
+        Thread.sleep(forTimeInterval: 0.05)
+
+        lock.lock(); let overflows = overflowCount; lock.unlock()
+        XCTAssertEqual(
+            overflows,
+            0,
+            "byte-fitting keyed replacement at count ceiling must not overflow"
+        )
+        let snap = batcher.admissionSnapshot()
+        XCTAssertEqual(snap.count, 1, "replacement keeps a single pending entry")
+        batcher.stop()
+    }
+
     private func makeEventFrame(kind: String, sequence: Int64, body: String) -> Data {
         let object: [String: Any] = [
             "type": "event",
@@ -110,5 +152,32 @@ final class WebSocketEventBatcherAdmissionTests: XCTestCase {
             "payload": ["body": body],
         ]
         return try! JSONSerialization.data(withJSONObject: object)
+    }
+
+    private func makeItemDeltaFrame(
+        sequence: Int64,
+        itemId: String,
+        text: String
+    ) -> (event: EventBus.Event, data: Data) {
+        let object: [String: Any] = [
+            "type": "event",
+            "sequence": sequence,
+            "kind": "agent.item.delta",
+            "payload": [
+                "item_id": itemId,
+                "text": text,
+            ],
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: object)
+        let event = EventBus.Event(
+            seq: sequence,
+            kind: "agent.item.delta",
+            payload: .object([
+                "item_id": .string(itemId),
+                "text": .string(text),
+            ]),
+            ts: 0
+        )
+        return (event, data)
     }
 }

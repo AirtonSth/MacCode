@@ -956,8 +956,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// Stop/Escape applies `.stopRequested` so a late `claimSpawn` cannot write.
     private var preparationStates: [AgentThreadID: ProviderPreparationState] = [:]
     /// Surface claimed prep but `startRun` has not yet registered pendingProviderStarts.
-    /// Stop in this window must still arm pendingThreadStops so spawn is blocked.
-    private var reservedProviderStarts: Set<AgentThreadID> = []
+    /// Keyed by runId so a late startRun for run A cannot clear run B's reservation
+    /// on the same thread (multi-surface / resend overlap).
+    private var reservedProviderStarts: [AgentRunID: AgentThreadID] = [:]
     /// Runs whose destructive caller is waiting for provider/process teardown.
     /// The matching terminal callback is recorded even when markStopRequested
     /// already made the durable run row terminal.
@@ -1382,7 +1383,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let registeredPendingStart: Bool
         if pendingProviderStarts[request.threadId] == nil {
             pendingProviderStarts[request.threadId] = pendingProviderStart
-            reservedProviderStarts.remove(request.threadId)
+            // Drop only this run's reservation — never a sibling resend's.
+            if reservedProviderStarts[runId] == request.threadId {
+                reservedProviderStarts.removeValue(forKey: runId)
+            }
             rememberRunThreadOwnershipLocked(runId: runId, threadId: request.threadId)
             registeredPendingStart = true
             // S5: accept generation-owned preparation as soon as the start is admitted.
@@ -2400,25 +2404,29 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public func cancelPreparation(threadId: AgentThreadID) {
         lock.lock()
         _ = applyPreparationLocked(threadId: threadId, event: .stopRequested)
-        if pendingProviderStarts[threadId] != nil
-            || reservedProviderStarts.contains(threadId) {
+        let hasReservation = reservedProviderStarts.contains { $0.value == threadId }
+        if pendingProviderStarts[threadId] != nil || hasReservation {
             pendingThreadStops.insert(threadId)
         }
-        reservedProviderStarts.remove(threadId)
+        reservedProviderStarts = reservedProviderStarts.filter { $0.value != threadId }
         lock.unlock()
     }
 
     /// Surface finished Graphify claim and is about to call startRun. Stop in the
     /// gap must arm pendingThreadStops so registration cannot spawn.
-    public func reserveProviderStart(threadId: AgentThreadID) {
+    /// Reservation is run-scoped so late registration of a cancelled run cannot
+    /// clear a concurrent resend reservation on the same thread.
+    public func reserveProviderStart(threadId: AgentThreadID, runId: AgentRunID) {
         lock.lock()
-        reservedProviderStarts.insert(threadId)
+        reservedProviderStarts[runId] = threadId
         lock.unlock()
     }
 
-    public func releaseProviderStartReservation(threadId: AgentThreadID) {
+    public func releaseProviderStartReservation(threadId: AgentThreadID, runId: AgentRunID) {
         lock.lock()
-        reservedProviderStarts.remove(threadId)
+        if reservedProviderStarts[runId] == threadId {
+            reservedProviderStarts.removeValue(forKey: runId)
+        }
         lock.unlock()
     }
 

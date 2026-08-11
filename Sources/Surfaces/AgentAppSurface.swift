@@ -6078,7 +6078,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         surfacePreparationStates[tid] = claimedState
         // Close Stop race: surface claimed, startRun not yet registered.
-        coordinator.reserveProviderStart(threadId: tid)
+        // Run-scoped so a late cancelled sibling cannot clear this reservation.
+        coordinator.reserveProviderStart(threadId: tid, runId: runId)
         let req = AgentRunRequest(
             runId: runId,
             threadId: tid,
@@ -6149,7 +6150,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             if currentRunId == runId {
                 currentRunId = nil
             }
-            coordinator.releaseProviderStartReservation(threadId: tid)
+            coordinator.releaseProviderStartReservation(threadId: tid, runId: runId)
             return nil
         }
         do {
@@ -6158,7 +6159,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 routingSnapshot: routingSnapshot,
                 recordUserMessage: !resumeInterrupted
             )
-            coordinator.releaseProviderStartReservation(threadId: tid)
+            coordinator.releaseProviderStartReservation(threadId: tid, runId: runId)
             // Surface claim consumed the permit; coordinator owns the live run.
             // Terminalize *this* generation so a second send can accept again.
             let done = ProviderPreparationStateMachine.apply(
@@ -6249,7 +6250,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     self.onRunStateChange?()
                 }
             }
-            coordinator.releaseProviderStartReservation(threadId: tid)
+            coordinator.releaseProviderStartReservation(threadId: tid, runId: runId)
             return nil
         }
     }
