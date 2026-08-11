@@ -16,13 +16,15 @@ public enum AuthoritativePayloadRecovery {
     /// Parse original byte count from an owned presentation trailer when present.
     /// Used for hot-replay admission so rehydrate cannot expand past the budget.
     /// `payload` may be a full row or only a trailing suffix (metadata path).
+    /// Requires a true suffix match and original ≥ presentation length so a
+    /// lookalike mid-payload marker cannot under-report admission bytes.
     public static func authoritativeByteCount(
         forStoredPayload payload: String,
         presentationFallback: Int? = nil
     ) -> Int {
         let presentation = presentationFallback ?? payload.utf8.count
-        // Allow match at end of full payload or within a short trailer suffix.
-        let pattern = #"…\[truncated rc_oversized_v1 (\d+)→(\d+) bytes\]\[\[rc:[0-9a-fA-F]+\]\]"#
+        // True suffix only (\\z). Mid-payload lookalikes are ignored.
+        let pattern = #"…\[truncated rc_oversized_v1 (\d+)→(\d+) bytes\]\[\[rc:[0-9a-fA-F]+\]\]\z"#
         guard let regex = try? NSRegularExpression(pattern: pattern),
               let match = regex.firstMatch(
                 in: payload,
@@ -35,6 +37,8 @@ public enum AuthoritativePayloadRecovery {
               original > 0 else {
             return presentation
         }
+        // Reject under-claims that would bypass the byte ceiling.
+        if original < presentation { return presentation }
         return original
     }
 

@@ -424,6 +424,10 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             if cancelled {
                 s.status = .missing
                 s.rebuildCancelled = false
+                // Drop any generation advanced inside ensureSync for this target.
+                if s.builtGeneration == targetGen {
+                    s.builtGeneration = max(0, targetGen &- 1)
+                }
             } else {
                 s.status = status
                 if status == .fresh {
@@ -437,6 +441,11 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             service.schedules[checkout.scheduleID] = s
             service.globalCLIInFlight = false
             service.activeRebuildProcess = nil
+            // Clear process-wide cancel once this in-flight rebuild is drained so
+            // a later re-enable can resolve binaries / HEAD probes again.
+            if cancelled {
+                service.activeRebuildCancelled = false
+            }
             let deferredIDs = cancelled ? [] : service.globalCLIRerunIDs
             service.globalCLIRerunIDs.removeAll(keepingCapacity: true)
             let deferredRoots = deferredIDs.compactMap { id -> String? in
@@ -447,8 +456,12 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             }
             service.lock.unlock()
 
+            // If cancel landed after ensureSync saved a fingerprint, remove it so
+            // restart cannot warm the cancelled generation as fresh.
+            if cancelled {
+                try? FileManager.default.removeItem(at: service.fingerprintPath(for: checkout))
+            }
             // Fingerprint is written only inside ensureSync when not cancelled.
-            // Do not re-save here: that raced with cancel and could publish fresh.
             // Kick deferred checkouts that waited on the global gate (at most one
             // trailing ensure per id via startEnsureIfNeeded coalescing).
             for displayRoot in deferredRoots {
@@ -738,8 +751,19 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     }
 
     /// Cancel the active graphify child and mark rebuilds cancelled (S9).
+    /// Only sticky while a rebuild is actually in flight; idle cancel is a no-op
+    /// so Token Saver off/on does not poison PATH/HEAD probes forever.
     public func cancelInFlightRebuildIfNeeded() {
         lock.lock()
+        let anyInFlight = globalCLIInFlight
+            || schedules.values.contains(where: \.inFlight)
+            || activeRebuildProcess != nil
+        if !anyInFlight {
+            // No live rebuild: clear sticky cancel so re-enable works.
+            activeRebuildCancelled = false
+            lock.unlock()
+            return
+        }
         activeRebuildCancelled = true
         let process = activeRebuildProcess
         for id in Array(schedules.keys) {
@@ -759,6 +783,18 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
                 kill(process.processIdentifier, SIGKILL)
             }
         }
+    }
+
+    /// Call when Graphify runtime becomes active again after disable.
+    public func resumeAfterDisable() {
+        lock.lock()
+        activeRebuildCancelled = false
+        for id in Array(schedules.keys) {
+            guard var s = schedules[id] else { continue }
+            s.rebuildCancelled = false
+            schedules[id] = s
+        }
+        lock.unlock()
     }
 
     // MARK: Sticky

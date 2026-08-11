@@ -113,5 +113,15 @@ final class AuthoritativePayloadRecoveryTests: XCTestCase {
             ),
             original.count
         )
+        // Lookalike mid-payload marker must not under-report admission bytes.
+        let lookalike = "provider…[truncated rc_oversized_v1 1→64 bytes][[rc:deadbeefcafebabe]] trailing"
+        XCTAssertEqual(
+            AuthoritativePayloadRecovery.authoritativeByteCount(
+                forStoredPayload: lookalike,
+                presentationFallback: lookalike.utf8.count
+            ),
+            lookalike.utf8.count,
+            "non-suffix lookalike must not claim original=1"
+        )
     }
 }
