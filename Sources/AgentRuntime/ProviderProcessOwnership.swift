@@ -64,6 +64,21 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
         self.maxRecords = max(1, maxRecords)
     }
 
+    private func withOwnershipLock<T>(_ body: () throws -> T) throws -> T {
+        let lockPath = lockFileURL.path
+        let lockFD = open(lockPath, O_RDWR | O_CREAT, 0o600)
+        guard lockFD >= 0 else {
+            throw ProviderProcessOwnershipError.processListFailed("ownership lock open failed")
+        }
+        defer { close(lockFD) }
+        if flock(lockFD, LOCK_EX) != 0 {
+            throw ProviderProcessOwnershipError.processListFailed("ownership lock acquire failed")
+        }
+        defer { _ = flock(lockFD, LOCK_UN) }
+        return try body()
+    }
+
+
     /// True when a verified sweep has reduced records to the downgrade ceiling.
     public func isWithinDowngradeSafeCeiling() throws -> Bool {
         try load().count <= Self.downgradeSafeRecordCeiling
@@ -78,20 +93,24 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
     public func replace(_ tags: [SpawnedProcessTag]) throws {
         lock.lock()
         defer { lock.unlock() }
-        try replaceUnlocked(tags)
+        try withOwnershipLock {
+            try replaceUnlocked(tags, alreadyLocked: true)
+        }
     }
 
     public func append(_ tag: SpawnedProcessTag) throws {
         lock.lock()
         defer { lock.unlock() }
-        // A corrupt/unreadable ledger is evidence, not an empty ledger. Never
-        // overwrite it while appending a newly spawned provider.
-        let existing = try loadUnlocked()
-        // Replace only the same pgid row; never suffix-evict live/unknown
-        // ownership for size (S4). Authoritative metadata is proportional to
-        // live/unknown roots. Spawns are never refused solely due to row count.
-        let next = existing.filter { $0.pgid != tag.pgid } + [tag]
-        try replaceUnlocked(next)
+        try withOwnershipLock {
+            // A corrupt/unreadable ledger is evidence, not an empty ledger. Never
+            // overwrite it while appending a newly spawned provider.
+            let existing = try loadUnlocked()
+            // Replace only the same pgid row; never suffix-evict live/unknown
+            // ownership for size (S4). Authoritative metadata is proportional to
+            // live/unknown roots. Spawns are never refused solely due to row count.
+            let next = existing.filter { $0.pgid != tag.pgid } + [tag]
+            try replaceUnlocked(next, alreadyLocked: true)
+        }
     }
 
     /// Remove only the exact process lifetime supplied by its owner. A reused
@@ -99,8 +118,10 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
     public func removeExact(_ tag: SpawnedProcessTag) throws {
         lock.lock()
         defer { lock.unlock() }
-        let current = try loadUnlocked()
-        try replaceUnlocked(current.filter { $0 != tag })
+        try withOwnershipLock {
+            let current = try loadUnlocked()
+            try replaceUnlocked(current.filter { $0 != tag }, alreadyLocked: true)
+        }
     }
 
     /// Commit decisions made from one sweep snapshot without erasing process
@@ -110,19 +131,21 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
     func commitSweep(snapshot: [SpawnedProcessTag], retainedFromSnapshot: [SpawnedProcessTag]) throws {
         lock.lock()
         defer { lock.unlock() }
-        let current = try loadUnlocked()
-        var snapshotByPID: [pid_t: SpawnedProcessTag] = [:]
-        for tag in snapshot { snapshotByPID[tag.pgid] = tag }
-        let next = current.filter { currentTag in
-            guard let snapshotTag = snapshotByPID[currentTag.pgid] else {
-                return true
+        try withOwnershipLock {
+            let current = try loadUnlocked()
+            var snapshotByPID: [pid_t: SpawnedProcessTag] = [:]
+            for tag in snapshot { snapshotByPID[tag.pgid] = tag }
+            let next = current.filter { currentTag in
+                guard let snapshotTag = snapshotByPID[currentTag.pgid] else {
+                    return true
+                }
+                guard currentTag == snapshotTag else {
+                    return true
+                }
+                return retainedFromSnapshot.contains(currentTag)
             }
-            guard currentTag == snapshotTag else {
-                return true
-            }
-            return retainedFromSnapshot.contains(currentTag)
+            try replaceUnlocked(next, alreadyLocked: true)
         }
-        try replaceUnlocked(next)
     }
 
     private func loadUnlocked() throws -> [SpawnedProcessTag] {
@@ -130,7 +153,7 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
         return try decoder.decode([SpawnedProcessTag].self, from: Data(contentsOf: fileURL))
     }
 
-    private func replaceUnlocked(_ tags: [SpawnedProcessTag]) throws {
+    private func replaceUnlocked(_ tags: [SpawnedProcessTag], alreadyLocked: Bool = false) throws {
         let fm = FileManager.default
         let parent = fileURL.deletingLastPathComponent()
         try fm.createDirectory(
@@ -138,17 +161,27 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        // Cross-process advisory lock (S4).
-        let lockPath = lockFileURL.path
-        let lockFD = open(lockPath, O_RDWR | O_CREAT, 0o600)
-        guard lockFD >= 0 else {
-            throw ProviderProcessOwnershipError.processListFailed("ownership lock open failed")
+        // Cross-process advisory lock (S4) — skipped when caller already holds it.
+        let lockFD: Int32
+        if alreadyLocked {
+            lockFD = -1
+        } else {
+            let lockPath = lockFileURL.path
+            lockFD = open(lockPath, O_RDWR | O_CREAT, 0o600)
+            guard lockFD >= 0 else {
+                throw ProviderProcessOwnershipError.processListFailed("ownership lock open failed")
+            }
+            if flock(lockFD, LOCK_EX) != 0 {
+                close(lockFD)
+                throw ProviderProcessOwnershipError.processListFailed("ownership lock acquire failed")
+            }
         }
-        defer { close(lockFD) }
-        if flock(lockFD, LOCK_EX) != 0 {
-            throw ProviderProcessOwnershipError.processListFailed("ownership lock acquire failed")
+        defer {
+            if lockFD >= 0 {
+                _ = flock(lockFD, LOCK_UN)
+                close(lockFD)
+            }
         }
-        defer { _ = flock(lockFD, LOCK_UN) }
 
         // 0600 temp under 0700 dir; atomic rename WITHOUT removing destination first.
         let temp = parent.appendingPathComponent(

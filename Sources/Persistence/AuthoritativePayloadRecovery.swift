@@ -76,11 +76,20 @@ public enum AuthoritativePayloadRecovery {
             throw RecoveryError.storeFailed(String(describing: error))
         }
 
-        let prefix = data.prefix(limit)
-        var presentation = String(decoding: prefix, as: UTF8.self)
-        // Ensure we do not claim a complete body: append recoverable marker.
+        // Emit a compact, valid JSON envelope (not a truncated JSON prefix).
+        // Replay paths decode JSON; the original is recovered via the handle.
         let marker = ReversibleContentStore.marker(for: handle)
-        presentation += "\n\(marker)\n"
+        let envelope: [String: Any] = [
+            "rc_oversized": true,
+            "original_bytes": byteCount,
+            "handle": handle,
+            "marker": marker,
+            "preview_utf8_prefix": String(decoding: data.prefix(min(256, limit)), as: UTF8.self),
+        ]
+        guard let envelopeData = try? JSONSerialization.data(withJSONObject: envelope),
+              let presentation = String(data: envelopeData, encoding: .utf8) else {
+            throw RecoveryError.storeFailed("envelope_encode")
+        }
 
         return RecoveryResult(
             presentationText: presentation,

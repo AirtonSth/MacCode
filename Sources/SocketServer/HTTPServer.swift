@@ -2614,23 +2614,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         sequenceWatermark.recordFilteredEvent(sequence: sequence)
                     }
                 },
-                // S10: admission overflow records lost sequences and requires baseline.
-                onAdmissionOverflow: { lostSequences, reason in
+                // S10: admission overflow records lost sequences and uses the
+                // established baselineRequired transport contract (not a custom event).
+                onAdmissionOverflow: { lostSequences, _reason in
                     for sequence in lostSequences {
                         sequenceWatermark.recordFilteredEvent(sequence: sequence)
                     }
-                    // Rate-limited baseline recovery: force client to re-sync.
-                    let baselinePayload: [String: Any] = [
-                        "type": "event",
-                        "kind": "baseline_required",
-                        "payload": [
-                            "reason": reason,
-                            "lost_count": lostSequences.count,
-                        ],
-                    ]
-                    if let data = try? JSONSerialization.data(withJSONObject: baselinePayload) {
-                        enqueueApplicationOrDegrade(data)
-                    }
+                    emitPressureBaseline()
                 }
             ) { data in
                 enqueueApplicationOrDegrade(data)

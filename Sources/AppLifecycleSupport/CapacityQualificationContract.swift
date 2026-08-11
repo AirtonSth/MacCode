@@ -408,12 +408,20 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
             if sample.value == nil {
                 throw CapacityContractError.requiredMetricNull(key)
             }
-            // Each required metric must appear in every warmed run.
+            guard let claimed = sample.value, claimed.isFinite, claimed >= 0 else {
+                throw CapacityContractError.invalidWorkload("metric \(key) must be finite and >= 0")
+            }
+            // Each required metric must appear in every warmed run; sample is the mean.
+            var sum = 0.0
             for run in warmedRuns {
-                guard let v = run.metrics[key] else {
+                guard let v = run.metrics[key], v.isFinite, v >= 0 else {
                     throw CapacityContractError.missingRequiredField("warmedRun.\(run.runIndex).\(key)")
                 }
-                _ = v
+                sum += v
+            }
+            let mean = sum / Double(warmedRuns.count)
+            if abs(claimed - mean) > 1e-9 {
+                throw CapacityContractError.invalidEstimator("sample \(key) != mean of warmedRuns")
             }
             guard metricVarianceMax[key] != nil else {
                 throw CapacityContractError.missingRequiredField("metricVarianceMax.\(key)")

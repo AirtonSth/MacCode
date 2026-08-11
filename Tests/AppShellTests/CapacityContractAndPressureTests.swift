@@ -364,26 +364,24 @@ final class CapacityContractAndPressureTests: XCTestCase {
         nullMetric: String? = nil,
         warmedRuns: Int = 3
     ) throws -> CapacityQualificationArtifact {
-        let samples = manifest.requiredMetrics.map { name in
-            CapacityMetricSample(
-                name: name,
-                value: name == nullMetric ? nil : 1,
-                unit: "unit"
-            )
-        }
         let runs = (0..<warmedRuns).map { idx -> CapacityWarmedRunObservation in
             let metrics = Dictionary(uniqueKeysWithValues: manifest.requiredMetrics.map { name -> (String, Double) in
-                // values 1.00, 1.01, 1.02 so variance is deterministic
                 (name, 1.0 + Double(idx) * 0.01)
             })
             return CapacityWarmedRunObservation(runIndex: idx, metrics: metrics)
         }
         var variance: [String: Double] = [:]
-        for key in manifest.requiredMetrics {
-            let values = runs.map { $0.metrics[key]! }
+        let samples = manifest.requiredMetrics.map { name -> CapacityMetricSample in
+            let values = runs.map { $0.metrics[name]! }
             let lo = values.min()!
             let hi = values.max()!
-            variance[key] = hi == 0 ? 0 : (hi - lo) / hi
+            variance[name] = hi == 0 ? 0 : (hi - lo) / hi
+            let mean = values.reduce(0, +) / Double(max(1, values.count))
+            return CapacityMetricSample(
+                name: name,
+                value: name == nullMetric ? nil : mean,
+                unit: "unit"
+            )
         }
         let digest = try manifest.contentDigest()
         return CapacityQualificationArtifact(
