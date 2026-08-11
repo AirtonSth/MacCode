@@ -552,7 +552,10 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         }
 
         if FileManager.default.fileExists(atPath: dest.path) {
-            // Re-check cancel immediately before durable freshness commit.
+            // Probe HEAD outside the scheduler lock (run() also takes the lock).
+            let head = currentHead(checkout.displayRoot)
+            // Single cancellation-owned commit boundary: schedule state + fingerprint
+            // decision under lock; if cancelled before/while writing, roll back.
             lock.lock()
             let cancelledBeforeCommit = activeRebuildCancelled
                 || (schedules[checkout.scheduleID]?.rebuildCancelled == true)
@@ -565,31 +568,47 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
                 lock.unlock()
                 return .missing
             }
-            lock.unlock()
-            let head = currentHead(checkout.displayRoot)
-            // Generation + fingerprint are committed only when still not cancelled.
-            lock.lock()
-            let stillCancelled = activeRebuildCancelled
-                || (schedules[checkout.scheduleID]?.rebuildCancelled == true)
-            if stillCancelled {
-                var s = schedules[checkout.scheduleID] ?? RefreshSchedule()
-                s.displayRoot = checkout.displayRoot
-                s.status = .missing
-                s.rebuildCancelled = false
-                schedules[checkout.scheduleID] = s
-                lock.unlock()
-                return .missing
-            }
             var s = schedules[checkout.scheduleID] ?? RefreshSchedule()
+            let previousBuilt = s.builtGeneration
+            let previousStatus = s.status
+            let previousHead = s.lastHead
+            let previousSuccess = s.lastSuccessfulUpdate
             s.displayRoot = checkout.displayRoot
             s.lastSuccessfulUpdate = Date()
             s.lastHead = head
             s.status = .fresh
             if s.dirtyGeneration == 0 { s.dirtyGeneration = 1 }
             s.builtGeneration = s.dirtyGeneration
+            let committedBuilt = s.builtGeneration
             schedules[checkout.scheduleID] = s
             lock.unlock()
+
             saveFingerprint(checkout, head: head)
+
+            // If cancel landed after schedule update, roll back freshness so a
+            // cancelled build cannot survive restart as fresh.
+            lock.lock()
+            let cancelledAfterFingerprint = activeRebuildCancelled
+                || (schedules[checkout.scheduleID]?.rebuildCancelled == true)
+            if cancelledAfterFingerprint {
+                var rolled = schedules[checkout.scheduleID] ?? RefreshSchedule()
+                rolled.builtGeneration = previousBuilt
+                rolled.status = previousStatus == .fresh ? .stale : previousStatus
+                rolled.lastHead = previousHead
+                rolled.lastSuccessfulUpdate = previousSuccess
+                rolled.rebuildCancelled = false
+                schedules[checkout.scheduleID] = rolled
+                lock.unlock()
+                // Best-effort: remove fingerprint so restart does not warm cancelled gen.
+                try? FileManager.default.removeItem(at: fingerprintPath(for: checkout))
+                return .missing
+            }
+            // Confirm generation still matches our commit (no intervening ensure).
+            if schedules[checkout.scheduleID]?.builtGeneration != committedBuilt {
+                lock.unlock()
+                return .missing
+            }
+            lock.unlock()
             return .fresh
         }
         return .missing
@@ -983,7 +1002,22 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         let deadline = Date().addingTimeInterval(timeout)
         let maxOut = GraphifyRuntimeHardening.maxStdoutCaptureBytes
         let maxErr = GraphifyRuntimeHardening.maxStderrCaptureBytes
-        final class Box: @unchecked Sendable { var data = Data() }
+        final class Box: @unchecked Sendable {
+            private let lock = NSLock()
+            private var storage = Data()
+            private var finished = false
+            func set(_ data: Data) {
+                lock.lock(); storage = data; finished = true; lock.unlock()
+            }
+            func get() -> Data {
+                lock.lock(); defer { lock.unlock() }
+                return storage
+            }
+            var isFinished: Bool {
+                lock.lock(); defer { lock.unlock() }
+                return finished
+            }
+        }
         let outBox = Box()
         let errBox = Box()
         let q = DispatchQueue(label: "io.remotecode.graphify.pipe.drain", attributes: .concurrent)
@@ -992,20 +1026,20 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         let drainGroup = DispatchGroup()
         drainGroup.enter()
         q.async {
-            outBox.data = BoundedPipeDrain.readRemaining(
+            outBox.set(BoundedPipeDrain.readRemaining(
                 from: outHandle,
                 timeout: timeout + 0.5,
                 maxBytes: maxOut
-            )
+            ))
             drainGroup.leave()
         }
         drainGroup.enter()
         q.async {
-            errBox.data = BoundedPipeDrain.readRemaining(
+            errBox.set(BoundedPipeDrain.readRemaining(
                 from: errHandle,
                 timeout: timeout + 0.5,
                 maxBytes: maxErr
-            )
+            ))
             drainGroup.leave()
         }
         while p.isRunning && Date() < deadline {
@@ -1027,23 +1061,42 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
                 Thread.sleep(forTimeInterval: 0.05)
             }
             if p.isRunning { kill(p.processIdentifier, SIGKILL) }
-        } else {
+        }
+        // Always reap; SIGKILL path still needs waitUntilExit when possible.
+        if p.isRunning {
+            // Last chance reap under short bound.
+            let reapDeadline = Date().addingTimeInterval(0.5)
+            while p.isRunning && Date() < reapDeadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+        }
+        if !p.isRunning {
             p.waitUntilExit()
         }
         // Unblock drains: close write ends so EOF can arrive.
         try? out.fileHandleForWriting.close()
         try? err.fileHandleForWriting.close()
-        // Readers enforce their own absolute deadlines; join with remaining margin.
-        let remainingMs = max(50, Int((deadline.timeIntervalSinceNow + 0.5) * 1000))
-        _ = drainGroup.wait(timeout: .now() + .milliseconds(remainingMs))
+        // Join drains under absolute remaining budget; do not read boxes until finished
+        // or the hard deadline expires (then still lock-safe snapshot).
+        let hardJoinDeadline = Date().addingTimeInterval(max(0.1, deadline.timeIntervalSinceNow + 0.6))
+        while true {
+            let waitMs = max(10, Int(hardJoinDeadline.timeIntervalSinceNow * 1000))
+            if drainGroup.wait(timeout: .now() + .milliseconds(min(waitMs, 100))) == .success {
+                break
+            }
+            if Date() >= hardJoinDeadline { break }
+            if outBox.isFinished && errBox.isFinished { break }
+        }
         lock.lock(); activeRebuildProcess = nil; lock.unlock()
+        let oData = outBox.get()
+        let eData = errBox.get()
         if timedOut {
-            return (-9, String(data: outBox.data, encoding: .utf8) ?? "", "graphify process timed out after \(Int(timeout))s")
+            return (-9, String(data: oData, encoding: .utf8) ?? "", "graphify process timed out after \(Int(timeout))s")
         }
         return (
             p.terminationStatus,
-            String(data: outBox.data, encoding: .utf8) ?? "",
-            String(data: errBox.data, encoding: .utf8) ?? ""
+            String(data: oData, encoding: .utf8) ?? "",
+            String(data: eData, encoding: .utf8) ?? ""
         )
     }
 }

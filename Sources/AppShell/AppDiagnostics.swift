@@ -607,17 +607,26 @@ enum AppDiagnostics {
             case .normal, .unknown: return .normal
             }
         }()
-        // Host vs provider-tree pressure: use app footprint vs provider-tree RSS when available.
+        // Provider-tree pressure vs an authoritative capacity denominator (managed tree
+        // ceiling when known), not app/provider composition share.
         let providerLevel: PressureLevel = {
-            guard sample.isComplete,
-                  let appKB = sample.appFootprintKB,
-                  let providerKB = sample.providerRSSKB,
-                  appKB > 0 else {
-                return hostLevel
+            guard sample.isComplete, let providerKB = sample.providerRSSKB else {
+                return .normal
             }
-            let fraction = Double(providerKB) / Double(appKB + providerKB)
-            if fraction >= 0.75 { return .critical }
-            if fraction >= 0.50 { return .warning }
+            let denominatorKB: Double = {
+                if let ceiling = sample.profile.managedTreeCeilingKB, ceiling > 0 {
+                    return Double(ceiling)
+                }
+                let physical = sample.profile.physicalMemoryBytes
+                if physical > 0 {
+                    return Double(physical) / 1024.0
+                }
+                return 0
+            }()
+            guard denominatorKB > 0 else { return .normal }
+            let fraction = Double(providerKB) / denominatorKB
+            if fraction >= 0.85 { return .critical }
+            if fraction >= 0.70 { return .warning }
             return .normal
         }()
         // Accounting completeness ≠ physical capacity qualification.

@@ -104,5 +104,14 @@ final class AuthoritativePayloadRecoveryTests: XCTestCase {
             AuthoritativePayloadRecovery.authoritativeByteCount(forStoredPayload: "small"),
             5
         )
+        // Metadata path: only trailer suffix + presentation LENGTH fallback.
+        let suffix = String(result.presentationText.suffix(120))
+        XCTAssertEqual(
+            AuthoritativePayloadRecovery.authoritativeByteCount(
+                forStoredPayload: suffix,
+                presentationFallback: result.presentationText.utf8.count
+            ),
+            original.count
+        )
     }
 }

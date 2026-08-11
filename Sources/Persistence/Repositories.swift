@@ -4460,25 +4460,23 @@ public final class AgentRunRepository: @unchecked Sendable {
     }
 
     /// Metadata-only newest rows: `id`, `seq`, and authoritative payload bytes.
-    /// For owned oversized trailers, uses the original byte count from the trailer
-    /// so hot-replay admission cannot admit a small presentation then expand a
-    /// multi-gigabyte recovery blob (S3).
+    /// For owned oversized trailers, uses the original byte count from a **bounded
+    /// trailer suffix** (not the full payload) so metadata-first reads stay small.
     public func listLatestStreamEventMetadata(
         threadId: AgentThreadID,
         limit: Int
     ) throws -> [StreamEventRowMeta] {
         let safeLimit = max(0, limit)
         guard safeLimit > 0 else { return [] }
-        // Project trailing slice for original-size parse without full blob when possible.
-        // SQLite SUBSTR with negative length is not portable; fetch payload_json only for
-        // the candidate window (limit is small: eventLimit+1) and parse trailer in Swift.
+        // Project LENGTH(blob) + last ~240 characters only. Never SELECT full payload_json.
         let st = try db.prepare("""
-            SELECT id, seq, payload_json
+            SELECT id, seq, presentation_bytes, trailer_suffix
             FROM (
                 SELECT e.id AS id,
                        e.seq AS seq,
                        r.started_at AS started_at,
-                       e.payload_json AS payload_json
+                       LENGTH(CAST(e.payload_json AS BLOB)) AS presentation_bytes,
+                       substr(e.payload_json, -240) AS trailer_suffix
                 FROM agent_stream_events e
                 JOIN agent_runs r ON r.id = e.run_id
                 WHERE r.thread_id = ?
@@ -4493,9 +4491,15 @@ public final class AgentRunRepository: @unchecked Sendable {
         while try st.step() {
             let id = st.columnInt64(0)
             let seq = Int(st.columnInt64(1))
-            let payload = st.columnText(2) ?? ""
-            let bytes = Int64(AuthoritativePayloadRecovery.authoritativeByteCount(forStoredPayload: payload))
-            rows.append(StreamEventRowMeta(id: id, seq: seq, payloadBytes: bytes))
+            let presentation = st.columnInt64(2)
+            let trailer = st.columnText(3) ?? ""
+            let authoritative = Int64(
+                AuthoritativePayloadRecovery.authoritativeByteCount(
+                    forStoredPayload: trailer,
+                    presentationFallback: Int(presentation)
+                )
+            )
+            rows.append(StreamEventRowMeta(id: id, seq: seq, payloadBytes: authoritative))
         }
         return rows
     }
