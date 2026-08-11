@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Versioned capacity/qualification contract (plan-optimize-swift S1 / T-003).
 ///
@@ -301,6 +302,14 @@ public struct CapacityQualificationManifest: Sendable, Codable, Equatable {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         return try encoder.encode(self)
     }
+
+    /// Stable content digest for artifact binding (not just id equality).
+    public func contentDigest() throws -> String {
+        let data = try encodePretty()
+        var hasher = SHA256()
+        hasher.update(data: data)
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
 }
 
 /// Qualification run artifact: required metrics are fatal when null.
@@ -334,6 +343,7 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
     public var warmedSampleCount: Int
     public var physicallyExecutedTier: [String]
     public var createdAtISO8601: String
+    public var manifestDigest: String
     /// Per-run metric observations used to prove warmed n>=3 variance.
     public var warmedRuns: [CapacityWarmedRunObservation]
     /// Max relative range ((max-min)/max) across warmed runs per required metric.
@@ -346,6 +356,7 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
         warmedSampleCount: Int,
         physicallyExecutedTier: [String],
         createdAtISO8601: String,
+        manifestDigest: String,
         warmedRuns: [CapacityWarmedRunObservation] = [],
         metricVarianceMax: [String: Double] = [:]
     ) {
@@ -355,6 +366,7 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
         self.warmedSampleCount = warmedSampleCount
         self.physicallyExecutedTier = physicallyExecutedTier
         self.createdAtISO8601 = createdAtISO8601
+        self.manifestDigest = manifestDigest
         self.warmedRuns = warmedRuns
         self.metricVarianceMax = metricVarianceMax
     }
@@ -407,16 +419,45 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
                 throw CapacityContractError.missingRequiredField("metricVarianceMax.\(key)")
             }
         }
-        // Physical tier claims must match manifest (or be empty when none claimed).
+        // Physical tier set must exactly equal physically executed claims (or both empty).
         let claimed = Set(manifest.hardwareTier.filter(\.physicallyExecuted).map(\.tierName))
-        for name in physicallyExecutedTier {
-            if !claimed.isEmpty && !claimed.contains(name) {
-                throw CapacityContractError.invalidWorkload("unclaimed physical tier \(name)")
+        let reported = Set(physicallyExecutedTier)
+        if claimed != reported {
+            throw CapacityContractError.invalidWorkload("physical tier set mismatch claimed=\(claimed.sorted()) reported=\(reported.sorted())")
+        }
+        // Unique warmed run indices + recompute variance from runs.
+        var seenIdx = Set<Int>()
+        for run in warmedRuns {
+            if seenIdx.contains(run.runIndex) {
+                throw CapacityContractError.invalidEstimator("duplicate warmed runIndex \(run.runIndex)")
             }
+            seenIdx.insert(run.runIndex)
+        }
+        if warmedRuns.count != warmedSampleCount {
+            throw CapacityContractError.invalidEstimator("warmedRuns.count != warmedSampleCount")
+        }
+        for key in manifest.requiredMetrics {
+            let values = warmedRuns.compactMap { $0.metrics[key] }
+            guard values.count == warmedRuns.count else {
+                throw CapacityContractError.missingRequiredField("warmedRun.\(key)")
+            }
+            let lo = values.min() ?? 0
+            let hi = values.max() ?? 0
+            let recomputed = hi == 0 ? 0 : (hi - lo) / hi
+            guard let declared = metricVarianceMax[key] else {
+                throw CapacityContractError.missingRequiredField("metricVarianceMax.\(key)")
+            }
+            if abs(declared - recomputed) > 1e-9 {
+                throw CapacityContractError.invalidEstimator("variance mismatch for \(key)")
+            }
+        }
+        // Bind artifact to immutable manifest content digest.
+        let expectedDigest = try manifest.contentDigest()
+        if manifestDigest != expectedDigest {
+            throw CapacityContractError.invalidWorkload("manifestDigest mismatch")
         }
     }
 }
-
 
 /// Content-free gauge snapshot for signpost-style capacity instrumentation.
 public struct CapacityGaugeSnapshot: Sendable, Codable, Equatable {

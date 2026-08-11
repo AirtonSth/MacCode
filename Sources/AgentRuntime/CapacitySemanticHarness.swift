@@ -282,8 +282,14 @@ public enum CapacitySemanticHarness {
                     continue
                 }
                 if let parentId = nodes[i].parentId {
-                    guard let pidx = byId[parentId],
-                          nodes[pidx].status == .completed || nodes[pidx].status == .cancelled else { continue }
+                    guard let pidx = byId[parentId] else { continue }
+                    if nodes[pidx].status == .cancelled || nodes[pidx].status == .failed {
+                        nodes[i].status = .cancelled
+                        nodes[i].finishedAtMs = clock.nowMs
+                        markProgress()
+                        continue
+                    }
+                    guard nodes[pidx].status == .completed else { continue }
                 }
                 nodes[i].status = .active
                 nodes[i].startedAtMs = clock.nowMs
@@ -349,12 +355,15 @@ public enum CapacitySemanticHarness {
         let completed = nodes.filter { $0.status == .completed }.count
         let cancelled = nodes.filter { $0.status == .cancelled }.count
         let failed = nodes.filter { $0.status == .failed }.count
+        // Each completed nested node rejoins exactly once (boolean flag per node).
         let rejoinOK = nodes.filter { $0.kind == .nested }.allSatisfy { node in
-            if node.status == .completed { return node.resultRejoined }
-            return true
+            switch node.status {
+            case .completed:
+                return node.resultRejoined
+            case .cancelled, .failed, .waiting, .active:
+                return true
+            }
         }
-        // Nested completed nodes rejoin exactly once (boolean flag, not multi-count).
-        let multiRejoin = rejoinCounts.values.contains(where: { $0 < 0 })
         let queueDrained = !nodes.contains(where: { $0.status == .waiting || $0.status == .active })
         let terminalExact = nodes.allSatisfy { node in
             switch node.status {
@@ -371,7 +380,7 @@ public enum CapacitySemanticHarness {
             completedCount: completed,
             cancelledCount: cancelled,
             failedCount: failed,
-            rejoinExactlyOnce: rejoinOK && !multiRejoin,
+            rejoinExactlyOnce: rejoinOK,
             queueDrained: queueDrained,
             terminalOwnershipExact: terminalExact
         )
@@ -443,7 +452,10 @@ public struct CapacitySubprocessFixtureSpec: Sendable, Equatable {
     public func materializedFrames(seed: UInt64) -> [String] {
         var frames = self.frames
         if reorder && frames.count > 1 {
-            var rng = CapacitySeededRNG(seed: seed ^ UInt64(provider.hashValue))
+            // Stable seed mix — never use process-randomized hashValue.
+            var mix: UInt64 = seed
+            for b in provider.utf8 { mix = mix &* 131 + UInt64(b) }
+            var rng = CapacitySeededRNG(seed: mix == 0 ? 1 : mix)
             let i = rng.nextInt(in: 0...(frames.count - 1))
             let j = rng.nextInt(in: 0...(frames.count - 1))
             frames.swapAt(i, j)

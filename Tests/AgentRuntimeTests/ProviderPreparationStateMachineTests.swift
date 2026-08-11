@@ -29,17 +29,30 @@ final class ProviderPreparationStateMachineTests: XCTestCase {
             state: state,
             event: .accept(draftMessageId: "d", atMs: 1)
         ).state
-        let gen = state.generation
+        let genA = state.generation
         state = ProviderPreparationStateMachine.apply(state: state, event: .stopRequested).state
-        XCTAssertNotEqual(state.generation, gen, "cancel bumps generation")
+        XCTAssertNotEqual(state.generation, genA, "cancel bumps generation")
 
-        let latePrep = ProviderPreparationStateMachine.apply(state: state, event: .preparationFinished)
+        // Re-accept generation B.
+        state = ProviderPreparationStateMachine.apply(
+            state: state,
+            event: .accept(draftMessageId: "d2", atMs: 2)
+        ).state
+        let genB = state.generation
+        XCTAssertNotEqual(genA, genB)
+
+        // Stale generation A completion must not spawn into B.
+        let latePrep = ProviderPreparationStateMachine.apply(
+            state: state,
+            event: .preparationFinished(generation: genA)
+        )
         XCTAssertFalse(latePrep.allowProviderSpawn)
-        XCTAssertEqual(latePrep.ignoredReason, "not_preparing")
+        XCTAssertTrue(latePrep.suppressLateCallback)
+        XCTAssertEqual(state.phase, .preparing)
 
         let late = ProviderPreparationStateMachine.apply(
             state: state,
-            event: .lateCallback(generation: gen)
+            event: .lateCallback(generation: genA)
         )
         XCTAssertTrue(late.suppressLateCallback)
     }
@@ -50,20 +63,27 @@ final class ProviderPreparationStateMachineTests: XCTestCase {
             state: state,
             event: .accept(draftMessageId: "d", atMs: 1)
         ).state
-        let prepDone = ProviderPreparationStateMachine.apply(state: state, event: .preparationFinished)
+        let gen = state.generation
+        let prepDone = ProviderPreparationStateMachine.apply(
+            state: state,
+            event: .preparationFinished(generation: gen)
+        )
         XCTAssertTrue(prepDone.allowProviderSpawn)
         XCTAssertEqual(prepDone.state.phase, .providerStarting)
         XCTAssertFalse(ProviderPreparationStateMachine.isRunningAnnounced(prepDone.state))
         state = prepDone.state
 
-        let spawned = ProviderPreparationStateMachine.apply(state: state, event: .providerSpawned)
+        let spawned = ProviderPreparationStateMachine.apply(
+            state: state,
+            event: .providerSpawned(generation: gen)
+        )
         XCTAssertEqual(spawned.state.phase, .running)
         XCTAssertTrue(ProviderPreparationStateMachine.isRunningAnnounced(spawned.state))
         state = spawned.state
 
         let done = ProviderPreparationStateMachine.apply(
             state: state,
-            event: .providerFinished(.completed)
+            event: .providerFinished(generation: gen, reason: .completed)
         )
         XCTAssertEqual(done.state.phase, .terminal)
         XCTAssertEqual(done.state.terminalReason, .completed)

@@ -39,9 +39,12 @@ public enum GraphifyRuntimeHardening {
     public static let maxArtifactBytes = 512 * 1024 * 1024
 
     public static func isPinComplete(_ pin: GraphifyRuntimePin = defaultPin) -> Bool {
-        !pin.approvedVersion.isEmpty
+        let hex = CharacterSet(charactersIn: "0123456789abcdef")
+        let sha = pin.sha256.lowercased()
+        return !pin.approvedVersion.isEmpty
             && pin.approvedVersion != "unpinned-pending-canary"
-            && pin.sha256.count == 64
+            && sha.count == 64
+            && sha.unicodeScalars.allSatisfy { hex.contains($0) }
     }
 
     /// Active rebuild must be cancellable before watchers stop.

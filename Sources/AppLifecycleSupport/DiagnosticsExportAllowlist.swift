@@ -4,8 +4,7 @@ import CryptoKit
 /// Typed allowlist for capacity/diagnostics export (plan-optimize-swift S1 / T-003).
 ///
 /// Only exact (section, key) pairs from `allowedKeys` may be exported. Values are
-/// restricted to non-secret scalars (numbers, pressure levels, short enums).
-/// Correlation IDs are salted session-local. Explicit export is 0600.
+/// validated per key domain. Correlation IDs are salted session-local. Explicit export is 0600.
 
 public enum DiagnosticsExportSection: String, Sendable, Codable, Equatable, CaseIterable {
     case capacityManifest
@@ -56,7 +55,6 @@ public enum DiagnosticsExportAllowlist {
     public static let defaultRetentionHours = 72
     public static let maxValueLength = 64
 
-    /// Exact allowlisted keys per section (true allowlist, not denylist).
     public static let allowedKeys: [DiagnosticsExportSection: Set<String>] = [
         .capacityManifest: ["schema_version", "manifest_id", "warmed_sample_count"],
         .capacityMetrics: [
@@ -86,21 +84,50 @@ public enum DiagnosticsExportAllowlist {
         allowedKeys[section]?.contains(key) == true
     }
 
-    /// Values must be short scalars: digits, optional decimal, or known enums.
-    public static func isAllowedValue(_ value: String) -> Bool {
+    public static func isAllowedValue(
+        _ value: String,
+        section: DiagnosticsExportSection,
+        key: String
+    ) -> Bool {
         if value.isEmpty || value.count > maxValueLength { return false }
         if value.contains("[[rc:") { return false }
         if value.contains("/") || value.contains("\\") { return false }
         if value.contains("@") { return false }
-        if value.lowercased().contains("bearer") { return false }
-        if value.lowercased().contains("sk-") { return false }
-        // Allow numeric, bool-ish, and pressure/enum tokens.
-        let allowedScalars = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
-        return value.unicodeScalars.allSatisfy { allowedScalars.contains($0) }
+        let lower = value.lowercased()
+        if lower.contains("bearer") || lower.contains("sk-") { return false }
+
+        switch (section, key) {
+        case (.pressureState, "level"):
+            return ["normal", "warning", "critical", "unknown"].contains(value)
+        case (.pressureState, "frozen_accounting"),
+             (.managedRSSTrend, "sample_complete"),
+             (.hardwareTier, "physically_executed"):
+            return value == "true" || value == "false" || value == "0" || value == "1"
+        case (.pressureState, "epoch"),
+             (.pressureState, "action_count"),
+             (.capacityMetrics, _),
+             (.managedRSSTrend, "total_managed_rss_kb"),
+             (.managedRSSTrend, "slope_kb_per_minute"),
+             (.managedRSSTrend, "high_water_managed_rss_kb"),
+             (.transportQueueDepths, _),
+             (.ownershipCoverage, _),
+             (.hangWatchdog, "hang_likely_count"),
+             (.capacityManifest, "warmed_sample_count"),
+             (.hardwareTier, "physical_memory_bytes"):
+            return Double(value) != nil
+        case (.hangWatchdog, "gap_kind"):
+            return ["hangLikely", "suspendedOrSleep", "normal"].contains(value)
+        default:
+            let allowedScalars = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+            return value.unicodeScalars.allSatisfy { allowedScalars.contains($0) }
+        }
     }
 
     public static func filter(_ fields: [DiagnosticsExportField]) -> [DiagnosticsExportField] {
-        fields.filter { isAllowed(section: $0.section, key: $0.key) && isAllowedValue($0.value) }
+        fields.filter {
+            isAllowed(section: $0.section, key: $0.key)
+                && isAllowedValue($0.value, section: $0.section, key: $0.key)
+        }
     }
 
     public static func validate(_ fields: [DiagnosticsExportField]) throws {
@@ -110,7 +137,7 @@ public enum DiagnosticsExportAllowlist {
             guard isAllowed(section: field.section, key: field.key) else {
                 throw DiagnosticsExportError.unknownKey(composite)
             }
-            guard isAllowedValue(field.value) else {
+            guard isAllowedValue(field.value, section: field.section, key: field.key) else {
                 throw DiagnosticsExportError.invalidValue(field.value)
             }
             if seen.contains(composite) {
@@ -120,7 +147,6 @@ public enum DiagnosticsExportAllowlist {
         }
     }
 
-    /// Session-local correlation id: salted hash, not a raw UUID/path.
     public static func correlationID(sessionSalt: Data, eventSeed: String) -> String {
         var hasher = SHA256()
         hasher.update(data: sessionSalt)
@@ -158,7 +184,6 @@ public enum DiagnosticsExportAllowlist {
         return data
     }
 
-    /// Write export with 0600 permissions under a 0700 parent directory.
     public static func writeExportFile(data: Data, to url: URL) throws {
         let fm = FileManager.default
         let parent = url.deletingLastPathComponent()
@@ -177,7 +202,6 @@ public enum DiagnosticsExportAllowlist {
         try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
-    /// Secret canary: synthetic secrets must not survive filtering / validation.
     public static func secretCanaryPayload() -> [DiagnosticsExportField] {
         [
             DiagnosticsExportField(section: .capacityMetrics, key: "app_rss_kb", value: "12345"),
@@ -187,7 +211,6 @@ public enum DiagnosticsExportAllowlist {
             DiagnosticsExportField(section: .capacityMetrics, key: "tool_handle", value: "[[rc:abc]]"),
             DiagnosticsExportField(section: .capacityMetrics, key: "raw_error", value: "boom"),
             DiagnosticsExportField(section: .pressureState, key: "level", value: "warning"),
-            // Allowed key with secret-like value must also be rejected.
             DiagnosticsExportField(section: .pressureState, key: "level", value: "bearer-xyz"),
         ]
     }

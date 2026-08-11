@@ -98,6 +98,14 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                     if self.wouldExceedAdmissionLocked(additionalBytes: data.count) {
                         self.handleOverflowLocked(reason: "admission_bytes_or_count")
                     }
+                    guard self.canAdmitSingleFrameLocked(byteCount: data.count) else {
+                        // Frame alone exceeds budget: record its sequence as lost and drop.
+                        var lost: [Int64] = []
+                        if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
+                        self.overflowCount += 1
+                        self.onAdmissionOverflow?(lost, "frame_exceeds_budget")
+                        return
+                    }
                     self.noteEnqueueLocked(data)
                     self.nilKeyQueue.append(data)
                     if self.isAdmissionAgedLocked() {
@@ -128,6 +136,13 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                 guard !self.stopped else { return }
                 if self.wouldExceedAdmissionLocked(additionalBytes: data.count) {
                     self.handleOverflowLocked(reason: "admission_bytes_or_count")
+                }
+                guard self.canAdmitSingleFrameLocked(byteCount: data.count) else {
+                    var lost: [Int64] = []
+                    if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
+                    self.overflowCount += 1
+                    self.onAdmissionOverflow?(lost, "frame_exceeds_budget")
+                    return
                 }
                 if let previous = self.pending[key] {
                     if self.filter.coalescingMergesByConcatenation(for: event),
@@ -224,7 +239,14 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         oldestEnqueueUptime = nil
         scheduled = false
         nilKeyScheduled = false
-        onAdmissionOverflow?(lost, reason)
+        // Always notify; production must supply a handler that advances watermark
+        // and emits baseline_required. Nil still counts as explicit overflow for tests.
+        onAdmissionOverflow?(lost.sorted(), reason)
+    }
+
+    /// Whether a single frame may be admitted after an overflow clear.
+    private func canAdmitSingleFrameLocked(byteCount: Int) -> Bool {
+        byteCount <= maxPendingBytes
     }
 
     func flush() {

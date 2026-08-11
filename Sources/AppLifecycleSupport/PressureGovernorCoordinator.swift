@@ -107,6 +107,13 @@ public final class PressureGovernorCoordinator: @unchecked Sendable {
         guard plan.target.epoch == liveTarget.epoch else {
             return PressureMutationOutcome(skipped: plan.actions, reason: "target_epoch_mismatch")
         }
+        // Revalidate sidecar request generation and Graphify child identity (S7).
+        if plan.target.sidecarRequestGeneration != liveTarget.sidecarRequestGeneration {
+            return PressureMutationOutcome(skipped: plan.actions, reason: "sidecar_generation_mismatch")
+        }
+        if plan.target.graphifyChildIdentity != liveTarget.graphifyChildIdentity {
+            return PressureMutationOutcome(skipped: plan.actions, reason: "graphify_identity_mismatch")
+        }
         // Never act on incomplete accounting.
         if state.frozenAccounting {
             return PressureMutationOutcome(skipped: plan.actions, reason: "frozen_accounting")
@@ -134,11 +141,6 @@ public final class PressureGovernorCoordinator: @unchecked Sendable {
                 continue
             }
             if action == .pauseGraphifyEnsureAndWatchCallbacks {
-                if liveTarget.graphifyChildIdentity != lastGraphifyIdentity
-                    && lastGraphifyIdentity != nil
-                    && liveTarget.graphifyChildIdentity != lastGraphifyIdentity {
-                    // Identity drift: revalidate by accepting current and applying.
-                }
                 lastGraphifyIdentity = liveTarget.graphifyChildIdentity
             }
             if action == .releaseDistillIdleModelGPU {

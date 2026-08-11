@@ -39,7 +39,7 @@ final class CapacityContractAndPressureTests: XCTestCase {
 
     func test_requiredMetricNull_isFatalOnArtifact() throws {
         let manifest = CapacityQualificationManifest.defaultHardcoreSwarm()
-        let artifact = makeValidArtifact(manifest: manifest, nullMetric: CapacityRequiredMetricKey.appRSSKB.rawValue)
+        let artifact = try makeValidArtifact(manifest: manifest, nullMetric: CapacityRequiredMetricKey.appRSSKB.rawValue)
         XCTAssertThrowsError(try artifact.validate(against: manifest)) { error in
             XCTAssertEqual(
                 error as? CapacityContractError,
@@ -50,19 +50,19 @@ final class CapacityContractAndPressureTests: XCTestCase {
 
     func test_artifact_requiresMinWarmedSamplesAndVariance() throws {
         let manifest = CapacityQualificationManifest.defaultHardcoreSwarm()
-        let artifact = makeValidArtifact(manifest: manifest, warmedRuns: 2)
+        let artifact = try makeValidArtifact(manifest: manifest, warmedRuns: 2)
         XCTAssertThrowsError(try artifact.validate(against: manifest))
     }
 
     func test_artifact_passesWhenAllRequiredPresent() throws {
         let manifest = CapacityQualificationManifest.defaultHardcoreSwarm()
-        let artifact = makeValidArtifact(manifest: manifest)
+        let artifact = try makeValidArtifact(manifest: manifest)
         try artifact.validate(against: manifest)
     }
 
     func test_artifact_rejectsManifestIdMismatch() throws {
         let manifest = CapacityQualificationManifest.defaultHardcoreSwarm()
-        var artifact = makeValidArtifact(manifest: manifest)
+        var artifact = try makeValidArtifact(manifest: manifest)
         artifact.manifestId = "other"
         XCTAssertThrowsError(try artifact.validate(against: manifest))
     }
@@ -363,7 +363,7 @@ final class CapacityContractAndPressureTests: XCTestCase {
         manifest: CapacityQualificationManifest,
         nullMetric: String? = nil,
         warmedRuns: Int = 3
-    ) -> CapacityQualificationArtifact {
+    ) throws -> CapacityQualificationArtifact {
         let samples = manifest.requiredMetrics.map { name in
             CapacityMetricSample(
                 name: name,
@@ -371,19 +371,28 @@ final class CapacityContractAndPressureTests: XCTestCase {
                 unit: "unit"
             )
         }
-        let runs = (0..<warmedRuns).map { idx in
-            CapacityWarmedRunObservation(
-                runIndex: idx,
-                metrics: Dictionary(uniqueKeysWithValues: manifest.requiredMetrics.map { ($0, Double(1 + idx) * 0.01 + 1) })
-            )
+        let runs = (0..<warmedRuns).map { idx -> CapacityWarmedRunObservation in
+            let metrics = Dictionary(uniqueKeysWithValues: manifest.requiredMetrics.map { name -> (String, Double) in
+                // values 1.00, 1.01, 1.02 so variance is deterministic
+                (name, 1.0 + Double(idx) * 0.01)
+            })
+            return CapacityWarmedRunObservation(runIndex: idx, metrics: metrics)
         }
-        let variance = Dictionary(uniqueKeysWithValues: manifest.requiredMetrics.map { ($0, 0.02) })
+        var variance: [String: Double] = [:]
+        for key in manifest.requiredMetrics {
+            let values = runs.map { $0.metrics[key]! }
+            let lo = values.min()!
+            let hi = values.max()!
+            variance[key] = hi == 0 ? 0 : (hi - lo) / hi
+        }
+        let digest = try manifest.contentDigest()
         return CapacityQualificationArtifact(
             manifestId: manifest.id,
             samples: samples,
             warmedSampleCount: warmedRuns,
             physicallyExecutedTier: [],
             createdAtISO8601: "2026-08-11T00:00:00Z",
+            manifestDigest: digest,
             warmedRuns: runs,
             metricVarianceMax: variance
         )

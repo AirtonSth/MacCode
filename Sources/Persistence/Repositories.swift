@@ -3284,27 +3284,59 @@ public final class AgentRunRepository: @unchecked Sendable {
     private let streamEventDecoder = JSONDecoder()
     public init(db: SQLiteDB) { self.db = db }
 
+    /// Store-before-loss soft bound used by coordinator + repository (S3).
+    public func boundPayloadForPersistence(
+        _ payloadJSON: String,
+        byteLimit: Int = maximumPersistedEventRowBytes
+    ) -> String {
+        Self.softTruncateUTF8Payload(
+            payloadJSON,
+            byteLimit: byteLimit,
+            reversibleStore: ReversibleContentStore(db: db)
+        )
+    }
+
     private func boundedStreamRow(kind: String, payloadJSON: String) -> (kind: String, payloadJSON: String) {
         let kindBytes = kind.utf8.count
         let payloadBudget = max(1, Self.maximumPersistedEventRowBytes - kindBytes)
-        let boundedPayload = Self.softTruncateUTF8Payload(payloadJSON, byteLimit: payloadBudget)
+        let store = ReversibleContentStore(db: db)
+        let boundedPayload = Self.softTruncateUTF8Payload(
+            payloadJSON,
+            byteLimit: payloadBudget,
+            reversibleStore: store
+        )
         return (kind, boundedPayload)
     }
 
     private func boundedProviderPayload(_ payloadJSON: String) -> String {
-        Self.softTruncateUTF8Payload(payloadJSON, byteLimit: Self.maximumPersistedEventRowBytes)
+        let store = ReversibleContentStore(db: db)
+        return Self.softTruncateUTF8Payload(
+            payloadJSON,
+            byteLimit: Self.maximumPersistedEventRowBytes,
+            reversibleStore: store
+        )
     }
 
     /// Character-safe soft truncate. Shared with coordinator so persist + buffer
-    /// share one admission policy. UTF-8 index arithmetic (O(headBudget)) instead
-    /// of Character-index walks over the admitted head.
-    nonisolated static func softTruncateUTF8Payload(
+    /// share one admission policy. When `reversibleStore` is provided and the
+    /// payload exceeds the limit, the exact original is stored first and a
+    /// recoverable `[[rc:handle]]` marker is embedded (S3 / T-003).
+    public nonisolated static func softTruncateUTF8Payload(
         _ payloadJSON: String,
-        byteLimit: Int
+        byteLimit: Int,
+        reversibleStore: ReversibleContentStore? = nil
     ) -> String {
         let limit = max(1, byteLimit)
         let originalBytes = payloadJSON.utf8.count
         guard originalBytes > limit else { return payloadJSON }
+        if let reversibleStore,
+           let recovered = try? AuthoritativePayloadRecovery.prepareForPresentation(
+            text: payloadJSON,
+            store: reversibleStore,
+            limit: limit
+           ) {
+            return recovered.presentationText
+        }
         let trailer = "…[truncated \(originalBytes)→\(limit) bytes]"
         let headBudget = max(0, limit - trailer.utf8.count)
         guard headBudget > 0 else { return trailer }

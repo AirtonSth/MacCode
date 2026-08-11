@@ -138,28 +138,46 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        // 0600 temp inode under 0700 directory, write+fsync, atomic rename, fsync dir.
+        // Cross-process advisory lock (S4).
+        let lockPath = lockFileURL.path
+        let lockFD = open(lockPath, O_RDWR | O_CREAT, 0o600)
+        guard lockFD >= 0 else {
+            throw ProviderProcessOwnershipError.processListFailed("ownership lock open failed")
+        }
+        defer { close(lockFD) }
+        if flock(lockFD, LOCK_EX) != 0 {
+            throw ProviderProcessOwnershipError.processListFailed("ownership lock acquire failed")
+        }
+        defer { _ = flock(lockFD, LOCK_UN) }
+
+        // 0600 temp under 0700 dir; atomic rename WITHOUT removing destination first.
         let temp = parent.appendingPathComponent(
             ".\(fileURL.lastPathComponent).tmp-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString)"
         )
         let data = try encoder.encode(tags)
         try data.write(to: temp, options: .atomic)
         try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temp.path)
+        // Atomic replace when destination exists; first write uses rename.
         if fm.fileExists(atPath: fileURL.path) {
-            try fm.removeItem(at: fileURL)
+            _ = try fm.replaceItemAt(fileURL, withItemAt: temp)
+        } else {
+            try fm.moveItem(at: temp, to: fileURL)
         }
-        try fm.moveItem(at: temp, to: fileURL)
         try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
-        // Best-effort directory fsync for crash durability.
         let dirFD = open(parent.path, O_RDONLY)
         if dirFD >= 0 {
             _ = fsync(dirFD)
             close(dirFD)
         }
-        // Recover abandoned temp files from prior crashes.
-        if let entries = try? fm.contentsOfDirectory(at: parent, includingPropertiesForKeys: nil) {
-            for url in entries where url.lastPathComponent.hasPrefix(".\(fileURL.lastPathComponent).tmp-") {
-                try? fm.removeItem(at: url)
+        // Recover abandoned temps older than this process only (do not delete in-flight peers).
+        if let entries = try? fm.contentsOfDirectory(at: parent, includingPropertiesForKeys: [.contentModificationDateKey]) {
+            let prefix = ".\(fileURL.lastPathComponent).tmp-"
+            let mine = "-\(ProcessInfo.processInfo.processIdentifier)-"
+            for url in entries where url.lastPathComponent.hasPrefix(prefix) {
+                // Only clean temps that clearly belong to this PID and still exist after replace.
+                if url.lastPathComponent.contains(mine) {
+                    try? fm.removeItem(at: url)
+                }
             }
         }
     }

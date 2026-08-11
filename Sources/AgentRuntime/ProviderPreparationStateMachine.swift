@@ -50,11 +50,12 @@ public struct ProviderPreparationState: Sendable, Equatable {
 
 public enum ProviderPreparationEvent: Sendable, Equatable {
     case accept(draftMessageId: String, atMs: Int64)
-    case preparationFinished
-    case providerSpawned
-    case providerRunning
+    /// Completions must name the generation that started the work (S5).
+    case preparationFinished(generation: UInt64)
+    case providerSpawned(generation: UInt64)
+    case providerRunning(generation: UInt64)
     case stopRequested
-    case providerFinished(ProviderPreparationTerminalReason)
+    case providerFinished(generation: UInt64, reason: ProviderPreparationTerminalReason)
     case lateCallback(generation: UInt64)
 }
 
@@ -101,7 +102,10 @@ public enum ProviderPreparationStateMachine {
             // Composer may clear only after draft identity is persisted (caller duty).
             return ProviderPreparationTransition(state: next, clearComposer: true)
 
-        case .preparationFinished:
+        case .preparationFinished(let generation):
+            guard generation == state.generation else {
+                return ProviderPreparationTransition(state: state, suppressLateCallback: true, ignoredReason: "stale_generation")
+            }
             guard state.phase == .preparing else {
                 return ProviderPreparationTransition(state: state, ignoredReason: "not_preparing")
             }
@@ -109,7 +113,10 @@ public enum ProviderPreparationStateMachine {
             next.accessibleStatus = "Starting provider"
             return ProviderPreparationTransition(state: next, allowProviderSpawn: true)
 
-        case .providerSpawned:
+        case .providerSpawned(let generation):
+            guard generation == state.generation else {
+                return ProviderPreparationTransition(state: state, suppressLateCallback: true, ignoredReason: "stale_generation")
+            }
             guard state.phase == .providerStarting else {
                 return ProviderPreparationTransition(state: state, ignoredReason: "not_provider_starting")
             }
@@ -117,7 +124,10 @@ public enum ProviderPreparationStateMachine {
             next.accessibleStatus = "Running"
             return ProviderPreparationTransition(state: next)
 
-        case .providerRunning:
+        case .providerRunning(let generation):
+            guard generation == state.generation else {
+                return ProviderPreparationTransition(state: state, suppressLateCallback: true, ignoredReason: "stale_generation")
+            }
             guard state.phase == .providerStarting || state.phase == .running else {
                 return ProviderPreparationTransition(state: state, ignoredReason: "invalid_running")
             }
@@ -142,7 +152,10 @@ public enum ProviderPreparationStateMachine {
                 return ProviderPreparationTransition(state: state, ignoredReason: "stop_noop")
             }
 
-        case .providerFinished(let reason):
+        case .providerFinished(let generation, let reason):
+            guard generation == state.generation else {
+                return ProviderPreparationTransition(state: state, suppressLateCallback: true, ignoredReason: "stale_generation")
+            }
             guard state.phase == .running || state.phase == .stopping || state.phase == .providerStarting else {
                 return ProviderPreparationTransition(state: state, ignoredReason: "not_live")
             }

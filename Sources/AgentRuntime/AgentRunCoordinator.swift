@@ -5273,12 +5273,33 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
             let preparedWrite: (payloadJSON: String, providerEvent: ProviderRuntimeEvent?)?
             if let data, let json = String(data: data, encoding: .utf8) {
-                let payloadJSON = Self.boundedPersistedStreamPayload(
-                    streamPayloadCompactor?(json) ?? json
+                // S3: bound via repository so originals above the 16 MiB
+                // presentation ceiling are stored before presentation loss.
+                let payloadJSON = runRepo.boundPayloadForPersistence(
+                    streamPayloadCompactor?(json) ?? json,
+                    byteLimit: Self.maximumBufferedEventBytes
                 )
                 let providerEvent: ProviderRuntimeEvent?
                 if case .providerRuntime(let runtimeEvent) = ev {
-                    providerEvent = Self.boundedProviderRuntimeEvent(runtimeEvent)
+                    let boundedPayload = runRepo.boundPayloadForPersistence(
+                        runtimeEvent.payloadJSON,
+                        byteLimit: Self.maximumBufferedEventBytes
+                    )
+                    if boundedPayload == runtimeEvent.payloadJSON {
+                        providerEvent = runtimeEvent
+                    } else {
+                        providerEvent = ProviderRuntimeEvent(
+                            id: runtimeEvent.id,
+                            provider: runtimeEvent.provider,
+                            source: runtimeEvent.source,
+                            method: runtimeEvent.method,
+                            providerTurnId: runtimeEvent.providerTurnId,
+                            providerItemId: runtimeEvent.providerItemId,
+                            providerRequestId: runtimeEvent.providerRequestId,
+                            payloadJSON: boundedPayload,
+                            receivedAtMs: runtimeEvent.receivedAtMs
+                        )
+                    }
                 } else {
                     providerEvent = nil
                 }
@@ -6967,6 +6988,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// so a slow trickle still reaches the DB (and survives reload/crash).
     nonisolated static let streamFlushTimeThresholdMs: Int64 = 250
 
+    /// Soft-truncate without store (tests / fallback). Production stream writes
+    /// use `AgentRunRepository.boundPayloadForPersistence` so originals are
+    /// stored before presentation loss (S3).
+    nonisolated static func softTruncateUTF8Payload(
+        _ payloadJSON: String,
+        byteLimit: Int
+    ) -> String {
+        AgentRunRepository.softTruncateUTF8Payload(payloadJSON, byteLimit: byteLimit, reversibleStore: nil)
+    }
+
     nonisolated static func boundedPersistedStreamPayload(
         _ payloadJSON: String,
         byteLimit: Int = maximumBufferedEventBytes
@@ -6991,37 +7022,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             payloadJSON: bounded,
             receivedAtMs: event.receivedAtMs
         )
-    }
-
-    /// Soft-truncate an encoded payload at a Character-safe boundary. Prefer the
-    /// head of the frame so partial tool output remains useful; never emit a
-    /// recoverable user-facing error for size pressure.
-    ///
-    /// Hot path uses UTF-8 index arithmetic (O(headBudget) bytes + small boundary
-    /// walk-back) instead of iterating Character indices across the admitted head.
-    nonisolated static func softTruncateUTF8Payload(
-        _ payloadJSON: String,
-        byteLimit: Int
-    ) -> String {
-        let limit = max(1, byteLimit)
-        let originalBytes = payloadJSON.utf8.count
-        guard originalBytes > limit else { return payloadJSON }
-        let trailer = "…[truncated \(originalBytes)→\(limit) bytes]"
-        let headBudget = max(0, limit - trailer.utf8.count)
-        guard headBudget > 0 else { return trailer }
-        var utf8End = payloadJSON.utf8.index(
-            payloadJSON.utf8.startIndex,
-            offsetBy: headBudget,
-            limitedBy: payloadJSON.utf8.endIndex
-        ) ?? payloadJSON.utf8.endIndex
-        // Align to a Character boundary so multi-byte sequences are never split.
-        while utf8End > payloadJSON.utf8.startIndex {
-            if let end = utf8End.samePosition(in: payloadJSON) {
-                return String(payloadJSON[..<end]) + trailer
-            }
-            payloadJSON.utf8.formIndex(before: &utf8End)
-        }
-        return trailer
     }
 
     /// FIFO-set helper for correctness identifiers stored in the compact runtime
