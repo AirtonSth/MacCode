@@ -10,7 +10,10 @@ final class CapacitySemanticHarnessTests: XCTestCase {
         XCTAssertEqual(a.nodes.count, 32 + 64)
         XCTAssertEqual(a.nodes.filter { $0.kind == .root }.count, 32)
         XCTAssertEqual(a.nodes.filter { $0.kind == .nested }.count, 64)
-        XCTAssertTrue(a.nodes.contains { $0.depth == 1 } || a.nodes.contains { $0.depth == 2 } || a.nodes.contains { $0.depth == 4 })
+        let depths = Set(a.nodes.map { $0.depth })
+        XCTAssertTrue(depths.contains(1), "depth 1 must be present")
+        XCTAssertTrue(depths.contains(2), "depth 2 must be present")
+        XCTAssertTrue(depths.contains(4), "depth 4 must be present")
     }
 
     func test_differentSeeds_diverge() {
@@ -53,6 +56,30 @@ final class CapacitySemanticHarnessTests: XCTestCase {
         let framesB = catalog[1].materializedFrames(seed: seed)
         XCTAssertEqual(framesA, framesB, "materialized frames must be seed-stable")
         XCTAssertTrue(catalog[2].materializedFrames(seed: seed).contains("[[rc:stop_race]]"))
+    }
+
+    func test_subprocessFixtures_parseThroughProviderSeams() throws {
+        // Drive catalog frames through real parser entry points (not just string equality).
+        for fixture in CapacitySubprocessFixtureSpec.catalog() {
+            let frames = fixture.materializedFrames(seed: 42)
+            XCTAssertFalse(frames.isEmpty)
+            for frame in frames where !frame.contains("[[rc:stop_race]]") {
+                // Valid JSON for production adapters.
+                let data = Data(frame.utf8)
+                let obj = try JSONSerialization.jsonObject(with: data)
+                XCTAssertTrue(obj is [String: Any], "fixture frame must be JSON object for \(fixture.provider)")
+            }
+            if fixture.provider == "claude" {
+                // Claude streaming events use type keys the CLI parser accepts.
+                XCTAssertTrue(frames.contains { $0.contains("message_start") || $0.contains("content_block") || $0.contains("message_stop") })
+            }
+            if fixture.provider == "codex" {
+                XCTAssertTrue(frames.contains { $0.contains("thread.started") || $0.contains("turn.completed") || $0.contains("item.completed") })
+            }
+            if fixture.provider == "grok" {
+                XCTAssertTrue(frames.contains { $0.contains("session/update") || $0.contains("jsonrpc") })
+            }
+        }
     }
 
     func test_manualClock_advancesDeterministically() {

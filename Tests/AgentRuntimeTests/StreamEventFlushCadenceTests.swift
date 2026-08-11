@@ -357,7 +357,7 @@ final class StreamEventFlushCadenceTests: XCTestCase {
         let payload = String(repeating: "x", count: 10_000) + "ééé"
         let limit = 4_096
         let a = AgentRunCoordinator.softTruncateUTF8Payload(payload, byteLimit: limit)
-        let b = AgentRunRepository.softTruncateUTF8Payload(payload, byteLimit: limit)
+        let b = try! AgentRunRepository.softTruncateUTF8Payload(payload, byteLimit: limit, reversibleStore: nil)
         XCTAssertEqual(a, b, "persist + buffer must share one truncation policy")
         XCTAssertLessThanOrEqual(a.utf8.count, limit)
     }

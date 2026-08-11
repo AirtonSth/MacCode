@@ -455,6 +455,9 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
             guard let declared = metricVarianceMax[key] else {
                 throw CapacityContractError.missingRequiredField("metricVarianceMax.\(key)")
             }
+            guard declared.isFinite, declared >= 0, declared <= 1 else {
+                throw CapacityContractError.invalidEstimator("metricVarianceMax.\(key) must be finite in [0,1]")
+            }
             if abs(declared - recomputed) > 1e-9 {
                 throw CapacityContractError.invalidEstimator("variance mismatch for \(key)")
             }

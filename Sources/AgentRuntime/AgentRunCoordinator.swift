@@ -5273,37 +5273,44 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
             let preparedWrite: (payloadJSON: String, providerEvent: ProviderRuntimeEvent?)?
             if let data, let json = String(data: data, encoding: .utf8) {
-                // S3: bound via repository so originals above the 16 MiB
-                // presentation ceiling are stored before presentation loss.
-                let payloadJSON = runRepo.boundPayloadForPersistence(
-                    streamPayloadCompactor?(json) ?? json,
-                    byteLimit: Self.maximumBufferedEventBytes
-                )
-                let providerEvent: ProviderRuntimeEvent?
-                if case .providerRuntime(let runtimeEvent) = ev {
-                    let boundedPayload = runRepo.boundPayloadForPersistence(
-                        runtimeEvent.payloadJSON,
+                do {
+                    // S3: bound via repository so originals above the 16 MiB
+                    // presentation ceiling are stored before presentation loss.
+                    // Store failure propagates — never discard the original silently.
+                    let payloadJSON = try runRepo.boundPayloadForPersistence(
+                        streamPayloadCompactor?(json) ?? json,
                         byteLimit: Self.maximumBufferedEventBytes
                     )
-                    if boundedPayload == runtimeEvent.payloadJSON {
-                        providerEvent = runtimeEvent
-                    } else {
-                        providerEvent = ProviderRuntimeEvent(
-                            id: runtimeEvent.id,
-                            provider: runtimeEvent.provider,
-                            source: runtimeEvent.source,
-                            method: runtimeEvent.method,
-                            providerTurnId: runtimeEvent.providerTurnId,
-                            providerItemId: runtimeEvent.providerItemId,
-                            providerRequestId: runtimeEvent.providerRequestId,
-                            payloadJSON: boundedPayload,
-                            receivedAtMs: runtimeEvent.receivedAtMs
+                    let providerEvent: ProviderRuntimeEvent?
+                    if case .providerRuntime(let runtimeEvent) = ev {
+                        let boundedPayload = try runRepo.boundPayloadForPersistence(
+                            runtimeEvent.payloadJSON,
+                            byteLimit: Self.maximumBufferedEventBytes
                         )
+                        if boundedPayload == runtimeEvent.payloadJSON {
+                            providerEvent = runtimeEvent
+                        } else {
+                            providerEvent = ProviderRuntimeEvent(
+                                id: runtimeEvent.id,
+                                provider: runtimeEvent.provider,
+                                source: runtimeEvent.source,
+                                method: runtimeEvent.method,
+                                providerTurnId: runtimeEvent.providerTurnId,
+                                providerItemId: runtimeEvent.providerItemId,
+                                providerRequestId: runtimeEvent.providerRequestId,
+                                payloadJSON: boundedPayload,
+                                receivedAtMs: runtimeEvent.receivedAtMs
+                            )
+                        }
+                    } else {
+                        providerEvent = nil
                     }
-                } else {
-                    providerEvent = nil
+                    preparedWrite = (payloadJSON, providerEvent)
+                } catch {
+                    recordMirrorPersistenceFailure(error, threadId: threadId)
+                    emitPersistenceIssue("run.stream_event.bound_payload", error: error, runId: runId, threadId: threadId)
+                    preparedWrite = nil
                 }
-                preparedWrite = (payloadJSON, providerEvent)
             } else {
                 preparedWrite = nil
             }
@@ -6995,7 +7002,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         _ payloadJSON: String,
         byteLimit: Int
     ) -> String {
-        AgentRunRepository.softTruncateUTF8Payload(payloadJSON, byteLimit: byteLimit, reversibleStore: nil)
+        // nil store: pure presentation truncate (no I/O); never throws.
+        (try? AgentRunRepository.softTruncateUTF8Payload(payloadJSON, byteLimit: byteLimit, reversibleStore: nil))
+            ?? payloadJSON
     }
 
     nonisolated static func boundedPersistedStreamPayload(

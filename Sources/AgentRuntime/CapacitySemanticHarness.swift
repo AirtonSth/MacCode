@@ -188,16 +188,28 @@ public enum CapacitySemanticHarness {
             rootIDs.append(id)
         }
 
+        // Reserve nested nodes across configured depths so each depth is represented.
         var remaining = nestedNodes
-        var parentFrontier = rootIDs
-        var depthIndex = 0
-        while remaining > 0 && !parentFrontier.isEmpty {
-            let depth = depths[min(depthIndex, depths.count - 1)]
+        var parentsByDepth: [Int: [String]] = [0: rootIDs]
+        let targetDepths = depths.filter { $0 > 0 }.sorted()
+        let slices = max(1, targetDepths.count)
+        var perDepth = Array(repeating: nestedNodes / slices, count: slices)
+        for i in 0..<(nestedNodes % slices) { perDepth[i] += 1 }
+
+        for (depthIdx, depth) in targetDepths.enumerated() {
+            guard remaining > 0 else { break }
+            let budget = min(remaining, perDepth[depthIdx])
+            let parentDepth = depthIdx == 0 ? 0 : targetDepths[depthIdx - 1]
+            var parentFrontier = parentsByDepth[parentDepth] ?? rootIDs
+            if parentFrontier.isEmpty { parentFrontier = rootIDs }
             var nextFrontier: [String] = []
-            for parent in parentFrontier {
-                guard remaining > 0 else { break }
+            var placed = 0
+            var parentCursor = 0
+            while placed < budget {
+                let parent = parentFrontier[parentCursor % parentFrontier.count]
+                parentCursor += 1
                 let fan = fanOut[rng.nextInt(in: 0...(fanOut.count - 1))]
-                let childCount = min(fan, remaining)
+                let childCount = min(fan, budget - placed)
                 for _ in 0..<childCount {
                     let id = rng.deterministicID(prefix: "node")
                     let provider = providers[rng.nextInt(in: 0...(providers.count - 1))]
@@ -209,13 +221,11 @@ public enum CapacitySemanticHarness {
                         provider: provider
                     ))
                     nextFrontier.append(id)
+                    placed += 1
                     remaining -= 1
-                    if remaining == 0 { break }
                 }
             }
-            parentFrontier = nextFrontier
-            depthIndex += 1
-            if depthIndex > depths.count + 4 { break }
+            parentsByDepth[depth] = nextFrontier
         }
 
         // Seeded fault plan against a deterministic subset of nodes.
@@ -342,26 +352,23 @@ public enum CapacitySemanticHarness {
             clock.advance(byMs: workQuantumMs)
             nodes[idx].status = .completed
             nodes[idx].finishedAtMs = clock.nowMs
-            // Exactly-once rejoin into parent accounting.
-            if let parentId = nodes[idx].parentId {
-                rejoinCounts[parentId, default: 0] += 1
-                nodes[idx].resultRejoined = true
-            } else {
-                nodes[idx].resultRejoined = true
-            }
+            // Exactly-once rejoin into parent accounting (count per child id).
+            let childId = nodes[idx].id
+            rejoinCounts[childId, default: 0] += 1
+            nodes[idx].resultRejoined = rejoinCounts[childId] == 1
             markProgress()
         }
 
         let completed = nodes.filter { $0.status == .completed }.count
         let cancelled = nodes.filter { $0.status == .cancelled }.count
         let failed = nodes.filter { $0.status == .failed }.count
-        // Each completed nested node rejoins exactly once (boolean flag per node).
+        // Each completed nested node rejoins exactly once (per-child count == 1).
         let rejoinOK = nodes.filter { $0.kind == .nested }.allSatisfy { node in
             switch node.status {
             case .completed:
-                return node.resultRejoined
+                return node.resultRejoined && rejoinCounts[node.id] == 1
             case .cancelled, .failed, .waiting, .active:
-                return true
+                return rejoinCounts[node.id, default: 0] == 0 || rejoinCounts[node.id] == 1
             }
         }
         let queueDrained = !nodes.contains(where: { $0.status == .waiting || $0.status == .active })

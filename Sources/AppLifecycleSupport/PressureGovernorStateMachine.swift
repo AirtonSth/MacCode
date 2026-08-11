@@ -226,6 +226,8 @@ public enum PressureGovernorStateMachine {
             next.frozenAccounting = true
             next.consecutiveEscalateSamples = 0
             next.escalateTargetLevel = nil
+            // Incomplete/stale samples interrupt recovery streak (must restart).
+            next.consecutiveRecoverSamples = 0
             // OS signal still has immediate precedence for escalation.
             let osLevel = levelFromOS(sample.osSignal)
             if osLevel > next.level {

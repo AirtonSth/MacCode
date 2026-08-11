@@ -304,6 +304,43 @@ final class CapacityContractAndPressureTests: XCTestCase {
         XCTAssertTrue(second.emittedActions.isEmpty)
     }
 
+
+    func test_pressure_incompleteSample_resetsRecoveryStreak() {
+        let thresholds = PressureThresholds.default
+        let entered = Date(timeIntervalSince1970: 8_000)
+        var state = PressureGovernorState(level: .warning, epoch: 2, levelEnteredAt: entered)
+        let base = entered.addingTimeInterval(thresholds.minDwellSeconds + 1)
+        // Two recovery samples
+        for i in 0..<2 {
+            let r = PressureGovernorStateMachine.apply(
+                state: state,
+                sample: PressureSample(date: base.addingTimeInterval(Double(i)), osSignal: .normal, managedRSSFraction: 0.10, isComplete: true),
+                thresholds: thresholds,
+                now: base.addingTimeInterval(Double(i))
+            )
+            state = r.state
+        }
+        XCTAssertEqual(state.consecutiveRecoverSamples, 2)
+        // Incomplete interrupts streak
+        let incomplete = PressureGovernorStateMachine.apply(
+            state: state,
+            sample: PressureSample(date: base.addingTimeInterval(3), osSignal: .normal, managedRSSFraction: nil, isComplete: false),
+            thresholds: thresholds,
+            now: base.addingTimeInterval(3)
+        )
+        XCTAssertEqual(incomplete.state.consecutiveRecoverSamples, 0)
+        state = incomplete.state
+        // One more low sample must NOT recover (need 3 consecutive fresh)
+        let one = PressureGovernorStateMachine.apply(
+            state: state,
+            sample: PressureSample(date: base.addingTimeInterval(4), osSignal: .normal, managedRSSFraction: 0.10, isComplete: true),
+            thresholds: thresholds,
+            now: base.addingTimeInterval(4)
+        )
+        XCTAssertEqual(one.state.level, .warning)
+        XCTAssertEqual(one.state.consecutiveRecoverSamples, 1)
+    }
+
     func test_pressure_epochFreshness() {
         let state = PressureGovernorState(level: .warning, epoch: 9)
         XCTAssertTrue(PressureGovernorStateMachine.isEpochFresh(state: state, expectedEpoch: 9))

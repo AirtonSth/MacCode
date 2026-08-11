@@ -10,6 +10,9 @@ import Foundation
 public enum AuthoritativePayloadRecovery {
     /// Presentation truncation boundary (16 MiB).
     public static let presentationByteLimit = 16 * 1024 * 1024
+    /// Owned trailer prefix so recovery detection cannot collide with provider content.
+    public static let ownedTrailerToken = "rc_oversized_v1"
+
 
     public struct RecoveryResult: Sendable, Equatable {
         public var presentationText: String
@@ -79,7 +82,7 @@ public enum AuthoritativePayloadRecovery {
         // Soft-truncated the presentation form (keeps legacy "truncated" trailer
         // semantics) while the exact original is recoverable via [[rc:handle]].
         let marker = ReversibleContentStore.marker(for: handle)
-        let trailer = "…[truncated \(byteCount)→\(limit) bytes]\(marker)"
+        let trailer = "…[truncated \(AuthoritativePayloadRecovery.ownedTrailerToken) \(byteCount)→\(limit) bytes]\(marker)"
         let headBudget = max(0, limit - trailer.utf8.count)
         let text = String(decoding: data, as: UTF8.self)
         let presentation: String

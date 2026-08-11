@@ -3288,19 +3288,19 @@ public final class AgentRunRepository: @unchecked Sendable {
     public func boundPayloadForPersistence(
         _ payloadJSON: String,
         byteLimit: Int = maximumPersistedEventRowBytes
-    ) -> String {
-        Self.softTruncateUTF8Payload(
+    ) throws -> String {
+        try Self.softTruncateUTF8Payload(
             payloadJSON,
             byteLimit: byteLimit,
             reversibleStore: ReversibleContentStore(db: db)
         )
     }
 
-    private func boundedStreamRow(kind: String, payloadJSON: String) -> (kind: String, payloadJSON: String) {
+    private func boundedStreamRow(kind: String, payloadJSON: String) throws -> (kind: String, payloadJSON: String) {
         let kindBytes = kind.utf8.count
         let payloadBudget = max(1, Self.maximumPersistedEventRowBytes - kindBytes)
         let store = ReversibleContentStore(db: db)
-        let boundedPayload = Self.softTruncateUTF8Payload(
+        let boundedPayload = try Self.softTruncateUTF8Payload(
             payloadJSON,
             byteLimit: payloadBudget,
             reversibleStore: store
@@ -3308,9 +3308,9 @@ public final class AgentRunRepository: @unchecked Sendable {
         return (kind, boundedPayload)
     }
 
-    private func boundedProviderPayload(_ payloadJSON: String) -> String {
+    private func boundedProviderPayload(_ payloadJSON: String) throws -> String {
         let store = ReversibleContentStore(db: db)
-        return Self.softTruncateUTF8Payload(
+        return try Self.softTruncateUTF8Payload(
             payloadJSON,
             byteLimit: Self.maximumPersistedEventRowBytes,
             reversibleStore: store
@@ -3325,35 +3325,24 @@ public final class AgentRunRepository: @unchecked Sendable {
         _ payloadJSON: String,
         byteLimit: Int,
         reversibleStore: ReversibleContentStore? = nil
-    ) -> String {
+    ) throws -> String {
         let limit = max(1, byteLimit)
         let originalBytes = payloadJSON.utf8.count
         guard originalBytes > limit else { return payloadJSON }
+        // Already an owned S3 presentation — do not double-wrap (coordinator+repo).
+        if payloadJSON.contains(AuthoritativePayloadRecovery.ownedTrailerToken) {
+            return payloadJSON
+        }
         // S3: store-before-loss is mandatory when a store is provided. Fail open
         // only by raising — callers must not silently drop the original.
         if let reversibleStore {
-            do {
-                return try AuthoritativePayloadRecovery.prepareForPresentation(
-                    text: payloadJSON,
-                    store: reversibleStore,
-                    limit: limit
-                ).presentationText
-            } catch {
-                // Last-resort: still attempt to store raw bytes and emit envelope.
-                // If store itself fails, rethrow as empty with marker is unsafe —
-                // return a durable failure envelope that decode paths reject loudly.
-                let failure: [String: Any] = [
-                    "rc_oversized": true,
-                    "store_failed": true,
-                    "original_bytes": originalBytes,
-                    "error": String(describing: error),
-                ]
-                if let data = try? JSONSerialization.data(withJSONObject: failure),
-                   let text = String(data: data, encoding: .utf8) {
-                    return text
-                }
-                return #"{"rc_oversized":true,"store_failed":true}"#
-            }
+            // Store-before-loss: failures propagate; never replace original with
+            // an unrecoverable substitute under a provided store.
+            return try AuthoritativePayloadRecovery.prepareForPresentation(
+                text: payloadJSON,
+                store: reversibleStore,
+                limit: limit
+            ).presentationText
         }
         let trailer = "…[truncated \(originalBytes)→\(limit) bytes]"
         let headBudget = max(0, limit - trailer.utf8.count)
@@ -3375,22 +3364,17 @@ public final class AgentRunRepository: @unchecked Sendable {
     /// Rehydrate a store-before-loss presentation form back to the original UTF-8 payload.
     /// Recognizes `[[rc:handle]]` markers and legacy `rc_oversized` JSON envelopes.
     public func rehydrateOversizedPayloadIfNeeded(_ payloadJSON: String) throws -> String {
-        if payloadJSON.contains("store_failed") && payloadJSON.contains("rc_oversized") {
-            throw PersistenceDataError.corruptStreamEvent("oversized payload store failed; original unavailable")
+        // Only owned S3 trailers are recovered — avoid false positives on provider content.
+        guard payloadJSON.contains(AuthoritativePayloadRecovery.ownedTrailerToken) else {
+            return payloadJSON
         }
-        let handle: String?
-        if let range = payloadJSON.range(of: #"\[\[rc:([0-9a-fA-F]+)\]\]"#, options: .regularExpression) {
-            let marker = String(payloadJSON[range])
-            handle = ReversibleContentStore.normalize(marker)
-        } else if payloadJSON.contains("rc_oversized"),
-                  let data = payloadJSON.data(using: .utf8),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let h = object["handle"] as? String {
-            handle = h
-        } else {
-            handle = nil
+        guard let range = payloadJSON.range(of: #"\[\[rc:([0-9a-fA-F]+)\]\]"#, options: .regularExpression) else {
+            throw PersistenceDataError.corruptStreamEvent("owned oversized trailer missing handle")
         }
-        guard let handle, !handle.isEmpty else { return payloadJSON }
+        let handle = ReversibleContentStore.normalize(String(payloadJSON[range]))
+        guard !handle.isEmpty else {
+            throw PersistenceDataError.corruptStreamEvent("owned oversized trailer empty handle")
+        }
         let store = ReversibleContentStore(db: db)
         let original = try AuthoritativePayloadRecovery.rehydrate(handle: handle, store: store)
         guard let text = String(data: original, encoding: .utf8) else {
@@ -3574,7 +3558,7 @@ public final class AgentRunRepository: @unchecked Sendable {
     }
 
     public func appendStreamEvent(runId: AgentRunID, seq: Int, kind: String, payloadJSON: String) throws {
-        let bounded = boundedStreamRow(kind: kind, payloadJSON: payloadJSON)
+        let bounded = try boundedStreamRow(kind: kind, payloadJSON: payloadJSON)
         let st = try db.prepare("INSERT INTO agent_stream_events(run_id, seq, event_kind, payload_json, created_at) VALUES(?, ?, ?, ?, ?);")
         try st.bind(1, runId.value.uuidString)
         try st.bind(2, Int64(seq))
@@ -3781,7 +3765,7 @@ public final class AgentRunRepository: @unchecked Sendable {
     }
 
     public func appendProviderEventLog(threadId: AgentThreadID, runId: AgentRunID?, event: ProviderRuntimeEvent) throws {
-        let boundedPayload = boundedProviderPayload(event.payloadJSON)
+        let boundedPayload = try boundedProviderPayload(event.payloadJSON)
         let st = try db.prepare("""
             INSERT INTO agent_provider_event_logs(
                 thread_id, run_id, event_id, provider, source, method,
@@ -3960,7 +3944,7 @@ public final class AgentRunRepository: @unchecked Sendable {
         runId: AgentRunID,
         item: StreamWriteIntent
     ) throws {
-        let bounded = boundedStreamRow(kind: item.kind, payloadJSON: item.payloadJSON)
+        let bounded = try boundedStreamRow(kind: item.kind, payloadJSON: item.payloadJSON)
         let existing = try db.prepare("SELECT event_kind, payload_json FROM agent_stream_events WHERE run_id = ? AND seq = ? LIMIT 1;")
         try existing.bind(1, runId.value.uuidString)
         try existing.bind(2, Int64(item.seq))
@@ -3993,7 +3977,7 @@ public final class AgentRunRepository: @unchecked Sendable {
         runId: AgentRunID,
         event: ProviderRuntimeEvent
     ) throws {
-        let boundedPayload = boundedProviderPayload(event.payloadJSON)
+        let boundedPayload = try boundedProviderPayload(event.payloadJSON)
         let existing = try db.prepare("""
             SELECT provider, source, method, provider_turn_id, provider_item_id,
                    provider_request_id, payload_json, received_at_ms

@@ -105,16 +105,29 @@ public enum DiagnosticsExportAllowlist {
             return value == "true" || value == "false" || value == "0" || value == "1"
         case (.pressureState, "epoch"),
              (.pressureState, "action_count"),
-             (.capacityMetrics, _),
              (.managedRSSTrend, "total_managed_rss_kb"),
-             (.managedRSSTrend, "slope_kb_per_minute"),
              (.managedRSSTrend, "high_water_managed_rss_kb"),
              (.transportQueueDepths, _),
-             (.ownershipCoverage, _),
+             (.ownershipCoverage, "live_row_count"),
              (.hangWatchdog, "hang_likely_count"),
              (.capacityManifest, "warmed_sample_count"),
-             (.hardwareTier, "physical_memory_bytes"):
-            return Double(value) != nil
+             (.hardwareTier, "physical_memory_bytes"),
+             (.capacityMetrics, "app_rss_kb"),
+             (.capacityMetrics, "provider_tree_rss_kb"),
+             (.capacityMetrics, "sidecar_rss_kb"),
+             (.capacityMetrics, "batcher_pending_bytes"),
+             (.capacityMetrics, "batcher_pending_count"):
+            guard let n = Double(value), n.isFinite, n >= 0, floor(n) == n else { return false }
+            return true
+        case (.capacityMetrics, "ownership_coverage_fraction"),
+             (.ownershipCoverage, "coverage_fraction"):
+            guard let n = Double(value), n.isFinite, n >= 0, n <= 1 else { return false }
+            return true
+        case (.capacityMetrics, _),
+             (.managedRSSTrend, "slope_kb_per_minute"):
+            // Latency / slope: finite non-negative
+            guard let n = Double(value), n.isFinite, n >= 0 else { return false }
+            return true
         case (.hangWatchdog, "gap_kind"):
             return ["hangLikely", "suspendedOrSleep", "normal"].contains(value)
         default:
