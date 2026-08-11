@@ -273,4 +273,32 @@ public enum ProviderPreparationStateMachine {
         guard permitGeneration == state.generation else { return false }
         return state.phase == .providerStarting
     }
+
+    /// Surface production helper (S5): finish prep + claim using the generation
+    /// captured at accept time — never re-read `state.generation` after an await.
+    /// Returns nil when the accepted generation was revoked (Stop/resend).
+    public static func finishAndClaimCapturedGeneration(
+        state: ProviderPreparationState,
+        acceptedGeneration: UInt64
+    ) -> ProviderPreparationState? {
+        let finished = apply(
+            state: state,
+            event: .preparationFinished(generation: acceptedGeneration)
+        )
+        if finished.suppressLateCallback
+            || finished.ignoredReason == "stale_generation"
+            || !finished.allowProviderSpawn {
+            return nil
+        }
+        let claimed = claimSpawn(
+            state: finished.state,
+            permitGeneration: finished.spawnPermitGeneration ?? acceptedGeneration
+        )
+        if claimed.suppressLateCallback
+            || claimed.ignoredReason != nil
+            || claimed.state.phase != .running {
+            return nil
+        }
+        return claimed.state
+    }
 }

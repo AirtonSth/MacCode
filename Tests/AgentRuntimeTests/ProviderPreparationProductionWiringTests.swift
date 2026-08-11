@@ -168,6 +168,37 @@ final class ProviderPreparationProductionWiringTests: XCTestCase {
         )
     }
 
+    /// S5 race: accept A → Stop → accept B → late finish of A must not claim B.
+    func test_capturedGeneration_lateFinishCannotClaimResentPrep() {
+        var state = ProviderPreparationState()
+        state = ProviderPreparationStateMachine.apply(
+            state: state,
+            event: .accept(draftMessageId: "A", atMs: 1)
+        ).state
+        let genA = state.generation
+        state = ProviderPreparationStateMachine.apply(state: state, event: .stopRequested).state
+        state = ProviderPreparationStateMachine.apply(
+            state: state,
+            event: .accept(draftMessageId: "B", atMs: 2)
+        ).state
+        let genB = state.generation
+        XCTAssertNotEqual(genA, genB)
+
+        // Late completion for A after B accepted — production must use genA.
+        let lateA = ProviderPreparationStateMachine.finishAndClaimCapturedGeneration(
+            state: state,
+            acceptedGeneration: genA
+        )
+        XCTAssertNil(lateA, "cancelled generation A must never claim after B accepted")
+
+        let claimB = ProviderPreparationStateMachine.finishAndClaimCapturedGeneration(
+            state: state,
+            acceptedGeneration: genB
+        )
+        XCTAssertEqual(claimB?.phase, .running)
+        XCTAssertEqual(claimB?.generation, genB)
+    }
+
     func test_twoSequentialTurns_acceptNotPoisoned() async throws {
         let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-seq")
         let thread = AgentThread(title: "prep-seq", provider: .codex, model: "fake-model")

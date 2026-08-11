@@ -400,6 +400,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// coordinator start). Stop/Escape applies `.stopRequested` so a late
     /// claim cannot call `coordinator.startRun`.
     private var surfacePreparationStates: [AgentThreadID: ProviderPreparationState] = [:]
+    /// Generation that currently owns `preparingRunThreadId` for each thread.
+    /// A superseded/cancelled prep must not clear a newer generation's marker.
+    private var preparingRunGeneration: [AgentThreadID: UInt64] = [:]
     /// UX-MAC_AGENT-009: true while the last surfaced error is recoverable, so
     /// the transcript can offer a Retry of the last prompt instead of forcing a
     /// retype. Cleared when a run starts or any non-error event arrives.
@@ -5921,8 +5924,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // never be left permanently loading.
         // Run identity is fixed at acceptance so Stop can cancel this generation.
         let runId = requestedRunId ?? AgentRunID()
-        preparingRunThreadId = tid
         // S5: accept surface-owned preparation generation before any Graphify work.
+        // Capture the generation for this startProviderRun invocation — never
+        // re-read state.generation after await (Stop + resend can advance it).
         let surfaceAccept = ProviderPreparationStateMachine.apply(
             state: surfacePreparationStates[tid] ?? ProviderPreparationState(),
             event: .accept(
@@ -5931,8 +5935,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             )
         )
         surfacePreparationStates[tid] = surfaceAccept.state
+        let acceptedGeneration = surfaceAccept.state.generation
+        preparingRunThreadId = tid
+        preparingRunGeneration[tid] = acceptedGeneration
         defer {
-            if preparingRunThreadId == tid { preparingRunThreadId = nil }
+            // Only clear the Loading marker if we still own this generation.
+            if preparingRunThreadId == tid,
+               preparingRunGeneration[tid] == acceptedGeneration {
+                preparingRunThreadId = nil
+                preparingRunGeneration.removeValue(forKey: tid)
+            }
         }
         // B5: title a still-default thread from its first message.
         if let t = threads.first(where: { $0.id == tid }),
@@ -6039,62 +6051,68 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             isStopping = false
             onRunStateChange?()
         } catch {
-            // S5: terminalize so the next send is not stuck in preparing.
-            let gen = surfacePreparationStates[tid]?.generation ?? 0
-            surfacePreparationStates[tid] = ProviderPreparationStateMachine.apply(
+            // S5: only mutate prep state for *this* accepted generation.
+            let failed = ProviderPreparationStateMachine.apply(
                 state: surfacePreparationStates[tid] ?? ProviderPreparationState(),
-                event: .preparationFailed(generation: gen, reason: .durabilityFailure)
-            ).state
-            // Roll back premature pending write so reload is not phantom-active.
-            if var rolled = try? threadRepo.get(id: tid), rolled.status == .pending {
-                rolled.status = .failed
-                rolled.updatedAt = Date()
-                try? threadRepo.upsert(rolled)
-                if let index = threads.firstIndex(where: { $0.id == tid }) {
-                    threads[index] = rolled
+                event: .preparationFailed(
+                    generation: acceptedGeneration,
+                    reason: .durabilityFailure
+                )
+            )
+            if !failed.suppressLateCallback {
+                surfacePreparationStates[tid] = failed.state
+                // Roll back premature pending write so reload is not phantom-active.
+                if var rolled = try? threadRepo.get(id: tid), rolled.status == .pending {
+                    rolled.status = .failed
+                    rolled.updatedAt = Date()
+                    try? threadRepo.upsert(rolled)
+                    if let index = threads.firstIndex(where: { $0.id == tid }) {
+                        threads[index] = rolled
+                    }
                 }
+                statusMessage = "Failed to prepare run: \(error)"
+                status = .failed
+                currentRunId = nil
+                runThreads[runId] = nil
             }
-            statusMessage = "Failed to prepare run: \(error)"
-            status = .failed
-            currentRunId = nil
-            runThreads[runId] = nil
             return nil
         }
-        // S5: finish surface prep and claim spawn before coordinator.startRun.
-        // Stop/Escape during Graphify/preflight revokes this generation.
+        // S5: finish + claim using generation captured at accept (not live map).
         let surfacePrep = surfacePreparationStates[tid] ?? ProviderPreparationState()
-        let surfaceFinished = ProviderPreparationStateMachine.apply(
+        guard let claimedState = ProviderPreparationStateMachine.finishAndClaimCapturedGeneration(
             state: surfacePrep,
-            event: .preparationFinished(generation: surfacePrep.generation)
-        )
-        surfacePreparationStates[tid] = surfaceFinished.state
-        let surfaceClaimed = ProviderPreparationStateMachine.claimSpawn(
-            state: surfaceFinished.state,
-            permitGeneration: surfaceFinished.spawnPermitGeneration
-        )
-        surfacePreparationStates[tid] = surfaceClaimed.state
-        guard surfaceClaimed.state.phase == .running, surfaceClaimed.ignoredReason == nil else {
-            // Do NOT arm coordinator pendingThreadStops before startRun admitted.
-            let gen = surfaceClaimed.state.generation
-            surfacePreparationStates[tid] = ProviderPreparationStateMachine.apply(
-                state: surfaceClaimed.state,
-                event: .providerFinished(generation: gen, reason: .cancelled)
-            ).state
-            if var rolled = try? threadRepo.get(id: tid), rolled.status == .pending {
-                rolled.status = .cancelled
-                rolled.updatedAt = Date()
-                try? threadRepo.upsert(rolled)
-                if let index = threads.firstIndex(where: { $0.id == tid }) {
-                    threads[index] = rolled
+            acceptedGeneration: acceptedGeneration
+        ) else {
+            // Stale (Stop + resend) or cancelled: never mutate a newer generation.
+            if preparingRunGeneration[tid] == acceptedGeneration {
+                let cancelled = ProviderPreparationStateMachine.apply(
+                    state: surfacePrep,
+                    event: .providerFinished(
+                        generation: acceptedGeneration,
+                        reason: .cancelled
+                    )
+                )
+                if !cancelled.suppressLateCallback {
+                    surfacePreparationStates[tid] = cancelled.state
                 }
+                if var rolled = try? threadRepo.get(id: tid), rolled.status == .pending {
+                    rolled.status = .cancelled
+                    rolled.updatedAt = Date()
+                    try? threadRepo.upsert(rolled)
+                    if let index = threads.firstIndex(where: { $0.id == tid }) {
+                        threads[index] = rolled
+                    }
+                }
+                statusMessage = "Run cancelled during preparation"
+                status = .cancelled
+                currentRunId = nil
+                runThreads[runId] = nil
+                preparingRunThreadId = nil
+                preparingRunGeneration.removeValue(forKey: tid)
             }
-            statusMessage = "Run cancelled during preparation"
-            status = .cancelled
-            currentRunId = nil
-            runThreads[runId] = nil
-            preparingRunThreadId = nil
             return nil
         }
+        surfacePreparationStates[tid] = claimedState
         do {
             let runId = try await coordinator.startRun(
                 req,
@@ -6102,12 +6120,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 recordUserMessage: !resumeInterrupted
             )
             // Surface claim consumed the permit; coordinator owns the live run.
-            // Terminalize surface prep so a second send can accept again.
-            let gen = surfacePreparationStates[tid]?.generation ?? 0
-            surfacePreparationStates[tid] = ProviderPreparationStateMachine.apply(
+            // Terminalize *this* generation so a second send can accept again.
+            let done = ProviderPreparationStateMachine.apply(
                 state: surfacePreparationStates[tid] ?? ProviderPreparationState(),
-                event: .providerFinished(generation: gen, reason: .completed)
-            ).state
+                event: .providerFinished(
+                    generation: acceptedGeneration,
+                    reason: .completed
+                )
+            )
+            if !done.suppressLateCallback {
+                surfacePreparationStates[tid] = done.state
+            }
             do {
                 try clearComposerDraft(threadId: tid, providerInstanceId: providerInstanceId)
                 attachments = []
@@ -6146,23 +6169,32 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             return runId
         } catch {
-            let gen = surfacePreparationStates[tid]?.generation ?? 0
-            surfacePreparationStates[tid] = ProviderPreparationStateMachine.apply(
+            let failed = ProviderPreparationStateMachine.apply(
                 state: surfacePreparationStates[tid] ?? ProviderPreparationState(),
-                event: .providerFinished(generation: gen, reason: .providerFailure)
-            ).state
-            await MainActor.run {
-                // Prefer LocalizedError copy so ManagedProviderAdmissionError shows
-                // the human message instead of the raw enum case name in the banner.
-                let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                self.statusMessage = "Failed to start: \(detail)"
-                self.status = .failed
-                self.currentRunId = nil
-                self.runThreads[runId] = nil
-                self.runStartedAt = nil
-                self.clearActivePlanFollowUpSuppressionIfSafe()
-                self.reloadThreads()
-                self.onRunStateChange?()
+                event: .providerFinished(
+                    generation: acceptedGeneration,
+                    reason: .providerFailure
+                )
+            )
+            if !failed.suppressLateCallback {
+                surfacePreparationStates[tid] = failed.state
+            }
+            // Only surface failure UI if this generation still owns prep (not a
+            // superseded late failure after Stop + resend).
+            if preparingRunGeneration[tid] == acceptedGeneration
+                || preparingRunGeneration[tid] == nil {
+                await MainActor.run {
+                    let detail = (error as? LocalizedError)?.errorDescription
+                        ?? error.localizedDescription
+                    self.statusMessage = "Failed to start: \(detail)"
+                    self.status = .failed
+                    self.currentRunId = nil
+                    self.runThreads[runId] = nil
+                    self.runStartedAt = nil
+                    self.clearActivePlanFollowUpSuppressionIfSafe()
+                    self.reloadThreads()
+                    self.onRunStateChange?()
+                }
             }
             return nil
         }
@@ -6411,6 +6443,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             )
             surfacePreparationStates[tid] = stopped.state
             preparingRunThreadId = nil
+            preparingRunGeneration.removeValue(forKey: tid)
             coordinator.cancelPreparation(threadId: tid)
             // Fall through so a pending coordinator start also receives stopRun.
         }
@@ -6547,6 +6580,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 event: .stopRequested
             ).state
             preparingRunThreadId = nil
+            preparingRunGeneration.removeValue(forKey: id)
             coordinator.cancelPreparation(threadId: id)
         }
         if isScheduledThreadRunning?(id) == true, let stopScheduledThread {
