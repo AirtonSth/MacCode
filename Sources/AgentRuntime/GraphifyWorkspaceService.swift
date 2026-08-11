@@ -633,13 +633,31 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             }
             // Kick deferred checkouts that waited on the global gate (at most one
             // trailing ensure per id via startEnsureIfNeeded coalescing).
-            for displayRoot in deferredRoots {
-                if let deferredCheckout = GraphifyGitProbe.identity(at: displayRoot)?.checkout {
-                    service.startEnsureIfNeeded(checkout: deferredCheckout)
+            // Under pressure pause: preserve dirty/rerun only — do not spawn git
+            // identity probes before startEnsure would no-op.
+            service.lock.lock()
+            let deferUnderPressure = service.pressurePauseEnsureAndWatch
+            if deferUnderPressure {
+                for id in deferredIDs where id != checkout.scheduleID {
+                    guard var sch = service.schedules[id] else { continue }
+                    sch.rerunRequested = true
+                    if sch.dirtyGeneration == sch.builtGeneration {
+                        sch.dirtyGeneration &+= 1
+                    }
+                    service.schedules[id] = sch
+                }
+            }
+            service.lock.unlock()
+            if !deferUnderPressure {
+                for displayRoot in deferredRoots {
+                    if let deferredCheckout = GraphifyGitProbe.identity(at: displayRoot)?.checkout {
+                        service.startEnsureIfNeeded(checkout: deferredCheckout)
+                    }
                 }
             }
             if needRerun {
                 // Replacement after cancel or trailing dirty during build.
+                // startEnsureIfNeeded itself no-ops under pressure pause.
                 service.startEnsureIfNeeded(checkout: checkout)
             }
         }
