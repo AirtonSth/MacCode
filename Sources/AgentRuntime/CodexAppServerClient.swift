@@ -826,9 +826,9 @@ public final class CodexAppServerClient: @unchecked Sendable {
             let efforts = reasoningEfforts(from: raw["supportedReasoningEfforts"])
             let defaultEffort = string(raw, "defaultReasoningEffort").flatMap(AgentReasoningEffort.init(rawValue:))
             let supportedEfforts = efforts.isEmpty ? defaultEffort.map { [$0] } ?? [] : efforts
-            let speedTiers = raw["additionalSpeedTiers"] as? [String]
-                ?? raw["additional_speed_tiers"] as? [String]
-                ?? []
+            // Upstream ModelPreset::supports_fast_mode checks service_tiers first,
+            // then falls back to deprecated additional_speed_tiers.
+            let supportsFast = Self.supportsFastMode(fromModelEntry: raw)
             let contextWindow = int(raw, "modelContextWindow")
                 ?? int(raw, "contextWindow")
                 ?? int(raw, "maxTokens")
@@ -838,7 +838,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
                 provider: .codex,
                 supportsReasoning: !supportedEfforts.isEmpty,
                 supportedReasoningEfforts: supportedEfforts,
-                supportsServiceTier: speedTiers.contains("fast"),
+                supportsServiceTier: supportsFast,
                 supportsCustomModel: true,
                 contextWindowTokens: contextWindow
             )
@@ -856,6 +856,28 @@ public final class CodexAppServerClient: @unchecked Sendable {
             }
         }
         return []
+    }
+
+    /// Whether model/list advertises fast mode (serviceTiers first, additionalSpeedTiers fallback).
+    private static func supportsFastMode(fromModelEntry raw: [String: Any]) -> Bool {
+        if serviceTiersAdvertiseFast(raw["serviceTiers"] ?? raw["service_tiers"]) {
+            return true
+        }
+        let speedTiers = raw["additionalSpeedTiers"] as? [String]
+            ?? raw["additional_speed_tiers"] as? [String]
+            ?? []
+        return speedTiers.contains { $0.caseInsensitiveCompare("fast") == .orderedSame }
+    }
+
+    private static func serviceTiersAdvertiseFast(_ value: Any?) -> Bool {
+        guard let objects = value as? [[String: Any]] else { return false }
+        return objects.contains { entry in
+            // Real catalog may use id="priority" with name="Fast"; check both fields.
+            let id = string(entry, "id")
+            let name = string(entry, "name")
+            return id?.caseInsensitiveCompare("fast") == .orderedSame
+                || name?.caseInsensitiveCompare("fast") == .orderedSame
+        }
     }
 
     private static func string(_ object: JSONObject, _ key: String) -> String? {

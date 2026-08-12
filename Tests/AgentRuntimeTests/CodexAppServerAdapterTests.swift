@@ -3542,6 +3542,57 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         )
     }
 
+    func test_itemCompletedSleepWithoutStatusMapsToCompleted() async throws {
+        // WHY: openai/codex Sleep (and agentMessage/plan/imageView) omit status;
+        // completion is signaled only by item/completed. itemState(nil) defaulted
+        // to .streaming so sleep rows spun forever (CODEX-APP-006). Must be .completed,
+        // not .cancelled/.streaming.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "sleep then continue"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.notificationHandler?("item/started", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "item": ["id": "sleep-1", "type": "sleep", "durationMs": 250]
+        ])
+        client.notificationHandler?("item/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "item": [
+                "id": "sleep-1",
+                "type": "sleep",
+                "durationMs": 250
+                // no status field — upstream Sleep item shape
+            ]
+        ])
+
+        _ = try await waitForItemCompleted(in: sink, itemId: "sleep-1")
+        let events = await sink.snapshot()
+        let completed = events.compactMap { event -> AssistantItemState? in
+            if case .itemCompleted(let itemId, let state) = event, itemId == "sleep-1" {
+                return state
+            }
+            return nil
+        }
+        XCTAssertEqual(completed, [.completed],
+                       "item/completed type=sleep without status must finalState .completed, not .streaming/.cancelled")
+    }
+
     func test_hookCompletedNestedRunStatusMapsToTerminalStates() async throws {
         // WHY: openai/codex HookCompletedNotification nests HookRunSummary under `run`
         // with HookRunStatus blocked/stopped (camelCase). Reading only flat/hook/summary
