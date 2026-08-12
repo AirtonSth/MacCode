@@ -388,15 +388,31 @@ final class IntrinsicHeightTextView: NSTextView {
         return size
     }
 
+    /// Commit a container width only when it moves by at least one whole point.
+    ///
+    /// WHY: SwiftUI often proposes 220.00 ↔ 220.25 during the same transaction.
+    /// Treating that as a real wrap change invalidates intrinsic height and
+    /// re-enters AttributeGraph (same class as the 2026-08-12 hang).
+    static func shouldInvalidateContainerWidth(
+        current: CGFloat,
+        proposed: CGFloat,
+        minimumDelta: CGFloat = 1
+    ) -> Bool {
+        guard proposed.isFinite, proposed > 0 else { return false }
+        let quantized = proposed.rounded()
+        if current <= 0 { return true }
+        return abs(quantized - current) >= minimumDelta
+    }
+
     override func layout() {
         super.layout()
         let width = bounds.width
         guard width > 0, let textContainer else { return }
-        let target = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
-        if textContainer.containerSize.width != width {
-            textContainer.containerSize = target
-            invalidateIntrinsicContentSize()
-        }
+        let current = textContainer.containerSize.width
+        guard Self.shouldInvalidateContainerWidth(current: current, proposed: width) else { return }
+        let quantized = width.rounded()
+        textContainer.containerSize = NSSize(width: quantized, height: CGFloat.greatestFiniteMagnitude)
+        invalidateIntrinsicContentSize()
     }
 
     override func didChangeText() {

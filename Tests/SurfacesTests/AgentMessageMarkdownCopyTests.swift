@@ -64,6 +64,124 @@ final class AgentMessageMarkdownCopyTests: XCTestCase {
         )
     }
 
+    /// WHY: wrapping AgentMessageMarkdownView in SwiftUI `.textSelection`
+    /// installs SelectionOverlay (NSTextField) on every Text child. The
+    /// 2026-08-12 hang sample spent the entire main-thread quantum in
+    /// SelectionOverlay.updateNSView → setFont → invalidateIntrinsicContentSize.
+    func test_assistantProseDoesNotWrapMarkdownInSwiftUITextSelection() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        let start = try XCTUnwrap(source.range(of: "private func assistantProse("))
+        let tail = source[start.lowerBound...]
+        let end = try XCTUnwrap(tail.range(of: "private func assistantCopyBar"))
+        let prose = String(tail[..<end.lowerBound])
+        XCTAssertTrue(prose.contains("AgentMessageMarkdownView("))
+        XCTAssertFalse(
+            prose.contains(".textSelection(.enabled)"),
+            "selection belongs on AgentLinkedInlineText NSTextView, not a SwiftUI overlay around the markdown stack"
+        )
+    }
+
+    func test_reasoningAndToolHotPathsAvoidSwiftUITextSelection() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+
+        let reasoningStart = try XCTUnwrap(source.range(of: "if expanded, !text.isEmpty {"))
+        let reasoningTail = source[reasoningStart.lowerBound...]
+        let reasoningEnd = try XCTUnwrap(reasoningTail.range(of: "accessibilityIdentifier(\"agent.reasoning."))
+        let reasoning = String(reasoningTail[..<reasoningEnd.lowerBound])
+        XCTAssertTrue(reasoning.contains("AgentSelectablePlainText("))
+        XCTAssertFalse(
+            reasoning.contains(".textSelection(.enabled)"),
+            "streaming Thought must not install SelectionOverlay; it is always expanded while streaming"
+        )
+
+        let summaryStart = try XCTUnwrap(source.range(of: "if let summary = commandSummary, !summary.isEmpty {"))
+        let summaryTail = source[summaryStart.lowerBound...]
+        let summaryEnd = try XCTUnwrap(summaryTail.range(of: "if let activityHint {"))
+        let summary = String(summaryTail[..<summaryEnd.lowerBound])
+        XCTAssertFalse(
+            summary.contains(".textSelection(.enabled)"),
+            "always-visible tool summaries must not create a SelectionOverlay per live work row"
+        )
+    }
+
+    func test_applyExternalTextDefersCursorPublish() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        let start = try XCTUnwrap(source.range(of: "func applyExternalText(_ value: String, to textView: NSTextView)"))
+        let tail = source[start.lowerBound...]
+        let end = try XCTUnwrap(tail.range(of: "func recalculateHeight()"))
+        let apply = String(tail[..<end.lowerBound])
+        let asyncRange = try XCTUnwrap(apply.range(of: "DispatchQueue.main.async"))
+        let cursorRange = try XCTUnwrap(apply.range(of: "onCursorMoved(endOffset)"))
+        XCTAssertLessThan(
+            asyncRange.lowerBound,
+            cursorRange.lowerBound,
+            "cursor publish from applyExternalText must run on a later turn than updateNSView"
+        )
+    }
+
+    func test_markdownCodeBlockDoesNotUseSwiftUITextSelection() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/Surfaces/AgentMessageMarkdown.swift"),
+            encoding: .utf8
+        )
+        let start = try XCTUnwrap(source.range(of: "case .code:"))
+        let tail = source[start.lowerBound...]
+        let end = try XCTUnwrap(tail.range(of: "private func headingSize"))
+        let codeBlock = String(tail[..<end.lowerBound])
+        XCTAssertTrue(
+            codeBlock.contains("AgentLinkedInlineText("),
+            "code fences must use the NSTextView path so parent refreshes can no-op"
+        )
+        XCTAssertFalse(
+            codeBlock.contains(".textSelection(.enabled)"),
+            "SwiftUI textSelection on fenced code is the SelectionOverlay that froze the transcript"
+        )
+    }
+
+    func test_fileEditDiffCardDoesNotWrapLinesInSwiftUITextSelection() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/Surfaces/AgentMessageMarkdown.swift"),
+            encoding: .utf8
+        )
+        let start = try XCTUnwrap(source.range(of: "struct AgentFileEditDiffCard: View {"))
+        let tail = source[start.lowerBound...]
+        let end = try XCTUnwrap(tail.range(of: "private func diffLineRow"))
+        let card = String(tail[..<end.lowerBound])
+        XCTAssertFalse(
+            card.contains(".textSelection(.enabled)"),
+            "a parent SelectionOverlay over N diff lines is the same setFont loop as assistant markdown"
+        )
+    }
+
     func test_copyCodeToPasteboard_preservesMultilineCode() {
         let multiline = """
         import Foundation

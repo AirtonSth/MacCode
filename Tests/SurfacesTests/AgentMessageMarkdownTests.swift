@@ -219,4 +219,43 @@ final class AgentMessageMarkdownTests: XCTestCase {
         ])
         XCTAssertEqual(groups[2][0].text, "Final paragraph.")
     }
+
+    /// WHY: `ForEach(..., id: \.offset)` remounted later NSTextViews when a
+    /// code fence appeared mid-stream, paying apply()+layout on every stable
+    /// prose group behind the fence.
+    func test_identifiedSelectionGroups_keepLaterProseIdWhenFenceInserts() {
+        let before = AgentMessageMarkdown.blocks(from: """
+        Intro paragraph.
+
+        ```
+        let existing = true
+        ```
+
+        Outro paragraph.
+        """)
+        let after = AgentMessageMarkdown.blocks(from: """
+        Intro paragraph.
+
+        ```
+        let inserted = true
+        ```
+
+        ```
+        let existing = true
+        ```
+
+        Outro paragraph.
+        """)
+        let beforeGroups = AgentMessageMarkdown.identifiedSelectionGroups(from: before)
+        let afterGroups = AgentMessageMarkdown.identifiedSelectionGroups(from: after)
+        XCTAssertEqual(beforeGroups.map(\.blocks.count), [1, 1, 1])
+        XCTAssertEqual(afterGroups.map(\.blocks.count), [1, 1, 1, 1])
+        XCTAssertEqual(beforeGroups.first?.id, afterGroups.first?.id)
+        XCTAssertEqual(
+            afterGroups.last?.id,
+            beforeGroups.last?.id,
+            "identical trailing prose must keep its identity when an earlier fence appears; offset ids remount it"
+        )
+        XCTAssertNotEqual(afterGroups[1].id, afterGroups[2].id)
+    }
 }

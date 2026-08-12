@@ -70,6 +70,10 @@ struct TimelineItemIndex: Sendable, Equatable {
 @MainActor
 public final class AgentComposerState: ObservableObject {
     @Published public var prompt: String = ""
+    /// UTF-16 caret offset from PromptComposerEditor. Lives on the composer
+    /// object so a cursor report cannot republish `AgentAppViewModel` (and the
+    /// transcript-bearing `AgentAppView`) from `updateNSView`.
+    @Published public var cursorOffset: Int? = nil
 }
 
 /// Stream/transcript paint state on its OWN ObservableObject so token/tool storms
@@ -263,7 +267,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // suggestions anchor at the actual insertion point, not text.endIndex.
     // nil means "not yet reported by the editor" -- suggestions fall back to
     // the endIndex anchor so programmatic prompt mutations (tests, /clear) work.
-    @Published public var composerCursorOffset: Int? = nil
+    // Proxy onto composerState so caret publishes do not rebuild the transcript.
+    public var composerCursorOffset: Int? {
+        get { composerState.cursorOffset }
+        set { composerState.cursorOffset = newValue }
+    }
     @Published public var provider: AgentProvider = .codex
     @Published public var providerInstanceId: String = AgentProvider.codex.rawValue
     /// macOS account that will execute the next provider process (`sudo -u`).
@@ -9821,6 +9829,9 @@ public struct AgentAppView: View {
     @State private var draggingThreadId: AgentThreadID?
     @State private var timelineSticksToBottom = true
     @State private var showScrollDownButton = false
+    /// Last committed transcript viewport width (whole points, 2pt hysteresis).
+    /// Read by history revision / content frame; never written during body.
+    @State private var committedTimelineViewportWidth: CGFloat = 0
     /// Increments on FAB / thread-open so TimelineScrollFollower re-arms pin
     /// even when sticky detach would otherwise ignore a stale `pinned: true`.
     @State private var timelinePinForceToken = 0
@@ -10629,6 +10640,34 @@ public struct AgentAppView: View {
         let usable = columnWidth - userMessageBubbleLeadingGutter
         guard usable.isFinite, usable > 0 else { return userMessageBubbleMinWidth }
         return min(userMessageBubbleMaxWidth, max(userMessageBubbleMinWidth, usable))
+    }
+
+    /// Snap GeometryReader widths to whole points.
+    ///
+    /// WHY: the live hang on 2026-08-12 had AttributeGraph stuck in
+    /// `GraphHost.flushTransactions` while `timelineColumnWidth` (a raw
+    /// `CGFloat` from GeometryReader) sat on `AgentStableTranscriptHistoryRevision`.
+    /// Subpixel proposals (675.4 ↔ 676.4) made EquatableView remount every
+    /// history row inside one transaction.
+    nonisolated static func quantizedTimelineViewportWidth(_ raw: CGFloat) -> CGFloat {
+        guard raw.isFinite, raw > 0 else { return 0 }
+        return raw.rounded()
+    }
+
+    /// Commit a quantized viewport width only when it moves by at least 2pt.
+    ///
+    /// A 1pt threshold is not enough: rounding can flip 675.4 / 676.4 every
+    /// layout pass. Two points of hysteresis stops that oscillation without
+    /// delaying a real user resize.
+    nonisolated static func shouldCommitTimelineViewportWidth(
+        current: CGFloat,
+        proposed: CGFloat,
+        minimumDelta: CGFloat = 2
+    ) -> Bool {
+        let quantized = quantizedTimelineViewportWidth(proposed)
+        guard quantized > 0 else { return false }
+        if current <= 0 { return true }
+        return abs(quantized - current) >= minimumDelta
     }
     nonisolated static let runningTranscriptContextSlack: TimeInterval = 2
     // PERF-MAC_AGENT-023: idle/completed threads render their transcript in an
@@ -12146,7 +12185,12 @@ public struct AgentAppView: View {
                 GeometryReader { viewport in
                     // Horizontal padding on the transcript stack is 22pt each side.
                     // User bubbles size against this content column, not the raw viewport.
-                    let timelineColumnWidth = max(0, viewport.size.width - 44)
+                    // Use the committed width so a subpixel GeometryReader proposal
+                    // cannot change AgentStableTranscriptHistoryRevision mid-transaction.
+                    let viewportWidth = committedTimelineViewportWidth > 0
+                        ? committedTimelineViewportWidth
+                        : Self.quantizedTimelineViewportWidth(viewport.size.width)
+                    let timelineColumnWidth = max(0, viewportWidth - 44)
                     ScrollView {
                         // Viewport virtualization: LazyVStack releases off-screen rows.
                         // Guardrails vs historical LazyLayout loops (PERF-MAC_AGENT-022):
@@ -12330,8 +12374,12 @@ public struct AgentAppView: View {
                         }
                         .padding(.horizontal, 22)
                         .padding(.vertical, 32)
-                        .frame(width: viewport.size.width, alignment: .leading)
+                        .frame(width: viewportWidth, alignment: .leading)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .onAppear { commitTimelineViewportWidth(viewport.size.width) }
+                    .onChange(of: viewport.size.width) { width in
+                        commitTimelineViewportWidth(width)
                     }
                     .coordinateSpace(name: "agentTimeline")
                     .background(DS.Palette.bg)
@@ -13071,6 +13119,15 @@ public struct AgentAppView: View {
         return ["BOTTOM"]
     }
 
+    private func commitTimelineViewportWidth(_ raw: CGFloat) {
+        let quantized = Self.quantizedTimelineViewportWidth(raw)
+        guard Self.shouldCommitTimelineViewportWidth(
+            current: committedTimelineViewportWidth,
+            proposed: raw
+        ) else { return }
+        committedTimelineViewportWidth = quantized
+    }
+
     // TimelineScrollFollower reports pin transitions from real AppKit geometry — these
     // only flip @State when actually crossing, so they never churn the body per frame.
     private func onTimelineReturnedToBottom() {
@@ -13224,7 +13281,9 @@ public struct AgentAppView: View {
             cacheResults: cacheMarkdown
         )
             .foregroundColor(DS.Palette.text)
-            .textSelection(.enabled)
+            // Selection lives in AgentLinkedInlineText (NSTextView). SwiftUI
+            // `.textSelection` here wraps every Text descendant in SelectionOverlay;
+            // those overlays re-entered AttributeGraph until the main thread hung.
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 
@@ -14145,11 +14204,12 @@ public struct AgentAppView: View {
                     displayText: text,
                     accessibilityIdentifier: "agent.reasoning.original.\(item.id)"
                 )
-                Text(text)
-                    .font(DS.Font.bodyDense)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineSpacing(3)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: text,
+                    fontSize: 12,
+                    textColor: DS.NS.textTertiary,
+                    lineSpacing: 3
+                )
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -14367,7 +14427,6 @@ public struct AgentAppView: View {
                 HStack(alignment: .top, spacing: DS.Space.xs) {
                     Text(summary)
                         .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary)
-                        .textSelection(.enabled)
                         .lineLimit(expanded ? nil : 1)
                         .truncationMode(.tail)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -14437,10 +14496,12 @@ public struct AgentAppView: View {
 
             // Expanded: full command (when longer/different than the summary) + output.
             if expanded, let full = commandFull, fullDiffersFromSummary, !full.isEmpty {
-                Text(full)
-                    .font(DS.Font.monoSmall)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .textSelection(.enabled)
+                AgentLinkedInlineText(
+                    text: full,
+                    fontSize: 11,
+                    monospaced: true,
+                    textColor: DS.NS.textTertiary
+                )
                     .padding(.horizontal, DS.Space.sm).padding(.vertical, 6)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface.opacity(0.7))
@@ -14452,9 +14513,12 @@ public struct AgentAppView: View {
             // the transcript. Skill tool output stays complete (source-aware exception).
             // Full text stays selectable.
             if expanded, let o = output, !o.isEmpty {
-                Text(AgentTimelineItemPresentation.cappedDetail(o, for: item))
-                    .font(DS.Font.mono).foregroundColor(DS.Palette.textSecondary)
-                    .textSelection(.enabled)
+                AgentLinkedInlineText(
+                    text: AgentTimelineItemPresentation.cappedDetail(o, for: item),
+                    fontSize: 13,
+                    monospaced: true,
+                    textColor: DS.NS.textSecondary
+                )
                     .padding(DS.Space.md)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface)
@@ -16636,7 +16700,6 @@ public struct AgentAppView: View {
                 Spacer(minLength: 0)
             }
             AgentMessageMarkdownView(text: markdown)
-                .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: DS.Space.xs) {
                 if plan.showsImplementationActions {
@@ -17247,7 +17310,11 @@ private struct PromptComposerEditor: NSViewRepresentable {
             textView.string = value
             let endOffset = (value as NSString).length
             textView.setSelectedRange(NSRange(location: endOffset, length: 0))
-            onCursorMoved(endOffset)
+            // Defer: updateNSView calls this, and a sync @Published write
+            // re-enters AttributeGraph ("Publishing changes from within view updates").
+            DispatchQueue.main.async { [weak self] in
+                self?.onCursorMoved(endOffset)
+            }
         }
 
         func recalculateHeight() {
@@ -17342,6 +17409,18 @@ enum ScrollPinTransition {
     case scrolledAway
     /// Neither condition: no state change.
     case unchanged
+}
+
+/// Pin callbacks must leave the current SwiftUI layout/update turn.
+///
+/// WHY: `NSView.frameDidChangeNotification` and `updateNSView` run inside
+/// `GraphHost.flushTransactions`. Writing `@State` there logs
+/// "Publishing changes from within view updates" and re-enters AttributeGraph
+/// (2026-08-12 hang: gapSec grew past 180s on the main thread).
+enum AgentTimelinePinPublication {
+    static func enqueue(_ work: @escaping () -> Void) {
+        DispatchQueue.main.async(execute: work)
+    }
 }
 
 enum ScrollPinPolicy {
@@ -17717,10 +17796,12 @@ private struct TimelineScrollFollower: NSViewRepresentable {
             lastAtBottom = atBottom
             pinned = atBottom
             if atBottom {
-                onReturnedToBottom?()
+                let callback = onReturnedToBottom
+                AgentTimelinePinPublication.enqueue { callback?() }
             } else {
                 cancelPendingSnap()
-                onScrolledAway?()
+                let callback = onScrolledAway
+                AgentTimelinePinPublication.enqueue { callback?() }
             }
         }
     }

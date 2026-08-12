@@ -185,6 +185,34 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
     }
 
+    /// WHY: GeometryReader proposed 675.4 ↔ 676.4 during the 2026-08-12 hang.
+    /// Rounding alone still flips the revision every pass; 2pt hysteresis is
+    /// what keeps AgentStableRows mounted.
+    func test_timelineViewportWidthCommit_ignoresSubpixelOscillationAroundRoundingBoundary() {
+        XCTAssertEqual(AgentAppView.quantizedTimelineViewportWidth(676.4), 676)
+        XCTAssertEqual(AgentAppView.quantizedTimelineViewportWidth(675.4), 675)
+        XCTAssertTrue(
+            AgentAppView.shouldCommitTimelineViewportWidth(current: 0, proposed: 676.4),
+            "first paint must accept a positive width"
+        )
+        XCTAssertFalse(
+            AgentAppView.shouldCommitTimelineViewportWidth(current: 676, proposed: 675.4),
+            "1pt rounding flip must not remount the stable history LazyVStack"
+        )
+        XCTAssertFalse(
+            AgentAppView.shouldCommitTimelineViewportWidth(current: 676, proposed: 676.4),
+            "subpixel jitter around the committed width must be a no-op"
+        )
+        XCTAssertTrue(
+            AgentAppView.shouldCommitTimelineViewportWidth(current: 676, proposed: 700),
+            "a real user resize must still commit"
+        )
+        XCTAssertFalse(
+            AgentAppView.shouldCommitTimelineViewportWidth(current: 676, proposed: 0),
+            "non-positive proposals must not clear a committed width"
+        )
+    }
+
     func test_liveWorkRowsKeepCompletedPrefixStableAndStreamingTailMutable() {
         let turnID = "turn"
         func item(_ id: String, state: AssistantItemState) -> AssistantItem {

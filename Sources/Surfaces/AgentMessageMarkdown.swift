@@ -101,6 +101,39 @@ enum AgentMessageMarkdown {
         return result
     }
 
+    /// Stable identity for one markdown selection surface (prose group or isolated
+    /// code/table). `enumerated()` offsets remount later NSTextViews when a fence
+    /// appears mid-stream.
+    struct IdentifiedSelectionGroup: Identifiable, Equatable {
+        let id: String
+        let blocks: [AgentMessageMarkdownBlock]
+    }
+
+    static func identifiedSelectionGroups(
+        from blocks: [AgentMessageMarkdownBlock]
+    ) -> [IdentifiedSelectionGroup] {
+        var seen: [String: Int] = [:]
+        return selectionGroups(from: blocks).map { group in
+            let key = group.map(selectionGroupBlockKey).joined(separator: "\u{1e}")
+            let n = seen[key, default: 0]
+            seen[key] = n + 1
+            return IdentifiedSelectionGroup(id: "\(key)#\(n)", blocks: group)
+        }
+    }
+
+    static func selectionGroupBlockKey(_ block: AgentMessageMarkdownBlock) -> String {
+        switch block.kind {
+        case .paragraph: return "p:\(block.text)"
+        case .heading(let level): return "h\(level):\(block.text)"
+        case .bullet(let indent): return "b\(indent):\(block.text)"
+        case .numbered(let number, let indent): return "n\(indent).\(number):\(block.text)"
+        case .blockquote: return "q:\(block.text)"
+        case .code(let language): return "c:\(language):\(block.text)"
+        case .table(let headers, let rows):
+            return "t:\(headers.joined(separator: ",")):\(rows.map { $0.joined(separator: ",") }.joined(separator: ";"))"
+        }
+    }
+
     static func selectionGroups(from blocks: [AgentMessageMarkdownBlock]) -> [[AgentMessageMarkdownBlock]] {
         var groups: [[AgentMessageMarkdownBlock]] = []
         var prose: [AgentMessageMarkdownBlock] = []
@@ -585,12 +618,12 @@ struct AgentMessageMarkdownView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: compact ? DS.Space.sm : DS.Space.md) {
-            ForEach(Array(AgentMessageMarkdown.selectionGroups(from: AgentMessageMarkdown.blocks(from: text, cache: cacheResults)).enumerated()), id: \.offset) { index, group in
-                if group.count == 1, let block = group.first, isIsolatedBlock(block) {
+            ForEach(Array(AgentMessageMarkdown.identifiedSelectionGroups(from: AgentMessageMarkdown.blocks(from: text, cache: cacheResults)).enumerated()), id: \.element.id) { index, group in
+                if group.blocks.count == 1, let block = group.blocks.first, isIsolatedBlock(block) {
                     blockView(block, index: index)
                 } else {
                     AgentLinkedAttributedText(
-                        attributed: AgentMessageMarkdown.selectableProse(from: group, compact: compact, cache: cacheResults),
+                        attributed: AgentMessageMarkdown.selectableProse(from: group.blocks, compact: compact, cache: cacheResults),
                         font: .systemFont(ofSize: 13),
                         textColor: DS.NS.text,
                         lineFragmentPadding: 0,
@@ -708,10 +741,16 @@ struct AgentMessageMarkdownView: View {
             // IMP-010: wrap code block in ZStack so a copy button can be
             // overlaid in the top-right corner without altering layout.
             ZStack(alignment: .topTrailing) {
-                Text(block.text.isEmpty ? " " : block.text)
-                    .font(DS.Font.monoSmall)
-                    .foregroundColor(DS.Palette.text)
-                    .textSelection(.enabled)
+                // NSTextView selection, not SwiftUI `.textSelection`. The latter
+                // installs SelectionOverlay (NSTextField) whose setFont /
+                // invalidateIntrinsicContentSize loop froze the agent transcript.
+                AgentLinkedInlineText(
+                    text: block.text.isEmpty ? " " : block.text,
+                    fontSize: 11,
+                    monospaced: true,
+                    lineSpacing: 0,
+                    cacheResults: cacheResults
+                )
                     .padding(DS.Space.md)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface)
@@ -847,7 +886,6 @@ struct AgentFileEditDiffCard: View {
                             .foregroundColor(DS.Palette.warning)
                             .lineLimit(1)
                             .truncationMode(.middle)
-                            .textSelection(.enabled)
                     }
                     Spacer(minLength: 0)
                     Image(systemName: expanded ? "chevron.down" : "chevron.right")
@@ -888,7 +926,6 @@ struct AgentFileEditDiffCard: View {
                             .padding(.vertical, 4)
                     }
                 }
-                .textSelection(.enabled)
                 .background(DS.Palette.surface)
             }
         }

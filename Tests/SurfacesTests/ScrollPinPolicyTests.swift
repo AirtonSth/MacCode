@@ -289,6 +289,48 @@ final class ScrollPinPolicyTests: XCTestCase {
             "SwiftUI detach always wins"
         )
     }
+    /// Pin @State must not be written from updateNSView / frame notifications.
+    /// The 2026-08-12 hang logged "Publishing changes from within view updates"
+    /// and then never returned to the run loop.
+    func test_pinPublication_runsOnLaterTurnNotSynchronously() {
+        var ran = false
+        AgentTimelinePinPublication.enqueue { ran = true }
+        XCTAssertFalse(
+            ran,
+            "enqueue must not run during the caller's layout/update turn"
+        )
+        let exp = expectation(description: "deferred pin publish")
+        AgentTimelinePinPublication.enqueue { exp.fulfill() }
+        wait(for: [exp], timeout: 1)
+    }
+
+    func test_timelineFollowerDefersPinPublicationOffLayoutTransaction() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        let start = try XCTUnwrap(source.range(of: "private func report(atBottom: Bool)"))
+        let tail = source[start.lowerBound...]
+        let end = try XCTUnwrap(tail.range(of: "// PERF-MAC_AGENT-004"))
+        let report = String(tail[..<end.lowerBound])
+        XCTAssertTrue(
+            report.contains("AgentTimelinePinPublication.enqueue"),
+            "report() must defer SwiftUI pin callbacks; sync onReturnedToBottom/onScrolledAway re-enters AttributeGraph"
+        )
+        XCTAssertFalse(
+            report.contains("onReturnedToBottom?()"),
+            "direct pin callback from report() publishes @State mid-layout"
+        )
+        XCTAssertFalse(
+            report.contains("onScrolledAway?()"),
+            "direct unpin callback from report() publishes @State mid-layout"
+        )
+    }
+
     /// A dense provider stream previously called `layoutSubtreeIfNeeded()` from
     /// updateNSView/frame notifications, recursively entering NSHostingView layout
     /// thousands of times. Keep the follower measurement path read-only.

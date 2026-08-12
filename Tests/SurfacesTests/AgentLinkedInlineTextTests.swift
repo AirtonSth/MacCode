@@ -187,11 +187,29 @@ final class AgentLinkedInlineTextTests: XCTestCase {
         )
     }
 
-    /// WHY: A fractional width can cross a glyph-wrap boundary. Reusing the
-    /// previous height with a tolerance would make SwiftUI place the row at a
-    /// stale height, so every actual width change must evict the cache.
+    /// WHY: SwiftUI proposed 220.00 ↔ 220.25 during the 2026-08-12 hang.
+    /// Evicting intrinsic height on that jitter re-enters AttributeGraph.
+    func test_containerWidthPolicy_ignoresSubpixelJitterAndCommitsWholePoints() {
+        XCTAssertFalse(
+            IntrinsicHeightTextView.shouldInvalidateContainerWidth(current: 220, proposed: 220.25),
+            "subpixel proposals must not invalidate intrinsic height"
+        )
+        XCTAssertFalse(
+            IntrinsicHeightTextView.shouldInvalidateContainerWidth(current: 220, proposed: 219.6),
+            "rounding back to the committed point must be a no-op"
+        )
+        XCTAssertTrue(
+            IntrinsicHeightTextView.shouldInvalidateContainerWidth(current: 220, proposed: 222),
+            "a real whole-point wrap change must still evict"
+        )
+        XCTAssertTrue(
+            IntrinsicHeightTextView.shouldInvalidateContainerWidth(current: 0, proposed: 220),
+            "first layout must accept a positive width"
+        )
+    }
+
     @MainActor
-    func test_intrinsicHeight_fractionalWidthChangeRecomputesHeight() {
+    func test_intrinsicHeight_wholePointWidthChangeRecomputesHeight() {
         let textView = IntrinsicHeightTextView(usingTextLayoutManager: false)
         textView.frame = NSRect(x: 0, y: 0, width: 220, height: 400)
         textView.textContainerInset = .zero
@@ -211,16 +229,26 @@ final class AgentLinkedInlineTextTests: XCTestCase {
         AgentLinkedInlineTextRepresentable.applyTextStorage(value, to: textView)
         textView.layoutSubtreeIfNeeded()
         _ = textView.intrinsicContentSize
-        let firstComputations = textView.intrinsicHeightComputationCount
 
         textView.setFrameSize(NSSize(width: 220.25, height: 400))
-        textView.layoutSubtreeIfNeeded()
+        textView.layout()
         _ = textView.intrinsicContentSize
+        let afterSubpixel = textView.intrinsicHeightComputationCount
+        textView.layout()
+        _ = textView.intrinsicContentSize
+        XCTAssertEqual(
+            textView.intrinsicHeightComputationCount,
+            afterSubpixel,
+            "repeated subpixel layout must not keep invalidating intrinsic height"
+        )
 
+        textView.setFrameSize(NSSize(width: 248, height: 400))
+        textView.layout()
+        _ = textView.intrinsicContentSize
         XCTAssertGreaterThan(
             textView.intrinsicHeightComputationCount,
-            firstComputations,
-            "a fractional width change must not reuse a stale cached height"
+            afterSubpixel,
+            "a whole-point width change must evict the cached height"
         )
     }
 
@@ -311,6 +339,41 @@ final class AgentLinkedInlineTextTests: XCTestCase {
         XCTAssertTrue(plan.isNoOp, "semantically equal rows must skip conversion and layout")
         XCTAssertFalse(plan.storageDirty)
         XCTAssertFalse(plan.heightDirty)
+    }
+
+    /// WHY: `selectableProse` rebuilds AttributedString on every parent body
+    /// pass. If independently constructed results compare unequal, apply()
+    /// rebuilds NSAttributedString for every mounted row and invalidates
+    /// intrinsic height — the observed AgentLinkedInlineTextRepresentable.apply freeze.
+    func test_updatePlan_equalIndependentlyConstructedMarkdownProse_isNoOp() {
+        let source = "See `Package.swift` and https://example.com/docs for the wrap path."
+        let font = NSFont.systemFont(ofSize: 13)
+        let color = DS.NS.text
+        let blocks = AgentMessageMarkdown.blocks(from: source)
+        let first = AgentMessageMarkdown.selectableProse(from: blocks, compact: false)
+        let second = AgentMessageMarkdown.selectableProse(from: blocks, compact: false)
+        let plan = AgentLinkedInlineTextUpdatePlan.make(
+            previous: AgentLinkedInlineTextAppliedState(
+                attributed: first,
+                font: font,
+                textColor: color,
+                lineSpacing: 5,
+                maximumNumberOfLines: nil,
+                lineFragmentPadding: 0
+            ),
+            next: AgentLinkedInlineTextAppliedState(
+                attributed: second,
+                font: font,
+                textColor: color,
+                lineSpacing: 5,
+                maximumNumberOfLines: nil,
+                lineFragmentPadding: 0
+            )
+        )
+        XCTAssertTrue(
+            plan.isNoOp,
+            "markdown prose rebuilt from the same blocks must skip NSTextView storage/layout"
+        )
     }
 
     func test_updatePlan_sameCharactersDifferentLinkDestination_marksStorageDirty() {
