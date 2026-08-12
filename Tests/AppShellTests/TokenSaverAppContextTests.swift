@@ -9,6 +9,27 @@ import SocketServer
 
 @MainActor
 final class TokenSaverAppContextTests: XCTestCase {
+    func testUserPromptUsesSR2OnlyWhenFinalWireSavesTokens() {
+        // WHY: the SR2 envelope itself has overhead. We must never advertise
+        // token savings by making a short paid-provider prompt larger.
+        let original = Array(repeating: "Please inspect the duplicate controller implementation.", count: 80)
+            .joined(separator: " ")
+        let compressed = "inspect duplicate controller implementation"
+        let adopted = AppContext.netPositiveSR2UserInstruction(
+            original: original,
+            compressed: compressed
+        )
+
+        XCTAssertTrue(SR2WirePolicy.isSR2(adopted), adopted)
+        XCTAssertEqual(SR2WirePolicy.userInstruction(in: adopted), compressed)
+
+        let short = "fix typo"
+        XCTAssertEqual(
+            AppContext.netPositiveSR2UserInstruction(original: short, compressed: short),
+            short
+        )
+    }
+
     private final class TestScopedRecoveryStore: TokenSaverScopedRecoveryStoring, @unchecked Sendable {
         private let store: TokenSaverScopedRecoveryStore
 
@@ -837,12 +858,18 @@ final class TokenSaverAppContextTests: XCTestCase {
             prompt: prompt, provider: .claude, threadId: threadID, runId: runID
         )
         let deterministicOutput = DistillBlockDeduper.dedupe(prompt).output
-        XCTAssertEqual(shadowOutput, deterministicOutput, "shadow semantic output must never replace deterministic provider bytes")
+        let deterministicWire = AppContext.netPositiveSR2UserInstruction(
+            original: prompt,
+            compressed: deterministicOutput
+        )
+        XCTAssertEqual(shadowOutput, deterministicWire,
+                       "shadow semantic output must not replace the deterministic SR2 provider payload")
         try setSemantic(state: "promoted", retentionDays: 0)
         let zeroRetentionOutput = await context.tokenSaverCompress(
             prompt: prompt, provider: .claude, threadId: threadID, runId: runID
         )
-        XCTAssertEqual(zeroRetentionOutput, deterministicOutput, "retention zero must keep only the non-lossy deterministic win")
+        XCTAssertEqual(zeroRetentionOutput, deterministicWire,
+                       "retention zero must keep only the non-lossy deterministic SR2 win")
         let recoveryBefore = try context.db.prepare("SELECT COUNT(*) FROM token_saver_recovery_objects;")
         XCTAssertTrue(try recoveryBefore.step())
         XCTAssertEqual(recoveryBefore.columnInt64(0), 0)
@@ -934,8 +961,11 @@ final class TokenSaverAppContextTests: XCTestCase {
         let deterministicOutput = DistillBlockDeduper.dedupe(prompt).output
         XCTAssertEqual(
             output,
-            deterministicOutput.count < prompt.count ? deterministicOutput : prompt,
-            "injected finalization failure must fail open to deterministic/original"
+            AppContext.netPositiveSR2UserInstruction(
+                original: prompt,
+                compressed: deterministicOutput
+            ),
+            "injected finalization failure must fail open to deterministic SR2/original"
         )
         XCTAssertFalse(output.contains("[[rc:"), "fail-open after finalization failure must emit no recovery marker")
 
@@ -2329,6 +2359,31 @@ final class TokenSaverAppContextTests: XCTestCase {
                        max(TokenEstimator.estimate(humanized) - TokenEstimator.estimate(sr1), 0))
         XCTAssertEqual(claude.runs, 1)
         XCTAssertEqual(summary.modes.first?.mode, "sr1-humanize")
+    }
+
+    func test_tokenSaverHumanizeFallbackRendersSR2V1ThinkingFieldsAsNaturalText() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverSR2V1Fallback-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        let thread = AgentThread(title: "sr2 fallback", provider: .claude, model: "fake-model")
+        try context.threadRepo.upsert(thread)
+        try admitTokenSaver(in: context, threadID: thread.id)
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .user,
+            content: "Please keep the visible transcript in English."
+        ))
+        let wire = "@sr2 v1\nflow:inspect>verify>deploy\ndone:flow\no:cont"
+
+        let humanized = await context.tokenSaverHumanizeSR1Response(
+            wire,
+            provider: .claude,
+            threadId: thread.id
+        )
+
+        XCTAssertFalse(humanized.contains("@sr2"), humanized)
+        XCTAssertTrue(humanized.contains("Next steps: inspect then verify then deploy."), humanized)
+        XCTAssertTrue(humanized.contains("Complete when: flow."), humanized)
     }
 
     func test_tokenSaverUsageForDistillSkillRunDoesNotRecordSavingsWithoutSidecarCall() throws {

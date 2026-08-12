@@ -1,6 +1,6 @@
 import Foundation
 
-/// SR2 Opaque Agent IR — dense machine-only assistant wire when Token Saver is ON.
+/// SR2 Opaque Agent IR — dense machine-only provider wire when Token Saver is ON.
 ///
 /// Dual-channel contract:
 /// - **Provider history** keeps wire (SR2/SR1) or an enforced stub — never free monologue.
@@ -10,6 +10,8 @@ import Foundation
 public enum SR2WirePolicy: Sendable {
     public static let version = "v0"
     public static let markerLine = "@sr2 v0"
+    public static let optimizerVersion = "v1"
+    public static let optimizerMarkerLine = "@sr2 v1"
     public static let instructBlockMarker = "REMOTE_CODE_SR2_ALWAYS_ON_V1"
 
     /// Paid-feature providers that must ship the matrix together (T-SR2-09).
@@ -70,7 +72,12 @@ public enum SR2WirePolicy: Sendable {
             .filter { !$0.isEmpty }
         guard !lines.isEmpty else { return false }
         let first = lines[0].lowercased()
-        let hasBanner = first == markerLine.lowercased() || first == "sr2 v0"
+        let isOptimizerV1 = [optimizerMarkerLine, "sr2 v1"]
+            .map { $0.lowercased() }
+            .contains(first)
+        let hasBanner = [markerLine, optimizerMarkerLine, "sr2 v0", "sr2 v1"]
+            .map { $0.lowercased() }
+            .contains(first)
         if hasBanner {
             lines.removeFirst()
         }
@@ -101,21 +108,26 @@ public enum SR2WirePolicy: Sendable {
         // A body longer than the inspected prefix is not allowed to smuggle
         // prose past the grammar either.
         guard lines.count <= 20 else { return false }
-        return hasOutcome
+        // Runtime v0 is an outcome protocol and still requires `o:`. Optimizer
+        // v1 is a semantic prompt IR: `flow:...` / `done:...` can be complete
+        // without inventing an outcome that did not exist in the source.
+        return isOptimizerV1 || hasOutcome
     }
 
-    private static func structuredField(_ line: String) -> (key: Character, value: String)? {
-        guard let first = line.first?.lowercased().first,
-              Set(["g", "d", "p", "o", "e", "h", "t"]).contains(first) else {
+    private static func structuredField(_ line: String) -> (key: String, value: String)? {
+        guard let delimiterIndex = line.firstIndex(where: { $0 == ":" || $0 == "=" }) else {
             return nil
         }
-        let remainder = line.dropFirst()
-        guard let delimiter = remainder.first, delimiter == ":" || delimiter == "=" else {
-            return nil
-        }
-        let value = remainder.dropFirst().trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = line[..<delimiterIndex].lowercased()
+        let allowed = Set([
+            "g", "d", "p", "o", "e", "h", "t", "u",
+            "flow", "done", "tools", "must", "should", "may", "not", "constraints", "outputs"
+        ])
+        guard allowed.contains(key) else { return nil }
+        let value = line[line.index(after: delimiterIndex)...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return nil }
-        return (first, value)
+        return (key, value)
     }
 
     public static func channelKind(
@@ -151,6 +163,47 @@ public enum SR2WirePolicy: Sendable {
         guard let end = text[start.upperBound...].range(of: "]]"),
               end.lowerBound > start.upperBound else { return nil }
         return String(text[start.lowerBound..<end.upperBound])
+    }
+
+    /// Lossless single-line envelope for a user instruction sent to a paid
+    /// provider. The caller owns the net-positive gate: wrapping is useful only
+    /// when the final wire still estimates smaller than the original prompt.
+    public static func userInstructionWire(_ instruction: String) -> String {
+        let escaped = instruction
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\n", with: "\\n")
+        return "\(markerLine)\nu:\(escaped)\no:cont"
+    }
+
+    /// Decodes a `u:` field produced by `userInstructionWire`.
+    public static func userInstruction(in wire: String) -> String? {
+        guard isSR2(wire) else { return nil }
+        let lines = wire.split(whereSeparator: \.isNewline).map(String.init)
+        guard let payload = lines.first(where: { $0.lowercased().hasPrefix("u:") })?.dropFirst(2) else {
+            return nil
+        }
+        var result = ""
+        var escaping = false
+        for character in payload {
+            if escaping {
+                switch character {
+                case "n": result.append("\n")
+                case "r": result.append("\r")
+                case "\\": result.append("\\")
+                default:
+                    result.append("\\")
+                    result.append(character)
+                }
+                escaping = false
+            } else if character == "\\" {
+                escaping = true
+            } else {
+                result.append(character)
+            }
+        }
+        if escaping { result.append("\\") }
+        return result
     }
 
     /// Collapse free prose into a recoverable wire stub for provider history.
@@ -260,7 +313,7 @@ public enum SR2WirePolicy: Sendable {
     public static let alwaysOnInstructBlock = """
     \(instructBlockMarker)
     Token Saver ON — assistant wire is MANDATORY for Claude, Codex, and Grok (no free monologue).
-    Every final assistant reply MUST be SR2 Opaque Agent IR (machine-only). Humans never read this wire; the host humanizes for UI.
+    Every provider-authored text item MUST be SR2 Opaque Agent IR (machine-only): reasoning, commentary/intermediate updates, and final replies. Humans never read this wire; the host humanizes for UI.
     Format:
     @sr2 v0
     g:<goal_id>? d:<decision_id>? p:path:line[,…]? o:ok|fail|need|cont e:<class>? h:[[rc:<handle>]]?
@@ -270,7 +323,9 @@ public enum SR2WirePolicy: Sendable {
     - Long answers: answer-as-handle — short o: + h:[[rc:<handle>]] + p: anchors (not full prose on wire).
     - Keep paths, SHAs, exit codes, error strings exact when present.
     - SR1 (S/C/D/R/O/N/P) is fallback only if you cannot emit SR2; never plain chat prose.
-    - Tool stdout: keep exact-output (rg/sed/cat/jq) unpiped; pipe noisy builds/tests/logs via `| distill`.
+    - User input may arrive as `u:<lossless escaped instruction>` plus `o:cont`; decode `\\n`, `\\r`, and `\\\\` before acting.
+    - Tool stdout stays exact: keep exact-output (rg/sed/cat/jq) unpiped; pipe noisy builds/tests/logs via `| distill`.
+    - Host-local telemetry labels such as Thinking/Ran Shell/Failed Shell are outside the provider wire.
     """
 
     // MARK: - T-SR2-08 action-only / answer-as-handle
@@ -516,7 +571,7 @@ public enum SR2WirePolicy: Sendable {
             let enforced = enforceFreeProse(model, handle: handle)
             return DualChannelPersistPlan(
                 historyText: enforced.wireStub,
-                uiText: model,
+                uiText: uiIn.isEmpty ? model : uiIn,
                 shouldEmitTranslation: true,
                 wasEnforced: true,
                 complianceMiss: true,

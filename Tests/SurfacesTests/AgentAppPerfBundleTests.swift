@@ -1,9 +1,51 @@
 import XCTest
 import Combine
+import AppKit
+import SwiftUI
 @testable import Surfaces
 import CoreModel
 import Persistence
 import AgentRuntime
+
+private struct StableRowsLayoutBenchmarkFixture: View {
+    let tick: Int
+    let optimized: Bool
+    let revision: AgentStableTranscriptHistoryRevision
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Forces a parent diff for every simulated live paint without
+            // changing the stable transcript-history inputs.
+            Text("\(tick)").frame(width: 1, height: 1).opacity(0.001)
+            ScrollView {
+                if optimized {
+                    AgentStableRows(revision: revision) {
+                        historyRows
+                    }
+                    .equatable()
+                } else {
+                    historyRows
+                }
+            }
+        }
+    }
+
+    private var historyRows: some View {
+        LazyVStack(alignment: .leading, spacing: 12) {
+            ForEach(0..<24, id: \.self) { index in
+                AgentLinkedInlineText(
+                    text: "Stable transcript row \(index) links `Package.swift` and https://example.com/docs with enough prose to wrap across the mounted reading column.",
+                    lineSpacing: 2
+                )
+                // Mirrors production row builders capturing the changing parent
+                // view value even though this row's own presentation is stable.
+                .background(Text("\(tick)").frame(width: 0, height: 0).opacity(0))
+                .id(index)
+            }
+        }
+        .padding(16)
+    }
+}
 
 /// Tests for the MED perf bundle (token-stream hot path) in AgentAppSurface.swift.
 ///
@@ -26,6 +68,171 @@ import AgentRuntime
 ///   blocked the main actor.
 @MainActor
 final class AgentAppPerfBundleTests: XCTestCase {
+
+    func test_stableHistoryRevisionChangesOnlyForHistoryPresentationInputs() {
+        let messageID = AgentMessageID()
+        let baseline = AgentStableTranscriptHistoryRevision(
+            entryIDs: ["message-stable", "turn-finished"],
+            expandedTools: [],
+            expandedToolGroups: [],
+            expandedReasoning: [],
+            showingOutboundMessages: [],
+            expandedCompletedWorkTurns: [],
+            workDisclosureRevealByTurn: [:],
+            translatedMessageIDs: [],
+            translationOriginals: [:],
+            outboundPayloads: [messageID: "@sr2 v1\nt:verify"],
+            proposedPlanIDs: [],
+            suppressesProposedPlanReview: false,
+            status: .running
+        )
+
+        // WHY: live-tail token/body changes are intentionally absent from this
+        // value, so rebuilding the same history revision remains equal and the
+        // EquatableView can retain the mounted LazyVStack subtree.
+        let nextLiveTick = AgentStableTranscriptHistoryRevision(
+            entryIDs: baseline.entryIDs,
+            expandedTools: [],
+            expandedToolGroups: [],
+            expandedReasoning: [],
+            showingOutboundMessages: [],
+            expandedCompletedWorkTurns: [],
+            workDisclosureRevealByTurn: [:],
+            translatedMessageIDs: [],
+            translationOriginals: [:],
+            outboundPayloads: baseline.outboundPayloads,
+            proposedPlanIDs: [],
+            suppressesProposedPlanReview: false,
+            status: .running
+        )
+        XCTAssertEqual(baseline, nextLiveTick)
+
+        let revealedOutbound = AgentStableTranscriptHistoryRevision(
+            entryIDs: baseline.entryIDs,
+            expandedTools: [],
+            expandedToolGroups: [],
+            expandedReasoning: [],
+            showingOutboundMessages: [messageID],
+            expandedCompletedWorkTurns: [],
+            workDisclosureRevealByTurn: [:],
+            translatedMessageIDs: [],
+            translationOriginals: [:],
+            outboundPayloads: baseline.outboundPayloads,
+            proposedPlanIDs: [],
+            suppressesProposedPlanReview: false,
+            status: .running
+        )
+        XCTAssertNotEqual(baseline, revealedOutbound,
+                          "a user-visible stable-row toggle must invalidate history")
+    }
+
+    func test_liveWorkRowsKeepCompletedPrefixStableAndStreamingTailMutable() {
+        let turnID = "turn"
+        func item(_ id: String, state: AssistantItemState) -> AssistantItem {
+            AssistantItem(
+                id: id,
+                turnId: turnID,
+                type: .commandExecution,
+                state: state,
+                body: id,
+                startedAtMs: 1
+            )
+        }
+        let rows: [AgentAppView.TurnRenderBlock] = [
+            .item(item("done-1", state: .completed)),
+            .toolGroup(id: "done-group", items: [
+                item("done-2", state: .completed),
+                item("done-3", state: .failed),
+            ]),
+            .item(item("live", state: .streaming)),
+            .item(item("concurrent-done", state: .completed)),
+        ]
+
+        let split = AgentAppView.splitStableWorkRows(rows)
+        XCTAssertEqual(split.stable.map(\.id), ["block-item-done-1", "block-group-done-group"])
+        XCTAssertEqual(split.liveTail.map(\.id), ["block-item-live", "block-item-concurrent-done"])
+        XCTAssertTrue(split.stable.allSatisfy { !$0.containsStreamingItem })
+        XCTAssertEqual(
+            (split.stable + split.liveTail).map(\.id),
+            rows.map(\.id),
+            "splitting layout ownership must preserve every row and its order"
+        )
+    }
+
+    /// CPU/layout proxy for the reported live-transcript hang. This drives the
+    /// same parent-refresh + LazyVStack + AgentLinkedInlineText shape, comparing
+    /// the old unguarded subtree with the shipped equatable history boundary.
+    /// It does not claim end-to-end first-paint latency.
+    @MainActor
+    func test_microbenchStableRowsBoundaryAvoidsLiveTickPlacement() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["RC2_STABLE_ROWS_BENCHMARK"] == "1",
+            "benchmark is opt-in; set RC2_STABLE_ROWS_BENCHMARK=1"
+        )
+        let revision = AgentStableTranscriptHistoryRevision(
+            entryIDs: (0..<24).map { "history-\($0)" },
+            expandedTools: [],
+            expandedToolGroups: [],
+            expandedReasoning: [],
+            showingOutboundMessages: [],
+            expandedCompletedWorkTurns: [],
+            workDisclosureRevealByTurn: [:],
+            translatedMessageIDs: [],
+            translationOriginals: [:],
+            outboundPayloads: [:],
+            proposedPlanIDs: [],
+            suppressesProposedPlanReview: false,
+            status: .running
+        )
+        let ticks = 120
+
+        func measuredBatch(optimized: Bool) -> Double {
+            let hosting = NSHostingView(rootView: StableRowsLayoutBenchmarkFixture(
+                tick: 0,
+                optimized: optimized,
+                revision: revision
+            ))
+            hosting.frame = NSRect(x: 0, y: 0, width: 720, height: 560)
+            hosting.layoutSubtreeIfNeeded()
+            let start = DispatchTime.now().uptimeNanoseconds
+            for tick in 1...ticks {
+                hosting.rootView = StableRowsLayoutBenchmarkFixture(
+                    tick: tick,
+                    optimized: optimized,
+                    revision: revision
+                )
+                hosting.layoutSubtreeIfNeeded()
+            }
+            return Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        }
+
+        _ = measuredBatch(optimized: false)
+        _ = measuredBatch(optimized: true)
+        var legacy: [Double] = []
+        var optimized: [Double] = []
+        for _ in 0..<7 {
+            legacy.append(measuredBatch(optimized: false))
+            optimized.append(measuredBatch(optimized: true))
+        }
+        let legacyMedian = legacy.sorted()[legacy.count / 2]
+        let optimizedMedian = optimized.sorted()[optimized.count / 2]
+        let payload: [String: Any] = [
+            "fixture": "stable_rows_live_tick_cpu_layout_proxy",
+            "samples": 7,
+            "ticks_per_sample": ticks,
+            "legacy_ms": legacy,
+            "optimized_ms": optimized,
+            "legacy_median_ms": legacyMedian,
+            "optimized_median_ms": optimizedMedian,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        print("AGENT_STABLE_ROWS_BENCHMARK \(String(decoding: data, as: UTF8.self))")
+        XCTAssertLessThan(
+            optimizedMedian,
+            legacyMedian,
+            "stable history must cost less than rebuilding it for every live paint"
+        )
+    }
 
     override func setUp() {
         super.setUp()
@@ -294,6 +501,16 @@ final class AgentAppPerfBundleTests: XCTestCase {
         let sr1Fallback = vm.assistantDisplayText(for: sr1)
         XCTAssertFalse(sr1Fallback.contains("SR1"), sr1Fallback)
         XCTAssertTrue(sr1Fallback.contains("tests green"), sr1Fallback)
+
+        let sr2V1 = AgentMessage(
+            threadId: threadId,
+            role: .assistant,
+            content: "@sr2 v1\nflow:inspect>verify>deploy\ndone:flow\no:cont"
+        )
+        let sr2V1Fallback = vm.assistantDisplayText(for: sr2V1)
+        XCTAssertFalse(sr2V1Fallback.contains("@sr2"), sr2V1Fallback)
+        XCTAssertTrue(sr2V1Fallback.contains("Next steps: inspect then verify then deploy."), sr2V1Fallback)
+        XCTAssertTrue(sr2V1Fallback.contains("Complete when: flow."), sr2V1Fallback)
 
         let oversizedSR2 = AgentMessage(
             threadId: threadId,

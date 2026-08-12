@@ -1127,6 +1127,21 @@ public enum Schema {
                OR state = 'compensated'
                OR state = 'abandoned';
         """),
+        // Exact provider-bound user payload for the transcript's opt-in
+        // "show sent" view. Kept separate from the human-authored message so
+        // exports, copy, and default rendering remain natural-language-first.
+        SchemaStep(63, """
+        CREATE TABLE IF NOT EXISTS agent_message_outbound_payloads (
+            message_id TEXT PRIMARY KEY NOT NULL,
+            thread_id TEXT NOT NULL,
+            outbound_text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(message_id) REFERENCES agent_messages(id) ON DELETE CASCADE,
+            FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_message_outbound_payloads_thread
+            ON agent_message_outbound_payloads(thread_id, created_at);
+        """),
     ]
 
     /// Tables that exist in the schema for historical reasons but have no

@@ -77,6 +77,7 @@ public final class AgentComposerState: ObservableObject {
 @MainActor
 public final class AgentTranscriptState: ObservableObject {
     @Published public var messages: [AgentMessage] = []
+    @Published public var outboundPayloadsByMessageId: [AgentMessageID: String] = [:]
     @Published public var timeline = AssistantTimelineState()
     @Published public var timelineUpdateTick: Int = 0
 }
@@ -98,6 +99,56 @@ private struct TranscriptReactiveScope<Content: View>: View {
     @ObservedObject var transcriptState: AgentTranscriptState
     @ViewBuilder var content: () -> Content
     var body: some View { content() }
+}
+
+/// Identity boundary between immutable transcript history and the live tail.
+///
+/// WHY: `TranscriptReactiveScope` intentionally refreshes for every streamed
+/// batch. Without an equatable boundary, that refresh also re-diffs and places
+/// every mounted `LazyVStack` history row. `AgentLinkedInlineText` can skip its
+/// storage update, but SwiftUI has already paid the row/representable layout
+/// traversal by then. This revision includes every mutable input used by a
+/// stable row, while deliberately excluding live-tail text and paint ticks.
+struct AgentStableTranscriptHistoryRevision: Equatable {
+    let entryIDs: [String]
+    let expandedTools: Set<String>
+    let expandedToolGroups: Set<String>
+    let expandedReasoning: Set<String>
+    let showingOutboundMessages: Set<AgentMessageID>
+    let expandedCompletedWorkTurns: Set<String>
+    let workDisclosureRevealByTurn: [String: Int]
+    let translatedMessageIDs: Set<AgentMessageID>
+    let translationOriginals: [AgentMessageID: String]
+    let outboundPayloads: [AgentMessageID: String]
+    let proposedPlanIDs: [String]
+    let suppressesProposedPlanReview: Bool
+    let status: AgentRunStatus
+}
+
+struct AgentStableRows<Revision: Equatable, Content: View>: View, Equatable {
+    let revision: Revision
+    let content: Content
+
+    init(
+        revision: Revision,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.revision = revision
+        self.content = content()
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.revision == rhs.revision
+    }
+
+    var body: some View { content }
+}
+
+struct AgentStableWorkRowsRevision: Equatable {
+    let rowIDs: [String]
+    let expandedTools: Set<String>
+    let expandedToolGroups: Set<String>
+    let expandedReasoning: Set<String>
 }
 
 /// Thread mutations performed by the macOS UI itself (create/rename/pin/color/
@@ -175,6 +226,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var messages: [AgentMessage] {
         get { transcriptState.messages }
         set { transcriptState.messages = newValue }
+    }
+    public var outboundPayloadsByMessageId: [AgentMessageID: String] {
+        get { transcriptState.outboundPayloadsByMessageId }
+        set { transcriptState.outboundPayloadsByMessageId = newValue }
     }
     public var timeline: AssistantTimelineState {
         get { transcriptState.timeline }
@@ -564,25 +619,43 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             var outcomes: [String] = []
             var paths: [String] = []
             var errors: [String] = []
+            var semantics: [String] = []
+            var continuationOnly = false
+            let labels = [
+                "g": "Goal", "d": "Decision", "t": "Task",
+                "flow": "Next steps", "done": "Complete when", "tools": "Tools",
+                "must": "Required", "should": "Recommended", "may": "Optional",
+                "not": "Do not", "constraints": "Constraints", "outputs": "Outputs",
+            ]
             for raw in trimmed.split(whereSeparator: \.isNewline) {
                 let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
                 let lower = line.lowercased()
                 if lower.hasPrefix("o:") || lower.hasPrefix("o=") {
                     let value = String(line.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !value.isEmpty {
-                        outcomes.append(value == "cont" ? "Continuing (tools)." : value)
-                    }
+                    if !value.isEmpty, value != "cont" { outcomes.append(value) }
+                    else if value == "cont" { continuationOnly = true }
                 } else if lower.hasPrefix("p:") || lower.hasPrefix("p=") {
                     let value = String(line.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
                     if !value.isEmpty { paths.append(value) }
                 } else if lower.hasPrefix("e:") || lower.hasPrefix("e=") {
                     let value = String(line.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
                     if !value.isEmpty { errors.append(value) }
+                } else if let delimiter = line.firstIndex(where: { $0 == ":" || $0 == "=" }) {
+                    let key = String(line[..<delimiter]).lowercased()
+                    let value = String(line[line.index(after: delimiter)...])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .replacingOccurrences(of: ">", with: " then ")
+                        .replacingOccurrences(of: "+", with: " and ")
+                        .replacingOccurrences(of: "|", with: " or ")
+                    if let label = labels[key], !value.isEmpty {
+                        semantics.append("\(label): \(value).")
+                    }
                 }
             }
-            var pieces = outcomes
+            var pieces = outcomes + semantics
             pieces.append(contentsOf: errors.prefix(2))
             if !paths.isEmpty { pieces.append(paths.joined(separator: ", ")) }
+            if pieces.isEmpty, continuationOnly { pieces.append("Continuing the work.") }
             let display = pieces.isEmpty ? "I could not expand the SR2 response." : pieces.joined(separator: "\n")
             return Self.boundedDeterministicWireDisplay(display)
         }
@@ -2581,6 +2654,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // Only clear when switching threads so the prior thread's rows do not flash.
         if messages.contains(where: { $0.threadId != id }) {
             messages = []
+            outboundPayloadsByMessageId = [:]
             messageHistoryIsPartial = false
         }
         // Invalidate any in-flight older-page load (thread switch or re-select).
@@ -2589,6 +2663,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let repository = messageRepo
         messageHistoryLoadTask = Task { @MainActor [weak self] in
             let loaded = await Self.loadMessagePageOffMain(repository: repository, threadId: id)
+            let outboundPayloads = await Self.loadOutboundPayloadsOffMain(
+                repository: repository,
+                threadId: id
+            )
             guard let self, !Task.isCancelled, !self.isDisposed,
                   self.selectedThreadId == id else { return }
             let loadedRows = loaded?.rows ?? []
@@ -2602,6 +2680,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 threadId: id
             )
             self.messageHistoryIsPartial = loaded?.hasMoreOlder ?? false
+            self.outboundPayloadsByMessageId = outboundPayloads
             // Queue rows are not transcript bubbles; only re-apply plan
             // suppression after the durable message merge.
             self.restoreQueuedFollowupTranscriptPresentation(threadId: id)
@@ -2695,6 +2774,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 budget: fullLoadBodyBudgetBytes,
                 contentLimit: AssistantTimelineState.liveTextLimit
             )
+        }.value
+    }
+
+    nonisolated static func loadOutboundPayloadsOffMain(
+        repository: AgentMessageRepository,
+        threadId: AgentThreadID
+    ) async -> [AgentMessageID: String] {
+        await Task.detached(priority: .userInitiated) {
+            (try? repository.outboundPayloads(threadId: threadId)) ?? [:]
         }.value
     }
 
@@ -6264,6 +6352,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 routingSnapshot: routingSnapshot,
                 recordUserMessage: !resumeInterrupted
             )
+            let userMessageId = AgentMessageID(runId.value)
+            let repository = messageRepo
+            let outbound = await Task.detached(priority: .userInitiated) {
+                try? repository.outboundPayload(messageId: userMessageId)
+            }.value
+            if let outbound {
+                outboundPayloadsByMessageId[userMessageId] = outbound
+            }
             coordinator.releaseProviderStartReservation(threadId: tid, runId: runId)
             // Surface claim consumed the permit; coordinator owns the live run.
             // Terminalize *this* generation so a second send can accept again.
@@ -9269,6 +9365,9 @@ public struct AgentAppView: View {
     // UX-MAC_AGENT-010: reasoning rows collapse to "Thought" by default once
     // completed; ids here are the ones the user explicitly expanded.
     @State private var expandedReasoning: Set<String> = []
+    /// User-message ids whose bubble temporarily shows the exact provider-bound
+    /// SR2 payload instead of the natural-language original.
+    @State private var showingOutboundUserMessages: Set<AgentMessageID> = []
     @State private var selectedThreadIds: Set<AgentThreadID> = []
     @State private var lastSelectedThreadId: AgentThreadID?
     @State private var draggingThreadId: AgentThreadID?
@@ -9509,6 +9608,31 @@ public struct AgentAppView: View {
             case .toolGroup(let id, _): return "block-group-\(id)"
             }
         }
+
+        var containsStreamingItem: Bool {
+            switch self {
+            case .item(let item):
+                return item.state == .streaming
+            case .toolGroup(_, let items):
+                return items.contains { $0.state == .streaming }
+            }
+        }
+    }
+
+    /// Stable completed prefix + mutable tail for a live Work-so-far list.
+    /// Once any streaming row appears, all following rows stay eager so their
+    /// relative order and concurrent updates remain visible. The common agent
+    /// shape is a long completed prefix plus one short active tail.
+    nonisolated static func splitStableWorkRows(
+        _ rows: [TurnRenderBlock]
+    ) -> (stable: [TurnRenderBlock], liveTail: [TurnRenderBlock]) {
+        guard let firstLive = rows.firstIndex(where: \.containsStreamingItem) else {
+            return (rows, [])
+        }
+        return (
+            Array(rows[..<firstLive]),
+            Array(rows[firstLive...])
+        )
     }
 
     /// Tool-call kinds that are safe to fold into a count. `error`/`review`/`contextCompaction`
@@ -10051,6 +10175,15 @@ public struct AgentAppView: View {
     /// grows vertically with content — no character or line-count truncation.
     static func userMessageDisplayText(_ text: String) -> String {
         text
+    }
+
+    static func userMessageDisplayText(
+        original: String,
+        outbound: String?,
+        showOutbound: Bool
+    ) -> String {
+        guard showOutbound, let outbound, !outbound.isEmpty else { return original }
+        return outbound
     }
 
     /// Cap live-render text to the first `limit` graphemes (head window).
@@ -11575,6 +11708,21 @@ public struct AgentAppView: View {
                         )
                         let historyEntries = split.history
                         let liveTail = split.liveTail
+                        let historyRevision = AgentStableTranscriptHistoryRevision(
+                            entryIDs: historyEntries.map(\.id),
+                            expandedTools: expandedTools,
+                            expandedToolGroups: expandedToolGroups,
+                            expandedReasoning: expandedReasoning,
+                            showingOutboundMessages: showingOutboundUserMessages,
+                            expandedCompletedWorkTurns: expandedCompletedWorkTurns,
+                            workDisclosureRevealByTurn: workDisclosureRevealByTurn,
+                            translatedMessageIDs: vm.sr1TranslatedMessageIds,
+                            translationOriginals: vm.sr1OriginalTextsByMessageId,
+                            outboundPayloads: vm.outboundPayloadsByMessageId,
+                            proposedPlanIDs: vm.timeline.proposedPlans.map(\.id),
+                            suppressesProposedPlanReview: vm.suppressesProposedPlanReview,
+                            status: vm.status
+                        )
                         VStack(alignment: .leading, spacing: 32) {
                             // Pin probe MUST live inside the scroll document so
                             // `enclosingScrollView` resolves. Placing it on ScrollView's
@@ -11633,13 +11781,18 @@ public struct AgentAppView: View {
                                 )
                                 .id("agent.transcript.revealControl")
                             }
-                            // Finished / stable history — Lazy releases off-screen.
-                            LazyVStack(alignment: .leading, spacing: 32) {
-                                ForEach(historyEntries) { entry in
-                                    transcriptEntryRow(entry, columnWidth: timelineColumnWidth)
-                                        .id(entry.id)
+                            // Finished / stable history — Lazy releases off-screen,
+                            // and the equatable boundary keeps live-tail batches from
+                            // re-placing its mounted AppKit text rows.
+                            AgentStableRows(revision: historyRevision) {
+                                LazyVStack(alignment: .leading, spacing: 32) {
+                                    ForEach(historyEntries) { entry in
+                                        transcriptEntryRow(entry, columnWidth: timelineColumnWidth)
+                                            .id(entry.id)
+                                    }
                                 }
                             }
+                            .equatable()
                             // Live streaming turns — eager, outside Lazy.
                             ForEach(liveTail) { entry in
                                 transcriptEntryRow(entry, columnWidth: timelineColumnWidth)
@@ -11786,6 +11939,7 @@ public struct AgentAppView: View {
             // render its whole history with no user action — reintroducing the hang.
             .onChange(of: vm.selectedThreadId) { _ in
                 vm.transcriptHistoryRevealCount = 0
+                showingOutboundUserMessages = []
                 pendingSessionApproval = nil
                 collapseAllWorkDisclosures()
                 knownFinishedWorkTurnIds = []
@@ -13081,7 +13235,13 @@ public struct AgentAppView: View {
     private func messageRow(_ msg: AgentMessage, columnWidth: CGFloat = 10_000) -> some View {
         switch msg.role {
         case .user:
-            let displayText = Self.userMessageDisplayText(msg.content)
+            let outbound = vm.outboundPayloadsByMessageId[msg.id]
+            let canShowOutbound = outbound.map { !$0.isEmpty && $0 != msg.content } ?? false
+            let displayText = Self.userMessageDisplayText(
+                original: msg.content,
+                outbound: outbound,
+                showOutbound: showingOutboundUserMessages.contains(msg.id)
+            )
             // Cap width against the live column so the bubble wraps instead of
             // painting past the timeline edge. Height is content-driven — never
             // a fixed frame and never a line-count truncate/"Show more" gate.
@@ -13111,7 +13271,25 @@ public struct AgentAppView: View {
                     // show when each message was sent. Keep meta inside the bubble
                     // column so copy + relative time never spill past the pane.
                     HStack(spacing: DS.Space.xs) {
-                        Button { copyToPasteboard(msg.content) } label: {
+                        if canShowOutbound {
+                            Toggle("SR2 sent", isOn: Binding(
+                                get: { showingOutboundUserMessages.contains(msg.id) },
+                                set: { show in
+                                    if show {
+                                        showingOutboundUserMessages.insert(msg.id)
+                                    } else {
+                                        showingOutboundUserMessages.remove(msg.id)
+                                    }
+                                }
+                            ))
+                            .toggleStyle(.switch)
+                            .controlSize(.mini)
+                            .font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .accessibilityIdentifier("agent.userMessage.showOutbound.\(msg.id.value.uuidString)")
+                            .help("Show the exact SR2 payload sent to the provider")
+                        }
+                        Button { copyToPasteboard(displayText) } label: {
                             Image(systemName: "doc.on.doc")
                                 .font(.system(size: 11, weight: .regular))
                                 .frame(width: 18, height: 18)
@@ -13257,6 +13435,13 @@ public struct AgentAppView: View {
         let expanded = isCompletedWorkExpanded(for: turn)
         let reveal = workDisclosureRevealByTurn[turn.turnId] ?? 0
         let slice = AgentWorkDisclosureLayout.paintSlice(all: blocks, revealCount: reveal)
+        let workRows = Self.splitStableWorkRows(slice.rows)
+        let stableWorkRevision = AgentStableWorkRowsRevision(
+            rowIDs: workRows.stable.map(\.id),
+            expandedTools: expandedTools,
+            expandedToolGroups: expandedToolGroups,
+            expandedReasoning: expandedReasoning
+        )
         VStack(alignment: .leading, spacing: DS.Space.md) {
             Button {
                 withAnimation(.easeInOut(duration: 0.16)) {
@@ -13310,7 +13495,24 @@ public struct AgentAppView: View {
                         .buttonStyle(.plain)
                         .accessibilityIdentifier("agent.work.revealEarlier.\(turn.turnId)")
                     }
-                    ForEach(slice.rows) { block in
+                    // Completed prefix: retain the mounted subtree across live
+                    // graphify/tool deltas. The outer LazyVStack now places one
+                    // stable child plus the short mutable tail, rather than up to
+                    // 48 AppKit-backed text rows on every stream paint.
+                    if !workRows.stable.isEmpty {
+                        AgentStableRows(revision: stableWorkRevision) {
+                            LazyVStack(alignment: .leading, spacing: DS.Space.lg) {
+                                ForEach(workRows.stable) { block in
+                                    switch block {
+                                    case .item(let item): itemRow(item)
+                                    case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
+                                    }
+                                }
+                            }
+                        }
+                        .equatable()
+                    }
+                    ForEach(workRows.liveTail) { block in
                         switch block {
                         case .item(let item): itemRow(item)
                         case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)

@@ -804,6 +804,30 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
                        "non-finite/negative column widths must fail closed to the minimum, not NaN or zero")
     }
 
+    func test_userMessageDisplayToggleShowsExactOutboundWithoutReplacingOriginal() {
+        // WHY: natural language is the default transcript, while the opt-in
+        // toggle must reveal byte-for-byte what the paid provider received.
+        let original = "Depois de verificar, faça deploy."
+        let outbound = "@sr2 v1\nflow:verify>deploy\ndone:flow\no:cont"
+
+        XCTAssertEqual(
+            AgentAppView.userMessageDisplayText(
+                original: original,
+                outbound: outbound,
+                showOutbound: false
+            ),
+            original
+        )
+        XCTAssertEqual(
+            AgentAppView.userMessageDisplayText(
+                original: original,
+                outbound: outbound,
+                showOutbound: true
+            ),
+            outbound
+        )
+    }
+
     // MARK: - relativeTimestamp
 
     func test_relativeTimestamp_withinSixtySecondsReturnsJustNow() {

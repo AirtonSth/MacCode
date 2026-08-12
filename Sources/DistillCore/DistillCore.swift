@@ -1809,7 +1809,15 @@ public struct MLXDistillRuntime: DistillRuntime {
     /// compression — and .sr1Humanize is a translation.
     static func guardLossyProseOutput(_ output: String, request: DistillRequest) -> String {
         switch request.mode {
-        case .longText, .watchSummary:
+        case .longText:
+            return SR2Optimizer.optimize(
+                original: request.input,
+                candidates: [output],
+                targetTokenizer: request.provider.map {
+                    "\($0)-unavailable; model-agnostic-estimator-v1"
+                } ?? "model-agnostic-estimator-v1"
+            ).output
+        case .watchSummary:
             let literalGuarded = LiteralPreservation.guarded(original: request.input, compressed: output)
             guard literalGuarded.droppedLiteral == nil else { return literalGuarded.output }
             return FaithfulnessGate.validate(original: request.input, compressed: literalGuarded.output).accepted
@@ -1839,7 +1847,7 @@ public struct MLXDistillRuntime: DistillRuntime {
         return LocalDistillRuntime.boundedCommandOutput(output, maxOutputCharacters: request.maxOutputCharacters)
     }
 
-    private static func systemInstructions(for mode: DistillMode) -> String {
+    static func systemInstructions(for mode: DistillMode) -> String {
         switch mode {
         case .sr1Humanize:
             return """
@@ -1867,7 +1875,20 @@ public struct MLXDistillRuntime: DistillRuntime {
             Keep prose answers to one sentence, max three short lines. Structured answers may be longer when the format requires it.
             Never ask for more input.
             """
-        case .longText, .watchSummary:
+        case .longText:
+            return """
+            You are the SR2 Optimizer: a semantic compiler, never a text minifier.
+            Compile in two phases: Natural language -> internal Semantic IR -> token-aware @sr2 v1.
+            The Semantic IR must preserve goals, tasks, repositories, tools, skills, MUST/SHOULD/MAY/MUST NOT, constraints, dependencies, ordering, verification/testing/deployment gates, credentials, identifiers, required outputs, fallbacks, and completion conditions.
+            Semantic fidelity and instruction reliability outrank token reduction. Never remove information merely to improve compression.
+            Encode ordered mandatory work as flow:A>B>C, conjunction as +, scoped operations as X:Y, required members as [a,b], and completion as done:X. `>` means the prior step must succeed before the next begins; it is not interchangeable with `+`.
+            Generate compact candidates mentally, compare actual token count for the target model when its tokenizer is available, and return the lowest-token behaviorally equivalent candidate. Do not optimize character count or over-compress into ambiguous abbreviations.
+            Validate before returning: the SR2 must not permit an action forbidden by the source, earlier completion, lost ordering, weakened modality, or dropped condition.
+            Preserve every exact command, credential, file path, file:line, error string, number, ID, status, and proof verbatim.
+            Output only valid @sr2 v1. Use g, flow, done, tools, must, should, may, not, constraints, outputs, p, d, e, h, t, and o:ok|fail|need|cont when the source has an outcome. Do not invent an outcome for an instruction prompt. No preamble, explanation, markdown, or free prose outside fields.
+            If no cheaper behaviorally equivalent SR2 exists, return the source unchanged; the host will fail open.
+            """
+        case .watchSummary:
             return """
             You compress long text into /distill compressed language for another AI model that already understands it.
             Use Military English with fixed prefixes, one item per line: S=state, C=context, D=action, R=risk, O=outcome, N=no-go, P=proof.
@@ -1892,8 +1913,9 @@ public struct MLXDistillRuntime: DistillRuntime {
         case .longText:
             return """
             /no_think
-            Compress the following into /distill compressed language (S/C/D/R/O/N/P lines).
-            Preserve exact commands, paths, file:line, errors, numbers, IDs, and status verbatim.
+            Compile the prompt below to the smallest reliable @sr2 v1 after building its Semantic IR.
+            Target tokenizer/model: \(request.provider ?? "unknown; use the shared estimator").
+            Preserve exact commands, credentials, paths, file:line, errors, numbers, IDs, ordering, modality, and completion gates.
 
             \(fitInput(request.input))
 

@@ -3119,17 +3119,25 @@ public final class AppContext {
         let deterministicBytes = deterministicCandidate.utf8.count
         let deterministicCharacters = deterministicCandidate.count
 
+        /// Wrap only a measured net-positive candidate. SR2 syntax is not free:
+        /// short prompts stay verbatim rather than paying more tokens merely to
+        /// satisfy the wire preference.
+        func outboundWire(for candidate: String) -> String {
+            Self.netPositiveSR2UserInstruction(original: prompt, compressed: candidate)
+        }
+
         // Adopt `candidate` only if it beats the ORIGINAL prompt; record honest end-to-end
         // savings (original -> final), tagged with the caller's cache_state AND the engine
         // that produced the win (deterministic pre-pass vs the model) so the Token Saver
         // breakdown attributes per technique.
         func adopt(_ candidate: String, stage: TokenSaverRouteStage) -> String {
-            guard candidate.utf8.count < promptBytes else {
+            let outbound = outboundWire(for: candidate)
+            guard outbound != prompt else {
                 self.tokenSaverPromptSkipSet[skipKey] = Date()
                 return prompt
             }
             let inputTokens = TokenEstimator.estimate(prompt)
-            let outputTokens = TokenEstimator.estimate(candidate)
+            let outputTokens = TokenEstimator.estimate(outbound)
             recordTokenSaverSidecarSavings(
                 provider: provider,
                 threadId: threadId,
@@ -3140,7 +3148,7 @@ public final class AppContext {
                 cacheState: cacheState,
                 routeStage: stage
             )
-            return candidate
+            return outbound
         }
 
         // Demand-start Distill without blocking this turn on MLX warmup. Kick the
@@ -3231,6 +3239,15 @@ public final class AppContext {
             // Fail-open to the deterministic pre-pass if it helped, else the original.
             return deterministicBytes < promptBytes ? adopt(deterministicCandidate, stage: .deterministic) : prompt
         }
+    }
+
+    static func netPositiveSR2UserInstruction(original: String, compressed: String) -> String {
+        let wire = SR2WirePolicy.isSR2(compressed)
+            ? compressed
+            : SR2WirePolicy.userInstructionWire(compressed)
+        return TokenEstimator.estimate(wire) < TokenEstimator.estimate(original)
+            ? wire
+            : original
     }
 
     private func prepareSemanticCandidate(
@@ -3818,6 +3835,33 @@ public final class AppContext {
             var outcomes: [String] = []
             var paths: [String] = []
             var errors: [String] = []
+            var semantics: [String] = []
+            var continuationOnly = false
+            func readableValue(_ value: String) -> String {
+                value
+                    .replacingOccurrences(of: ">", with: portuguese ? " depois " : (spanish ? " despues " : " then "))
+                    .replacingOccurrences(of: "+", with: portuguese ? " e " : (spanish ? " y " : " and "))
+                    .replacingOccurrences(of: "|", with: portuguese ? " ou " : (spanish ? " o " : " or "))
+            }
+            func labeled(_ key: String, _ value: String) -> String? {
+                let labels: [String: (String, String, String)] = [
+                    "g": ("Objetivo", "Objetivo", "Goal"),
+                    "d": ("Decisao", "Decision", "Decision"),
+                    "t": ("Tarefa", "Tarea", "Task"),
+                    "flow": ("Proximos passos", "Proximos pasos", "Next steps"),
+                    "done": ("Concluir quando", "Completar cuando", "Complete when"),
+                    "tools": ("Ferramentas", "Herramientas", "Tools"),
+                    "must": ("Obrigatorio", "Obligatorio", "Required"),
+                    "should": ("Recomendado", "Recomendado", "Recommended"),
+                    "may": ("Opcional", "Opcional", "Optional"),
+                    "not": ("Nao fazer", "No hacer", "Do not"),
+                    "constraints": ("Restricoes", "Restricciones", "Constraints"),
+                    "outputs": ("Entregaveis", "Entregables", "Outputs"),
+                ]
+                guard let labels = labels[key] else { return nil }
+                let label = portuguese ? labels.0 : (spanish ? labels.1 : labels.2)
+                return "\(label): \(readableValue(value))."
+            }
             for raw in response.split(whereSeparator: \.isNewline) {
                 let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !line.isEmpty else { continue }
@@ -3826,23 +3870,30 @@ public final class AppContext {
                 if lower.hasPrefix("o:") || lower.hasPrefix("o=") {
                     let v = String(line.dropFirst(2)).trimmingCharacters(in: .whitespaces)
                     if !v.isEmpty, v != "cont" { outcomes.append(v) }
-                    else if v == "cont" {
-                        if portuguese { outcomes.append("Continuando (tools).") }
-                        else if spanish { outcomes.append("Continuando (tools).") }
-                        else { outcomes.append("Continuing (tools).") }
-                    }
+                    else if v == "cont" { continuationOnly = true }
                 } else if lower.hasPrefix("p:") {
                     let v = String(line.dropFirst(2)).trimmingCharacters(in: .whitespaces)
                     if !v.isEmpty { paths.append(v) }
                 } else if lower.hasPrefix("e:") {
                     let v = String(line.dropFirst(2)).trimmingCharacters(in: .whitespaces)
                     if !v.isEmpty { errors.append(v) }
+                } else if let delimiter = line.firstIndex(where: { $0 == ":" || $0 == "=" }) {
+                    let key = String(line[..<delimiter]).lowercased()
+                    let value = String(line[line.index(after: delimiter)...])
+                        .trimmingCharacters(in: .whitespaces)
+                    if !value.isEmpty, let rendered = labeled(key, value) {
+                        semantics.append(rendered)
+                    }
                 }
-                // g/d/h are ops chrome in fail-open UI.
             }
-            var pieces = outcomes
+            var pieces = outcomes + semantics
             if !errors.isEmpty { pieces.append(contentsOf: errors.prefix(2)) }
             if !paths.isEmpty { pieces.append(paths.joined(separator: ", ")) }
+            if pieces.isEmpty, continuationOnly {
+                if portuguese { pieces.append("Continuando o trabalho.") }
+                else if spanish { pieces.append("Continuando el trabajo.") }
+                else { pieces.append("Continuing the work.") }
+            }
             if pieces.isEmpty {
                 if portuguese { return "Nao consegui expandir a resposta SR2." }
                 if spanish { return "No pude expandir la respuesta SR2." }

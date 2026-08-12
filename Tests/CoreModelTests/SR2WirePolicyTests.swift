@@ -34,6 +34,17 @@ final class SR2WirePolicyTests: XCTestCase {
         XCTAssertFalse(SR2WirePolicy.isSR2("@sr2 v0\no:maybe\np:Sources/Foo.swift:12"))
     }
 
+    func testAcceptsSR2V1SemanticWorkflowFields() {
+        let wire = """
+        @sr2 v1
+        g:admin-foundation-v3|star-api-v3
+        flow:/sam-task>verify>gh:merge-main>green>deploy>retest
+        done:flow
+        tools:Chrome|ComputerUse
+        """
+        XCTAssertTrue(SR2WirePolicy.isSR2(wire), wire)
+    }
+
     func testMalformedBannerFallsIntoFreeProseEnforcement() {
         let malformed = "@sr2 v0\no:ok\nThe provider continued with a normal prose explanation."
         let plan = SR2WirePolicy.dualChannelPersistPlan(
@@ -124,6 +135,16 @@ final class SR2WirePolicyTests: XCTestCase {
         )
         let off = SR2WirePolicy.appendingAlwaysOnInstruct(to: "base", tokenSaverHintOn: false)
         XCTAssertEqual(off, "base")
+    }
+
+    func testUserInstructionWireRoundTripsMultilinePrompt() {
+        // WHY: user prompts may contain exact paths, quotes, and newlines. The
+        // paid provider may receive SR2 only when that envelope is lossless.
+        let prompt = "Fix /tmp/Foo.swift:42\nKeep \"abc-123\" exact."
+        let wire = SR2WirePolicy.userInstructionWire(prompt)
+
+        XCTAssertTrue(SR2WirePolicy.isSR2(wire), wire)
+        XCTAssertEqual(SR2WirePolicy.userInstruction(in: wire), prompt)
     }
 
     func testProviderMatrixRequiresAllThree() {

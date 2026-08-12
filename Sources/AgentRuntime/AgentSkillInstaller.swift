@@ -220,7 +220,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
 
     This is a conversation style mode, not a prompt-compression request.
     Do not return the user's prompt compressed as an artifact.
-    Adopt dense Token Saver wire: prefer @sr2 v0 Opaque Agent IR on every final assistant reply (Claude/Codex/Grok). No free monologue — host humanizes for the user. SR1 sparse O-first is fallback only. Keep using wire for the rest of the thread.
+    Adopt dense Token Saver wire: use @sr2 v0 Opaque Agent IR for every provider-authored text item (Claude/Codex/Grok), including reasoning, commentary/intermediate updates, and final replies. No free monologue — host humanizes for the user. SR1 sparse O-first is fallback only. Tool stdout stays exact. Keep using wire for the rest of the thread.
 
     Core behavior (token-efficient dialect — sparse by default):
     - Registers: R0 micro | R1 work | R2 tool (tool path is `| distill`, not chat prefixes).
@@ -278,7 +278,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
 
     public static let distillAgentInstructionsTemplate = """
     <!-- distill skill: begin -->
-    CRITICAL: Prefer **@sr2 v0** Opaque Agent IR on every assistant final (Claude/Codex/Grok). No free monologue. Host humanizes for UI. SR1 sparse O-first is fallback only.\nCRITICAL: Use `/distill` dialect for provider turns — **sparse, O-first, mode-aware** (not a fixed 6-line S/C/D tax).
+    CRITICAL: Use **@sr2 v0** Opaque Agent IR for every provider-authored text item (Claude/Codex/Grok): reasoning, commentary/intermediate updates, and final replies. No free monologue. Host humanizes for UI. Tool stdout stays exact. SR1 sparse O-first is fallback only.\nCRITICAL: Use `/distill` dialect for provider turns — **sparse, O-first, mode-aware** (not a fixed 6-line S/C/D tax).
     Registers: **R0 micro** (greeting/yes-no/trivial status) = `O:` only, user language, ≤2 lines; no S/C/D/R/N/P, no user restatement.
     **R1 work** (code/PR/debug/plan) = O-first; add S/C/D/R/N/P only when needed; never pad to six lines; short atoms; caps: status ≤4 lines, implement ≤12 unless asked.
     Prefixes when used: S=state, C=context, D=action, R=risk, O=outcome, N=no-go, P=proof.

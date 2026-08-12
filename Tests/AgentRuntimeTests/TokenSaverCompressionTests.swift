@@ -507,6 +507,11 @@ final class TokenSaverCompressionTests: XCTestCase {
         let messages = (try? messageRepo.list(threadId: thread.id)) ?? []
         XCTAssertEqual(messages.first(where: { $0.role == .user })?.content, original,
                        "the displayed user message must remain the original, uncompressed text")
+        XCTAssertEqual(
+            try messageRepo.outboundPayload(messageId: AgentMessageID(runID.value)),
+            "COMPRESSED::" + original.uppercased(),
+            "the transcript toggle must read the exact provider-bound prompt"
+        )
     }
 
     func test_followUpCompressorTransformsOutboundButPreservesVerbatimAnswer() async throws {
@@ -912,6 +917,101 @@ final class TokenSaverCompressionTests: XCTestCase {
         XCTAssertTrue(persistedBodies.contains(expected),
                       "replayed Agent App timelines must also use the humanized stream text")
         XCTAssertFalse(persistedBodies.contains("Dict: S=state"))
+    }
+
+    func test_activeTokenSaverHumanizesFreeProseIntermediateBeforeLiveOrReplayTimeline() async throws {
+        // WHY: provider non-compliance must not leak natural-language commentary
+        // into the Agent App while the all-SR2 contract is active.
+        let tmp = NSTemporaryDirectory() + "rc2-ts-free-prose-stream-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let raw = "Checking role-based access before editing the controller."
+        let wire = "@sr2 v0\no:cont\nd:check_access"
+        let runner = ScriptedStreamRunner(provider: .codex, body: raw, finalMessage: wire)
+        let thread = AgentThread(title: "free prose stream", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: runner]
+        )
+        let observer = RecordingObserver()
+        coordinator.addObserver(observer)
+        coordinator.tokenSaverRuntimeActive = { true }
+        coordinator.finalResponseTranslator = { response, _, _, _ in
+            response == raw ? "Verificando o acesso por função antes de editar o controller." : "Continuando."
+        }
+        coordinator.reversibleProseStore = { _ in "stream-handle" }
+
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "Check access"
+        ))
+
+        let expected = "Verificando o acesso por função antes de editar o controller."
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline,
+              !observer.recordedEvents.contains(where: { $0.bodyAppendForTest == expected }) {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let live = observer.recordedEvents.compactMap(\.bodyAppendForTest).joined(separator: "\n")
+        let replay = coordinator.latestStreamEvents(threadId: thread.id)
+            .compactMap(\.bodyAppendForTest)
+            .joined(separator: "\n")
+
+        XCTAssertTrue(live.contains(expected), live)
+        XCTAssertFalse(live.contains(raw), live)
+        XCTAssertTrue(replay.contains(expected), replay)
+        XCTAssertFalse(replay.contains(raw), replay)
+    }
+
+    func test_tokenSaverOffStreamsFreeProseIntermediateVerbatim() async throws {
+        // WHY: all-SR2 enforcement belongs to Token Saver and must not alter the
+        // normal provider stream when that feature is disabled.
+        let tmp = NSTemporaryDirectory() + "rc2-ts-off-free-prose-stream-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let raw = "Checking role-based access."
+        let runner = ScriptedStreamRunner(provider: .codex, body: raw, finalMessage: raw)
+        let thread = AgentThread(title: "off free prose", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: runner]
+        )
+        let observer = RecordingObserver()
+        coordinator.addObserver(observer)
+        coordinator.tokenSaverRuntimeActive = { false }
+        coordinator.finalResponseTranslator = { _, _, _, _ in
+            XCTFail("Token Saver OFF must not humanize provider text")
+            return "wrong"
+        }
+
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "Check access"
+        ))
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline,
+              !observer.recordedEvents.contains(where: { $0.bodyAppendForTest == raw }) {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let live = observer.recordedEvents.compactMap(\.bodyAppendForTest).joined(separator: "\n")
+        XCTAssertTrue(live.contains(raw), live)
     }
 
     func test_bufferedSR1AndDeferredTerminalRecordComplianceOnce() async throws {

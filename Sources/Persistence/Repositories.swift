@@ -1580,6 +1580,60 @@ public final class AgentMessageRepository: @unchecked Sendable {
         try pruneMessagesKeepingLatest(threadId: m.threadId, limit: Self.maxMessagesPerThread)
     }
 
+    /// Persist the exact user payload handed to the provider runner. This is a
+    /// separate leg from `AgentMessage.content`, which remains the user's
+    /// original natural-language message.
+    public func upsertOutboundPayload(
+        messageId: AgentMessageID,
+        threadId: AgentThreadID,
+        outboundText: String,
+        createdAt: Date = Date()
+    ) throws {
+        let statement = try db.prepare("""
+            INSERT INTO agent_message_outbound_payloads(
+                message_id, thread_id, outbound_text, created_at
+            ) VALUES(?, ?, ?, ?)
+            ON CONFLICT(message_id) DO UPDATE SET
+                thread_id = excluded.thread_id,
+                outbound_text = excluded.outbound_text,
+                created_at = excluded.created_at;
+            """)
+        try statement.bind(1, messageId.value.uuidString)
+        try statement.bind(2, threadId.value.uuidString)
+        try statement.bind(3, outboundText)
+        try statement.bind(4, iso.string(from: createdAt))
+        _ = try statement.step()
+    }
+
+    public func outboundPayloads(threadId: AgentThreadID) throws -> [AgentMessageID: String] {
+        let statement = try db.prepare("""
+            SELECT message_id, outbound_text
+            FROM agent_message_outbound_payloads
+            WHERE thread_id = ?
+            ORDER BY created_at ASC;
+            """)
+        try statement.bind(1, threadId.value.uuidString)
+        var payloads: [AgentMessageID: String] = [:]
+        while try statement.step() {
+            guard let idText = statement.columnText(0),
+                  let id = UUID(uuidString: idText),
+                  let outbound = statement.columnText(1) else { continue }
+            payloads[AgentMessageID(id)] = outbound
+        }
+        return payloads
+    }
+
+    public func outboundPayload(messageId: AgentMessageID) throws -> String? {
+        let statement = try db.prepare("""
+            SELECT outbound_text
+            FROM agent_message_outbound_payloads
+            WHERE message_id = ?
+            LIMIT 1;
+            """)
+        try statement.bind(1, messageId.value.uuidString)
+        return try statement.step() ? statement.columnText(0) : nil
+    }
+
     /// Deletes oldest durable messages so only the newest `limit` remain.
     public func pruneMessagesKeepingLatest(
         threadId: AgentThreadID,

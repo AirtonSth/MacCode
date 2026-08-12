@@ -18,6 +18,20 @@ final class SR2ProviderMatrixTests: XCTestCase {
         XCTAssertTrue(prompt.contains("@sr2"))
     }
 
+    func testTokenSaverProviderPromptRequiresSR2ForEveryProviderAuthoredTextItem() {
+        // WHY: a final-only rule still lets visible reasoning/commentary leak
+        // PT/EN into the transcript and provider history.
+        let prompt = AgentSkillInstaller.tokenSaverProviderPrompt(
+            "",
+            environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
+        )
+
+        XCTAssertTrue(prompt.contains("Every provider-authored text item"), prompt)
+        XCTAssertTrue(prompt.contains("reasoning"), prompt)
+        XCTAssertTrue(prompt.contains("commentary"), prompt)
+        XCTAssertTrue(prompt.contains("Tool stdout stays exact"), prompt)
+    }
+
     func testTokenSaverOffDoesNotInjectSR2Block() {
         let prompt = AgentSkillInstaller.tokenSaverProviderPrompt(
             "base only",

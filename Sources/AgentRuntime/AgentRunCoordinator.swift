@@ -1089,8 +1089,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     var gracefulStopTimeout: TimeInterval = 2
     var hardStopTimeout: TimeInterval = 5
 
-    /// Token Saver /distill hook: async transform applied to provider text
-    /// detected as SR1 compressed language. The returned value is what gets
+    /// Token Saver /distill hook: async transform applied to provider-authored
+    /// text. The returned value is what gets
     /// persisted and shown to users. Must fail open by returning the input
     /// unchanged on any error.
     public var finalResponseTranslator: (@Sendable (_ response: String, _ provider: AgentProvider, _ threadId: AgentThreadID, _ runId: AgentRunID) async -> String)?
@@ -1617,6 +1617,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 try messageRepo.append(userMsg)
                 onMessageAppended?(userMsg)
             }
+            try messageRepo.upsertOutboundPayload(
+                messageId: userMsg.id,
+                threadId: userMsg.threadId,
+                outboundText: effectiveRequest.prompt,
+                createdAt: userMsg.createdAt
+            )
         }
         // persist run
         let run = AgentRun(id: effectiveRequest.runId, threadId: effectiveRequest.threadId, provider: effectiveRequest.provider, providerInstanceId: effectiveRequest.providerInstanceId, model: effectiveRequest.model, status: .pending)
@@ -6878,7 +6884,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 return .hold
             }
             var runBuffers = bufferedProviderTextItems[runId] ?? [:]
-            let shouldBuffer = shouldBufferProviderTextPrefix(delta)
+            // With Token Saver active, every provider-authored text item is a
+            // wire channel. Hold the complete item so a non-compliant PT/EN
+            // first delta can never paint into the live transcript. Tool calls
+            // and their exact output never enter this branch.
+            let shouldBuffer = isTokenSaverRuntimeActiveNow()
+                || shouldBufferProviderTextPrefix(delta)
             if shouldBuffer {
                 runBuffers[itemId] = BufferedProviderTextItem(
                     text: AssistantTimelineState.cappedText(delta),
@@ -6955,6 +6966,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     }
 
     private func shouldTranslateProviderText(_ text: String, runId: AgentRunID) -> Bool {
+        if isTokenSaverRuntimeActiveNow() {
+            return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
         if SR1ResponseDetector.isSR1(text) {
             markDistillOutputMode(runId)
             return true
