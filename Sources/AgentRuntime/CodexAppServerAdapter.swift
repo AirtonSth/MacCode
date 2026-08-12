@@ -1314,7 +1314,12 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                     summary: summary
                 ))
             }
-            events.append(.itemCompleted(itemId: itemId, finalState: Self.itemState(for: string(item, "status"))))
+            // item/completed is authoritative: missing/empty status means completed
+            // (sleep/agentMessage/plan omit status; defaulting to streaming left spinners).
+            events.append(.itemCompleted(
+                itemId: itemId,
+                finalState: Self.itemCompletedState(for: string(item, "status"))
+            ))
             // Codex can complete a final_answer item without ever emitting
             // turn/completed. Arm a single thread/read reconcile loop so the run
             // only finishes when the server authoritatively reports the turn idle.
@@ -2940,7 +2945,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let type = string(item, "type") ?? "unknown"
         if isUserMessageItem(item, type: type) { return [] }
         let itemType = assistantItemType(for: type)
-        let state = itemState(for: string(item, "status"))
+        // Thread-history items are terminal snapshots; missing status → completed.
+        let state = itemCompletedState(for: string(item, "status"))
         let summary = summary(for: item, type: type)
         let resourcePath: String? = {
             if itemType == .imageView { return string(item, "path") }
@@ -2987,11 +2993,12 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case "fileChange": return .fileChange
         case "mcpToolCall", "mcp_call": return .mcpToolCall
         case "dynamicToolCall", "imageGeneration": return .dynamicToolCall
-        case "collabAgentToolCall": return .collabToolCall
+        case "collabAgentToolCall", "subAgentActivity", "sub_agent_activity": return .collabToolCall
         case "webSearch", "web_search_call", "tool_search_call", "tool_search_output", "search", "open_page", "find_in_page": return .webSearch
         case "imageView", "image_generation_call", "input_image": return .imageView
         case "enteredReviewMode", "exitedReviewMode": return .review
         case "contextCompaction", "context_compaction", "compaction", "compaction_trigger": return .contextCompaction
+        case "sleep": return .tool
         default: return .tool
         }
     }
@@ -3103,6 +3110,18 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
     }
 
+    /// Terminal state for item/completed (and history snapshots).
+    /// Missing/empty status means completed; explicit statuses reuse itemState.
+    private static func itemCompletedState(for status: String?) -> AssistantItemState {
+        let trimmed = status?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if trimmed.isEmpty {
+            return .completed
+        }
+        let mapped = itemState(for: trimmed)
+        // Non-terminal wire values on a completed notification still settle.
+        return mapped == .streaming ? .completed : mapped
+    }
+
     private static func summary(for item: [String: Any], type: String) -> String? {
         switch type {
         case "userMessage":
@@ -3140,6 +3159,13 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             return "Review"
         case "contextCompaction", "context_compaction", "compaction", "compaction_trigger":
             return "Context compaction"
+        case "sleep":
+            if let ms = item["durationMs"] as? Int ?? item["duration_ms"] as? Int {
+                return "Sleep \(ms)ms"
+            }
+            return "Sleep"
+        case "subAgentActivity", "sub_agent_activity":
+            return string(item, "summary") ?? string(item, "text") ?? "Sub-agent activity"
         default:
             return type
         }

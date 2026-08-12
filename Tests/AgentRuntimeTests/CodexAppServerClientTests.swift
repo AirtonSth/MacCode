@@ -466,6 +466,86 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual(models.first?.contextWindowTokens, 128_000)
     }
 
+    func test_modelDescriptorsSupportsFastFromServiceTiersObjects() {
+        // WHY: openai/codex model/list advertises fast via serviceTiers objects
+        // (id/name). Reading only deprecated additionalSpeedTiers left Fast UI dead
+        // when the catalog populates only serviceTiers (CODEX-APP-005).
+        let models = CodexAppServerClient.modelDescriptors(fromModelListResponse: [
+            "data": [[
+                "model": "gpt-5.7-codex",
+                "displayName": "GPT-5.7 Codex",
+                "serviceTiers": [
+                    ["id": "flex", "name": "Flex"],
+                    ["id": "fast", "name": "Fast"]
+                ],
+                "additionalSpeedTiers": []
+            ]]
+        ])
+
+        XCTAssertEqual(models.first?.supportsServiceTier, true,
+                       "serviceTiers entry id=fast must enable Fast mode even when additionalSpeedTiers is empty")
+    }
+
+    func test_modelDescriptorsSupportsFastFromServiceTiersNameOnly() {
+        let models = CodexAppServerClient.modelDescriptors(fromModelListResponse: [
+            "models": [[
+                "id": "gpt-5.7",
+                "service_tiers": [
+                    ["name": "FAST"]
+                ]
+            ]]
+        ])
+
+        XCTAssertEqual(models.first?.supportsServiceTier, true,
+                       "service_tiers name matching fast case-insensitively must enable Fast mode")
+    }
+
+    func test_modelDescriptorsSupportsFastWhenServiceTierIdIsPriorityButNameIsFast() {
+        // WHY: Live model/list uses serviceTiers like {id:"priority", name:"Fast"}.
+        // Preferring id alone (id ?? name) would miss Fast and leave the UI dead
+        // when additionalSpeedTiers is empty (CODEX-APP-005).
+        let models = CodexAppServerClient.modelDescriptors(fromModelListResponse: [
+            "data": [[
+                "model": "gpt-5.5",
+                "displayName": "GPT-5.5",
+                "serviceTiers": [
+                    ["id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"]
+                ],
+                "additionalSpeedTiers": []
+            ]]
+        ])
+
+        XCTAssertEqual(models.first?.supportsServiceTier, true,
+                       "serviceTiers name=Fast must enable Fast even when id is priority, not fast")
+    }
+
+    func test_modelDescriptorsSupportsFastFromDeprecatedAdditionalSpeedTiers() {
+        // WHY: Keep back-compat for older app-server peers that only send
+        // additionalSpeedTiers string arrays (CODEX-APP-005 fallback).
+        let models = CodexAppServerClient.modelDescriptors(fromModelListResponse: [
+            "models": [[
+                "id": "legacy-codex",
+                "additionalSpeedTiers": ["fast"]
+            ]]
+        ])
+
+        XCTAssertEqual(models.first?.supportsServiceTier, true,
+                       "deprecated additionalSpeedTiers containing fast must still enable Fast mode")
+    }
+
+    func test_modelDescriptorsDoesNotSupportFastWithoutEitherTierShape() {
+        let models = CodexAppServerClient.modelDescriptors(fromModelListResponse: [
+            "models": [[
+                "id": "economy",
+                "serviceTiers": [["id": "flex"]],
+                "additionalSpeedTiers": []
+            ]]
+        ])
+
+        XCTAssertEqual(models.first?.supportsServiceTier, false,
+                       "models without a fast tier must not expose Fast mode")
+    }
+
     func test_startTurnSendsPromptImagesModeAndRuntimePolicyThroughAppServerProtocol() async throws {
         let script = try makeFakeAppServerPeer()
         let client = try CodexAppServerClient(
