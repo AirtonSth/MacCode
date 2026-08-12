@@ -375,7 +375,7 @@ final class IntrinsicHeightTextView: NSTextView {
         let width = textContainer.containerSize.width
         if let cachedIntrinsicContentSize,
            let cachedIntrinsicContentWidth,
-           abs(cachedIntrinsicContentWidth - width) <= 0.5 {
+           cachedIntrinsicContentWidth == width {
             return cachedIntrinsicContentSize
         }
         intrinsicHeightComputationCount += 1
@@ -393,7 +393,7 @@ final class IntrinsicHeightTextView: NSTextView {
         let width = bounds.width
         guard width > 0, let textContainer else { return }
         let target = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
-        if abs(textContainer.containerSize.width - width) > 0.5 {
+        if textContainer.containerSize.width != width {
             textContainer.containerSize = target
             invalidateIntrinsicContentSize()
         }

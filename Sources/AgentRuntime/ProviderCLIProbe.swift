@@ -261,13 +261,19 @@ public enum ProviderCLIProbe {
         guard FileManager.default.isExecutableFile(atPath: trimmed) else { return nil }
 
         let baseEnv = CodexRunner.processEnvironment(overrides: environment, purpose: .supportProcess)
+        let transport = ProviderSubprocessLauncher.transportCommand(
+            provider: .codex,
+            executablePath: trimmed,
+            arguments: arguments,
+            environment: baseEnv
+        )
         let launchPlan: RunAsUserProcessBootstrap.LaunchPlan
         do {
             // Match ClaudeStreamingCLIAdapter: foreign user → sudo -n -u -H
             // (no askpass during probe — password UI only at real spawn).
             launchPlan = try RunAsUserProcessBootstrap.plan(
-                executablePath: trimmed,
-                arguments: arguments,
+                executablePath: transport.executablePath,
+                arguments: transport.arguments,
                 environment: baseEnv,
                 currentDirectory: FileManager.default.currentDirectoryPath,
                 runAsUser: runAsUser,

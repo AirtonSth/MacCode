@@ -513,11 +513,18 @@ final class DistillContentRouterTests: XCTestCase {
         XCTAssertEqual(try canonical(pretty), try canonical(output), "routed output is the lossless minify")
     }
 
-    func test_localRuntime_leavesProseLongTextToFallback() async throws {
-        let prose = (0..<20).map { "narrative line number \($0) describing things" }.joined(separator: "\n")
-        let request = DistillRequest(mode: .longText, input: prose)
+    func test_localRuntime_preservesProseLongTextSourceVerbatim() async throws {
+        // WHY: prose the lossless router cannot encode must fail open without
+        // dropping a late instruction or obeying the compression-size budget.
+        let tail = "UNIQUE FINAL INSTRUCTION: preserve the deployment gate."
+        let prose = ((0..<20).map { "narrative line number \($0) describing things" } + [tail])
+            .joined(separator: "\n")
+        let request = DistillRequest(mode: .longText, input: prose, maxOutputCharacters: 32)
         let output = try await LocalDistillRuntime().distill(request)
-        XCTAssertTrue(output.contains("S "), "prose falls through to the heuristic summary path")
+
+        XCTAssertEqual(output, prose)
+        XCTAssertTrue(output.hasSuffix(tail))
+        XCTAssertGreaterThan(output.count, request.maxOutputCharacters)
     }
 
     // MARK: - Helpers

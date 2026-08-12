@@ -79,16 +79,31 @@ public final class CodexParser {
                 ensureTurn(&out)
                 let turnId = currentTurnId ?? ""
                 switch tt {
-                case .assistantMessage:
-                    assembled += (assembled.isEmpty ? "" : "\n") + text
-                    out.append(.itemStarted(item: AssistantItem(id: iid, turnId: turnId, type: .assistantMessage, state: .streaming, summary: nil, body: "", startedAtMs: now)))
+                case .assistantMessage, .reasoning:
+                    if tt == .assistantMessage {
+                        assembled += (assembled.isEmpty ? "" : "\n") + text
+                    }
+                    // Normalize fallback completed text to the same event shape
+                    // used by streaming/app-server providers. Provider-authored
+                    // text must cross itemDelta so Token Saver can hold and
+                    // canonicalize it before persistence or first paint.
+                    out.append(.itemStarted(item: AssistantItem(
+                        id: iid,
+                        turnId: turnId,
+                        type: tt,
+                        state: .streaming,
+                        summary: nil,
+                        body: "",
+                        progress: tt == .reasoning ? Self.progressValue(item) : nil,
+                        startedAtMs: now
+                    )))
                     out.append(.itemDelta(itemId: iid, bodyAppend: text, outputAppend: nil, summary: nil))
                     out.append(.itemCompleted(itemId: iid, finalState: .completed))
                 case .tool:
                     let summary = item["command"] as? String ?? item["name"] as? String ?? kind
                     out.append(.itemStarted(item: AssistantItem(id: iid, turnId: turnId, type: .tool, state: .completed, summary: summary, body: "", output: text, progress: Self.progressValue(item), startedAtMs: now)))
                     out.append(.itemCompleted(itemId: iid, finalState: .completed))
-                default: // reasoning / plan
+                default: // plan / other non-provider-text items
                     out.append(.itemStarted(item: AssistantItem(id: iid, turnId: turnId, type: tt, state: .streaming, summary: nil, body: text, progress: Self.progressValue(item), startedAtMs: now)))
                     out.append(.itemCompleted(itemId: iid, finalState: .completed))
                 }

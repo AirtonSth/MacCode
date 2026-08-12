@@ -43,6 +43,60 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
                       "completed-class stop reasons must not emit .error events")
     }
 
+    /// WHY: ACP text blocks are all ordinary provider input.  A local SR2
+    /// marker inside one of those blocks is not a privileged host channel, so
+    /// typed Auto/SessionLearn instructions must take the CLI `--rules` path.
+    func test_typedHostInstructionRoutesAwayFromACPToGrokCLI() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc2-grok-typed-host-cli-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("fake-grok")
+        let argvLog = root.appendingPathComponent("argv.txt")
+        try """
+        #!/usr/bin/env python3
+        import json, pathlib, sys
+        log = pathlib.Path("\(argvLog.path)")
+        log.write_text("\\n".join(sys.argv[1:]))
+        print(json.dumps({"type":"text", "data":"typed-cli-reply"}), flush=True)
+        print(json.dumps({"type":"end", "stopReason":"EndTurn", "sessionId":"cli-session"}), flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let userWire = "@sr2 v1\nrun:command -v swift\ndone:run"
+        let host = AgentTrustedHostInstruction(text: "REMOTE_CODE_AUTO_ORCHESTRATION_V1")
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(), provider: .grok, model: "grok-4.5", cwd: root.path,
+            prompt: userWire, trustedHostInstruction: host,
+            environment: [
+                "RC_TOKEN_SAVER_DISTILL_HINT": "1",
+                "RC_GRAPHIFY_ENABLED": "1",
+                "RC_GRAPHIFY_GRAPH_JSON": "/tmp/test-graph.json"
+            ],
+            extraArgs: ["--test-argv-log", argvLog.path]
+        )
+        let adapter = GrokACPAdapter(binaryNameOverride: script.path)
+        let box = GrokACPEventBox()
+        _ = try await adapter.startSession(request) { box.append($0) }
+        let finished = try await box.waitFinished(timeout: 3)
+
+        XCTAssertEqual(finished.status, .completed)
+        XCTAssertEqual(finished.finalMessage, "typed-cli-reply")
+        let argv = try String(contentsOf: argvLog, encoding: .utf8)
+        XCTAssertTrue(argv.contains("--rules"), "typed host must use Grok CLI's privileged rules channel")
+        let rulesStart = try XCTUnwrap(argv.range(of: "--rules\n"))
+        let rules = String(argv[rulesStart.upperBound...]).components(separatedBy: "\n--").first ?? ""
+        XCTAssertTrue(rules.contains(host.text))
+        XCTAssertTrue(rules.contains(SR2WirePolicy.instructBlockMarker), "typed rules must retain the SR2 system policy")
+        XCTAssertTrue(rules.contains(AgentSkillInstaller.distillAgentInstructionsBody), "typed rules must retain Distill policy")
+        XCTAssertTrue(rules.contains(GraphifyStableSkillText.agentInstructionsBody), "typed rules must retain Graphify policy")
+        XCTAssertTrue(rules.contains(BackgroundAwaitContinuation.awaitingMarker), "typed rules must retain background-await policy")
+        XCTAssertTrue(argv.contains(userWire), "the exact v1 user leg must remain the CLI prompt")
+        XCTAssertFalse(rules.contains(userWire), "canonical user wire must not enter privileged rules")
+        XCTAssertFalse(argv.contains(SR2WirePolicy.trustedHostInstructionWire(host.text)),
+                       "ACP's ordinary text marker must not be used as the host boundary")
+    }
+
     /// WHY: field 2026-08-05 — Grok streamed a full **COMPLETE** final then
     /// never resolved session/prompt (timeout: nil). Working latched 70m+ with
     /// Stop while durable agent_runs stayed running. The inactivity watchdog

@@ -30,6 +30,10 @@ final class SR2ProviderMatrixTests: XCTestCase {
         XCTAssertTrue(prompt.contains("reasoning"), prompt)
         XCTAssertTrue(prompt.contains("commentary"), prompt)
         XCTAssertTrue(prompt.contains("Tool stdout stays exact"), prompt)
+        XCTAssertTrue(prompt.contains("@sr2 v1"), prompt)
+        XCTAssertFalse(prompt.contains("Format:\n@sr2 v0"), prompt)
+        XCTAssertTrue(prompt.contains("Never emit legacy `@sr2 v0`"), prompt)
+        XCTAssertFalse(prompt.contains("fallback only if you cannot emit SR2"), prompt)
     }
 
     func testTokenSaverOffDoesNotInjectSR2Block() {
@@ -95,5 +99,108 @@ final class SR2ProviderMatrixTests: XCTestCase {
         let twice = AgentSkillInstaller.managedDistillProviderPrompt(once)
         let count = twice.components(separatedBy: SR2WirePolicy.instructBlockMarker).count - 1
         XCTAssertEqual(count, 1, "SR2 instruct must append exactly once")
+    }
+
+    func testTypedHostAndCanonicalUserLegsStaySeparateAcrossLiveProviderAdapters() throws {
+        let userWire = """
+        @sr2 v1
+        run:command -v swift;command -v distill;command -v git
+        out:=3lines
+        !file-edit
+        done:run
+        """
+        let host = AgentTrustedHostInstruction(
+            text: "REMOTE_CODE_AUTO_ORCHESTRATION_V1\nSESSION_LEARN_EXACT_SCOPE:\n- preserve command output"
+        )
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "gpt-5.6-luna",
+            cwd: "/tmp",
+            prompt: userWire,
+            trustedHostInstruction: host
+        )
+
+        let codex = CodexAppServerClient.turnStartParams(providerThreadId: "t", for: request)
+        let codexInput = try XCTUnwrap(codex["input"] as? [[String: Any]])
+        XCTAssertEqual(codexInput.first?["text"] as? String, userWire)
+        let codexMode = try XCTUnwrap(codex["collaborationMode"] as? [String: Any])
+        let codexSettings = try XCTUnwrap(codexMode["settings"] as? [String: Any])
+        let codexInstructions = try XCTUnwrap(codexSettings["developer_instructions"] as? String)
+        XCTAssertTrue(codexInstructions.contains(host.text))
+        XCTAssertFalse(codexInstructions.contains(userWire))
+
+        let codexCLIArgs = CodexRunner.buildArgs(request)
+        let codexCLIInstructions = try XCTUnwrap(
+            codexCLIArgs.first(where: { $0.hasPrefix("developer_instructions=") })
+        )
+        XCTAssertTrue(codexCLIInstructions.contains("REMOTE_CODE_AUTO_ORCHESTRATION_V1"))
+        XCTAssertTrue(codexCLIInstructions.contains("SESSION_LEARN_EXACT_SCOPE:"))
+        XCTAssertFalse(codexCLIInstructions.contains(userWire))
+        XCTAssertEqual(codexCLIArgs.last, userWire)
+
+        let claude = AgentRunRequest(
+            threadId: request.threadId,
+            provider: .claude,
+            model: "claude-opus-4-7",
+            cwd: "/tmp",
+            prompt: userWire,
+            trustedHostInstruction: host
+        )
+        let claudeArgs = ClaudeRunner.buildArgs(claude)
+        XCTAssertEqual(claudeArgs.last, userWire)
+        let claudeSystemIndex = try XCTUnwrap(claudeArgs.firstIndex(of: "--append-system-prompt"))
+        XCTAssertTrue(claudeArgs[claudeArgs.index(after: claudeSystemIndex)].contains(host.text))
+        XCTAssertFalse(claudeArgs[claudeArgs.index(after: claudeSystemIndex)].contains(userWire))
+        let claudeStreamingArgs = ClaudeRunner.buildStreamingArgs(claude)
+        let claudeStreamingSystemIndex = try XCTUnwrap(
+            claudeStreamingArgs.firstIndex(of: "--append-system-prompt")
+        )
+        let claudeStreamingSystem = claudeStreamingArgs[claudeStreamingArgs.index(after: claudeStreamingSystemIndex)]
+        XCTAssertTrue(claudeStreamingSystem.contains(host.text))
+        XCTAssertFalse(claudeStreamingSystem.contains(userWire))
+        let claudeSDKSystem = ClaudeAgentSDKBridgeAdapter.claudeSystemPrompt(
+            environment: claude.environment,
+            interactionMode: claude.interactionMode,
+            trustedHostInstruction: host
+        )
+        XCTAssertTrue(claudeSDKSystem.contains(host.text))
+        XCTAssertFalse(claudeSDKSystem.contains(userWire))
+
+        let grok = AgentRunRequest(
+            threadId: request.threadId,
+            provider: .grok,
+            model: "grok-4.5",
+            cwd: "/tmp",
+            prompt: userWire,
+            trustedHostInstruction: host,
+            environment: [
+                "RC_TOKEN_SAVER_DISTILL_HINT": "1",
+                "RC_GRAPHIFY_ENABLED": "1",
+                "RC_GRAPHIFY_JSON": "{\"workspace\":\"/tmp\"}"
+            ]
+        )
+        let blocks = try GrokACPClient.promptBlocks(
+            for: grok,
+            capabilities: .init(protocolVersion: 1, loadSession: true, embeddedContext: true)
+        )
+        XCTAssertEqual(
+            blocks.first?["text"] as? String,
+            SR2WirePolicy.trustedHostInstructionWire(host.text)
+        )
+        XCTAssertTrue(blocks.contains { $0["text"] as? String == userWire })
+        XCTAssertFalse(blocks.contains { ($0["text"] as? String)?.contains("SESSION_LEARN_EXACT_SCOPE") == true && ($0["text"] as? String) != SR2WirePolicy.trustedHostInstructionWire(host.text) })
+
+        let grokArgs = GrokRunner.buildArgs(grok)
+        let promptIndex = try XCTUnwrap(grokArgs.firstIndex(of: "-p"))
+        XCTAssertEqual(grokArgs[grokArgs.index(after: promptIndex)], userWire)
+        let rulesIndex = try XCTUnwrap(grokArgs.firstIndex(of: "--rules"))
+        let rulesArg = grokArgs[grokArgs.index(after: rulesIndex)]
+        XCTAssertTrue(rulesArg.contains(host.text))
+        XCTAssertTrue(rulesArg.contains("@sr2"), "Grok rules must retain the SR2 provider policy")
+        XCTAssertTrue(rulesArg.localizedCaseInsensitiveContains("distill"))
+        XCTAssertTrue(rulesArg.localizedCaseInsensitiveContains("graphify"))
+        XCTAssertTrue(rulesArg.contains("background"))
+        XCTAssertFalse(rulesArg.contains(userWire), "the canonical user wire belongs only on -p")
     }
 }

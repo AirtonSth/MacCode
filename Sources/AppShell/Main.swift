@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import CoreModel
 import Persistence
 
 @main
@@ -17,6 +18,17 @@ struct RemoteCodeMain {
         }
         let appSupportOverride = ProcessInfo.processInfo.environment["RC2_APP_SUPPORT"]
         let dbOverride = ProcessInfo.processInfo.environment["RC2_DB_PATH"]
+        let appSupportDirectory = AppPaths.appSupportDirectory(
+            for: channel,
+            override: appSupportOverride
+        )
+        let managedIntegrationHomeOverride = AppDelegate.managedIntegrationHome(
+            channel: channel,
+            appSupportDirectory: appSupportDirectory,
+            environment: ProcessInfo.processInfo.environment,
+            isTestContext: AppContext.isRunningUnitTests
+        )
+        ChildProcessEnvironmentPolicy.consumeHostOnlyKeysFromCurrentProcess()
 
         if CommandLine.arguments.contains("--scheduled-task-agent-unregister") {
             do {
@@ -44,7 +56,12 @@ struct RemoteCodeMain {
             return
         }
         app.setActivationPolicy(.regular)
-        let delegate = AppDelegate(channel: channel, appSupportOverride: appSupportOverride, dbOverride: dbOverride)
+        let delegate = AppDelegate(
+            channel: channel,
+            appSupportOverride: appSupportOverride,
+            dbOverride: dbOverride,
+            managedIntegrationHomeOverride: managedIntegrationHomeOverride
+        )
         app.delegate = delegate
         app.activate(ignoringOtherApps: true)
         withExtendedLifetime(delegate) {

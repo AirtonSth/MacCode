@@ -722,9 +722,29 @@ public enum TokenSaverExecutionReceiptSeam {
         to environment: [String: String]
     ) -> [String: String] {
         let statePath = environment["REMOTE_CODE_DISTILL_STATE_PATH"]
+        let appSupport = environment["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"]
         var updated = scrub(environment)
         updated.merge(self.environment(from: receipt)) { _, receiptValue in receiptValue }
-        if receipt.capabilities.postToolUse == true, let statePath, !statePath.isEmpty {
+        // Codex/Grok do not expose Claude's PostToolUse capability, but their
+        // managed `distill` wrapper still needs the host-issued sidecar lease.
+        // Preserve only the exact host path when the receipt independently
+        // authorizes distill, managed PATH, and recovery scope, and the path
+        // belongs to the app-support DB namespace. Denial/provider/namespace
+        // mismatch exits above or leaves the state path scrubbed.
+        if receipt.capabilities.distill == true,
+           receipt.capabilities.managedPath == true,
+           receipt.capabilities.recoveryScope == true,
+           let appSupport,
+           !appSupport.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let statePath,
+           !statePath.isEmpty,
+           URL(fileURLWithPath: statePath).standardizedFileURL == URL(
+               fileURLWithPath: appSupport,
+               isDirectory: true
+           )
+               .appendingPathComponent("Distill", isDirectory: true)
+               .appendingPathComponent("DistillCLIState.json")
+               .standardizedFileURL {
             updated["REMOTE_CODE_DISTILL_STATE_PATH"] = statePath
         }
         return updated
@@ -797,6 +817,47 @@ public enum AgentDeletedThreadRetirementOutcome: Equatable, Sendable {
     case retired
     case confirmedPresent
     case retryRequired
+}
+
+/// Host-owned semantic input for Token Saver prompt compilation.
+///
+/// The provider-bound prompt is not a provenance source: it can contain Auto
+/// orchestration text or user-quoted boilerplate. Keep the natural user text
+/// and any host-promoted segments separate so downstream compilers never need
+/// to infer trust from marker strings inside prompt content.
+public struct AgentPromptSemanticSource: Sendable, Equatable {
+    public let naturalUserText: String
+    public let trustedHostSegments: [String]
+
+    public init(_ naturalUserText: String, trustedHostSegments: [String] = []) {
+        self.naturalUserText = naturalUserText
+        self.trustedHostSegments = trustedHostSegments
+    }
+
+    public func appendingTrustedHostSegments(_ segments: [String]) -> AgentPromptSemanticSource {
+        guard !segments.isEmpty else { return self }
+        return AgentPromptSemanticSource(
+            naturalUserText,
+            trustedHostSegments: trustedHostSegments + segments
+        )
+    }
+}
+
+/// The two provider-facing legs of a turn. `userPrompt` is the canonical
+/// user wire (SR2 v1 when Token Saver is active); trusted host guidance is a
+/// separately typed instruction and therefore cannot leak into `u:` or the
+/// raw user-toggle view.
+public struct AgentProviderPromptPayload: Sendable, Equatable {
+    public let userPrompt: String
+    public let trustedHostInstruction: AgentTrustedHostInstruction?
+
+    public init(
+        userPrompt: String,
+        trustedHostInstruction: AgentTrustedHostInstruction? = nil
+    ) {
+        self.userPrompt = userPrompt
+        self.trustedHostInstruction = trustedHostInstruction
+    }
 }
 
 public final class AgentRunCoordinator: @unchecked Sendable {
@@ -922,6 +983,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private var orchestrationDeadlineWorkItems: [AgentRunID: DispatchWorkItem] = [:]
     private var externalReceiptLeaseWorkItems: [AgentRunID: DispatchWorkItem] = [:]
     private var activeAssistantMessageIds: [AgentRunID: AgentMessageID] = [:]
+    /// Immutable Token Saver admission captured immediately before provider
+    /// callbacks can begin. Settings may change while a run is streaming; all
+    /// text legs for that run must still follow the policy that admitted it.
+    private var tokenSaverRunAdmissions: [AgentRunID: Bool] = [:]
     private var activeProviderTextItemTypes: [AgentRunID: [String: AssistantItemType]] = [:]
     private var bufferedProviderTextItems: [AgentRunID: [String: BufferedProviderTextItem]] = [:]
     /// Stream humanization is asynchronous. A provider can emit its terminal
@@ -1070,13 +1135,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     /// Token Saver hook: async transform applied to the outbound provider
     /// prompt only. The original text is always preserved as the displayed
-    /// user message. Must be fail-open — return the input unchanged on any
-    /// error or when Token Saver is disabled.
-    public var promptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider, _ threadId: AgentThreadID, _ runId: AgentRunID?) async -> String)?
+    /// user message. The semantic source is host-owned and keeps promoted
+    /// segments separate from natural user text. Must be fail-open — return
+    /// the input unchanged on any error or when Token Saver is disabled.
+    public var promptCompressor: (@Sendable (_ prompt: String, _ semanticSource: AgentPromptSemanticSource, _ provider: AgentProvider, _ threadId: AgentThreadID, _ runId: AgentRunID?) async -> String)?
+    /// Typed provider payload seam. Production AppShell uses this to keep
+    /// promoted SessionLearn beside trusted Auto instructions, never inside
+    /// the user's SR2 wire. The legacy compressor remains for hosts/tests that
+    /// only need a user-string transform.
+    public var promptPayloadCompressor: (@Sendable (_ prompt: String, _ semanticSource: AgentPromptSemanticSource, _ provider: AgentProvider, _ threadId: AgentThreadID, _ runId: AgentRunID?) async -> AgentProviderPromptPayload)?
     /// Token Saver hook for free-form follow-up answers. Defaults to
     /// `promptCompressor` when nil, but app shells can provide a separate hook
     /// to tag telemetry as `prompt_followup`.
-    public var followUpPromptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider, _ threadId: AgentThreadID) async -> String)?
+    public var followUpPromptCompressor: (@Sendable (_ prompt: String, _ semanticSource: AgentPromptSemanticSource, _ provider: AgentProvider, _ threadId: AgentThreadID) async -> String)?
     /// P3: optionally compact large tool output in a persisted stream-event payload before it
     /// is written (CCR-backed, structure-preserving). nil => payloads stored verbatim.
     public var streamPayloadCompactor: (@Sendable (_ payloadJSON: String) -> String)?
@@ -1547,8 +1618,26 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // original prompt is preserved verbatim as the displayed user message.
         let preservedUserContent = request.userMessageContent ?? request.prompt
         var outboundPrompt = request.prompt
-        if let promptCompressor {
-            outboundPrompt = await promptCompressor(request.prompt, request.provider, request.threadId, request.runId)
+        var trustedHostInstruction = request.trustedHostInstruction
+        if let promptPayloadCompressor {
+            let payload = await promptPayloadCompressor(
+                request.prompt,
+                AgentPromptSemanticSource(preservedUserContent),
+                request.provider,
+                request.threadId,
+                request.runId
+            )
+            outboundPrompt = payload.userPrompt
+            trustedHostInstruction = trustedHostInstruction?.appending(payload.trustedHostInstruction)
+                ?? payload.trustedHostInstruction
+        } else if let promptCompressor {
+            outboundPrompt = await promptCompressor(
+                request.prompt,
+                AgentPromptSemanticSource(preservedUserContent),
+                request.provider,
+                request.threadId,
+                request.runId
+            )
         }
         var effectiveEnvironment = request.environment
         let scopedEnvironment = await runEnvironmentProvider?(request.provider, request.threadId, request.environment) ?? [:]
@@ -1584,6 +1673,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             model: request.model,
             cwd: request.cwd,
             prompt: outboundPrompt,
+            trustedHostInstruction: trustedHostInstruction,
             userMessageContent: preservedUserContent,
             attachments: request.attachments,
             providerThreadId: resumeCursor,
@@ -1694,9 +1784,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
         let coordinator = self
         let handle: AgentRunHandle
+        let tokenSaverAdmitted = isTokenSaverRuntimeActiveNow()
+        lock.withLock {
+            tokenSaverRunAdmissions[runId] = tokenSaverAdmitted
+        }
         let expectsDistillOutput = Self.promptInvokesDistill(effectiveRequest.prompt) ||
             Self.promptInvokesDistill(effectiveRequest.userMessageContent)
-        if expectsDistillOutput {
+        if tokenSaverAdmitted, expectsDistillOutput {
             markDistillOutputMode(runId)
         }
         do {
@@ -1713,14 +1807,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lock.unlock()
         } catch {
             clearDistillOutputMode(runId)
-            lock.lock()
-            let gen = preparationStates[effectiveRequest.threadId]?.generation ?? 0
-            // claimSpawn already advanced to running; terminalize that generation.
-            _ = applyPreparationLocked(
-                threadId: effectiveRequest.threadId,
-                event: .providerFinished(generation: gen, reason: .providerFailure)
-            )
-            lock.unlock()
+            lock.withLock {
+                tokenSaverRunAdmissions.removeValue(forKey: runId)
+                let gen = preparationStates[effectiveRequest.threadId]?.generation ?? 0
+                // claimSpawn already advanced to running; terminalize that generation.
+                _ = applyPreparationLocked(
+                    threadId: effectiveRequest.threadId,
+                    event: .providerFinished(generation: gen, reason: .providerFailure)
+                )
+            }
             markStartFailure(
                 error,
                 request: effectiveRequest,
@@ -1982,14 +2077,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 delegationCapabilitySHA256: delegationCapabilitySHA256
             )
             let launch = routingSnapshot.launchConfigurations[admission.route.providerInstanceId]
-            // Display the user's words unchanged; wrap only the provider-bound prompt
-            // so Auto always enters $remote-code-orchestrate with the host receipt
-            // the app already admitted (provider/model) — skill must not re-guess.
+            // Keep Auto orchestration on the trusted host leg. The user prompt
+            // remains byte-for-byte natural here and is compiled independently
+            // into the canonical provider user wire later in startRun.
             let displayPrompt = request.userMessageContent ?? request.prompt
-            let orchestratedPrompt = AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(
-                userPrompt: request.prompt,
-                admittedRoute: admission.route
-            )
             return AgentRunRequest(
                 runId: request.runId,
                 threadId: request.threadId,
@@ -1997,7 +2088,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 providerInstanceId: admission.route.providerInstanceId,
                 model: admission.route.selection.effectiveModel,
                 cwd: request.cwd,
-                prompt: orchestratedPrompt,
+                prompt: request.prompt,
+                trustedHostInstruction: AgentOrchestrationRuntime.autoTrustedHostInstruction(
+                    admittedRoute: admission.route
+                ),
                 userMessageContent: displayPrompt,
                 attachments: request.attachments,
                 providerThreadId: request.providerThreadId,
@@ -2867,6 +2961,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             || orchestrationDeadlineWorkItems[runId] != nil
             || externalReceiptLeaseWorkItems[runId] != nil
             || activeAssistantMessageIds[runId] != nil
+            || tokenSaverRunAdmissions[runId] != nil
             || activeProviderTextItemTypes[runId] != nil
             || bufferedProviderTextItems[runId] != nil
             || providerTextTranslationsInFlight[runId] != nil
@@ -2969,6 +3064,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         orchestrationDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
         externalReceiptLeaseWorkItems.removeValue(forKey: runId)?.cancel()
         activeAssistantMessageIds.removeValue(forKey: runId)
+        tokenSaverRunAdmissions.removeValue(forKey: runId)
         activeProviderTextItemTypes.removeValue(forKey: runId)
         bufferedProviderTextItems.removeValue(forKey: runId)
         providerTextTranslationsInFlight.removeValue(forKey: runId)
@@ -3540,6 +3636,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             activeRunMetadata.removeValue(forKey: runId)
             activeTurnIds.removeValue(forKey: runId)
             activeAssistantMessageIds.removeValue(forKey: runId)
+            tokenSaverRunAdmissions.removeValue(forKey: runId)
             activeProviderTextItemTypes.removeValue(forKey: runId)
             bufferedProviderTextItems.removeValue(forKey: runId)
             activeDistillOutputRuns.remove(runId)
@@ -3657,6 +3754,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         latestRunErrorMessages.removeValue(forKey: runId)
         activeTurnIds.removeValue(forKey: runId)
         activeAssistantMessageIds.removeValue(forKey: runId)
+        tokenSaverRunAdmissions.removeValue(forKey: runId)
         activeProviderTextItemTypes.removeValue(forKey: runId)
         bufferedProviderTextItems.removeValue(forKey: runId)
         activeDistillOutputRuns.remove(runId)
@@ -4027,9 +4125,20 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let adapter = try adapterForThread(threadId)
         let outboundText: String
         if let followUpPromptCompressor {
-            outboundText = await followUpPromptCompressor(text, adapter.provider, threadId)
+            outboundText = await followUpPromptCompressor(
+                text,
+                AgentPromptSemanticSource(text),
+                adapter.provider,
+                threadId
+            )
         } else if let promptCompressor {
-            outboundText = await promptCompressor(text, adapter.provider, threadId, nil)
+            outboundText = await promptCompressor(
+                text,
+                AgentPromptSemanticSource(text),
+                adapter.provider,
+                threadId,
+                nil
+            )
         } else {
             outboundText = text
         }
@@ -4455,12 +4564,229 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public static let hotReplayEventCount = 4_096
     public static let hotReplayEventBytes: Int64 = 32 * 1_024 * 1_024
 
+    private struct DurableCommandReplaySnapshot {
+        let itemID: String
+        var turnID: String
+        var command: String?
+        var output: String = ""
+        var finalState: AssistantItemState = .streaming
+        var startedAtMs: Int64
+        var finishedAtMs: Int64?
+    }
+
+    #if DEBUG
+    var durableCommandReplayWillLoadForTesting: (@Sendable (AgentThreadID) async -> Void)?
+    #endif
+
     public func latestStreamEvents(threadId: AgentThreadID) -> [AssistantEvent] {
         (try? runRepo.listLatestStreamEvents(
             threadId: threadId,
             limit: Self.hotReplayEventCount,
             maxPayloadBytes: Self.hotReplayEventBytes
         )) ?? []
+    }
+
+    /// One-time full-open recovery for a pruned stream prefix. The bounded
+    /// provider read, reversible-payload rehydration, JSON parsing, and output
+    /// capping all stay off MainActor; the caller generation-fences the returned
+    /// snapshot before one atomic timeline publish. This is never a live-poll path.
+    public func durableCommandReplay(
+        threadId: AgentThreadID,
+        persistedEvents: [AssistantEvent]
+    ) async -> [AssistantEvent] {
+        let repository = runRepo
+        #if DEBUG
+        let willLoadForTesting = durableCommandReplayWillLoadForTesting
+        #endif
+        let worker = Task.detached(priority: .userInitiated) {
+            #if DEBUG
+            await willLoadForTesting?(threadId)
+            #endif
+            guard !Task.isCancelled else { return persistedEvents }
+            let providerEvents = (try? repository.listLatestProviderEventLogs(
+                threadId: threadId,
+                limit: AgentEventRetentionPolicy.production.providerLogCountPerThread
+            )) ?? []
+            guard !Task.isCancelled else { return persistedEvents }
+
+            let existingStartedItemIDs = Set(persistedEvents.compactMap { event -> String? in
+                guard case .itemStarted(let item) = event else { return nil }
+                return item.id
+            })
+            let recoveredItems = Self.durableCommandReplayItems(from: providerEvents)
+                .filter { !existingStartedItemIDs.contains($0.id) }
+            guard !recoveredItems.isEmpty else { return persistedEvents }
+
+            // A retention boundary can leave a command's delta/completion while
+            // dropping only its start. Replace every retained item-scoped row for
+            // recovered ids so completed aggregate output is never appended twice.
+            let recoveredItemIDs = Set(recoveredItems.map(\.id))
+            let retainedEvents = persistedEvents.filter { event in
+                guard let itemID = Self.itemScopedEventID(event) else { return true }
+                return !recoveredItemIDs.contains(itemID)
+            }
+            return recoveredItems.map(AssistantEvent.itemStarted) + retainedEvents
+        }
+        return await withTaskCancellationHandler {
+            await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+    }
+
+    private nonisolated static func itemScopedEventID(_ event: AssistantEvent) -> String? {
+        switch event {
+        case .itemStarted(let item): return item.id
+        case .itemDelta(let itemID, _, _, _): return itemID
+        case .itemState(let itemID, _): return itemID
+        case .itemProgress(let itemID, _): return itemID
+        case .itemCompleted(let itemID, _): return itemID
+        default: return nil
+        }
+    }
+
+    /// Reconstruct only complete-enough command snapshots. Provider rows are
+    /// already chronological and capped per thread; completed payload output is
+    /// authoritative over earlier deltas, and output is reduced to the same cap
+    /// the live timeline enforces before it enters SwiftUI state.
+    private nonisolated static func durableCommandReplayItems(
+        from providerEvents: [ProviderRuntimeEvent]
+    ) -> [AssistantItem] {
+        var snapshots: [String: DurableCommandReplaySnapshot] = [:]
+        var order: [String] = []
+
+        func string(_ object: [String: Any], _ key: String) -> String? {
+            object[key] as? String
+        }
+        func milliseconds(_ value: Any?) -> Int64? {
+            if let number = value as? NSNumber { return number.int64Value }
+            if let string = value as? String { return Int64(string) }
+            return nil
+        }
+        func isCommandType(_ value: String?) -> Bool {
+            switch value {
+            case "commandExecution", "local_shell_call": return true
+            default: return false
+            }
+        }
+        func ensureSnapshot(
+            itemID: String,
+            turnID: String,
+            receivedAtMs: Int64
+        ) -> DurableCommandReplaySnapshot {
+            if let existing = snapshots[itemID] { return existing }
+            order.append(itemID)
+            return DurableCommandReplaySnapshot(
+                itemID: itemID,
+                turnID: turnID,
+                startedAtMs: receivedAtMs
+            )
+        }
+
+        for event in providerEvents {
+            guard let data = event.payloadJSON.data(using: .utf8),
+                  let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                continue
+            }
+            let item = payload["item"] as? [String: Any]
+            let itemID = event.providerItemId
+                ?? item.flatMap { string($0, "id") }
+                ?? string(payload, "itemId")
+                ?? string(payload, "item_id")
+            guard let itemID, !itemID.isEmpty else { continue }
+            let turnID = event.providerTurnId
+                ?? string(payload, "turnId")
+                ?? string(payload, "turn_id")
+                ?? ""
+
+            switch event.method {
+            case "item/started", "item.started":
+                guard let item, isCommandType(string(item, "type")) else { continue }
+                var snapshot = ensureSnapshot(
+                    itemID: itemID,
+                    turnID: turnID,
+                    receivedAtMs: event.receivedAtMs
+                )
+                if snapshot.turnID.isEmpty { snapshot.turnID = turnID }
+                if let command = string(item, "command"), !command.isEmpty {
+                    snapshot.command = command
+                }
+                snapshot.startedAtMs = milliseconds(item["startedAtMs"]) ?? snapshot.startedAtMs
+                snapshots[itemID] = snapshot
+
+            case "item/commandExecution/outputDelta", "command/exec/outputDelta",
+                 "item.commandExecution.outputDelta", "command.exec.outputDelta":
+                var snapshot = ensureSnapshot(
+                    itemID: itemID,
+                    turnID: turnID,
+                    receivedAtMs: event.receivedAtMs
+                )
+                if snapshot.turnID.isEmpty { snapshot.turnID = turnID }
+                if let delta = string(payload, "delta") ?? string(payload, "text") ?? string(payload, "output") {
+                    AssistantTimelineState.appendCapped(
+                        &snapshot.output,
+                        append: delta,
+                        limit: AssistantTimelineState.liveOutputLimit
+                    )
+                }
+                snapshots[itemID] = snapshot
+
+            case "item/completed", "item.completed":
+                guard let item,
+                      isCommandType(string(item, "type")) || snapshots[itemID] != nil else {
+                    continue
+                }
+                var snapshot = ensureSnapshot(
+                    itemID: itemID,
+                    turnID: turnID,
+                    receivedAtMs: event.receivedAtMs
+                )
+                if snapshot.turnID.isEmpty { snapshot.turnID = turnID }
+                if let command = string(item, "command"), !command.isEmpty {
+                    snapshot.command = command
+                }
+                if let completedOutput = string(item, "aggregatedOutput") ?? string(item, "output") {
+                    snapshot.output = AssistantTimelineState.cappedText(
+                        completedOutput,
+                        limit: AssistantTimelineState.liveOutputLimit
+                    )
+                }
+                let status = (string(item, "status") ?? "completed").lowercased()
+                let exitCode = (item["exitCode"] as? NSNumber)?.intValue
+                if status == "failed" || (exitCode != nil && exitCode != 0) {
+                    snapshot.finalState = .failed
+                } else if status == "cancelled" || status == "interrupted" {
+                    snapshot.finalState = .cancelled
+                } else {
+                    snapshot.finalState = .completed
+                }
+                snapshot.finishedAtMs = milliseconds(payload["completedAtMs"])
+                    ?? milliseconds(item["completedAtMs"])
+                    ?? event.receivedAtMs
+                snapshots[itemID] = snapshot
+
+            default:
+                continue
+            }
+        }
+
+        return order.compactMap { itemID in
+            guard let snapshot = snapshots[itemID],
+                  let command = snapshot.command,
+                  !command.isEmpty,
+                  snapshot.finishedAtMs != nil else { return nil }
+            return AssistantItem(
+                id: snapshot.itemID,
+                turnId: snapshot.turnID,
+                type: .commandExecution,
+                state: snapshot.finalState,
+                summary: command,
+                body: command,
+                output: snapshot.output.isEmpty ? nil : snapshot.output,
+                startedAtMs: snapshot.startedAtMs,
+                finishedAtMs: snapshot.finishedAtMs
+            )
+        }
     }
 
     /// Cheap COUNT(*) for UI change detection. Prefer this over
@@ -5432,7 +5758,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             if allowFinalResponseTranslation,
                case .turnCompleted(let turnId, let finalMessage) = ev,
                let finalMessage,
-               shouldTranslateFinalResponse(finalMessage) {
+               shouldTranslateFinalResponse(finalMessage, runId: runId) {
                 rememberCompletedTurn(turnId, runId: runId)
                 return
             }
@@ -5475,14 +5801,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                                 allowFinalResponseTranslation: false
                             )
                         }
-                        // Stream surface shows UI text; history body is finalized on turnCompleted.
-                        let display = plan.uiText
+                        // Persist canonical provider history for every text item.
+                        // The typed translation above is the sole UI projection,
+                        // so reasoning/commentary remains natural without putting
+                        // that prose back into the next-turn history leg.
+                        let history = plan.historyText
                         let delta: AssistantEvent
                         switch target {
                         case .body:
-                            delta = .itemDelta(itemId: itemId, bodyAppend: display, outputAppend: nil, summary: nil)
+                            delta = .itemDelta(itemId: itemId, bodyAppend: history, outputAppend: nil, summary: nil)
                         case .output:
-                            delta = .itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: display, summary: nil)
+                            delta = .itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: history, summary: nil)
                         }
                         self.handle(
                             event: .event(delta),
@@ -5926,7 +6255,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             if allowFinalResponseTranslation,
                reportedStatus == .completed,
                let finalMessage,
-               shouldTranslateFinalResponse(finalMessage) {
+               shouldTranslateFinalResponse(finalMessage, runId: runId) {
                 Task { [weak self] in
                     guard let self else { return }
                     let translated = await self.translateFinalResponse(finalMessage, runId: runId, threadId: threadId)
@@ -6149,6 +6478,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             activeRunMetadata.removeValue(forKey: runId)
             activeTurnIds.removeValue(forKey: runId)
             activeAssistantMessageIds.removeValue(forKey: runId)
+            tokenSaverRunAdmissions.removeValue(forKey: runId)
             activeProviderTextItemTypes.removeValue(forKey: runId)
             bufferedProviderTextItems.removeValue(forKey: runId)
             activeDistillOutputRuns.remove(runId)
@@ -6692,11 +7022,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         tokenSaverRuntimeActive?() == true
     }
 
-    private func shouldTranslateFinalResponse(_ text: String) -> Bool {
+    private func tokenSaverWasAdmitted(for runId: AgentRunID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return tokenSaverRunAdmissions[runId] == true
+    }
+
+    private func shouldTranslateFinalResponse(_ text: String, runId: AgentRunID) -> Bool {
         guard finalResponseTranslator != nil else { return false }
-        // Never dual-channel / enforce when Token Saver is OFF — translator may
-        // still be wired for the process lifetime.
-        guard isTokenSaverRuntimeActiveNow() else { return false }
+        // Never re-read mutable Settings here. Concurrent runs and callbacks
+        // retain the exact policy captured before their provider started.
+        guard tokenSaverWasAdmitted(for: runId) else { return false }
         // Token Saver dual-channel: humanize SR2/SR1 wire, and enforce free prose
         // so monologue cannot become the only leg (host maps via SR2WirePolicy).
         if SR2WirePolicy.isSR2(text) { return true }
@@ -6718,7 +7054,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let plan = SR2WirePolicy.dualChannelPersistPlan(
             modelOutput: modelOutput,
             humanizeOutput: humanizeOutput,
-            tokenSaverOn: isTokenSaverRuntimeActiveNow(),
+            tokenSaverOn: tokenSaverWasAdmitted(for: runId),
             isSR1: { SR1ResponseDetector.isSR1($0) },
             storeProse: store.map { storeFn in
                 { prose in storeFn(prose) }
@@ -6823,7 +7159,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     }
 
     private func interceptProviderTextEvent(_ ev: AssistantEvent, runId: AgentRunID, threadId: AgentThreadID) -> ProviderTextDecision? {
-        guard finalResponseTranslator != nil else { return nil }
+        // The translator is process-lifetime infrastructure, not Token Saver
+        // admission. OFF must bypass every hold/humanize/canonicalization path
+        // even when provider text happens to resemble legacy SR1.
+        guard finalResponseTranslator != nil,
+              tokenSaverWasAdmitted(for: runId) else { return nil }
         switch ev {
         case .itemStarted(let item):
             if isProviderTextItem(item.type) {
@@ -6888,20 +7228,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // wire channel. Hold the complete item so a non-compliant PT/EN
             // first delta can never paint into the live transcript. Tool calls
             // and their exact output never enter this branch.
-            let shouldBuffer = isTokenSaverRuntimeActiveNow()
-                || shouldBufferProviderTextPrefix(delta)
-            if shouldBuffer {
-                runBuffers[itemId] = BufferedProviderTextItem(
-                    text: AssistantTimelineState.cappedText(delta),
-                    target: target,
-                    itemType: itemType
-                )
-                bufferedProviderTextItems[runId] = runBuffers
-                lock.unlock()
-                return .hold
-            }
+            runBuffers[itemId] = BufferedProviderTextItem(
+                text: AssistantTimelineState.cappedText(delta),
+                target: target,
+                itemType: itemType
+            )
+            bufferedProviderTextItems[runId] = runBuffers
             lock.unlock()
-            return nil
+            return .hold
         case .itemCompleted(let itemId, let finalState):
             lock.lock()
             var runBuffers = bufferedProviderTextItems[runId] ?? [:]
@@ -6947,47 +7281,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         type == .assistantMessage || type == .reasoning
     }
 
-    private func shouldBufferProviderTextPrefix(_ text: String) -> Bool {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Pure-whitespace deltas are not SR1 signals; stream them live so a
-        // normal reply whose first chunk is "\n" does not appear all-at-once.
-        guard !trimmed.isEmpty else { return false }
-        if SR1ResponseDetector.isSR1(trimmed) { return true }
-        let lower = trimmed.lowercased()
-        if lower.hasPrefix("sr1") || lower.hasPrefix("dict") { return true }
-        guard let first = trimmed.first?.uppercased().first,
-              // Single source of truth: see CoreModel.DistillSemanticPrefixes.
-              DistillSemanticPrefixes.set.contains(first) else {
-            return false
-        }
-        let rest = trimmed.dropFirst()
-        guard let delimiter = rest.first else { return true }
-        return delimiter == ":" || delimiter == "=" || delimiter == " " || delimiter == "\t"
-    }
-
     private func shouldTranslateProviderText(_ text: String, runId: AgentRunID) -> Bool {
-        if isTokenSaverRuntimeActiveNow() {
-            return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }
-        if SR1ResponseDetector.isSR1(text) {
-            markDistillOutputMode(runId)
-            return true
-        }
-        let allowOutcomeSpace = runUsesDistillOutputMode(runId)
-        // R0 exemption: a lone short `O:` line is the dialect's own chat-reply shape,
-        // so translating it buys an extra local-model round trip plus a "translated"
-        // badge on the cheapest replies. Only exempt while this run has not already
-        // produced real dialect output — once it has, a bare outcome line is far more
-        // likely to be a continuation of that dialect than a greeting.
-        if !allowOutcomeSpace,
-           SR1ResponseDetector.isBareShortOutcomeLine(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            return false
-        }
-        if SR1ResponseDetector.isSingleSemanticLine(text, allowSpaceDelimitedOutcome: allowOutcomeSpace) {
-            markDistillOutputMode(runId)
-            return true
-        }
-        return false
+        // Defense in depth for future callers: canonical provider history and
+        // the natural UI leg are paid Token Saver behavior only.
+        guard tokenSaverWasAdmitted(for: runId) else { return false }
+        return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func markDistillOutputMode(_ runId: AgentRunID) {
@@ -7001,12 +7299,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         activeDistillOutputRuns.remove(runId)
         discardRunThreadOwnershipIfReleasedLocked(runId)
         lock.unlock()
-    }
-
-    private func runUsesDistillOutputMode(_ runId: AgentRunID) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return activeDistillOutputRuns.contains(runId)
     }
 
     private static func promptInvokesDistill(_ text: String?) -> Bool {
@@ -7044,7 +7336,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     }
 
     private func translateSR1Response(_ response: String, runId: AgentRunID, threadId: AgentThreadID) async -> String {
-        guard let finalResponseTranslator else { return response }
+        guard tokenSaverWasAdmitted(for: runId),
+              let finalResponseTranslator else { return response }
         let provider: AgentProvider = {
             lock.lock()
             let activeProvider = activeRunMetadata[runId]?.provider

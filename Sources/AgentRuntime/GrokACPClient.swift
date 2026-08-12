@@ -719,8 +719,23 @@ public final class GrokACPClient: @unchecked Sendable {
 
     public static func promptBlocks(for request: AgentRunRequest, capabilities: GrokACPInitializeResult) throws -> [JSONObject] {
         var blocks: [JSONObject] = []
+        // ACP does not negotiate a system/developer block. When the host has
+        // a typed instruction, carry it as a strict SR2 host block and keep a
+        // second text block for the canonical user leg. Legacy requests retain
+        // their existing provider prompt shape for compatibility.
+        let hasTypedHostInstruction = request.trustedHostInstruction?.isEmpty == false
+        if let trustedHostInstruction = request.trustedHostInstruction,
+           !trustedHostInstruction.isEmpty {
+            blocks.append([
+                "type": "text",
+                "text": SR2WirePolicy.trustedHostInstructionWire(trustedHostInstruction.text)
+            ])
+        }
+        let providerBase = hasTypedHostInstruction
+            ? AgentProviderInstructionText.providerPreamble(for: request.interactionMode)
+            : request.providerPrompt
         let providerPrompt = AgentSkillInstaller.tokenSaverProviderPrompt(
-            request.providerPrompt,
+            providerBase,
             environment: request.environment
         )
         // Additive: background-await self-declare marker so shell-detached
@@ -734,6 +749,9 @@ public final class GrokACPClient: @unchecked Sendable {
             composed = providerPrompt + "\n\n" + BackgroundAwaitContinuation.systemPromptDirective
         }
         if !composed.isEmpty { blocks.append(["type": "text", "text": composed]) }
+        if hasTypedHostInstruction {
+            blocks.append(["type": "text", "text": request.prompt])
+        }
         for attachment in request.attachments {
             switch attachment.kind {
             case .image:

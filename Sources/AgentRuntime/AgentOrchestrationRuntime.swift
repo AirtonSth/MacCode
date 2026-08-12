@@ -2686,6 +2686,32 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     public static let orchestrateSkillInvocationName =
         AgentSkillInstaller.remoteCodeOrchestratePinnedPackage.skillID
 
+    /// Trusted host leg for Auto. This is deliberately separate from the
+    /// natural user prompt: the provider must consume these instructions as
+    /// host guidance, never as user-authored semantic source.
+    public static func autoTrustedHostInstruction(
+        admittedRoute: AgentOrchestrationRoute
+    ) -> AgentTrustedHostInstruction {
+        let host = orchestrateHostKey(for: admittedRoute.provider)
+        let effort = admittedRoute.selection.reasoningEffort.rawValue
+        return AgentTrustedHostInstruction(text: """
+        REMOTE_CODE_AUTO_ORCHESTRATION_V1
+        Run $\(orchestrateSkillInvocationName) controller-only for this Auto turn.
+        - FIRST: Micro chat bypass — conversational requests without code/files/commands/PR/deploy/repo changes stay on the controller in one short reply.
+        - Otherwise classify T0–T3 + certainty; pick Micro/Single/Multi/Critical.
+        - Load only the skill sections needed for the selected mode; never summarize skill bodies.
+        - Keep the controller light; escalate workers only after capability failure.
+        - Fan-out default 2 / hard cap 3; use thin prompts and cheap focused proof.
+        Host runtime receipt (authoritative — do not re-detect or claim another host):
+        - active_host: \(host)
+        - provider: \(admittedRoute.provider.rawValue)
+        - provider_instance_id: \(admittedRoute.providerInstanceId)
+        - controller_model: \(admittedRoute.selection.effectiveModel)
+        - controller_effort: \(effort)
+        - Bind every worker/reviewer from host-runtime-matrix.md row for active_host=\(host) only.
+        """)
+    }
+
     /// Prefix every Auto provider prompt so the controller always runs
     /// `$remote-code-orchestrate`. Idempotent when the skill is already invoked
     /// (still injects the host receipt once when missing).

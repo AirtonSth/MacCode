@@ -128,6 +128,11 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
 
     public let provider: AgentProvider = .grok
     private let binaryNameOverride: String?
+    /// ACP exposes only ordinary text blocks.  A typed host instruction must
+    /// therefore use the Grok CLI's privileged `--rules` channel instead of
+    /// being smuggled into an ACP text array where the provider cannot
+    /// distinguish host policy from user content.
+    private let typedHostCLIAdapter: OneShotProviderAdapter
     private let cancellationGracePeriod: TimeInterval
     /// Inactivity bound while a prompt is in flight. Re-armed on every emitted
     /// turn event (tools, stream deltas). When `session/prompt` never returns
@@ -144,6 +149,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     private static let discoveryCacheLock = NSLock()
     private static var sharedDiscoveryCache: [String: (result: GrokACPDiscoveryResult, fetchedAt: Date)] = [:]
     private var sessions: [AgentThreadID: Session] = [:]
+    /// Threads currently owned by the typed-host CLI route.  One-shot CLI
+    /// sessions are not ACP sessions, so keep the routing ownership here for
+    /// interrupt/stop and status calls without mixing the two transports.
+    private var typedHostCLIThreads = Set<AgentThreadID>()
     private var promptWriteAcceptanceCountForTestingStorage = 0
     var beforePromptWriteForTesting: (() -> Void)?
     var beforePhysicalPromptWriteForTesting: (() -> Void)?
@@ -161,6 +170,9 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         modelCacheTTL: TimeInterval = 300
     ) {
         self.binaryNameOverride = binaryNameOverride
+        self.typedHostCLIAdapter = OneShotProviderAdapter(
+            runner: GrokRunner(binaryNameOverride: binaryNameOverride)
+        )
         self.cancellationGracePeriod = max(0.01, cancellationGracePeriod)
         self.turnInactivityTimeout = max(0.01, turnInactivityTimeout)
         self.discoveryCwd = discoveryCwd
@@ -321,13 +333,19 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         _ request: AgentRunRequest,
         onEvent: @escaping @Sendable (AgentRunEvent) -> Void
     ) async throws -> AgentRunHandle {
-        try await openSession(request, loadExisting: false, onEvent: onEvent, startPrompt: true)
+        if Self.usesTypedHostCLI(request) {
+            return try await startTypedHostCLISession(request, onEvent: onEvent)
+        }
+        return try await openSession(request, loadExisting: false, onEvent: onEvent, startPrompt: true)
     }
 
     public func sendTurn(
         _ request: AgentRunRequest,
         onEvent: @escaping @Sendable (AgentRunEvent) -> Void
     ) async throws -> AgentRunHandle {
+        if Self.usesTypedHostCLI(request) {
+            return try await startTypedHostCLISession(request, onEvent: onEvent)
+        }
         let existing = synchronized { sessions[request.threadId] }
         guard let existing else {
             return try await openSession(
@@ -342,6 +360,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     }
 
     public func interruptTurn(threadId: AgentThreadID) throws {
+        if isTypedHostCLIThread(threadId) {
+            try typedHostCLIAdapter.interruptTurn(threadId: threadId)
+            return
+        }
         lock.lock()
         guard let session = sessions[threadId] else {
             lock.unlock()
@@ -407,6 +429,11 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     }
 
     public func stopSession(threadId: AgentThreadID) throws {
+        if isTypedHostCLIThread(threadId) {
+            defer { removeTypedHostCLIThread(threadId) }
+            try typedHostCLIAdapter.stopSession(threadId: threadId)
+            return
+        }
         lock.lock()
         guard let session = sessions.removeValue(forKey: threadId) else {
             lock.unlock()
@@ -428,6 +455,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         _ request: AgentRunRequest,
         onEvent: @escaping @Sendable (AgentRunEvent) -> Void
     ) async throws {
+        if Self.usesTypedHostCLI(request) {
+            try await typedHostCLIAdapter.recoverSession(request, onEvent: onEvent)
+            return
+        }
         guard request.providerThreadId?.isEmpty == false else {
             throw AgentProviderAdapterError.unsupported("Grok ACP recovery requires providerThreadId")
         }
@@ -436,7 +467,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
 
     public func listSessions() -> [AgentProviderSessionSummary] {
         lock.lock(); defer { lock.unlock() }
-        return sessions.values.map {
+        let acp = sessions.values.map {
             AgentProviderSessionSummary(
                 threadId: $0.threadId,
                 provider: .grok,
@@ -444,15 +475,21 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 providerThreadId: $0.providerThreadId
             )
         }
+        let cliThreads = typedHostCLIThreads
+        let cli = typedHostCLIAdapter.listSessions().filter { cliThreads.contains($0.threadId) }
+        return acp + cli
     }
 
     public func hasSession(threadId: AgentThreadID) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        return sessions[threadId] != nil
+        return sessions[threadId] != nil || typedHostCLIThreads.contains(threadId)
     }
 
     public func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] {
-        try synchronized {
+        if isTypedHostCLIThread(threadId) {
+            return try await typedHostCLIAdapter.readThread(threadId: threadId)
+        }
+        return try synchronized {
             guard let session = sessions[threadId] else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
             return session.history
         }
@@ -470,8 +507,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             $0.promptWritePermit.invalidate()
         }
         sessions.removeAll()
+        typedHostCLIThreads.removeAll()
         lock.unlock()
         all.forEach { $0.client.stop() }
+        typedHostCLIAdapter.stopAll()
     }
 
     public func stopAllForAppTermination() {
@@ -482,8 +521,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             $0.promptWritePermit.invalidate()
         }
         sessions.removeAll()
+        typedHostCLIThreads.removeAll()
         lock.unlock()
         all.forEach { $0.client.stopImmediatelyForAppTermination() }
+        typedHostCLIAdapter.stopAllForAppTermination()
     }
 
     public func streamEvents(
@@ -491,8 +532,50 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         onEvent: @escaping @Sendable (AgentRunEvent) -> Void
     ) throws {
         lock.lock(); defer { lock.unlock() }
+        if typedHostCLIThreads.contains(threadId) {
+            throw AgentProviderAdapterError.unsupported("Grok typed-host CLI sessions do not support streamEvents")
+        }
         guard let session = sessions[threadId] else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
         session.onEvent = onEvent
+    }
+
+    /// ACP text blocks cannot carry a trustworthy host/user distinction.  The
+    /// production route for a typed host instruction is therefore the Grok
+    /// CLI, whose `--rules` argument is the provider's privileged host channel.
+    nonisolated static func usesTypedHostCLI(_ request: AgentRunRequest) -> Bool {
+        request.trustedHostInstruction?.isEmpty == false
+    }
+
+    private func startTypedHostCLISession(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        // A thread may change from ordinary ACP to Auto/typed-host routing.
+        // Never leave both transports owning the same logical thread.
+        if synchronized({ sessions[request.threadId] != nil }) {
+            try? stopSession(threadId: request.threadId)
+        }
+        synchronized { typedHostCLIThreads.insert(request.threadId) }
+        let routedEvents: @Sendable (AgentRunEvent) -> Void = { [weak self] event in
+            if case .finished = event {
+                self?.removeTypedHostCLIThread(request.threadId)
+            }
+            onEvent(event)
+        }
+        do {
+            return try await typedHostCLIAdapter.sendTurn(request, onEvent: routedEvents)
+        } catch {
+            removeTypedHostCLIThread(request.threadId)
+            throw error
+        }
+    }
+
+    private func isTypedHostCLIThread(_ threadId: AgentThreadID) -> Bool {
+        synchronized { typedHostCLIThreads.contains(threadId) }
+    }
+
+    private func removeTypedHostCLIThread(_ threadId: AgentThreadID) {
+        synchronized { typedHostCLIThreads.remove(threadId) }
     }
 
     private func openSession(

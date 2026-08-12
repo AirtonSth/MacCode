@@ -273,6 +273,24 @@ public final class ProviderProcessOwnership: @unchecked Sendable {
         defer { lock.unlock() }
         return configuredStore
     }
+
+    /// Test-only lifecycle seam. Production callers must use `configure(fileURL:)`
+    /// and never rely on an implicit store; tests that temporarily configure the
+    /// shared coordinator can restore the exact prior object after each case.
+    internal func configurationSnapshotForTesting() -> ProviderProcessOwnershipStore? {
+        lock.lock()
+        defer { lock.unlock() }
+        return configuredStore
+    }
+
+    /// Test-only lifecycle seam paired with `configurationSnapshotForTesting()`.
+    /// This is intentionally internal so production clients cannot replace the
+    /// app's durable ownership wiring.
+    internal func restoreConfigurationForTesting(_ snapshot: ProviderProcessOwnershipStore?) {
+        lock.lock()
+        configuredStore = snapshot
+        lock.unlock()
+    }
 }
 
 public extension ProviderProcessSweeper {

@@ -175,6 +175,65 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         try adapter.stopSession(threadId: threadId)
     }
 
+    /// WHY: the host instruction is installed at Claude process creation.  A
+    /// persistent streaming process must not receive a later turn under the
+    /// previous host policy; changing the typed host identity requires a
+    /// resume/respawn with the new system prompt.
+    func test_changedTrustedHostInstructionRespawnsStreamingSession() async throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-streaming-host-switch-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let script = tmp.appendingPathComponent("fake-claude")
+        let spawnLog = tmp.appendingPathComponent("spawn-args.log")
+        try """
+        #!/usr/bin/env python3
+        import json, pathlib, sys
+        log = pathlib.Path(sys.argv[sys.argv.index("--spawn-log") + 1])
+        with log.open("a") as f:
+            f.write("SPAWN " + " ".join(sys.argv[1:]) + "\\n")
+        spawn = sum(1 for line in log.read_text().splitlines() if line.startswith("SPAWN "))
+        session = "claude-host-switch-session"
+        print(json.dumps({"type":"system","subtype":"init","session_id":session}), flush=True)
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            answer = "HOST_SWITCH_REPLY_" + str(spawn)
+            print(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"text","text":"prompt"}]},"session_id":session}), flush=True)
+            print(json.dumps({"type":"assistant","message":{"id":"host-switch-turn-" + str(spawn),"role":"assistant","content":[{"type":"text","text":answer}]},"session_id":session}), flush=True)
+            print(json.dumps({"type":"result","subtype":"success","is_error":False,"result":answer,"session_id":session}), flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let adapter = ClaudeStreamingCLIAdapter(binaryNameOverride: script.path)
+        let threadId = AgentThreadID()
+        let first = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .claude, model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path, prompt: "first",
+            trustedHostInstruction: AgentTrustedHostInstruction(text: "HOST_POLICY_A"),
+            extraArgs: ["--spawn-log", spawnLog.path]
+        )) { event in Task { await first.record(event) } }
+        try await waitForFinish(in: first, expected: "HOST_SWITCH_REPLY_1")
+
+        let second = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .claude, model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path, prompt: "second",
+            trustedHostInstruction: AgentTrustedHostInstruction(text: "HOST_POLICY_B"),
+            providerThreadId: "claude-host-switch-session",
+            extraArgs: ["--spawn-log", spawnLog.path]
+        )) { event in Task { await second.record(event) } }
+        try await waitForFinish(in: second, expected: "HOST_SWITCH_REPLY_2")
+
+        let launches = try String(contentsOf: spawnLog, encoding: .utf8)
+        XCTAssertEqual(launches.components(separatedBy: "SPAWN ").count - 1, 2,
+                       "changing typed host identity must respawn the streaming Claude process")
+        XCTAssertTrue(launches.contains("HOST_POLICY_A"))
+        XCTAssertTrue(launches.contains("HOST_POLICY_B"))
+        try adapter.stopSession(threadId: threadId)
+    }
+
     func test_streamingCLIAdapterFinalizesAssistantTextWhenProcessExitsWithoutResult() async throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-streaming-finalize-\(UUID().uuidString)", isDirectory: true)
@@ -1095,6 +1154,70 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         try adapter.stopSession(threadId: threadId)
     }
 
+    /// WHY: the SDK bridge's system prompt is fixed when the query session is
+    /// created.  Consecutive turns with a changed typed host must create a
+    /// resumed bridge session rather than silently retaining the old host.
+    func test_agentSDKBridgeChangedTrustedHostInstructionRespawnsSession() async throws {
+        guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-sdk-host-switch-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+        let commandLog = tmp.appendingPathComponent("commands.jsonl")
+        try """
+        import fs from 'node:fs';
+        import readline from 'node:readline';
+        const log = process.argv[2];
+        const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+        let turn = 0;
+        function write(obj) { process.stdout.write(JSON.stringify(obj) + '\\n'); }
+        for await (const line of rl) {
+          if (!line.trim()) continue;
+          const cmd = JSON.parse(line);
+          fs.appendFileSync(log, JSON.stringify(cmd) + '\\n');
+          if (cmd.type === 'rc_configure') {
+            write({ type: 'system', subtype: 'init', session_id: 'sdk-host-switch-session' });
+          } else if (cmd.type === 'rc_turn') {
+            turn += 1;
+            const answer = 'SDK_HOST_SWITCH_REPLY_' + ((fs.readFileSync(log, 'utf8').match(/\"type\":\"rc_configure\"/g) || []).length);
+            write({ type: 'assistant', message: { id: 'sdk-host-switch-turn-' + turn, role: 'assistant', content: [{ type: 'text', text: answer }] }, session_id: 'sdk-host-switch-session' });
+            write({ type: 'result', subtype: 'success', is_error: false, result: answer, session_id: 'sdk-host-switch-session' });
+          } else if (cmd.type === 'rc_close') {
+            process.exit(0);
+          }
+        }
+        """.write(to: bridge, atomically: true, encoding: .utf8)
+
+        let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
+        let threadId = AgentThreadID()
+        let first = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .claude, model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path, prompt: "first",
+            trustedHostInstruction: AgentTrustedHostInstruction(text: "SDK_HOST_POLICY_A"),
+            providerBinary: "/usr/bin/true", extraArgs: [commandLog.path]
+        )) { event in Task { await first.record(event) } }
+        try await waitForFinish(in: first, expected: "SDK_HOST_SWITCH_REPLY_1")
+
+        let second = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .claude, model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path, prompt: "second",
+            trustedHostInstruction: AgentTrustedHostInstruction(text: "SDK_HOST_POLICY_B"),
+            providerThreadId: "sdk-host-switch-session",
+            providerBinary: "/usr/bin/true", extraArgs: [commandLog.path]
+        )) { event in Task { await second.record(event) } }
+        try await waitForFinish(in: second, expected: "SDK_HOST_SWITCH_REPLY_2")
+
+        let commands = try String(contentsOf: commandLog, encoding: .utf8)
+        XCTAssertEqual(commands.components(separatedBy: "\"type\":\"rc_configure\"").count - 1, 2,
+                       "changing typed host identity must respawn the SDK bridge query")
+        XCTAssertTrue(commands.contains("SDK_HOST_POLICY_A"))
+        XCTAssertTrue(commands.contains("SDK_HOST_POLICY_B"))
+        try adapter.stopSession(threadId: threadId)
+    }
+
     func test_agentSDKBridgeAdapterSendsDistillSystemPromptOnlyWhenTokenSaverHintSet() async throws {
         guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -1145,16 +1268,20 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                       "rc_configure must send a system prompt")
         XCTAssertTrue(on.contains("Background-await protocol"),
                       "the system prompt must always carry the background-await self-declaration rule")
-        // WHY both sides: the injected prompt must carry the noisy-output allowlist
-        // AND the never-pipe list for exact-output tools. This previously asserted
-        // "pipe EVERY pipable ..." and was red — the template moved to the
-        // fidelity-based predicate and the assertion was left behind.
-        XCTAssertTrue(on.contains("Good to pipe:"),
-                      "Token Saver on: system prompt carries the `| distill` piping rule")
-        XCTAssertTrue(on.contains("for exact-output tools"),
-                      "Token Saver on: system prompt carries the never-pipe rule for byte-exact output")
-        XCTAssertTrue(on.contains("S=state"),
-                      "Token Saver on: system prompt carries distill-language prefixes")
+        // WHY both sides: Token Saver must require canonical v1 provider text
+        // and ordinary-command compression while preserving the byte-exact
+        // exception. Legacy v0/SR1 is named only as forbidden output, never as
+        // an advertised wire option.
+        XCTAssertTrue(on.contains("Use canonical **@sr2 v1** Opaque Agent IR"),
+                      "Token Saver on: every provider-authored text item uses canonical SR2 v1")
+        XCTAssertTrue(on.contains("MANDATORY default-pipe:"),
+                      "Token Saver on: ordinary non-TUI, non-exact shell output must use Distill")
+        XCTAssertTrue(on.contains("NEVER pipe `| distill` only for exact-output"),
+                      "Token Saver on: byte-exact commands remain outside Distill")
+        XCTAssertTrue(on.contains("Never emit legacy @sr2 v0 or SR1"),
+                      "legacy v0/SR1 is prohibited rather than advertised")
+        XCTAssertFalse(on.contains("S=state"),
+                       "the canonical v1 prompt must not advertise legacy SR1 field aliases")
 
         let off = try await configureCommand(tokenSaverOn: false)
         // Background-await stays; Distill is paid (Token Saver only).

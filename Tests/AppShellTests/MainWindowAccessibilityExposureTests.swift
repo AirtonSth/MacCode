@@ -6,6 +6,14 @@ import XCTest
 final class MainWindowAccessibilityExposureTests: XCTestCase {
     private var retainedControllers: [MainWindowController] = []
 
+    private func sourceURL(_ relative: String) -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // MainWindowAccessibilityExposureTests.swift
+            .deletingLastPathComponent() // AppShellTests
+            .deletingLastPathComponent() // Tests
+            .appendingPathComponent(relative)
+    }
+
     override func tearDown() {
         for controller in retainedControllers {
             controller.window.orderOut(nil)
@@ -14,7 +22,7 @@ final class MainWindowAccessibilityExposureTests: XCTestCase {
         super.tearDown()
     }
 
-    func test_mainWindowDeclaresExplicitAXWindowMetadataForComputerUseAndVoiceOver() throws {
+    func test_mainWindowPreservesNativeAXWindowMetadataForComputerUseAndVoiceOver() throws {
         let dir = NSTemporaryDirectory() + "RC2MainWindowAX-\(UUID().uuidString)"
         let context = try AppContext(channel: .debug, appSupportOverride: dir)
         let router = AppCommandRouter(context: context)
@@ -30,12 +38,11 @@ final class MainWindowAccessibilityExposureTests: XCTestCase {
         XCTAssertEqual(
             controller.window.accessibilityRole(),
             .window,
-            "The main RemoteCode window must explicitly expose AXWindow so automation and VoiceOver inspect the UI tree."
+            "The main RemoteCode window must retain AppKit's native AXWindow role so automation and VoiceOver inspect the UI tree."
         )
-        XCTAssertEqual(
+        XCTAssertNotNil(
             controller.window.accessibilitySubrole(),
-            .standardWindow,
-            "The main RemoteCode window must expose AXStandardWindow semantics instead of relying on titlebar customization defaults."
+            "The main RemoteCode window must let AppKit supply the native AX subrole for its current host and presentation state."
         )
         XCTAssertEqual(
             controller.window.accessibilityTitle(),
@@ -47,5 +54,26 @@ final class MainWindowAccessibilityExposureTests: XCTestCase {
             "window.main",
             "The main RemoteCode window must have a stable AX identifier so automation can target it without parsing user workspace text."
         )
+    }
+
+    func test_productWindowsDoNotOverrideNativeAXRoleOrSubrole() throws {
+        // WHY: assigning AXWindow/AXStandardWindow directly to NSWindow makes the
+        // out-of-process AXWindows collection expose AXApplication children. That
+        // breaks Computer Use window matching even though in-process getters still
+        // report the requested values. AppKit must remain the owner of role/subrole.
+        for relative in [
+            "Sources/AppShell/MainWindowController.swift",
+            "Sources/AppShell/SettingsWindow.swift",
+        ] {
+            let source = try String(contentsOf: sourceURL(relative), encoding: .utf8)
+            XCTAssertFalse(
+                source.contains("setAccessibilityRole(.window)"),
+                "\(relative) must not override NSWindow's native AXWindow role."
+            )
+            XCTAssertFalse(
+                source.contains("setAccessibilitySubrole(.standardWindow)"),
+                "\(relative) must not override NSWindow's native AXStandardWindow subrole."
+            )
+        }
     }
 }

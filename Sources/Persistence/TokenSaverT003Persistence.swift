@@ -1292,7 +1292,14 @@ public final class TokenSaverRuntimeRecoveryWorker: @unchecked Sendable {
     }
 
     private func authoritativeRetentionDays(projectID: String, lane: String) throws -> Int? {
-        try db.performSync { database in
+        // Bash budgets and deterministic lossy reducers are implementation
+        // routes of the governed deterministic wrapper lane. Keep their stored
+        // lane attribution, but never require separate operator scorecards just
+        // to mint the recovery handle that makes those routes safe.
+        let governanceLane = ["bash_line_budget", "deterministic_lossy"].contains(lane)
+            ? "deterministic_wrapper"
+            : lane
+        return try db.performSync { database in
             // Fully promoted + scorecarded lane: authoritative product retention.
             let statement = try database.prepare("""
                 SELECT retention_days FROM token_saver_lane_state
@@ -1306,7 +1313,7 @@ public final class TokenSaverRuntimeRecoveryWorker: @unchecked Sendable {
             """)
             defer { statement.reset() }
             try statement.bind(1, projectID)
-            try statement.bind(2, lane)
+            try statement.bind(2, governanceLane)
             if try statement.step() {
                 return Int(statement.columnInt64(0))
             }
@@ -1326,7 +1333,7 @@ public final class TokenSaverRuntimeRecoveryWorker: @unchecked Sendable {
             """)
             defer { explicit.reset() }
             try explicit.bind(1, projectID)
-            try explicit.bind(2, lane)
+            try explicit.bind(2, governanceLane)
             if try explicit.step() {
                 let retentionDays = Int(explicit.columnInt64(0))
                 let optedOut = explicit.columnInt64(1) != 0
@@ -1339,7 +1346,7 @@ public final class TokenSaverRuntimeRecoveryWorker: @unchecked Sendable {
                 // leaving retention_days > 0. Kill switch must deny before we honor
                 // a positive retention value — except the unrepaired factory seed
                 // (kill still on + retention 0 + owner_and_scorecard_required).
-                if killSwitch && !(lane == "deterministic_wrapper"
+                if killSwitch && !(governanceLane == "deterministic_wrapper"
                     && reason == "owner_and_scorecard_required"
                     && retentionDays <= 0) {
                     return nil
@@ -1349,7 +1356,7 @@ public final class TokenSaverRuntimeRecoveryWorker: @unchecked Sendable {
                 }
                 // Soft default only for unrepaired factory seed shape. After repair
                 // (kill off) an operator-chosen retention_days=0 stays denied.
-                if lane == "deterministic_wrapper",
+                if governanceLane == "deterministic_wrapper",
                    reason == "owner_and_scorecard_required",
                    killSwitch {
                     return 7
@@ -1362,7 +1369,7 @@ public final class TokenSaverRuntimeRecoveryWorker: @unchecked Sendable {
             // No lane row: tool-output wrapper still gets a default recovery window
             // so projectless threads can store-before-loss. Semantic prose stays
             // fail-closed until promoted.
-            if lane == "deterministic_wrapper" {
+            if governanceLane == "deterministic_wrapper" {
                 return 7
             }
             return nil

@@ -1005,7 +1005,9 @@ public actor DistillScheduler {
         let started = Date()
         let staged = try await runtime.distillStaged(request)
         let elapsedMs = Int(Date().timeIntervalSince(started) * 1_000)
-        let output = String(staged.output.prefix(request.maxOutputCharacters))
+        let output = request.mode == .longText && staged.output == request.input
+            ? staged.output
+            : String(staged.output.prefix(request.maxOutputCharacters))
         guard !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw DistillError.invalidOutput
         }
@@ -1177,6 +1179,9 @@ public struct LocalDistillRuntime: DistillRuntime {
         if request.mode == .longText || request.mode == .watchSummary,
            let routed = contentRouter.route(request.input, options: routerOptions(for: request)) {
             return routed.output
+        }
+        if request.mode == .longText {
+            return request.input
         }
         if request.mode == .commandOutput {
             return commandOutputFallback(
@@ -1882,6 +1887,7 @@ public struct MLXDistillRuntime: DistillRuntime {
             The Semantic IR must preserve goals, tasks, repositories, tools, skills, MUST/SHOULD/MAY/MUST NOT, constraints, dependencies, ordering, verification/testing/deployment gates, credentials, identifiers, required outputs, fallbacks, and completion conditions.
             Semantic fidelity and instruction reliability outrank token reduction. Never remove information merely to improve compression.
             Encode ordered mandatory work as flow:A>B>C, conjunction as +, scoped operations as X:Y, required members as [a,b], and completion as done:X. `>` means the prior step must succeed before the next begins; it is not interchangeable with `+`.
+            Bind modality and conditions to their exact predicates: must:A, not:B, should:C, may:D, constraints:if:condition=>action. Never preserve these merely as global signals or swap them between actions. `done:X` must name the source completion target, and every source ordering edge must remain in flow.
             Generate compact candidates mentally, compare actual token count for the target model when its tokenizer is available, and return the lowest-token behaviorally equivalent candidate. Do not optimize character count or over-compress into ambiguous abbreviations.
             Validate before returning: the SR2 must not permit an action forbidden by the source, earlier completion, lost ordering, weakened modality, or dropped condition.
             Preserve every exact command, credential, file path, file:line, error string, number, ID, status, and proof verbatim.
@@ -2009,7 +2015,8 @@ public struct MLXDistillRuntime: DistillRuntime {
               !lowercased.contains("\ninput:") else {
             return false
         }
-        if mode == .sr1Humanize, Self.isLikelySR1(trimmed) {
+        if mode == .sr1Humanize,
+           (Self.isLikelySR1(trimmed) || SR2WirePolicy.containsHumanizationWireSyntax(trimmed)) {
             return false
         }
 
@@ -2048,7 +2055,7 @@ public struct MLXDistillRuntime: DistillRuntime {
                 maxOutputCharacters: request.maxOutputCharacters
             )
         case .longText:
-            prefix = "S"
+            return request.input
         case .watchSummary:
             prefix = "D"
         case .sr1Humanize:

@@ -1,5 +1,6 @@
 import XCTest
 import Combine
+import CryptoKit
 import AppKit
 import SwiftUI
 @testable import Surfaces
@@ -73,6 +74,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
         let messageID = AgentMessageID()
         let baseline = AgentStableTranscriptHistoryRevision(
             entryIDs: ["message-stable", "turn-finished"],
+            timelineColumnWidth: 676,
             expandedTools: [],
             expandedToolGroups: [],
             expandedReasoning: [],
@@ -81,6 +83,8 @@ final class AgentAppPerfBundleTests: XCTestCase {
             workDisclosureRevealByTurn: [:],
             translatedMessageIDs: [],
             translationOriginals: [:],
+            translationFinals: [:],
+            assistantDisplayRevision: 0,
             outboundPayloads: [messageID: "@sr2 v1\nt:verify"],
             proposedPlanIDs: [],
             suppressesProposedPlanReview: false,
@@ -92,6 +96,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
         // EquatableView can retain the mounted LazyVStack subtree.
         let nextLiveTick = AgentStableTranscriptHistoryRevision(
             entryIDs: baseline.entryIDs,
+            timelineColumnWidth: baseline.timelineColumnWidth,
             expandedTools: [],
             expandedToolGroups: [],
             expandedReasoning: [],
@@ -100,6 +105,8 @@ final class AgentAppPerfBundleTests: XCTestCase {
             workDisclosureRevealByTurn: [:],
             translatedMessageIDs: [],
             translationOriginals: [:],
+            translationFinals: [:],
+            assistantDisplayRevision: 0,
             outboundPayloads: baseline.outboundPayloads,
             proposedPlanIDs: [],
             suppressesProposedPlanReview: false,
@@ -107,8 +114,33 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
         XCTAssertEqual(baseline, nextLiveTick)
 
+        let resizedColumn = AgentStableTranscriptHistoryRevision(
+            entryIDs: baseline.entryIDs,
+            timelineColumnWidth: 512,
+            expandedTools: baseline.expandedTools,
+            expandedToolGroups: baseline.expandedToolGroups,
+            expandedReasoning: baseline.expandedReasoning,
+            showingOutboundMessages: baseline.showingOutboundMessages,
+            expandedCompletedWorkTurns: baseline.expandedCompletedWorkTurns,
+            workDisclosureRevealByTurn: baseline.workDisclosureRevealByTurn,
+            translatedMessageIDs: baseline.translatedMessageIDs,
+            translationOriginals: baseline.translationOriginals,
+            translationFinals: baseline.translationFinals,
+            assistantDisplayRevision: baseline.assistantDisplayRevision,
+            outboundPayloads: baseline.outboundPayloads,
+            proposedPlanIDs: baseline.proposedPlanIDs,
+            suppressesProposedPlanReview: baseline.suppressesProposedPlanReview,
+            status: baseline.status
+        )
+        XCTAssertNotEqual(
+            baseline,
+            resizedColumn,
+            "resizing the transcript column must invalidate stable rows so user bubble widths update"
+        )
+
         let revealedOutbound = AgentStableTranscriptHistoryRevision(
             entryIDs: baseline.entryIDs,
+            timelineColumnWidth: baseline.timelineColumnWidth,
             expandedTools: [],
             expandedToolGroups: [],
             expandedReasoning: [],
@@ -117,6 +149,8 @@ final class AgentAppPerfBundleTests: XCTestCase {
             workDisclosureRevealByTurn: [:],
             translatedMessageIDs: [],
             translationOriginals: [:],
+            translationFinals: [:],
+            assistantDisplayRevision: 0,
             outboundPayloads: baseline.outboundPayloads,
             proposedPlanIDs: [],
             suppressesProposedPlanReview: false,
@@ -124,6 +158,31 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
         XCTAssertNotEqual(baseline, revealedOutbound,
                           "a user-visible stable-row toggle must invalidate history")
+
+        var translatedHistory = nextLiveTick
+        translatedHistory = AgentStableTranscriptHistoryRevision(
+            entryIDs: translatedHistory.entryIDs,
+            timelineColumnWidth: translatedHistory.timelineColumnWidth,
+            expandedTools: translatedHistory.expandedTools,
+            expandedToolGroups: translatedHistory.expandedToolGroups,
+            expandedReasoning: translatedHistory.expandedReasoning,
+            showingOutboundMessages: translatedHistory.showingOutboundMessages,
+            expandedCompletedWorkTurns: translatedHistory.expandedCompletedWorkTurns,
+            workDisclosureRevealByTurn: translatedHistory.workDisclosureRevealByTurn,
+            translatedMessageIDs: translatedHistory.translatedMessageIDs,
+            translationOriginals: translatedHistory.translationOriginals,
+            translationFinals: translatedHistory.translationFinals,
+            assistantDisplayRevision: 1,
+            outboundPayloads: translatedHistory.outboundPayloads,
+            proposedPlanIDs: translatedHistory.proposedPlanIDs,
+            suppressesProposedPlanReview: translatedHistory.suppressesProposedPlanReview,
+            status: translatedHistory.status
+        )
+        XCTAssertNotEqual(
+            baseline,
+            translatedHistory,
+            "digest-verified item/reasoning provenance must repaint stable history without carrying full strings in the revision"
+        )
     }
 
     func test_liveWorkRowsKeepCompletedPrefixStableAndStreamingTailMutable() {
@@ -171,6 +230,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
         let revision = AgentStableTranscriptHistoryRevision(
             entryIDs: (0..<24).map { "history-\($0)" },
+            timelineColumnWidth: 676,
             expandedTools: [],
             expandedToolGroups: [],
             expandedReasoning: [],
@@ -179,6 +239,8 @@ final class AgentAppPerfBundleTests: XCTestCase {
             workDisclosureRevealByTurn: [:],
             translatedMessageIDs: [],
             translationOriginals: [:],
+            translationFinals: [:],
+            assistantDisplayRevision: 0,
             outboundPayloads: [:],
             proposedPlanIDs: [],
             suppressesProposedPlanReview: false,
@@ -472,6 +534,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
     func test_prunedCompliantSR1AndSR2MessagesRemainReadableFromPersistedWire() throws {
         let (vm, _) = try makeVM()
         let threadId = AgentThreadID()
+        let sr2TurnId = "turn-sr2-final"
 
         let sr2 = AgentMessage(
             threadId: threadId,
@@ -483,45 +546,902 @@ final class AgentAppPerfBundleTests: XCTestCase {
             role: .assistant,
             content: "SR1\nO: tests green\nP: suite passed"
         )
-        var translations = AssistantTimelineState()
-        translations.apply(.sr1Translation(AssistantSR1Translation(
-            messageId: sr2.id.value.uuidString,
-            originalText: sr2.content,
-            rewrittenText: "Fixed Sources/App.swift line 12."
-        )))
-        vm.refreshSR1TranslationStateFromTimeline(translations)
-        XCTAssertEqual(vm.assistantDisplayText(for: sr2), "Fixed Sources/App.swift line 12.")
-
-        // Simulate hot-budget/event pruning, then render from the durable
-        // assistant message as a reopened thread would.
-        vm.refreshSR1TranslationStateFromTimeline(AssistantTimelineState())
-        let sr2Fallback = vm.assistantDisplayText(for: sr2)
-        XCTAssertFalse(sr2Fallback.contains("@sr2"), sr2Fallback)
-        XCTAssertTrue(sr2Fallback.contains("ok"), sr2Fallback)
-        let sr1Fallback = vm.assistantDisplayText(for: sr1)
-        XCTAssertFalse(sr1Fallback.contains("SR1"), sr1Fallback)
-        XCTAssertTrue(sr1Fallback.contains("tests green"), sr1Fallback)
-
         let sr2V1 = AgentMessage(
             threadId: threadId,
             role: .assistant,
             content: "@sr2 v1\nflow:inspect>verify>deploy\ndone:flow\no:cont"
         )
-        let sr2V1Fallback = vm.assistantDisplayText(for: sr2V1)
-        XCTAssertFalse(sr2V1Fallback.contains("@sr2"), sr2V1Fallback)
-        XCTAssertTrue(sr2V1Fallback.contains("Next steps: inspect then verify then deploy."), sr2V1Fallback)
-        XCTAssertTrue(sr2V1Fallback.contains("Complete when: flow."), sr2V1Fallback)
-
         let oversizedSR2 = AgentMessage(
             threadId: threadId,
             role: .assistant,
             content: "@sr2 v0\no:ok\np:" + String(repeating: "path/", count: 2_000)
         )
+        let timelineItem = AssistantItem(
+            id: "item-sr2-v1",
+            turnId: "turn-sr2-item",
+            type: .assistantMessage,
+            state: .completed,
+            body: sr2V1.content,
+            startedAtMs: 1
+        )
+        var translations = AssistantTimelineState()
+        translations.apply(.turnStarted(turnId: sr2TurnId))
+        translations.apply(.turnCompleted(turnId: sr2TurnId, finalMessage: sr2.content))
+        translations.apply(.itemStarted(item: timelineItem))
+        translations.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: sr2.id.value.uuidString,
+            originalText: sr2.content,
+            rewrittenText: "Fixed Sources/App.swift line 12."
+        )))
+        translations.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: sr1.id.value.uuidString,
+            originalText: sr1.content,
+            rewrittenText: "Tests are green; the suite passed."
+        )))
+        translations.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: sr2V1.id.value.uuidString,
+            originalText: sr2V1.content,
+            rewrittenText: "Next steps: inspect then verify then deploy.\nComplete when: flow."
+        )))
+        translations.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: oversizedSR2.id.value.uuidString,
+            originalText: oversizedSR2.content,
+            rewrittenText: "ok"
+        )))
+        translations.apply(.sr1Translation(AssistantSR1Translation(
+            itemId: timelineItem.id,
+            originalText: timelineItem.body,
+            rewrittenText: "Next steps: inspect then verify then deploy.\nComplete when: flow."
+        )))
+        vm.refreshSR1TranslationStateFromTimeline(translations)
+        XCTAssertEqual(vm.assistantDisplayText(for: sr2), "Fixed Sources/App.swift line 12.")
+        XCTAssertEqual(vm.assistantDisplayText(for: sr2.content, turnId: sr2TurnId),
+                       "Fixed Sources/App.swift line 12.")
+
+        // Simulate hot-budget/event pruning, then render from the durable
+        // assistant message as a reopened thread would.
+        vm.refreshSR1TranslationStateFromTimeline(AssistantTimelineState())
+        let sr2Fallback = vm.assistantDisplayText(for: sr2)
+        XCTAssertEqual(sr2Fallback, "Fixed Sources/App.swift line 12.")
+        XCTAssertFalse(sr2Fallback.contains("@sr2"), sr2Fallback)
+        let sr1Fallback = vm.assistantDisplayText(for: sr1)
+        XCTAssertEqual(sr1Fallback, "Tests are green; the suite passed.")
+        XCTAssertFalse(sr1Fallback.contains("SR1"), sr1Fallback)
+
+        let sr2V1Fallback = vm.assistantDisplayText(for: sr2V1)
+        XCTAssertFalse(sr2V1Fallback.contains("@sr2"), sr2V1Fallback)
+        XCTAssertTrue(sr2V1Fallback.contains("Next steps: inspect then verify then deploy."), sr2V1Fallback)
+        XCTAssertTrue(sr2V1Fallback.contains("Complete when: flow."), sr2V1Fallback)
+        let timelineFallback = vm.assistantDisplayText(
+            for: timelineItem.body,
+            itemId: timelineItem.id,
+            turnId: timelineItem.turnId
+        )
+        XCTAssertFalse(timelineFallback.contains("@sr2"), timelineFallback)
+        XCTAssertTrue(timelineFallback.contains("Next steps: inspect then verify then deploy."), timelineFallback)
+        let turnFallback = vm.assistantDisplayText(for: sr2.content, turnId: sr2TurnId)
+        XCTAssertFalse(turnFallback.contains("@sr2"), turnFallback)
+        XCTAssertEqual(turnFallback, "Fixed Sources/App.swift line 12.")
+
         let boundedFallback = vm.assistantDisplayText(for: oversizedSR2)
+        XCTAssertEqual(boundedFallback, "ok")
         XCTAssertLessThanOrEqual(
             boundedFallback.count,
-            4_002,
-            "wire fallback must stay bounded even when durable fields are oversized"
+            AgentMessageRepository.assistantDisplayStoredCharacterLimit,
+            "persisted typed display must remain bounded"
+        )
+
+        // Content alone is intentionally not a classifier. This marker-first
+        // example has no typed translation provenance and must remain natural.
+        let naturalMarkerFirst = "@sr2 v1\ng:remote-code-orchestrate\ndone:run"
+        XCTAssertEqual(vm.humanizedAssistantContent(naturalMarkerFirst), naturalMarkerFirst)
+        XCTAssertEqual(vm.assistantDisplayText(for: naturalMarkerFirst), naturalMarkerFirst)
+    }
+
+    func test_v1ReasoningAndThinkingUseTheirOwnSHAProvenanceNotTheTurnFinal() throws {
+        // WHY: reasoning/thinking rows share a turn id with the final answer.
+        // A turn-scoped rewrite must never replace a different item body; each
+        // row needs its own typed item id + exact wire digest.
+        let (vm, _) = try makeVM()
+        let threadId = AgentThreadID()
+        let turnId = "v1-mixed-turn"
+        let reasoningWire = "@sr2 v1\ng:inspect provenance\nflow:read>verify"
+        let thinkingWire = "@sr2 v1\ng:prepare tests\nflow:write>run"
+        let finalWire = "@sr2 v1\no:done\np:focused suites passed"
+        let reasoningNatural = "I inspected the provenance path and verified its owner."
+        let thinkingNatural = "I am preparing and running the focused tests."
+        let finalNatural = "Done. The focused suites passed."
+        let finalMessage = AgentMessage(
+            threadId: threadId,
+            role: .assistant,
+            content: finalWire
+        )
+        let reasoning = AssistantItem(
+            id: "v1-reasoning",
+            turnId: turnId,
+            type: .reasoning,
+            state: .completed,
+            body: reasoningWire,
+            startedAtMs: 1
+        )
+        let thinking = AssistantItem(
+            id: "v1-thinking",
+            turnId: turnId,
+            type: .reasoning,
+            state: .streaming,
+            body: thinkingWire,
+            startedAtMs: 2
+        )
+
+        var timeline = AssistantTimelineState()
+        timeline.apply(.turnStarted(turnId: turnId))
+        timeline.apply(.itemStarted(item: reasoning))
+        timeline.apply(.itemStarted(item: thinking))
+        timeline.apply(.turnCompleted(turnId: turnId, finalMessage: finalWire))
+        timeline.apply(.sr1Translation(AssistantSR1Translation(
+            itemId: reasoning.id,
+            originalText: reasoningWire,
+            rewrittenText: reasoningNatural
+        )))
+        timeline.apply(.sr1Translation(AssistantSR1Translation(
+            itemId: thinking.id,
+            originalText: thinkingWire,
+            rewrittenText: thinkingNatural
+        )))
+        timeline.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: finalMessage.id.value.uuidString,
+            originalText: finalWire,
+            rewrittenText: finalNatural
+        )))
+        vm.refreshSR1TranslationStateFromTimeline(timeline)
+
+        XCTAssertEqual(
+            vm.assistantDisplayText(for: reasoningWire, itemId: reasoning.id, turnId: turnId),
+            reasoningNatural
+        )
+        XCTAssertEqual(
+            vm.assistantDisplayText(for: thinkingWire, itemId: thinking.id, turnId: turnId),
+            thinkingNatural
+        )
+        XCTAssertEqual(vm.assistantDisplayText(for: finalWire, turnId: turnId), finalNatural)
+        for display in [reasoningNatural, thinkingNatural, finalNatural] {
+            XCTAssertFalse(display.contains("@sr2"), "natural default must not expose the v1 marker: \(display)")
+        }
+    }
+
+    func test_v1OriginalWireToggleReturnsExactWireOnlyForTranslatedRows() {
+        // WHY: disclosure/copy must use the provider value byte-for-byte, while
+        // ordinary assistant-authored SR2 examples with no rewrite get no raw UI.
+        let exactWire = "\n@sr2 v1\r\no:done\r\np:sha256=0123456789abcdef\n"
+        let natural = "Done."
+
+        XCTAssertEqual(
+            AgentAppView.assistantOriginalWire(
+                messageContent: exactWire,
+                displayText: natural,
+                wasSR1Translated: false
+            ),
+            exactWire
+        )
+        XCTAssertEqual(
+            AgentAppView.assistantOriginalWire(
+                messageContent: exactWire,
+                displayText: exactWire,
+                wasSR1Translated: true
+            ),
+            exactWire,
+            "typed translation provenance keeps the toggle even when display text happens to equal the wire"
+        )
+        XCTAssertNil(
+            AgentAppView.assistantOriginalWire(
+                messageContent: exactWire,
+                displayText: exactWire,
+                wasSR1Translated: false
+            ),
+            "content shape alone must not classify a legitimate assistant-authored SR2 example"
+        )
+        XCTAssertNil(
+            AgentAppView.assistantOriginalWire(
+                messageContent: "   \n",
+                displayText: natural,
+                wasSR1Translated: true
+            )
+        )
+
+        let providerOriginal = "legacy\r\nprovider output\n@sr2 example stays byte exact"
+        let inlineDigest = SHA256.hash(data: Data(providerOriginal.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let inlineEnvelope = "@sr2 v1\no:ok\np:sha256=\(inlineDigest)\nh:inline-base64:\(Data(providerOriginal.utf8).base64EncodedString())"
+        XCTAssertEqual(
+            AgentAppView.assistantOriginalWire(
+                messageContent: inlineEnvelope,
+                displayText: natural,
+                wasSR1Translated: true
+            ),
+            providerOriginal,
+            "canonical v1 disclosure must decode the byte-exact pre-normalization provider output"
+        )
+
+        let handleOriginal = "provider wire behind handle\nwith exact newline"
+        let handleDigest = SHA256.hash(data: Data(handleOriginal.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let handleEnvelope = "@sr2 v1\no:ok\np:sha256=\(handleDigest)\nh:[[rc:v1-exact-handle]]"
+        XCTAssertEqual(
+            AgentAppView.assistantOriginalWire(
+                messageContent: handleEnvelope,
+                displayText: natural,
+                wasSR1Translated: true,
+                retrieve: { $0 == "[[rc:v1-exact-handle]]" ? handleOriginal : nil }
+            ),
+            handleOriginal
+        )
+        XCTAssertEqual(
+            AgentAppView.assistantOriginalWire(
+                messageContent: handleEnvelope,
+                displayText: natural,
+                wasSR1Translated: true,
+                retrieve: { _ in "tampered provider wire" }
+            ),
+            handleEnvelope,
+            "digest mismatch must fail closed to exact canonical history, never unverified provider text"
+        )
+    }
+
+    func test_turnOwnedFinalUsesDurableSR2ProseForDisplayAndCopy() throws {
+        let (vm, _) = try makeVM()
+        let raw = "@sr2 v0\no:ok\nh:[[rc:turn-final-handle]]"
+        let natural = "The checks passed and the build is green."
+        vm.coordinator.reversibleProseRetriever = { marker in
+            marker == "[[rc:turn-final-handle]]" ? natural : nil
+        }
+
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-final-wire",
+            items: [AssistantItem(id: "tool", turnId: "turn-final-wire", type: .tool, startedAtMs: 1)],
+            finalAssistantMessage: raw,
+            finished: true
+        )
+
+        XCTAssertTrue(AgentAppView.shouldRenderFinalAssistantMessage(turn),
+                      "a turn-owned final after work must remain the visible answer")
+        XCTAssertEqual(vm.assistantDisplayText(for: raw), natural,
+                         "turn-owned final display must resolve the durable prose marker")
+        XCTAssertFalse(vm.assistantDisplayText(for: raw).contains("[[rc:"),
+                        "default display/copy text must never expose the recovery handle")
+    }
+
+    func test_turnOwnedFinalUsesDeterministicSR2DisplayAfterRetrieverPruning() throws {
+        let (vm, _) = try makeVM()
+        let threadId = AgentThreadID()
+        let turnId = "turn-deterministic-wire"
+        let raw = "@sr2 v1\nflow:inspect>verify>deploy\ndone:flow\no:cont"
+        let message = AgentMessage(threadId: threadId, role: .assistant, content: raw)
+        var timeline = AssistantTimelineState()
+        timeline.apply(.turnStarted(turnId: turnId))
+        timeline.apply(.turnCompleted(turnId: turnId, finalMessage: raw))
+        timeline.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: message.id.value.uuidString,
+            originalText: raw,
+            rewrittenText: "Next steps: inspect then verify then deploy.\nComplete when: flow."
+        )))
+        vm.refreshSR1TranslationStateFromTimeline(timeline)
+
+        vm.coordinator.reversibleProseRetriever = { _ in nil }
+        vm.refreshSR1TranslationStateFromTimeline(AssistantTimelineState())
+
+        XCTAssertEqual(
+            vm.assistantDisplayText(for: raw, turnId: turnId),
+            "Next steps: inspect then verify then deploy.\nComplete when: flow.",
+            "a reopened turn-owned SR2 final uses deterministic humanization only after typed provenance survives event pruning"
+        )
+        XCTAssertFalse(vm.assistantDisplayText(for: raw, turnId: turnId).contains("@sr2"),
+                       "deterministic final display/copy must not expose provider wire")
+    }
+
+    func test_switchAwayBackRehydratesPersistedTypedWireDisplayAfterEventPruning() async throws {
+        // WHY: the hot translation event and in-memory provenance maps are both
+        // allowed to disappear. A reopened VM must still use the persisted typed
+        // digest/display pair, while the exact raw message remains the toggle.
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "persisted wire")
+        let sourceThread = try XCTUnwrap(vm.selectedThreadId)
+        let raw = "@sr2 v1\nflow:inspect>verify>deploy\ndone:flow\no:cont"
+        let natural = "Next steps: inspect then verify then deploy.\nComplete when: flow."
+        let itemId = "persisted-item"
+        let turnId = "persisted-turn"
+        let item = AssistantItem(
+            id: itemId,
+            turnId: turnId,
+            type: .assistantMessage,
+            state: .completed,
+            body: raw,
+            startedAtMs: 1
+        )
+        let message = AgentMessage(threadId: sourceThread, role: .assistant, content: raw)
+        try vm.messageRepo.append(message)
+        vm.messages = [message]
+        var timeline = AssistantTimelineState()
+        timeline.apply(.turnStarted(turnId: turnId))
+        timeline.apply(.itemStarted(item: item))
+        timeline.apply(.turnCompleted(turnId: turnId, finalMessage: raw))
+        timeline.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: message.id.value.uuidString,
+            originalText: raw,
+            rewrittenText: natural
+        )))
+        timeline.apply(.sr1Translation(AssistantSR1Translation(
+            itemId: itemId,
+            originalText: raw,
+            rewrittenText: natural
+        )))
+        vm.refreshSR1TranslationStateFromTimeline(timeline)
+        XCTAssertEqual(vm.assistantDisplayText(for: message), natural)
+        await vm.waitForAssistantDisplayPersistence()
+
+        // Prune the event, then force the same lifecycle as a reopened thread.
+        vm.refreshSR1TranslationStateFromTimeline(AssistantTimelineState())
+        vm.createThread(title: "other thread")
+        vm.selectThread(sourceThread)
+        await vm.waitForMessageHistoryLoad()
+
+        let reopened = try XCTUnwrap(vm.messages.first(where: { $0.id == message.id }))
+        XCTAssertEqual(reopened.content, raw, "raw toggle must preserve the exact persisted provider wire")
+        XCTAssertEqual(
+            vm.assistantDisplayText(for: reopened),
+            natural,
+            "reopened display must use persisted typed provenance after hot event pruning"
+        )
+        XCTAssertEqual(
+            vm.assistantDisplayText(for: raw, itemId: itemId, turnId: turnId),
+            natural,
+            "reopened timeline item display must use persisted typed provenance"
+        )
+        XCTAssertEqual(
+            vm.assistantDisplayText(for: raw, turnId: turnId),
+            natural,
+            "reopened turn final display must use persisted typed provenance"
+        )
+        XCTAssertEqual(
+            vm.humanizedAssistantContent("@sr2 v1\ng:remote-code-orchestrate\ndone:run"),
+            "@sr2 v1\ng:remote-code-orchestrate\ndone:run",
+            "untrusted marker-first natural content remains untouched"
+        )
+    }
+
+    func test_freshVMReopenUsesDurableV1MessageReasoningThinkingAndFinalAfterTranslationPruning() async throws {
+        // WHY: translation events are hot and prunable. This persists only the
+        // wire-bearing timeline plus the typed digest/display side records, then
+        // constructs a genuinely fresh view model over the same SQLite store.
+        let tmp = NSTemporaryDirectory() + "rc2-v1-fresh-reopen-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        func coordinator() -> AgentRunCoordinator {
+            AgentRunCoordinator(
+                runRepo: runRepo,
+                messageRepo: messageRepo,
+                threadRepo: threadRepo,
+                providers: [.codex: FakeProviderRunner(provider: .codex)]
+            )
+        }
+
+        let workspaceID = WorkspaceID()
+        let first = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator(),
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        first.createThread(title: "fresh v1 provenance")
+        let threadId = try XCTUnwrap(first.selectedThreadId)
+        let turnId = "fresh-v1-turn"
+        let messageWire = "@sr2 v1\no:message\np:message proof"
+        let reasoningWire = "@sr2 v1\ng:reason\nflow:inspect>verify"
+        let thinkingWire = "@sr2 v1\ng:think\nflow:prepare>run"
+        let finalWire = "@sr2 v1\no:final\np:final proof"
+        let messageNatural = "Message proof is available."
+        let reasoningNatural = "I inspected and verified the reason."
+        let thinkingNatural = "I am preparing and running the check."
+        let finalNatural = "Final proof is available."
+        let message = AgentMessage(threadId: threadId, role: .assistant, content: messageWire)
+        let messageItem = AssistantItem(
+            id: "fresh-message-item",
+            turnId: turnId,
+            type: .assistantMessage,
+            state: .completed,
+            body: messageWire,
+            startedAtMs: 1
+        )
+        let reasoning = AssistantItem(
+            id: "fresh-reasoning-item",
+            turnId: turnId,
+            type: .reasoning,
+            state: .completed,
+            body: reasoningWire,
+            startedAtMs: 2
+        )
+        let thinking = AssistantItem(
+            id: "fresh-thinking-item",
+            turnId: turnId,
+            type: .reasoning,
+            state: .streaming,
+            body: thinkingWire,
+            startedAtMs: 3
+        )
+        try messageRepo.append(message)
+        first.messages = [message]
+
+        let durableEvents: [AssistantEvent] = [
+            .turnStarted(turnId: turnId),
+            .itemStarted(item: messageItem),
+            .itemCompleted(itemId: messageItem.id, finalState: .completed),
+            .itemStarted(item: reasoning),
+            .itemCompleted(itemId: reasoning.id, finalState: .completed),
+            .itemStarted(item: thinking),
+            .turnCompleted(turnId: turnId, finalMessage: finalWire),
+        ]
+        let runId = AgentRunID()
+        try runRepo.upsert(AgentRun(
+            id: runId,
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-test",
+            status: .completed,
+            finishedAt: Date()
+        ))
+        let encoder = JSONEncoder()
+        let writes = try durableEvents.enumerated().map { offset, event in
+            AgentRunRepository.StreamWriteIntent(
+                seq: offset + 1,
+                kind: event.debugDescription,
+                payloadJSON: String(decoding: try encoder.encode(event), as: UTF8.self),
+                providerEvent: nil
+            )
+        }
+        try runRepo.persistStreamBatch(
+            runId: runId,
+            threadId: threadId,
+            items: writes,
+            shouldPruneStreamEvents: false
+        )
+
+        var translated = AssistantTimelineState()
+        durableEvents.forEach { translated.apply($0) }
+        translated.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: message.id.value.uuidString,
+            originalText: messageWire,
+            rewrittenText: messageNatural
+        )))
+        for pair in [
+            (messageItem, messageNatural),
+            (reasoning, reasoningNatural),
+            (thinking, thinkingNatural),
+        ] {
+            translated.apply(.sr1Translation(AssistantSR1Translation(
+                itemId: pair.0.id,
+                originalText: pair.0.body,
+                rewrittenText: pair.1
+            )))
+        }
+        let finalProvenanceMessage = AgentMessage(
+            threadId: threadId,
+            role: .assistant,
+            content: finalWire
+        )
+        try messageRepo.append(finalProvenanceMessage)
+        first.messages.append(finalProvenanceMessage)
+        translated.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: finalProvenanceMessage.id.value.uuidString,
+            originalText: finalWire,
+            rewrittenText: finalNatural
+        )))
+        first.timeline = translated
+        first.refreshSR1TranslationStateFromTimeline()
+        await first.waitForAssistantDisplayPersistence()
+        first.dispose()
+
+        // No sr1Translation event was persisted above: reopen must come entirely
+        // from the bounded, thread-scoped, SHA-verified side records.
+        let reopened = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator(),
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            initialThreadId: threadId
+        )
+        await reopened.waitForMessageHistoryLoad()
+        let reopenedMessage = try XCTUnwrap(reopened.messages.first(where: { $0.id == message.id }))
+        XCTAssertEqual(reopened.assistantDisplayText(for: reopenedMessage), messageNatural)
+        XCTAssertEqual(
+            reopened.assistantDisplayText(for: messageWire, itemId: messageItem.id, turnId: turnId),
+            messageNatural
+        )
+        XCTAssertEqual(
+            reopened.assistantDisplayText(for: reasoningWire, itemId: reasoning.id, turnId: turnId),
+            reasoningNatural
+        )
+        XCTAssertEqual(
+            reopened.assistantDisplayText(for: thinkingWire, itemId: thinking.id, turnId: turnId),
+            thinkingNatural
+        )
+        XCTAssertEqual(reopened.assistantDisplayText(for: finalWire, turnId: turnId), finalNatural)
+        for display in [messageNatural, reasoningNatural, thinkingNatural, finalNatural] {
+            XCTAssertFalse(display.contains("@sr2"), "fresh default must not expose v1 wire: \(display)")
+        }
+        reopened.dispose()
+    }
+
+    func test_exactR17FinalReopensNaturalForMessageItemAndTurnWithExactOriginal() async throws {
+        // WHY: live R17 persisted a canonical message stub but wrote the same
+        // 401-character provider wire into all three durable display rows.
+        // A fresh process must default to natural text at every owner while the
+        // explicit original disclosure still resolves the exact provider bytes.
+        let tmp = NSTemporaryDirectory() + "rc2-r17-final-reopen-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let store = ReversibleContentStore(db: db)
+        func coordinator() -> AgentRunCoordinator {
+            let value = AgentRunCoordinator(
+                runRepo: runRepo,
+                messageRepo: messageRepo,
+                threadRepo: threadRepo,
+                providers: [.codex: FakeProviderRunner(provider: .codex)]
+            )
+            value.reversibleProseRetriever = { try? store.retrieveText($0) }
+            return value
+        }
+
+        let workspaceID = WorkspaceID()
+        let first = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator(),
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        first.createThread(title: "R17 final provenance")
+        let threadId = try XCTUnwrap(first.selectedThreadId)
+        let turnId = "019ff718-7fd3-75c1-80f4-a18c53ea5b69"
+        let itemId = "msg_0920fe1871e40bf8016a7cb27cfde48191abf062b9e80ca2a2"
+        let wire = "@sr2 v1\ng:run-summary\no:swift=/tmp/RemoteCodeAgentCanary-r17.9NjZ6W/state/Application Support/RemoteCodeAgentCanary/ManagedIntegrationHome/.remote-code/bin/swift; distill=/tmp/RemoteCodeAgentCanary-r17.9NjZ6W/state/Application Support/RemoteCodeAgentCanary/ManagedIntegrationHome/.remote-code/bin/distill\\nREADME.md:3 UNIQUE_EXACT_MATCH=sr2-e2e-20260811; noisy.swift=200 lines\nd:exit=0; files-edited=0"
+        XCTAssertEqual(wire.count, 401)
+        XCTAssertEqual(
+            SHA256.hash(data: Data(wire.utf8)).map { String(format: "%02x", $0) }.joined(),
+            "f1e7839008cd5493b45b4dc9d861396773c2720b1ca3957f2c332de64c16d99a"
+        )
+        let plan = SR2WirePolicy.dualChannelPersistPlan(
+            modelOutput: wire,
+            humanizeOutput: wire,
+            tokenSaverOn: true,
+            isSR1: { _ in false },
+            storeProse: { try? store.store($0) }
+        )
+        XCTAssertFalse(plan.uiText.contains("@sr2"), plan.uiText)
+
+        let message = AgentMessage(threadId: threadId, role: .assistant, content: plan.historyText)
+        try messageRepo.append(message)
+        first.messages = [message]
+        let item = AssistantItem(
+            id: itemId,
+            turnId: turnId,
+            type: .assistantMessage,
+            state: .completed,
+            body: plan.historyText,
+            startedAtMs: 1
+        )
+        let durableEvents: [AssistantEvent] = [
+            .turnStarted(turnId: turnId),
+            .itemStarted(item: item),
+            .itemCompleted(itemId: itemId, finalState: .completed),
+            .turnCompleted(turnId: turnId, finalMessage: plan.historyText),
+        ]
+        let runId = AgentRunID()
+        try runRepo.upsert(AgentRun(
+            id: runId,
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-test",
+            status: .completed,
+            finishedAt: Date()
+        ))
+        let encoder = JSONEncoder()
+        try runRepo.persistStreamBatch(
+            runId: runId,
+            threadId: threadId,
+            items: try durableEvents.enumerated().map { offset, event in
+                AgentRunRepository.StreamWriteIntent(
+                    seq: offset + 1,
+                    kind: event.debugDescription,
+                    payloadJSON: String(decoding: try encoder.encode(event), as: UTF8.self),
+                    providerEvent: nil
+                )
+            },
+            shouldPruneStreamEvents: false
+        )
+
+        var translated = AssistantTimelineState()
+        durableEvents.forEach { translated.apply($0) }
+        translated.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: message.id.value.uuidString,
+            originalText: plan.historyText,
+            rewrittenText: plan.uiText
+        )))
+        translated.apply(.sr1Translation(AssistantSR1Translation(
+            itemId: itemId,
+            originalText: plan.historyText,
+            rewrittenText: plan.uiText
+        )))
+        first.timeline = translated
+        first.refreshSR1TranslationStateFromTimeline()
+        await first.waitForAssistantDisplayPersistence()
+        first.dispose()
+
+        let reopened = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator(),
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            initialThreadId: threadId
+        )
+        await reopened.waitForMessageHistoryLoad()
+        let reopenedMessage = try XCTUnwrap(reopened.messages.first(where: { $0.id == message.id }))
+        let displays = [
+            reopened.assistantDisplayText(for: reopenedMessage),
+            reopened.assistantDisplayText(for: plan.historyText, itemId: itemId, turnId: turnId),
+            reopened.assistantDisplayText(for: plan.historyText, turnId: turnId),
+        ]
+        XCTAssertEqual(displays, [plan.uiText, plan.uiText, plan.uiText])
+        for display in displays {
+            XCTAssertFalse(display.localizedCaseInsensitiveContains("@sr2"), display)
+        }
+        XCTAssertEqual(
+            AgentAppView.assistantOriginalWire(
+                messageContent: reopenedMessage.content,
+                displayText: displays[0],
+                wasSR1Translated: false,
+                retrieve: { try? store.retrieveText($0) }
+            ),
+            wire
+        )
+        reopened.dispose()
+    }
+
+    func test_transientAssistantDisplayPersistenceFailureRetriesBeforeFreshV1Reopen() async throws {
+        // WHY: a transient side-record write must not poison in-memory dedupe.
+        // Translation events are prunable, so a later refresh must retry and
+        // leave a fresh VM with natural default text plus exact raw disclosure.
+        let tmp = NSTemporaryDirectory() + "rc2-v1-retry-reopen-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        func coordinator() -> AgentRunCoordinator {
+            AgentRunCoordinator(
+                runRepo: runRepo,
+                messageRepo: messageRepo,
+                threadRepo: threadRepo,
+                providers: [.codex: FakeProviderRunner(provider: .codex)]
+            )
+        }
+
+        let workspaceID = WorkspaceID()
+        let first = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator(),
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        first.createThread(title: "transient display retry")
+        let threadId = try XCTUnwrap(first.selectedThreadId)
+        let providerOriginal = "provider\r\nwire survives exactly\n@sr2 example"
+        let digest = SHA256.hash(data: Data(providerOriginal.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let canonicalWire = "@sr2 v1\no:ok\np:sha256=\(digest)\nh:inline-base64:\(Data(providerOriginal.utf8).base64EncodedString())"
+        let natural = "The provider result survives a transient persistence failure."
+        let message = AgentMessage(threadId: threadId, role: .assistant, content: canonicalWire)
+        try messageRepo.append(message)
+        first.messages = [message]
+
+        var translated = AssistantTimelineState()
+        translated.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: message.id.value.uuidString,
+            originalText: canonicalWire,
+            rewrittenText: natural
+        )))
+        first.failNextAssistantDisplayPersistenceWritesForTesting()
+        first.refreshSR1TranslationStateFromTimeline(translated)
+        await first.waitForAssistantDisplayPersistence()
+        XCTAssertTrue(try messageRepo.assistantDisplayTranslations(threadId: threadId).isEmpty)
+
+        first.refreshSR1TranslationStateFromTimeline(translated)
+        await first.waitForAssistantDisplayPersistence()
+        XCTAssertEqual(
+            try messageRepo.assistantDisplayTranslations(threadId: threadId).count,
+            1,
+            "the next bounded refresh must retry the transiently failed write"
+        )
+
+        first.refreshSR1TranslationStateFromTimeline(AssistantTimelineState())
+        first.dispose()
+
+        let reopened = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator(),
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            initialThreadId: threadId
+        )
+        await reopened.waitForMessageHistoryLoad()
+        let reopenedMessage = try XCTUnwrap(reopened.messages.first(where: { $0.id == message.id }))
+        let defaultText = reopened.assistantDisplayText(for: reopenedMessage)
+        XCTAssertEqual(defaultText, natural)
+        XCTAssertFalse(defaultText.contains("@sr2"), "fresh default must never expose canonical provider wire")
+        XCTAssertEqual(
+            AgentAppView.assistantOriginalWire(
+                messageContent: reopenedMessage.content,
+                displayText: defaultText,
+                wasSR1Translated: reopened.sr1TranslatedMessageIds.contains(message.id)
+            ),
+            providerOriginal,
+            "fresh disclosure/copy must retain the byte-exact pre-normalization provider output"
+        )
+        reopened.dispose()
+    }
+
+    func test_persistedDisplayBoundSurvivesFreshThreadReopen() async throws {
+        // WHY: bounded durable display text must remain readable after the
+        // event and in-memory maps are gone; the raw wire must never be the
+        // bounded value or the default display.
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "bounded provenance")
+        let threadId = try XCTUnwrap(vm.selectedThreadId)
+        let raw = "@sr2 v0\no:ok"
+        let natural = String(repeating: "humanized ", count: 600)
+        let message = AgentMessage(threadId: threadId, role: .assistant, content: raw)
+        try vm.messageRepo.append(message)
+        vm.messages = [message]
+        var timeline = AssistantTimelineState()
+        timeline.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: message.id.value.uuidString,
+            originalText: raw,
+            rewrittenText: natural
+        )))
+        vm.refreshSR1TranslationStateFromTimeline(timeline)
+        await vm.waitForAssistantDisplayPersistence()
+
+        vm.refreshSR1TranslationStateFromTimeline(AssistantTimelineState())
+        vm.createThread(title: "another bounded thread")
+        vm.selectThread(threadId)
+        await vm.waitForMessageHistoryLoad()
+
+        let reopened = try XCTUnwrap(vm.messages.first(where: { $0.id == message.id }))
+        let expected = String(natural.prefix(AgentMessageRepository.assistantDisplayCharacterLimit)) + "\n…"
+        XCTAssertEqual(reopened.content, raw, "raw toggle must retain the exact provider wire")
+        XCTAssertEqual(vm.assistantDisplayText(for: reopened), expected)
+        XCTAssertEqual(expected.count, AgentMessageRepository.assistantDisplayStoredCharacterLimit)
+    }
+
+    func test_persistedTimelineProvenanceIsThreadScopedForCollidingOwnerIDs() async throws {
+        // WHY: provider item/turn IDs are not globally unique. The durable
+        // provenance key must include the thread or one thread can rewrite the
+        // other after a switch or reopen.
+        let (vm, _) = try makeVM()
+        let itemId = "same-item"
+        let turnId = "same-turn"
+
+        vm.createThread(title: "collision A")
+        let threadA = try XCTUnwrap(vm.selectedThreadId)
+        let rawA = "@sr2 v1\ng:goal-a"
+        let messageA = AgentMessage(threadId: threadA, role: .assistant, content: rawA)
+        try vm.messageRepo.append(messageA)
+        vm.messages = [messageA]
+        let itemA = AssistantItem(
+            id: itemId, turnId: turnId, type: .assistantMessage,
+            state: .completed, body: rawA, startedAtMs: 1
+        )
+        var timelineA = AssistantTimelineState()
+        timelineA.apply(.turnStarted(turnId: turnId))
+        timelineA.apply(.itemStarted(item: itemA))
+        timelineA.apply(.turnCompleted(turnId: turnId, finalMessage: rawA))
+        timelineA.apply(.sr1Translation(AssistantSR1Translation(
+            itemId: itemId, originalText: rawA, rewrittenText: "Display A"
+        )))
+        timelineA.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: messageA.id.value.uuidString, originalText: rawA, rewrittenText: "Display A"
+        )))
+        vm.refreshSR1TranslationStateFromTimeline(timelineA)
+        await vm.waitForAssistantDisplayPersistence()
+
+        vm.createThread(title: "collision B")
+        let threadB = try XCTUnwrap(vm.selectedThreadId)
+        let rawB = "@sr2 v1\ng:goal-b"
+        let messageB = AgentMessage(threadId: threadB, role: .assistant, content: rawB)
+        try vm.messageRepo.append(messageB)
+        vm.messages = [messageB]
+        let itemB = AssistantItem(
+            id: itemId, turnId: turnId, type: .assistantMessage,
+            state: .completed, body: rawB, startedAtMs: 1
+        )
+        var timelineB = AssistantTimelineState()
+        timelineB.apply(.turnStarted(turnId: turnId))
+        timelineB.apply(.itemStarted(item: itemB))
+        timelineB.apply(.turnCompleted(turnId: turnId, finalMessage: rawB))
+        timelineB.apply(.sr1Translation(AssistantSR1Translation(
+            itemId: itemId, originalText: rawB, rewrittenText: "Display B"
+        )))
+        timelineB.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: messageB.id.value.uuidString, originalText: rawB, rewrittenText: "Display B"
+        )))
+        vm.refreshSR1TranslationStateFromTimeline(timelineB)
+        await vm.waitForAssistantDisplayPersistence()
+
+        vm.selectThread(threadA)
+        await vm.waitForMessageHistoryLoad()
+        XCTAssertEqual(vm.assistantDisplayText(for: rawA, itemId: itemId, turnId: turnId), "Display A")
+        XCTAssertEqual(vm.assistantDisplayText(for: rawA, turnId: turnId), "Display A")
+
+        vm.selectThread(threadB)
+        await vm.waitForMessageHistoryLoad()
+        XCTAssertEqual(vm.assistantDisplayText(for: rawB, itemId: itemId, turnId: turnId), "Display B")
+        XCTAssertEqual(vm.assistantDisplayText(for: rawB, turnId: turnId), "Display B")
+
+        for index in 0...(AgentMessageRepository.maxMessagesPerThread + 4) {
+            try vm.messageRepo.upsertTimelineDisplayTranslation(
+                ownerKind: "item",
+                ownerId: "retained-\(index)",
+                threadId: threadA,
+                originalWire: "wire-\(index)",
+                displayText: "display-\(index)"
+            )
+        }
+        let retainedA = try vm.messageRepo.timelineDisplayTranslations(threadId: threadA)
+        XCTAssertLessThanOrEqual(
+            retainedA.count,
+            AgentMessageRepository.maxMessagesPerThread,
+            "timeline provenance must prune old per-thread rows instead of growing without bound"
+        )
+    }
+
+    func test_reopenedAssistantKeepsRawToggleAfterTranslationEventsArePruned() throws {
+        let (vm, _) = try makeVM()
+        let threadId = AgentThreadID()
+        let raw = "@sr2 v0\no:ok\nh:[[rc:reopened-handle]]"
+        let message = AgentMessage(threadId: threadId, role: .assistant, content: raw)
+        vm.coordinator.reversibleProseRetriever = { marker in
+            marker == "[[rc:reopened-handle]]" ? "Natural answer after reopen." : nil
+        }
+
+        XCTAssertTrue(
+            AgentAppView.showsAssistantOriginalToggle(
+                messageContent: message.content,
+                displayText: vm.assistantDisplayText(for: message),
+                wasSR1Translated: false
+            ),
+            "persisted SR2 content must keep an exact raw/original toggle without a live translation event"
+        )
+
+        vm.refreshSR1TranslationStateFromTimeline(AssistantTimelineState())
+        XCTAssertTrue(vm.sr1TranslatedMessageIds.isEmpty)
+        XCTAssertTrue(vm.sr1OriginalTextsByMessageId.isEmpty)
+        XCTAssertTrue(
+            AgentAppView.showsAssistantOriginalToggle(
+                messageContent: message.content,
+                displayText: vm.assistantDisplayText(for: message),
+                wasSR1Translated: false
+            ),
+            "the raw/original toggle must be derived from durable message content, not prunable translation maps"
         )
     }
 

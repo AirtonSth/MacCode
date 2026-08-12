@@ -63,6 +63,26 @@ final class LoginShellEnvironmentTests: XCTestCase {
                      "an over-cap child must be drained to completion and then rejected instead of caching its sentinel-bearing prefix")
     }
 
+    func test_captureOnce_scrubsManagedIntegrationHomeBeforeSupportShellSpawn() {
+        // WHY: prewarm can run before any provider environment is constructed.
+        // The login-shell capture itself is a support child and must never inherit
+        // the app-owned integration root.
+        var spawnedEnvironment: [String: String] = [:]
+        let result = LoginShellEnvironment.captureOnce(
+            parentEnvironment: [
+                "SHELL": "/bin/zsh",
+                "RC2_MANAGED_INTEGRATION_HOME": "/tmp/app-owned-home",
+            ],
+            spawn: { _, _, environment, _ in
+                spawnedEnvironment = environment
+                return self.data("\u{0}\(LoginShellEnvironment.sentinel)\u{0}OK=1\u{0}")
+            }
+        )
+
+        XCTAssertEqual(result?["OK"], "1")
+        XCTAssertNil(spawnedEnvironment["RC2_MANAGED_INTEGRATION_HOME"])
+    }
+
     func test_parse_skipsRecordsWithNoEquals() {
         let s = LoginShellEnvironment.sentinel
         let env = LoginShellEnvironment.parse(data("\u{0}\(s)\u{0}garbage\u{0}OK=1\u{0}"))
@@ -97,6 +117,36 @@ final class LoginShellEnvironmentTests: XCTestCase {
                      "support processes (model discovery, probes, npm) must NOT receive profile secrets")
         XCTAssertNil(env["REMOTE_CODE_AGENT_PROVIDER"],
                      "support processes carry no provider attribution")
+    }
+
+    func test_managedIntegrationHomeIsScrubbedFromAllProviderAndSupportChildren() {
+        // WHY: RC2_MANAGED_INTEGRATION_HOME controls app-owned filesystem
+        // integration. It is host bootstrap state, not provider run state, and
+        // must stay private even when inherited from GUI, login shell, or an
+        // explicit provider-instance override.
+        LoginShellEnvironment.setForTesting([
+            "RC2_MANAGED_INTEGRATION_HOME": "/tmp/from-login"
+        ])
+        let purposes: [(String, CodexRunner.EnvironmentPurpose)] = [
+            ("Claude", .agentTurn(.claude)),
+            ("Codex", .agentTurn(.codex)),
+            ("Grok", .agentTurn(.grok)),
+            ("support", .supportProcess),
+        ]
+
+        for (label, purpose) in purposes {
+            let env = CodexRunner.processEnvironment(
+                overrides: ["RC2_MANAGED_INTEGRATION_HOME": "/tmp/from-override"],
+                purpose: purpose,
+                base: guiBase.merging([
+                    "RC2_MANAGED_INTEGRATION_HOME": "/tmp/from-gui",
+                ]) { _, override in override }
+            )
+            XCTAssertNil(
+                env["RC2_MANAGED_INTEGRATION_HOME"],
+                "\(label) child environment must scrub the app-host-only managed integration root"
+            )
+        }
     }
 
     func test_claudeAgentTurn_stripsAuthKeysOnBothBranches_soOAuthStaysDefault() {

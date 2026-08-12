@@ -56,6 +56,34 @@ public enum ProcessLocator {
         return nil
     }
 
+    /// Resolve a launcher/runtime binary without allowing a RemoteCode-managed
+    /// proxy in `~/.remote-code/bin` to satisfy the lookup. This is intentionally
+    /// narrower than normal provider resolution: the provider's own child
+    /// commands still inherit the managed PATH.
+    public static func resolveOutsideManagedBin(
+        _ name: String,
+        environmentPath: String?,
+        homeDirectory: String,
+        managedBinDirectory: String? = nil
+    ) -> String? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.contains("/") {
+            let expanded = (trimmed as NSString).expandingTildeInPath
+            return FileManager.default.isExecutableFile(atPath: expanded) ? expanded : nil
+        }
+        var managedBins = Set([Self.normalizedDirectory("\(homeDirectory)/.remote-code/bin")])
+        if let managedBinDirectory,
+           !managedBinDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            managedBins.insert(Self.normalizedDirectory(managedBinDirectory))
+        }
+        for component in searchPath(environmentPath: environmentPath, homeDirectory: homeDirectory)
+        where !managedBins.contains(Self.normalizedDirectory(component)) {
+            let full = component + "/" + trimmed
+            if FileManager.default.isExecutableFile(atPath: full) { return full }
+        }
+        return nil
+    }
+
     private static func normalizedDirectory(_ path: String) -> String {
         var p = path
         while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
@@ -156,6 +184,24 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         if request.serviceTier == .fast {
             args += ["-c", "model_service_tier=\"fast\""]
         }
+        if let trustedHostInstruction = request.trustedHostInstruction,
+           !trustedHostInstruction.isEmpty {
+            let base = AgentProviderInstructionText.developerInstructions(for: request.interactionMode)
+            let withTokenSaver = AgentSkillInstaller.tokenSaverProviderPrompt(
+                base,
+                environment: request.environment
+            )
+            var developer = withTokenSaver.isEmpty
+                ? BackgroundAwaitContinuation.systemPromptDirective
+                : withTokenSaver + "\n\n" + BackgroundAwaitContinuation.systemPromptDirective
+            developer += "\n\nREMOTE_CODE_TRUSTED_HOST_INSTRUCTIONS_V1\n"
+                + trustedHostInstruction.text
+            let quoted = developer
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+                .replacingOccurrences(of: "\n", with: "\\n")
+            args += ["-c", "developer_instructions=\"\(quoted)\""]
+        }
         if !resuming {
             let model = request.model.trimmingCharacters(in: .whitespaces)
             if !model.isEmpty, model.lowercased() != "default" {
@@ -175,7 +221,7 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         }
         args += request.extraArgs
         if resuming, let ptid { args.append(ptid) }   // SESSION_ID before PROMPT
-        args.append(request.providerPrompt)
+        args.append(request.trustedHostInstruction == nil ? request.providerPrompt : request.prompt)
         return args
     }
 
@@ -366,16 +412,17 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         purpose: EnvironmentPurpose,
         base gui: [String: String] = ProcessInfo.processInfo.environment
     ) -> [String: String] {
+        let childSafeGUI = ChildProcessEnvironmentPolicy.scrubHostOnlyKeys(from: gui)
         // Login-shell env import applies only to real agent turns, and only when the
         // kill-switch is not off (default ON). When inactive, behavior is identical
         // to the pre-parity implementation (GUI env, no strips).
-        let importEnabled = (gui["RC_LOGIN_SHELL_ENV_IMPORT"] ?? "1") != "0"
+        let importEnabled = (childSafeGUI["RC_LOGIN_SHELL_ENV_IMPORT"] ?? "1") != "0"
         let active = purpose.importsLoginEnvironment && importEnabled
         let login: [String: String]? = active
-            ? LoginShellEnvironment.current(parentEnvironment: gui)
+            ? LoginShellEnvironment.current(parentEnvironment: childSafeGUI)
             : nil
 
-        var base = gui
+        var base = childSafeGUI
         if let login {
             // delta-over-GUI: overlay login keys that differ/are new, except the
             // GUI-owned identity/sandbox keys; drop shell-local volatile keys.
@@ -404,6 +451,7 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         // parent shell receipt from leaking into support or cross-user launches.
         base = AgentHostEnvironmentMerge.stripHostInjects(from: base)
         var env = base.merging(overrides) { _, override in override }
+        env = ChildProcessEnvironmentPolicy.scrubHostOnlyKeys(from: env)
 
         let home = env["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path
         // Prepend the login PATH so profile PATH additions resolve; expandedPath then
@@ -438,11 +486,17 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !managedBin.isEmpty {
             let current = env["PATH"] ?? ""
+            let providerProxyBin = env["RC_REMOTE_CODE_PROVIDER_PROXY_BIN"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            var prefixes = [managedBin]
+            if let providerProxyBin, !providerProxyBin.isEmpty, providerProxyBin != managedBin {
+                prefixes.append(providerProxyBin)
+            }
             let parts = current
                 .split(separator: ":", omittingEmptySubsequences: false)
                 .map(String.init)
-                .filter { $0 != managedBin }
-            env["PATH"] = ([managedBin] + parts).joined(separator: ":")
+                .filter { !prefixes.contains($0) }
+            env["PATH"] = (prefixes + parts).joined(separator: ":")
         }
         // Expose the `RefreshMcpTools` tool for Claude turns so the agent can pick
         // up remote MCP servers (Linear, etc.) that finish their async connect a

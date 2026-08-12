@@ -136,6 +136,11 @@ final class CanaryAppScriptTests: XCTestCase {
         for command in ["build", "run", "stop", "status", "reset-state"] {
             XCTAssertTrue(source.contains(command), "the harness must expose the \(command) command")
         }
+        XCTAssertTrue(
+            source.contains("MANAGED_INTEGRATION_HOME=\"$APP_SUPPORT/ManagedIntegrationHome\"")
+                && source.contains("RC2_MANAGED_INTEGRATION_HOME=\"$MANAGED_INTEGRATION_HOME\""),
+            "the canary must keep managed wrappers under its disposable state instead of mutating the user's real home"
+        )
     }
 
     func testTerminalStabilityHarnessCannotTargetThePrimaryApp() throws {

@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 
 /// Captures the user's LOGIN-SHELL exported environment once per app run so that
 /// agent-turn spawns receive the same secrets/PATH an interactive terminal would.
@@ -145,7 +146,9 @@ public enum LoginShellEnvironment {
         // Match the embedded terminal's TERM so $TERM/tty-gated profile branches
         // behave closer to a real terminal. (True tty-only `[ -t 1 ]` exports remain
         // unreachable without a PTY — a documented limitation.)
-        var captureEnv = parentEnvironment
+        var captureEnv = ChildProcessEnvironmentPolicy.scrubHostOnlyKeys(
+            from: parentEnvironment
+        )
         if (captureEnv["TERM"] ?? "").isEmpty { captureEnv["TERM"] = "xterm-256color" }
         let runner = spawn ?? defaultSpawn
         guard let data = runner(shell, args, captureEnv, captureTimeout) else { return nil }

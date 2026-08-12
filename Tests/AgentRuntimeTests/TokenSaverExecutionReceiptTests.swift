@@ -287,7 +287,10 @@ final class TokenSaverExecutionReceiptTests: XCTestCase {
         // inherited GUI state must not accidentally become Token Saver-enabled.
         let claudeReceipt = receipt(provider: .claude)
         var overrides = TokenSaverExecutionReceiptSeam.environment(from: claudeReceipt)
-        overrides["REMOTE_CODE_DISTILL_STATE_PATH"] = "/tmp/distill-state"
+        let appSupport = "/tmp/rc-token-saver-support"
+        let statePath = "\(appSupport)/Distill/DistillCLIState.json"
+        overrides["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"] = appSupport
+        overrides["REMOTE_CODE_DISTILL_STATE_PATH"] = statePath
         let base = [
             "HOME": "/tmp/home",
             "PATH": "/usr/bin",
@@ -302,7 +305,8 @@ final class TokenSaverExecutionReceiptTests: XCTestCase {
         )
         XCTAssertEqual(agent["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
         XCTAssertEqual(agent["RC_TOKEN_SAVER_POST_TOOL_USE"], "1")
-        XCTAssertEqual(agent["REMOTE_CODE_DISTILL_STATE_PATH"], "/tmp/distill-state")
+        XCTAssertEqual(agent["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"], appSupport)
+        XCTAssertEqual(agent["REMOTE_CODE_DISTILL_STATE_PATH"], statePath)
         XCTAssertEqual(agent["REMOTE_CODE_AGENT_PROVIDER"], "claude")
 
         let rawAgent = CodexRunner.processEnvironment(
@@ -320,6 +324,16 @@ final class TokenSaverExecutionReceiptTests: XCTestCase {
         XCTAssertNil(support[TokenSaverExecutionReceipt.envKey])
         XCTAssertNil(support["RC_TOKEN_SAVER_DISTILL_HINT"])
         XCTAssertNil(support["REMOTE_CODE_DISTILL_STATE_PATH"])
+
+        var mismatchedOverrides = overrides
+        mismatchedOverrides["REMOTE_CODE_DISTILL_STATE_PATH"] = "/tmp/other/Distill/DistillCLIState.json"
+        let mismatched = CodexRunner.processEnvironment(
+            overrides: mismatchedOverrides,
+            purpose: .agentTurn(.claude),
+            base: base
+        )
+        XCTAssertNil(mismatched["REMOTE_CODE_DISTILL_STATE_PATH"],
+                     "receipt propagation must not preserve a state lease outside its app-support namespace")
     }
 
     func test_processEnvironment_reassertsManagedBinOnPathForAllProviders() throws {

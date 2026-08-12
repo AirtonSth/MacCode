@@ -56,16 +56,18 @@ final class DistillInstructionsTemplateTests: XCTestCase {
                       "workers must not be forced to restate Distill rules inside skill prompts")
         XCTAssertFalse(t.contains("Every subagent, worker, reviewer, or delegated prompt MUST repeat"),
                        "removed: requiring every worker to restate Distill")
-        // Sparse dialect: R0 micro O-only + R1 work O-first (token savings vs 6-line tax).
-        XCTAssertTrue(t.contains("R0 micro"), "R0 micro register present")
-        XCTAssertTrue(t.contains("R1 work"), "R1 work register present")
-        XCTAssertTrue(t.contains("O-first") || t.contains("O: only") || t.contains("`O:` only"),
-                      "O-first / O-only sparsity present")
-        XCTAssertTrue(t.lowercased().contains("never pad to six"),
-                      "must forbid fixed six-line S/C/D padding")
+        // Sparse dialect: SR2 v1 only. Legacy SR1 registers are decode-only and
+        // must never be advertised to a provider that can author new wire.
+        XCTAssertTrue(t.contains("canonical **@sr2 v1**"), "current SR2 v1 wire is mandatory")
+        XCTAssertTrue(t.contains("one field per line") && t.contains("omit unused fields"),
+                      "v1 sparsity is explicit")
+        XCTAssertTrue(t.contains("use `o:cont` for tool-only continuation"),
+                      "tool-only continuation uses the canonical sparse v1 field")
+        XCTAssertFalse(t.contains("R0 micro") || t.contains("R1 work"),
+                       "retired SR1 registers must not be advertised")
         // Reasoning/thinking narration must be distill-shaped too, so the existing reasoning ->
         // humanize -> savings pipeline can compress and credit it instead of leaking verbose prose.
-        XCTAssertTrue(t.lowercased().contains("reasoning") || t.lowercased().contains("r1"),
+        XCTAssertTrue(t.lowercased().contains("reasoning"),
                       "agent must keep thinking/work turns in sparse distill, not free prose")
         XCTAssertFalse(t.contains("Keep hidden chain-of-thought private"),
                        "thinking is no longer exempt from distill; surfaced reasoning is compressed and counted")
@@ -77,8 +79,10 @@ final class DistillInstructionsTemplateTests: XCTestCase {
         XCTAssertLessThan(t.count, 2_600, "provider config must stay compact (skill-complete rule may add a few lines)")
         XCTAssertFalse(t.contains("bun test 2>&1 | distill"), "examples belong in the managed skill")
         XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("bun test 2>&1 | distill"))
-        XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("R0 micro"),
-                      "full skill carries R0 dialect details")
+        XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("@sr2 v1"),
+                      "full skill carries the current SR2 v1 dialect")
+        XCTAssertFalse(AgentSkillInstaller.distillSkillTemplate.contains("R0 micro"),
+                       "full skill must not advertise the retired SR1 register dialect")
         XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("NEVER Distill skill content"),
                       "full skill body also protects skill content as a verbatim category")
         XCTAssertTrue(
@@ -94,6 +98,23 @@ final class DistillInstructionsTemplateTests: XCTestCase {
         // Bounded by the managed markers.
         XCTAssertTrue(t.hasPrefix(AgentSkillInstaller.distillInstructionsBeginMarker))
         XCTAssertTrue(t.contains("<!-- distill skill: end -->"))
+    }
+
+    func test_instructionsSplitMixedShellGroupsIntoSeparateToolCalls() {
+        // WHY: an absolute provider zsh can bypass the managed aggregate
+        // wrapper. Batching exact probes with a noisy suffix would otherwise
+        // invite partial-child compression and prefix loss.
+        let compact = AgentSkillInstaller.distillAgentInstructionsTemplate
+        XCTAssertTrue(compact.contains("Mixed exact+ordinary shell: separate tool calls"))
+        XCTAssertTrue(compact.contains("unowned mix fails open raw"))
+        XCTAssertTrue(compact.contains("`run:[a;b]>[c]`"))
+        XCTAssertTrue(compact.contains("each bracket is one separate ordered shell tool call"))
+        XCTAssertTrue(compact.contains("ordinary group uses explicit `| distill`"))
+
+        let full = AgentSkillInstaller.distillSkillTemplate
+        XCTAssertTrue(full.contains("NEVER batch exact-output and ordinary commands"))
+        XCTAssertTrue(full.contains("Run exact probes as separate tool calls"))
+        XCTAssertTrue(full.contains("Unowned mixed compounds intentionally fail open wholly raw"))
     }
 
     func test_tokenSaverOffDoesNotInjectDistillPolicy() {

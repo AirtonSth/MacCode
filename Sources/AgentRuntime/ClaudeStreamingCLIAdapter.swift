@@ -91,6 +91,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         var lastInFlightPrompt: String?
         /// Last request used to (re)spawn this session (cwd / model / resume).
         var lastSpawnRequest: AgentRunRequest?
+        /// The typed host instruction is installed at process/session creation.
+        /// A persistent Claude session cannot safely change it in place, so a
+        /// changed identity must take the existing resume/respawn path.
+        var trustedHostInstructionIdentity: String?
         /// Saw a non-terminal ambient `result` with origin.kind == task-notification.
         var ambientTaskNotificationResultSeen = false
         /// True once this logical turn already spent its one ambient-exit retry.
@@ -226,7 +230,8 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session.sawError = false
         session.status = .running
         session.cancellationRequested = false
-        session.lastInFlightPrompt = request.providerPrompt
+        let userPrompt = request.trustedHostInstruction == nil ? request.providerPrompt : request.prompt
+        session.lastInFlightPrompt = userPrompt
         session.lastSpawnRequest = request
         // Fresh user turn: clear ambient-only bookkeeping. A mid-run ambient
         // retry reuses the same Session fields without going through sendTurn.
@@ -256,10 +261,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         do {
             if let acceptancePermit = request.acceptancePermit {
                 try acceptancePermit.withAcceptance {
-                    try sendPrompt(request.providerPrompt, to: session)
+                    try sendPrompt(userPrompt, to: session)
                 }
             } else {
-                try sendPrompt(request.providerPrompt, to: session)
+                try sendPrompt(userPrompt, to: session)
             }
         } catch {
             lock.lock()
@@ -639,6 +644,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                               reasoningEffort: request.reasoningEffort,
                               interactionMode: request.interactionMode,
                               foreignUserUID: foreignUserUID)
+        session.trustedHostInstructionIdentity = Self.trustedHostInstructionIdentity(for: request)
         session.environment = request.environment
         stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self, weak session] handle in
             guard let self, let session else { return }
@@ -682,6 +688,13 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             && session.permissionMode == request.permissionMode
             && session.reasoningEffort == request.reasoningEffort
             && session.interactionMode == request.interactionMode
+            && session.trustedHostInstructionIdentity == trustedHostInstructionIdentity(for: request)
+    }
+
+    private static func trustedHostInstructionIdentity(for request: AgentRunRequest) -> String? {
+        let value = request.trustedHostInstruction?.text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return value?.isEmpty == false ? value : nil
     }
 
     private func sendPrompt(_ text: String, to session: Session) throws {
@@ -2009,6 +2022,7 @@ private extension AgentRunRequest {
             model: model,
             cwd: cwd,
             prompt: prompt,
+            trustedHostInstruction: trustedHostInstruction,
             userMessageContent: userMessageContent,
             attachments: attachments,
             providerThreadId: providerThreadId,

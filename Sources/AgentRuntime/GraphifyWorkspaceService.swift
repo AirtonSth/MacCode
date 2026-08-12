@@ -275,7 +275,9 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     }
 
     private func processEnvironment() -> [String: String] {
-        var env = ProcessInfo.processInfo.environment
+        var env = ChildProcessEnvironmentPolicy.scrubHostOnlyKeys(
+            from: ProcessInfo.processInfo.environment
+        )
         if let login = LoginShellEnvironment.current() {
             for (k, v) in login where env[k] == nil { env[k] = v }
             if let p = login["PATH"] {
@@ -286,7 +288,7 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         let localBin = NSHomeDirectory() + "/.local/bin"
         let path = env["PATH"] ?? ""
         if !path.contains(localBin) { env["PATH"] = localBin + ":" + path }
-        return env
+        return ChildProcessEnvironmentPolicy.scrubHostOnlyKeys(from: env)
     }
 
     // MARK: Status / verify (staleness-aware)

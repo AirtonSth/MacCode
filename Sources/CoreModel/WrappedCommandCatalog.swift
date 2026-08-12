@@ -30,11 +30,30 @@ public enum WrappedCommandCatalog {
         "cat", "head", "tail", "nl", "tac",
         // exact compare / binary-ish dumps
         "diff", "cmp", "od", "hexdump", "xxd", "base64",
+        // verification digests (every byte is part of the proof)
+        "hash", "shasum", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum",
+        "md5", "md5sum", "cksum", "b2sum",
         // structured extractors (full document often required)
         "jq", "yq"
     ]
 
     public static let exactOutputCommandSet: Set<String> = Set(exactOutputCommands)
+
+    // MARK: Interactive / TUI (no wrap, no | distill)
+
+    /// Programs whose normal contract owns a terminal session rather than
+    /// producing finite stdout for the agent. Capturing these behind a wrapper
+    /// can break input, cursor control, alternate screens, or job control.
+    public static let interactiveCommands: [String] = [
+        "vi", "vim", "nvim", "nano", "emacs",
+        "less", "more", "most", "man", "info",
+        "top", "htop", "btop", "watch", "fzf",
+        "lazygit", "tig", "gitui", "ranger", "nnn", "mc", "k9s",
+        "tmux", "screen", "lldb", "gdb",
+        "ssh", "sftp", "ftp", "telnet"
+    ]
+
+    public static let interactiveCommandSet: Set<String> = Set(interactiveCommands)
 
     // MARK: Compressible wrap targets
 
@@ -77,5 +96,27 @@ public enum WrappedCommandCatalog {
     public static func isExactOutputCommand(_ command: String) -> Bool {
         let base = (command as NSString).lastPathComponent
         return exactOutputCommandSet.contains(base)
+    }
+
+    public static func isInteractiveCommand(_ command: String) -> Bool {
+        let base = (command as NSString).lastPathComponent
+        return interactiveCommandSet.contains(base)
+    }
+
+    /// Universal wrapper admission. The installed command set is discovered
+    /// from PATH at runtime; this method owns only the closed exclusions.
+    public static func isAutoWrappableCommand(_ command: String) -> Bool {
+        let base = (command as NSString).lastPathComponent
+        guard !base.isEmpty,
+              base != "RemoteCodeDistillService",
+              base != "distill",
+              base != "remote-code",
+              base != "rc-retrieve-mcp",
+              !ProviderProxyCatalog.isProviderProxyCommand(base),
+              !isExactOutputCommand(base),
+              !isInteractiveCommand(base) else {
+            return false
+        }
+        return true
     }
 }

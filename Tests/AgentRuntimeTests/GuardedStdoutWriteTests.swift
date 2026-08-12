@@ -27,7 +27,24 @@ final class GuardedStdoutWriteTests: XCTestCase {
         close(readFD) // consumer closed
         let ok = GuardedStdoutWrite.writeAll(Data("hello".utf8), to: writeFD)
         XCTAssertFalse(ok, "EPIPE after peer close must return false, not raise")
+        let deferred = GuardedStdoutWrite.deferredSideEffectAfterCompleteDelivery(
+            "savings-ledger-row", delivered: ok
+        )
+        XCTAssertNil(deferred,
+                     "a broken stdout pipe must not run the savings ledger for undelivered output")
         close(writeFD)
+    }
+
+    func test_partialDeliveryDoesNotReleaseDeferredSideEffect() {
+        let deferred = GuardedStdoutWrite.deferredSideEffectAfterCompleteDelivery(
+            "savings-ledger-row", delivered: false
+        )
+        XCTAssertNil(deferred,
+                     "partial delivery is not sufficient proof that the agent saw compressed output")
+        XCTAssertEqual(
+            GuardedStdoutWrite.deferredSideEffectAfterCompleteDelivery("savings-ledger-row", delivered: true),
+            "savings-ledger-row"
+        )
     }
 
     func test_writeAll_toOpenPipe_deliversBytes() throws {

@@ -2717,8 +2717,6 @@ public final class SettingsWindowController: NSObject {
         ))
         let win = NSWindow(contentViewController: host)
         win.title = "RemoteCode Settings"
-        win.setAccessibilityRole(.window)
-        win.setAccessibilitySubrole(.standardWindow)
         win.setAccessibilityTitle("RemoteCode Settings")
         win.setAccessibilityIdentifier("window.settings")
         win.styleMask = [.titled, .closable, .resizable]

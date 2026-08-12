@@ -157,6 +157,24 @@ final class ProviderProxyPolicyTests: XCTestCase {
         XCTAssertFalse(scrubbed.keys.contains { $0.hasPrefix("RC_GRAPHIFY_") })
     }
 
+    func test_paidRuntimeEnvironmentAlwaysScrubsHostManagedIntegrationHome() {
+        // WHY: provider proxies may originate in an embedded terminal rather than
+        // AppShell's launcher. Host filesystem-ownership state must not cross that
+        // provider boundary regardless of paid-lane admission.
+        for tokenSaverActive in [false, true] {
+            let scrubbed = ProviderProxyPolicy.paidRuntimeEnvironment(
+                environment: [
+                    ChildProcessEnvironmentPolicy.managedIntegrationHomeKey: "/tmp/app-owned-home",
+                    "UNCHANGED": "yes",
+                ],
+                tokenSaverRuntimeActive: tokenSaverActive,
+                graphifyRuntimeActive: tokenSaverActive
+            )
+            XCTAssertNil(scrubbed[ChildProcessEnvironmentPolicy.managedIntegrationHomeKey])
+            XCTAssertEqual(scrubbed["UNCHANGED"], "yes")
+        }
+    }
+
     func test_childScopedEnvironment_retargetsEachProviderGeneration() {
         // WHY: Codex→Grok→Claude must link each raw provider process to the
         // immediately preceding external child instead of flattening to Codex.

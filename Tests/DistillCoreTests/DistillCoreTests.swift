@@ -766,19 +766,40 @@ final class DistillCoreTests: XCTestCase {
         )
     }
 
-    func test_mlxFallbackKeepsInputFactsWhenModelOutputIsInvalid() {
+    func test_mlxSR1HumanizeRejectsExactR9PartialSR2Rendering() {
+        // WHY: a projectless live thread produced this exact model result. A
+        // leading natural word must not hide a raw protocol banner farther down.
+        let leaked = "done\n@sr2 v0\n1=/Users/samuelfajreldines/.remote-code/bin/swift;/Users/samuelfajreldines/.remote-code/bin/distill"
+
+        XCTAssertFalse(
+            MLXDistillRuntime.isUsefulOutput(leaked, mode: .sr1Humanize),
+            "the sidecar must reject SR1/SR2 wire syntax anywhere in a humanizer result"
+        )
+    }
+
+    func test_mlxFallbackKeepsInputVerbatimWhenModelOutputIsInvalid() {
         let request = DistillRequest(
             mode: .longText,
             input: "RemoteCode Token Saver runs locally on macOS.\nIt preserves exact commands.",
-            maxOutputCharacters: 180
+            maxOutputCharacters: 24
         )
 
         let output = MLXDistillRuntime.fallbackOutput(for: request)
 
-        XCTAssertEqual(
-            output,
-            "S RemoteCode Token Saver runs locally on macOS.\nS It preserves exact commands."
-        )
-        XCTAssertLessThanOrEqual(output.count, request.maxOutputCharacters)
+        XCTAssertEqual(output, request.input)
+    }
+
+    func test_localLongTextFallbackAndSchedulerPreserveTailBeyondTwelveLinesAndCharacterBudget() async throws {
+        // WHY: the deterministic local fallback is the no-model path. It must
+        // not silently erase a late requirement before the host emits lossless v1.
+        let tail = "UNIQUE FINAL INSTRUCTION: preserve the deployment gate."
+        let input = ((1...15).map { "context line \($0)" } + [tail]).joined(separator: "\n")
+        let request = DistillRequest(mode: .longText, input: input, maxOutputCharacters: 32)
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1)
+
+        let response = try await scheduler.submit(request)
+
+        XCTAssertEqual(response.output, input)
+        XCTAssertTrue(response.output.hasSuffix(tail))
     }
 }

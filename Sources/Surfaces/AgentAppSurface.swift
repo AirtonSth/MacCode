@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import AppKit
 import SwiftUI
 import Combine
@@ -111,6 +112,7 @@ private struct TranscriptReactiveScope<Content: View>: View {
 /// stable row, while deliberately excluding live-tail text and paint ticks.
 struct AgentStableTranscriptHistoryRevision: Equatable {
     let entryIDs: [String]
+    let timelineColumnWidth: CGFloat
     let expandedTools: Set<String>
     let expandedToolGroups: Set<String>
     let expandedReasoning: Set<String>
@@ -119,6 +121,8 @@ struct AgentStableTranscriptHistoryRevision: Equatable {
     let workDisclosureRevealByTurn: [String: Int]
     let translatedMessageIDs: Set<AgentMessageID>
     let translationOriginals: [AgentMessageID: String]
+    let translationFinals: [String: String]
+    let assistantDisplayRevision: UInt64
     let outboundPayloads: [AgentMessageID: String]
     let proposedPlanIDs: [String]
     let suppressesProposedPlanReview: Bool
@@ -149,6 +153,7 @@ struct AgentStableWorkRowsRevision: Equatable {
     let expandedTools: Set<String>
     let expandedToolGroups: Set<String>
     let expandedReasoning: Set<String>
+    let assistantDisplayRevision: UInt64
 }
 
 /// Thread mutations performed by the macOS UI itself (create/rename/pin/color/
@@ -486,6 +491,33 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public private(set) var sr1OriginalTextsByMessageId: [AgentMessageID: String] = [:]
     /// UI body when message.content holds the dense wire/stub (dual-channel).
     @Published public private(set) var sr1RewrittenTextsByMessageId: [AgentMessageID: String] = [:]
+    /// Trusted UI rewrite for a turn-owned final. Unlike the message map above,
+    /// a final has no message id at render time, so this is populated only when
+    /// a persisted message id, its translation event, and one timeline turn
+    /// agree on the same history body.
+    @Published public private(set) var sr1RewrittenTextsByTurnId: [String: String] = [:]
+    /// Provider-wire provenance is retained separately from the bounded hot
+    /// timeline projections above. The source is always a typed SR1 event; the
+    /// keys let persisted messages and turn/item snapshots keep rendering their
+    /// wire bodies after that event is evicted from the hot timeline.
+    private struct TrustedProviderDisplay: Equatable {
+        let wireSHA256: String
+        let displayText: String
+    }
+    private var trustedProviderDisplayByMessageId: [AgentMessageID: TrustedProviderDisplay] = [:]
+    private var trustedProviderDisplayByTurnId: [String: TrustedProviderDisplay] = [:]
+    private var trustedProviderDisplayByItemId: [String: TrustedProviderDisplay] = [:]
+    /// Cheap repaint token for digest-verified display provenance. Stable
+    /// LazyVStack histories include this scalar instead of copying or hashing
+    /// every bounded natural display string during each paint.
+    @Published public private(set) var assistantDisplayRevision: UInt64 = 0
+    private var persistedDisplayTranslationKeys: Set<String> = []
+    private var pendingDisplayTranslationKeys: Set<String> = []
+    private var assistantDisplayPersistenceGeneration: UInt64 = 0
+    private var assistantDisplayPersistenceTask: Task<Void, Never>?
+    #if DEBUG
+    private var assistantDisplayPersistenceFailuresRemainingForTesting = 0
+    #endif
     /// The UI holds only a bounded recent message page. Older durable messages
     /// remain in SQLite and are intentionally outside the hot screen-memory set.
     @Published public private(set) var messageHistoryIsPartial = false
@@ -532,6 +564,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // the undo window lapses. Cancelled on a new revert, on undo, or on teardown.
     private var checkpointRevertUndoExpiryTask: Task<Void, Never>?
     private var messageHistoryLoadTask: Task<Void, Never>?
+    private var durableCommandRecoveryTask: Task<Void, Never>?
     /// PERF: tracks thread ids whose placeholder titles have already been repaired
     /// so reloadThreads never issues a full messageRepo.list for the same thread twice.
     private var repairedThreadIds: Set<AgentThreadID> = []
@@ -592,6 +625,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         self.clock = clock
     }
 
+    #if DEBUG
+    func failNextAssistantDisplayPersistenceWritesForTesting(_ count: Int = 1) {
+        assistantDisplayPersistenceFailuresRemainingForTesting = max(0, count)
+    }
+    #endif
+
     public func sr1OriginalText(for id: AgentMessageID) -> String? {
         sr1OriginalTextsByMessageId[id]
     }
@@ -601,6 +640,98 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     private static let deterministicWireDisplayCharacterLimit = 4_000
+
+    private static func providerWireSHA256(_ text: String) -> String {
+        var hasher = SHA256()
+        var copy = text
+        copy.withUTF8 { buffer in
+            hasher.update(bufferPointer: UnsafeRawBufferPointer(buffer))
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func boundedTrustedDisplay(_ text: String) -> String {
+        AgentMessageRepository.boundedAssistantDisplayText(text)
+    }
+
+    private func queueAssistantDisplayPersistence(
+        key: String,
+        write: @escaping @Sendable () throws -> Void
+    ) {
+        guard !persistedDisplayTranslationKeys.contains(key),
+              pendingDisplayTranslationKeys.insert(key).inserted else { return }
+        let prior = assistantDisplayPersistenceTask
+        let generation = assistantDisplayPersistenceGeneration
+        #if DEBUG
+        let shouldFailForTesting = assistantDisplayPersistenceFailuresRemainingForTesting > 0
+        if shouldFailForTesting { assistantDisplayPersistenceFailuresRemainingForTesting -= 1 }
+        #else
+        let shouldFailForTesting = false
+        #endif
+        let writeTask = Task.detached(priority: .utility) {
+            await prior?.value
+            guard !Task.isCancelled, !shouldFailForTesting else { return false }
+            do {
+                try write()
+                return true
+            } catch {
+                return false
+            }
+        }
+        assistantDisplayPersistenceTask = Task { @MainActor [weak self] in
+            let didPersist = await writeTask.value
+            guard let self, !Task.isCancelled,
+                  self.assistantDisplayPersistenceGeneration == generation else { return }
+            self.pendingDisplayTranslationKeys.remove(key)
+            if didPersist {
+                self.persistedDisplayTranslationKeys.insert(key)
+            }
+        }
+    }
+
+    private func queueAssistantDisplayTranslationPersistence(
+        messageId: AgentMessageID,
+        threadId: AgentThreadID,
+        originalWire: String,
+        displayText: String
+    ) {
+        let digest = Self.providerWireSHA256(originalWire)
+        let key = "\(messageId.value.uuidString):\(digest)"
+        let repository = messageRepo
+        queueAssistantDisplayPersistence(key: key) {
+            try repository.upsertAssistantDisplayTranslation(
+                messageId: messageId,
+                threadId: threadId,
+                originalWire: originalWire,
+                displayText: displayText
+            )
+        }
+    }
+
+    private func queueTimelineDisplayTranslationPersistence(
+        ownerKind: String,
+        ownerId: String,
+        threadId: AgentThreadID,
+        originalWire: String,
+        displayText: String
+    ) {
+        let digest = Self.providerWireSHA256(originalWire)
+        let key = "timeline:\(ownerKind):\(ownerId):\(digest)"
+        let repository = messageRepo
+        queueAssistantDisplayPersistence(key: key) {
+            try repository.upsertTimelineDisplayTranslation(
+                ownerKind: ownerKind,
+                ownerId: ownerId,
+                threadId: threadId,
+                originalWire: originalWire,
+                displayText: displayText
+            )
+        }
+    }
+
+    func waitForAssistantDisplayPersistence() async {
+        await assistantDisplayPersistenceTask?.value
+    }
 
     private static func boundedDeterministicWireDisplay(_ text: String) -> String {
         guard text.count > deterministicWireDisplayCharacterLimit else { return text }
@@ -678,23 +809,51 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     /// Dual-channel display: prefer humanized rewrite when content is wire/stub.
-    public func assistantDisplayText(for message: AgentMessage) -> String {
-        if let rewritten = sr1RewrittenTextsByMessageId[message.id], !rewritten.isEmpty {
-            return rewritten
-        }
-        // Translation stream events are intentionally prunable. When a replay
-        // no longer contains that event, resolve the durable prose marker from
-        // the persisted history stub before showing raw SR2 wire to the user.
-        if let marker = SR2WirePolicy.recoveryMarker(in: message.content),
+    /// This same durable fallback is used for assistant/reasoning timeline items;
+    /// stream translation events may be pruned while their wire bodies remain.
+    public func humanizedAssistantContent(_ content: String) -> String {
+        if let marker = SR2WirePolicy.recoveryMarker(in: content),
            let recovered = coordinator.reversibleProseRetriever?(marker),
            !recovered.isEmpty {
             return recovered
         }
-        if let fallback = Self.deterministicWireDisplayText(message.content),
-           !fallback.isEmpty {
-            return fallback
+        // Content alone carries no provenance. A user can intentionally quote
+        // a marker-first SR2 example, so deterministic wire expansion belongs
+        // only to the typed translation path below (or durable recovery above).
+        return content
+    }
+
+    public func assistantDisplayText(for message: AgentMessage) -> String {
+        if let rewritten = sr1RewrittenTextsByMessageId[message.id], !rewritten.isEmpty {
+            return rewritten
         }
-        return message.content
+        if let trusted = trustedProviderDisplayByMessageId[message.id],
+           trusted.wireSHA256 == Self.providerWireSHA256(message.content) {
+            return trusted.displayText
+        }
+        return humanizedAssistantContent(message.content)
+    }
+
+    /// Display text for persisted timeline content. A turn-owned final has no
+    /// message id at paint time, while an item has a stable item id; both are
+    /// checked against typed translation provenance before deterministic wire
+    /// expansion is allowed.
+    public func assistantDisplayText(
+        for content: String,
+        itemId: String? = nil,
+        turnId: String? = nil
+    ) -> String {
+        if let itemId,
+           let trusted = trustedProviderDisplayByItemId[itemId],
+           trusted.wireSHA256 == Self.providerWireSHA256(content) {
+            return trusted.displayText
+        }
+        if let turnId,
+           let trusted = trustedProviderDisplayByTurnId[turnId],
+           trusted.wireSHA256 == Self.providerWireSHA256(content) {
+            return trusted.displayText
+        }
+        return humanizedAssistantContent(content)
     }
 
     public init(
@@ -900,6 +1059,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         checkpointRevertUndoExpiryTask = nil
         messageHistoryLoadTask?.cancel()
         messageHistoryLoadTask = nil
+        durableCommandRecoveryTask?.cancel()
+        durableCommandRecoveryTask = nil
         cancelOlderMessageLoad()
         if let tokenSaverFooterObserver {
             NotificationCenter.default.removeObserver(tokenSaverFooterObserver)
@@ -933,6 +1094,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         sr1TranslatedMessageIds = []
         sr1OriginalTextsByMessageId = [:]
         sr1RewrittenTextsByMessageId = [:]
+        sr1RewrittenTextsByTurnId = [:]
+        trustedProviderDisplayByMessageId = [:]
+        trustedProviderDisplayByTurnId = [:]
+        trustedProviderDisplayByItemId = [:]
+        persistedDisplayTranslationKeys = []
+        pendingDisplayTranslationKeys = []
+        assistantDisplayPersistenceGeneration &+= 1
+        assistantDisplayPersistenceTask?.cancel()
+        assistantDisplayPersistenceTask = nil
     }
 
     /// Used by the multi-surface rail reload hub (EventBus fan-out).
@@ -1535,6 +1705,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Bumped on every full thread open so deferred provider-snapshot tasks for
     /// a prior open never wipe a newer selection (or the same thread re-selected soft).
     private var selectThreadOpenGeneration: UInt64 = 0
+    #if DEBUG
+    private(set) var durableCommandReplayCompletionCountForTesting = 0
+    #endif
 
     public func selectThread(_ id: AgentThreadID, markRead: Bool = true) {
         guard !isDisposed else { return }
@@ -1573,6 +1746,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return
         }
         // Full open path — only when the selected thread actually changes.
+        durableCommandRecoveryTask?.cancel()
+        durableCommandRecoveryTask = nil
         selectThreadOpenGeneration &+= 1
         let openGeneration = selectThreadOpenGeneration
         Self.agentOpenTrace(
@@ -1593,6 +1768,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         sr1TranslatedMessageIds = []
         sr1OriginalTextsByMessageId = [:]
         sr1RewrittenTextsByMessageId = [:]
+        sr1RewrittenTextsByTurnId = [:]
+        trustedProviderDisplayByMessageId = [:]
+        trustedProviderDisplayByTurnId = [:]
+        trustedProviderDisplayByItemId = [:]
+        persistedDisplayTranslationKeys = []
+        pendingDisplayTranslationKeys = []
+        assistantDisplayPersistenceGeneration &+= 1
         // Per-thread provider state: the opened thread republishes its own
         // count on its next snapshot, so carrying the previous thread's
         // shell count over would advertise work that isn't this thread's.
@@ -1674,7 +1856,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         streamAggregateBudgetOps = 0
         _ = streamEventBatch.drain()
         let persistedEvents = coordinator.latestStreamEvents(threadId: id)
-        if coordinator.hotReplayIsPartial(threadId: id) {
+        let replayIsPartial = coordinator.hotReplayIsPartial(threadId: id)
+        if replayIsPartial {
             historyReplayNotice = Self.replayNoticeText(isPartial: true)
         }
         // PERF: open instantly from persisted events (no main-thread provider
@@ -1710,6 +1893,39 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         Self.agentOpenTrace(
             "full open firstPaint items=\(persistedItemCount) turns=\(timeline.turns.count) fetchSnapshot=\(fetchSnapshot) recoverable=\(selectedThreadHasRecoverableContext)"
         )
+        if replayIsPartial {
+            let firstPaintTimeline = timeline
+            let coordinator = coordinator
+            durableCommandRecoveryTask = Task { @MainActor [weak self] in
+                let replayEvents = await coordinator.durableCommandReplay(
+                    threadId: id,
+                    persistedEvents: persistedEvents
+                )
+                guard let self else { return }
+                #if DEBUG
+                self.durableCommandReplayCompletionCountForTesting &+= 1
+                #endif
+                // Recovery is advisory display state. Never let an older open,
+                // a thread switch, or live progress overwrite newer transcript state.
+                guard self.selectedThreadId == id,
+                      self.selectThreadOpenGeneration == openGeneration,
+                      self.timeline == firstPaintTimeline,
+                      replayEvents != persistedEvents else {
+                    return
+                }
+                Self.agentOpenTrace(
+                    "durable command replay APPLY thread=\(id.value.uuidString.prefix(8)) gen=\(openGeneration)"
+                )
+                self.timeline = Self.timelineByReplaying(replayEvents)
+                self.rehydrateDurableActiveState(threadId: id)
+                self.restoreQueuedFollowupTranscriptPresentation(threadId: id)
+                self.rehydrateProposedPlans(threadId: id)
+                self.rehydratePendingCallbacks(threadId: id)
+                self.lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: replayEvents)
+                self.refreshSR1TranslationStateFromTimeline(preservingExisting: true)
+                self.timelineItemIndex = TimelineItemIndex(turns: self.timeline.turns)
+            }
+        }
         if fetchSnapshot {
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -2667,6 +2883,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 repository: repository,
                 threadId: id
             )
+            let persistedDisplayTranslations = await Self.loadAssistantDisplayTranslationsOffMain(
+                repository: repository,
+                threadId: id
+            )
+            let persistedTimelineTranslations = await Self.loadTimelineDisplayTranslationsOffMain(
+                repository: repository,
+                threadId: id
+            )
             guard let self, !Task.isCancelled, !self.isDisposed,
                   self.selectedThreadId == id else { return }
             let loadedRows = loaded?.rows ?? []
@@ -2681,12 +2905,56 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             )
             self.messageHistoryIsPartial = loaded?.hasMoreOlder ?? false
             self.outboundPayloadsByMessageId = outboundPayloads
+            self.trustedProviderDisplayByMessageId = Dictionary(
+                uniqueKeysWithValues: persistedDisplayTranslations.map {
+                    ($0.messageId, TrustedProviderDisplay(
+                        wireSHA256: $0.wireSHA256,
+                        displayText: $0.displayText
+                    ))
+                }
+            )
+            self.persistedDisplayTranslationKeys = Set(
+                persistedDisplayTranslations.map { "\($0.messageId.value.uuidString):\($0.wireSHA256)" }
+            )
+            for translation in persistedTimelineTranslations {
+                let display = TrustedProviderDisplay(
+                    wireSHA256: translation.wireSHA256,
+                    displayText: translation.displayText
+                )
+                switch translation.ownerKind {
+                case "item": self.trustedProviderDisplayByItemId[translation.ownerId] = display
+                case "turn": self.trustedProviderDisplayByTurnId[translation.ownerId] = display
+                default: break
+                }
+                self.persistedDisplayTranslationKeys.insert(
+                    "timeline:\(translation.ownerKind):\(translation.ownerId):\(translation.wireSHA256)"
+                )
+            }
+            self.rehydrateTrustedTurnDisplaysFromPersistedMessages()
+            // Provenance maps are intentionally not @Published individually:
+            // publishing their bounded strings would widen every transcript
+            // invalidation. One scalar lets stable history repaint exactly once.
+            self.assistantDisplayRevision &+= 1
             // Queue rows are not transcript bubbles; only re-apply plan
             // suppression after the durable message merge.
             self.restoreQueuedFollowupTranscriptPresentation(threadId: id)
             if self.messageHistoryIsPartial {
                 NSLog("[AgentApp] recent message page loaded: \(self.messages.count) rows; older durable messages remain outside the hot UI window")
             }
+        }
+    }
+
+    /// Reconnect persisted message provenance to a turn final after the stream
+    /// translation event has been pruned. The digest match is against the typed
+    /// persisted message record; no wire-shape classifier is involved.
+    private func rehydrateTrustedTurnDisplaysFromPersistedMessages() {
+        for turn in timeline.turns {
+            guard let final = turn.finalAssistantMessage else { continue }
+            guard let message = messages.first(where: {
+                $0.role == .assistant && $0.content == final
+            }), let display = trustedProviderDisplayByMessageId[message.id],
+                  display.wireSHA256 == Self.providerWireSHA256(final) else { continue }
+            trustedProviderDisplayByTurnId[turn.turnId] = display
         }
     }
 
@@ -2761,6 +3029,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         await messageHistoryLoadTask?.value
     }
 
+    /// Test seam: waits for the bounded off-main command recovery scheduled by
+    /// a pruned full-open replay.
+    func waitForDurableCommandRecovery() async {
+        await durableCommandRecoveryTask?.value
+    }
+
     nonisolated static func loadMessagePageOffMain(
         repository: AgentMessageRepository,
         threadId: AgentThreadID,
@@ -2783,6 +3057,24 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     ) async -> [AgentMessageID: String] {
         await Task.detached(priority: .userInitiated) {
             (try? repository.outboundPayloads(threadId: threadId)) ?? [:]
+        }.value
+    }
+
+    nonisolated static func loadAssistantDisplayTranslationsOffMain(
+        repository: AgentMessageRepository,
+        threadId: AgentThreadID
+    ) async -> [AgentMessageRepository.AssistantDisplayTranslation] {
+        await Task.detached(priority: .userInitiated) {
+            (try? repository.assistantDisplayTranslations(threadId: threadId)) ?? []
+        }.value
+    }
+
+    nonisolated static func loadTimelineDisplayTranslationsOffMain(
+        repository: AgentMessageRepository,
+        threadId: AgentThreadID
+    ) async -> [AgentMessageRepository.TimelineDisplayTranslation] {
+        await Task.detached(priority: .userInitiated) {
+            (try? repository.timelineDisplayTranslations(threadId: threadId)) ?? []
         }.value
     }
 
@@ -5085,6 +5377,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         sr1TranslatedMessageIds = []
         sr1OriginalTextsByMessageId = [:]
         sr1RewrittenTextsByMessageId = [:]
+        sr1RewrittenTextsByTurnId = [:]
+        trustedProviderDisplayByMessageId = [:]
+        trustedProviderDisplayByTurnId = [:]
+        trustedProviderDisplayByItemId = [:]
+        persistedDisplayTranslationKeys = []
+        pendingDisplayTranslationKeys = []
+        assistantDisplayPersistenceGeneration &+= 1
+        assistantDisplayPersistenceTask?.cancel()
+        assistantDisplayPersistenceTask = nil
         providerThreadSnapshotStatusMessage = nil
         providerThreadSnapshotLastConfirmedAt = nil
         selectedThreadHasRecoverableContext = false
@@ -7783,12 +8084,86 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         var ids: Set<AgentMessageID> = []
         var originals: [AgentMessageID: String] = [:]
         var rewrites: [AgentMessageID: String] = [:]
+        // Keep this provenance ledger outside the hot timeline projection. The
+        // latter is deliberately replaced after aggregate-budget eviction;
+        // these keys are what let already-persisted transcript rows continue to
+        // render their provider wire without content-based classification.
+        var trustedMessageDisplays = trustedProviderDisplayByMessageId
+        var trustedTurnDisplays = trustedProviderDisplayByTurnId
+        var trustedItemDisplays = trustedProviderDisplayByItemId
         for (rawId, translation) in sourceTimeline.sr1TranslationsByMessageId {
             guard let uuid = UUID(uuidString: rawId) else { continue }
             let id = AgentMessageID(uuid)
             ids.insert(id)
             originals[id] = translation.originalText
             rewrites[id] = translation.rewrittenText
+            if !translation.originalText.isEmpty, !translation.rewrittenText.isEmpty {
+                let display = Self.boundedTrustedDisplay(translation.rewrittenText)
+                trustedMessageDisplays[id] = TrustedProviderDisplay(
+                    wireSHA256: Self.providerWireSHA256(translation.originalText),
+                    displayText: display
+                )
+                if let threadId = messages.first(where: { $0.id == id })?.threadId ?? selectedThreadId {
+                    queueAssistantDisplayTranslationPersistence(
+                        messageId: id,
+                        threadId: threadId,
+                        originalWire: translation.originalText,
+                        displayText: display
+                    )
+                }
+            }
+        }
+        for (rawItemId, translation) in sourceTimeline.sr1TranslationsByItemId {
+            guard !translation.originalText.isEmpty, !translation.rewrittenText.isEmpty else { continue }
+            let display = TrustedProviderDisplay(
+                wireSHA256: Self.providerWireSHA256(translation.originalText),
+                displayText: Self.boundedTrustedDisplay(translation.rewrittenText)
+            )
+            trustedItemDisplays[rawItemId] = display
+            if let threadId = selectedThreadId {
+                queueTimelineDisplayTranslationPersistence(
+                    ownerKind: "item",
+                    ownerId: rawItemId,
+                    threadId: threadId,
+                    originalWire: translation.originalText,
+                    displayText: display.displayText
+                )
+            }
+            if let item = sourceTimeline.turns.lazy
+                .flatMap({ $0.items })
+                .first(where: { $0.id == rawItemId }),
+               item.body == translation.originalText || item.output == translation.originalText {
+                trustedTurnDisplays[item.turnId] = display
+            }
+        }
+        var finalRewrites: [String: String] = [:]
+        for (rawId, translation) in sourceTimeline.sr1TranslationsByMessageId {
+            guard UUID(uuidString: rawId) != nil,
+                  !translation.rewrittenText.isEmpty else { continue }
+            let matchingTurns = sourceTimeline.turns.filter {
+                $0.finalAssistantMessage == translation.originalText
+            }
+            // Content equality is only the final identity check. The trusted
+            // source is the typed translation event keyed by the persisted
+            // assistant message id; ambiguous duplicate finals fail closed.
+            guard matchingTurns.count == 1,
+                  let turn = matchingTurns.first else { continue }
+            finalRewrites[turn.turnId] = translation.rewrittenText
+            if !translation.originalText.isEmpty, !translation.rewrittenText.isEmpty {
+                trustedTurnDisplays[turn.turnId] = TrustedProviderDisplay(
+                    wireSHA256: Self.providerWireSHA256(translation.originalText),
+                    displayText: Self.boundedTrustedDisplay(translation.rewrittenText)
+                )
+                if let threadId = selectedThreadId {
+                    queueTimelineDisplayTranslationPersistence(
+                        ownerKind: "turn",
+                        ownerId: turn.turnId,
+                        threadId: threadId,
+                        originalWire: translation.originalText,
+                        displayText: translation.rewrittenText
+                    )
+                }
+            }
         }
         // Two callers, two semantics:
         // - Live-stream batches REPLACE, so translations evicted by the hot-text
@@ -7802,6 +8177,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             ids.formUnion(sr1TranslatedMessageIds)
             originals.merge(sr1OriginalTextsByMessageId) { fromTimeline, _ in fromTimeline }
             rewrites.merge(sr1RewrittenTextsByMessageId) { fromTimeline, _ in fromTimeline }
+            finalRewrites.merge(sr1RewrittenTextsByTurnId) { fromTimeline, _ in fromTimeline }
         }
         if ids != sr1TranslatedMessageIds {
             sr1TranslatedMessageIds = ids
@@ -7811,6 +8187,25 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         if rewrites != sr1RewrittenTextsByMessageId {
             sr1RewrittenTextsByMessageId = rewrites
+        }
+        if finalRewrites != sr1RewrittenTextsByTurnId {
+            sr1RewrittenTextsByTurnId = finalRewrites
+        }
+        var trustedDisplayChanged = false
+        if trustedMessageDisplays != trustedProviderDisplayByMessageId {
+            trustedProviderDisplayByMessageId = trustedMessageDisplays
+            trustedDisplayChanged = true
+        }
+        if trustedTurnDisplays != trustedProviderDisplayByTurnId {
+            trustedProviderDisplayByTurnId = trustedTurnDisplays
+            trustedDisplayChanged = true
+        }
+        if trustedItemDisplays != trustedProviderDisplayByItemId {
+            trustedProviderDisplayByItemId = trustedItemDisplays
+            trustedDisplayChanged = true
+        }
+        if trustedDisplayChanged {
+            assistantDisplayRevision &+= 1
         }
     }
 }
@@ -8447,6 +8842,13 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         default:
             return nil
         }
+        if let command = rawShellCommand(for: item) {
+            return AgentAppView.cappedVisibleText(
+                command,
+                limit: AgentAppView.commandPreviewCharacterLimit,
+                truncatedLabel: "hidden from preview"
+            )
+        }
         let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { return nil }
         if let data = body.data(using: .utf8),
@@ -8470,6 +8872,20 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         }
         // Non-JSON body is already a human-readable input/description.
         return AgentAppView.cappedVisibleText(body, limit: AgentAppView.commandPreviewCharacterLimit, truncatedLabel: "hidden from preview")
+    }
+
+    /// Exact command text for expanded display and copy. Collapsed previews stay
+    /// capped, but a provider that emits commandExecution as a raw non-JSON body
+    /// must never lose the tail of the command in the only audit surface.
+    static func fullToolCommand(for item: AssistantItem) -> String? {
+        switch item.type {
+        case .tool, .mcpToolCall, .dynamicToolCall, .collabToolCall, .commandExecution:
+            break
+        default:
+            return nil
+        }
+        if let raw = rawShellCommand(for: item) { return raw }
+        return toolCommandPreview(for: item)
     }
 
     // MARK: Tool card presentation (collapsed density)
@@ -8525,6 +8941,9 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
     /// L1 title for tool rows: short tool name without full shell pipelines or call UUIDs.
     /// Does not mutate stored summary/body — pure display transform.
     static func toolDisplayLabel(for item: AssistantItem) -> String {
+        if item.type == .commandExecution, fullToolCommand(for: item) != nil {
+            return "Shell"
+        }
         var label = basePrimaryText(for: item)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         // Provider titles sometimes embed `[bg]` + the whole command.
@@ -8652,7 +9071,7 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
 
     /// Token Saver distill wrapper was present on the command (display chip only).
     static func toolCommandWasDistilled(for item: AssistantItem) -> Bool {
-        guard let raw = rawShellCommand(for: item) ?? toolCommandPreview(for: item) else { return false }
+        guard let raw = fullToolCommand(for: item) else { return false }
         return firstMatchRange(distillPipePresentRegex, in: raw) != nil
     }
 
@@ -8791,16 +9210,45 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         return false
     }
 
-    /// Raw `command`/`cmd`/`script` string from tool input JSON (uncapped), if present.
+    /// Raw shell input (uncapped), whether the provider encoded it as JSON or
+    /// emitted it directly in `body`.
     static func rawShellCommand(for item: AssistantItem) -> String? {
-        guard let obj = toolInputObject(for: item) else { return nil }
-        for key in ["command", "cmd", "script"] {
-            if let value = (obj[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
-                return value
+        if let obj = toolInputObject(for: item) {
+            for key in ["command", "cmd", "script"] {
+                if let value = (obj[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                    return value
+                }
             }
+        }
+        guard hasRawBodyShellIdentity(item) else { return nil }
+        let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !body.isEmpty,
+           body.data(using: .utf8).flatMap({ try? JSONSerialization.jsonObject(with: $0) }) == nil {
+            return body
+        }
+        // Codex app-server commandExecution items carry the command in summary;
+        // body is empty at start and output is streamed separately. Preserve the
+        // uncapped summary as a compatibility fallback for persisted transcripts.
+        if item.type == .commandExecution,
+           let summary = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !summary.isEmpty,
+           !commandExecutionPlaceholderSummaries.contains(summary.lowercased()) {
+            return summary
         }
         return nil
     }
+
+    private static func hasRawBodyShellIdentity(_ item: AssistantItem) -> Bool {
+        if item.type == .commandExecution { return true }
+        guard let summary = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+            return false
+        }
+        return ["bash", "shell", "terminal", "command", "exec"].contains(summary)
+    }
+
+    private static let commandExecutionPlaceholderSummaries: Set<String> = [
+        "command output", "running", "completed", "failed", "cancelled", "canceled", "in progress"
+    ]
 
     static func looksLikeShellCommand(_ text: String) -> Bool {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -9435,6 +9883,39 @@ public struct AgentAppView: View {
     /// decision is independent of view state.
     static func showsTranslatedBadge(wasSR1Translated: Bool) -> Bool {
         wasSR1Translated
+    }
+
+    /// A persisted assistant message keeps its exact provider wire in `content`.
+    /// The raw/original disclosure must remain available even after prunable SR1
+    /// translation events have been evicted from the hot timeline.
+    static func showsAssistantOriginalToggle(
+        messageContent: String,
+        displayText: String,
+        wasSR1Translated: Bool
+    ) -> Bool {
+        guard !messageContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        return wasSR1Translated || messageContent != displayText
+    }
+
+    /// Exact provider wire used by both the disclosure body and its copy action.
+    /// Returning the original value (rather than reconstructing it from display
+    /// text) keeps byte-for-byte v1 payloads available without classifying
+    /// legitimate assistant-authored SR2 examples as protocol output.
+    static func assistantOriginalWire(
+        messageContent: String,
+        displayText: String,
+        wasSR1Translated: Bool,
+        retrieve: ((String) -> String?)? = nil
+    ) -> String? {
+        guard showsAssistantOriginalToggle(
+            messageContent: messageContent,
+            displayText: displayText,
+            wasSR1Translated: wasSR1Translated
+        ) else { return nil }
+        return SR2WirePolicy.providerOriginal(in: messageContent, retrieve: retrieve)
+            ?? messageContent
     }
 
     static func sr1BadgeLabel(hasOriginalText: Bool) -> String {
@@ -10222,16 +10703,21 @@ public struct AgentAppView: View {
     static func liveRenderableCopy(_ item: AssistantItem) -> AssistantItem {
         var copy = item
         copy.summary = cappedOptionalVisibleText(copy.summary, limit: liveTurnSummaryCharacterLimit)
+        let preservesAuditInput = AgentTimelineItemPresentation.rawShellCommand(for: item) != nil
         // Streaming: keep the *tail* (latest tokens). Head-capping freezes early
         // text while later tokens rewrite "on top" without the user seeing them
         // (reasoning, assistantMessage, tool body/output).
         if item.state == .streaming {
-            copy.body = cappedVisibleTextTail(copy.body, limit: liveTurnBodyCharacterLimit)
+            if !preservesAuditInput {
+                copy.body = cappedVisibleTextTail(copy.body, limit: liveTurnBodyCharacterLimit)
+            }
             if let output = copy.output {
                 copy.output = cappedVisibleTextTail(output, limit: liveTurnOutputCharacterLimit)
             }
         } else {
-            copy.body = cappedVisibleText(copy.body, limit: liveTurnBodyCharacterLimit)
+            if !preservesAuditInput {
+                copy.body = cappedVisibleText(copy.body, limit: liveTurnBodyCharacterLimit)
+            }
             copy.output = cappedOptionalVisibleText(copy.output, limit: liveTurnOutputCharacterLimit)
         }
         return copy
@@ -11710,6 +12196,7 @@ public struct AgentAppView: View {
                         let liveTail = split.liveTail
                         let historyRevision = AgentStableTranscriptHistoryRevision(
                             entryIDs: historyEntries.map(\.id),
+                            timelineColumnWidth: timelineColumnWidth,
                             expandedTools: expandedTools,
                             expandedToolGroups: expandedToolGroups,
                             expandedReasoning: expandedReasoning,
@@ -11718,6 +12205,8 @@ public struct AgentAppView: View {
                             workDisclosureRevealByTurn: workDisclosureRevealByTurn,
                             translatedMessageIDs: vm.sr1TranslatedMessageIds,
                             translationOriginals: vm.sr1OriginalTextsByMessageId,
+                            translationFinals: vm.sr1RewrittenTextsByTurnId,
+                            assistantDisplayRevision: vm.assistantDisplayRevision,
                             outboundPayloads: vm.outboundPayloadsByMessageId,
                             proposedPlanIDs: vm.timeline.proposedPlans.map(\.id),
                             suppressesProposedPlanReview: vm.suppressesProposedPlanReview,
@@ -12757,6 +13246,58 @@ public struct AgentAppView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    /// Shared original-wire disclosure for every assistant prose row. The
+    /// natural display remains the default; expansion reveals and copies the
+    /// exact provider value supplied by the SHA-verified provenance path.
+    @ViewBuilder
+    private func assistantOriginalWireDisclosure(
+        originalWire: String,
+        displayText: String,
+        wasSR1Translated: Bool = false,
+        accessibilityIdentifier: String
+    ) -> some View {
+        if let wire = Self.assistantOriginalWire(
+            messageContent: originalWire,
+            displayText: displayText,
+            wasSR1Translated: wasSR1Translated,
+            retrieve: vm.coordinator.reversibleProseRetriever
+        ) {
+            DisclosureGroup {
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    Text(wire)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button { copyToPasteboard(wire) } label: {
+                        Label("Copy original wire", systemImage: "doc.on.doc")
+                            .font(DS.Font.caption2)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityLabel("Copy original provider wire")
+                    .accessibilityIdentifier("\(accessibilityIdentifier).copy")
+                    .help("Copy original provider wire")
+                }
+                .padding(DS.Space.sm)
+                .background(
+                    DS.Palette.surface,
+                    in: RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                )
+            } label: {
+                Text(wasSR1Translated
+                     ? Self.sr1BadgeLabel(hasOriginalText: true)
+                     : "View original wire")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
+            .accessibilityLabel(wasSR1Translated
+                                ? "This reply was translated from Token Saver compressed output. View original."
+                                : "View original provider wire")
+            .accessibilityIdentifier(accessibilityIdentifier)
+        }
+    }
+
     /// Pure seam: thread footer figure — full bare-user credible stack
     /// (measured tool-output + dialect + graphify + multi-turn cache impact + Auto).
     ///
@@ -13330,31 +13871,26 @@ public struct AgentAppView: View {
                     )
                     // Dual-channel: content may be wire/stub; prefer rewritten UI text.
                     let displayBody = vm.assistantDisplayText(for: msg)
+                    let showOriginalToggle = Self.showsAssistantOriginalToggle(
+                        messageContent: msg.content,
+                        displayText: displayBody,
+                        wasSR1Translated: showBadge
+                    )
                     VStack(alignment: .leading, spacing: DS.Space.xs) {
-                        if showBadge {
-                            if let original = vm.sr1OriginalText(for: msg.id) {
-                                DisclosureGroup {
-                                    Text(original)
-                                        .font(DS.Font.caption)
-                                        .foregroundColor(DS.Palette.textSecondary)
-                                        .textSelection(.enabled)
-                                        .padding(DS.Space.sm)
-                                        .background(DS.Palette.surface, in: RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                                } label: {
-                                    Text(Self.sr1BadgeLabel(hasOriginalText: true))
-                                        .font(DS.Font.caption2)
-                                        .foregroundColor(DS.Palette.textTertiary)
-                                }
-                                .accessibilityLabel("This reply was translated from Token Saver compressed output. View original.")
-                                .accessibilityIdentifier("agent.assistantMessage.sr1Original.\(msg.id.value.uuidString)")
-                            } else {
-                                Text(Self.sr1BadgeLabel(hasOriginalText: false))
-                                    .font(DS.Font.caption2)
-                                    .foregroundColor(DS.Palette.textTertiary)
-                                    .accessibilityLabel("This reply was translated from Token Saver compressed output")
-                                    .accessibilityIdentifier("agent.assistantMessage.sr1Badge.\(msg.id.value.uuidString)")
+                        if showOriginalToggle {
+                            assistantOriginalWireDisclosure(
+                                originalWire: msg.content,
+                                displayText: displayBody,
+                                wasSR1Translated: showBadge,
+                                accessibilityIdentifier: "agent.assistantMessage.sr1Original.\(msg.id.value.uuidString)"
+                            )
+                        } else if showBadge {
+                            Text(Self.sr1BadgeLabel(hasOriginalText: false))
+                                .font(DS.Font.caption2)
+                                .foregroundColor(DS.Palette.textTertiary)
+                                .accessibilityLabel("This reply was translated from Token Saver compressed output")
+                                .accessibilityIdentifier("agent.assistantMessage.sr1Badge.\(msg.id.value.uuidString)")
                             }
-                        }
                         assistantProse(displayBody)
                         assistantCopyBar(text: BackgroundAwaitContinuation.strippingAwaitingMarker(displayBody), identifierSuffix: msg.id.value.uuidString)
                     }
@@ -13416,9 +13952,15 @@ public struct AgentAppView: View {
             // Only show the turn's final text if no assistant-message item
             // already rendered it (prevents the answer showing twice).
             if let final = turn.finalAssistantMessage, inputs.shouldRenderFinal {
+                let displayFinal = vm.assistantDisplayText(for: final, turnId: turn.turnId)
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    assistantProse(final, cacheMarkdown: turn.finished)
-                    assistantCopyBar(text: BackgroundAwaitContinuation.strippingAwaitingMarker(final), identifierSuffix: turn.turnId)
+                    assistantOriginalWireDisclosure(
+                        originalWire: final,
+                        displayText: displayFinal,
+                        accessibilityIdentifier: "agent.turnFinal.original.\(turn.turnId)"
+                    )
+                    assistantProse(displayFinal, cacheMarkdown: turn.finished)
+                    assistantCopyBar(text: BackgroundAwaitContinuation.strippingAwaitingMarker(displayFinal), identifierSuffix: turn.turnId)
                 }
             }
         }
@@ -13440,7 +13982,8 @@ public struct AgentAppView: View {
             rowIDs: workRows.stable.map(\.id),
             expandedTools: expandedTools,
             expandedToolGroups: expandedToolGroups,
-            expandedReasoning: expandedReasoning
+            expandedReasoning: expandedReasoning,
+            assistantDisplayRevision: vm.assistantDisplayRevision
         )
         VStack(alignment: .leading, spacing: DS.Space.md) {
             Button {
@@ -13533,7 +14076,23 @@ public struct AgentAppView: View {
         switch item.type {
         case .assistantMessage:
             if Self.shouldRenderAssistantItemBody(item.body, persistedAssistantTexts: persistedAssistantTexts) {
-                assistantProse(item.body, cacheMarkdown: item.state != .streaming)
+                let displayText = vm.assistantDisplayText(
+                    for: item.body,
+                    itemId: item.id,
+                    turnId: item.turnId
+                )
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    assistantOriginalWireDisclosure(
+                        originalWire: item.body,
+                        displayText: displayText,
+                        accessibilityIdentifier: "agent.assistantItem.original.\(item.id)"
+                    )
+                    assistantProse(displayText, cacheMarkdown: item.state != .streaming)
+                    assistantCopyBar(
+                        text: BackgroundAwaitContinuation.strippingAwaitingMarker(displayText),
+                        identifierSuffix: item.id
+                    )
+                }
             }
         case .reasoning:
             reasoningRow(item)
@@ -13541,7 +14100,10 @@ public struct AgentAppView: View {
             VStack(alignment: .leading, spacing: DS.Space.xs) {
                 Text("PLAN").font(DS.Font.caption2.weight(.semibold)).tracking(0.6)
                     .foregroundColor(DS.Palette.accent)
-                assistantProse(item.body, cacheMarkdown: item.state != .streaming)
+                assistantProse(
+                    vm.assistantDisplayText(for: item.body, itemId: item.id, turnId: item.turnId),
+                    cacheMarkdown: item.state != .streaming
+                )
             }
         case .imageView:
             imageViewRow(item)
@@ -13554,7 +14116,8 @@ public struct AgentAppView: View {
     // It stays open while streaming, then collapses to a tappable "Thought" row.
     @ViewBuilder
     private func reasoningRow(_ item: AssistantItem) -> some View {
-        let text = item.body.isEmpty ? (AgentTimelineItemPresentation.make(for: item).detail ?? "") : item.body
+        let rawText = item.body.isEmpty ? (AgentTimelineItemPresentation.make(for: item).detail ?? "") : item.body
+        let text = vm.assistantDisplayText(for: rawText, itemId: item.id, turnId: item.turnId)
         let streaming = item.state == .streaming
         let expanded = streaming || expandedReasoning.contains(item.id)
         VStack(alignment: .leading, spacing: DS.Space.xs) {
@@ -13577,6 +14140,11 @@ public struct AgentAppView: View {
             .buttonStyle(.plain)
             .help(streaming ? "" : (text.isEmpty ? "" : (expanded ? "Hide reasoning" : "Show reasoning")))
             if expanded, !text.isEmpty {
+                assistantOriginalWireDisclosure(
+                    originalWire: rawText,
+                    displayText: text,
+                    accessibilityIdentifier: "agent.reasoning.original.\(item.id)"
+                )
                 Text(text)
                     .font(DS.Font.bodyDense)
                     .foregroundColor(DS.Palette.textTertiary)
@@ -13683,8 +14251,7 @@ public struct AgentAppView: View {
         let presentation = AgentTimelineItemPresentation.make(for: item)
         let displayLabel = AgentTimelineItemPresentation.toolDisplayLabel(for: item)
         // Prefer uncapped raw shell for expand/copy so live body caps cannot mangle JSON.
-        let commandFull = AgentTimelineItemPresentation.rawShellCommand(for: item)
-            ?? AgentTimelineItemPresentation.toolCommandPreview(for: item)
+        let commandFull = AgentTimelineItemPresentation.fullToolCommand(for: item)
         let commandSummary = AgentTimelineItemPresentation.toolCommandSummary(for: item)
         let isBackground = AgentTimelineItemPresentation.isBackgroundTool(for: item)
         let wasDistilled = AgentTimelineItemPresentation.toolCommandWasDistilled(for: item)

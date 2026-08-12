@@ -966,6 +966,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             model: request.model,
             cwd: request.cwd,
             prompt: request.prompt,
+            trustedHostInstruction: request.trustedHostInstruction,
             userMessageContent: request.userMessageContent,
             attachments: request.attachments,
             providerThreadId: nil,
@@ -1220,18 +1221,20 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
             let itemId = string(item, "id") ?? string(payload, "itemId") ?? string(payload, "item_id") ?? UUID().uuidString
             let rawType = string(item, "type") ?? string(payload, "type") ?? "unknown"
+            let itemType = Self.assistantItemType(for: rawType)
             if Self.isUserMessageItem(item, type: rawType) { break }
             if markStartedItem(threadId: threadId, turnId: turnId, itemId: itemId) {
                 events.append(.itemStarted(item: AssistantItem(
                     id: itemId,
                     turnId: turnId,
-                    type: Self.assistantItemType(for: rawType),
+                    type: itemType,
                     state: .streaming,
                     summary: Self.summary(for: item, type: rawType),
+                    body: itemType == .commandExecution ? (string(item, "command") ?? "") : "",
                     startedAtMs: now
                 )))
             }
-            if Self.assistantItemType(for: rawType) == .commandExecution {
+            if itemType == .commandExecution {
                 trackDetachedShellSpawn(in: item, threadId: threadId)
                 scheduleTurnReconciliation(threadId: threadId, turnId: turnId)
             }
@@ -1296,6 +1299,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                         type: itemType,
                         state: .completed,
                         summary: summary,
+                        body: itemType == .commandExecution ? (string(item, "command") ?? "") : "",
                         startedAtMs: now,
                         finishedAtMs: now
                     )))
@@ -2966,6 +2970,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 type: itemType,
                 state: state == .completed ? .streaming : state,
                 summary: summary,
+                body: itemType == .commandExecution ? (string(item, "command") ?? "") : "",
                 resourcePath: resourcePath,
                 startedAtMs: startedAtMs
             ))

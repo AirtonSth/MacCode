@@ -158,8 +158,6 @@ final class InteractiveTitlebarWindow: NSWindow {
 
 private extension NSWindow {
     func configureRemoteCodeWindowAccessibility(title: String, identifier: String) {
-        setAccessibilityRole(.window)
-        setAccessibilitySubrole(.standardWindow)
         setAccessibilityTitle(title)
         setAccessibilityIdentifier(identifier)
     }

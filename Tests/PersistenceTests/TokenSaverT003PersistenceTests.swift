@@ -946,6 +946,25 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
             try scalar(db, sql: "SELECT expires_at_ms FROM token_saver_recovery_objects WHERE id = '\(prepared.objectID)';"),
             Int(retentionStart.addingTimeInterval(7 * 86_400).timeIntervalSince1970 * 1_000)
         )
+        for lane in ["bash_line_budget", "deterministic_lossy"] {
+            let routed = try worker.prepareOriginal(
+                Data("\(lane)-default".utf8),
+                scope: scope(),
+                operationID: "\(lane)-default-op",
+                lane: lane,
+                expiresAt: nil,
+                disk: disk,
+                now: retentionStart
+            )
+            XCTAssertEqual(
+                try scalar(
+                    db,
+                    sql: "SELECT COUNT(*) FROM token_saver_recovery_objects WHERE id = '\(routed.objectID)' AND lane = '\(lane)';"
+                ),
+                1,
+                "wrapper subroutes must inherit wrapper governance without losing lane attribution"
+            )
+        }
         XCTAssertThrowsError(try worker.prepareOriginal(
             Data("semantic-default".utf8),
             scope: scope(),

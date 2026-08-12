@@ -14,6 +14,17 @@ public enum GuardedStdoutWriteResult: Equatable, Sendable {
 }
 
 public enum GuardedStdoutWrite {
+    /// A deferred ledger/update callback is valid only after every stdout byte
+    /// was delivered.  Keeping this gate beside the low-level write result
+    /// makes broken-pipe and partial-delivery behavior explicit to wrapper
+    /// callers instead of allowing a savings side effect to claim unseen data.
+    public static func deferredSideEffectAfterCompleteDelivery<T>(
+        _ sideEffect: T?,
+        delivered: Bool
+    ) -> T? {
+        delivered ? sideEffect : nil
+    }
+
     /// Classifies a single write(2) attempt against stdout.
     public static func classify(bytesWritten: Int, expected: Int, errnoValue: Int32) -> GuardedStdoutWriteResult {
         if bytesWritten < 0 {

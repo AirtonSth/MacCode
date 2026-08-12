@@ -246,7 +246,8 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertTrue(codexText.contains(AgentSkillInstaller.distillInstructionsBeginMarker))
         XCTAssertTrue(claudeText.contains(AgentSkillInstaller.distillInstructionsEndMarker))
         XCTAssertTrue(codexText.contains("Use `/distill` dialect for provider turns"))
-        XCTAssertTrue(codexText.contains("managed `distill` CLI"))
+        XCTAssertTrue(codexText.contains("PATH wrappers"),
+                      "provider config must carry the current managed-wrapper policy")
         // CLI recovery language lives in the skill body; on-disk AGENTS.md is the dialect + pipe rules.
         XCTAssertFalse(codexText.contains(TokenSaverProviderSafetyABI.block))
         XCTAssertFalse(claudeText.contains(TokenSaverProviderSafetyABI.block))
@@ -256,7 +257,7 @@ final class TokenSaverInstallTests: XCTestCase {
                        "providers must not be instructed to invoke the old TypeScript distill CLI")
         XCTAssertFalse(claudeText.contains("git diff | distill"),
                        "always-loaded provider config should reference the skill instead of carrying examples")
-        XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("git log/status/diff (summaries)"))
+        XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("NEVER Distill skill content"))
     }
 
     func test_installAppPrivateDistillSkillNeverTouchesProviderHomes() throws {
@@ -327,8 +328,8 @@ final class TokenSaverInstallTests: XCTestCase {
         // Token Saver on still protects skill content as a verbatim category while
         // keeping ordinary-output Distill eligibility.
         XCTAssertTrue(runtimePrompt.contains("NEVER Distill skill content"))
-        XCTAssertTrue(runtimePrompt.contains("eligible ordinary")
-                      || runtimePrompt.contains("Good to pipe:"))
+        XCTAssertTrue(runtimePrompt.contains("PATH wrappers")
+                      || runtimePrompt.contains("MANDATORY default-pipe"))
         XCTAssertFalse(runtimePrompt.contains("[[rc:skill"),
                        "skill content must not be represented via recovery handles")
     }
@@ -712,6 +713,49 @@ final class TokenSaverInstallTests: XCTestCase {
         )
     }
 
+    func test_managedBashBridgeRestoresManagedPathAfterProviderShellSnapshot() throws {
+        let home = tempDir("TokenSaverBashBridge")
+        defer {
+            if FileManager.default.fileExists(atPath: home.path) {
+                try? FileManager.default.removeItem(at: home)
+            }
+        }
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let managedBin = home.appendingPathComponent(".remote-code/bin").path
+        let originalBashEnv = home.appendingPathComponent("original.bash_env")
+        try Data("export PATH=\"/usr/bin:/bin\"\n".utf8).write(to: originalBashEnv)
+
+        _ = try installer.installProviderShellBridge()
+        let bashEnv = installer.providerShellBridgeBashEnvURL
+        XCTAssertTrue(FileManager.default.fileExists(atPath: bashEnv.path))
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = ["-c", "printf '%s' \"$PATH\""]
+        process.environment = [
+            "HOME": home.path,
+            "PATH": "/usr/bin:/bin",
+            "BASH_ENV": bashEnv.path,
+            "RC_REMOTE_CODE_ORIGINAL_BASH_ENV": originalBashEnv.path,
+            "RC_REMOTE_CODE_MANAGED_BIN": managedBin
+        ]
+        let output = Pipe()
+        process.standardOutput = output
+        try process.run()
+        process.waitUntilExit()
+        let result = String(
+            data: output.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        )?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        XCTAssertEqual(process.terminationStatus, 0)
+        XCTAssertTrue(
+            result?.hasPrefix(managedBin + ":") == true,
+            "Grok ACP Bash snapshots must restore managed wrappers before ordinary commands"
+        )
+    }
+
     func test_verifiedAgentAppMiddlewareRejectsMissingAndForeignAliases() throws {
         let home = tempDir()
         defer { try? FileManager.default.removeItem(at: home) }
@@ -830,7 +874,8 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertFalse(text.contains("stale distill instructions"))
         XCTAssertEqual(text.components(separatedBy: AgentSkillInstaller.distillInstructionsBeginMarker).count - 1, 1)
         XCTAssertFalse(text.contains("bun test 2>&1 | distill"))
-        XCTAssertTrue(text.contains("managed `distill` CLI"))
+        XCTAssertTrue(text.contains("PATH wrappers"),
+                      "installed provider instructions must carry the current managed-wrapper policy")
     }
 
     func test_agentSkillInstallerUninstallDistillInstructionsRemovesOnlyManagedBlock() throws {

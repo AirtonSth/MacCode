@@ -55,11 +55,28 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
 
     /// Builds `grok` argv for a one-shot headless turn. Pure + static for tests.
     public static func buildArgs(_ request: AgentRunRequest, newSessionId: String? = nil) -> [String] {
+        let hasTypedHostInstruction = request.trustedHostInstruction?.isEmpty == false
         let providerPrompt = AgentSkillInstaller.tokenSaverProviderPrompt(
-            request.providerPrompt,
+            hasTypedHostInstruction
+                ? AgentProviderInstructionText.providerPreamble(for: request.interactionMode)
+                : request.providerPrompt,
             environment: request.environment
         )
         var args: [String] = ["-p", providerPrompt, "--output-format", "streaming-json"]
+        if let trustedHostInstruction = request.trustedHostInstruction,
+           !trustedHostInstruction.isEmpty {
+            // Grok's privileged rules channel must retain the provider/system
+            // policy as well as the typed host leg. The user wire stays solely
+            // on -p so Auto/SessionLearn never enter ordinary user content.
+            let rules = [providerPrompt, BackgroundAwaitContinuation.systemPromptDirective,
+                         trustedHostInstruction.text]
+                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                .joined(separator: "\n\n")
+            args += ["--rules", rules]
+            // `-p` is the user leg for typed payloads; provider instructions
+            // are carried by --rules so Auto/SessionLearn never enter it.
+            args[1] = request.prompt
+        }
         let model = request.model.trimmingCharacters(in: .whitespacesAndNewlines)
         if !model.isEmpty {
             args.append(contentsOf: ["--model", model])

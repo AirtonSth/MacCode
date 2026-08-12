@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// SR2 Opaque Agent IR — dense machine-only provider wire when Token Saver is ON.
@@ -8,11 +9,40 @@ import Foundation
 ///
 /// Providers Claude, Codex, and Grok share this policy; only instruct injection adapters differ.
 public enum SR2WirePolicy: Sendable {
-    public static let version = "v0"
-    public static let markerLine = "@sr2 v0"
-    public static let optimizerVersion = "v1"
-    public static let optimizerMarkerLine = "@sr2 v1"
+    public static let version = "v1"
+    public static let markerLine = "@sr2 v1"
+    public static let optimizerVersion = version
+    public static let optimizerMarkerLine = markerLine
+    public static let legacyMarkerLine = "@sr2 v0"
+    /// ACP has no negotiated system/developer content type. Its host leg uses
+    /// this strict, separately parsed SR2 block instead of sharing the user's
+    /// `@sr2 v1` body.
+    public static let trustedHostMarkerLine = "@sr2 host v1"
     public static let instructBlockMarker = "REMOTE_CODE_SR2_ALWAYS_ON_V1"
+    public static let structuredFieldKeys: Set<String> = [
+        "g", "d", "p", "o", "e", "h", "t", "u",
+        "flow", "done", "tools", "must", "should", "may", "not", "constraints", "outputs",
+        "run", "out"
+    ]
+    public static let advertisedV1Sample = """
+    @sr2 v1
+    g:goal-id
+    d:decision-id
+    p:path:1
+    o:ok
+    e:none
+    h:[[rc:handle]]
+    """
+    /// Source-compatible name for callers compiled against the earlier policy.
+    /// Its bytes are deliberately current v1; no new instruction advertises v0.
+    @available(*, deprecated, renamed: "advertisedV1Sample")
+    public static let advertisedV0Sample = advertisedV1Sample
+    public static let semanticV1Sample = """
+    @sr2 v1
+    run:command -v swift;command -v distill
+    out:=2lines
+    !file-edit
+    """
 
     /// Paid-feature providers that must ship the matrix together (T-SR2-09).
     public static let requiredProviders: [String] = ["claude", "codex", "grok"]
@@ -75,7 +105,7 @@ public enum SR2WirePolicy: Sendable {
         let isOptimizerV1 = [optimizerMarkerLine, "sr2 v1"]
             .map { $0.lowercased() }
             .contains(first)
-        let hasBanner = [markerLine, optimizerMarkerLine, "sr2 v0", "sr2 v1"]
+        let hasBanner = [legacyMarkerLine, markerLine, "sr2 v0", "sr2 v1"]
             .map { $0.lowercased() }
             .contains(first)
         if hasBanner {
@@ -99,7 +129,7 @@ public enum SR2WirePolicy: Sendable {
                     .first
                     .map(String.init)
                     .map { $0.lowercased() }
-                guard let outcome, ["ok", "fail", "need", "cont"].contains(outcome) else {
+                guard let outcome, ["ok", "done", "fail", "need", "cont"].contains(outcome) else {
                     return false
                 }
                 hasOutcome = true
@@ -114,16 +144,214 @@ public enum SR2WirePolicy: Sendable {
         return isOptimizerV1 || hasOutcome
     }
 
+    /// Current provider compliance is narrower than legacy readability. Old
+    /// `@sr2 v0` threads still parse through `isSR2`, but only an exact v1
+    /// banner/body is eligible to remain newly persisted provider history.
+    public static func isCurrentSR2(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text == trimmed,
+              trimmed.split(whereSeparator: \.isNewline).first?.lowercased()
+                == markerLine.lowercased() else {
+            return false
+        }
+        return isSR2(trimmed)
+    }
+
+    /// Provider-bound text with an SR2 banner must never fall back to raw UI
+    /// merely because its body misses the strict grammar. This is intentionally
+    /// narrower than a general text classifier: callers use it only after typed
+    /// provider provenance, while natural assistant text may quote SR2 verbatim.
+    public static func hasSR2Banner(_ text: String) -> Bool {
+        guard let first = text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: \.isNewline)
+            .first?
+            .lowercased() else { return false }
+        return [legacyMarkerLine, markerLine, "sr2 v0", "sr2 v1"]
+            .map { $0.lowercased() }
+            .contains(first)
+    }
+
+    /// Reject untrusted humanizer output that still contains provider wire.
+    ///
+    /// Whole-string SR1/SR2 classification is deliberately insufficient at
+    /// this boundary: a local model can prepend one natural word and then emit
+    /// a raw banner or field dump. This probe is only for text produced by the
+    /// humanizer. Natural assistant/user content has no such provenance and
+    /// must not be stripped merely because it quotes an SR2 example.
+    public static func containsHumanizationWireSyntax(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let lower = trimmed.lowercased()
+        if lower.contains("@sr2 v0") || lower.contains("@sr2 v1")
+            || lower.contains("sr2 v0") || lower.contains("sr2 v1")
+            || lower.contains("[[rc:") {
+            return true
+        }
+
+        let lines = trimmed
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        var legacySemanticLineCount = 0
+        for line in lines {
+            let lineLower = line.lowercased()
+            let tokens = lineLower
+                .split { !$0.isLetter && !$0.isNumber }
+                .map(String.init)
+            if tokens.contains("sr1")
+                || lineLower == "dict"
+                || lineLower.hasPrefix("dict:") {
+                return true
+            }
+            if structuredField(line) != nil {
+                return true
+            }
+            guard let first = line.first,
+                  DistillSemanticPrefixes.contains(first),
+                  line.count > 1 else { continue }
+            let next = line[line.index(after: line.startIndex)]
+            if next == ":" || next == "=" || next.isWhitespace {
+                legacySemanticLineCount += 1
+            }
+        }
+        // A trusted humanizer may naturally answer in Portuguese with a single
+        // sentence such as "O Snake..." or "O jogo...". The old SR1 dialect is
+        // a multi-line field dump at this boundary; markers and colon/equal
+        // structured fields were rejected above independently.
+        return legacySemanticLineCount >= 2
+    }
+
+    /// Deterministic last-resort UI rendering from a source that has already
+    /// been classified as trusted wire. It never examines arbitrary natural
+    /// prose, which preserves quoted protocol examples without heuristic text
+    /// stripping. Every proof/evidence field is retained; this is a semantic
+    /// fallback, not a preview truncation.
+    public static func deterministicHumanizedWire(_ text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isSR2(trimmed) || hasSR2Banner(trimmed) else { return nil }
+
+        var outcomes: [String] = []
+        var evidence: [String] = []
+        var errors: [String] = []
+        var semantics: [String] = []
+        var continuationOnly = false
+        let labels = [
+            "g": "Goal", "d": "Decision", "t": "Task",
+            "flow": "Next steps", "done": "Complete when", "tools": "Tools",
+            "must": "Required", "should": "Recommended", "may": "Optional",
+            "not": "Do not", "constraints": "Constraints", "outputs": "Outputs",
+            "run": "Run", "out": "Expected output",
+        ]
+
+        func readable(_ value: String) -> String {
+            value
+                .replacingOccurrences(of: ">", with: " then ")
+                .replacingOccurrences(of: "+", with: " and ")
+                .replacingOccurrences(of: "|", with: " or ")
+        }
+        func sentence(_ value: String) -> String {
+            let value = readable(value)
+            return value.hasSuffix(".") ? value : value + "."
+        }
+        func evidenceLine(_ value: String) -> String {
+            if let equals = value.firstIndex(of: "=") {
+                let index = value[..<equals]
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let detail = value[value.index(after: equals)...]
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !index.isEmpty, index.allSatisfy(\.isNumber), !detail.isEmpty {
+                    return "Evidence \(index): \(sentence(detail))"
+                }
+            }
+            return "Evidence: \(sentence(value))"
+        }
+
+        for raw in trimmed.split(whereSeparator: \.isNewline) {
+            let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty, !line.lowercased().hasPrefix("@sr2"),
+                  let field = structuredField(line) else { continue }
+            switch field.key {
+            case "o":
+                let head = field.value.split(whereSeparator: \.isWhitespace).first?.lowercased()
+                if head == "cont" {
+                    continuationOnly = true
+                } else if head == "done" {
+                    outcomes.append("Completed.")
+                } else {
+                    outcomes.append(sentence(field.value))
+                }
+            case "p":
+                evidence.append(evidenceLine(field.value))
+            case "e":
+                errors.append("Error: \(sentence(field.value))")
+            case "h":
+                continue
+            default:
+                if let label = labels[field.key] {
+                    semantics.append("\(label): \(sentence(field.value))")
+                }
+            }
+        }
+
+        var pieces = outcomes + semantics + errors + evidence
+        if pieces.isEmpty, continuationOnly { pieces.append("Continuing the work.") }
+        return pieces.isEmpty
+            ? "I could not expand the SR2 response."
+            : pieces.joined(separator: "\n")
+    }
+
+    /// Deterministic UI fallback for provider output already classified as
+    /// legacy SR1. This parser is deliberately provenance-bound: arbitrary
+    /// natural prose never enters it, so labels can be removed without risking
+    /// damage to legitimate sentences such as "O jogo...".
+    private static func deterministicHumanizedSR1(_ text: String) -> String? {
+        var pieces: [String] = []
+        let labels: [Character: String] = [
+            "S": "State", "C": "Context", "D": "Action", "R": "Risk",
+            "O": "", "N": "Do not", "P": "Proof",
+        ]
+        for raw in text.split(whereSeparator: \.isNewline) {
+            let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+            let lower = line.lowercased()
+            if lower == "sr1" || lower.hasPrefix("sr1 ")
+                || lower == "dict" || lower.hasPrefix("dict:") {
+                continue
+            }
+            guard let first = line.first?.uppercased().first,
+                  let label = labels[first],
+                  line.count > 1 else {
+                pieces.append(line)
+                continue
+            }
+            let next = line.index(after: line.startIndex)
+            let delimiter = line[next]
+            guard delimiter == ":" || delimiter == "=" || delimiter.isWhitespace else {
+                pieces.append(line)
+                continue
+            }
+            let start = delimiter == ":" || delimiter == "="
+                ? line.index(after: next)
+                : next
+            let value = line[start...].trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else { continue }
+            pieces.append(label.isEmpty ? value : "\(label): \(value)")
+        }
+        return pieces.isEmpty ? nil : pieces.joined(separator: "\n")
+    }
+
     private static func structuredField(_ line: String) -> (key: String, value: String)? {
+        if line.hasPrefix("!") {
+            let value = line.dropFirst()
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? nil : ("not", value)
+        }
         guard let delimiterIndex = line.firstIndex(where: { $0 == ":" || $0 == "=" }) else {
             return nil
         }
         let key = line[..<delimiterIndex].lowercased()
-        let allowed = Set([
-            "g", "d", "p", "o", "e", "h", "t", "u",
-            "flow", "done", "tools", "must", "should", "may", "not", "constraints", "outputs"
-        ])
-        guard allowed.contains(key) else { return nil }
+        guard structuredFieldKeys.contains(key) else { return nil }
         let value = line[line.index(after: delimiterIndex)...]
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return nil }
@@ -163,6 +391,63 @@ public enum SR2WirePolicy: Sendable {
         guard let end = text[start.upperBound...].range(of: "]]"),
               end.lowerBound > start.upperBound else { return nil }
         return String(text[start.lowerBound..<end.upperBound])
+    }
+
+    private static let inlineOriginalPrefix = "inline-base64:"
+
+    /// Lossless canonical v1 history envelope used when a provider emitted a
+    /// legacy wire or free prose. The preferred form stores the exact provider
+    /// bytes under a durable handle. If storage fails, base64 keeps those UTF-8
+    /// bytes inline so history remains both v1-compliant and recoverable.
+    private static func canonicalHistoryEnvelope(
+        for providerOutput: String,
+        handle: String?
+    ) -> String {
+        let data = Data(providerOutput.utf8)
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let payload: String
+        if let handle {
+            payload = recoveryMarker(for: handle)
+        } else {
+            payload = inlineOriginalPrefix + data.base64EncodedString()
+        }
+        return [markerLine, "o:ok", "p:sha256=\(digest)", "h:\(payload)"].joined(separator: "\n")
+    }
+
+    /// Recover the byte-exact provider output represented by a canonical v1
+    /// history envelope. `retrieve` receives the complete `[[rc:...]]` marker.
+    /// Both handle and inline forms are SHA-256 checked before release.
+    public static func providerOriginal(
+        in history: String,
+        retrieve: ((String) -> String?)? = nil
+    ) -> String? {
+        let lines = history
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+        guard lines.first?.lowercased() == markerLine.lowercased(),
+              let digestField = lines.first(where: { $0.lowercased().hasPrefix("p:sha256=") }),
+              let payloadField = lines.first(where: { $0.lowercased().hasPrefix("h:") }) else {
+            return nil
+        }
+        let expectedDigest = String(digestField.dropFirst("p:sha256=".count)).lowercased()
+        guard expectedDigest.count == 64,
+              expectedDigest.allSatisfy({ $0.isHexDigit }) else { return nil }
+        let payload = String(payloadField.dropFirst(2))
+        let original: String?
+        if payload.hasPrefix(inlineOriginalPrefix),
+           let data = Data(base64Encoded: String(payload.dropFirst(inlineOriginalPrefix.count))) {
+            original = String(data: data, encoding: .utf8)
+        } else if payload.hasPrefix("[[rc:"), payload.hasSuffix("]]"), let retrieve {
+            original = retrieve(payload)
+        } else {
+            original = nil
+        }
+        guard let original else { return nil }
+        let actualDigest = SHA256.hash(data: Data(original.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return actualDigest == expectedDigest ? original : nil
     }
 
     /// Lossless single-line envelope for a user instruction sent to a paid
@@ -206,6 +491,53 @@ public enum SR2WirePolicy: Sendable {
         return result
     }
 
+    /// Encode trusted host guidance for providers without a system/developer
+    /// payload surface (currently Grok ACP). This is intentionally not a user
+    /// instruction wire and can never be decoded through `userInstruction`.
+    public static func trustedHostInstructionWire(_ instruction: String) -> String {
+        let escaped = instruction
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\n", with: "\\n")
+        return "\(trustedHostMarkerLine)\nhost:\(escaped)"
+    }
+
+    /// Strict parser for the typed ACP host block. Rejects banners, extra
+    /// fields, malformed escapes, or content that could be mistaken for the
+    /// canonical user SR2 v1 leg.
+    public static func trustedHostInstruction(in wire: String) -> String? {
+        let lines = wire.split(whereSeparator: \.isNewline).map(String.init)
+        guard lines.count == 2,
+              lines[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                == trustedHostMarkerLine.lowercased(),
+              lines[1].lowercased().hasPrefix("host:") else {
+            return nil
+        }
+        let payload = String(lines[1].dropFirst("host:".count))
+        guard !payload.isEmpty else { return nil }
+        var result = ""
+        var escaping = false
+        for character in payload {
+            if escaping {
+                switch character {
+                case "n": result.append("\n")
+                case "r": result.append("\r")
+                case "\\": result.append("\\")
+                default: return nil
+                }
+                escaping = false
+            } else if character == "\\" {
+                escaping = true
+            } else {
+                result.append(character)
+            }
+        }
+        guard !escaping, !result.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return result
+    }
+
     /// Collapse free prose into a recoverable wire stub for provider history.
     public static func enforceFreeProse(
         _ prose: String,
@@ -213,13 +545,9 @@ public enum SR2WirePolicy: Sendable {
     ) -> EnforceResult {
         let trimmed = prose.trimmingCharacters(in: .whitespacesAndNewlines)
         let marker = recoveryMarker(for: handle)
-        let stub = """
-        \(markerLine)
-        o:ok
-        h:\(marker)
-        """
+        let stub = canonicalHistoryEnvelope(for: prose, handle: handle)
         return EnforceResult(
-            wireStub: stub.trimmingCharacters(in: .whitespacesAndNewlines),
+            wireStub: stub,
             fullProse: trimmed,
             recoveryHandlePlaceholder: marker
         )
@@ -269,6 +597,19 @@ public enum SR2WirePolicy: Sendable {
                 complianceMiss: false
             )
         case .freeProse:
+            if hasSR2Banner(trimmed) {
+                // Keep the strict classification as a compliance miss, but send
+                // provider-originated banner text through the trusted humanizer.
+                // The dual-channel persist step will canonicalize the history leg.
+                return Classification(
+                    kind: .freeProse,
+                    providerHistoryText: trimmed,
+                    uiSourceText: trimmed,
+                    needsHumanize: true,
+                    wasEnforced: true,
+                    complianceMiss: true
+                )
+            }
             let enforced = enforceFreeProse(trimmed, handle: recoveryHandle)
             return Classification(
                 kind: .freeProse,
@@ -315,15 +656,18 @@ public enum SR2WirePolicy: Sendable {
     Token Saver ON — assistant wire is MANDATORY for Claude, Codex, and Grok (no free monologue).
     Every provider-authored text item MUST be SR2 Opaque Agent IR (machine-only): reasoning, commentary/intermediate updates, and final replies. Humans never read this wire; the host humanizes for UI.
     Format:
-    @sr2 v0
-    g:<goal_id>? d:<decision_id>? p:path:line[,…]? o:ok|fail|need|cont e:<class>? h:[[rc:<handle>]]?
+    \(advertisedV1Sample)
+    Each field is on its own line; omit optional lines instead of joining fields.
     Rules:
     - No articles, filler, hedging, markdown essays, or multi-paragraph prose on the wire.
     - Prefer action-only `o:cont` when only tool calls ran (see actionOnlyWire).
     - Long answers: answer-as-handle — short o: + h:[[rc:<handle>]] + p: anchors (not full prose on wire).
     - Keep paths, SHAs, exit codes, error strings exact when present.
-    - SR1 (S/C/D/R/O/N/P) is fallback only if you cannot emit SR2; never plain chat prose.
+    - `@sr2 v1` is the only current provider wire. Never emit legacy `@sr2 v0`, SR1 (S/C/D/R/O/N/P), or plain chat prose.
     - User input may arrive as `u:<lossless escaped instruction>` plus `o:cont`; decode `\\n`, `\\r`, and `\\\\` before acting.
+    - User semantic input may arrive as:
+    \(semanticV1Sample)
+      Here `run:a;b` is one shell tool call. `run:[a;b]>[c]` requires two separate ordered shell tool calls; never flatten bracketed groups into one `sh`/`zsh -c` compound. `out:=Nlines` requires one global exact cardinality, and indexed `out:1=2lines,2=1line` binds exact cardinality to individual ordered groups; `!file-edit` forbids file edits. Execute exact groups raw. For an ordinary non-TUI group, preserve its command and add explicit `| distill` in that separate tool call when full stdout is not needed byte-exactly.
     - Tool stdout stays exact: keep exact-output (rg/sed/cat/jq) unpiped; pipe noisy builds/tests/logs via `| distill`.
     - Host-local telemetry labels such as Thinking/Ran Shell/Failed Shell are outside the provider wire.
     """
@@ -505,6 +849,7 @@ public enum SR2WirePolicy: Sendable {
         isSR1: (String) -> Bool,
         storeProse: ((String) -> String?)?
     ) -> DualChannelPersistPlan {
+        let original = modelOutput
         let model = modelOutput.trimmingCharacters(in: .whitespacesAndNewlines)
         let uiIn = humanizeOutput.trimmingCharacters(in: .whitespacesAndNewlines)
         if model.isEmpty {
@@ -529,49 +874,79 @@ public enum SR2WirePolicy: Sendable {
             )
         }
         let kind = channelKind(of: model, isSR1: isSR1)
+        func verifiedHandle() -> String? {
+            guard let rawHandle = storeProse?(original) else { return nil }
+            let handle = rawHandle.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !handle.isEmpty,
+                  handle.caseInsensitiveCompare("pending") != .orderedSame,
+                  handle.caseInsensitiveCompare("unavailable") != .orderedSame else {
+                return nil
+            }
+            return handle
+        }
+        func normalizedHistory() -> String {
+            canonicalHistoryEnvelope(for: original, handle: verifiedHandle())
+        }
         switch kind {
-        case .sr2, .sr1:
-            let ui = uiIn.isEmpty || isSR2(uiIn) || isSR1(uiIn) ? model : uiIn
+        case .sr2:
+            let humanizerLeakedWire = containsHumanizationWireSyntax(uiIn)
+            let deterministic = deterministicHumanizedWire(model)
+            let ui = uiIn.isEmpty || isSR2(uiIn) || isSR1(uiIn) || humanizerLeakedWire
+                ? (deterministic ?? model)
+                : uiIn
             // Prefer UI expansion when humanize produced readable prose.
             let useUI = ui != model && !ui.isEmpty && !isSR2(ui) && !isSR1(ui)
+            if !isCurrentSR2(original) {
+                return DualChannelPersistPlan(
+                    historyText: normalizedHistory(),
+                    uiText: useUI ? ui : (deterministic ?? ui),
+                    shouldEmitTranslation: true,
+                    wasEnforced: true,
+                    complianceMiss: true,
+                    kind: kind
+                )
+            }
             return DualChannelPersistPlan(
-                historyText: model,
+                historyText: original,
                 uiText: useUI ? ui : model,
                 shouldEmitTranslation: useUI,
                 wasEnforced: false,
                 complianceMiss: false,
                 kind: kind
             )
-        case .freeProse:
-            guard let rawHandle = storeProse?(model) else {
-                let ui = uiIn.isEmpty ? model : uiIn
-                return DualChannelPersistPlan(
-                    historyText: model,
-                    uiText: ui,
-                    shouldEmitTranslation: false,
-                    wasEnforced: false,
-                    complianceMiss: true,
-                    kind: .freeProse
-                )
-            }
-            let handle = rawHandle.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !handle.isEmpty,
-                  handle.caseInsensitiveCompare("pending") != .orderedSame,
-                  handle.caseInsensitiveCompare("unavailable") != .orderedSame else {
-                let ui = uiIn.isEmpty ? model : uiIn
-                return DualChannelPersistPlan(
-                    historyText: model,
-                    uiText: ui,
-                    shouldEmitTranslation: false,
-                    wasEnforced: false,
-                    complianceMiss: true,
-                    kind: .freeProse
-                )
-            }
-            let enforced = enforceFreeProse(model, handle: handle)
+        case .sr1:
+            let humanizerLeakedWire = containsHumanizationWireSyntax(uiIn)
+            let deterministic = deterministicHumanizedSR1(model)
+            let ui = uiIn.isEmpty || isSR2(uiIn) || isSR1(uiIn) || humanizerLeakedWire
+                ? (deterministic ?? model)
+                : uiIn
             return DualChannelPersistPlan(
-                historyText: enforced.wireStub,
-                uiText: uiIn.isEmpty ? model : uiIn,
+                historyText: normalizedHistory(),
+                uiText: ui,
+                shouldEmitTranslation: true,
+                wasEnforced: true,
+                complianceMiss: true,
+                kind: kind
+            )
+        case .freeProse:
+            if hasSR2Banner(model) {
+                let leakedWire = uiIn.isEmpty
+                    || containsHumanizationWireSyntax(uiIn)
+                    || isSR1(uiIn)
+                let deterministic = deterministicHumanizedWire(model)
+                    ?? "I could not expand the SR2 response."
+                return DualChannelPersistPlan(
+                    historyText: normalizedHistory(),
+                    uiText: leakedWire ? deterministic : uiIn,
+                    shouldEmitTranslation: true,
+                    wasEnforced: true,
+                    complianceMiss: true,
+                    kind: .freeProse
+                )
+            }
+            return DualChannelPersistPlan(
+                historyText: normalizedHistory(),
+                uiText: uiIn.isEmpty ? original : humanizeOutput,
                 shouldEmitTranslation: true,
                 wasEnforced: true,
                 complianceMiss: true,

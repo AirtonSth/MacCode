@@ -1542,9 +1542,216 @@ public final class AgentMessageRepository: @unchecked Sendable {
     private let decoder = JSONDecoder()
     public init(db: SQLiteDB) { self.db = db }
 
+    /// Typed provider-wire display metadata. The raw wire remains in
+    /// `agent_messages.content`; this side table stores only a bounded natural
+    /// rendering and the digest that proves which persisted body it belongs to.
+    /// The table is installed by the additive schema migration; this repository
+    /// path is DML-only so refreshes never execute DDL on the UI actor.
+    public struct AssistantDisplayTranslation: Sendable, Equatable {
+        public let messageId: AgentMessageID
+        public let wireSHA256: String
+        public let displayText: String
+
+        public init(messageId: AgentMessageID, wireSHA256: String, displayText: String) {
+            self.messageId = messageId
+            self.wireSHA256 = wireSHA256
+            self.displayText = displayText
+        }
+    }
+
+    public struct TimelineDisplayTranslation: Sendable, Equatable {
+        public let ownerKind: String
+        public let ownerId: String
+        public let wireSHA256: String
+        public let displayText: String
+
+        public init(ownerKind: String, ownerId: String, wireSHA256: String, displayText: String) {
+            self.ownerKind = ownerKind
+            self.ownerId = ownerId
+            self.wireSHA256 = wireSHA256
+            self.displayText = displayText
+        }
+    }
+
+    public static let assistantDisplayCharacterLimit = 4_000
+    public static let assistantDisplayStoredCharacterLimit = assistantDisplayCharacterLimit + 2
+
+    public static func boundedAssistantDisplayText(_ text: String) -> String {
+        guard text.count > assistantDisplayCharacterLimit else { return text }
+        return String(text.prefix(assistantDisplayCharacterLimit)) + "\n…"
+    }
+
+    public func upsertAssistantDisplayTranslation(
+        messageId: AgentMessageID,
+        threadId: AgentThreadID,
+        originalWire: String,
+        displayText: String,
+        createdAt: Date = Date()
+    ) throws {
+        let bounded = Self.boundedAssistantDisplayText(displayText)
+        let statement = try db.prepare("""
+            INSERT INTO agent_message_display_translations(
+                message_id, thread_id, wire_sha256, display_text, created_at
+            ) VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(message_id) DO UPDATE SET
+                thread_id = excluded.thread_id,
+                wire_sha256 = excluded.wire_sha256,
+                display_text = excluded.display_text,
+                created_at = excluded.created_at;
+        """)
+        try statement.bind(1, messageId.value.uuidString)
+        try statement.bind(2, threadId.value.uuidString)
+        try statement.bind(3, Self.bodySHA256Hex(originalWire))
+        try statement.bind(4, bounded)
+        try statement.bind(5, iso.string(from: createdAt))
+        _ = try statement.step()
+        try pruneAssistantDisplayTranslations(threadId: threadId)
+        try pruneAssistantDisplayTranslationsGlobal()
+    }
+
+    public func assistantDisplayTranslations(threadId: AgentThreadID) throws -> [AssistantDisplayTranslation] {
+        let statement = try db.prepare("""
+            SELECT message_id, wire_sha256, display_text
+            FROM agent_message_display_translations
+            WHERE thread_id = ?
+            ORDER BY created_at DESC LIMIT ?;
+        """)
+        try statement.bind(1, threadId.value.uuidString)
+        try statement.bind(2, Self.maxMessagesPerThread)
+        var rows: [AssistantDisplayTranslation] = []
+        while try statement.step() {
+            guard let rawID = statement.columnText(0),
+                  let uuid = UUID(uuidString: rawID),
+                  let digest = statement.columnText(1),
+                  let display = statement.columnText(2),
+                  digest.utf8.count == 64,
+                  display.count <= Self.assistantDisplayStoredCharacterLimit else { continue }
+            rows.append(AssistantDisplayTranslation(
+                messageId: AgentMessageID(uuid),
+                wireSHA256: digest,
+                displayText: display
+            ))
+        }
+        return rows
+    }
+
+    public func pruneAssistantDisplayTranslations(
+        threadId: AgentThreadID,
+        limit: Int = AgentMessageRepository.maxMessagesPerThread
+    ) throws {
+        let statement = try db.prepare("""
+            DELETE FROM agent_message_display_translations
+            WHERE thread_id = ? AND rowid NOT IN (
+                SELECT rowid FROM agent_message_display_translations
+                WHERE thread_id = ? ORDER BY created_at DESC LIMIT ?
+            );
+        """)
+        try statement.bind(1, threadId.value.uuidString)
+        try statement.bind(2, threadId.value.uuidString)
+        try statement.bind(3, max(1, limit))
+        _ = try statement.step()
+    }
+
+    public func pruneAssistantDisplayTranslationsGlobal(
+        limit: Int = AgentMessageRepository.maxAssistantDisplayTranslationsGlobal
+    ) throws {
+        let statement = try db.prepare("""
+            DELETE FROM agent_message_display_translations
+            WHERE rowid NOT IN (
+                SELECT rowid FROM agent_message_display_translations
+                ORDER BY created_at DESC LIMIT ?
+            );
+        """)
+        try statement.bind(1, max(1, limit))
+        _ = try statement.step()
+    }
+
+    public func upsertTimelineDisplayTranslation(
+        ownerKind: String,
+        ownerId: String,
+        threadId: AgentThreadID,
+        originalWire: String,
+        displayText: String,
+        createdAt: Date = Date()
+    ) throws {
+        let bounded = Self.boundedAssistantDisplayText(displayText)
+        let statement = try db.prepare("""
+            INSERT INTO agent_timeline_display_translations(
+                owner_kind, owner_id, thread_id, wire_sha256, display_text, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?)
+            ON CONFLICT(thread_id, owner_kind, owner_id) DO UPDATE SET
+                thread_id = excluded.thread_id,
+                wire_sha256 = excluded.wire_sha256,
+                display_text = excluded.display_text,
+                created_at = excluded.created_at;
+        """)
+        try statement.bind(1, ownerKind)
+        try statement.bind(2, ownerId)
+        try statement.bind(3, threadId.value.uuidString)
+        try statement.bind(4, Self.bodySHA256Hex(originalWire))
+        try statement.bind(5, bounded)
+        try statement.bind(6, iso.string(from: createdAt))
+        _ = try statement.step()
+        try pruneTimelineDisplayTranslations(threadId: threadId)
+        try pruneTimelineDisplayTranslationsGlobal()
+    }
+
+    public func pruneTimelineDisplayTranslations(
+        threadId: AgentThreadID,
+        limit: Int = AgentMessageRepository.maxMessagesPerThread
+    ) throws {
+        let statement = try db.prepare("""
+            DELETE FROM agent_timeline_display_translations
+            WHERE thread_id = ? AND rowid NOT IN (
+                SELECT rowid FROM agent_timeline_display_translations
+                WHERE thread_id = ? ORDER BY created_at DESC LIMIT ?
+            );
+        """)
+        try statement.bind(1, threadId.value.uuidString)
+        try statement.bind(2, threadId.value.uuidString)
+        try statement.bind(3, max(1, limit))
+        _ = try statement.step()
+    }
+
+    public func pruneTimelineDisplayTranslationsGlobal(
+        limit: Int = AgentMessageRepository.maxTimelineDisplayTranslationsGlobal
+    ) throws {
+        let statement = try db.prepare("""
+            DELETE FROM agent_timeline_display_translations
+            WHERE rowid NOT IN (
+                SELECT rowid FROM agent_timeline_display_translations
+                ORDER BY created_at DESC LIMIT ?
+            );
+        """)
+        try statement.bind(1, max(1, limit))
+        _ = try statement.step()
+    }
+
+    public func timelineDisplayTranslations(threadId: AgentThreadID) throws -> [TimelineDisplayTranslation] {
+        let statement = try db.prepare("""
+            SELECT owner_kind, owner_id, wire_sha256, display_text
+            FROM agent_timeline_display_translations
+            WHERE thread_id = ? ORDER BY created_at DESC LIMIT ?;
+        """)
+        try statement.bind(1, threadId.value.uuidString)
+        try statement.bind(2, Self.maxMessagesPerThread)
+        var rows: [TimelineDisplayTranslation] = []
+        while try statement.step() {
+            guard let kind = statement.columnText(0), !kind.isEmpty,
+                  let id = statement.columnText(1), !id.isEmpty,
+                  let digest = statement.columnText(2), digest.utf8.count == 64,
+                  let display = statement.columnText(3),
+                  display.count <= Self.assistantDisplayStoredCharacterLimit else { continue }
+            rows.append(TimelineDisplayTranslation(ownerKind: kind, ownerId: id, wireSHA256: digest, displayText: display))
+        }
+        return rows
+    }
+
     /// Durable transcript retention: keep only the newest N messages per thread
     /// so long-running agent sessions cannot grow `agent_messages` without bound.
     public static let maxMessagesPerThread = 100
+    public static let maxAssistantDisplayTranslationsGlobal = 10_000
+    public static let maxTimelineDisplayTranslationsGlobal = 10_000
 
     public func append(_ m: AgentMessage) throws {
         let bodyBytes = m.content.utf8.count

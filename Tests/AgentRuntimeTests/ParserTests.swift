@@ -41,6 +41,38 @@ final class CodexParserTests: XCTestCase {
                        "agent_message item must become the turn's final reply")
     }
 
+    func test_realExecSchema_reasoningStreamsTextThroughDelta() throws {
+        // WHY: Token Saver intercepts provider text at the delta boundary. The
+        // real fallback schema delivers reasoning as one completed item, so the
+        // parser must normalize it to the same start/delta/completed contract as
+        // streamed app-server reasoning instead of painting raw text at start.
+        let parser = CodexParser()
+        _ = parser.parseLine(#"{"type":"turn.started","turn_id":"turn-reasoning"}"#)
+        let raw = "Analisando a falha antes de responder."
+        let events = parser.parseLine(
+            #"{"type":"item.completed","item":{"id":"reasoning-fallback","type":"reasoning","text":"Analisando a falha antes de responder."}}"#
+        )
+
+        XCTAssertEqual(events.count, 3)
+        let started = try XCTUnwrap(events.first)
+        guard case .itemStarted(let item) = started else {
+            return XCTFail("real fallback reasoning must begin with itemStarted")
+        }
+        XCTAssertEqual(item.type, .reasoning)
+        XCTAssertEqual(item.body, "",
+                       "provider reasoning must not bypass the delta interceptor through itemStarted.body")
+        guard case .itemDelta(let itemId, let bodyAppend, let outputAppend, _) = events[1] else {
+            return XCTFail("real fallback reasoning must carry text through itemDelta")
+        }
+        XCTAssertEqual(itemId, "reasoning-fallback")
+        XCTAssertEqual(bodyAppend, raw)
+        XCTAssertNil(outputAppend)
+        guard case .itemCompleted(let itemId, .completed) = events[2] else {
+            return XCTFail("real fallback reasoning must complete after its delta")
+        }
+        XCTAssertEqual(itemId, "reasoning-fallback")
+    }
+
     func test_turnFailed_isLoudError() {
         let p = CodexParser()
         let evs = p.parseLine(#"{"type":"turn.failed","error":{"message":"model blocked"}}"#)

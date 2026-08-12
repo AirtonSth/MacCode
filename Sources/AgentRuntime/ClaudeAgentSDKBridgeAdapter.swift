@@ -93,6 +93,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         var bridgeUserInputSchemas: [String: [String: Any]] = [:]
         var cancellationRequested = false
         let claudeExecutablePath: String?
+        /// The typed host instruction is installed in the SDK system prompt at
+        /// session creation. A changed value requires a resumed respawn; the
+        /// SDK bridge has no safe per-turn system/developer update.
+        var trustedHostInstructionIdentity: String?
         // Bounded raw stderr tail, retained so the terminal diagnostic can carry
         // the REAL Node failure reason (e.g. ERR_MODULE_NOT_FOUND / native binary
         // not found) instead of a bare "exited with status N". Caller guards
@@ -407,7 +411,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
                 try self.write([
                     "type": "rc_turn",
                     "prompt": GraphifyStableSkillText.augmentTurnPrompt(
-                        request.providerPrompt,
+                        request.trustedHostInstruction == nil ? request.providerPrompt : request.prompt,
                         environment: request.environment
                     ),
                     "attachments": Self.attachmentPayload(request.attachments),
@@ -692,7 +696,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             // switch: respawn with resume, mirroring ClaudeStreamingCLIAdapter.canReuse.
             // An in-flight turn keeps the session (sendTurn rejects it right after,
             // exactly as before; recoverSession just re-attaches).
-            if (existing.reasoningEffort == request.reasoningEffort && existing.claudeExecutablePath == claudeExecutablePath) || existing.inFlightRunId != nil {
+            if (existing.reasoningEffort == request.reasoningEffort
+                && existing.claudeExecutablePath == claudeExecutablePath
+                && existing.trustedHostInstructionIdentity == Self.trustedHostInstructionIdentity(for: request))
+                || existing.inFlightRunId != nil {
                 lock.unlock()
                 do {
                     try applyRuntimeSwitchIfNeeded(existing, request: request)
@@ -716,6 +723,12 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         }
         lock.unlock()
         return try await startNewSession(request, provisioningCallback: provisioningCallback)
+    }
+
+    private static func trustedHostInstructionIdentity(for request: AgentRunRequest) -> String? {
+        let value = request.trustedHostInstruction?.text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return value?.isEmpty == false ? value : nil
     }
 
     private func startNewSession(_ request: AgentRunRequest,
@@ -875,6 +888,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
                               reasoningEffort: request.reasoningEffort,
                               providerThreadId: effectiveProviderThreadId,
                               claudeExecutablePath: claudeExecutablePath)
+        session.trustedHostInstructionIdentity = Self.trustedHostInstructionIdentity(for: request)
         stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self, weak session] handle in
             guard let self, let session else { return }
             session.stdoutReadLock.lock()
@@ -1673,7 +1687,11 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         if let settings = ClaudeRunner.ultracodeSettingsArgs(request.reasoningEffort).last {
             payload["settings"] = settings
         }
-        payload["system_prompt"] = Self.claudeSystemPrompt(environment: request.environment)
+        payload["system_prompt"] = Self.claudeSystemPrompt(
+            environment: request.environment,
+            interactionMode: request.interactionMode,
+            trustedHostInstruction: request.trustedHostInstruction
+        )
         return payload
     }
 
@@ -1689,11 +1707,22 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     /// Managed Distill language + pipe rules only when Token Saver is active
     /// (`RC_TOKEN_SAVER_DISTILL_HINT=1`). Codex/Grok use the same env gate —
     /// never via `~/.claude/skills` / `~/.codex/skills`.
-    static func claudeSystemPrompt(environment: [String: String]) -> String {
-        AgentSkillInstaller.tokenSaverProviderPrompt(
-            BackgroundAwaitContinuation.alwaysOnClaudeDirectives,
+    static func claudeSystemPrompt(
+        environment: [String: String],
+        interactionMode: AgentInteractionMode = .default,
+        trustedHostInstruction: AgentTrustedHostInstruction? = nil
+    ) -> String {
+        var prompt = AgentSkillInstaller.tokenSaverProviderPrompt(
+            AgentProviderInstructionText.providerPreamble(for: interactionMode)
+                + "\n\n"
+                + BackgroundAwaitContinuation.alwaysOnClaudeDirectives,
             environment: environment
         )
+        if let trustedHostInstruction, !trustedHostInstruction.isEmpty {
+            prompt += "\n\nREMOTE_CODE_TRUSTED_HOST_INSTRUCTIONS_V1\n"
+                + trustedHostInstruction.text
+        }
+        return prompt
     }
 
     private func effectiveProviderThreadId(for request: AgentRunRequest) -> String? {

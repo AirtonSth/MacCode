@@ -881,7 +881,7 @@ public final class AppContext {
             )
         }
         try? tokenSaverSavingsRepo.prune()
-        self.coordinator.promptCompressor = { [weak self] prompt, provider, threadId, runId in
+        self.coordinator.promptCompressor = { [weak self] prompt, semanticSource, provider, threadId, runId in
             guard let self else { return prompt }
             // task-08: cross-user raw-only before any SessionLearn/compress work.
             let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
@@ -891,9 +891,88 @@ public final class AppContext {
             let scopedPrompt = await self.tokenSaverSessionLearnPrompt(
                 prompt, provider: provider, threadId: threadId, runId: runId
             )
-            return await self.tokenSaverCompress(prompt: scopedPrompt, provider: provider, threadId: threadId, runId: runId)
+            let trustedSemanticSource = semanticSource.appendingTrustedHostSegments(
+                scopedPrompt.trustedHostSegments
+            )
+            let compressed = await self.tokenSaverCompress(
+                prompt: scopedPrompt.prompt,
+                semanticSource: trustedSemanticSource,
+                provider: provider,
+                threadId: threadId,
+                runId: runId
+            )
+            // SR2 is the paid runtime's wire language, even when a short prompt
+            // is not a net-positive compression candidate. The natural prompt
+            // remains in AgentMessage.content; only this provider-bound leg is
+            // wrapped and escaped losslessly.
+            let (runtimeActive, targetModel) = await MainActor.run {
+                (self.isTokenSaverRuntimeActive(), (try? self.threadRepo.get(id: threadId))?.model)
+            }
+            let preservesInternalProtocol = compressed != scopedPrompt.prompt
+                && Self.isKnownInternalSR2(compressed)
+            return runtimeActive
+                ? Self.alwaysOnSR2UserInstruction(
+                    compressed,
+                    preservesKnownInternalProtocol: preservesInternalProtocol,
+                    semanticSource: trustedSemanticSource.naturalUserText,
+                    trustedSemanticSegments: trustedSemanticSource.trustedHostSegments,
+                    losslessFallback: scopedPrompt.prompt,
+                    provider: provider.rawValue,
+                    model: targetModel
+                )
+                : compressed
         }
-        self.coordinator.followUpPromptCompressor = { [weak self] prompt, provider, threadId in
+        self.coordinator.promptPayloadCompressor = { [weak self] prompt, semanticSource, provider, threadId, runId in
+            guard let self else { return AgentProviderPromptPayload(userPrompt: prompt) }
+            // The typed payload is the production seam: SessionLearn is host
+            // context, while the natural user prompt is compiled on its own.
+            let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
+            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .initial) else {
+                return AgentProviderPromptPayload(userPrompt: prompt)
+            }
+            let runtimeActive = await MainActor.run { self.isTokenSaverRuntimeActive() }
+            guard runtimeActive else {
+                return AgentProviderPromptPayload(userPrompt: prompt)
+            }
+            let scopedPrompt = await self.tokenSaverSessionLearnPrompt(
+                prompt, provider: provider, threadId: threadId, runId: runId
+            )
+            let compressed = await self.tokenSaverCompress(
+                prompt: prompt,
+                semanticSource: AgentPromptSemanticSource(semanticSource.naturalUserText),
+                provider: provider,
+                threadId: threadId,
+                runId: runId
+            )
+            let targetModel = await MainActor.run {
+                (try? self.threadRepo.get(id: threadId))?.model
+            }
+            let preservesInternalProtocol = compressed != prompt
+                && Self.isKnownInternalSR2(compressed)
+            let userWire = Self.alwaysOnSR2UserInstruction(
+                compressed,
+                preservesKnownInternalProtocol: preservesInternalProtocol,
+                semanticSource: semanticSource.naturalUserText,
+                // SessionLearn is intentionally omitted from the user leg.
+                trustedSemanticSegments: [],
+                losslessFallback: prompt,
+                provider: provider.rawValue,
+                model: targetModel
+            )
+            let learned = scopedPrompt.trustedHostSegments
+                .joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let host: AgentTrustedHostInstruction? = learned.isEmpty
+                ? nil
+                : AgentTrustedHostInstruction(
+                    text: "REMOTE_CODE_SESSION_LEARN_V1\nSESSION_LEARN_EXACT_SCOPE:\n\(learned)"
+                )
+            return AgentProviderPromptPayload(
+                userPrompt: userWire,
+                trustedHostInstruction: host
+            )
+        }
+        self.coordinator.followUpPromptCompressor = { [weak self] prompt, semanticSource, provider, threadId in
             guard let self else { return prompt }
             let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
             guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .followUp) else {
@@ -902,7 +981,32 @@ public final class AppContext {
             let scopedPrompt = await self.tokenSaverSessionLearnPrompt(
                 prompt, provider: provider, threadId: threadId, runId: nil
             )
-            return await self.tokenSaverCompress(prompt: scopedPrompt, provider: provider, threadId: threadId, cacheState: "prompt_followup")
+            let trustedSemanticSource = semanticSource.appendingTrustedHostSegments(
+                scopedPrompt.trustedHostSegments
+            )
+            let compressed = await self.tokenSaverCompress(
+                prompt: scopedPrompt.prompt,
+                semanticSource: trustedSemanticSource,
+                provider: provider,
+                threadId: threadId,
+                cacheState: "prompt_followup"
+            )
+            let (runtimeActive, targetModel) = await MainActor.run {
+                (self.isTokenSaverRuntimeActive(), (try? self.threadRepo.get(id: threadId))?.model)
+            }
+            let preservesInternalProtocol = compressed != scopedPrompt.prompt
+                && Self.isKnownInternalSR2(compressed)
+            return runtimeActive
+                ? Self.alwaysOnSR2UserInstruction(
+                    compressed,
+                    preservesKnownInternalProtocol: preservesInternalProtocol,
+                    semanticSource: trustedSemanticSource.naturalUserText,
+                    trustedSemanticSegments: trustedSemanticSource.trustedHostSegments,
+                    losslessFallback: scopedPrompt.prompt,
+                    provider: provider.rawValue,
+                    model: targetModel
+                )
+                : compressed
         }
         self.coordinator.finalResponseTranslator = { [weak self] response, provider, threadId, runId in
             guard let self else { return response }
@@ -1779,11 +1883,11 @@ public final class AppContext {
         return cancelAllQueueDrainWaiters()
     }
 
-    /// Managed `/distill` state is only useful while Token Saver is on, so the skill
-    /// and provider config lifecycle tracks the Token Saver toggle: present when
-    /// enabled, removed when disabled. Driven from every Token Saver trigger:
-    /// app open/close and the enable/disable toggle, so it never lingers once
-    /// Token Saver is off.
+    /// Managed `/distill` state is shared per-user integration. Runtime admission
+    /// tracks the Token Saver toggle: enabled runs receive it, while disabled
+    /// runs receive no paid environment and bypass it. The on-disk entrypoints
+    /// remain available to another concurrently running ON instance; explicit
+    /// installer uninstall methods handle user-requested cleanup.
     static var isRunningUnitTests: Bool {
         ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil ||
             NSClassFromString("XCTestCase") != nil
@@ -1908,8 +2012,13 @@ public final class AppContext {
             env["PATH"] = ([managedBin] + pathParts).joined(separator: ":")
             env["RC_REMOTE_CODE_MANAGED_BIN"] = managedBin
         }
-        // Claude PostToolUse needs the sidecar state file path (not a secret).
-        if receipt.capabilities.postToolUse == true {
+        // Every admitted distill/managed-wrapper lane needs the namespace-local
+        // sidecar lease.  Claude used to be the only caller because its
+        // PostToolUse hook read this path, but Codex/Grok command wrappers also
+        // resolve `distill` from the provider child environment.  Stamping the
+        // path for all admitted managed lanes keeps canary/debug state isolated
+        // and prevents a wrapper from falling through to the stable lease.
+        if receipt.capabilities.distill == true || receipt.capabilities.managedPath == true {
             env["REMOTE_CODE_DISTILL_STATE_PATH"] = appSupportDirectory
                 .appendingPathComponent("Distill", isDirectory: true)
                 .appendingPathComponent("DistillCLIState.json")
@@ -1984,8 +2093,8 @@ public final class AppContext {
             "REMOTE_CODE_PROVIDER_INSTANCE_ID": thread?.providerInstanceId ?? provider.rawValue,
         ]) { _, new in new }
         let installer = makeAgentSkillInstaller()
-        // Nested launches inherit managed bin; keep distill healthy whenever Token
-        // Saver is admitted so child shells and PostToolUse hooks never see a gap.
+        // Nested launches inherit provider aliases always; keep distill healthy
+        // whenever Token Saver is admitted so child shells never see a gap.
         if tokenSaverRuntimeAdmitted {
             do {
                 _ = try installer.ensureDistillCLI()
@@ -1996,14 +2105,29 @@ public final class AppContext {
             }
         }
         let managedBin = installer.managedCLIBinURL.path
+        let providerProxyBin = installer.providerProxyBinURL.path
         let basePath = environment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
-        environment["PATH"] = AppCommandRouter.providerPathWithManagedWrappers(
-            currentPath: basePath,
-            managedBin: managedBin
-        )
-        environment["RC_REMOTE_CODE_MANAGED_BIN"] = managedBin
+        if tokenSaverRuntimeAdmitted {
+            environment["PATH"] = AppCommandRouter.providerPathWithManagedWrappers(
+                currentPath: basePath,
+                managedBin: managedBin,
+                providerProxyBin: providerProxyBin
+            )
+            environment["RC_REMOTE_CODE_MANAGED_BIN"] = managedBin
+        } else {
+            environment["PATH"] = AppCommandRouter.providerPathWithManagedWrappers(
+                currentPath: basePath,
+                managedBin: providerProxyBin
+            )
+            // The shell bridge uses this key to reassert the provider-only
+            // directory after a provider snapshot/profile refresh.
+            environment["RC_REMOTE_CODE_MANAGED_BIN"] = providerProxyBin
+        }
+        environment["RC_REMOTE_CODE_PROVIDER_PROXY_BIN"] = providerProxyBin
         environment.removeValue(forKey: "RC_REMOTE_CODE_AGENT_APP_COMMAND")
-        if let agentAppCommand = installer.verifiedAgentAppMiddlewareURL() {
+        if let agentAppCommand = installer.verifiedAgentAppMiddlewareURL(
+            binDirectory: installer.providerProxyBinURL
+        ) {
             environment["RC_REMOTE_CODE_AGENT_APP_COMMAND"] = agentAppCommand.path
         }
 
@@ -2034,10 +2158,24 @@ public final class AppContext {
                 environment["RC_REMOTE_CODE_ORIGINAL_ZDOTDIR"]
             environment["RC_REMOTE_CODE_MANAGED_ZDOTDIR"] = shellBridge.path
             environment["ZDOTDIR"] = shellBridge.path
+            let bashEnv = installer.providerShellBridgeBashEnvURL
+            if FileManager.default.fileExists(atPath: bashEnv.path) {
+                let originalBashEnv = environment["BASH_ENV"]?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if let originalBashEnv,
+                   !originalBashEnv.isEmpty,
+                   originalBashEnv != bashEnv.path {
+                    environment["RC_REMOTE_CODE_ORIGINAL_BASH_ENV"] = originalBashEnv
+                } else {
+                    environment.removeValue(forKey: "RC_REMOTE_CODE_ORIGINAL_BASH_ENV")
+                }
+                environment["BASH_ENV"] = bashEnv.path
+            }
         } else {
             environment.removeValue(forKey: "RC_REMOTE_CODE_ORIGINAL_ZDOTDIR")
             environment.removeValue(forKey: "RC_REMOTE_CODE_EFFECTIVE_ZDOTDIR")
             environment.removeValue(forKey: "RC_REMOTE_CODE_MANAGED_ZDOTDIR")
+            environment.removeValue(forKey: "RC_REMOTE_CODE_ORIGINAL_BASH_ENV")
         }
         if let workspaceID = thread?.workspaceId?.value.uuidString {
             environment["RC_REMOTE_CODE_WORKSPACE_ID"] = workspaceID
@@ -2136,9 +2274,10 @@ public final class AppContext {
             if persistPreference {
                 settingsStore.update { $0.tokenSaverEnabled = false }
             }
-            // Revoke live capabilities before touching any legacy install. A
-            // failed legacy scrub must never leave a resident paid sidecar,
-            // Graphify watcher, CLI, wrapper, or retrieve MCP active.
+            // Revoke live capabilities before cleaning up legacy provider-home
+            // state. Managed CLI/PATH entrypoints are per-user shared resources;
+            // their runtime admission gate fails closed while this instance is
+            // off, so an OFF instance cannot tear down another ON instance.
             tokenSaverDistillServiceController.stop()
             reconcileGraphifyHost(settings: settings(enabled: false))
             return reconcileManagedDistillSkills(tokenSaverEnabled: false)
@@ -2359,10 +2498,11 @@ public final class AppContext {
 
     /// Reconcile Distill integration after the lifecycle gate above (paid
     /// feature). The app-private skill package lives under Application Support
-    /// only (never `~/.claude` / `~/.codex` skill trees). CLI, command wrappers,
-    /// and retrieve
-    /// MCP are installed only while Token Saver is enabled; disabled removes them
-    /// so free/unsubscribed runs never get token-economy hooks.
+    /// only (never `~/.claude` / `~/.codex` skill trees). Managed CLI, command
+    /// wrappers, and retrieve MCP are shared per-user entrypoints: they remain
+    /// installed while Token Saver is off, but OFF runs receive no admitted
+    /// runtime environment and therefore bypass Distill. Explicit installer
+    /// uninstall methods remain available for user-requested cleanup.
     ///
     /// Nested provider PATH proxies (`grok`/`claude`/`codex`) are always installed
     /// when reconcile runs: they are not a Token Saver lane. They only intercept
@@ -2378,20 +2518,6 @@ public final class AppContext {
                 try operation()
             } catch {
                 failures.append("\(label): \((error as NSError).localizedDescription)")
-            }
-        }
-
-        func removePaidIntegration() {
-            // Keep these independent and first. One malformed provider config or
-            // filesystem failure must not short-circuit the remaining removals.
-            capture("command wrapper cleanup") {
-                _ = try installer.uninstallCommandWrappers()
-            }
-            capture("Distill CLI cleanup") {
-                _ = try installer.uninstallDistillCLI()
-            }
-            capture("retrieve MCP cleanup") {
-                try installer.uninstallRetrieveMCP()
             }
         }
 
@@ -2436,7 +2562,9 @@ public final class AppContext {
                 )
             }
         } else {
-            removePaidIntegration()
+            // Do not uninstall shared per-user entrypoints here. Another
+            // RemoteCode instance may still have Token Saver admitted; this
+            // instance's OFF runtime gate keeps its own commands verbatim.
             managedDistillSkillInstallResults = []
         }
 
@@ -2453,12 +2581,16 @@ public final class AppContext {
         // Always-on subagent routing is independent of Token Saver. Install each
         // component separately so a failure cannot remove or suppress siblings.
         do {
-            _ = try installer.installProviderProxies()
+            _ = try installer.installProviderProxies(
+                binDirectory: installer.providerProxyBinURL
+            )
         } catch {
             NSLog("RemoteCode provider proxy install failed: \(error)")
         }
         do {
-            _ = try installer.installAgentAppMiddleware()
+            _ = try installer.installAgentAppMiddleware(
+                binDirectory: installer.providerProxyBinURL
+            )
         } catch {
             NSLog("RemoteCode Agent App middleware install failed: \(error)")
         }
@@ -3035,6 +3167,7 @@ public final class AppContext {
 
     func tokenSaverCompress(
         prompt: String,
+        semanticSource: AgentPromptSemanticSource? = nil,
         provider: AgentProvider,
         threadId: AgentThreadID,
         cacheState: String = "prompt",
@@ -3119,19 +3252,47 @@ public final class AppContext {
         let deterministicBytes = deterministicCandidate.utf8.count
         let deterministicCharacters = deterministicCandidate.count
 
-        /// Wrap only a measured net-positive candidate. SR2 syntax is not free:
-        /// short prompts stay verbatim rather than paying more tokens merely to
-        /// satisfy the wire preference.
-        func outboundWire(for candidate: String) -> String {
-            Self.netPositiveSR2UserInstruction(original: prompt, compressed: candidate)
+        /// Encode every candidate as SR2. The paid-provider wire contract stays
+        /// stable even when the envelope costs more than a short prompt.
+        func outboundWire(for candidate: String, preservesKnownInternalProtocol: Bool = false) -> String {
+            Self.sr2UserInstructionWire(
+                candidate,
+                preservesKnownInternalProtocol: preservesKnownInternalProtocol,
+                semanticSource: semanticSource?.naturalUserText,
+                trustedSemanticSegments: semanticSource?.trustedHostSegments ?? []
+            )
         }
 
-        // Adopt `candidate` only if it beats the ORIGINAL prompt; record honest end-to-end
-        // savings (original -> final), tagged with the caller's cache_state AND the engine
-        // that produced the win (deterministic pre-pass vs the model) so the Token Saver
-        // breakdown attributes per technique.
-        func adopt(_ candidate: String, stage: TokenSaverRouteStage) -> String {
-            let outbound = outboundWire(for: candidate)
+        // Record honest end-to-end savings (original -> final), tagged with the caller's
+        // cache_state AND the engine that produced the win. The delta is clamped at zero
+        // when SR2's envelope costs more than the natural prompt.
+        func adopt(
+            _ candidate: String,
+            stage: TokenSaverRouteStage,
+            preservesKnownInternalProtocol: Bool = false
+        ) -> String {
+            let outbound: String
+            if preservesKnownInternalProtocol,
+               Self.isKnownInternalSR2(candidate),
+               !Self.isSemanticallyCoveredInternalSR2(
+                    candidate,
+                    original: prompt,
+                    semanticSource: semanticSource
+               ) {
+                // A model candidate can be syntactically valid SR2 while
+                // dropping a host-promoted segment. Preserve the complete
+                // provider prompt rather than trusting protocol-shaped bytes.
+                outbound = Self.sr2UserInstructionWire(
+                    prompt,
+                    semanticSource: semanticSource?.naturalUserText,
+                    trustedSemanticSegments: semanticSource?.trustedHostSegments ?? []
+                )
+            } else {
+                outbound = outboundWire(
+                    for: candidate,
+                    preservesKnownInternalProtocol: preservesKnownInternalProtocol
+                )
+            }
             guard outbound != prompt else {
                 self.tokenSaverPromptSkipSet[skipKey] = Date()
                 return prompt
@@ -3165,10 +3326,16 @@ public final class AppContext {
             // No model service: deterministic pre-passes still fail open and can save tokens.
             return deterministicBytes < promptBytes ? adopt(deterministicCandidate, stage: .deterministic) : prompt
         }
+        let targetModel = (try? threadRepo.get(id: threadId))?.model
+        let targetProviderModel = [provider.rawValue, targetModel]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "/")
         let request = DistillRequest(
             mode: .longText,
             priority: .interactive,
             input: deterministicCandidate,
+            provider: targetProviderModel,
             runMode: semanticPromoted ? .optimize : .audit,
             maxOutputCharacters: max(512, deterministicCharacters)
         )
@@ -3197,10 +3364,19 @@ public final class AppContext {
             let literalSafeModelOutput = LiteralPreservation.guarded(original: prompt, compressed: modelOutput).droppedLiteral == nil
                 ? modelOutput
                 : deterministicCandidate
+            // A sidecar may echo the provider's legacy v0 envelope after Auto
+            // orchestration boilerplate has entered its input. Recompile that
+            // protocol-shaped response from the original semantic source so a
+            // v0 control stub cannot bypass the SR2 v1 command contract.
+            let semanticModelOutput = Self.recompileLegacySR2Candidate(
+                original: prompt,
+                candidate: literalSafeModelOutput,
+                semanticSource: semanticSource
+            )
             // The deterministic lane never adopts sidecar bytes. A semantic candidate
             // is live only after its own lane is promoted and exact-scope recovery was
             // durably stored and read back. Shadow runs observe it verbatim-only.
-            let modelWon = literalSafeModelOutput.utf8.count < deterministicBytes
+            let modelWon = semanticModelOutput.utf8.count < deterministicBytes
             if !modelWon, deterministicBytes >= promptBytes {
                 tokenSaverPromptSkipSet[skipKey] = Date()
             }
@@ -3213,7 +3389,7 @@ public final class AppContext {
                   let recoveredCandidate = prepareSemanticCandidate(
                     original: prompt,
                     stageOriginal: deterministicCandidate,
-                    candidate: literalSafeModelOutput,
+                    candidate: semanticModelOutput,
                     capability: response.originalHandle,
                     idempotencyKey: response.recoveryIdempotencyKey,
                     provider: provider,
@@ -3233,7 +3409,11 @@ public final class AppContext {
                     ? adopt(deterministicCandidate, stage: .deterministic)
                     : prompt
             }
-            return adopt(recoveredCandidate, stage: response.routeStage ?? .llmMLX)
+            return adopt(
+                recoveredCandidate,
+                stage: response.routeStage ?? .llmMLX,
+                preservesKnownInternalProtocol: true
+            )
         } catch {
             NSLog("RemoteCode Token Saver compression skipped (provider=\(provider.rawValue)): \(error)")
             // Fail-open to the deterministic pre-pass if it helped, else the original.
@@ -3241,13 +3421,169 @@ public final class AppContext {
         }
     }
 
+    /// Provider-facing user leg for the always-on Token Saver runtime. Unlike
+    /// `netPositiveSR2UserInstruction`, this deliberately pays SR2's small
+    /// envelope overhead for short prompts so every admitted turn has one
+    /// stable machine-readable wire contract.
+    nonisolated public static func alwaysOnSR2UserInstruction(
+        _ compressed: String,
+        preservesKnownInternalProtocol: Bool = false,
+        semanticSource: String? = nil,
+        trustedSemanticSegments: [String] = [],
+        losslessFallback: String? = nil,
+        provider: String? = nil,
+        model: String? = nil,
+        targetTokenizer: String? = nil,
+        targetTokenCount: SR2Optimizer.TokenCounter? = nil
+    ) -> String {
+        sr2UserInstructionWire(
+            compressed,
+            preservesKnownInternalProtocol: preservesKnownInternalProtocol,
+            semanticSource: semanticSource,
+            trustedSemanticSegments: trustedSemanticSegments,
+            losslessFallback: losslessFallback,
+            provider: provider,
+            model: model,
+            targetTokenizer: targetTokenizer,
+            targetTokenCount: targetTokenCount
+        )
+    }
+
     static func netPositiveSR2UserInstruction(original: String, compressed: String) -> String {
-        let wire = SR2WirePolicy.isSR2(compressed)
-            ? compressed
-            : SR2WirePolicy.userInstructionWire(compressed)
-        return TokenEstimator.estimate(wire) < TokenEstimator.estimate(original)
-            ? wire
-            : original
+        // Keep `original` in the signature for call-site compatibility. Token Saver's
+        // provider leg is SR2 even when the envelope is not net-positive for a short
+        // prompt; the UI retains the natural prompt separately.
+        _ = original
+        return sr2UserInstructionWire(compressed)
+    }
+
+    /// The caller-facing compressor only receives natural user text or a known
+    /// internal optimizer result. A syntactically valid SR2 string without a
+    /// recoverable `u:` field is not enough provenance to send it as protocol.
+    private nonisolated static func sr2UserInstructionWire(
+        _ candidate: String,
+        preservesKnownInternalProtocol: Bool = false,
+        semanticSource: String? = nil,
+        trustedSemanticSegments: [String] = [],
+        losslessFallback: String? = nil,
+        provider: String? = nil,
+        model: String? = nil,
+        targetTokenizer: String? = nil,
+        targetTokenCount: SR2Optimizer.TokenCounter? = nil
+    ) -> String {
+        // Preserve a genuinely empty prompt as empty. A non-empty whitespace-only
+        // prompt is still user data and must travel through the lossless envelope.
+        guard !candidate.isEmpty else {
+            return candidate
+        }
+        if let decoded = SR2WirePolicy.userInstruction(in: candidate) {
+            return SR2WirePolicy.isCurrentSR2(candidate)
+                ? candidate
+                : SR2WirePolicy.userInstructionWire(decoded)
+        }
+        if preservesKnownInternalProtocol,
+           isKnownInternalSR2(candidate) {
+            guard !trustedSemanticSegments.isEmpty else { return candidate }
+            let trustedSource = AgentPromptSemanticSource(
+                semanticSource ?? "",
+                trustedHostSegments: trustedSemanticSegments
+            )
+            guard isSemanticallyCoveredInternalSR2(
+                candidate,
+                original: losslessFallback ?? candidate,
+                semanticSource: trustedSource
+            ) else {
+                return SR2WirePolicy.userInstructionWire(losslessFallback ?? candidate)
+            }
+            return candidate
+        }
+        // This local compiler is deliberately bounded to self-contained command
+        // contracts and still passes SR2Optimizer's token and semantic gates.
+        // It is safe for projectless prompts; project-scoped MLX/recovery lanes
+        // retain their existing admission requirements above this boundary.
+        let target = [provider, model]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "/")
+        let tokenizerLabel = targetTokenizer
+            ?? "\(target.isEmpty ? "unknown-provider/model" : target) tokenizer-unavailable; model-agnostic-estimator-v1"
+        let compiled = SR2Optimizer.compile(
+            original: candidate,
+            semanticSource: semanticSource,
+            semanticSegments: [semanticSource].compactMap { $0 } + trustedSemanticSegments,
+            targetTokenizer: tokenizerLabel,
+            targetTokenizerAvailable: targetTokenCount != nil,
+            tokenCount: targetTokenCount ?? { TokenEstimator.estimate($0) }
+        )
+        if compiled.accepted {
+            return compiled.output
+        }
+        return SR2WirePolicy.userInstructionWire(losslessFallback ?? candidate)
+    }
+
+    /// Semantic adoption appends scoped recovery markers after compiling the
+    /// SR2 candidate. Validate the protocol portion without granting the same
+    /// exception to arbitrary caller-provided text.
+    private nonisolated static func isKnownInternalSR2(_ candidate: String) -> Bool {
+        let protocolText = candidate
+            .split(whereSeparator: \.isNewline)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("[[rc:") }
+            .joined(separator: "\n")
+        guard SR2WirePolicy.isSR2(protocolText) else { return false }
+        return protocolText
+            .split(whereSeparator: \.isNewline)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == SR2WirePolicy.optimizerMarkerLine.lowercased()
+    }
+
+    private nonisolated static func isSemanticallyCoveredInternalSR2(
+        _ candidate: String,
+        original: String,
+        semanticSource: AgentPromptSemanticSource?
+    ) -> Bool {
+        guard let semanticSource else { return true }
+        let protocolText = candidate
+            .split(whereSeparator: \.isNewline)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("[[rc:") }
+            .joined(separator: "\n")
+        let decision = SR2Optimizer.optimize(
+            original: original,
+            candidates: [protocolText],
+            semanticSource: semanticSource.naturalUserText,
+            semanticSegments: [semanticSource.naturalUserText] + semanticSource.trustedHostSegments
+        )
+        return decision.accepted
+    }
+
+    private nonisolated static func recompileLegacySR2Candidate(
+        original: String,
+        candidate: String,
+        semanticSource: AgentPromptSemanticSource?
+    ) -> String {
+        let firstLine = candidate
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: \.isNewline)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard firstLine?.hasPrefix("@sr2") == true,
+              firstLine != SR2WirePolicy.optimizerMarkerLine.lowercased() else {
+            return candidate
+        }
+        let compiled = SR2Optimizer.compile(
+            original: original,
+            semanticSource: semanticSource?.naturalUserText,
+            semanticSegments: semanticSource.map {
+                [$0.naturalUserText] + $0.trustedHostSegments
+            }
+        )
+        // A legacy v0 sidecar result may preserve every pinned literal while
+        // still dropping a non-literal constraint or a promoted host segment.
+        // Rejected recompilation therefore fails open to the complete provider
+        // prompt; returning the shorter candidate here would silently lose
+        // trusted semantics.
+        return compiled.accepted ? compiled.output : original
     }
 
     private func prepareSemanticCandidate(
@@ -3453,9 +3789,9 @@ public final class AppContext {
         provider: AgentProvider,
         threadId: AgentThreadID,
         runId: AgentRunID?
-    ) -> String {
+    ) -> (prompt: String, trustedHostSegments: [String]) {
         let settings = SettingsStore(db: db).load()
-        guard settings.sessionLearnEnabled else { return prompt }
+        guard settings.sessionLearnEnabled else { return (prompt, []) }
         // WHY: session_learn retains scoped text — keep project admission; make denials loud.
         if tokenSaverLaneIsDisabled("session_learn") {
             recordTokenSaverAdmissionDenial(
@@ -3463,7 +3799,7 @@ public final class AppContext {
                 lane: "session_learn",
                 decision: .init(allowed: false, reason: "operator_lane_disabled")
             )
-            return prompt
+            return (prompt, [])
         }
         let sessionAdmission = tokenSaverProjectAdmission(threadId: threadId, lane: "session_learn")
         guard sessionAdmission.allowed else {
@@ -3472,12 +3808,12 @@ public final class AppContext {
                 lane: "session_learn",
                 decision: sessionAdmission
             )
-            return prompt
+            return (prompt, [])
         }
         guard let thread = try? threadRepo.get(id: threadId),
               let workspaceID = thread.workspaceId?.value.uuidString,
               let projectID = thread.projectId?.value.uuidString else {
-            return prompt
+            return (prompt, [])
         }
         let scope = TokenSaverSessionLearnScope(
             workspaceID: workspaceID,
@@ -3504,12 +3840,15 @@ public final class AppContext {
                 topK: 3,
                 byteBudget: 512
             )
-            guard !selected.isEmpty else { return prompt }
+            guard !selected.isEmpty else { return (prompt, []) }
             let bounded = selected.map { "- \($0.text)" }.joined(separator: "\n")
-            return prompt + "\n\nSESSION_LEARN_EXACT_SCOPE:\n" + bounded
+            return (
+                prompt + "\n\nSESSION_LEARN_EXACT_SCOPE:\n" + bounded,
+                [bounded]
+            )
         } catch {
             NSLog("RemoteCode Token Saver SessionLearn prompt read failed: \(error)")
-            return prompt
+            return (prompt, [])
         }
     }
 
@@ -3679,7 +4018,7 @@ public final class AppContext {
 
         // Free prose: coordinator dual-channel plan stores prose + writes wire stub
         // as history. Translator returns UI prose (humanize is a no-op). Do not Distill.
-        if classified.wasEnforced {
+        if classified.wasEnforced && !classified.needsHumanize {
             // Best-effort store here too so humanize path alone still recovers;
             // dualChannelPersistPlan will store again (content-addressed, same handle).
             _ = try? ReversibleContentStore(db: db).store(classified.uiSourceText)
@@ -3721,7 +4060,8 @@ public final class AppContext {
             let humanized: String
             if !expanded.isEmpty,
                !SR1ResponseDetector.isSR1(expanded),
-               !SR2WirePolicy.isSR2(expanded) {
+               !SR2WirePolicy.isSR2(expanded),
+               !Self.containsRawHumanizationWireSyntax(expanded) {
                 humanized = expanded
             } else {
                 humanized = fallback
@@ -3733,6 +4073,16 @@ public final class AppContext {
             recordTokenSaverSR1HumanizeSavings(sr1: wire, humanized: fallback, provider: provider, threadId: threadId)
             return fallback
         }
+    }
+
+    /// A trusted humanizer response is the only UI boundary allowed to turn
+    /// provider wire into ordinary prose. Whole-string classification is not
+    /// sufficient here: a translator can prepend prose to an otherwise raw
+    /// SR1/SR2 marker and evade the protocol detectors. Reject the complete
+    /// translation when any line still looks like a wire marker or field so
+    /// the deterministic fallback keeps the UI free of control syntax.
+    private nonisolated static func containsRawHumanizationWireSyntax(_ text: String) -> Bool {
+        SR2WirePolicy.containsHumanizationWireSyntax(text)
     }
 
     private func currentDistillClientWaitingForStartup() async -> DistillServiceClient? {
@@ -3831,9 +4181,13 @@ public final class AppContext {
         let spanish = targetLanguage.localizedCaseInsensitiveContains("Spanish")
 
         // SR2 Opaque Agent IR (T-FF-01 fail-open without Fieldfare): expand o:/p:/e: fields.
-        if SR2WirePolicy.isSR2(response) {
+        if SR2WirePolicy.isSR2(response) || SR2WirePolicy.hasSR2Banner(response) {
+            if !portuguese, !spanish,
+               let rendered = SR2WirePolicy.deterministicHumanizedWire(response) {
+                return rendered
+            }
             var outcomes: [String] = []
-            var paths: [String] = []
+            var evidence: [String] = []
             var errors: [String] = []
             var semantics: [String] = []
             var continuationOnly = false
@@ -3862,6 +4216,18 @@ public final class AppContext {
                 let label = portuguese ? labels.0 : (spanish ? labels.1 : labels.2)
                 return "\(label): \(readableValue(value))."
             }
+            func evidenceLine(_ value: String) -> String {
+                let label = portuguese ? "Evidencia" : (spanish ? "Evidencia" : "Evidence")
+                if let equals = value.firstIndex(of: "=") {
+                    let index = value[..<equals].trimmingCharacters(in: .whitespacesAndNewlines)
+                    let detail = value[value.index(after: equals)...]
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !index.isEmpty, index.allSatisfy(\.isNumber), !detail.isEmpty {
+                        return "\(label) \(index): \(detail)"
+                    }
+                }
+                return "\(label): \(value)"
+            }
             for raw in response.split(whereSeparator: \.isNewline) {
                 let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !line.isEmpty else { continue }
@@ -3873,7 +4239,7 @@ public final class AppContext {
                     else if v == "cont" { continuationOnly = true }
                 } else if lower.hasPrefix("p:") {
                     let v = String(line.dropFirst(2)).trimmingCharacters(in: .whitespaces)
-                    if !v.isEmpty { paths.append(v) }
+                    if !v.isEmpty { evidence.append(evidenceLine(v)) }
                 } else if lower.hasPrefix("e:") {
                     let v = String(line.dropFirst(2)).trimmingCharacters(in: .whitespaces)
                     if !v.isEmpty { errors.append(v) }
@@ -3888,7 +4254,7 @@ public final class AppContext {
             }
             var pieces = outcomes + semantics
             if !errors.isEmpty { pieces.append(contentsOf: errors.prefix(2)) }
-            if !paths.isEmpty { pieces.append(paths.joined(separator: ", ")) }
+            pieces.append(contentsOf: evidence)
             if pieces.isEmpty, continuationOnly {
                 if portuguese { pieces.append("Continuando o trabalho.") }
                 else if spanish { pieces.append("Continuando el trabajo.") }

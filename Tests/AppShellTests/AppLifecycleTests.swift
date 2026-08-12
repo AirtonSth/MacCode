@@ -1,5 +1,7 @@
 import AppKit
 import XCTest
+import CoreModel
+import Persistence
 @testable import AppLifecycleSupport
 @testable import AppShell
 
@@ -170,6 +172,186 @@ final class AppLifecycleRecorderTests: XCTestCase {
 }
 
 final class AppLifecycleTests: XCTestCase {
+    private func makeManagedIntegrationFixture() throws -> (
+        root: URL,
+        appSupport: URL,
+        outside: URL
+    ) {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RC2ManagedIntegration-" + UUID().uuidString, isDirectory: true)
+        let appSupport = root.appendingPathComponent("app-support", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        return (root, appSupport, outside)
+    }
+
+    func test_hostOnlyManagedIntegrationHomeIsConsumedBeforeChildProcesses() throws {
+        var consumedKeys: [String] = []
+        ChildProcessEnvironmentPolicy.consumeHostOnlyKeysFromCurrentProcess {
+            consumedKeys.append($0)
+        }
+        XCTAssertEqual(
+            consumedKeys,
+            [ChildProcessEnvironmentPolicy.managedIntegrationHomeKey],
+            "the app bootstrap must consume exactly the managed-integration host key before any child can inherit it"
+        )
+
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/AppShell/Main.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let resolution = try XCTUnwrap(
+            source.range(of: "let managedIntegrationHomeOverride =")
+        )
+        let consumption = try XCTUnwrap(
+            source.range(of: "ChildProcessEnvironmentPolicy.consumeHostOnlyKeysFromCurrentProcess()")
+        )
+        let firstCommandMode = try XCTUnwrap(
+            source.range(of: "if CommandLine.arguments.contains(\"--scheduled-task-agent-unregister\")")
+        )
+        XCTAssertLessThan(resolution.lowerBound, consumption.lowerBound)
+        XCTAssertLessThan(
+            consumption.lowerBound,
+            firstCommandMode.lowerBound,
+            "the host-only key must be removed before command modes or NSApplication can launch any child process"
+        )
+    }
+
+    func test_finderCanaryWithoutManagedHomeOverrideDerivesCanonicalAppSupportIsolation() throws {
+        // WHY: LaunchServices only preserves bundle LSEnvironment. A Finder
+        // relaunch without the shell-only override must never fall back to the
+        // developer's real ~/.remote-code integration.
+        let fixture = try makeManagedIntegrationFixture()
+        let appSupportAlias = fixture.root.appendingPathComponent("app-support-alias")
+        try FileManager.default.createSymbolicLink(
+            at: appSupportAlias,
+            withDestinationURL: fixture.appSupport
+        )
+
+        let resolved = AppDelegate.managedIntegrationHome(
+            channel: .canary,
+            appSupportDirectory: appSupportAlias,
+            environment: [:],
+            isTestContext: false
+        )
+
+        XCTAssertEqual(
+            resolved?.path,
+            fixture.appSupport.appendingPathComponent("ManagedIntegrationHome").path
+        )
+    }
+
+    func test_stableProductionIgnoresManagedIntegrationHomeOverride() throws {
+        let fixture = try makeManagedIntegrationFixture()
+        let validDescendant = fixture.appSupport.appendingPathComponent("explicit-home")
+
+        XCTAssertNil(AppDelegate.managedIntegrationHome(
+            channel: .stable,
+            appSupportDirectory: fixture.appSupport,
+            environment: ["RC2_MANAGED_INTEGRATION_HOME": validDescendant.path],
+            isTestContext: false
+        ))
+    }
+
+    func test_nonTestDebugLaunchRejectsManagedIntegrationHomeOverride() throws {
+        let fixture = try makeManagedIntegrationFixture()
+        let validDescendant = fixture.appSupport.appendingPathComponent("explicit-home")
+
+        XCTAssertNil(AppDelegate.managedIntegrationHome(
+            channel: .debug,
+            appSupportDirectory: fixture.appSupport,
+            environment: ["RC2_MANAGED_INTEGRATION_HOME": validDescendant.path],
+            isTestContext: false
+        ))
+    }
+
+    func test_canaryRejectsOutsideManagedIntegrationHomeOverride() throws {
+        let fixture = try makeManagedIntegrationFixture()
+
+        let resolved = AppDelegate.managedIntegrationHome(
+            channel: .canary,
+            appSupportDirectory: fixture.appSupport,
+            environment: ["RC2_MANAGED_INTEGRATION_HOME": fixture.outside.path],
+            isTestContext: false
+        )
+
+        XCTAssertEqual(
+            resolved?.path,
+            fixture.appSupport.appendingPathComponent("ManagedIntegrationHome").path,
+            "an outside absolute override must be rejected in favor of the contained canary default"
+        )
+    }
+
+    func test_canaryRejectsPreexistingSymlinkEscapeOverride() throws {
+        let fixture = try makeManagedIntegrationFixture()
+        let escape = fixture.appSupport.appendingPathComponent("escape")
+        try FileManager.default.createSymbolicLink(at: escape, withDestinationURL: fixture.outside)
+
+        let resolved = AppDelegate.managedIntegrationHome(
+            channel: .canary,
+            appSupportDirectory: fixture.appSupport,
+            environment: [
+                "RC2_MANAGED_INTEGRATION_HOME": escape
+                    .appendingPathComponent("not-created-yet")
+                    .path
+            ],
+            isTestContext: false
+        )
+
+        XCTAssertEqual(
+            resolved?.path,
+            fixture.appSupport.appendingPathComponent("ManagedIntegrationHome").path,
+            "a preexisting symlink must not escape canonical canary app-support even when the leaf is absent"
+        )
+    }
+
+    func test_finderCanaryRejectsSymlinkEscapeAtDerivedDefault() throws {
+        // WHY: no environment override exists on a Finder relaunch. A stale or
+        // malicious default entry must not redirect managed integration writes
+        // outside canonical canary app-support.
+        let fixture = try makeManagedIntegrationFixture()
+        let derived = fixture.appSupport.appendingPathComponent("ManagedIntegrationHome")
+        try FileManager.default.createSymbolicLink(at: derived, withDestinationURL: fixture.outside)
+
+        let resolved = AppDelegate.managedIntegrationHome(
+            channel: .canary,
+            appSupportDirectory: fixture.appSupport,
+            environment: [:],
+            isTestContext: false
+        )
+
+        XCTAssertEqual(
+            resolved?.path,
+            fixture.appSupport.path,
+            "an escaped derived child must fall back to a canonical contained synthetic home, never the real user home"
+        )
+        XCTAssertNotEqual(resolved?.path, fixture.outside.path)
+    }
+
+    func test_validDescendantOverrideIsAcceptedForCanaryAndTests() throws {
+        let fixture = try makeManagedIntegrationFixture()
+        let validDescendant = fixture.appSupport
+            .appendingPathComponent("nested", isDirectory: true)
+            .appendingPathComponent("explicit-home", isDirectory: true)
+
+        for (channel, isTestContext) in [(ReleaseChannel.canary, false), (.debug, true)] {
+            XCTAssertEqual(
+                AppDelegate.managedIntegrationHome(
+                    channel: channel,
+                    appSupportDirectory: fixture.appSupport,
+                    environment: ["RC2_MANAGED_INTEGRATION_HOME": validDescendant.path],
+                    isTestContext: isTestContext
+                )?.path,
+                validDescendant.path,
+                "a contained override must remain available to canary and isolated test launches"
+            )
+        }
+    }
+
     @MainActor func test_lastWindowCloseDoesNotTerminateLongRunningTerminalSessions() {
         let delegate = AppDelegate()
 

@@ -4108,9 +4108,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !managedBin.isEmpty,
            let path = env["PATH"] {
+            let providerProxyBin = env["RC_REMOTE_CODE_PROVIDER_PROXY_BIN"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             env["PATH"] = Self.providerPathWithManagedWrappers(
                 currentPath: path,
-                managedBin: managedBin
+                managedBin: managedBin,
+                providerProxyBin: providerProxyBin
             )
         }
         return env
@@ -5406,29 +5409,35 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             // Token Saver command-compression wrappers remain gated by admission below.
             let managedBin = env["RC_REMOTE_CODE_MANAGED_BIN"]
                 ?? AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+            let providerProxyBin = env["RC_REMOTE_CODE_PROVIDER_PROXY_BIN"]
+                ?? managedBin
             let basePath = env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
             env["PATH"] = Self.providerPathWithManagedWrappers(
                 currentPath: basePath,
-                managedBin: managedBin
+                managedBin: providerProxyBin
             )
             // task-08: Token Saver PATH/hint only when same-user admission allows.
             let tokenSaverEnv = context.tokenSaverAgentEnvironment(provider: provider, threadId: threadId)
             if tokenSaverEnv.isEmpty {
                 // Cross-user / raw-only: scrub Token Saver optimization keys, but keep
-                // managed bin on PATH so nested provider proxies + Subagents telemetry work.
+                // only the provider proxy bin on PATH so ordinary commands cannot
+                // launch universal RemoteCode wrappers.
                 var cleaned = TokenSaverExecutionReceiptSeam.scrub(env)
                 cleaned["PATH"] = Self.providerPathWithManagedWrappers(
                     currentPath: cleaned["PATH"] ?? basePath,
-                    managedBin: managedBin
+                    managedBin: providerProxyBin
                 )
                 return cleaned
             }
             env.merge(tokenSaverEnv) { _, new in new }
             // Re-assert managed bin first after any Token Saver PATH rewrite.
             if let path = env["PATH"] {
+                let effectiveManagedBin = env["RC_REMOTE_CODE_MANAGED_BIN"]
+                    ?? managedBin
                 env["PATH"] = Self.providerPathWithManagedWrappers(
                     currentPath: path,
-                    managedBin: managedBin
+                    managedBin: effectiveManagedBin,
+                    providerProxyBin: providerProxyBin
                 )
             }
         } else {
@@ -5451,18 +5460,23 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return cleaned
     }
 
-    /// Prepends the managed CLI bin (`~/.remote-code/bin`) so nested provider proxies
-    /// and (when Token Saver is on) command-compression wrappers win PATH lookup inside
+    /// Prepends the selected provider/runtime bins so nested provider proxies and,
+    /// when Token Saver is on, command-compression wrappers win PATH lookup inside
     /// the provider process. Host top-level launches use absolute binaries via
     /// `ProcessLocator` and skip provider proxy shims.
-    static func providerPathWithManagedWrappers(currentPath: String, managedBin: String) -> String {
+    static func providerPathWithManagedWrappers(
+        currentPath: String,
+        managedBin: String,
+        providerProxyBin: String? = nil
+    ) -> String {
         let trimmed = managedBin.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return currentPath }
+        let proxy = providerProxyBin?.trimmingCharacters(in: .whitespacesAndNewlines)
         let parts = currentPath
             .split(separator: ":", omittingEmptySubsequences: false)
             .map(String.init)
-            .filter { $0 != trimmed }
-        return ([trimmed] + parts).joined(separator: ":")
+            .filter { $0 != trimmed && $0 != proxy }
+        return ([trimmed] + (proxy.map { [$0] } ?? []) + parts).joined(separator: ":")
     }
 
     private func configuredProviderBinary(_ provider: AgentProvider) -> String? {

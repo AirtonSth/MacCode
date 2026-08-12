@@ -957,7 +957,8 @@ public final class CodexAppServerClient: @unchecked Sendable {
                 "reasoning_effort": appServerReasoningEffort(for: request.reasoningEffort).rawValue,
                 "developer_instructions": developerInstructions(
                     for: request.interactionMode,
-                    environment: request.environment
+                    environment: request.environment,
+                    trustedHostInstruction: request.trustedHostInstruction
                 )
             ]
         ]
@@ -973,16 +974,21 @@ public final class CodexAppServerClient: @unchecked Sendable {
     /// stalls reach the host's [[RC_AWAITING]] recovery path).
     private static func developerInstructions(
         for mode: AgentInteractionMode,
-        environment: [String: String]
+        environment: [String: String],
+        trustedHostInstruction: AgentTrustedHostInstruction? = nil
     ) -> String {
         let base = AgentProviderInstructionText.developerInstructions(for: mode)
         // tokenSaverProviderPrompt also chains graphifyProviderPrompt.
         let withTokenSaver = AgentSkillInstaller.tokenSaverProviderPrompt(base, environment: environment)
         // Additive only: systemPromptDirective (NOT alwaysOnClaudeDirectives —
         // those carry Claude-CLI-only MCP rules).
-        if withTokenSaver.isEmpty {
-            return BackgroundAwaitContinuation.systemPromptDirective
+        var instructions = withTokenSaver.isEmpty
+            ? BackgroundAwaitContinuation.systemPromptDirective
+            : withTokenSaver + "\n\n" + BackgroundAwaitContinuation.systemPromptDirective
+        if let trustedHostInstruction, !trustedHostInstruction.isEmpty {
+            instructions += "\n\nREMOTE_CODE_TRUSTED_HOST_INSTRUCTIONS_V1\n"
+                + trustedHostInstruction.text
         }
-        return withTokenSaver + "\n\n" + BackgroundAwaitContinuation.systemPromptDirective
+        return instructions
     }
 }

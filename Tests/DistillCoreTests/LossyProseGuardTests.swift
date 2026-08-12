@@ -16,10 +16,18 @@ final class LossyProseGuardTests: XCTestCase {
     }
 
     func test_longText_acceptsOutputThatKeepsLiterals() {
-        let input = "Long verbose instruction. The crash is at Sources/Render/View.swift:212 with code 5012, plus padding padding padding."
-        let lossy = "Crash at Sources/Render/View.swift:212, code 5012."
-        let guarded = MLXDistillRuntime.guardLossyProseOutput(lossy, request: request(.longText, input: input))
-        XCTAssertEqual(guarded, lossy, "all literals preserved => adopt the compressed output")
+        let input = """
+        Use Trello or Playwright. After Playwright verification succeeds, merge with gh.
+        The task is complete only after deployment succeeds.
+        """
+        let optimized = """
+        @sr2 v1
+        tools:Trello|Playwright
+        flow:Playwright:verify>gh:merge
+        done:deploy
+        """
+        let guarded = MLXDistillRuntime.guardLossyProseOutput(optimized, request: request(.longText, input: input))
+        XCTAssertEqual(guarded, optimized, "a cheaper, behaviorally equivalent SR2 v1 candidate remains eligible")
     }
 
     func test_commandOutput_isExemptFromGuard() {
@@ -55,5 +63,20 @@ final class LossyProseGuardTests: XCTestCase {
         let input = "ERROR at Sources/Render/View.swift:212 with code 5012."
         let compressed = "ERROR Sources/Render/View.swift:212 code 5012."
         XCTAssertTrue(FaithfulnessGate.validate(original: input, compressed: compressed).accepted)
+    }
+
+    func test_longTextMLXFallbackPreservesTailBeyondEightLinesAndCharacterBudget() {
+        // WHY: an unavailable/invalid model must fail open without dropping a
+        // late instruction merely because the fallback exceeds its output budget.
+        let tail = "UNIQUE FINAL INSTRUCTION: never edit production data."
+        let input = ((1...15).map { "context line \($0)" } + [tail]).joined(separator: "\n")
+        let fallback = MLXDistillRuntime.fallbackOutput(for: DistillRequest(
+            mode: .longText,
+            input: input,
+            maxOutputCharacters: 32
+        ))
+
+        XCTAssertEqual(fallback, input)
+        XCTAssertTrue(fallback.hasSuffix(tail))
     }
 }

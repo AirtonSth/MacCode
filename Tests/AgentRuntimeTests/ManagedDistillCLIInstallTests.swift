@@ -173,6 +173,35 @@ final class ManagedDistillCLIInstallTests: XCTestCase {
         XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: lsLink.path))
     }
 
+    func test_installCommandWrappers_discoversEveryEligiblePathCommand() throws {
+        let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let binary = try fakeServiceBinary(in: home)
+        let systemBin = home.appendingPathComponent("system-bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: systemBin, withIntermediateDirectories: true)
+        for command in ["custom-build-tool", "npx", "rg", "sed", "shasum", "sha256sum", "vim", "less", "codex"] {
+            let url = systemBin.appendingPathComponent(command)
+            try Data("#!/bin/sh\nexit 0\n".utf8).write(to: url)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        }
+        let installer = AgentSkillInstaller(homeDirectory: home)
+
+        let installed = try installer.installCommandWrappers(
+            serviceBinaryURL: binary,
+            searchDirectoriesOverride: [systemBin.path]
+        )
+
+        XCTAssertTrue(installed.contains("custom-build-tool"))
+        XCTAssertTrue(installed.contains("npx"))
+        for excluded in ["rg", "sed", "shasum", "sha256sum", "vim", "less", "codex"] {
+            XCTAssertFalse(installed.contains(excluded), excluded)
+            XCTAssertNil(
+                try? FileManager.default.destinationOfSymbolicLink(
+                    atPath: home.appendingPathComponent(".remote-code/bin/\(excluded)").path
+                )
+            )
+        }
+    }
+
     func test_installCommandWrappers_removesLegacyExactOutputSymlinks() throws {
         let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
         let binary = try fakeServiceBinary(in: home)
@@ -207,6 +236,116 @@ final class ManagedDistillCLIInstallTests: XCTestCase {
         for command in installed {
             XCTAssertTrue(FileManager.default.fileExists(atPath: home.appendingPathComponent(".remote-code/bin/\(command)").path))
         }
+    }
+
+    func test_installCommandWrappers_reconcileRemovesStaleManagedWrapperAndPreservesForeignSymlink() throws {
+        let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let binary = try fakeServiceBinary(in: home)
+        let systemBin = home.appendingPathComponent("system-bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: systemBin, withIntermediateDirectories: true)
+        let staleName = "stale-tool"
+        let currentName = "current-tool"
+        for name in [staleName, currentName] {
+            let url = systemBin.appendingPathComponent(name)
+            try Data("#!/bin/sh\nexit 0\n".utf8).write(to: url)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        }
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        _ = try installer.installCommandWrappers(
+            serviceBinaryURL: binary,
+            searchDirectoriesOverride: [systemBin.path]
+        )
+        let managedBin = home.appendingPathComponent(".remote-code/bin", isDirectory: true)
+        let foreignTarget = home.appendingPathComponent("foreign-tool")
+        try Data("foreign".utf8).write(to: foreignTarget)
+        let foreignLink = managedBin.appendingPathComponent("foreign-alias")
+        try FileManager.default.createSymbolicLink(at: foreignLink, withDestinationURL: foreignTarget)
+        try FileManager.default.removeItem(at: systemBin.appendingPathComponent(staleName))
+
+        _ = try installer.installCommandWrappers(
+            serviceBinaryURL: binary,
+            searchDirectoriesOverride: [systemBin.path]
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: managedBin.appendingPathComponent(staleName).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: managedBin.appendingPathComponent(currentName).path))
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: foreignLink.path),
+            foreignTarget.path,
+            "reconciliation must not overwrite a foreign symlink in the managed directory"
+        )
+    }
+
+    func test_installCommandWrappers_retargetsOlderRemoteCodeServiceSymlink() throws {
+        let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let oldBinary = home.appendingPathComponent("old/RemoteCodeDistillService")
+        let newBinary = home.appendingPathComponent("new/RemoteCodeDistillService")
+        for binary in [oldBinary, newBinary] {
+            try FileManager.default.createDirectory(at: binary.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("binary".utf8).write(to: binary)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+        }
+        let systemBin = home.appendingPathComponent("system-bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: systemBin, withIntermediateDirectories: true)
+        let command = systemBin.appendingPathComponent("custom-tool")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: command)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: command.path)
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let link = home.appendingPathComponent(".remote-code/bin/custom-tool")
+        try FileManager.default.createDirectory(at: link.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: oldBinary)
+
+        _ = try installer.installCommandWrappers(
+            serviceBinaryURL: newBinary,
+            searchDirectoriesOverride: [systemBin.path]
+        )
+
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: link.path),
+            newBinary.path,
+            "an older managed service link must retarget during install"
+        )
+    }
+
+    func test_installCommandWrappers_reconcileRemovesStaleLinkToOlderRemoteCodeService() throws {
+        let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let oldBinary = home.appendingPathComponent("old/RemoteCodeDistillService")
+        let newBinary = home.appendingPathComponent("new/RemoteCodeDistillService")
+        for binary in [oldBinary, newBinary] {
+            try FileManager.default.createDirectory(at: binary.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("binary".utf8).write(to: binary)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+        }
+        let systemBin = home.appendingPathComponent("system-bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: systemBin, withIntermediateDirectories: true)
+        for name in ["current-tool", "stale-tool"] {
+            let command = systemBin.appendingPathComponent(name)
+            try Data("#!/bin/sh\nexit 0\n".utf8).write(to: command)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: command.path)
+        }
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        _ = try installer.installCommandWrappers(
+            serviceBinaryURL: oldBinary,
+            searchDirectoriesOverride: [systemBin.path]
+        )
+        try FileManager.default.removeItem(at: systemBin.appendingPathComponent("stale-tool"))
+
+        _ = try installer.installCommandWrappers(
+            serviceBinaryURL: newBinary,
+            searchDirectoriesOverride: [systemBin.path]
+        )
+
+        let managedBin = home.appendingPathComponent(".remote-code/bin", isDirectory: true)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: managedBin.appendingPathComponent("stale-tool").path),
+            "reconciliation must remove a disappeared command even when its link targets an older service binary"
+        )
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(
+                atPath: managedBin.appendingPathComponent("current-tool").path
+            ),
+            newBinary.path
+        )
     }
 
     func test_uninstallCommandWrappers_leavesAUserOwnedFileUntouched() throws {

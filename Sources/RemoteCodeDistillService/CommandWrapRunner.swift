@@ -4,14 +4,14 @@ import DistillCore
 import Foundation
 
 /// OS-level execution half of the RTK-style transparent command wrappers. The pure
-/// decisions (what to wrap, thresholds, contracts, real-binary resolution) live in
+/// decisions (what to wrap, contracts, real-binary resolution) live in
 /// `CommandWrapPolicy`; this type runs the real command and detects — fail-closed — whether
 /// the wrapper is the TERMINAL command feeding the agent before compressing.
 enum CommandWrapRunner {
     /// Optional best-effort work (Wave A ledger POST) that must not delay stdout delivery.
     typealias DeferredSideEffect = @Sendable () async -> Void
 
-    /// Compresses `captured` stdout (reversible, with the given store floor) using the optional
+    /// Compresses captured stdout (reversible, with the given store floor) using the optional
     /// per-command extraction `query`, returning the emitted bytes (compressed text + recovery
     /// handle) plus an optional deferred side effect, or nil to fall back to the raw bytes.
     typealias Compressor = @Sendable (
@@ -26,7 +26,10 @@ enum CommandWrapRunner {
     /// runaway producer can't be held in memory. Matches the sidecar's own 512 KB stdin cap with
     /// generous headroom for review-sized output.
     private static let captureCapBytes = 8 * 1024 * 1024
-
+    /// Scoped proof that a child wrapper belongs to one validated mixed shell.
+    /// The value is the outer wrapper PID; the child additionally verifies that
+    /// PID is its shell parent's parent before treating stdout as terminal.
+    private static let segmentedShellEnvironmentKey = "REMOTE_CODE_WRAP_SEGMENTED_SHELL"
     /// Runs the wrapped command and writes its (possibly compressed) output to our real stdout
     /// before any deferred ledger side effect is returned to the caller.
     /// Always returns the REAL command's exit code so the agent's shell sees the true status.
@@ -40,10 +43,74 @@ enum CommandWrapRunner {
             FileHandle.standardError.write(Data("\(CommandWrapPolicy.commandBasename(command)): command not found\n".utf8))
             return (127, nil)
         }
-
-        // Mutating / disabled invocations run untouched with all streams inherited.
-        if CommandWrapPolicy.passthroughReason(command: command, args: args, environment: env) != nil {
-            return (runInheritingAllStreams(executable: realExe, args: args), nil)
+        // Determine ownership before spawning the real command. A non-terminal wrapper is an
+        // intermediate pipeline or a redirected invocation; inheriting both streams preserves
+        // the shell's stdout/stderr routing exactly. Capturing first would merge diagnostics
+        // into stdout before we discover that the bytes must pass through unchanged.
+        let hasAdmittedTokenSaver = WrapPipeInspector.hasAdmittedTokenSaver(environment: env)
+        let isTerminalToAgent = WrapPipeInspector.isTerminalToAgent(environment: env)
+        if let passthroughReason = CommandWrapPolicy.passthroughReason(
+            command: command,
+            args: args,
+            environment: env
+        ) {
+            if passthroughReason == "segmented_shell" {
+                guard WrapPipeInspector.isTerminalToAgent(
+                    environment: env,
+                    allowUnownedToolShell: true
+                ),
+                      let payloadIndex = shellPayloadIndex(in: args),
+                      CommandWrapPolicy.boundedSemicolonSegments(args[payloadIndex]) != nil else {
+                    // A mixed aggregate is never safe to compress. If we cannot
+                    // prove and own each boundary, execute the original shell
+                    // once with its streams untouched.
+                    return (
+                        runInheritingAllStreams(
+                            executable: realExe,
+                            args: args,
+                            markAsParent: hasAdmittedTokenSaver,
+                            removingEnvironmentKeys: [segmentedShellEnvironmentKey]
+                        ),
+                        nil
+                    )
+                }
+                // zsh reads startup files before the `-c` payload. Mark that
+                // phase as nested, keep segment ownership out of its environment,
+                // then switch markers silently for the validated sequence.
+                var scopedArgs = args
+                scopedArgs[payloadIndex] = "unset REMOTE_CODE_WRAP_PARENT;export \(segmentedShellEnvironmentKey)=\(getpid());\(args[payloadIndex])"
+                return (
+                    runInheritingAllStreams(
+                        executable: realExe,
+                        args: scopedArgs,
+                        markAsParent: true,
+                        removingEnvironmentKeys: [segmentedShellEnvironmentKey]
+                    ),
+                    nil
+                )
+            }
+            return (
+                runInheritingAllStreams(
+                    executable: realExe,
+                    args: args,
+                    markAsParent: passthroughReason == "explicit_distill_pipeline"
+                        || hasAdmittedTokenSaver
+                ),
+                nil
+            )
+        }
+        if !isTerminalToAgent {
+            // A real command can launch another PATH wrapper through a shebang
+            // (`npm` -> `/usr/bin/env node`). For an admitted run, keep that
+            // nested interpreter raw even though this wrapper is nonterminal.
+            return (
+                runInheritingAllStreams(
+                    executable: realExe,
+                    args: args,
+                    markAsParent: hasAdmittedTokenSaver
+                ),
+                nil
+            )
         }
 
         let captured = runCapturingStdout(executable: realExe, args: args)
@@ -67,7 +134,8 @@ enum CommandWrapRunner {
         }
         let action = CommandWrapPolicy.decide(
             command: command,
-            isTerminalToAgent: WrapPipeInspector.isTerminalToAgent(),
+            args: args,
+            isTerminalToAgent: isTerminalToAgent,
             outputIsValidUTF8: text != nil,
             byteCount: byteCount,
             lineCount: lineCount,
@@ -83,8 +151,11 @@ enum CommandWrapRunner {
             let query = CommandWrapPolicy.extractionQuery(forCommand: command)
             let (bytes, deferred) = await compressedOrRaw(captured.stdout, query: query, compress: compress)
             // Write stdout first; caller awaits deferred only after this returns.
-            _ = GuardedStdoutWrite.writeAll(bytes)
-            return (captured.exitCode, deferred)
+            let delivered = GuardedStdoutWrite.writeAll(bytes)
+            return (
+                captured.exitCode,
+                GuardedStdoutWrite.deferredSideEffectAfterCompleteDelivery(deferred, delivered: delivered)
+            )
         }
     }
 
@@ -126,6 +197,21 @@ enum CommandWrapRunner {
         return newlines + 1
     }
 
+    private static func shellPayloadIndex(in args: [String]) -> Int? {
+        for index in args.indices {
+            let argument = args[index]
+            guard argument == "-c"
+                    || (argument.hasPrefix("-")
+                        && !argument.hasPrefix("--")
+                        && argument.dropFirst().contains("c")) else {
+                continue
+            }
+            let payloadIndex = args.index(after: index)
+            return payloadIndex < args.endIndex ? payloadIndex : nil
+        }
+        return nil
+    }
+
     // MARK: - real-binary resolution
 
     private static func resolveRealExecutable(command: String, environment: [String: String]) -> String? {
@@ -162,10 +248,25 @@ enum CommandWrapRunner {
 
     // MARK: - subprocess execution
 
-    private static func runInheritingAllStreams(executable: String, args: [String]) -> Int32 {
+    private static func runInheritingAllStreams(
+        executable: String,
+        args: [String],
+        markAsParent: Bool = false,
+        removingEnvironmentKeys: Set<String> = []
+    ) -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = args
+        if markAsParent || !removingEnvironmentKeys.isEmpty {
+            var environment = ProcessInfo.processInfo.environment
+            for key in removingEnvironmentKeys {
+                environment.removeValue(forKey: key)
+            }
+            if markAsParent {
+                environment["REMOTE_CODE_WRAP_PARENT"] = "1"
+            }
+            process.environment = environment
+        }
         // Leave standardInput/Output/Error unset so the child inherits ours verbatim.
         do {
             try process.run()
@@ -185,15 +286,19 @@ enum CommandWrapRunner {
     }
 
     /// Runs the real command capturing ONLY stdout; stdin and stderr are inherited so the
-    /// command reads its real input and its errors reach the agent unchanged. On overflow the
-    /// buffered + remaining bytes are streamed straight to our stdout (raw passthrough).
+    /// command reads its real input and its diagnostics reach the agent unchanged. On overflow
+    /// the buffered + remaining bytes are streamed straight to our stdout (raw passthrough).
     private static func runCapturingStdout(executable: String, args: [String]) -> CapturedOutput {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = args
+        process.environment = ProcessInfo.processInfo.environment.merging(
+            ["REMOTE_CODE_WRAP_PARENT": "1"],
+            uniquingKeysWith: { _, child in child }
+        )
         let outPipe = Pipe()
         process.standardOutput = outPipe
-        // standardInput / standardError inherited (unset).
+        // standardInput / standardError remain inherited (unset).
         do {
             try process.run()
         } catch {
@@ -231,8 +336,44 @@ enum CommandWrapRunner {
 /// that would corrupt the downstream command. Handles bash's exec-optimization of single
 /// commands (the wrapper's parent becomes the agent itself).
 enum WrapPipeInspector {
-    static func isTerminalToAgent() -> Bool {
-        guard let mine = pipeInfo(pid: getpid(), fd: 1) else { return false } // stdout not a pipe → not terminal
+    private static let providerTerminalStdoutKey = "RC_REMOTE_CODE_PROVIDER_TERMINAL_STDOUT"
+    private static let unownedToolShellKey = "RC_REMOTE_CODE_UNOWNED_TOOL_SHELL"
+    private static let segmentedShellEnvironmentKey = "REMOTE_CODE_WRAP_SEGMENTED_SHELL"
+
+    /// A wrapper is allowed to capture only for a host-admitted Token Saver run.
+    /// Provider brokers commonly expose the final stdout as a pipe whose reader is
+    /// outside the wrapper's process ancestry; ordinary shell pipelines keep their
+    /// reader below the launching shell. Keep those cases distinct.
+    static func isTerminalToAgent(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        allowUnownedToolShell: Bool = false
+    ) -> Bool {
+        guard hasAdmittedTokenSaver(environment: environment) else { return false }
+
+        // A validated mixed shell exports its outer wrapper PID at the start of
+        // its `-c` payload, after startup files have run. Only a direct child
+        // wrapper whose shell parent belongs to that exact outer wrapper may
+        // own one ordinary segment.
+        if segmentedShellOwnsChild(environment: environment) {
+            return true
+        }
+
+        // Codex resolves its tool shell independently of PATH and can
+        // exec-optimize the final child, erasing the shell argv before a child
+        // wrapper can inspect it. The host therefore labels this shell as
+        // unowned. Only the validated aggregate marker above can transfer
+        // selective ownership to a child; otherwise every auto-wrapper fails
+        // open and an explicit `| distill` remains the compression boundary.
+        if environment[unownedToolShellKey] == "1" && !allowUnownedToolShell {
+            return false
+        }
+
+        guard let mine = pipeInfo(pid: getpid(), fd: 1) else {
+            // A provider PTY is the only non-pipe terminal route we recognize. A
+            // user's own terminal without the host admission above remains raw.
+            return isatty(STDOUT_FILENO) == 1 || providerTerminalFallback(environment: environment)
+        }
+
         let peerHandle = mine.peer
         var current: Int32? = parentPID(of: getpid())
         var hops = 0
@@ -241,7 +382,123 @@ enum WrapPipeInspector {
             current = parentPID(of: pid)
             hops += 1
         }
-        return false
+
+        // The provider's broker may own the read end from a process outside this
+        // ancestry. A pipeline reader is a descendant of the launching shell. The
+        // distinction is deliberately used only after admission, and only when a
+        // process actually owns the peer end of this exact pipe.
+        let launchingParent = parentPID(of: getpid())
+        let parentIsShell = launchingParent.map(isShellProcess) ?? false
+        let hasExternalReader = peerOwners(of: peerHandle).contains { owner in
+            guard parentIsShell, let launchingParent else { return true }
+            return !isDescendant(owner, of: launchingParent)
+        }
+        return hasExternalReader || providerTerminalFallback(environment: environment)
+    }
+
+    private static func segmentedShellOwnsChild(environment: [String: String]) -> Bool {
+        guard let raw = environment[segmentedShellEnvironmentKey],
+              let wrapperPID = Int32(raw), wrapperPID > 1,
+              let parent = parentPID(of: getpid()),
+              isManagedShellWrapper(wrapperPID) else {
+            return false
+        }
+        // zsh may exec-optimize the final simple command, in which case the
+        // child wrapper's parent is the outer wrapper directly.
+        return parent == wrapperPID
+            || (isShellProcess(parent) && parentPID(of: parent) == wrapperPID)
+    }
+
+    /// The aggregate marker is accepted only from another instance of this
+    /// exact service binary invoked through a managed shell symlink. A PID
+    /// relationship alone is forgeable (`export marker=$PPID`) inside an
+    /// admitted tool shell and must never transfer compression ownership.
+    private static func isManagedShellWrapper(_ pid: Int32) -> Bool {
+        guard executablePath(of: pid) == executablePath(of: getpid()),
+              let argumentZero = processArgumentZero(of: pid) else {
+            return false
+        }
+        return ["sh", "bash", "zsh", "dash", "fish"].contains(
+            (argumentZero as NSString).lastPathComponent
+        )
+    }
+
+    private static func executablePath(of pid: Int32) -> String? {
+        var path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return nil }
+        return String(cString: path)
+    }
+
+    private static func processArgumentZero(of pid: Int32) -> String? {
+        var name = [Int32(CTL_KERN), Int32(KERN_PROCARGS2), pid]
+        var required = 0
+        guard sysctl(&name, UInt32(name.count), nil, &required, nil, 0) == 0,
+              required >= MemoryLayout<Int32>.size,
+              required <= 1024 * 1024 else {
+            return nil
+        }
+        var bytes = [UInt8](repeating: 0, count: required)
+        guard bytes.withUnsafeMutableBytes({ buffer in
+            sysctl(&name, UInt32(name.count), buffer.baseAddress, &required, nil, 0)
+        }) == 0 else {
+            return nil
+        }
+
+        var index = MemoryLayout<Int32>.size
+        while index < required, bytes[index] != 0 { index += 1 }
+        while index < required, bytes[index] == 0 { index += 1 }
+        let start = index
+        while index < required, bytes[index] != 0 { index += 1 }
+        guard index > start else { return nil }
+        return String(decoding: bytes[start..<index], as: UTF8.self)
+    }
+
+    /// Codex may expose the final tool stream as a socket, which has no pipe
+    /// peer handle to prove ownership. A single bare command is exec-optimized
+    /// by the shell, so its parent is the provider broker; a pipeline stage
+    /// retains the launching shell as its parent. The host-issued marker is
+    /// considered only after full receipt/scope admission above.
+    private static func providerTerminalFallback(environment: [String: String]) -> Bool {
+        guard environment[providerTerminalStdoutKey] == "1",
+              let parent = parentPID(of: getpid()) else { return false }
+        return !isShellProcess(parent)
+    }
+
+    static func hasAdmittedTokenSaver(environment: [String: String]) -> Bool {
+        // The hint is descriptive prompt/runtime state, not an admission proof.
+        // Only the host-issued, structurally validated receipt can authorize
+        // wrapper capture; managed PATH and a forged hint must remain raw.
+        guard let receipt = TokenSaverExecutionReceiptSeam.receipt(from: environment) else {
+            return false
+        }
+        return receipt.admitted
+            && receipt.sameUser
+            && receipt.capabilities.distill == true
+            && receipt.capabilities.managedPath == true
+            && hasCompleteScope(environment: environment, receipt: receipt)
+    }
+
+    private static func hasCompleteScope(
+        environment: [String: String],
+        receipt: TokenSaverExecutionReceipt
+    ) -> Bool {
+        let required = [
+            "RC_TOKEN_SAVER_WORKSPACE_ID",
+            "RC_TOKEN_SAVER_PROJECT_ID",
+            "RC_TOKEN_SAVER_THREAD_ID",
+            "RC_TOKEN_SAVER_ATTEMPT_ID",
+            "REMOTE_CODE_AGENT_PROVIDER",
+        ]
+        guard required.allSatisfy({
+            guard let value = environment[$0]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !value.isEmpty else { return false }
+            return true
+        }) else { return false }
+        return receipt.provider == environment["REMOTE_CODE_AGENT_PROVIDER"]
+            && receipt.threadId == environment["RC_TOKEN_SAVER_THREAD_ID"]
+            && receipt.workspaceId == environment["RC_TOKEN_SAVER_WORKSPACE_ID"]
+            && receipt.projectId == environment["RC_TOKEN_SAVER_PROJECT_ID"]
+            && receipt.attemptId == environment["RC_TOKEN_SAVER_ATTEMPT_ID"]
     }
 
     private static func pipeInfo(pid: Int32, fd: Int32) -> (handle: UInt64, peer: UInt64)? {
@@ -271,5 +528,42 @@ enum WrapPipeInspector {
             if let info = pipeInfo(pid: pid, fd: fd.proc_fd) { handles.append(info.handle) }
         }
         return handles
+    }
+
+    private static func peerOwners(of peerHandle: UInt64) -> [Int32] {
+        let required = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
+        guard required > 0 else { return [] }
+        var pids = [Int32](repeating: 0, count: Int(required) / MemoryLayout<Int32>.size)
+        let written = pids.withUnsafeMutableBytes { rawBuffer in
+            proc_listpids(
+                UInt32(PROC_ALL_PIDS),
+                0,
+                rawBuffer.baseAddress,
+                Int32(rawBuffer.count)
+            )
+        }
+        guard written > 0 else { return [] }
+        return pids.prefix(Int(written) / MemoryLayout<Int32>.size).compactMap { pid in
+            pipeHandles(of: pid).contains(peerHandle) ? pid : nil
+        }
+    }
+
+    private static func isDescendant(_ pid: Int32, of ancestor: Int32) -> Bool {
+        var current: Int32? = pid
+        var hops = 0
+        while let value = current, value > 1, hops < 32 {
+            if value == ancestor { return true }
+            current = parentPID(of: value)
+            hops += 1
+        }
+        return false
+    }
+
+    private static func isShellProcess(_ pid: Int32) -> Bool {
+        var path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return false }
+        let executable = String(cString: path)
+        let basename = (executable as NSString).lastPathComponent
+        return ["sh", "bash", "zsh", "dash", "fish"].contains(basename)
     }
 }

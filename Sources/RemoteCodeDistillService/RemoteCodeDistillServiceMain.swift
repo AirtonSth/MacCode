@@ -185,7 +185,7 @@ struct RemoteCodeDistillServiceMain {
                 await runSubagentTelemetry(arguments: Array(rawArgs.dropFirst(2)))
                 return
             }
-            await runCLI(arguments: Array(rawArgs.dropFirst()))
+            await runCLI(arguments: Array(rawArgs.dropFirst()), requiresReceipt: true)
             return
         }
         if rawArgs.dropFirst().first == "cli" {
@@ -224,8 +224,8 @@ struct RemoteCodeDistillServiceMain {
             Darwin.exit(code)
         }
         // RTK-style transparent command wrappers: invoked via a symlink whose basename is a
-        // wrapped command (e.g. ~/.remote-code/bin/rg), or explicitly as `… wrap <cmd> <args>`.
-        if CommandWrapPolicy.isWrapped(programName) {
+        // wrapped command (e.g. ~/.remote-code/bin/npx), or explicitly as `… wrap <cmd> <args>`.
+        if CommandWrapPolicy.isAutoWrappable(programName) {
             await runWrap(command: programName, arguments: Array(rawArgs.dropFirst()))
             return
         }
@@ -386,7 +386,7 @@ struct RemoteCodeDistillServiceMain {
         }
     }
 
-    private static func runCLI(arguments: [String]) async {
+    private static func runCLI(arguments: [String], requiresReceipt: Bool = false) async {
         let stdin = FileHandle.standardInput.readDataToEndOfFile()
         let env = ProcessInfo.processInfo.environment
         let recoveryContext = ManagedDistillCLI.recoveryContext(environment: env)
@@ -396,11 +396,12 @@ struct RemoteCodeDistillServiceMain {
         )
         let maxChars = Int(env["REMOTE_CODE_DISTILL_MAX_OUTPUT_CHARS"] ?? "") ?? 4_000
         let session = createConfiguredURLSession()
-        let loadedState = loadCLIStateSnapshot()
+        let loadedState = loadCLIStateSnapshot(requireExplicitNamespace: requiresReceipt)
         let admission = LiveTokenSaverDistillAdmission(
             state: loadedState?.state,
             statePath: loadedState?.path
         )
+        let receiptAdmitted = !requiresReceipt || hasAdmittedExplicitDistillReceipt(environment: env)
         let cli = ManagedDistillCLI(
             arguments: arguments,
             stdin: stdin,
@@ -408,9 +409,9 @@ struct RemoteCodeDistillServiceMain {
             provider: provider,
             recoveryContext: recoveryContext,
             maxOutputCharacters: maxChars,
-            distillAdmission: { admission?.isAdmitted() == true }
+            distillAdmission: { receiptAdmitted && admission?.isAdmitted() == true }
         ) { request in
-            guard admission?.isAdmitted() == true else { return nil }
+            guard receiptAdmitted, admission?.isAdmitted() == true else { return nil }
             do {
                 var scopedRequest = request
                 applyRecoveryHeaders(to: &scopedRequest, environment: env)
@@ -716,13 +717,44 @@ struct RemoteCodeDistillServiceMain {
         let path: String
     }
 
-    private static func loadCLIStateSnapshot() -> LoadedCLIState? {
+    private static func loadCLIStateSnapshot(requireExplicitNamespace: Bool = false) -> LoadedCLIState? {
         let env = ProcessInfo.processInfo.environment
         var candidates: [String] = []
-        if let override = env["REMOTE_CODE_DISTILL_STATE_PATH"], !override.isEmpty {
+        let appSupport = env["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let override = env["REMOTE_CODE_DISTILL_STATE_PATH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let expectedNamespaceStatePath = appSupport.flatMap { appSupport -> String? in
+            guard !appSupport.isEmpty else { return nil }
+            return URL(fileURLWithPath: appSupport, isDirectory: true)
+                .appendingPathComponent("Distill", isDirectory: true)
+                .appendingPathComponent("DistillCLIState.json")
+                .standardizedFileURL.path
+        }
+        if requireExplicitNamespace {
+            guard let expectedNamespaceStatePath else { return nil }
+            if let override, !override.isEmpty,
+               URL(fileURLWithPath: override).standardizedFileURL.path != expectedNamespaceStatePath {
+                return nil
+            }
+            candidates = [expectedNamespaceStatePath]
+        } else if let override, !override.isEmpty {
             // Explicit override is authoritative — do not fall through to channel paths.
             candidates = [override]
+        } else if let appSupport {
+            // An explicit app namespace is also authoritative. Never use a stable,
+            // canary, or debug lease when this namespace is missing or malformed.
+            // Falling through would let a child cross-read another app instance's
+            // live token and sidecar.
+            guard !appSupport.isEmpty else { return nil }
+            candidates = [
+                URL(fileURLWithPath: appSupport, isDirectory: true)
+                    .appendingPathComponent("Distill", isDirectory: true)
+                    .appendingPathComponent("DistillCLIState.json")
+                    .path
+            ]
         } else {
+            guard !requireExplicitNamespace else { return nil }
             for channel in [ReleaseChannel.stable, .canary, .debug] {
                 candidates.append(
                     AppPaths.appSupportDirectory(for: channel)
@@ -746,6 +778,55 @@ struct RemoteCodeDistillServiceMain {
             )
         }
         return nil
+    }
+
+    /// Explicit `distill` is a paid, lossy command. It may run only for the
+    /// host-issued receipt that matches this provider attempt and its complete
+    /// recovery scope; hints, PATH placement, and a live lease alone are not
+    /// authorization.
+    private static func hasAdmittedExplicitDistillReceipt(
+        environment: [String: String]
+    ) -> Bool {
+        guard let receipt = TokenSaverExecutionReceiptSeam.receipt(from: environment),
+              receipt.admitted,
+              receipt.sameUser,
+              receipt.capabilities.distill == true,
+              receipt.capabilities.managedPath == true,
+              receipt.capabilities.recoveryScope == true,
+              let provider = environment["REMOTE_CODE_AGENT_PROVIDER"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !provider.isEmpty,
+              receipt.provider == provider else {
+            return false
+        }
+        guard let appSupport = environment["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !appSupport.isEmpty else {
+            return false
+        }
+        let expectedStatePath = URL(fileURLWithPath: appSupport, isDirectory: true)
+            .appendingPathComponent("Distill", isDirectory: true)
+            .appendingPathComponent("DistillCLIState.json")
+            .standardizedFileURL.path
+        if let statePath = environment["REMOTE_CODE_DISTILL_STATE_PATH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !statePath.isEmpty,
+           URL(fileURLWithPath: statePath).standardizedFileURL.path != expectedStatePath {
+            return false
+        }
+        let scopeMatches = [
+            ("RC_TOKEN_SAVER_WORKSPACE_ID", receipt.workspaceId),
+            ("RC_TOKEN_SAVER_PROJECT_ID", receipt.projectId),
+            ("RC_TOKEN_SAVER_THREAD_ID", receipt.threadId),
+            ("RC_TOKEN_SAVER_ATTEMPT_ID", receipt.attemptId),
+        ]
+        return scopeMatches.allSatisfy { key, expected in
+            guard let expected,
+                  let actual = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !actual.isEmpty else {
+                return false
+            }
+            return actual == expected
+        }
     }
 
     private struct RuntimeResolution {

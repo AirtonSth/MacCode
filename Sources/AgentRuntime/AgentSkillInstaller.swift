@@ -176,7 +176,7 @@ public struct RemoteCodeSubagentTelemetryScope: Sendable, Equatable {
 public final class AgentSkillInstaller: @unchecked Sendable {
     public static let distillSkillID = "distill"
     public static let distillSourceURL = "https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md"
-    public static let distillLocalVersion = "7"
+    public static let distillLocalVersion = "9"
     public static let distillInstructionsBeginMarker = "<!-- distill skill: begin -->"
     public static let distillInstructionsEndMarker = "<!-- distill skill: end -->"
     public static let distillCLIBeginMarker = "# RemoteCode managed distill CLI: begin"
@@ -220,26 +220,15 @@ public final class AgentSkillInstaller: @unchecked Sendable {
 
     This is a conversation style mode, not a prompt-compression request.
     Do not return the user's prompt compressed as an artifact.
-    Adopt dense Token Saver wire: use @sr2 v0 Opaque Agent IR for every provider-authored text item (Claude/Codex/Grok), including reasoning, commentary/intermediate updates, and final replies. No free monologue — host humanizes for the user. SR1 sparse O-first is fallback only. Tool stdout stays exact. Keep using wire for the rest of the thread.
+    Adopt canonical `@sr2 v1` Opaque Agent IR for every provider-authored text item (Claude/Codex/Grok), including reasoning, commentary/intermediate updates, and final replies. No free monologue — the host humanizes for the user. Never emit legacy `@sr2 v0` or SR1 S/C/D/R/O/N/P text. Tool stdout stays exact. Keep using v1 wire for the rest of the thread.
 
-    Core behavior (token-efficient dialect — sparse by default):
-    - Registers: R0 micro | R1 work | R2 tool (tool path is `| distill`, not chat prefixes).
-    - R0 micro (greeting, yes/no, trivial status, conversational only): **O-only**.
-      One short line in the user's language. No S/C/D/R/N/P. No restating the user. No English meta.
-      Example: `O: bem, obrigado — pronto pro próximo`
-    - R1 work (code, PR, debug, plan, multi-step): **O-first**, sparse optional fields.
-      Prefixes (use only when needed): S=state, C=context, D=action, R=risk, N=no-go, P=proof.
-      Never pad to six lines. Do not restate the user prompt in C. One idea per line.
-      Prefer short atoms over prose. Exact paths/commands/IDs when useful.
-    - Do not use Military English boilerplate on R0. On R1 keep short command-style English for ops fields; put user-facing answer in O (user language when the user wrote non-English).
-    - No filler. No long prose unless the user asks for explanation.
-    - Surfaced thinking: R0 none; R1 sparse distill lines only; keep secrets out.
-    - Hard caps: R0 ≤2 lines / ~60 tokens; R1 status ≤4 lines; R1 implement ≤12 lines unless user asks for detail.
-
-    Thread behavior:
-    - Prefer R0 for micro chat. Escalate to R1 only when the turn does real work.
-    - Do not output a rewritten/compressed version of the latest user prompt unless the user explicitly asks to compress text.
-    - Emit `Dict:` early only when aliases reduce repetition (never secrets/people/paths/URLs as aliases).
+    Core behavior (sparse by default):
+    - Begin every provider-authored text item with exactly `@sr2 v1`.
+    - Use only the v1 fields documented by the host instruction; put each field on its own line and omit unused fields.
+    - Tool-only continuation is `@sr2 v1` plus `o:cont`; long answers use the host's v1 answer-handle shape.
+    - Keep exact paths, commands, IDs, errors, and proof anchors when useful.
+    - No filler, markdown essays, or multi-paragraph prose on the wire.
+    - Do not output a rewritten/compressed copy of the user's prompt unless explicitly asked to compress text.
 
     Command-output / exploration policy (Token Saver — Claude + Codex + Grok, primary + nested + subagents):
     - **Coverage first (mandatory for large surveys):** do **not** flood context with native multi-file `read_file` / `grep` / `list_dir` / tree walks. Order:
@@ -249,7 +238,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     - **Why:** Grok/Codex cannot rewrite native tool output (passive/no `updatedToolOutput`). Claude PostToolUse may compress some tools, but shell wrappers + `| distill` maximize measured savings on all three providers. Prefer shell+compress for noisy builds/tests/logs.
     - MANDATORY default-pipe: for **every** non-GUI pipable shell command whose full stdout you do **not** need byte-exactly next, end with `| distill "<question>"` (`pipefail` when exit status matters). If you only need summary / pass-fail / key lines, you MUST pipe.
       Applies to: build, test, lint, install, docker, kubectl, terraform, find, ls, git/gh/glab (including `gh api`, merges, status), package managers, python/bun one-shots, curl/aws/cloud CLIs, compound scripts, CI/logs, and **any other ordinary command** not listed under NEVER below.
-      Host PATH wrappers auto-compress **all subcommands** of wrapped binaries (no read-only allowlist) when terminal-to-agent and above threshold — still pipe `| distill` yourself so extraction is explicit. Same policy for primary, nested subagents, and cross-provider orchestration (Claude/Codex/Grok).
+      Host PATH wrappers auto-route **every discovered non-TUI, non-exact executable** through Distill when terminal-to-agent, regardless of output size — still pipe `| distill` yourself so extraction is explicit. Same policy for primary, nested subagents, and cross-provider orchestration (Claude/Codex/Grok).
+    - NEVER batch exact-output and ordinary commands into one shell tool call or `sh`/`zsh -c` compound. Run exact probes as separate tool calls, then run the ordinary command separately with explicit `| distill`; host wrappers auto-cover bare calls only when their shell has validated aggregate ownership. Unowned mixed compounds intentionally fail open wholly raw.
     - NEVER pipe `| distill` only when you need the **exact** full stdout (or the tool is not a normal shell pipe target):
       search/match: rg, grep, egrep, fgrep, ag, ugrep, git grep
       line/stream edit or dump: sed, awk, cat, head, tail, nl, cut, tr, paste
@@ -278,14 +268,11 @@ public final class AgentSkillInstaller: @unchecked Sendable {
 
     public static let distillAgentInstructionsTemplate = """
     <!-- distill skill: begin -->
-    CRITICAL: Use **@sr2 v0** Opaque Agent IR for every provider-authored text item (Claude/Codex/Grok): reasoning, commentary/intermediate updates, and final replies. No free monologue. Host humanizes for UI. Tool stdout stays exact. SR1 sparse O-first is fallback only.\nCRITICAL: Use `/distill` dialect for provider turns — **sparse, O-first, mode-aware** (not a fixed 6-line S/C/D tax).
-    Registers: **R0 micro** (greeting/yes-no/trivial status) = `O:` only, user language, ≤2 lines; no S/C/D/R/N/P, no user restatement.
-    **R1 work** (code/PR/debug/plan) = O-first; add S/C/D/R/N/P only when needed; never pad to six lines; short atoms; caps: status ≤4 lines, implement ≤12 unless asked.
-    Prefixes when used: S=state, C=context, D=action, R=risk, O=outcome, N=no-go, P=proof.
-    Dict/`#` vars only when they reduce repetition. Never alias secrets, people, IDs, paths, URLs.
-    Do not return a rewritten/compressed copy of the user's prompt unless explicitly asked to compress text.
-    Token Saver — Claude/Codex/Grok (primary, nested, subagents): large surveys → Graphify query-first when `$RC_GRAPHIFY_GRAPH_JSON` is set, else shell + PATH wrappers / `| distill`. Avoid flooding native multi-file read_file/grep (Grok/Codex cannot rewrite those; Claude PostToolUse helps but shell coverage is higher). Native reads only for small exact slices.
-    MANDATORY default-pipe: for **every** non-GUI pipable shell command whose full stdout you do **not** need byte-exactly next, end with `| distill "<question>"` (`pipefail` when exit status matters). If you only need summary/pass-fail/key lines, you MUST pipe. Host PATH wrappers auto-compress all subcommands of wrapped binaries (incl. gh api; no read-only allowlist); still pipe yourself for an explicit extraction question. Applies primary + nested + cross-provider (Claude/Codex/Grok) whenever Token Saver is admitted.
+    CRITICAL: Use canonical **@sr2 v1** Opaque Agent IR for every provider-authored text item (Claude/Codex/Grok): reasoning, commentary/intermediate updates, and final replies. No free monologue. Host humanizes for UI. Tool stdout stays exact. Never emit legacy @sr2 v0 or SR1 S/C/D/R/O/N/P text.\nCRITICAL: Keep v1 sparse: one field per line, omit unused fields, and use `o:cont` for tool-only continuation.
+    Do not rewrite/compress the user's prompt unless explicitly asked.
+    Token Saver — Claude/Codex/Grok (primary, nested, cross-provider): for large surveys use Graphify first when `$RC_GRAPHIFY_GRAPH_JSON` is set; otherwise use shell + PATH wrappers / `| distill`. Avoid native multi-file reads/searches; reserve them for small exact slices.
+    MANDATORY default-pipe: for **every** non-TUI pipable shell command whose full stdout you do **not** need byte-exactly next, end with `| distill "<question>"` (`pipefail` when exit status matters). If you only need summary/pass-fail/key lines, you MUST pipe. Host PATH wrappers auto-route every discovered non-TUI, non-exact executable and eligible subcommand (including `gh api`); still pipe yourself for an explicit extraction question. Applies primary + nested + cross-provider (Claude/Codex/Grok) whenever Token Saver is admitted. The UI preserves the complete original command for expand/copy.
+    Mixed exact+ordinary shell: separate tool calls. In SR2, `run:[a;b]>[c]` means each bracket is one separate ordered shell tool call; never flatten groups. Exact raw; ordinary group uses explicit `| distill`; wrapper only with owned shell; unowned mix fails open raw.
     NEVER pipe `| distill` only for exact-output (agent needs full stdout): rg, grep, egrep, fgrep, sed, awk, cat, head, tail, nl, cut, tr, diff, jq, yq, git grep/show/cat-file/blame; also patches/hashes/tokens, GUI/interactive/TUI, non-pipable, or service unavailable — state the skip briefly.
     Omitting `| distill` on a non-exact, non-GUI shell command is a policy violation.
     NEVER Distill skill content: Skill tool output and requested/returned SKILL bodies must stay complete/verbatim (no summary, `[[rc:]]` handle, truncation, or savings accounting).
@@ -881,10 +868,27 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         cliBinDirectory
     }
 
+    /// Provider-only aliases used for always-on Subagents routing. Keeping
+    /// these outside the universal wrapper directory lets Token Saver OFF
+    /// provider shells resolve nested providers without launching the
+    /// RemoteCodeDistillService for ordinary commands.
+    public var providerProxyBinURL: URL {
+        cliBinDirectory
+            .deletingLastPathComponent()
+            .appendingPathComponent("provider-bin", isDirectory: true)
+    }
+
     public var providerShellBridgeURL: URL {
         cliBinDirectory
             .deletingLastPathComponent()
             .appendingPathComponent("shell/zsh", isDirectory: true)
+    }
+
+    /// Bash's non-interactive startup hook. Grok ACP's persistent terminal uses
+    /// Bash on macOS, so the zsh-only bridge is not enough to restore the managed
+    /// PATH after a shell snapshot/profile refresh.
+    public var providerShellBridgeBashEnvURL: URL {
+        providerShellBridgeURL.appendingPathComponent(".bash_env")
     }
 
     /// A directory that is conventionally on the user's `$PATH`. RemoteCode bridges the
@@ -992,6 +996,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     private func recoverServiceBinaryFromManagedWrappers() -> URL? {
         var names = ["claude", "codex", "grok", "git", "npm", "remote-code", "ls", "distill"]
         names.append(contentsOf: WrappedCommandCatalog.commands)
+        names.append(contentsOf: (try? fileManager.contentsOfDirectory(atPath: cliBinDirectory.path)) ?? [])
         var seen = Set<String>()
         for name in names where seen.insert(name).inserted {
             let link = cliBinDirectory.appendingPathComponent(name)
@@ -1061,24 +1066,38 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// Provider basenames (`grok`/`claude`/`codex`) are **not** part of this catalog —
     /// see `installProviderProxies()`.
     @discardableResult
-    public func installCommandWrappers(serviceBinaryURL: URL? = nil) throws -> [String] {
+    public func installCommandWrappers(
+        serviceBinaryURL: URL? = nil,
+        searchDirectoriesOverride: [String]? = nil
+    ) throws -> [String] {
         try fileManager.createDirectory(at: cliBinDirectory, withIntermediateDirectories: true)
         guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
             throw AgentSkillCLIError.serviceBinaryUnavailable
         }
-        // Drop exact-output wrappers left by older catalogs (sed/rg/cat/…).
+        let searchDirectories = searchDirectoriesOverride ?? systemCommandSearchDirectories()
+        let discovered = Set(autoWrappableCommands(searchDirectories: searchDirectories))
+        let reserved = Set(
+            ProviderProxyCatalog.providers
+                + ["distill", Self.agentAppMiddlewareCommand, "rc-retrieve-mcp"]
+        )
+        // Reconciliation must remove wrappers for commands that disappeared from
+        // PATH; otherwise a stale symlink continues to shadow a missing command.
+        let stale = ((try? fileManager.contentsOfDirectory(atPath: cliBinDirectory.path)) ?? [])
+            .filter { !reserved.contains($0) && !discovered.contains($0) }
+        _ = try removeManagedServiceSymlinks(basenames: stale)
         _ = try removeManagedWrapperSymlinks(
-            basenames: WrappedCommandCatalog.exactOutputCommands,
+            basenames: stale + WrappedCommandCatalog.exactOutputCommands + WrappedCommandCatalog.interactiveCommands,
             binaryURL: binary
         )
-        let searchDirectories = systemCommandSearchDirectories()
         var installed: [String] = []
-        for command in WrappedCommandCatalog.commands {
-            guard commandExistsOnSystem(command, searchDirectories: searchDirectories) else { continue }
+        for command in discovered.sorted() {
             let link = cliBinDirectory.appendingPathComponent(command)
             if let dest = try? fileManager.destinationOfSymbolicLink(atPath: link.path) {
                 if dest == binary.path { installed.append(command); continue }
-                try? fileManager.removeItem(at: link) // replace a stale managed symlink
+                // Replace an older RemoteCode service link after an app upgrade,
+                // but preserve arbitrary user-owned symlinks in the managed bin.
+                guard managedServiceSymlink(at: link) else { continue }
+                try fileManager.removeItem(at: link)
             } else if fileManager.fileExists(atPath: link.path) {
                 // A real (non-symlink) file we did not create — never clobber it.
                 continue
@@ -1104,8 +1123,14 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         serviceBinaryURL: URL? = nil
     ) throws -> [String] {
         let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager)
+        let reserved = Set(
+            ProviderProxyCatalog.providers
+                + ["distill", Self.agentAppMiddlewareCommand, "rc-retrieve-mcp"]
+        )
+        let installedNames = ((try? fileManager.contentsOfDirectory(atPath: cliBinDirectory.path)) ?? [])
+            .filter { !reserved.contains($0) }
         return try removeManagedWrapperSymlinks(
-            basenames: WrappedCommandCatalog.symlinkBasenamesToRemove,
+            basenames: installedNames + WrappedCommandCatalog.symlinkBasenamesToRemove,
             binaryURL: binary
         )
     }
@@ -1122,9 +1147,11 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     @discardableResult
     public func installProviderProxies(
         serviceBinaryURL: URL? = nil,
-        searchDirectoriesOverride: [String]? = nil
+        searchDirectoriesOverride: [String]? = nil,
+        binDirectory: URL? = nil
     ) throws -> [String] {
-        try fileManager.createDirectory(at: cliBinDirectory, withIntermediateDirectories: true)
+        let targetDirectory = binDirectory ?? cliBinDirectory
+        try fileManager.createDirectory(at: targetDirectory, withIntermediateDirectories: true)
         guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
             throw AgentSkillCLIError.serviceBinaryUnavailable
         }
@@ -1132,7 +1159,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         var installed: [String] = []
         for command in ProviderProxyCatalog.providers {
             guard commandExistsOnSystem(command, searchDirectories: searchDirectories) else { continue }
-            let link = cliBinDirectory.appendingPathComponent(command)
+            let link = targetDirectory.appendingPathComponent(command)
             if (try? fileManager.destinationOfSymbolicLink(atPath: link.path)) != nil {
                 if symbolicLink(at: link, pointsTo: binary) {
                     installed.append(command)
@@ -1155,13 +1182,15 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// bundled `rc2` client; no second daemon or provider implementation exists.
     @discardableResult
     public func installAgentAppMiddleware(
-        serviceBinaryURL: URL? = nil
+        serviceBinaryURL: URL? = nil,
+        binDirectory: URL? = nil
     ) throws -> URL? {
-        try fileManager.createDirectory(at: cliBinDirectory, withIntermediateDirectories: true)
+        let targetDirectory = binDirectory ?? cliBinDirectory
+        try fileManager.createDirectory(at: targetDirectory, withIntermediateDirectories: true)
         guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
             throw AgentSkillCLIError.serviceBinaryUnavailable
         }
-        let link = cliBinDirectory.appendingPathComponent(Self.agentAppMiddlewareCommand)
+        let link = targetDirectory.appendingPathComponent(Self.agentAppMiddlewareCommand)
         if (try? fileManager.destinationOfSymbolicLink(atPath: link.path)) != nil {
             if symbolicLink(at: link, pointsTo: binary) {
                 return link
@@ -1180,9 +1209,11 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// RemoteCode service binary. A missing alias or user-owned file must never
     /// be advertised to provider prompts as a working host launcher.
     public func verifiedAgentAppMiddlewareURL(
-        serviceBinaryURL: URL? = nil
+        serviceBinaryURL: URL? = nil,
+        binDirectory: URL? = nil
     ) -> URL? {
-        let link = cliBinDirectory.appendingPathComponent(Self.agentAppMiddlewareCommand)
+        let targetDirectory = binDirectory ?? cliBinDirectory
+        let link = targetDirectory.appendingPathComponent(Self.agentAppMiddlewareCommand)
         guard let rawDestination = try? fileManager.destinationOfSymbolicLink(atPath: link.path),
               let expected = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager)
         else {
@@ -1226,6 +1257,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             fi
             if [[ -n "${RC_REMOTE_CODE_MANAGED_BIN:-}" ]]; then
               path=("$RC_REMOTE_CODE_MANAGED_BIN" "${(@)path:#${~${(b)RC_REMOTE_CODE_MANAGED_BIN}}}")
+            fi
+            if [[ -n "${RC_REMOTE_CODE_PROVIDER_PROXY_BIN:-}" ]]; then
+              path=("$RC_REMOTE_CODE_PROVIDER_PROXY_BIN" "${(@)path:#${~${(b)RC_REMOTE_CODE_PROVIDER_PROXY_BIN}}}")
               export PATH
             fi
             """
@@ -1234,24 +1268,56 @@ public final class AgentSkillInstaller: @unchecked Sendable {
                 options: .atomic
             )
         }
+        let bashBody = """
+        # RemoteCode managed provider Bash bridge. Grok ACP's persistent terminal
+        # can restore a shell snapshot after the provider starts; reapply the
+        # managed bin after the user's optional BASH_ENV has run.
+        if [ -n "${RC_REMOTE_CODE_ORIGINAL_BASH_ENV:-}" ] \
+          && [ "${RC_REMOTE_CODE_ORIGINAL_BASH_ENV}" != "${BASH_ENV:-}" ] \
+          && [ -r "${RC_REMOTE_CODE_ORIGINAL_BASH_ENV}" ]; then
+          . "${RC_REMOTE_CODE_ORIGINAL_BASH_ENV}"
+        fi
+        if [ -n "${RC_REMOTE_CODE_MANAGED_BIN:-}" ]; then
+          case "${PATH:-}" in
+            "${RC_REMOTE_CODE_MANAGED_BIN}"|"${RC_REMOTE_CODE_MANAGED_BIN}":*) ;;
+            *) PATH="${RC_REMOTE_CODE_MANAGED_BIN}${PATH:+:$PATH}"; export PATH ;;
+          esac
+        fi
+        if [ -n "${RC_REMOTE_CODE_PROVIDER_PROXY_BIN:-}" ]; then
+          case ":${PATH:-}:" in
+            *:"${RC_REMOTE_CODE_PROVIDER_PROXY_BIN}":*) ;;
+            *) PATH="${RC_REMOTE_CODE_PROVIDER_PROXY_BIN}${PATH:+:$PATH}"; export PATH ;;
+          esac
+        fi
+        """
+        try Data((bashBody + "\n").utf8).write(
+            to: providerShellBridgeBashEnvURL,
+            options: .atomic
+        )
         return directory
     }
 
     /// Remove provider-proxy symlinks that still point at our service binary only.
     @discardableResult
     public func uninstallProviderProxies(
-        serviceBinaryURL: URL? = nil
+        serviceBinaryURL: URL? = nil,
+        binDirectory: URL? = nil
     ) throws -> [String] {
         guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager)
         else {
             return []
         }
         var removed: [String] = []
-        for command in ProviderProxyCatalog.providers {
-            let link = cliBinDirectory.appendingPathComponent(command)
-            guard symbolicLink(at: link, pointsTo: binary) else { continue }
-            try fileManager.removeItem(at: link)
-            removed.append(command)
+        let targetDirectories = binDirectory.map { [$0] } ?? [cliBinDirectory, providerProxyBinURL]
+        for targetDirectory in targetDirectories {
+            for command in ProviderProxyCatalog.providers {
+                let link = targetDirectory.appendingPathComponent(command)
+                guard symbolicLink(at: link, pointsTo: binary) else { continue }
+                try fileManager.removeItem(at: link)
+                if !removed.contains(command) {
+                    removed.append(command)
+                }
+            }
         }
         return removed
     }
@@ -1268,6 +1334,15 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         )
         return destination.resolvingSymlinksInPath().standardizedFileURL
             == expected.resolvingSymlinksInPath().standardizedFileURL
+    }
+
+    private func managedServiceSymlink(at link: URL) -> Bool {
+        guard let destination = resolvedSymlinkTarget(at: link),
+              fileManager.isExecutableFile(atPath: destination.path) else {
+            return false
+        }
+        return destination.lastPathComponent == "RemoteCodeDistillService"
+            || destination.path.contains("RemoteCodeDistillService")
     }
 
     private func resolvedSymbolicLinkDestination(
@@ -1294,6 +1369,17 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return removed
     }
 
+    private func removeManagedServiceSymlinks(basenames: [String]) throws -> [String] {
+        var removed: [String] = []
+        for command in basenames {
+            let link = cliBinDirectory.appendingPathComponent(command)
+            guard managedServiceSymlink(at: link) else { continue }
+            try fileManager.removeItem(at: link)
+            removed.append(command)
+        }
+        return removed
+    }
+
     /// Agent command search path (the same dirs the agent's shell sees) minus the managed bin
     /// dir, so "does the real command exist?" never resolves to one of our own wrapper symlinks.
     private func systemCommandSearchDirectories() -> [String] {
@@ -1313,6 +1399,28 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             }
         }
         return false
+    }
+
+    /// Discover every executable basename the provider shell can resolve. The
+    /// managed bin is excluded by `systemCommandSearchDirectories`, so discovery
+    /// never feeds our own symlinks back into the set. Closed exclusions live in
+    /// CoreModel and are shared with runtime dispatch.
+    private func autoWrappableCommands(searchDirectories: [String]) -> [String] {
+        var commands = Set<String>()
+        for directory in searchDirectories {
+            guard let names = try? fileManager.contentsOfDirectory(atPath: directory) else { continue }
+            for name in names where WrappedCommandCatalog.isAutoWrappableCommand(name) {
+                let path = (directory as NSString).appendingPathComponent(name)
+                guard fileManager.isExecutableFile(atPath: path),
+                      let attributes = try? fileManager.attributesOfItem(atPath: path),
+                      let type = attributes[.type] as? FileAttributeType,
+                      type == .typeRegular || type == .typeSymbolicLink else {
+                    continue
+                }
+                commands.insert(name)
+            }
+        }
+        return commands.sorted()
     }
 
     private func claudeSettingsURL() -> URL {
@@ -1574,6 +1682,28 @@ public final class AgentSkillInstaller: @unchecked Sendable {
                 continue
             }
             return absolute
+        }
+        // Universal command discovery can leave only a custom-name wrapper after
+        // an app move. Scan the managed directory so recovery does not depend on
+        // the historical catalog.
+        if let names = try? fileManager.contentsOfDirectory(atPath: defaultBin.path) {
+            for name in names where seen.insert(name).inserted {
+                let link = defaultBin.appendingPathComponent(name)
+                guard let dest = try? fileManager.destinationOfSymbolicLink(atPath: link.path) else {
+                    continue
+                }
+                let absolute: URL = (dest as NSString).isAbsolutePath
+                    ? URL(fileURLWithPath: dest).resolvingSymlinksInPath()
+                    : link.deletingLastPathComponent()
+                        .appendingPathComponent(dest)
+                        .resolvingSymlinksInPath()
+                guard fileManager.isExecutableFile(atPath: absolute.path),
+                      absolute.lastPathComponent == "RemoteCodeDistillService"
+                        || absolute.path.contains("RemoteCodeDistillService") else {
+                    continue
+                }
+                return absolute
+            }
         }
         return nil
     }

@@ -165,9 +165,40 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
             providerSnapshotSupplier: { [snapshot] in [snapshot] },
             providers: [.claude: claude, .codex: codex]
         )
+        let naturalPrompt = "Run these commands in order: `command -v swift`, then `command -v distill`, then `command -v git`. Return exactly three lines. Do not edit files."
+        let expectedUserWire = """
+        @sr2 v1
+        run:command -v swift;command -v distill;command -v git
+        out:=3lines
+        !file-edit
+        done:run
+        """
+        let learned = "- preserve command output"
+        coordinator.promptPayloadCompressor = { prompt, _, _, _, _ in
+            XCTAssertEqual(prompt, naturalPrompt)
+            return AgentProviderPromptPayload(
+                userPrompt: expectedUserWire,
+                trustedHostInstruction: AgentTrustedHostInstruction(
+                    text: "REMOTE_CODE_SESSION_LEARN_V1\nSESSION_LEARN_EXACT_SCOPE:\n\(learned)"
+                )
+            )
+        }
         let runId = AgentRunID()
 
-        _ = try await coordinator.startRun(request(threadId: thread.id, runId: runId))
+        _ = try await coordinator.startRun(AgentRunRequest(
+            runId: runId,
+            threadId: thread.id,
+            provider: .claude,
+            providerInstanceId: "claude-manual",
+            model: "claude-manual",
+            cwd: NSTemporaryDirectory(),
+            prompt: naturalPrompt,
+            userMessageContent: naturalPrompt,
+            permissionMode: .supervised,
+            reasoningEffort: .medium,
+            serviceTier: .auto,
+            interactionMode: .default
+        ))
 
         XCTAssertEqual(claude.startCount, 0)
         XCTAssertEqual(codex.startCount, 1)
@@ -180,13 +211,16 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
         XCTAssertEqual(admittedRequest.model, "gpt-5.6-luna")
         XCTAssertEqual(admittedRequest.reasoningEffort, .medium)
         XCTAssertEqual(admittedRequest.serviceTier, .auto)
-        XCTAssertEqual(admittedRequest.userMessageContent, "route this run",
+        XCTAssertEqual(admittedRequest.userMessageContent, naturalPrompt,
                        "user-visible transcript keeps the original message")
-        XCTAssertTrue(
-            AgentOrchestrationRuntime.promptAlreadyInvokesOrchestrateSkill(admittedRequest.prompt),
-            "Auto must always invoke $remote-code-orchestrate"
-        )
-        XCTAssertTrue(admittedRequest.prompt.contains("route this run"))
+        XCTAssertEqual(admittedRequest.prompt, expectedUserWire,
+                       "the provider user leg must be the canonical semantic v1 wire")
+        let host = try XCTUnwrap(admittedRequest.trustedHostInstruction?.text)
+        XCTAssertTrue(host.contains("REMOTE_CODE_AUTO_ORCHESTRATION_V1"), host)
+        XCTAssertTrue(host.contains("REMOTE_CODE_SESSION_LEARN_V1"), host)
+        XCTAssertTrue(host.contains(learned), host)
+        XCTAssertFalse(host.contains(expectedUserWire), "host instructions must not absorb the user wire")
+        XCTAssertFalse(admittedRequest.prompt.contains("REMOTE_CODE_AUTO_ORCHESTRATION_V1"))
         let receipt = try XCTUnwrap(receiptRepo.receipts().first)
         XCTAssertEqual(try receiptRepo.receipts().count, 1)
         XCTAssertEqual(receipt.runId, runId)

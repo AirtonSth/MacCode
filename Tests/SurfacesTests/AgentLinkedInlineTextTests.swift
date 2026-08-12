@@ -187,6 +187,43 @@ final class AgentLinkedInlineTextTests: XCTestCase {
         )
     }
 
+    /// WHY: A fractional width can cross a glyph-wrap boundary. Reusing the
+    /// previous height with a tolerance would make SwiftUI place the row at a
+    /// stale height, so every actual width change must evict the cache.
+    @MainActor
+    func test_intrinsicHeight_fractionalWidthChangeRecomputesHeight() {
+        let textView = IntrinsicHeightTextView(usingTextLayoutManager: false)
+        textView.frame = NSRect(x: 0, y: 0, width: 220, height: 400)
+        textView.textContainerInset = .zero
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.containerSize = NSSize(
+            width: 220,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        let value = AgentLinkedInlineTextRepresentable.makeNSAttributedString(
+            attributed: AgentMessageMarkdown.attributedInline(
+                "A stable row with enough words to make width-sensitive wrapping observable."
+            ),
+            font: .systemFont(ofSize: 13),
+            textColor: DS.NS.text,
+            lineSpacing: 2
+        )
+        AgentLinkedInlineTextRepresentable.applyTextStorage(value, to: textView)
+        textView.layoutSubtreeIfNeeded()
+        _ = textView.intrinsicContentSize
+        let firstComputations = textView.intrinsicHeightComputationCount
+
+        textView.setFrameSize(NSSize(width: 220.25, height: 400))
+        textView.layoutSubtreeIfNeeded()
+        _ = textView.intrinsicContentSize
+
+        XCTAssertGreaterThan(
+            textView.intrinsicHeightComputationCount,
+            firstComputations,
+            "a fractional width change must not reuse a stale cached height"
+        )
+    }
+
     /// WHY: Width, content, typography, line limits, and padding are all
     /// height inputs. Each change must evict the cache while preserving the
     /// existing selection/link conversion contract.

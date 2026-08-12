@@ -15,7 +15,7 @@ final class TestScopedRecoveryStore: TokenSaverScopedRecoveryStoring, @unchecked
         context: TokenSaverRecoveryRequestContext,
         lane: String
     ) throws -> TokenSaverScopedPreparation {
-        let capability = UUID().uuidString
+        let capability = UUID().uuidString.lowercased()
         lock.withLock {
             originals[capability] = data
             states[context.invocationID] = .init(state: .prepared, transportOutcome: .notSent)

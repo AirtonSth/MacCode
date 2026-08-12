@@ -2396,7 +2396,8 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
 
         XCTAssertEqual(client.readCalls.first?.providerThreadId, "codex-thread-1")
         XCTAssertTrue(events.contains { if case .threadStarted(let threadId, let providerThreadId) = $0 { return threadId == "codex-thread-1" && providerThreadId == "codex-thread-1" } else { return false } })
-        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "cmd-1" && item.type == .commandExecution && item.summary == "swift test" } else { return false } })
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "cmd-1" && item.type == .commandExecution && item.summary == "swift test" && item.body == "swift test" } else { return false } },
+                      "restored command rows must retain the complete executed command separately from output")
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "cmd-1" && output == "ok" } else { return false } })
         XCTAssertTrue(events.contains { if case .providerRuntime(let runtime) = $0 { return runtime.method == "thread/read.item" && runtime.providerItemId == "browser-1" && runtime.payloadJSON.contains("browserScreenshot") } else { return false } },
                       "thread/read must keep raw app-server snapshot items so newly added Codex item subtypes are debuggable before RemoteCode has specialized UI mapping")
@@ -3832,7 +3833,8 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
 
         _ = try await waitForItemCompleted(in: sink, itemId: "raw-web-1")
         let events = await sink.snapshot()
-        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "cmd-1" && item.type == .commandExecution && item.summary == "swift test" } else { return false } })
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "cmd-1" && item.type == .commandExecution && item.summary == "swift test" && item.body == "swift test" } else { return false } },
+                      "live command rows must retain the complete executed command separately from output")
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "cmd-1" && output == "ok\n" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "reasoning-1" && output == "thinking" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "patch-1" && output == "diff --git a/file b/file" } else { return false } })
@@ -3840,7 +3842,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "raw-message-1" && item.type == .assistantMessage && item.summary == "Assistant message" } else { return false } },
                       "current Codex raw response message items must not collapse into generic tool rows")
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, let body, _, _) = $0 { return itemId == "raw-message-1" && body == "raw assistant text" } else { return false } })
-        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "raw-shell-1" && item.type == .commandExecution && item.summary == "swift test" } else { return false } },
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "raw-shell-1" && item.type == .commandExecution && item.summary == "swift test" && item.body == "swift test" } else { return false } },
                       "current Codex raw local shell call items must render as command execution")
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "raw-web-1" && item.type == .webSearch && item.summary == "RemoteCode" } else { return false } },
                       "current Codex raw web search call items must render as web search")

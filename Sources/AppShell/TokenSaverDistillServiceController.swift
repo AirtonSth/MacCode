@@ -519,6 +519,9 @@ public struct RealDistillProcessSpawner: DistillProcessSpawning, Sendable {
         process.standardOutput = stdout
         process.standardError = stderr
         process.arguments = arguments
+        process.environment = ChildProcessEnvironmentPolicy.scrubHostOnlyKeys(
+            from: ProcessInfo.processInfo.environment
+        )
         try process.run()
         let ownershipTag = try ProcessSpawnTagger.tagProcess(process, managedKind: .sidecar)
         return DistillSpawnResult(
@@ -599,7 +602,7 @@ public final class TokenSaverDistillServiceController {
         executableURLResolver: @escaping ExecutableURLResolver = TokenSaverDistillServiceController.defaultExecutableURL,
         idleTimeoutMS: Int = 300_000,
         processSpawner: any DistillProcessSpawning = RealDistillProcessSpawner(),
-        terminateForeignServers: @escaping ForeignServerTerminator = { TokenSaverDistillServiceController.defaultTerminateForeignServers(keeping: $0) },
+        terminateForeignServers: ForeignServerTerminator? = nil,
         ownedProcessTerminationTimeout: TimeInterval = 2.5,
         memoryProfileProvider: @escaping @Sendable () -> ManagedProcessMemoryProfile = {
             ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory)
@@ -609,9 +612,50 @@ public final class TokenSaverDistillServiceController {
         self.executableURLResolver = executableURLResolver
         self.idleTimeoutMS = idleTimeoutMS
         self.processSpawner = processSpawner
-        self.terminateForeignServers = terminateForeignServers
+        let namespace = Self.sidecarNamespace(for: appSupportDirectory)
+        self.terminateForeignServers = terminateForeignServers ?? { keepPID in
+            Self.defaultTerminateForeignServers(keeping: keepPID, namespace: namespace)
+        }
         self.ownedProcessTerminationTimeout = max(0.1, ownedProcessTerminationTimeout)
         self.memoryProfileProvider = memoryProfileProvider
+    }
+
+    /// The sidecar namespace is the canonical app-support directory.  Release
+    /// channels already choose distinct support directories (the stable path is
+    /// intentionally the historical `RemoteCode` directory), and test/canary
+    /// launches may provide an explicit isolated directory.  Keep this helper
+    /// pure so process-table reconciliation cannot accidentally broaden scope.
+    nonisolated public static func sidecarNamespace(for appSupportDirectory: URL) -> String {
+        appSupportDirectory
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+    }
+
+    /// Extracts the namespace stamped into a running sidecar's argv.  The
+    /// controller always places `--app-support-dir` before `--host`; keeping the
+    /// bounded extraction here avoids treating spaces in macOS's
+    /// `Application Support` path as argument separators.
+    nonisolated public static func sidecarNamespace(from command: String) -> String? {
+        guard let start = command.range(of: " --app-support-dir ") else { return nil }
+        let remainder = command[start.upperBound...]
+        guard let end = remainder.range(of: " --host ") else { return nil }
+        let rawPath = remainder[..<end.lowerBound]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawPath.isEmpty else { return nil }
+        return sidecarNamespace(for: URL(fileURLWithPath: rawPath))
+    }
+
+    /// True only for a sidecar that belongs to the requested namespace.  An
+    /// unknown/malformed namespace is deliberately treated as foreign=false:
+    /// fail-open means we leave it alive instead of killing another channel.
+    nonisolated public static func sidecarCommand(
+        _ command: String,
+        belongsToNamespace namespace: String
+    ) -> Bool {
+        guard ProviderProcessSweeper.isRemoteCodeDistillServerCommand(command),
+              let commandNamespace = sidecarNamespace(from: command) else { return false }
+        return commandNamespace == namespace
     }
 
     /// Production ownership reconciliation. No-ops under XCTest so suite
@@ -623,7 +667,8 @@ public final class TokenSaverDistillServiceController {
     /// gate (second spawn fails or competes for unified memory).
     /// Never signals `mcp` helpers (multi-instance CLI path).
     nonisolated public static func defaultTerminateForeignServers(
-        keeping keepPID: Int32?
+        keeping keepPID: Int32?,
+        namespace: String
     ) -> ProviderProcessSweepResult {
         if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
             return ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
@@ -631,16 +676,13 @@ public final class TokenSaverDistillServiceController {
         var orphanRootPIDs: [Int32] = []
         var terminatedPIDs: [Int32] = []
         var failedPIDs: [Int32] = []
-        do {
-            let ledger = try ProviderProcessSweeper.terminatePersistedOrphanedProviderRuntimes(minAge: 0)
-            orphanRootPIDs.append(contentsOf: ledger.orphanRootPIDs)
-            terminatedPIDs.append(contentsOf: ledger.terminatedPIDs)
-            failedPIDs.append(contentsOf: ledger.failedPIDs)
-        } catch {
-            // Fall through to process-table reaping; ledger absence must not
-            // leave a multi-GB foreign Distill HTTP server alive.
-        }
-        let table = reapForeignHTTPDistillServers(keeping: keepPID)
+        // Do not run the global persisted-owner sweep here.  Its ledger predates
+        // sidecar namespaces, so it cannot distinguish stable from canary/debug
+        // roots and would terminate an otherwise healthy sibling.  The argv
+        // carries the authoritative app-support namespace and is reconciled
+        // below; the per-app ledger remains available to the normal app-exit
+        // sweeper for provider runtimes.
+        let table = reapForeignHTTPDistillServers(keeping: keepPID, namespace: namespace)
         orphanRootPIDs.append(contentsOf: table.orphanRootPIDs)
         terminatedPIDs.append(contentsOf: table.terminatedPIDs)
         failedPIDs.append(contentsOf: table.failedPIDs)
@@ -653,7 +695,8 @@ public final class TokenSaverDistillServiceController {
 
     /// TERM then brief wait then KILL for HTTP Distill servers only (`mcp` excluded).
     nonisolated private static func reapForeignHTTPDistillServers(
-        keeping keepPID: Int32?
+        keeping keepPID: Int32?,
+        namespace: String
     ) -> ProviderProcessSweepResult {
         guard let rows = try? ProviderProcessSweeper.psRowsThrowing() else {
             return ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
@@ -662,7 +705,7 @@ public final class TokenSaverDistillServiceController {
         var terminated: [Int32] = []
         var failed: [Int32] = []
         for row in rows {
-            guard ProviderProcessSweeper.isRemoteCodeDistillServerCommand(row.command) else { continue }
+            guard sidecarCommand(row.command, belongsToNamespace: namespace) else { continue }
             if let keepPID, row.pid == keepPID { continue }
             orphans.append(row.pid)
             let pid = row.pid
@@ -879,7 +922,7 @@ public final class TokenSaverDistillServiceController {
         foreignSweepInFlight = true
         let terminate = terminateForeignServers
         Task.detached(priority: .userInitiated) {
-            _ = terminate(nil)
+            let sweep = terminate(nil)
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.foreignSweepInFlight = false
@@ -888,6 +931,16 @@ public final class TokenSaverDistillServiceController {
                 guard self.shouldRun,
                       !(self.process?.isRunning ?? false),
                       self.terminatingProcess == nil else { return }
+                // A failed same-namespace termination is not an all-clear. Do
+                // not launch a second multi-GB model beside a live survivor;
+                // surface the failure and let the next explicit lifecycle
+                // reconciliation retry after the owner has drained.
+                guard sweep.failedPIDs.isEmpty else {
+                    self.status = .failed(
+                        "RemoteCodeDistillService namespace handoff failed (\(sweep.failedPIDs.count) process\(sweep.failedPIDs.count == 1 ? "" : "es") still running)"
+                    )
+                    return
+                }
                 self.performSpawn(executableURL: executableURL)
             }
         }

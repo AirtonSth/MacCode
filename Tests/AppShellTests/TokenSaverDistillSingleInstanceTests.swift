@@ -10,6 +10,61 @@ import Persistence
 @MainActor
 final class TokenSaverDistillSingleInstanceTests: XCTestCase {
 
+    func test_sidecarNamespaceReapingIsScopedToAppSupportDirectory() {
+        let stable = URL(fileURLWithPath: "/Users/test/Library/Application Support/RemoteCode")
+        let canary = URL(fileURLWithPath: "/tmp/RemoteCodeAgentCanary/state")
+        let stableCommand = "/Applications/RemoteCode.app/Contents/MacOS/RemoteCodeDistillService --auth-token token --app-support-dir \(stable.path) --host 127.0.0.1 --port 0"
+        let canaryCommand = "/tmp/RemoteCodeAgentCanary.app/Contents/MacOS/RemoteCodeDistillService --auth-token token --app-support-dir \(canary.path) --host 127.0.0.1 --port 0"
+
+        XCTAssertTrue(
+            TokenSaverDistillServiceController.sidecarCommand(
+                stableCommand,
+                belongsToNamespace: TokenSaverDistillServiceController.sidecarNamespace(for: stable)
+            ),
+            "the stable controller must recognize its historical RemoteCode namespace"
+        )
+        XCTAssertFalse(
+            TokenSaverDistillServiceController.sidecarCommand(
+                canaryCommand,
+                belongsToNamespace: TokenSaverDistillServiceController.sidecarNamespace(for: stable)
+            ),
+            "a canary sidecar must not be reaped by the stable controller"
+        )
+        XCTAssertTrue(
+            TokenSaverDistillServiceController.sidecarCommand(
+                canaryCommand,
+                belongsToNamespace: TokenSaverDistillServiceController.sidecarNamespace(for: canary)
+            ),
+            "the canary controller must still enforce singleton ownership within canary"
+        )
+    }
+
+    func test_sidecarNamespaceParserPreservesSpacesAndNeverAdmitsMCPOrUnknownNamespace() {
+        let namespace = URL(fileURLWithPath: "/Users/test/Library/Application Support/RemoteCode")
+        let server = "/tmp/RemoteCodeDistillService --auth-token token --app-support-dir \(namespace.path) --host 127.0.0.1 --port 0"
+        let mcp = "/tmp/RemoteCodeDistillService mcp"
+        let malformed = "/tmp/RemoteCodeDistillService --auth-token token --host 127.0.0.1 --port 0"
+
+        XCTAssertEqual(
+            TokenSaverDistillServiceController.sidecarNamespace(from: server),
+            TokenSaverDistillServiceController.sidecarNamespace(for: namespace)
+        )
+        XCTAssertFalse(
+            TokenSaverDistillServiceController.sidecarCommand(
+                mcp,
+                belongsToNamespace: TokenSaverDistillServiceController.sidecarNamespace(for: namespace)
+            ),
+            "the multi-instance mcp helper must never enter sidecar singleton reaping"
+        )
+        XCTAssertFalse(
+            TokenSaverDistillServiceController.sidecarCommand(
+                malformed,
+                belongsToNamespace: TokenSaverDistillServiceController.sidecarNamespace(for: namespace)
+            ),
+            "a sidecar without an explicit namespace must be left alive fail-open"
+        )
+    }
+
     private final class CapturingSpawner: DistillProcessSpawning, @unchecked Sendable {
         var spawnCount = 0
         func spawn(executableURL: URL, arguments: [String]) throws -> DistillSpawnResult {
@@ -108,6 +163,35 @@ final class TokenSaverDistillSingleInstanceTests: XCTestCase {
         XCTAssertFalse(keepArgs.values.isEmpty, "start must invoke the foreign-server terminator")
         XCTAssertEqual(keepArgs.values.first!, nil as Int32?,
                        "pre-spawn singleton gate keeps no prior server")
+    }
+
+    func test_failedSameNamespaceSweepBlocksSecondSidecarSpawn() async {
+        // WHY: a failed TERM/KILL handoff means the same-namespace MLX server
+        // may still hold the model. Spawning anyway recreates the memory
+        // contention and UI hang that the singleton gate is meant to prevent.
+        let spawner = CapturingSpawner()
+        let controller = TokenSaverDistillServiceController(
+            appSupportDirectory: URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true),
+            executableURLResolver: { URL(fileURLWithPath: "/bin/sh") },
+            processSpawner: spawner,
+            terminateForeignServers: { _ in
+                ProviderProcessSweepResult(orphanRootPIDs: [42], terminatedPIDs: [], failedPIDs: [42])
+            }
+        )
+        defer { controller.stop() }
+
+        controller.startIfEligible(
+            session: paidSession(),
+            settings: AppSettings(tokenSaverEnabled: true),
+            modelValidation: .installed
+        )
+
+        let failed = await waitUntil(timeout: 2) {
+            if case .failed = controller.status { return true }
+            return false
+        }
+        XCTAssertTrue(failed, "a failed namespace handoff must surface a failed status")
+        XCTAssertEqual(spawner.spawnCount, 0, "a failed handoff must never launch a second sidecar")
     }
 
     func test_stopTerminatesOnlyControllerOwnedProcess() async {

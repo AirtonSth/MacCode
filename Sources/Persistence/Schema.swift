@@ -24,7 +24,7 @@ public enum Schema {
     /// Must equal the highest SchemaStep version (checkpoint list at 58, Token
     /// Saver per-thread attribution at 59, fork lifecycle support at 61, and
     /// bounded historical-maintenance lookup support at 62).
-    public static let currentVersion: Int = 62
+    public static let currentVersion: Int = 66
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1141,6 +1141,54 @@ public enum Schema {
         );
         CREATE INDEX IF NOT EXISTS idx_agent_message_outbound_payloads_thread
             ON agent_message_outbound_payloads(thread_id, created_at);
+        """),
+        SchemaStep(64, """
+        CREATE TABLE IF NOT EXISTS agent_message_display_translations (
+            message_id TEXT PRIMARY KEY NOT NULL,
+            thread_id TEXT NOT NULL,
+            wire_sha256 TEXT NOT NULL,
+            display_text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(message_id) REFERENCES agent_messages(id) ON DELETE CASCADE,
+            FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_message_display_translations_thread
+            ON agent_message_display_translations(thread_id, created_at);
+        """),
+        SchemaStep(65, """
+        CREATE TABLE IF NOT EXISTS agent_timeline_display_translations (
+            owner_kind TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            wire_sha256 TEXT NOT NULL,
+            display_text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(thread_id, owner_kind, owner_id),
+            FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_timeline_display_translations_thread
+            ON agent_timeline_display_translations(thread_id, created_at);
+        """),
+        SchemaStep(66, """
+        ALTER TABLE agent_timeline_display_translations
+            RENAME TO agent_timeline_display_translations_v65;
+        CREATE TABLE agent_timeline_display_translations (
+            owner_kind TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            wire_sha256 TEXT NOT NULL,
+            display_text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(thread_id, owner_kind, owner_id),
+            FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE
+        );
+        INSERT INTO agent_timeline_display_translations(
+            owner_kind, owner_id, thread_id, wire_sha256, display_text, created_at
+        ) SELECT owner_kind, owner_id, thread_id, wire_sha256, display_text, created_at
+          FROM agent_timeline_display_translations_v65;
+        DROP TABLE agent_timeline_display_translations_v65;
+        CREATE INDEX IF NOT EXISTS idx_agent_timeline_display_translations_thread
+            ON agent_timeline_display_translations(thread_id, created_at);
         """),
     ]
 

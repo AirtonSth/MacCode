@@ -443,7 +443,7 @@ public enum ProviderProxyPolicy {
         tokenSaverRuntimeActive: Bool,
         graphifyRuntimeActive: Bool
     ) -> [String: String] {
-        var updated = environment
+        var updated = ChildProcessEnvironmentPolicy.scrubHostOnlyKeys(from: environment)
         if !tokenSaverRuntimeActive {
             for key in environment.keys
             where key.hasPrefix("RC_TOKEN_SAVER_")

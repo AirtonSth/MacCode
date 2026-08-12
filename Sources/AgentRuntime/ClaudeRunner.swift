@@ -141,7 +141,9 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     public static func buildArgs(_ request: AgentRunRequest) -> [String] {
         var args: [String] = ["--print", "--output-format", "stream-json", "--verbose"]
         args.append(contentsOf: ["--model", request.model])
-        let prompt = request.providerPrompt
+        // Auto turns carry a typed host leg; keep the positional user leg
+        // canonical instead of re-wrapping host orchestration as user text.
+        let prompt = request.trustedHostInstruction == nil ? request.providerPrompt : request.prompt
         args.append(contentsOf: effortArgs(request.reasoningEffort))
         args.append(contentsOf: ultracodeSettingsArgs(request.reasoningEffort, environment: request.environment))
         // Resume the prior session so the model keeps full context.
@@ -156,6 +158,9 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             case .autoAcceptEdits: args.append(contentsOf: ["--permission-mode", "acceptEdits"])
             case .fullAccess: args.append(contentsOf: ["--permission-mode", "bypassPermissions"])
             }
+        }
+        if request.trustedHostInstruction != nil {
+            args.append(contentsOf: ["--append-system-prompt", systemPrompt(for: request)])
         }
         args.append(contentsOf: request.extraArgs)
         args.append(prompt)
@@ -202,13 +207,25 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         // (both live via `alwaysOnClaudeDirectives`).
         // Background-await + MCP rules always; Distill only when Token Saver hint is set.
         // `--append-system-prompt` adds to the CLI's default prompt, so it stays additive.
-        let appendedSystemPrompt = AgentSkillInstaller.tokenSaverProviderPrompt(
-            BackgroundAwaitContinuation.alwaysOnClaudeDirectives,
-            environment: request.environment
-        )
+        let appendedSystemPrompt = systemPrompt(for: request)
         args.append(contentsOf: ["--append-system-prompt", appendedSystemPrompt])
         args.append(contentsOf: request.extraArgs)
         return args
+    }
+
+    /// Shared Claude system leg for one-shot and streaming adapters. The typed
+    /// host instruction is never concatenated into the positional user prompt.
+    static func systemPrompt(for request: AgentRunRequest) -> String {
+        var prompt = AgentSkillInstaller.tokenSaverProviderPrompt(
+            BackgroundAwaitContinuation.alwaysOnClaudeDirectives,
+            environment: request.environment
+        )
+        if let trustedHostInstruction = request.trustedHostInstruction,
+           !trustedHostInstruction.isEmpty {
+            prompt += "\n\nREMOTE_CODE_TRUSTED_HOST_INSTRUCTIONS_V1\n"
+                + trustedHostInstruction.text
+        }
+        return prompt
     }
 
     /// Human-readable error shown when the provider binary is absent from PATH.

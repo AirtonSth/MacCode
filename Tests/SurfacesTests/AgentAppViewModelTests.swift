@@ -14,6 +14,87 @@ import CoreModel
 @MainActor
 final class AgentAppViewModelTests: XCTestCase {
 
+    func testNaturalAssistantDisplayPreservesSR2ControlLookingExamples() throws {
+        // WHY: assistant text has no trustworthy provenance. A control-looking
+        // SR2 example is still user-visible content and must not be stripped by
+        // a content heuristic, including the orchestration goal literal.
+        let (viewModel, _) = try makeVM()
+        for example in ["g:example", "g:remote-code-orchestrate"] {
+            let content = "Here is the requested SR2 example:\n@sr2 v1\n\(example)"
+            XCTAssertEqual(viewModel.humanizedAssistantContent(content), content)
+        }
+
+        let markerFirst = "@sr2 v1\ng:remote-code-orchestrate\ndone:run"
+        XCTAssertEqual(
+            viewModel.humanizedAssistantContent(markerFirst),
+            markerFirst,
+            "marker-first protocol-looking text without translation provenance remains natural assistant content"
+        )
+
+        let leaked = "Completed the requested checks.\n@sr2 v0\ng:remote-code-orchestrate"
+        XCTAssertEqual(viewModel.humanizedAssistantContent(leaked), leaked)
+    }
+
+    func testTurnFinalUsesTrustedTranslationProvenanceWithoutStrippingNaturalSuffixes() throws {
+        // WHY: a turn-owned final has no message id at paint time. Only a typed
+        // SR1 translation tied to the persisted assistant message and one
+        // matching turn may replace it; content that merely resembles SR2 stays
+        // untouched.
+        let (viewModel, _) = try makeVM()
+        let threadId = AgentThreadID()
+        let raw = "ok\n@sr2 v0\ng:remote-code-orchestrate"
+        let message = AgentMessage(threadId: threadId, role: .assistant, content: raw)
+        viewModel.messages = [message]
+        viewModel.timeline.apply(.turnStarted(turnId: "translated-turn"))
+        viewModel.timeline.apply(.turnCompleted(turnId: "translated-turn", finalMessage: raw))
+        viewModel.timeline.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: message.id.value.uuidString,
+            originalText: raw,
+            rewrittenText: "ok"
+        )))
+
+        viewModel.refreshSR1TranslationStateFromTimeline()
+        XCTAssertEqual(
+            viewModel.assistantDisplayText(for: raw, turnId: "translated-turn"),
+            "ok",
+            "the persisted message id and timeline turn provide trusted final-display provenance"
+        )
+
+        let natural = "Completed the requested checks.\n@sr2 v0\ng:remote-code-orchestrate"
+        XCTAssertEqual(
+            viewModel.assistantDisplayText(for: natural, turnId: "untranslated-turn"),
+            natural,
+            "a natural suffix must not be removed by a text-matching sanitizer"
+        )
+    }
+
+    func testExactR9FinalUsesTypedHumanizationWithAllThreeEvidenceFields() throws {
+        // WHY: this is the exact 190-byte live R9 final. Once the coordinator
+        // emits its typed translation, every proof must reach the transcript and
+        // neither the wire banner nor field syntax may be painted or copied.
+        let (viewModel, _) = try makeVM()
+        let threadId = AgentThreadID()
+        let wire = "@sr2 v0\no:done\np:1=/Users/samuelfajreldines/.remote-code/bin/swift;/Users/samuelfajreldines/.remote-code/bin/distill\np:2=3:UNIQUE_EXACT_MATCH=sr2-e2e-20260811\np:3=swift noisy.swift completed"
+        XCTAssertEqual(wire.utf8.count, 190)
+        let natural = "Completed.\nEvidence 1: /Users/samuelfajreldines/.remote-code/bin/swift;/Users/samuelfajreldines/.remote-code/bin/distill.\nEvidence 2: 3:UNIQUE_EXACT_MATCH=sr2-e2e-20260811.\nEvidence 3: swift noisy.swift completed."
+        let message = AgentMessage(threadId: threadId, role: .assistant, content: wire)
+        viewModel.messages = [message]
+        viewModel.timeline.apply(.turnStarted(turnId: "r9-final"))
+        viewModel.timeline.apply(.turnCompleted(turnId: "r9-final", finalMessage: wire))
+        viewModel.timeline.apply(.sr1Translation(AssistantSR1Translation(
+            messageId: message.id.value.uuidString,
+            originalText: wire,
+            rewrittenText: natural
+        )))
+
+        viewModel.refreshSR1TranslationStateFromTimeline()
+        let display = viewModel.assistantDisplayText(for: wire, turnId: "r9-final")
+        XCTAssertEqual(display, natural)
+        XCTAssertFalse(display.localizedCaseInsensitiveContains("@sr2"), display)
+        XCTAssertFalse(display.contains("p:1="), display)
+        XCTAssertTrue(display.contains("Evidence 3: swift noisy.swift completed."), display)
+    }
+
     override func setUp() {
         super.setUp()
         // AgentLastModelStore.shared persists to the test runner's
@@ -2221,6 +2302,463 @@ final class AgentAppViewModelTests: XCTestCase {
                        "app restart must prefer provider readThread state over stale local final-message rows when the provider session is recoverable")
     }
 
+    func test_freshViewModelReopensCommandFromDurableProviderRowsAfterStreamCap() async throws {
+        // WHY: agent_stream_events keeps only the newest 100 rows. A command near
+        // the front of a verbose turn can therefore disappear after a thread switch
+        // or app restart even though Codex's bounded provider log still owns its
+        // exact command and completed output.
+        let tmp = NSTemporaryDirectory() + "rc2-vm-command-reopen-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let workspaceID = WorkspaceID()
+        var thread = AgentThread(
+            workspaceId: workspaceID,
+            title: "command survives reopen",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        thread.status = .completed
+        try threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .completed
+        )
+        try runRepo.upsert(run)
+
+        let turnID = "turn-command-reopen"
+        let itemID = "exec-command-reopen"
+        let command = "/bin/zsh -lc 'command -v swift;command -v distill;rg -n UNIQUE_EXACT_MATCH README.md;swift noisy.swift'"
+        let noisyOutput = String(repeating: "0123456789", count: (AssistantTimelineState.liveOutputLimit / 10) + 37)
+        let encoder = JSONEncoder()
+        func appendStream(_ event: AssistantEvent, seq: Int) throws {
+            try runRepo.appendStreamEvent(
+                runId: run.id,
+                seq: seq,
+                kind: event.debugDescription,
+                payloadJSON: String(decoding: try encoder.encode(event), as: UTF8.self)
+            )
+        }
+        func payload(_ object: [String: Any]) throws -> String {
+            String(decoding: try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]), as: UTF8.self)
+        }
+
+        let commandStart = AssistantEvent.itemStarted(item: AssistantItem(
+            id: itemID,
+            turnId: turnID,
+            type: .commandExecution,
+            state: .streaming,
+            summary: command,
+            body: command,
+            startedAtMs: 1
+        ))
+        try appendStream(commandStart, seq: 1)
+        try appendStream(.itemDelta(itemId: itemID, bodyAppend: nil, outputAppend: noisyOutput, summary: "Command output"), seq: 2)
+        try appendStream(.itemCompleted(itemId: itemID, finalState: .completed), seq: 3)
+
+        let providerEvents = [
+            ProviderRuntimeEvent(
+                id: "provider-command-start",
+                provider: .codex,
+                source: "codex.app-server",
+                method: "item/started",
+                providerTurnId: turnID,
+                providerItemId: itemID,
+                payloadJSON: try payload([
+                    "turnId": turnID,
+                    "item": ["id": itemID, "type": "commandExecution", "status": "inProgress", "command": command]
+                ]),
+                receivedAtMs: 1
+            ),
+            ProviderRuntimeEvent(
+                id: "provider-command-output",
+                provider: .codex,
+                source: "codex.app-server",
+                method: "item/commandExecution/outputDelta",
+                providerTurnId: turnID,
+                providerItemId: itemID,
+                payloadJSON: try payload(["turnId": turnID, "itemId": itemID, "delta": noisyOutput]),
+                receivedAtMs: 2
+            ),
+            ProviderRuntimeEvent(
+                id: "provider-command-completed",
+                provider: .codex,
+                source: "codex.app-server",
+                method: "item/completed",
+                providerTurnId: turnID,
+                providerItemId: itemID,
+                payloadJSON: try payload([
+                    "turnId": turnID,
+                    "item": [
+                        "id": itemID,
+                        "type": "commandExecution",
+                        "status": "completed",
+                        "command": command,
+                        "aggregatedOutput": noisyOutput
+                    ]
+                ]),
+                receivedAtMs: 3
+            )
+        ]
+        for event in providerEvents {
+            try runRepo.appendProviderEventLog(threadId: thread.id, runId: run.id, event: event)
+        }
+        let otherThread = AgentThread(
+            workspaceId: workspaceID,
+            title: "unrelated command thread",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        try threadRepo.upsert(otherThread)
+        try runRepo.appendProviderEventLog(
+            threadId: otherThread.id,
+            runId: nil,
+            event: ProviderRuntimeEvent(
+                id: "provider-command-wrong-thread",
+                provider: .codex,
+                source: "codex.app-server",
+                method: "item/started",
+                providerTurnId: turnID,
+                providerItemId: itemID,
+                payloadJSON: try payload([
+                    "turnId": turnID,
+                    "item": [
+                        "id": itemID,
+                        "type": "commandExecution",
+                        "status": "inProgress",
+                        "command": "printf WRONG_THREAD"
+                    ]
+                ]),
+                receivedAtMs: 4
+            )
+        )
+
+        // More than the production 100-row cap lands after the command.
+        for index in 0..<101 {
+            try appendStream(.itemStarted(item: AssistantItem(
+                id: "later-item-\(index)",
+                turnId: "later-turn-\(index)",
+                type: .tool,
+                state: .completed,
+                summary: "later event \(index)",
+                startedAtMs: Int64(index + 10)
+            )), seq: index + 4)
+        }
+        XCTAssertEqual(try runRepo.countStreamEvents(threadId: thread.id), 100)
+        XCTAssertFalse(try runRepo.listLatestStreamEvents(threadId: thread.id).contains {
+            if case .itemStarted(let item) = $0 { return item.id == itemID }
+            return false
+        }, "precondition: the ordinary stream replay has evicted the command")
+
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(provider: .codex)]
+        )
+        let reopened = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            promptHistoryStore: PromptHistoryStore(db: db),
+            initialThreadId: thread.id
+        )
+
+        XCTAssertFalse(reopened.timeline.turns.flatMap(\.items).contains { $0.id == itemID },
+                       "first paint must not wait for provider-log loading or JSON reconstruction")
+        await reopened.waitForDurableCommandRecovery()
+        let restoredItems = reopened.timeline.turns.flatMap(\.items).filter { $0.id == itemID }
+        XCTAssertEqual(restoredItems.count, 1, "durable reconstruction must not duplicate the command row")
+        let restored = try XCTUnwrap(restoredItems.first)
+        XCTAssertEqual(restored.type, .commandExecution)
+        XCTAssertEqual(restored.state, .completed)
+        XCTAssertEqual(AgentTimelineItemPresentation.fullToolCommand(for: restored), command,
+                       "expanded display and copy must preserve every command byte after reopen")
+        XCTAssertEqual(restored.output, AssistantTimelineState.cappedText(noisyOutput, limit: AssistantTimelineState.liveOutputLimit),
+                       "durable replay must retain the normal UI output cap")
+    }
+
+    func test_durableCommandReplayReplacesPartialCommandRowsWithoutAppendingOutputTwice() async throws {
+        // WHY: retention can cut through one command, evicting only itemStarted
+        // while its delta/completion remain. The provider-completed aggregate is
+        // authoritative and the retained delta must not be replayed a second time.
+        let tmp = NSTemporaryDirectory() + "rc2-vm-command-overlap-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let workspaceID = WorkspaceID()
+        var thread = AgentThread(
+            workspaceId: workspaceID,
+            title: "partial command boundary",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        thread.status = .completed
+        try threadRepo.upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "gpt-5.5", status: .completed)
+        try runRepo.upsert(run)
+
+        let turnID = "turn-overlap"
+        let itemID = "exec-overlap"
+        let command = "printf 'exact overlap command'"
+        let output = "alpha|BRAVO|charlie\n"
+        let encoder = JSONEncoder()
+        func append(_ event: AssistantEvent, seq: Int) throws {
+            try runRepo.appendStreamEvent(
+                runId: run.id,
+                seq: seq,
+                kind: event.debugDescription,
+                payloadJSON: String(decoding: try encoder.encode(event), as: UTF8.self)
+            )
+        }
+        func payload(_ object: [String: Any]) throws -> String {
+            String(decoding: try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]), as: UTF8.self)
+        }
+
+        try append(.itemStarted(item: AssistantItem(
+            id: itemID,
+            turnId: turnID,
+            type: .commandExecution,
+            state: .streaming,
+            summary: command,
+            body: command,
+            startedAtMs: 1
+        )), seq: 1)
+        try append(.itemDelta(itemId: itemID, bodyAppend: nil, outputAppend: output, summary: nil), seq: 2)
+        try append(.itemCompleted(itemId: itemID, finalState: .completed), seq: 3)
+        for index in 0..<98 {
+            try append(.itemStarted(item: AssistantItem(
+                id: "overlap-later-\(index)",
+                turnId: "overlap-later-turn-\(index)",
+                type: .tool,
+                state: .completed,
+                summary: "later \(index)",
+                startedAtMs: Int64(index + 10)
+            )), seq: index + 4)
+        }
+        XCTAssertEqual(try runRepo.countStreamEvents(threadId: thread.id), 100)
+        let retained = try runRepo.listLatestStreamEvents(threadId: thread.id)
+        XCTAssertFalse(retained.contains {
+            if case .itemStarted(let item) = $0 { return item.id == itemID }
+            return false
+        })
+        XCTAssertTrue(retained.contains {
+            if case .itemDelta(let id, _, _, _) = $0 { return id == itemID }
+            return false
+        }, "precondition: the retention boundary cuts through the command")
+
+        let providerEvents = [
+            ProviderRuntimeEvent(
+                id: "provider-overlap-start",
+                provider: .codex,
+                source: "codex.app-server",
+                method: "item/started",
+                providerTurnId: turnID,
+                providerItemId: itemID,
+                payloadJSON: try payload([
+                    "turnId": turnID,
+                    "item": ["id": itemID, "type": "commandExecution", "command": command]
+                ]),
+                receivedAtMs: 1
+            ),
+            ProviderRuntimeEvent(
+                id: "provider-overlap-output",
+                provider: .codex,
+                source: "codex.app-server",
+                method: "item/commandExecution/outputDelta",
+                providerTurnId: turnID,
+                providerItemId: itemID,
+                payloadJSON: try payload(["turnId": turnID, "itemId": itemID, "delta": output]),
+                receivedAtMs: 2
+            ),
+            ProviderRuntimeEvent(
+                id: "provider-overlap-completed",
+                provider: .codex,
+                source: "codex.app-server",
+                method: "item/completed",
+                providerTurnId: turnID,
+                providerItemId: itemID,
+                payloadJSON: try payload([
+                    "turnId": turnID,
+                    "item": [
+                        "id": itemID,
+                        "type": "commandExecution",
+                        "status": "completed",
+                        "command": command,
+                        "aggregatedOutput": output
+                    ]
+                ]),
+                receivedAtMs: 3
+            )
+        ]
+        for event in providerEvents {
+            try runRepo.appendProviderEventLog(threadId: thread.id, runId: run.id, event: event)
+        }
+
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(provider: .codex)]
+        )
+        let reopened = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            promptHistoryStore: PromptHistoryStore(db: db),
+            initialThreadId: thread.id
+        )
+        await reopened.waitForDurableCommandRecovery()
+
+        let restoredItems = reopened.timeline.turns.flatMap(\.items).filter { $0.id == itemID }
+        XCTAssertEqual(restoredItems.count, 1)
+        let restored = try XCTUnwrap(restoredItems.first)
+        XCTAssertEqual(AgentTimelineItemPresentation.fullToolCommand(for: restored), command)
+        XCTAssertEqual(restored.output, output, "retained output delta must not append after completed provider aggregate")
+        XCTAssertEqual(restored.state, .completed)
+    }
+
+    func test_durableCommandReplayDropsStaleCompletionAfterThreadSwitch() async throws {
+        // WHY: provider-log recovery is asynchronous. Switching threads while an
+        // old recovery is paused must never publish that command into the newly
+        // selected thread.
+        let tmp = NSTemporaryDirectory() + "rc2-vm-command-stale-open-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let workspaceID = WorkspaceID()
+        var staleThread = AgentThread(
+            workspaceId: workspaceID,
+            title: "stale command recovery",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        staleThread.status = .completed
+        try threadRepo.upsert(staleThread)
+        var selectedThread = AgentThread(
+            workspaceId: workspaceID,
+            title: "selected after switch",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        selectedThread.status = .completed
+        try threadRepo.upsert(selectedThread)
+        let staleRun = AgentRun(
+            threadId: staleThread.id,
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .completed
+        )
+        try runRepo.upsert(staleRun)
+
+        let encoder = JSONEncoder()
+        for index in 0..<101 {
+            let event = AssistantEvent.itemStarted(item: AssistantItem(
+                id: "stale-later-\(index)",
+                turnId: "stale-later-turn-\(index)",
+                type: .tool,
+                state: .completed,
+                summary: "later \(index)",
+                startedAtMs: Int64(index + 10)
+            ))
+            try runRepo.appendStreamEvent(
+                runId: staleRun.id,
+                seq: index + 1,
+                kind: event.debugDescription,
+                payloadJSON: String(decoding: try encoder.encode(event), as: UTF8.self)
+            )
+        }
+        let itemID = "stale-command-item"
+        let command = "printf STALE_COMMAND"
+        func payload(_ object: [String: Any]) throws -> String {
+            String(decoding: try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]), as: UTF8.self)
+        }
+        try runRepo.appendProviderEventLog(
+            threadId: staleThread.id,
+            runId: staleRun.id,
+            event: ProviderRuntimeEvent(
+                id: "stale-provider-start",
+                provider: .codex,
+                source: "codex.app-server",
+                method: "item/started",
+                providerTurnId: "stale-turn",
+                providerItemId: itemID,
+                payloadJSON: try payload([
+                    "turnId": "stale-turn",
+                    "item": ["id": itemID, "type": "commandExecution", "command": command]
+                ]),
+                receivedAtMs: 1
+            )
+        )
+        try runRepo.appendProviderEventLog(
+            threadId: staleThread.id,
+            runId: staleRun.id,
+            event: ProviderRuntimeEvent(
+                id: "stale-provider-completed",
+                provider: .codex,
+                source: "codex.app-server",
+                method: "item/completed",
+                providerTurnId: "stale-turn",
+                providerItemId: itemID,
+                payloadJSON: try payload([
+                    "turnId": "stale-turn",
+                    "item": [
+                        "id": itemID,
+                        "type": "commandExecution",
+                        "status": "completed",
+                        "command": command,
+                        "aggregatedOutput": "stale-output"
+                    ]
+                ]),
+                receivedAtMs: 2
+            )
+        )
+
+        let gate = DurableCommandReplayPause()
+        let staleThreadID = staleThread.id
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(provider: .codex)]
+        )
+        coordinator.durableCommandReplayWillLoadForTesting = { threadID in
+            if threadID == staleThreadID { await gate.reachAndWaitForRelease() }
+        }
+        let reopened = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            promptHistoryStore: PromptHistoryStore(db: db),
+            initialThreadId: staleThread.id
+        )
+        await gate.waitUntilReached()
+        reopened.selectThread(selectedThread.id)
+        await gate.release()
+        await waitAsync("stale durable command recovery finishes") {
+            reopened.durableCommandReplayCompletionCountForTesting == 1
+        }
+
+        XCTAssertEqual(reopened.selectedThreadId, selectedThread.id)
+        XCTAssertFalse(reopened.timeline.turns.flatMap(\.items).contains { $0.id == itemID },
+                       "completion from the prior open generation must be discarded")
+        XCTAssertFalse(reopened.timeline.turns.flatMap(\.items).contains { $0.body == command })
+    }
+
     func test_persistThreadConfig_writesProviderModelPermissionAndReasoningToThread() throws {
         let (vm, repo) = try makeVM()
         vm.createThread(title: "t")
@@ -3248,14 +3786,39 @@ final class AgentAppViewModelTests: XCTestCase {
         let visible = AgentAppView.visibleLiveTurnItems([item], running: true)
 
         XCTAssertEqual(visible.count, 1)
-        XCTAssertLessThan(visible[0].body.count, hugeBody.count,
-                          "live rendering must not carry full command bodies through SwiftUI layout")
+        XCTAssertEqual(visible[0].body, hugeBody,
+                       "the raw command input must remain available for expanded display and copy while output streams")
         XCTAssertLessThan(visible[0].output?.count ?? 0, hugeOutput.count,
                           "live rendering must not carry full command outputs through SwiftUI layout")
         XCTAssertLessThan(visible[0].summary?.count ?? 0, hugeSummary.count,
                           "live rendering must not carry full summaries through SwiftUI layout")
         XCTAssertEqual(AgentAppView.visibleLiveTurnItems([item], running: false)[0].output, hugeOutput,
                        "stored/completed data remains full; only active live UI copies are capped")
+    }
+
+    func test_liveRenderableCopyCapsLargeGenericToolBodyInsteadOfTreatingItAsShell() {
+        let head = String(repeating: "A", count: 80)
+        let tail = "LATEST-MCP-PROGRESS"
+        let body = head + String(repeating: "p", count: AgentAppView.liveTurnBodyCharacterLimit) + tail
+        let item = AssistantItem(
+            id: "generic-tool",
+            turnId: "turn-1",
+            type: .tool,
+            state: .streaming,
+            summary: "MCP progress",
+            body: body,
+            startedAtMs: 1
+        )
+
+        let visible = AgentAppView.liveRenderableCopy(item)
+
+        XCTAssertNil(AgentTimelineItemPresentation.rawShellCommand(for: item),
+                     "plain generic tool output is not proof of a shell command")
+        XCTAssertLessThan(visible.body.count, body.count,
+                          "large generic tool streams must stay bounded on the transcript hot path")
+        XCTAssertTrue(visible.body.contains(tail),
+                      "the generic streaming cap must retain the newest progress")
+        XCTAssertFalse(visible.body.hasPrefix(head))
     }
 
     /// Streaming Thought must show the *latest* tokens (terminal UX), not a frozen
@@ -3282,7 +3845,7 @@ final class AgentAppViewModelTests: XCTestCase {
                        "completed head-cap must not keep the tail window used only while streaming")
     }
 
-    func test_streamingToolBodyAndOutputLiveCapKeepsTailNotHead() {
+    func test_streamingNonCommandBodyAndOutputLiveCapKeepsTailNotHead() {
         // WHY: head-capping tool body/output froze mid-run Work so far streams.
         let head = String(repeating: "A", count: 80)
         let bodyTail = "LATEST-BODY-TOKEN"
@@ -3290,7 +3853,7 @@ final class AgentAppViewModelTests: XCTestCase {
         let bodyPad = String(repeating: "b", count: AgentAppView.liveTurnBodyCharacterLimit)
         let outPad = String(repeating: "o", count: AgentAppView.liveTurnOutputCharacterLimit)
         let item = AssistantItem(
-            id: "cmd", turnId: "t1", type: .commandExecution, state: .streaming,
+            id: "progress", turnId: "t1", type: .reasoning, state: .streaming,
             body: head + bodyPad + bodyTail,
             output: head + outPad + outTail,
             startedAtMs: 1
@@ -8223,6 +8786,34 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(fusedBig.blanked, refBig.blanked)
         XCTAssertEqual(fusedBig.rows.map(\.content), refBig.rows.map(\.content),
                        "single-pass cap+budget must equal map(cap)+applyBodyBudget over budget (oldest blanked)")
+    }
+}
+
+private actor DurableCommandReplayPause {
+    private var reached = false
+    private var reachedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var released = false
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func reachAndWaitForRelease() async {
+        reached = true
+        let waiters = reachedWaiters
+        reachedWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        guard !released else { return }
+        await withCheckedContinuation { releaseWaiters.append($0) }
+    }
+
+    func waitUntilReached() async {
+        guard !reached else { return }
+        await withCheckedContinuation { reachedWaiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
     }
 }
 

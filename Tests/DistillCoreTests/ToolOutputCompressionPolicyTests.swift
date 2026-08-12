@@ -37,6 +37,18 @@ final class ToolOutputCompressionPolicyTests: XCTestCase {
         XCTAssertFalse(rg.shouldCompress)
         XCTAssertEqual(rg.skipReason, .exactOutputShell)
 
+        let mixed = policy.decision(
+            toolName: "Bash",
+            output: large,
+            toolArgumentsSummary: "command=command -v swift\nswift noisy.swift"
+        )
+        XCTAssertFalse(mixed.shouldCompress)
+        XCTAssertEqual(
+            mixed.skipReason,
+            .exactOutputShell,
+            "the aggregate hook must stay raw; the compound PATH wrapper owns segment-level distill"
+        )
+
         let gitGrep = policy.decision(
             toolName: "Bash",
             output: large,

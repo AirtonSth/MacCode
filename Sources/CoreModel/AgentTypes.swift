@@ -531,6 +531,32 @@ public final class AgentRunAcceptancePermit: @unchecked Sendable {
     }
 }
 
+/// A host-authored instruction channel that must not be confused with the
+/// user's provider prompt. The coordinator mints this value only from trusted
+/// routing/session state; provider adapters place it on their instruction
+/// surface (or a typed SR2 host block for ACP).
+public struct AgentTrustedHostInstruction: Codable, Sendable, Equatable {
+    public static let schemaVersion = 1
+
+    public let schema: Int
+    public let text: String
+
+    public init(text: String, schema: Int = AgentTrustedHostInstruction.schemaVersion) {
+        self.schema = schema
+        self.text = text
+    }
+
+    public var isEmpty: Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    public func appending(_ other: AgentTrustedHostInstruction?) -> AgentTrustedHostInstruction {
+        guard let other, !other.isEmpty else { return self }
+        guard !isEmpty else { return other }
+        return AgentTrustedHostInstruction(text: text + "\n\n" + other.text)
+    }
+}
+
 public struct AgentRunRequest: Codable, Sendable, Equatable {
     public let runId: AgentRunID
     public let threadId: AgentThreadID
@@ -539,6 +565,9 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     public let model: String
     public let cwd: String
     public let prompt: String
+    /// Provider-facing user leg. Host orchestration/session-learn instructions
+    /// never belong here; they travel in `trustedHostInstruction`.
+    public let trustedHostInstruction: AgentTrustedHostInstruction?
     public let userMessageContent: String?
     public let attachments: [AgentAttachment]
     public let providerThreadId: String?
@@ -562,6 +591,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         model: String,
         cwd: String,
         prompt: String,
+        trustedHostInstruction: AgentTrustedHostInstruction? = nil,
         userMessageContent: String? = nil,
         attachments: [AgentAttachment] = [],
         providerThreadId: String? = nil,
@@ -582,6 +612,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         self.model = model
         self.cwd = cwd
         self.prompt = prompt
+        self.trustedHostInstruction = trustedHostInstruction
         self.userMessageContent = userMessageContent
         self.attachments = attachments
         self.providerThreadId = providerThreadId
@@ -597,7 +628,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case runId, threadId, provider, providerInstanceId, model, cwd, prompt, userMessageContent, attachments, providerThreadId, permissionMode, reasoningEffort, serviceTier, interactionMode, providerBinary, environment, extraArgs, runAsUser
+        case runId, threadId, provider, providerInstanceId, model, cwd, prompt, trustedHostInstruction, userMessageContent, attachments, providerThreadId, permissionMode, reasoningEffort, serviceTier, interactionMode, providerBinary, environment, extraArgs, runAsUser
     }
 
     public init(from decoder: Decoder) throws {
@@ -609,6 +640,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         model = try c.decode(String.self, forKey: .model)
         cwd = try c.decode(String.self, forKey: .cwd)
         prompt = try c.decode(String.self, forKey: .prompt)
+        trustedHostInstruction = try c.decodeIfPresent(AgentTrustedHostInstruction.self, forKey: .trustedHostInstruction)
         userMessageContent = try c.decodeIfPresent(String.self, forKey: .userMessageContent)
         attachments = try c.decodeIfPresent([AgentAttachment].self, forKey: .attachments) ?? []
         providerThreadId = try c.decodeIfPresent(String.self, forKey: .providerThreadId)
@@ -631,6 +663,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
             && lhs.model == rhs.model
             && lhs.cwd == rhs.cwd
             && lhs.prompt == rhs.prompt
+            && lhs.trustedHostInstruction == rhs.trustedHostInstruction
             && lhs.userMessageContent == rhs.userMessageContent
             && lhs.attachments == rhs.attachments
             && lhs.providerThreadId == rhs.providerThreadId

@@ -244,33 +244,11 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
         return Self.shellCommandLooksExactOutput(command)
     }
 
-    // PERF: shellCommandLooksExactOutput runs on every bash/shell compress
-    // decision and allocated CharacterSet(charactersIn: "|&;\n") per call.
-    private static let shellSegmentSeparators = CharacterSet(charactersIn: "|&;\n")
-
-    /// Segment-aware check shared with wrapper intent: pipes/and chains may mix tools.
+    /// Segment-aware check shared with wrapper intent: pipes/and chains may mix
+    /// tools. Mixed output remains protected here because a PostToolUse hook
+    /// receives only the aggregate bytes; the PATH wrapper owns the finer
+    /// per-child interception when it can preserve exact segments.
     public static func shellCommandLooksExactOutput(_ command: String) -> Bool {
-        let segments = command
-            .components(separatedBy: shellSegmentSeparators)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        for segment in segments {
-            let tokens = segment
-                .split(whereSeparator: { $0.isWhitespace })
-                .map(String.init)
-                .filter { !$0.isEmpty }
-            guard let primaryRaw = tokens.first else { continue }
-            let primary = (primaryRaw as NSString).lastPathComponent.lowercased()
-            if WrappedCommandCatalog.isExactOutputCommand(primary) {
-                return true
-            }
-            if primary == "git" {
-                let args = Array(tokens.dropFirst())
-                if CommandWrapPolicy.isExactGitSubcommand(args) {
-                    return true
-                }
-            }
-        }
-        return false
+        CommandWrapPolicy.shellOutputClassification(command) != .ordinaryOnly
     }
 }

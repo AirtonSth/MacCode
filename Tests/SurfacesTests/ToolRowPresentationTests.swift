@@ -27,6 +27,48 @@ final class ToolRowPresentationTests: XCTestCase {
         XCTAssertEqual(AgentTimelineItemPresentation.toolCommandPreview(for: toolItem(body: "raw command text")), "raw command text")
     }
 
+    func test_fullCommandPreservesUncappedCommandExecutionSummary() {
+        let command = "/bin/zsh -lc \"" + String(repeating: "E2E_FLAG=value ", count: 200) + "npx jest --runInBand\""
+        let item = toolItem(body: "", summary: command, type: .commandExecution)
+
+        XCTAssertEqual(AgentTimelineItemPresentation.fullToolCommand(for: item), command)
+        XCTAssertLessThan(
+            AgentTimelineItemPresentation.toolCommandPreview(for: item)?.count ?? 0,
+            command.count,
+            "collapsed preview remains bounded while expanded/copy keeps every command byte"
+        )
+        XCTAssertEqual(AgentTimelineItemPresentation.toolDisplayLabel(for: item), "Shell")
+    }
+
+    func test_fullCommandPreservesUncappedNonJSONBodyAcrossStreamingOutputDeltas() {
+        let command = "/bin/zsh -lc \"" + String(repeating: "BUILD_FLAG=value ", count: 200) + "swift test\""
+        let firstDelta = AssistantItem(
+            id: "streaming-command",
+            turnId: "turn",
+            type: .commandExecution,
+            state: .streaming,
+            summary: "Bash",
+            body: command,
+            output: "first output delta",
+            startedAtMs: 1
+        )
+        var laterDelta = firstDelta
+        laterDelta.output = "first output delta\nsecond output delta"
+
+        let firstVisible = AgentAppView.liveRenderableCopy(firstDelta)
+        let laterVisible = AgentAppView.liveRenderableCopy(laterDelta)
+
+        XCTAssertEqual(AgentTimelineItemPresentation.fullToolCommand(for: firstVisible), command)
+        XCTAssertEqual(AgentTimelineItemPresentation.fullToolCommand(for: laterVisible), command)
+        XCTAssertEqual(firstVisible.body, command)
+        XCTAssertEqual(laterVisible.body, command)
+        XCTAssertLessThan(
+            AgentTimelineItemPresentation.toolCommandPreview(for: laterVisible)?.count ?? 0,
+            command.count,
+            "only the collapsed preview may be capped; expanded display and copy must remain exact"
+        )
+    }
+
     func test_nonToolItemReturnsNilCommand() {
         XCTAssertNil(AgentTimelineItemPresentation.toolCommandPreview(for: toolItem(body: #"{"command":"x"}"#, type: .assistantMessage)))
     }

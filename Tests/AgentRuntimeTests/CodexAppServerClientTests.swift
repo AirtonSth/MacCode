@@ -894,12 +894,19 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             hintInstructions.contains("| distill"),
             "Token Saver on: Codex developer_instructions must instruct `| distill`"
         )
-        // Parity with Claude's per-session systemPrompt: full distill LANGUAGE spec per turn.
-        // "Registers:" is the register/prefix legend from the full distill body; a bare
-        // "| distill" pipe rule never carries it, so this proves the full spec is injected.
+        // Parity with Claude's per-session systemPrompt: the current SR2 v1 language,
+        // exact-output exception, and grouped-command boundary all travel together.
+        // A bare "| distill" pipe rule would not carry these semantics.
         XCTAssertTrue(
-            hintInstructions.contains("R0 micro") && hintInstructions.contains("R1 work"),
+            hintInstructions.contains("Use canonical **@sr2 v1** Opaque Agent IR")
+                && hintInstructions.contains("MANDATORY default-pipe:")
+                && hintInstructions.contains("NEVER pipe `| distill` only for exact-output")
+                && hintInstructions.contains("`run:[a;b]>[c]`"),
             "Codex developer_instructions must carry the full distill language spec, not only the pipe rule"
+        )
+        XCTAssertFalse(
+            hintInstructions.contains("R0 micro") || hintInstructions.contains("R1 work"),
+            "Codex must not advertise the retired SR1 register dialect"
         )
         XCTAssertEqual(
             hintInstructions.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,

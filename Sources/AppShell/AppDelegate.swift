@@ -101,6 +101,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     public let channel: ReleaseChannel
     private let appSupportOverride: String?
     private let dbOverride: String?
+    private let managedIntegrationHomeOverride: URL?
     private let physicalMemoryBytesProvider: @Sendable () -> UInt64
     private var providerSessionReaperTimer: Timer?
     private var ccrRetentionTimer: Timer?
@@ -140,6 +141,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         channel: ReleaseChannel = .debug,
         appSupportOverride: String? = nil,
         dbOverride: String? = nil,
+        managedIntegrationHomeOverride: URL? = nil,
         physicalMemoryBytesProvider: @escaping @Sendable () -> UInt64 = {
             ProcessInfo.processInfo.physicalMemory
         }
@@ -147,8 +149,94 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         self.channel = channel
         self.appSupportOverride = appSupportOverride
         self.dbOverride = dbOverride
+        self.managedIntegrationHomeOverride = managedIntegrationHomeOverride
         self.physicalMemoryBytesProvider = physicalMemoryBytesProvider
         super.init()
+    }
+
+    /// Resolves the process-host-only managed integration root. Canary launches
+    /// always derive a private home from their canonical app-support directory,
+    /// including Finder relaunches where shell-only overrides are unavailable.
+    /// An explicit override is only honored for canary/test launches and only
+    /// when its symlink-resolved path remains a strict app-support descendant.
+    nonisolated static func managedIntegrationHome(
+        channel: ReleaseChannel,
+        appSupportDirectory: URL,
+        environment: [String: String],
+        isTestContext: Bool
+    ) -> URL? {
+        guard channel == .canary || isTestContext,
+              let canonicalAppSupport = canonicalDirectoryURL(appSupportDirectory) else {
+            return nil
+        }
+
+        let desiredDerived = canonicalAppSupport
+            .appendingPathComponent("ManagedIntegrationHome", isDirectory: true)
+        // If a preexisting entry at the conventional child is itself a symlink
+        // escape, use the canonical app-support root as the synthetic home. That
+        // keeps AppContext's `.remote-code`/`.local` children contained instead
+        // of falling back to the user's real home.
+        let derived: URL
+        if let canonicalDerived = canonicalDirectoryURL(desiredDerived),
+           isStrictDescendant(canonicalDerived, of: canonicalAppSupport) {
+            derived = canonicalDerived
+        } else {
+            derived = canonicalAppSupport
+        }
+        guard let raw = environment["RC2_MANAGED_INTEGRATION_HOME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              (raw as NSString).isAbsolutePath,
+              let candidate = canonicalDirectoryURL(
+                URL(fileURLWithPath: raw, isDirectory: true)
+              ),
+              isStrictDescendant(candidate, of: canonicalAppSupport) else {
+            return derived
+        }
+        return candidate
+    }
+
+    /// Walk back to the deepest existing node, resolve it with `realpath(3)`,
+    /// then append only components proven not to exist yet. This covers `/tmp`
+    /// aliases and intermediate symlinks even when the requested leaf is absent.
+    private nonisolated static func canonicalDirectoryURL(_ url: URL) -> URL? {
+        guard url.isFileURL else { return nil }
+        var existingAncestor = url.standardizedFileURL
+        var missingComponents: [String] = []
+
+        while true {
+            var entryInfo = stat()
+            if lstat(existingAncestor.path, &entryInfo) == 0 {
+                break
+            }
+            guard errno == ENOENT else { return nil }
+            let parent = existingAncestor.deletingLastPathComponent()
+            guard parent.path != existingAncestor.path else { return nil }
+            missingComponents.append(existingAncestor.lastPathComponent)
+            existingAncestor = parent
+        }
+
+        guard let resolved = realpath(existingAncestor.path, nil) else { return nil }
+        defer { free(resolved) }
+        let resolvedPath = String(cString: resolved)
+        var resolvedInfo = stat()
+        guard stat(resolvedPath, &resolvedInfo) == 0,
+              (resolvedInfo.st_mode & S_IFMT) == S_IFDIR else {
+            return nil
+        }
+
+        var canonical = URL(fileURLWithPath: resolvedPath, isDirectory: true).standardizedFileURL
+        for component in missingComponents.reversed() {
+            canonical.appendPathComponent(component, isDirectory: true)
+        }
+        return canonical.standardizedFileURL
+    }
+
+    private nonisolated static func isStrictDescendant(_ candidate: URL, of parent: URL) -> Bool {
+        let parentPath = parent.standardizedFileURL.path
+        let candidatePath = candidate.standardizedFileURL.path
+        return candidatePath != parentPath
+            && candidatePath.hasPrefix(parentPath.hasSuffix("/") ? parentPath : parentPath + "/")
     }
 
     var managedProcessMemoryProfile: ManagedProcessMemoryProfile {
@@ -166,7 +254,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                 .appendingPathComponent("provider-process-ownership.json", isDirectory: false)
         )
         do {
-            context = try AppContext(channel: channel, dbPathOverride: dbOverride, appSupportOverride: appSupportOverride)
+            context = try AppContext(
+                channel: channel,
+                dbPathOverride: dbOverride,
+                appSupportOverride: appSupportOverride,
+                agentSkillsHomeOverrideForTesting: managedIntegrationHomeOverride
+            )
         } catch {
             // UX-MAC_PERSISTENCE-P1: plain-language copy + recovery guidance.
             // The most common causes are a permissions error on first launch
@@ -536,9 +629,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         removeScheduledTaskStoreObserver()
         disableInsomniaForAppClose()
         // Always stop the Distill MLX server on quit — multi-GB model must not linger.
-        // On terminate, reconcile Distill with the Token Saver toggle (install only when
-        // enabled; otherwise scrub legacy homes + uninstall CLI/wrappers). The MLX
-        // sidecar is stopped separately.
+        // On terminate, reconcile Distill with the Token Saver toggle. OFF runs
+        // revoke runtime admission but preserve shared per-user entrypoints; the
+        // MLX sidecar is stopped separately.
         stopTokenSaverDistillServiceForAppTermination()
         let tokenSaverEnabled = context.map { SettingsStore(db: $0.db).load().tokenSaverEnabled } ?? false
         if ProcessInfo.processInfo.environment["RC2_DISABLE_MANAGED_DISTILL_RECONCILE"] == "1" {

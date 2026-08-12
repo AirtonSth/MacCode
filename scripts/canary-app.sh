@@ -33,6 +33,7 @@ APP_PATH="$CANARY_ROOT/app/$CANARY_NAME.app"
 EXECUTABLE="$APP_PATH/Contents/MacOS/$CANARY_NAME"
 APP_SUPPORT="$CANARY_ROOT/state/Application Support/$CANARY_NAME"
 DB_PATH="$APP_SUPPORT/RemoteCode.sqlite"
+MANAGED_INTEGRATION_HOME="$APP_SUPPORT/ManagedIntegrationHome"
 RUN_DIR="$CANARY_ROOT/run"
 PID_FILE="$RUN_DIR/$CANARY_NAME.pid"
 LOG_FILE="$RUN_DIR/$CANARY_NAME.log"
@@ -155,6 +156,7 @@ run_canary() {
   RC2_CHANNEL=canary \
     RC2_APP_SUPPORT="$APP_SUPPORT" \
     RC2_DB_PATH="$DB_PATH" \
+    RC2_MANAGED_INTEGRATION_HOME="$MANAGED_INTEGRATION_HOME" \
     nohup "$EXECUTABLE" >> "$LOG_FILE" 2>&1 < /dev/null &
   pid=$!
   printf '%s\n' "$pid" > "$PID_FILE.tmp"
