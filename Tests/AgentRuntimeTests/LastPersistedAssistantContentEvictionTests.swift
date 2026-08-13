@@ -1,13 +1,12 @@
 import XCTest
 @testable import AgentRuntime
 
-// PERF-MAC_AGENT-008: verifies the eviction policy for the
-// lastPersistedAssistantContent dedup cache. WHY: without eviction, every thread
-// that ever ran in a session retains its full final-answer string indefinitely.
-// Multi-thread sessions can accumulate MBs of dead final-answer text that is
-// never freed until the process exits. These tests pin the pure eviction decision
-// (shouldEvictLastPersistedContent) that guards all three eviction sites:
-// thread-close (finished/cancelled) and oversized-entry (store path).
+// PERF-MAC_AGENT-008 / R7: verifies eviction + fingerprint policy for the
+// lastPersistedAssistantContent dedup cache. WHY: without thread-close eviction,
+// every thread that ever ran retains a map entry indefinitely. R7 stores a
+// fixed-size AssistantContentFingerprint (utf8 count + digest) instead of the
+// full final-answer String, so per-entry memory is bounded without size-cap
+// refusal of large responses.
 final class LastPersistedAssistantContentEvictionTests: XCTestCase {
 
     // A closed thread must always be evicted regardless of entry size. WHY: the
@@ -33,73 +32,67 @@ final class LastPersistedAssistantContentEvictionTests: XCTestCase {
         XCTAssertTrue(evict, "thread-close eviction must not be gated on entry size")
     }
 
-    // An active thread with a small entry must NOT be evicted. WHY: this is the
-    // hot path (normal dedup of turnCompleted+finished on the same turn). Evicting
-    // here would defeat the dedup and re-introduce the full-history scan on every
-    // duplicate event.
+    // An active thread keeps its fingerprint entry even for large source text.
+    // WHY: fingerprints are fixed-size; refusing large finals would re-introduce
+    // full-history scans on the common turnCompleted+finished duplicate path.
     func test_activeThread_smallEntry_keeps() {
         let evict = AgentRunCoordinator.shouldEvictLastPersistedContent(
             threadClosed: false,
             entryByteCount: 100,
             sizeCapBytes: 32_768
         )
-        XCTAssertFalse(evict, "an active thread with a small entry must keep the cache so dedup works without a full-history scan")
+        XCTAssertFalse(evict, "an active thread must keep the fingerprint so dedup works without a full-history scan")
     }
 
-    // An active thread with an entry exactly at the cap must NOT be evicted. WHY:
-    // the boundary is inclusive on the keep side; an off-by-one here would drop
-    // cache entries for legitimate same-size responses.
-    func test_activeThread_entryExactlyAtCap_keeps() {
+    func test_activeThread_entryExactlyAtHistoricalCap_keeps() {
         let cap = 32_768
         let evict = AgentRunCoordinator.shouldEvictLastPersistedContent(
             threadClosed: false,
             entryByteCount: cap,
             sizeCapBytes: cap
         )
-        XCTAssertFalse(evict, "an entry at exactly the cap must be kept; evicting at-cap would break dedup for normal-length responses")
+        XCTAssertFalse(evict, "fingerprint cache keeps entries at the historical String cap")
     }
 
-    // An active thread with an oversized entry must be evicted. WHY: caching very
-    // long responses (e.g. 200 KB final answer) wastes memory. Skipping the cache
-    // forces a full-history scan on the next duplicate event, which is correct and
-    // acceptable because large responses are rare.
-    func test_activeThread_oversizedEntry_evicts() {
+    // R7: oversized source text still keeps the fingerprint. WHY: fixed-size
+    // fingerprints remove the need to refuse large finals for memory bounding.
+    func test_activeThread_oversizedSourceText_keepsFingerprint() {
         let cap = 32_768
         let evict = AgentRunCoordinator.shouldEvictLastPersistedContent(
             threadClosed: false,
             entryByteCount: cap + 1,
             sizeCapBytes: cap
         )
-        XCTAssertTrue(evict, "an entry exceeding the cap must be evicted to bound per-entry memory for very long responses")
+        XCTAssertFalse(evict, "large finals still fingerprint-cache; size alone must not evict")
     }
 
-    // Two different entries one byte apart straddle the cap boundary correctly.
-    // WHY: off-by-one errors at the cap are a common source of silent regressions
-    // where the cache is either always bypassed (too eager) or retains oversized
-    // entries (too lenient).
-    func test_capBoundary_keepsBelowEvictsAbove() {
-        let cap = 1_024
-        let keepDecision = AgentRunCoordinator.shouldEvictLastPersistedContent(
-            threadClosed: false,
-            entryByteCount: cap,
-            sizeCapBytes: cap
-        )
-        let evictDecision = AgentRunCoordinator.shouldEvictLastPersistedContent(
-            threadClosed: false,
-            entryByteCount: cap + 1,
-            sizeCapBytes: cap
-        )
-        XCTAssertFalse(keepDecision, "entry at cap must be kept (boundary is inclusive)")
-        XCTAssertTrue(evictDecision,  "entry one byte over cap must be evicted")
+    func test_fingerprint_sameContent_equal() {
+        let a = AssistantContentFingerprint.of("hello final answer")
+        let b = AssistantContentFingerprint.of("hello final answer")
+        XCTAssertEqual(a, b, "identical UTF-8 content must fingerprint equal for dedup")
+        XCTAssertEqual(a.utf8Count, "hello final answer".utf8.count)
     }
 
-    // The built-in cap constant is within a reasonable range so accidental
-    // changes (e.g. a zero or a negative value from a typo) are caught. WHY: a
-    // zero cap would evict every entry and break dedup; a multi-MB cap would
-    // defeat the whole point of the guard.
+    func test_fingerprint_differentContent_notEqual() {
+        let a = AssistantContentFingerprint.of("answer A")
+        let b = AssistantContentFingerprint.of("answer B")
+        XCTAssertNotEqual(a, b, "distinct finals must not share a fingerprint")
+    }
+
+    func test_fingerprint_storedSize_isFixedAndTiny() {
+        // Historical per-entry ceiling retained full UTF-8 up to 32 KiB.
+        let priorStringCap = AgentRunCoordinator.lastPersistedAssistantContentSizeCap
+        let fingerprintBytes = AssistantContentFingerprint.storedByteSize
+        XCTAssertEqual(fingerprintBytes, 16, "two 64-bit words on this platform")
+        let reduction = Double(priorStringCap - fingerprintBytes) / Double(priorStringCap)
+        XCTAssertGreaterThan(reduction, 0.99, "fingerprint must cut per-entry retained bytes by >99% vs 32 KiB String")
+    }
+
+    // The built-in historical cap constant stays in a reasonable range so
+    // evidence/docs that cite 32 KiB remain meaningful.
     func test_builtInSizeCap_isReasonable() {
         let cap = AgentRunCoordinator.lastPersistedAssistantContentSizeCap
-        XCTAssertGreaterThan(cap, 4_096,    "cap too small: would evict normal-length responses and break dedup")
-        XCTAssertLessThan(cap, 1_048_576,   "cap too large: would retain MBs of final-answer text per thread")
+        XCTAssertGreaterThan(cap, 4_096, "historical cap too small to be a meaningful baseline")
+        XCTAssertLessThan(cap, 1_048_576, "historical cap too large for evidence baselines")
     }
 }

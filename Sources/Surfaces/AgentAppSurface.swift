@@ -7221,9 +7221,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         coordinator.stopRun(threadId: id)
     }
 
-    // PERF-MAC_AGENT-006: last assistant text this VM persisted per thread, to
-    // skip the O(history) reload when re-deduping the same completed answer.
-    private var lastPersistedAssistantContentByThread: [AgentThreadID: String] = [:]
+    // PERF-MAC_AGENT-006 / R7: fingerprint of last assistant text this VM
+    // persisted per thread, to skip the O(history) reload when re-deduping the
+    // same completed answer without retaining the full String.
+    private var lastPersistedAssistantContentByThread: [AgentThreadID: AssistantContentFingerprint] = [:]
 
     // PERF-MAC_AGENT-012: ID of the last final message this surface appended per
     // thread. Non-nil = this session already wrote a final to DB; a subsequent
@@ -7241,8 +7242,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // without main-actor hops.
     nonisolated static func shouldReloadForFinal(
         lastPersistedId: AgentMessageID?,
-        lastPersistedKey: String?,
-        incomingKey: String
+        lastPersistedKey: AssistantContentFingerprint?,
+        incomingKey: AssistantContentFingerprint
     ) -> Bool {
         // Content equality is checked by the caller before reaching this point;
         // if we are here incomingKey != lastPersistedKey (new text).
@@ -7251,13 +7252,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // content was different from incomingKey. A new final can be safely
         // appended. Reload only when id is nil (no session history — must check
         // DB for a pre-existing row written by a prior session/path).
+        _ = lastPersistedKey
+        _ = incomingKey
         return lastPersistedId == nil
     }
 
     private func persistFinalAssistantIfMissing(_ text: String, threadId: AgentThreadID) {
         let text = AssistantTimelineState.cappedText(text)
+        let fingerprint = AssistantContentFingerprint.of(text)
         // Fast path: same text already persisted this session — nothing to do.
-        if lastPersistedAssistantContentByThread[threadId] == text { return }
+        if lastPersistedAssistantContentByThread[threadId] == fingerprint { return }
         // PERF-MAC_AGENT-012: if we have a session ID for this thread the DB
         // state is known — skip O(history) list and append directly.
         // Reload only on first completion in a session (id == nil) to guard
@@ -7265,7 +7269,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if Self.shouldReloadForFinal(
             lastPersistedId: lastPersistedFinalIdByThread[threadId],
             lastPersistedKey: lastPersistedAssistantContentByThread[threadId],
-            incomingKey: text
+            incomingKey: fingerprint
         ) {
             // Only scan the retained window for duplicate finals.
             let existing = (try? messageRepo.listRecent(
@@ -7273,13 +7277,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 limit: AgentMessageRepository.maxMessagesPerThread
             )) ?? []
             guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else {
-                lastPersistedAssistantContentByThread[threadId] = text
+                lastPersistedAssistantContentByThread[threadId] = fingerprint
                 return
             }
         }
         let msg = AgentMessage(threadId: threadId, role: .assistant, content: text)
         try? messageRepo.append(msg)
-        lastPersistedAssistantContentByThread[threadId] = text
+        lastPersistedAssistantContentByThread[threadId] = fingerprint
         lastPersistedFinalIdByThread[threadId] = msg.id
     }
 
