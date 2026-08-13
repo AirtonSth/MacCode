@@ -211,22 +211,24 @@ public final class ScheduledTaskStore: @unchecked Sendable {
     public func claimDue(
         now: Date,
         owner: String,
-        limit: Int = 2,
+        limit: Int? = nil,
         leaseDuration: TimeInterval = 6 * 60 * 60
     ) throws -> [ScheduledTaskClaim] {
         try db.transaction {
-            // `limit` is per-poll batch size only — no global active-run ceiling.
-            let available = max(0, limit)
-            guard available > 0 else { return [] }
+            // No global active-run ceiling. `limit` is an optional test/batch
+            // slice only — production claims every due task.
+            if let limit, limit <= 0 { return [] }
             let query = try db.prepare(Self.taskSelect + """
                  WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?
                   AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
-                ORDER BY next_run_at ASC LIMIT ?;
+                ORDER BY next_run_at ASC\(limit == nil ? "" : " LIMIT ?");
                 """)
             defer { query.reset() }
             try query.bind(1, string(now))
             try query.bind(2, string(now))
-            try query.bind(3, available)
+            if let limit {
+                try query.bind(3, max(0, limit))
+            }
             var due: [ScheduledTask] = []
             while try query.step() { due.append(try decodeTask(query)) }
 

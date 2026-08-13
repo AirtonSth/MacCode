@@ -664,7 +664,11 @@ public final class ScheduledTaskScheduler {
                     return
                 }
                 let claims = try store.claimDue(now: now, owner: owner)
-                for claim in claims { await execute(claim) }
+                await withTaskGroup(of: Void.self) { group in
+                    for claim in claims {
+                        group.addTask { await self.execute(claim) }
+                    }
+                }
             } catch {
                 scheduledTaskLog.error("scheduler.tick_failed error=\(error.localizedDescription, privacy: .public)")
             }

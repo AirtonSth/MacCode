@@ -44,6 +44,14 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
             source.contains("calculatedNextRun(after: claim.run.scheduledAt)"),
             "execute must not advance with the raw spent scheduledAt"
         )
+        XCTAssertTrue(
+            source.contains("withTaskGroup"),
+            "due claims must start together — sequential await was a hidden concurrency cap"
+        )
+        XCTAssertFalse(
+            source.contains("claimDue(now: now, owner: owner, limit:"),
+            "the scheduler must not pass a claimDue batch limit"
+        )
     }
 
     func test_eligibleUsersIncludesCurrentNonRootUser_becauseEditorMustOfferRunnableIdentity() throws {

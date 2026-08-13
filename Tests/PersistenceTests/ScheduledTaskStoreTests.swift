@@ -87,13 +87,13 @@ final class ScheduledTaskStoreTests: XCTestCase {
     }
 
     func test_globalConcurrencyAllowsMoreThanTwoClaims_becauseNoHardActiveCap() throws {
-        // WHY: a global active-run ceiling of 2 blocked Run Now / due claims when
-        // unrelated tasks were already running. Batch `limit` is not a global cap.
+        // WHY: a default claimDue batch of 2 left later due tasks waiting a
+        // full tick. Production must claim every due task in one poll.
         for offset in 0..<3 {
             try store.save(makeTask(id: UUID(), title: "Task \(offset)", nextRunAt: Date(timeIntervalSince1970: 100)))
         }
 
-        XCTAssertEqual(try store.claimDue(now: Date(timeIntervalSince1970: 101), owner: "agent", limit: 3).count, 3)
+        XCTAssertEqual(try store.claimDue(now: Date(timeIntervalSince1970: 101), owner: "agent").count, 3)
     }
 
     func test_manualRunAllowsThirdDistinctTaskWhileOthersActive_becauseGlobalCapWasRemoved() throws {
