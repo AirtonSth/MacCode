@@ -4322,21 +4322,11 @@ public final class AppContext {
             return fallback
         }
 
-        let input = """
-        TARGET_LANGUAGE: \(targetLanguage)
-        USER_FACING_RULES:
-        Expand any SR1 variables such as #g1 using their definitions from the wire before answering.
-        Expand @sr2 / SR2 Opaque Agent IR fields (o/g/d/p/e/h) into natural language for the user.
-        Never show unresolved # variables or raw @sr2 field dumps to the user.
-
-        SR1_RESPONSE:
-        \(wire)
-        """
         let request = DistillRequest(
             mode: .sr1Humanize,
             priority: .interactive,
-            input: input,
-            maxOutputCharacters: max(1_200, min(12_000, wire.count * 4))
+            input: DistillHumanizePrompt.wrap(wire),
+            maxOutputCharacters: max(8_000, min(24_000, wire.count * 16))
         )
         do {
             let translated = try await client.distill(request).output.trimmingCharacters(in: .whitespacesAndNewlines)

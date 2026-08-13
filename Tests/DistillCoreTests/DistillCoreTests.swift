@@ -807,11 +807,7 @@ final class DistillCoreTests: XCTestCase {
         """
         let response = try await scheduler.submit(DistillRequest(
             mode: .sr1Humanize,
-            input: """
-            TARGET_LANGUAGE: English
-            SR1_RESPONSE:
-            \(wire)
-            """,
+            input: DistillHumanizePrompt.wrap(wire),
             maxOutputCharacters: 4_000
         ))
         XCTAssertFalse(response.output.contains("@sr2"), response.output)
@@ -824,6 +820,44 @@ final class DistillCoreTests: XCTestCase {
             response.output.contains("si-ncs/admin-foundation-v3#14"),
             response.output
         )
+    }
+
+    func test_sr1HumanizeUsesBareEnglishTranslatePromptAndKeepsAWideTokenBudget() {
+        // WHY: SR2→human is the RemoteCode user transcript, not paid-provider
+        // Distill. The local model gets one instruction plus the wire. The
+        // 512-token compression cap stays on command-output / prompt compile.
+        let wire = "@sr2 v1\ng:trello-doing-delivery"
+        let humanize = DistillRequest(
+            mode: .sr1Humanize,
+            input: DistillHumanizePrompt.wrap(wire),
+            maxOutputCharacters: 8_000
+        )
+        let compress = DistillRequest(
+            mode: .commandOutput,
+            input: "build passed\n0 failures",
+            maxOutputCharacters: 8_000
+        )
+        XCTAssertEqual(
+            DistillHumanizePrompt.wrap(wire),
+            """
+            Translate to human natural language (english):
+
+            \(wire)
+            """
+        )
+        XCTAssertGreaterThan(MLXDistillRuntime.maxTokens(for: humanize), 512)
+        XCTAssertLessThanOrEqual(MLXDistillRuntime.maxTokens(for: compress), 512)
+
+        let system = MLXDistillRuntime.systemInstructions(for: .sr1Humanize)
+        XCTAssertEqual(system, "Translate into natural language. Output only the translation.")
+
+        let prompt = MLXDistillRuntime.prompt(for: humanize)
+        XCTAssertTrue(prompt.contains(DistillHumanizePrompt.englishLead), prompt)
+        XCTAssertTrue(prompt.contains(wire), prompt)
+        XCTAssertFalse(prompt.contains("TARGET_LANGUAGE"), prompt)
+        XCTAssertFalse(prompt.contains("USER_FACING_RULES"), prompt)
+        XCTAssertFalse(prompt.contains("SR1_RESPONSE"), prompt)
+        XCTAssertFalse(prompt.localizedCaseInsensitiveContains("output at most"), prompt)
     }
 
     func test_mlxSR1HumanizeRejectsExactR9PartialSR2Rendering() {

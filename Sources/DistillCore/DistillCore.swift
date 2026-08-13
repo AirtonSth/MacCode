@@ -17,6 +17,16 @@ public enum DistillMode: String, Codable, Sendable, Equatable {
     case sr1Humanize
 }
 
+/// UI translation is not provider Distill. The local model sees this lead and the
+/// wire — nothing else. Paid Claude/Codex/Grok compression stays in the other modes.
+public enum DistillHumanizePrompt: Sendable {
+    public static let englishLead = "Translate to human natural language (english):"
+
+    public static func wrap(_ source: String) -> String {
+        "\(englishLead)\n\n\(source)"
+    }
+}
+
 public enum DistillPriority: Int, Codable, Sendable, Comparable {
     case background = 0
     case agent = 1
@@ -588,11 +598,16 @@ public enum DistillSavingsCalculator {
     }
 
     private static func sr1ResponseSource(from input: String) -> String {
-        let marker = "SR1_RESPONSE:"
-        guard let range = input.range(of: marker) else {
-            return input.trimmingCharacters(in: .whitespacesAndNewlines)
+        var source = input
+        if let range = input.range(of: "SR1_RESPONSE:", options: [.caseInsensitive]) {
+            source = String(input[range.upperBound...])
+        } else if let range = input.range(
+            of: DistillHumanizePrompt.englishLead,
+            options: [.caseInsensitive]
+        ) {
+            source = String(input[range.upperBound...])
         }
-        return input[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+        return source.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -1452,6 +1467,11 @@ public struct LocalDistillRuntime: DistillRuntime {
         var source = input
         if let range = input.range(of: "SR1_RESPONSE:", options: [.caseInsensitive]) {
             source = String(input[range.upperBound...])
+        } else if let range = input.range(
+            of: DistillHumanizePrompt.englishLead,
+            options: [.caseInsensitive]
+        ) {
+            source = String(input[range.upperBound...])
         }
         source = source.trimmingCharacters(in: .whitespacesAndNewlines)
         if SR2WirePolicy.isSR2(source) || SR2WirePolicy.hasSR2Banner(source)
@@ -1847,17 +1867,7 @@ public struct MLXDistillRuntime: DistillRuntime {
     static func systemInstructions(for mode: DistillMode) -> String {
         switch mode {
         case .sr1Humanize:
-            return """
-            You translate compressed agent output into human language for a software engineer.
-            Input may be SR1 (Dict/Dict+ and prefixes S, C, D, R, O, N, P) or SR2 (@sr2 v1 field lines such as g/d/p/o/e/h, Action, Proof, and e:status keys).
-            Prefix meanings are usually S=state/status, C=cause/context, D=action/decision, R=risk/blocker, O=outcome/output, N=constraint/no-go, P=pass criteria/proof.
-            Expand aliases from Dict and Dict+ when present. Keep aliases unchanged when no definition is present.
-            Expand every SR2 field into ordinary sentences or a short status list. Never echo @sr2, e:, g:, o:, p:, or other wire syntax.
-            Preserve constraints, pass criteria, required output, blockers, uncertainty, file names, paths, commands, environment variables, IDs, security warnings, and production/data-loss warnings.
-            Do not invent missing facts. Do not claim execution happened unless the input says it happened.
-            Write concise natural language in the requested language or locale.
-            Return only the translation. No preamble. No markdown.
-            """
+            return "Translate into natural language. Output only the translation."
         case .commandOutput:
             return """
             You compress shell or command output for another model that will act on your answer.
@@ -1914,7 +1924,7 @@ public struct MLXDistillRuntime: DistillRuntime {
         }
     }
 
-    private static func prompt(for request: DistillRequest) -> String {
+    static func prompt(for request: DistillRequest) -> String {
         switch request.mode {
         case .commandOutput:
             let question = request.question?.nilIfEmpty ?? "Compress the command output. Return only the useful signal."
@@ -1949,14 +1959,6 @@ public struct MLXDistillRuntime: DistillRuntime {
         case .sr1Humanize:
             return """
             /no_think
-            Rewrite the SR1_RESPONSE into natural language for the user.
-            Use TARGET_LANGUAGE.
-            Output at most \(request.maxOutputCharacters) characters.
-            Output only the final user-facing answer.
-            Preserve exact commands, paths, IDs, errors, numbers, statuses, and proof.
-            Do not output markdown unless the answer needs a short list.
-            Do not output SR1 prefixes, @sr2 banners, raw e:/g:/o:/p: field dumps, prefix dictionaries, XML tags, or instructions.
-
             \(request.input)
 
             OUTPUT:
@@ -1964,8 +1966,14 @@ public struct MLXDistillRuntime: DistillRuntime {
         }
     }
 
-    private static func maxTokens(for request: DistillRequest) -> Int {
-        min(512, max(32, request.maxOutputCharacters / 4))
+    /// Provider-facing distill stays capped. UI humanize may be longer than the wire.
+    static func maxTokens(for request: DistillRequest) -> Int {
+        switch request.mode {
+        case .sr1Humanize:
+            return min(2_048, max(256, request.maxOutputCharacters / 3))
+        case .commandOutput, .longText, .watchSummary:
+            return min(512, max(32, request.maxOutputCharacters / 4))
+        }
     }
 
     static func fitInput(_ input: String, maxCharacters: Int = 24_000) -> String {
