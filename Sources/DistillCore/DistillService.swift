@@ -1559,6 +1559,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
             }
             var response = compressed
             if distillRequest.effectiveRunMode == .optimize,
+               distillRequest.mode != .sr1Humanize,
                compressed.output != distillRequest.input {
                 // Store-before-loss (T-003): a lossy optimize output may only be
                 // served when backed by a scope-bound recovery handle. Do NOT fall

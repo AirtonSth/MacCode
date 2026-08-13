@@ -1039,12 +1039,58 @@ final class DistillServiceTests: XCTestCase {
         )
     }
 
+    func test_sr1HumanizeDeliversTranslationWithoutRecoveryHandle() async throws {
+        // WHY: AppContext humanize posts .sr1Humanize without recovery headers.
+        // The store-before-loss gate then discarded the local-LLM prose
+        // (delivered=0, discarded-no-handle) and echoed the @sr2 wire. The wire
+        // is already persisted as the assistant message; UI translation must ship.
+        struct TranslateRuntime: DistillRuntime {
+            func distill(_ request: DistillRequest) async throws -> String {
+                "The goal is to deliver the Trello task currently in Doing."
+            }
+        }
+        let configuration = try DistillServiceConfiguration(
+            authToken: "humanize-deliver-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 1
+        )
+        let scheduler = DistillScheduler(runtime: TranslateRuntime(), maxConcurrentRequests: 1)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let wire = "@sr2 v1\ng:trello-doing-delivery\nAction: blocked-deploy-proof\no:cont"
+        let request = DistillRequest(
+            mode: .sr1Humanize,
+            priority: .interactive,
+            input: wire,
+            maxOutputCharacters: 1_200
+        )
+        let distill = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/distill",
+            method: "POST",
+            token: "humanize-deliver-token",
+            body: try JSONEncoder().encode(request),
+            includeRecoveryHeaders: false
+        )
+        XCTAssertEqual(distill.status, 200)
+        let decoded = try JSONDecoder().decode(DistillResponse.self, from: distill.data)
+        XCTAssertEqual(
+            decoded.output,
+            "The goal is to deliver the Trello task currently in Doing."
+        )
+        XCTAssertFalse(decoded.output.contains("@sr2"))
+        XCTAssertNotEqual(decoded.output, wire)
+    }
+
     private func response(
         baseURL: String,
         path: String,
         method: String = "GET",
         token: String? = nil,
-        body: Data? = nil
+        body: Data? = nil,
+        includeRecoveryHeaders: Bool = true
     ) async throws -> (status: Int, data: Data) {
         var request = URLRequest(url: URL(string: baseURL + path)!)
         request.httpMethod = method
@@ -1057,7 +1103,7 @@ final class DistillServiceTests: XCTestCase {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.setValue("\(body.count)", forHTTPHeaderField: "Content-Length")
         }
-        if method == "POST", path == "/v1/distill" || path == "/v1/compress" {
+        if includeRecoveryHeaders, method == "POST", path == "/v1/distill" || path == "/v1/compress" {
             let context = testRecoveryContext()
             request.setValue(context.workspaceID, forHTTPHeaderField: "X-RemoteCode-Workspace-ID")
             request.setValue(context.projectID, forHTTPHeaderField: "X-RemoteCode-Project-ID")
