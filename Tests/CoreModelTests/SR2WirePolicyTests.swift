@@ -175,6 +175,15 @@ final class SR2WirePolicyTests: XCTestCase {
         XCTAssertTrue(SR2WirePolicy.isCurrentSR2(wire), wire)
     }
 
+    func testAcceptsTrackerDeliveryV1Sample() {
+        let wire = SR2WirePolicy.trackerDeliveryV1Sample
+        XCTAssertTrue(SR2WirePolicy.isSR2(wire), wire)
+        XCTAssertTrue(SR2WirePolicy.isCurrentSR2(wire), wire)
+        XCTAssertTrue(SR2WirePolicy.alwaysOnInstructBlock.contains(wire), wire)
+        XCTAssertTrue(SR2WirePolicy.structuredFieldKeys.contains("goal"))
+        XCTAssertTrue(SR2WirePolicy.structuredFieldKeys.contains("trello-comment"))
+    }
+
     func testAcceptsCanonicalExactCommandV1Fields() {
         let wire = """
         @sr2 v1

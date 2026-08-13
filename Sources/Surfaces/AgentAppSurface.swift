@@ -864,6 +864,52 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return humanizedAssistantContent(content)
     }
 
+    /// Item ids whose thought the user asked to humanize and that have not
+    /// finished (or failed open) yet.
+    @Published public private(set) var onDemandItemTranslationInFlight: Set<String> = []
+
+    public func isOnDemandItemTranslationInFlight(_ itemId: String) -> Bool {
+        onDemandItemTranslationInFlight.contains(itemId)
+    }
+
+    /// Local-LLM humanize for a Thought row. Auto-humanize never runs on
+    /// reasoning; this is the only path that spends Distill on a thought.
+    public func requestOnDemandItemTranslation(itemId: String, wire: String) {
+        guard !itemId.isEmpty,
+              !wire.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard let threadId = selectedThreadId else { return }
+        guard !onDemandItemTranslationInFlight.contains(itemId) else { return }
+        if let existing = timeline.sr1TranslationsByItemId[itemId],
+           !existing.rewrittenText.isEmpty {
+            return
+        }
+        onDemandItemTranslationInFlight.insert(itemId)
+        assistantDisplayRevision &+= 1
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.onDemandItemTranslationInFlight.remove(itemId)
+                self.assistantDisplayRevision &+= 1
+            }
+            let translated = await self.coordinator.humanizeProviderTextOnDemand(
+                text: wire,
+                threadId: threadId,
+                provider: self.provider
+            )
+            let prose = translated.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !prose.isEmpty,
+                  prose != wire,
+                  !SR2WirePolicy.isSR2(prose),
+                  !SR1ResponseDetector.isSR1(prose) else { return }
+            self.timeline.apply(.sr1Translation(AssistantSR1Translation(
+                itemId: itemId,
+                originalText: wire,
+                rewrittenText: prose
+            )))
+            self.refreshSR1TranslationStateFromTimeline(preservingExisting: true)
+        }
+    }
+
     public init(
         workspaceID: WorkspaceID,
         cwd: String,
@@ -9935,6 +9981,28 @@ public struct AgentAppView: View {
             : "translated from compressed output"
     }
 
+    /// Thoughts stay on the provider/host wire until the user asks. Offer
+    /// Translate only when the painted body is still SR1/SR2 (or identical to
+    /// that wire). Already-natural thoughts — recovered free prose or a prior
+    /// on-demand humanize — must not spend the local LLM again.
+    static func shouldOfferOnDemandThoughtTranslation(
+        storedBody: String,
+        displayText: String,
+        isTranslating: Bool
+    ) -> Bool {
+        guard !isTranslating else { return false }
+        let stored = storedBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        let display = displayText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !stored.isEmpty else { return false }
+        let displayIsNatural = display != stored
+            && !SR2WirePolicy.isSR2(display)
+            && !SR1ResponseDetector.isSR1(display)
+        if displayIsNatural { return false }
+        return SR2WirePolicy.hasSR2Banner(stored)
+            || SR2WirePolicy.isSR2(stored)
+            || SR1ResponseDetector.isSR1(stored)
+    }
+
     static let fullAccessScopeDescription =
         "The agent runs tools, edits, and proposed plans without asking for this thread until you change it."
 
@@ -14176,7 +14244,16 @@ public struct AgentAppView: View {
     @ViewBuilder
     private func reasoningRow(_ item: AssistantItem) -> some View {
         let rawText = item.body.isEmpty ? (AgentTimelineItemPresentation.make(for: item).detail ?? "") : item.body
-        let text = vm.assistantDisplayText(for: rawText, itemId: item.id, turnId: item.turnId)
+        let translated = vm.assistantDisplayText(for: rawText, itemId: item.id, turnId: item.turnId)
+        // Untranslated thoughts stay on the provider original (or the stored
+        // wire). Never spend Distill until the user clicks Translate.
+        let text: String = {
+            if translated != rawText { return translated }
+            return SR2WirePolicy.providerOriginal(
+                in: rawText,
+                retrieve: vm.coordinator.reversibleProseRetriever
+            ) ?? rawText
+        }()
         let streaming = item.state == .streaming
         let expanded = streaming || expandedReasoning.contains(item.id)
         VStack(alignment: .leading, spacing: DS.Space.xs) {
@@ -14199,11 +14276,36 @@ public struct AgentAppView: View {
             .buttonStyle(.plain)
             .help(streaming ? "" : (text.isEmpty ? "" : (expanded ? "Hide reasoning" : "Show reasoning")))
             if expanded, !text.isEmpty {
-                assistantOriginalWireDisclosure(
-                    originalWire: rawText,
+                let translating = vm.isOnDemandItemTranslationInFlight(item.id)
+                let offerTranslate = !streaming && Self.shouldOfferOnDemandThoughtTranslation(
+                    storedBody: rawText,
                     displayText: text,
-                    accessibilityIdentifier: "agent.reasoning.original.\(item.id)"
+                    isTranslating: translating
                 )
+                if offerTranslate {
+                    Button {
+                        vm.requestOnDemandItemTranslation(itemId: item.id, wire: rawText)
+                    } label: {
+                        Text("Translate")
+                            .font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.accent)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Translate this thought with the local Token Saver model")
+                    .accessibilityLabel("Translate thought")
+                    .accessibilityIdentifier("agent.reasoning.translate.\(item.id)")
+                } else if translating {
+                    Text("Translating…")
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .accessibilityIdentifier("agent.reasoning.translating.\(item.id)")
+                } else {
+                    assistantOriginalWireDisclosure(
+                        originalWire: rawText,
+                        displayText: text,
+                        accessibilityIdentifier: "agent.reasoning.original.\(item.id)"
+                    )
+                }
                 AgentSelectablePlainText(
                     text: text,
                     fontSize: 12,

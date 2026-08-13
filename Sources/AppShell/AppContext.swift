@@ -902,10 +902,8 @@ public final class AppContext {
                 threadId: threadId,
                 runId: runId
             )
-            // SR2 is the paid runtime's wire language, even when a short prompt
-            // is not a net-positive compression candidate. The natural prompt
-            // remains in AgentMessage.content; only this provider-bound leg is
-            // wrapped and escaped losslessly.
+            // Compact compiled SR2 is sent only when it is cheaper than the
+            // natural prompt. A more verbose `u:` envelope is not sent.
             let (runtimeActive, targetModel) = await MainActor.run {
                 (self.isTokenSaverRuntimeActive(), (try? self.threadRepo.get(id: threadId))?.model)
             }
@@ -3392,6 +3390,87 @@ public final class AppContext {
         )
     }
 
+    /// Local-LLM compiler for every user prompt. Heuristic encoders are not
+    /// used here. Unavailable sidecar or a rejected candidate fail open.
+    private func compileUserPromptViaLocalLLM(
+        prompt: String,
+        semanticSource: AgentPromptSemanticSource?,
+        provider: AgentProvider,
+        threadId: AgentThreadID,
+        cacheState: String,
+        runId: AgentRunID?
+    ) async -> (attempted: Bool, output: String?) {
+        guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return (false, nil)
+        }
+        startTokenSaverDistillServiceIfEligible()
+        guard let client = await currentDistillClientWaitingForStartup() else {
+            return (false, nil)
+        }
+        let natural = semanticSource?.naturalUserText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let source = (natural?.isEmpty == false ? natural! : prompt)
+        let targetModel = (try? threadRepo.get(id: threadId))?.model
+        let targetProviderModel = [provider.rawValue, targetModel]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "/")
+        let request = DistillRequest(
+            mode: .longText,
+            priority: .interactive,
+            input: source,
+            provider: targetProviderModel,
+            runMode: .optimize,
+            cacheState: cacheState,
+            maxOutputCharacters: max(512, source.count),
+            skipDeterministicRouting: true
+        )
+        do {
+            let response = try await client.distill(request)
+            let candidate = response.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !candidate.isEmpty else { return (true, nil) }
+            let lossless = SR2WirePolicy.userInstructionWire(prompt)
+            let decision = SR2Optimizer.optimize(
+                original: prompt,
+                candidates: [candidate],
+                semanticSource: semanticSource?.naturalUserText,
+                semanticSegments: [semanticSource?.naturalUserText].compactMap { $0 }
+                    + (semanticSource?.trustedHostSegments ?? []),
+                targetTokenizer: "\(targetProviderModel) tokenizer-unavailable; model-agnostic-estimator-v1",
+                tokenCount: { text in
+                    TokenEstimator.estimate(text == prompt ? lossless : text)
+                }
+            )
+            guard decision.accepted else {
+                NSLog("RemoteCode Token Saver SR2 compile rejected (provider=\(provider.rawValue)): \(decision.rejectionReason ?? "unknown")")
+                return (true, nil)
+            }
+            let cheaper = Self.preferNaturalLanguageIfSR2IsMoreVerbose(
+                natural: prompt,
+                wire: decision.output
+            )
+            guard cheaper == decision.output else {
+                return (true, nil)
+            }
+            let inputTokens = TokenEstimator.estimate(prompt)
+            let outputTokens = TokenEstimator.estimate(decision.output)
+            recordTokenSaverSidecarSavings(
+                provider: provider,
+                threadId: threadId,
+                mode: DistillMode.longText.rawValue,
+                inputTokens: inputTokens,
+                outputTokens: outputTokens,
+                savedTokens: max(inputTokens - outputTokens, 0),
+                cacheState: cacheState,
+                routeStage: response.routeStage ?? .llmMLX
+            )
+            _ = runId
+            return (true, decision.output)
+        } catch {
+            NSLog("RemoteCode Token Saver SR2 compile skipped (provider=\(provider.rawValue)): \(error)")
+            return (true, nil)
+        }
+    }
+
     func tokenSaverCompress(
         prompt: String,
         semanticSource: AgentPromptSemanticSource? = nil,
@@ -3407,6 +3486,25 @@ public final class AppContext {
             turn: turn
         ) else {
             return prompt
+        }
+        if tokenSaverLaneIsDisabled("semantic_prose") {
+            recordTokenSaverAdmissionDenial(
+                threadId: threadId,
+                lane: "semantic_prose",
+                decision: .init(allowed: false, reason: "operator_lane_disabled")
+            )
+            return prompt
+        }
+        let compiled = await compileUserPromptViaLocalLLM(
+            prompt: prompt,
+            semanticSource: semanticSource,
+            provider: provider,
+            threadId: threadId,
+            cacheState: cacheState,
+            runId: runId
+        )
+        if compiled.attempted {
+            return compiled.output ?? prompt
         }
         // Operator per-lane kill switch (incident control) — same decision child env exports.
         if tokenSaverLaneIsDisabled("deterministic_wrapper") {
@@ -3648,10 +3746,10 @@ public final class AppContext {
         }
     }
 
-    /// Provider-facing user leg for the always-on Token Saver runtime. Unlike
-    /// `netPositiveSR2UserInstruction`, this deliberately pays SR2's small
-    /// envelope overhead for short prompts so every admitted turn has one
-    /// stable machine-readable wire contract.
+    /// Provider-facing user leg. Compact compiled SR2 is sent only when it is
+    /// actually cheaper than the natural prompt. A `u:` envelope around a short
+    /// prompt is more verbose than the prose, so Claude/Codex/Grok receive the
+    /// natural language instead.
     nonisolated public static func alwaysOnSR2UserInstruction(
         _ compressed: String,
         preservesKnownInternalProtocol: Bool = false,
@@ -3677,11 +3775,11 @@ public final class AppContext {
     }
 
     static func netPositiveSR2UserInstruction(original: String, compressed: String) -> String {
-        // Keep `original` in the signature for call-site compatibility. Token Saver's
-        // provider leg is SR2 even when the envelope is not net-positive for a short
-        // prompt; the UI retains the natural prompt separately.
-        _ = original
-        return sr2UserInstructionWire(compressed)
+        sr2UserInstructionWire(
+            compressed,
+            preservesKnownInternalProtocol: isKnownInternalSR2(compressed),
+            losslessFallback: original
+        )
     }
 
     /// The caller-facing compressor only receives natural user text or a known
@@ -3703,49 +3801,96 @@ public final class AppContext {
         guard !candidate.isEmpty else {
             return candidate
         }
+        let wire: String
         if let decoded = SR2WirePolicy.userInstruction(in: candidate) {
-            return SR2WirePolicy.isCurrentSR2(candidate)
+            wire = SR2WirePolicy.isCurrentSR2(candidate)
                 ? candidate
                 : SR2WirePolicy.userInstructionWire(decoded)
-        }
-        if preservesKnownInternalProtocol,
-           isKnownInternalSR2(candidate) {
-            guard !trustedSemanticSegments.isEmpty else { return candidate }
-            let trustedSource = AgentPromptSemanticSource(
-                semanticSource ?? "",
-                trustedHostSegments: trustedSemanticSegments
-            )
-            guard isSemanticallyCoveredInternalSR2(
-                candidate,
-                original: losslessFallback ?? candidate,
-                semanticSource: trustedSource
-            ) else {
-                return SR2WirePolicy.userInstructionWire(losslessFallback ?? candidate)
+        } else if preservesKnownInternalProtocol,
+                  isKnownInternalSR2(candidate) {
+            if trustedSemanticSegments.isEmpty {
+                wire = candidate
+            } else {
+                let trustedSource = AgentPromptSemanticSource(
+                    semanticSource ?? "",
+                    trustedHostSegments: trustedSemanticSegments
+                )
+                wire = isSemanticallyCoveredInternalSR2(
+                    candidate,
+                    original: losslessFallback ?? candidate,
+                    semanticSource: trustedSource
+                )
+                    ? candidate
+                    : SR2WirePolicy.userInstructionWire(losslessFallback ?? candidate)
             }
-            return candidate
+        } else {
+            let target = [provider, model]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: "/")
+            let tokenizerLabel = targetTokenizer
+                ?? "\(target.isEmpty ? "unknown-provider/model" : target) tokenizer-unavailable; model-agnostic-estimator-v1"
+            let compiled = SR2Optimizer.compile(
+                original: losslessFallback ?? candidate,
+                semanticSource: semanticSource,
+                semanticSegments: [semanticSource].compactMap { $0 } + trustedSemanticSegments,
+                targetTokenizer: tokenizerLabel,
+                targetTokenizerAvailable: targetTokenCount != nil,
+                tokenCount: targetTokenCount ?? { TokenEstimator.estimate($0) }
+            )
+            wire = compiled.accepted
+                ? compiled.output
+                : SR2WirePolicy.userInstructionWire(candidate)
         }
-        // This local compiler is deliberately bounded to self-contained command
-        // contracts and still passes SR2Optimizer's token and semantic gates.
-        // It is safe for projectless prompts; project-scoped MLX/recovery lanes
-        // retain their existing admission requirements above this boundary.
-        let target = [provider, model]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .joined(separator: "/")
-        let tokenizerLabel = targetTokenizer
-            ?? "\(target.isEmpty ? "unknown-provider/model" : target) tokenizer-unavailable; model-agnostic-estimator-v1"
-        let compiled = SR2Optimizer.compile(
-            original: candidate,
-            semanticSource: semanticSource,
-            semanticSegments: [semanticSource].compactMap { $0 } + trustedSemanticSegments,
-            targetTokenizer: tokenizerLabel,
-            targetTokenizerAvailable: targetTokenCount != nil,
-            tokenCount: targetTokenCount ?? { TokenEstimator.estimate($0) }
+        return preferNaturalLanguageIfSR2IsMoreVerbose(
+            natural: providerNaturalUserText(
+                candidate: candidate,
+                wire: wire,
+                losslessFallback: losslessFallback
+            ),
+            wire: wire,
+            tokenCount: targetTokenCount
         )
-        if compiled.accepted {
-            return compiled.output
+    }
+
+    /// Natural text to compare against the SR2 wire. A `u:` envelope is judged
+    /// against the prose it encodes. Compiled SR2 is judged against the original
+    /// user prompt when the caller still has it.
+    private nonisolated static func providerNaturalUserText(
+        candidate: String,
+        wire: String,
+        losslessFallback: String?
+    ) -> String {
+        if let decoded = SR2WirePolicy.userInstruction(in: wire) {
+            return decoded
         }
-        return SR2WirePolicy.userInstructionWire(losslessFallback ?? candidate)
+        if let losslessFallback, !losslessFallback.isEmpty,
+           isKnownInternalSR2(wire) || isKnownInternalSR2(candidate) {
+            return losslessFallback
+        }
+        if let decoded = SR2WirePolicy.userInstruction(in: candidate) {
+            return decoded
+        }
+        return losslessFallback ?? candidate
+    }
+
+    /// Providers must not pay an SR2 envelope that is longer than the prose it
+    /// encodes. Token count is the Token Saver unit; character count breaks ties
+    /// when the estimator rounds a short `u:` wrap up to the same token total.
+    nonisolated static func preferNaturalLanguageIfSR2IsMoreVerbose(
+        natural: String,
+        wire: String,
+        tokenCount: SR2Optimizer.TokenCounter? = nil
+    ) -> String {
+        guard !natural.isEmpty, natural != wire else { return wire }
+        let count = tokenCount ?? { TokenEstimator.estimate($0) }
+        let wireTokens = count(wire)
+        let naturalTokens = count(natural)
+        if wireTokens > naturalTokens { return natural }
+        if wireTokens == naturalTokens, wire.utf8.count > natural.utf8.count {
+            return natural
+        }
+        return wire
     }
 
     /// Semantic adoption appends scoped recovery markers after compiling the

@@ -5883,9 +5883,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                             )
                         }
                         // Persist canonical provider history for every text item.
-                        // The typed translation above is the sole UI projection,
-                        // so reasoning/commentary remains natural without putting
-                        // that prose back into the next-turn history leg.
+                        // The typed translation above is the sole UI projection
+                        // for auto-humanized commentary/finals. Reasoning stays
+                        // on the wire until the user asks for on-demand humanize.
                         let history = plan.historyText
                         let delta: AssistantEvent
                         switch target {
@@ -7420,8 +7420,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
             lock.unlock()
             guard let buffered else { return nil }
-            if shouldTranslateProviderText(buffered.text, runId: runId) {
-                let target = buffered.itemType == .reasoning ? ProviderTextTarget.body : buffered.target
+            let target = buffered.itemType == .reasoning ? ProviderTextTarget.body : buffered.target
+            // Thoughts: keep history canonical (SR2/stub) but never spend the
+            // local LLM here. The user clicks Translate if they want prose.
+            if buffered.itemType == .reasoning {
+                return .emit(canonicalizedProviderTextEvents(
+                    itemId: itemId,
+                    text: buffered.text,
+                    target: target,
+                    finalState: finalState,
+                    runId: runId
+                ))
+            }
+            if shouldTranslateProviderText(buffered.text, itemType: buffered.itemType, runId: runId) {
                 return .translate(itemId: itemId, text: buffered.text, target: target, finalState: finalState)
             }
             let delta: AssistantEvent
@@ -7447,11 +7458,71 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         type == .assistantMessage || type == .reasoning
     }
 
-    private func shouldTranslateProviderText(_ text: String, runId: AgentRunID) -> Bool {
+    private func shouldTranslateProviderText(
+        _ text: String,
+        itemType: AssistantItemType,
+        runId: AgentRunID
+    ) -> Bool {
         // Defense in depth for future callers: canonical provider history and
         // the natural UI leg are paid Token Saver behavior only.
         guard tokenSaverWasAdmitted(for: runId) else { return false }
+        // Auto-LLM is reserved for the final / commentary assistant message.
+        // Reasoning stays on the wire until the user clicks Translate.
+        if itemType == .reasoning { return false }
         return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Wrap Token Saver reasoning/history without calling the local LLM.
+    private func canonicalizedProviderTextEvents(
+        itemId: String,
+        text: String,
+        target: ProviderTextTarget,
+        finalState: AssistantItemState,
+        runId: AgentRunID
+    ) -> [AssistantEvent] {
+        let plan = dualChannelPlan(
+            runId: runId,
+            modelOutput: text,
+            humanizeOutput: text,
+            recordCompliance: false
+        )
+        let history = plan.historyText.isEmpty ? text : plan.historyText
+        let delta: AssistantEvent
+        switch target {
+        case .body:
+            delta = .itemDelta(itemId: itemId, bodyAppend: history, outputAppend: nil, summary: nil)
+        case .output:
+            delta = .itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: history, summary: nil)
+        }
+        return [delta, .itemCompleted(itemId: itemId, finalState: finalState)]
+    }
+
+    /// User-clicked thought translation. Does not depend on a live run admission
+    /// because the thought may be hours old. Fail open when Token Saver is off
+    /// or the sidecar never returns.
+    public func humanizeProviderTextOnDemand(
+        text: String,
+        threadId: AgentThreadID,
+        provider: AgentProvider
+    ) async -> String {
+        guard isTokenSaverRuntimeActiveNow(),
+              let finalResponseTranslator else { return text }
+        let runId = AgentRunID()
+        let deadlineNs = UInt64(max(0.05, providerTerminalTranslationDeadline) * 1_000_000_000)
+        let translated: String = await withTaskGroup(of: String.self) { group in
+            group.addTask {
+                await finalResponseTranslator(text, provider, threadId, runId)
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: deadlineNs)
+                return text
+            }
+            let first = await group.next() ?? text
+            group.cancelAll()
+            return first
+        }
+        let trimmed = sanitizeFinalAssistantText(translated).trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? text : trimmed
     }
 
     private func markDistillOutputMode(_ runId: AgentRunID) {

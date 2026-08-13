@@ -802,6 +802,7 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
         )
         let hangGate = DispatchSemaphore(value: 0)
         var translatorEntered = false
+        coordinator.tokenSaverRuntimeActive = { true }
         coordinator.finalResponseTranslator = { response, _, _, _ in
             translatorEntered = true
             // Simulate a stuck/slow distill sidecar. Stop must not wait on this.
@@ -938,6 +939,7 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
         )
         let hangGate = DispatchSemaphore(value: 0)
         var translatorEntered = false
+        coordinator.tokenSaverRuntimeActive = { true }
         coordinator.finalResponseTranslator = { response, _, _, _ in
             translatorEntered = true
             hangGate.wait()

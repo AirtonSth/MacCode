@@ -22,7 +22,8 @@ public enum SR2WirePolicy: Sendable {
     public static let structuredFieldKeys: Set<String> = [
         "g", "d", "p", "o", "e", "h", "t", "u",
         "flow", "done", "tools", "must", "should", "may", "not", "constraints", "outputs",
-        "run", "out"
+        "run", "out",
+        "goal", "use", "browser", "auth", "pr", "comment", "trello-comment"
     ]
     public static let advertisedV1Sample = """
     @sr2 v1
@@ -46,6 +47,17 @@ public enum SR2WirePolicy: Sendable {
     public static let naturalTaskV1Sample = """
     @sr2 v1
     t:open:tracker>pick:1st issue(status=Todo,asgn=sam,prio?=[urgent]@title-or-text)>impl:<ISSUE>(wt@updated main,/task,!review:task,must:test)>update:tracker
+    """
+    public static let trackerDeliveryV1Sample = """
+    @sr2 v1
+    goal:trello.Doing[0]>implement>verify>merge:main>verify-merge>trello:Testing
+    use:trello-skill,/sam-task
+    must:/sam-task.all,/sam-task.playwright,postdeploy-test
+    browser:chrome|computer-use?
+    auth:user@example.com|secret
+    pr:gh,!glab
+    trello-comment:gh.PR.url
+    done:sam-task.all+playwright+deploy+postdeploy-test+merge-verified+trello-testing
     """
 
     /// Paid-feature providers that must ship the matrix together (T-SR2-09).
@@ -246,6 +258,8 @@ public enum SR2WirePolicy: Sendable {
             "must": "Required", "should": "Recommended", "may": "Optional",
             "not": "Do not", "constraints": "Constraints", "outputs": "Outputs",
             "run": "Run", "out": "Expected output",
+            "goal": "Goal", "use": "Use", "browser": "Browser", "auth": "Auth",
+            "pr": "Pull request", "comment": "Comment", "trello-comment": "Trello comment",
         ]
 
         func readable(_ value: String) -> String {
@@ -675,6 +689,9 @@ public enum SR2WirePolicy: Sendable {
     - A bounded natural orchestration may arrive as:
     \(naturalTaskV1Sample)
       In `t:`, `>` is strict order, parentheses bind attributes to that action, comma joins attributes, and `key=value` is a hard constraint. `key?=value@title-or-text` is a soft preference; `@title-or-text` matches the task title or text. Rank matching candidates first, then fall back to candidates satisfying the hard constraints when none match. `!x:y` is MUST NOT, `must:` is mandatory, `should:` is advisory, `wt@updated B` means a worktree based on updated branch B, and `label(role)=URL` preserves repository-role mappings. Keep every literal and binding exact.
+    - A bounded tracker-delivery goal may arrive as:
+    \(trackerDeliveryV1Sample)
+      In this shape `goal:` is ordered work (`>` means the prior step must succeed), `use:` names required skills/tools, `must:` is mandatory, `browser:A|B?` is an optional fallback, `auth:user|secret` is a login pair, `pr:tool,!other` selects the proposal CLI, and `trello-comment:` / `comment:tracker=` is the required tracker comment. `done:` is the completion gate. Keep every literal and binding exact.
     - Tool stdout stays exact: keep exact-output (rg/sed/cat/jq) unpiped; pipe noisy builds/tests/logs via `| distill`.
     - Host-local telemetry labels such as Thinking/Ran Shell/Failed Shell are outside the provider wire.
     """

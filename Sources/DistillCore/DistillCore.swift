@@ -106,6 +106,9 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
     /// original→precomputed delta via the normal savings path and must NOT re-run
     /// compression / call the model.
     public let precomputedOutput: String?
+    /// When true, skip JSON/log content-router shortcuts and compile with the
+    /// model. Used for user-prompt → @sr2 v1 so every prompt hits the compiler.
+    public let skipDeterministicRouting: Bool?
 
     public init(
         id: UUID = UUID(),
@@ -122,7 +125,8 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
         encoderLane: String? = nil,
         maxOutputCharacters: Int = 4_000,
         reversibleStoreMinBytes: Int? = nil,
-        precomputedOutput: String? = nil
+        precomputedOutput: String? = nil,
+        skipDeterministicRouting: Bool? = nil
     ) {
         self.id = id
         self.mode = mode
@@ -139,6 +143,11 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
         self.maxOutputCharacters = max(128, maxOutputCharacters)
         self.reversibleStoreMinBytes = reversibleStoreMinBytes.map { max(1, $0) }
         self.precomputedOutput = precomputedOutput
+        self.skipDeterministicRouting = skipDeterministicRouting
+    }
+
+    public var shouldSkipDeterministicRouting: Bool {
+        skipDeterministicRouting == true
     }
 
     public var effectiveRunMode: DistillRunMode {
@@ -166,7 +175,7 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
     private enum CodingKeys: String, CodingKey {
         case id, mode, priority, input, question, provider
         case recordSavings, runMode, cacheState, rerankQuery, topK, encoderLane, maxOutputCharacters
-        case reversibleStoreMinBytes, precomputedOutput
+        case reversibleStoreMinBytes, precomputedOutput, skipDeterministicRouting
     }
 
     /// Tolerant decoder: identical to the synthesized one EXCEPT a wire client may omit
@@ -191,6 +200,7 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
         self.maxOutputCharacters = try c.decode(Int.self, forKey: .maxOutputCharacters)
         self.reversibleStoreMinBytes = try c.decodeIfPresent(Int.self, forKey: .reversibleStoreMinBytes).map { max(1, $0) }
         self.precomputedOutput = try c.decodeIfPresent(String.self, forKey: .precomputedOutput)
+        self.skipDeterministicRouting = try c.decodeIfPresent(Bool.self, forKey: .skipDeterministicRouting)
     }
 }
 
@@ -1176,7 +1186,8 @@ public struct LocalDistillRuntime: DistillRuntime {
         // JSON/log payloads on the pure "compress this" modes, before any heuristic
         // summarization. Skipped for .commandOutput (it must answer the contract
         // question, not blind-minify) and .sr1Humanize (a translation task).
-        if request.mode == .longText || request.mode == .watchSummary,
+        if !request.shouldSkipDeterministicRouting,
+           request.mode == .longText || request.mode == .watchSummary,
            let routed = contentRouter.route(request.input, options: routerOptions(for: request)) {
             return routed.output
         }
@@ -1732,7 +1743,8 @@ public struct MLXDistillRuntime: DistillRuntime {
         // JSON/log on the pure "compress this" modes, before the model is invoked.
         // Covers the .longText prompt-compression path. .commandOutput is excluded
         // (honors its contract question above) and .sr1Humanize is a translation.
-        if request.mode == .longText || request.mode == .watchSummary,
+        if !request.shouldSkipDeterministicRouting,
+           request.mode == .longText || request.mode == .watchSummary,
            let routed = Self.contentRouter.route(request.input, options: Self.routerOptions(for: request)) {
             return DistillStageResult(output: routed.output, stage: .deterministic)
         }
@@ -1798,7 +1810,8 @@ public struct MLXDistillRuntime: DistillRuntime {
                     provider: request.provider,
                     recordSavings: request.recordSavings ?? false,
                     runMode: request.effectiveRunMode,
-                    maxOutputCharacters: request.maxOutputCharacters
+                    maxOutputCharacters: request.maxOutputCharacters,
+                    skipDeterministicRouting: request.skipDeterministicRouting
                 ),
                 payload
             )
@@ -1882,17 +1895,32 @@ public struct MLXDistillRuntime: DistillRuntime {
             """
         case .longText:
             return """
-            You are the SR2 Optimizer: a semantic compiler, never a text minifier.
-            Compile in two phases: Natural language -> internal Semantic IR -> token-aware @sr2 v1.
-            The Semantic IR must preserve goals, tasks, repositories, tools, skills, MUST/SHOULD/MAY/MUST NOT, constraints, dependencies, ordering, verification/testing/deployment gates, credentials, identifiers, required outputs, fallbacks, and completion conditions.
-            Semantic fidelity and instruction reliability outrank token reduction. Never remove information merely to improve compression.
-            Encode ordered mandatory work as flow:A>B>C, conjunction as +, scoped operations as X:Y, required members as [a,b], and completion as done:X. `>` means the prior step must succeed before the next begins; it is not interchangeable with `+`.
-            Bind modality and conditions to their exact predicates: must:A, not:B, should:C, may:D, constraints:if:condition=>action. Never preserve these merely as global signals or swap them between actions. `done:X` must name the source completion target, and every source ordering edge must remain in flow.
-            Generate compact candidates mentally, compare actual token count for the target model when its tokenizer is available, and return the lowest-token behaviorally equivalent candidate. Do not optimize character count or over-compress into ambiguous abbreviations.
-            Validate before returning: the SR2 must not permit an action forbidden by the source, earlier completion, lost ordering, weakened modality, or dropped condition.
-            Preserve every exact command, credential, file path, file:line, error string, number, ID, status, and proof verbatim.
-            Output only valid @sr2 v1. Use g, flow, done, tools, must, should, may, not, constraints, outputs, p, d, e, h, t, and o:ok|fail|need|cont when the source has an outcome. Do not invent an outcome for an instruction prompt. No preamble, explanation, markdown, or free prose outside fields.
-            If no cheaper behaviorally equivalent SR2 exists, return the source unchanged; the host will fail open.
+            You are the SR2 v1 compiler. Every user prompt is compiled. You are not a minifier and not a line matcher.
+            Phase 1: build a Semantic IR (goals, ordered work, tools/skills, MUST/SHOULD/MAY/MUST NOT, conditions, credentials, identifiers, outputs, fallbacks, completion).
+            Phase 2: encode that IR as the smallest reliable @sr2 v1. Fidelity outranks compression. Never drop a constraint to save tokens.
+            Encoding:
+            - One field per line after the banner `@sr2 v1`. No markdown, preamble, or prose.
+            - `>` = strict order (prior step must succeed). `+` = AND. `|` = OR. `?` = optional. `!` / `not:` = MUST NOT. `X:Y` = scoped op. `[a,b]` = required members.
+            - goal: or flow: = ordered work. use: or tools: = skills/tools. must:/should:/may:/not:. done: = completion gate. browser:A|B? = optional UI fallback. auth:user|secret = login pair, copy bytes exactly. pr:tool,!other = proposal CLI. comment:tracker=artifact or trello-comment:. run: = exact shell. out:=Nlines or out:1=2lines. t: = packed natural-task plan.
+            - Host chrome such as a leading `/goal` is not a source action. Keep `/sam-task` and other requested skills.
+            - Do not invent `o:ok|fail|need|cont` on an instruction prompt. Preserve commands, emails, passwords, URLs, paths, IDs, list names, and branch names verbatim.
+            Examples:
+            @sr2 v1
+            goal:trello.Doing[0]>implement>verify>merge:main>verify-merge>trello:Testing
+            use:trello-skill,/sam-task
+            must:/sam-task.all,/sam-task.playwright,postdeploy-test
+            browser:chrome|computer-use?
+            auth:user@example.com|secret
+            pr:gh,!glab
+            trello-comment:gh.PR.url
+            done:sam-task.all+playwright+deploy+postdeploy-test+merge-verified+trello-testing
+            @sr2 v1
+            t:open:tracker>pick:1st issue(status=Todo)>impl:<ISSUE>(/sam-task,must:test)>update:tracker
+            @sr2 v1
+            run:[command -v swift]>[command -v distill]
+            out:=2lines
+            !file-edit
+            If no cheaper equivalent SR2 exists, return the source unchanged.
             """
         case .watchSummary:
             return """
@@ -1919,9 +1947,9 @@ public struct MLXDistillRuntime: DistillRuntime {
         case .longText:
             return """
             /no_think
-            Compile the prompt below to the smallest reliable @sr2 v1 after building its Semantic IR.
+            Compile the natural-language prompt below to @sr2 v1. Output only the wire.
             Target tokenizer/model: \(request.provider ?? "unknown; use the shared estimator").
-            Preserve exact commands, credentials, paths, file:line, errors, numbers, IDs, ordering, modality, and completion gates.
+            Preserve exact commands, credentials, emails, passwords, paths, URLs, file:line, errors, numbers, IDs, list names, branches, ordering, modality, and completion gates.
 
             \(fitInput(request.input))
 

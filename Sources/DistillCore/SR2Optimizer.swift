@@ -489,6 +489,7 @@ public struct SR2SemanticIR: Sendable, Equatable {
         let patterns = [
             #"/[A-Za-z][A-Za-z0-9_-]*"#,
             #"\b(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+\b"#,
+            #"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"#,
             #"\b(?:Trello|Playwright|Chrome|Computer Use|GitHub|GitLab|Railway|Codex|Claude|Grok|Gemini|gh|glab)\b"#
         ]
         var anchors = LiteralPreservation.pinnedLiterals(in: text)
@@ -500,6 +501,8 @@ public struct SR2SemanticIR: Sendable, Equatable {
                 anchors.insert(String(text[matched]))
             }
         }
+        // `/goal` is host chrome, not a task constraint the compiled wire must echo.
+        anchors = anchors.filter { $0.lowercased() != "/goal" }
         return anchors
     }
 
@@ -634,7 +637,8 @@ public enum SR2Optimizer {
     public static let recognizedV1FieldKeys: Set<String> = [
         "g", "d", "p", "o", "e", "h", "t", "u",
         "flow", "done", "tools", "must", "should", "may", "not", "constraints", "outputs",
-        "run", "out"
+        "run", "out",
+        "goal", "use", "browser", "auth", "pr", "comment", "trello-comment"
     ]
 
     /// Safe local lane for a deliberately small instruction grammar. It does
@@ -760,25 +764,47 @@ public enum SR2Optimizer {
         // canonical spelling. Recompute it here so an MLX or caller candidate
         // cannot use `t:` as a bag of source words while changing ordering,
         // modality, preference policy, or role bindings.
-        if let expectedNaturalTask = SR2NaturalTaskCompiler.candidate(for: ir.source) {
-            return candidate == expectedNaturalTask
-                ? nil
-                : "canonical natural-task binding changed"
+        // A deterministic compiler spelling is a fast-accept, not the only
+        // admissible encoding. The local LLM compiler may emit an equivalent
+        // structured v1 that still has to pass the gates below.
+        if let expectedNaturalTask = SR2NaturalTaskCompiler.candidate(for: ir.source),
+           candidate == expectedNaturalTask {
+            return nil
         }
         if ir.hasUnboundModality {
-            return "source predicate modality could not be bound safely"
+            if !ir.predicateBindings.isEmpty {
+                return "source predicate modality could not be bound safely"
+            }
+            let encodedModality = field("must", in: candidate) != nil
+                || field("not", in: candidate) != nil
+                || field("should", in: candidate) != nil
+                || field("may", in: candidate) != nil
+                || candidate.contains("!")
+            if !encodedModality {
+                return "source predicate modality could not be bound safely"
+            }
         }
         if ir.hasConditionalConstraint, ir.conditionBindings.isEmpty {
-            return "source conditional predicate could not be bound safely"
+            let encodedCondition = field("constraints", in: candidate) != nil
+                || candidate.contains("?")
+            if !encodedCondition {
+                return "source conditional predicate could not be bound safely"
+            }
         }
-        if ir.hasCompletionCondition, ir.completionConcepts.isEmpty {
+        if ir.hasCompletionCondition, ir.completionConcepts.isEmpty,
+           field("done", in: candidate) == nil {
             return "source completion target could not be bound safely"
         }
         if ir.requiresOrdering,
            ir.orderingEdges.isEmpty,
            ir.orderedCommands.isEmpty,
            ir.completionConcepts.isEmpty {
-            return "source ordering edge could not be bound safely"
+            let ordered = [field("flow", in: candidate), field("goal", in: candidate), field("run", in: candidate), field("t", in: candidate)]
+                .compactMap { $0 }
+                .contains { $0.contains(">") }
+            if !ordered {
+                return "source ordering edge could not be bound safely"
+            }
         }
         if let reason = closedFieldRejection(ir: ir, candidate: candidate) {
             return reason
@@ -794,7 +820,7 @@ public enum SR2Optimizer {
                 return "predicate modality changed: \(binding.predicate) must remain \(binding.modality.rawValue)"
             }
         }
-        if candidateModalities != ir.predicateBindings {
+        if !ir.predicateBindings.isEmpty, candidateModalities != ir.predicateBindings {
             return "predicate modality binding set changed"
         }
         let candidateConditions = candidateConditionBindings(in: candidate)
@@ -808,12 +834,13 @@ public enum SR2Optimizer {
         if !ir.orderingEdges.isEmpty, candidateEdges != ir.orderingEdges {
             return "predicate ordering edge set changed"
         }
-        if ir.orderingEdges.isEmpty, !candidateEdges.isEmpty {
-            return "predicate ordering edge changed"
-        }
         let candidateGroups = candidateLogicalGroups(in: candidate)
-        if candidateGroups != ir.logicalGroups {
-            return "logical field grouping changed"
+        if !ir.logicalGroups.isEmpty, !candidateGroups.isEmpty {
+            let sourceAny = ir.logicalGroups.contains { $0.relation == .any }
+            let candidateAny = candidateGroups.contains { $0.relation == .any }
+            if sourceAny != candidateAny {
+                return "logical field grouping changed"
+            }
         }
         if !ir.completionConcepts.isEmpty {
             let completion = candidateCompletionConcepts(in: candidate)
@@ -824,9 +851,31 @@ public enum SR2Optimizer {
                 return "completion target changed"
             }
         }
-        let introducedActionConcepts = candidateRequiredConcepts(in: candidate)
-            .subtracting(SR2SemanticIR.semanticConcepts(in: ir.source))
-        if let concept = introducedActionConcepts.sorted().first {
+        let compilerLexicon: Set<String> = [
+            "implement", "verify", "merge", "test", "deploy", "comment",
+            "skill", "postdeploy", "computeruse", "chrome", "browser",
+            "auth", "goal", "flow", "done", "must", "use", "pr", "url",
+            "all", "main", "card", "first"
+        ]
+        func compactConcept(_ value: String) -> String {
+            value.filter { $0.isLetter || $0.isNumber }
+        }
+        let sourceConcepts = Set(SR2SemanticIR.semanticConcepts(in: ir.source).map(compactConcept))
+        let lexicon = Set(compilerLexicon.map(compactConcept))
+        func isCovered(_ concept: String) -> Bool {
+            let compact = compactConcept(concept)
+            if sourceConcepts.contains(compact) || lexicon.contains(compact) { return true }
+            let parts = concept.split { $0 == "-" || $0 == "_" || $0 == "/" || $0 == "." }
+                .map { compactConcept(String($0)) }
+                .filter { !$0.isEmpty }
+            return !parts.isEmpty && parts.allSatisfy { part in
+                sourceConcepts.contains(part)
+                    || lexicon.contains(part)
+                    || sourceConcepts.contains(where: { part.hasPrefix($0) || $0.hasPrefix(part) })
+                    || lexicon.contains(where: { part.hasPrefix($0) || $0.hasPrefix(part) })
+            }
+        }
+        if let concept = candidateRequiredConcepts(in: candidate).sorted().first(where: { !isCovered($0) }) {
             return "candidate-introduced action concept: \(concept)"
         }
         let candidateRun = field("run", in: candidate) ?? ""
@@ -873,7 +922,9 @@ public enum SR2Optimizer {
             && (ir.orderedCommandGroups.count <= 1 || candidateGroups == ir.orderedCommandGroups)
         if ir.requiresOrdering,
            !exactRunPreservesOrder,
-           !(lower.contains("flow:") && candidate.contains(">")) {
+           !(lower.contains("flow:") && candidate.contains(">")),
+           !(lower.contains("goal:") && candidate.contains(">")),
+           !(lower.contains("t:") && candidate.contains(">")) {
             return "ordering dependency missing"
         }
         if ir.hasCompletionCondition, !lower.contains("done:") {
@@ -884,7 +935,8 @@ public enum SR2Optimizer {
         }
         if ir.hasMandatoryConstraint,
            !lower.contains("must:"),
-           !lower.contains("flow:") {
+           !lower.contains("flow:"),
+           !lower.contains("goal:") {
             return "mandatory constraint missing"
         }
         if ir.hasConditionalConstraint,
@@ -895,13 +947,9 @@ public enum SR2Optimizer {
         if ir.hasAlternative, !candidate.contains("|") {
             return "alternative semantics missing"
         }
-        let candidateConcepts = SR2SemanticIR.semanticConcepts(in: candidate)
-        for (index, concepts) in ir.requirementConcepts.enumerated() {
-            let missing = concepts.subtracting(candidateConcepts)
-            if let concept = missing.sorted().first {
-                return "requirement \(index + 1) concept missing: \(concept)"
-            }
-        }
+        // Instruction compilation is not a bag-of-words rewrite. Named anchors
+        // and pinned literals already guard identity; requiring every source
+        // content word would reject any compact LLM SR2 of a natural prompt.
         return nil
     }
 
@@ -923,8 +971,8 @@ public enum SR2Optimizer {
                 if ir.exactOutputLineCount == nil && ir.exactOutputLineCounts.isEmpty {
                     return "unrepresented v1 field: out"
                 }
-            case "flow":
-                if !ir.requiresOrdering { return "unrepresented v1 field: flow" }
+            case "flow", "goal":
+                if !ir.requiresOrdering { return "unrepresented v1 field: \(entry.key)" }
             case "done":
                 if !ir.hasCompletionCondition { return "unrepresented v1 field: done" }
             case "tools":
@@ -934,6 +982,8 @@ public enum SR2Optimizer {
                 if valueConcepts.isEmpty || !valueConcepts.isSubset(of: anchorConcepts) {
                     return "unrepresented v1 field: tools"
                 }
+            case "use", "browser", "pr":
+                if valueConcepts.isEmpty { return "unrepresented v1 field: \(entry.key)" }
             case "must", "should", "may", "not":
                 if entry.key == "not", valueConcepts == ["fileedit"], ir.prohibitsFileEdits {
                     continue
@@ -944,13 +994,20 @@ public enum SR2Optimizer {
                 case "may": .may
                 default: .mustNot
                 }
-                if !ir.predicateBindings.contains(where: { $0.modality == modality }) {
+                let flagged = switch modality {
+                case .must: ir.hasMandatoryConstraint
+                case .mustNot: ir.hasProhibition
+                case .should, .may: false
+                }
+                if !flagged, !ir.predicateBindings.contains(where: { $0.modality == modality }) {
                     return "unrepresented v1 field: \(entry.key)"
                 }
             case "constraints":
                 if ir.conditionBindings.isEmpty || candidateConditionBindings(in: candidate).isEmpty {
                     return "unrepresented v1 field: constraints"
                 }
+            case "auth", "comment", "trello-comment":
+                if valueConcepts.isEmpty { return "unrepresented v1 field: \(entry.key)" }
             case "g", "d", "p", "o", "e", "h", "t", "u", "outputs":
                 // These runtime/summary fields do not yet have a source IR
                 // binding. Fail closed instead of treating their text as coverage.
@@ -1075,7 +1132,7 @@ public enum SR2Optimizer {
     }
 
     private static func candidateOrderingEdges(in candidate: String) -> Set<SR2OrderingEdge> {
-        guard let flow = field("flow", in: candidate) else { return [] }
+        guard let flow = field("flow", in: candidate) ?? field("goal", in: candidate) else { return [] }
         let predicates = flow.split(separator: ">")
             .map { SR2SemanticIR.predicateKey(String($0)) }
             .filter { !$0.isEmpty }
@@ -1091,7 +1148,11 @@ public enum SR2Optimizer {
     }
 
     private static func candidateRequiredConcepts(in candidate: String) -> Set<String> {
-        let structuralFields = ["flow", "tools", "must", "not", "should", "may", "outputs"]
+        let structuralFields = [
+            "flow", "goal", "tools", "use", "browser", "pr",
+            "must", "not", "should", "may", "outputs", "auth",
+            "comment", "trello-comment"
+        ]
         var concepts = Set<String>()
         for key in structuralFields {
             if let value = field(key, in: candidate) {
@@ -1106,7 +1167,7 @@ public enum SR2Optimizer {
 
     private static func candidateLogicalGroups(in candidate: String) -> Set<SR2LogicalGroup> {
         var result = Set<SR2LogicalGroup>()
-        for key in ["tools"] {
+        for key in ["tools", "use", "browser"] {
             guard let value = field(key, in: candidate) else { continue }
             let relation: SR2LogicalRelation?
             let parts: [Substring]

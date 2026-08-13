@@ -95,6 +95,92 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(display.contains("Evidence 3: swift noisy.swift completed."), display)
     }
 
+    func testOnDemandThoughtTranslationUsesLocalLLMOnlyAfterClick() async throws {
+        // WHY: auto-humanize of every thought is the expensive path. The
+        // Thought row must keep the wire until the user clicks Translate.
+        let (vm, threadRepo) = try makeVM()
+        let thread = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "ondemand thought",
+            provider: .grok,
+            model: "fake-model"
+        )
+        try threadRepo.upsert(thread)
+        vm.reloadThreads()
+        vm.selectThread(thread.id)
+        vm.provider = .grok
+
+        let wire = "@sr2 v1\no:inspecting the trello card before editing"
+        let natural = "I am inspecting the Trello card before editing."
+        vm.coordinator.tokenSaverRuntimeActive = { true }
+        vm.coordinator.finalResponseTranslator = { response, provider, threadId, _ in
+            XCTAssertEqual(provider, .grok)
+            XCTAssertEqual(threadId, thread.id)
+            XCTAssertEqual(response, wire)
+            return natural
+        }
+
+        vm.timeline.apply(.turnStarted(turnId: "t-thought"))
+        vm.timeline.apply(.itemStarted(item: AssistantItem(
+            id: "thought-1",
+            turnId: "t-thought",
+            type: .reasoning,
+            state: .completed,
+            body: wire,
+            startedAtMs: 1
+        )))
+
+        XCTAssertEqual(vm.assistantDisplayText(for: wire, itemId: "thought-1"), wire)
+        XCTAssertTrue(
+            AgentAppView.shouldOfferOnDemandThoughtTranslation(
+                storedBody: wire,
+                displayText: wire,
+                isTranslating: false
+            ),
+            "an untranslated SR2 thought must offer Translate"
+        )
+        XCTAssertFalse(
+            AgentAppView.shouldOfferOnDemandThoughtTranslation(
+                storedBody: wire,
+                displayText: natural,
+                isTranslating: false
+            ),
+            "already-natural thoughts must not offer another LLM pass"
+        )
+        XCTAssertFalse(
+            AgentAppView.shouldOfferOnDemandThoughtTranslation(
+                storedBody: "plain thinking",
+                displayText: "plain thinking",
+                isTranslating: false
+            ),
+            "Token Saver OFF / natural thoughts have no Translate control"
+        )
+        XCTAssertTrue(
+            AgentAppView.shouldOfferOnDemandThoughtTranslation(
+                storedBody: wire,
+                displayText: "S /distill ativo.",
+                isTranslating: false
+            ),
+            "a thought painted as the provider original still offers Translate"
+        )
+
+        vm.requestOnDemandItemTranslation(itemId: "thought-1", wire: wire)
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline,
+              vm.assistantDisplayText(for: wire, itemId: "thought-1") != natural {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(vm.assistantDisplayText(for: wire, itemId: "thought-1"), natural)
+        XCTAssertFalse(vm.isOnDemandItemTranslationInFlight("thought-1"))
+        XCTAssertFalse(
+            AgentAppView.shouldOfferOnDemandThoughtTranslation(
+                storedBody: wire,
+                displayText: vm.assistantDisplayText(for: wire, itemId: "thought-1"),
+                isTranslating: false
+            )
+        )
+    }
+
     override func setUp() {
         super.setUp()
         // AgentLastModelStore.shared persists to the test runner's

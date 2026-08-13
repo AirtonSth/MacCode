@@ -41,6 +41,11 @@ enum SR2NaturalTaskCompiler {
     }
 
     static func candidate(for source: String) -> String? {
+        linearOrchestrationCandidate(for: source)
+            ?? trackerDeliveryCandidate(for: source)
+    }
+
+    private static func linearOrchestrationCandidate(for source: String) -> String? {
         let lines = source
             .split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -252,5 +257,283 @@ enum SR2NaturalTaskCompiler {
                 !CharacterSet.controlCharacters.contains($0)
                     && !">(),&=;|\\".unicodeScalars.contains($0)
             }
+    }
+
+    // MARK: - Tracker delivery (Trello / STAR Portuguese goal)
+
+    private struct TrackerDelivery {
+        let tracker: String
+        let sourceList: String
+        let mergeBranch: String
+        let destList: String
+        let skill: String
+        let email: String
+        let password: String
+        let prTool: String
+        let forbiddenPRTool: String
+    }
+
+    /// Bounded compiler for the live Portuguese tracker-delivery goal:
+    /// pick the first card in a list, implement via a named skill, merge,
+    /// verify, comment the PR URL, then move the card. Every remaining
+    /// source line must bind or the caller keeps the lossless `u:` wire.
+    private static func trackerDeliveryCandidate(for source: String) -> String? {
+        var lines = source
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if let first = lines.first, isGoalSlashCommand(first) {
+            lines.removeFirst()
+        }
+        lines = collapseLabeledCredentialLines(lines)
+        guard !lines.isEmpty else { return nil }
+
+        var pipeline: (tracker: String, sourceList: String, mergeBranch: String, destList: String)?
+        var sawBrowser = false
+        var skill: String?
+        var mustSkill: String?
+        var commentTracker: String?
+        var commentPRTool: String?
+        var sawPostdeploy = false
+        var email: String?
+        var password: String?
+        var sawDone = false
+        var prTool: String?
+        var forbiddenPRTool: String?
+
+        for line in lines {
+            if pipeline == nil, let parsed = deliveryPipeline(in: line) {
+                pipeline = parsed
+                continue
+            }
+            if !sawBrowser, isDeliveryBrowser(line) {
+                sawBrowser = true
+                continue
+            }
+            if skill == nil, let parsed = deliverySkill(in: line) {
+                skill = parsed
+                continue
+            }
+            if mustSkill == nil, let parsed = deliveryMustSkill(in: line) {
+                mustSkill = parsed
+                continue
+            }
+            if commentTracker == nil, let parsed = deliveryComment(in: line) {
+                commentTracker = parsed.tracker
+                commentPRTool = parsed.prTool
+                continue
+            }
+            if !sawPostdeploy, isDeliveryPostdeploy(line) {
+                sawPostdeploy = true
+                continue
+            }
+            if email == nil, let parsed = deliveryEmail(in: line) {
+                email = parsed
+                continue
+            }
+            if password == nil, let parsed = deliveryPassword(in: line) {
+                password = parsed
+                continue
+            }
+            if !sawDone, isDeliveryDone(line) {
+                sawDone = true
+                continue
+            }
+            if prTool == nil, let parsed = deliveryPRTools(in: line) {
+                prTool = parsed.allowed
+                forbiddenPRTool = parsed.forbidden
+                continue
+            }
+            return nil
+        }
+
+        guard let pipeline,
+              sawBrowser,
+              let skill,
+              let mustSkill,
+              let commentTracker,
+              let commentPRTool,
+              sawPostdeploy,
+              let email,
+              let password,
+              sawDone,
+              let prTool,
+              let forbiddenPRTool,
+              mustSkill.lowercased() == skill.lowercased(),
+              commentTracker.lowercased() == pipeline.tracker.lowercased(),
+              commentPRTool.lowercased() == prTool.lowercased(),
+              isSafeTextAtom(pipeline.tracker),
+              isSafeTextAtom(pipeline.sourceList),
+              isSafeTextAtom(pipeline.mergeBranch),
+              isSafeTextAtom(pipeline.destList),
+              isSafeSkillAtom(skill),
+              isSafeEmailAtom(email),
+              isSafePasswordAtom(password),
+              isSafeTextAtom(prTool),
+              isSafeTextAtom(forbiddenPRTool) else {
+            return nil
+        }
+
+        let delivery = TrackerDelivery(
+            tracker: pipeline.tracker.lowercased(),
+            sourceList: pipeline.sourceList,
+            mergeBranch: pipeline.mergeBranch,
+            destList: pipeline.destList,
+            skill: skill,
+            email: email,
+            password: password,
+            prTool: prTool.lowercased(),
+            forbiddenPRTool: forbiddenPRTool.lowercased()
+        )
+        return encodeTrackerDelivery(delivery)
+    }
+
+    private static func encodeTrackerDelivery(_ delivery: TrackerDelivery) -> String {
+        let skillName = delivery.skill.hasPrefix("/")
+            ? String(delivery.skill.dropFirst())
+            : delivery.skill
+        let commentField = delivery.tracker == "trello"
+            ? "trello-comment:\(delivery.prTool).PR.url"
+            : "comment:\(delivery.tracker)=\(delivery.prTool).PR.url"
+        return """
+        \(SR2WirePolicy.optimizerMarkerLine)
+        goal:\(delivery.tracker).\(delivery.sourceList)[0]>implement>verify>merge:\(delivery.mergeBranch)>verify-merge>\(delivery.tracker):\(delivery.destList)
+        use:\(delivery.tracker)-skill,\(delivery.skill)
+        must:\(delivery.skill).all,\(delivery.skill).playwright,postdeploy-test
+        browser:chrome|computer-use?
+        auth:\(delivery.email)|\(delivery.password)
+        pr:\(delivery.prTool),!\(delivery.forbiddenPRTool)
+        \(commentField)
+        done:\(skillName).all+playwright+deploy+postdeploy-test+merge-verified+\(delivery.tracker)-\(delivery.destList.lowercased())
+        """
+    }
+
+    private static func isGoalSlashCommand(_ line: String) -> Bool {
+        fold(line).range(of: #"^/goal\.?$"#, options: .regularExpression) != nil
+    }
+
+    private static func collapseLabeledCredentialLines(_ lines: [String]) -> [String] {
+        var result: [String] = []
+        var index = 0
+        while index < lines.count {
+            let line = lines[index]
+            if isBareCredentialLabel(line), index + 1 < lines.count {
+                result.append("\(line) \(lines[index + 1])")
+                index += 2
+                continue
+            }
+            result.append(line)
+            index += 1
+        }
+        return result
+    }
+
+    private static func isBareCredentialLabel(_ line: String) -> Bool {
+        fold(line).range(
+            of: #"^(?:usuario|user|email|senha|password|pass)\s*:?\s*$"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private static func deliveryPipeline(in line: String) -> (
+        tracker: String, sourceList: String, mergeBranch: String, destList: String
+    )? {
+        guard let values = captures(
+            #"(?i)^usando a skill do ([A-Za-z][A-Za-z0-9_-]*) fa[cç]a a primeira (?:tarefa|task|card) que est[aá] no ([A-Za-z][A-Za-z0-9_-]*) e depois que tiver certeza de que tudo foi feito corretamente de merge para ([A-Za-z][A-Za-z0-9_-]*) garanta que o merge passou e mova para ([A-Za-z][A-Za-z0-9_-]*)\.?$"#,
+            in: line
+        ), values.count == 4 else { return nil }
+        return (values[0], values[1], values[2], values[3])
+    }
+
+    private static func isDeliveryBrowser(_ line: String) -> Bool {
+        fold(line).range(
+            of: #"^use o meu (?:google )?chrome ou computer use se precisar\.?$"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private static func deliverySkill(in line: String) -> String? {
+        captures(#"(?i)^use\s+(/[A-Za-z][A-Za-z0-9_-]*)\s*\.?$"#, in: line)?.first
+    }
+
+    private static func deliveryMustSkill(in line: String) -> String? {
+        captures(
+            #"(?i)^[eé]\s+obrigat[oó]rio seguir todos os passos da (/[A-Za-z][A-Za-z0-9_-]*) e principalmente os passos envolvendo playwright\.?$"#,
+            in: line
+        )?.first
+    }
+
+    private static func deliveryComment(in line: String) -> (tracker: String, prTool: String)? {
+        guard let values = captures(
+            #"(?i)^por fim comente no ([A-Za-z][A-Za-z0-9_-]*) card o link da (gh|github) pr\.?$"#,
+            in: line
+        ), values.count == 2 else { return nil }
+        let tool = values[1].lowercased() == "github" ? "gh" : values[1].lowercased()
+        return (values[0], tool)
+    }
+
+    private static func isDeliveryPostdeploy(_ line: String) -> Bool {
+        fold(line).range(
+            of: #"^teste sempre depois do deploy(?: feito)?\.?$"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private static func deliveryEmail(in line: String) -> String? {
+        let values = captures(
+            #"(?i)^(?:usuario|user|email)\s*:\s*(\S+@\S+)$"#,
+            in: line
+        )
+        return values?.first
+    }
+
+    private static func deliveryPassword(in line: String) -> String? {
+        captures(
+            #"(?i)^(?:senha|password|pass)\s*:\s*(.+)$"#,
+            in: line
+        )?.first
+    }
+
+    private static func isDeliveryDone(_ line: String) -> Bool {
+        fold(line).range(
+            of: #"^seu goal so estara completo quando voce tiver certeza de que aplicou todos os passos da [a-z0-9_/-]+ e testou tudo depois do deploy\.?$"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private static func deliveryPRTools(in line: String) -> (allowed: String, forbidden: String)? {
+        guard let values = captures(
+            #"(?i)^estamos usando ([A-Za-z][A-Za-z0-9_-]*) e n[aã]o ([A-Za-z][A-Za-z0-9_-]*)\.?$"#,
+            in: line
+        ), values.count == 2 else { return nil }
+        return (values[0], values[1])
+    }
+
+    private static func isSafeSkillAtom(_ value: String) -> Bool {
+        value.range(of: #"^/[A-Za-z][A-Za-z0-9_-]*$"#, options: .regularExpression) != nil
+    }
+
+    private static func isSafeEmailAtom(_ value: String) -> Bool {
+        guard value.range(of: #"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"#, options: .regularExpression) != nil,
+              !containsUnboundSemanticSyntax(value) else {
+            return false
+        }
+        return true
+    }
+
+    private static func isSafePasswordAtom(_ value: String) -> Bool {
+        !value.isEmpty
+            && !containsUnboundSemanticSyntax(value)
+            && value.unicodeScalars.allSatisfy {
+                !CharacterSet.controlCharacters.contains($0)
+                    && !":>(),&=+!@;|?\\".unicodeScalars.contains($0)
+            }
+    }
+
+    private static func fold(_ text: String) -> String {
+        text.folding(
+            options: [.diacriticInsensitive, .caseInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        ).lowercased()
     }
 }

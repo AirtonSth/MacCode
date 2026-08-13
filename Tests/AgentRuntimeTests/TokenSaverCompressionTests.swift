@@ -226,6 +226,23 @@ private actor CodexReasoningPause {
     }
 }
 
+private final class LockedStringBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String] = []
+
+    func append(_ value: String) {
+        lock.lock()
+        values.append(value)
+        lock.unlock()
+    }
+
+    func snapshot() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
+    }
+}
+
 private final class LockedTokenSaverToggle: @unchecked Sendable {
     private let lock = NSLock()
     private var enabled: Bool
@@ -1411,8 +1428,11 @@ final class TokenSaverCompressionTests: XCTestCase {
         XCTAssertEqual(translation.rewrittenText, expected)
     }
 
-    func test_singleSemanticSR1ReasoningLineIsHumanizedBeforeTimelinePersistence() async throws {
-        let tmp = NSTemporaryDirectory() + "rc2-ts-single-sr1-humanize-" + UUID().uuidString
+    func test_singleSemanticSR1ReasoningLineStaysOnWireUntilOnDemandHumanize() async throws {
+        // WHY: auto-LLM on every thought is the expensive path. A single SR1
+        // reasoning line must still land as canonical history, but Distill
+        // runs only when the user asks — or for the final answer.
+        let tmp = NSTemporaryDirectory() + "rc2-ts-single-sr1-ondemand-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
         let messageRepo = AgentMessageRepository(db: db)
@@ -1428,17 +1448,18 @@ final class TokenSaverCompressionTests: XCTestCase {
         let observer = RecordingObserver()
         coordinator.addObserver(observer)
         coordinator.tokenSaverRuntimeActive = { true }
+        let translatedInputs = LockedStringBox()
 
         coordinator.finalResponseTranslator = { response, provider, threadId, _ in
             XCTAssertEqual(provider, .codex)
             XCTAssertEqual(threadId, thread.id)
-            guard response == compressed else {
-                XCTAssertEqual(response, "done")
-                return "Completed."
+            translatedInputs.append(response)
+            if response == compressed
+                || SR2WirePolicy.providerOriginal(in: response) == compressed {
+                return "O modo /distill está ativo."
             }
-            XCTAssertTrue(SR1ResponseDetector.isSR1(response),
-                          "single semantic lines like 'S /distill ativo.' must be treated as SR1 when streamed by the provider")
-            return "O modo /distill está ativo."
+            XCTAssertEqual(response, "done")
+            return "Completed."
         }
 
         _ = try await coordinator.startRun(AgentRunRequest(
@@ -1449,28 +1470,36 @@ final class TokenSaverCompressionTests: XCTestCase {
             prompt: "/distill crie o snage game em html"
         ))
 
-        let expected = "O modo /distill está ativo."
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline,
               !observer.recordedEvents.contains(where: {
-                  $0.sr1TranslationForTest?.itemId != nil
-                      && $0.sr1TranslationForTest?.rewrittenText == expected
+                  if case .itemCompleted("stream-item", .completed) = $0 { return true }
+                  return false
               }) {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
 
         let history = try XCTUnwrap(observer.recordedEvents.compactMap(\.bodyAppendForTest).last)
-        let translation = try XCTUnwrap(observer.recordedEvents
-            .compactMap(\.sr1TranslationForTest)
-            .last(where: { $0.itemId != nil }))
         XCTAssertTrue(SR2WirePolicy.isCurrentSR2(history), history)
         XCTAssertEqual(SR2WirePolicy.providerOriginal(in: history), compressed)
-        XCTAssertEqual(translation.originalText, history)
-        XCTAssertEqual(translation.rewrittenText, expected)
+        XCTAssertFalse(observer.recordedEvents.contains { $0.sr1TranslationForTest?.itemId == "stream-item" },
+                       "thoughts must not auto-emit a typed UI translation")
+        XCTAssertFalse(translatedInputs.snapshot().contains(compressed),
+                       "the local LLM must not spend a turn on auto thought humanize")
+
+        let onDemand = await coordinator.humanizeProviderTextOnDemand(
+            text: history,
+            threadId: thread.id,
+            provider: .codex
+        )
+        XCTAssertEqual(onDemand, "O modo /distill está ativo.")
+        XCTAssertTrue(translatedInputs.snapshot().contains(history) || translatedInputs.snapshot().contains(compressed))
     }
 
-    func test_sr1ReasoningStreamIsHumanizedBeforeTimelinePersistence() async throws {
-        let tmp = NSTemporaryDirectory() + "rc2-ts-reasoning-humanize-" + UUID().uuidString
+    func test_sr1ReasoningStreamStaysCanonicalWithoutAutoHumanize() async throws {
+        // WHY: multi-line SR1 thoughts used to burn Distill on every item
+        // complete. History must stay v1; the UI wire stays until Translate.
+        let tmp = NSTemporaryDirectory() + "rc2-ts-reasoning-no-autohumanize-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
         let messageRepo = AgentMessageRepository(db: db)
@@ -1490,15 +1519,16 @@ final class TokenSaverCompressionTests: XCTestCase {
         let observer = RecordingObserver()
         coordinator.addObserver(observer)
         coordinator.tokenSaverRuntimeActive = { true }
+        let translatedInputs = LockedStringBox()
 
         coordinator.finalResponseTranslator = { response, provider, threadId, _ in
             XCTAssertEqual(provider, .claude)
             XCTAssertEqual(threadId, thread.id)
+            translatedInputs.append(response)
             guard response == compressed else {
                 XCTAssertEqual(response, "done")
                 return "Completed."
             }
-            XCTAssertTrue(SR1ResponseDetector.isSR1(response))
             return "O contexto foi carregado. Como /tmp não tem projeto, vou criar um arquivo HTML único para o Snake."
         }
 
@@ -1510,25 +1540,22 @@ final class TokenSaverCompressionTests: XCTestCase {
             prompt: "/distill crie o snage game em html"
         ))
 
-        let expected = "O contexto foi carregado. Como /tmp não tem projeto, vou criar um arquivo HTML único para o Snake."
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline,
               !observer.recordedEvents.contains(where: {
-                  $0.sr1TranslationForTest?.itemId != nil
-                      && $0.sr1TranslationForTest?.rewrittenText == expected
+                  if case .itemCompleted("stream-item", .completed) = $0 { return true }
+                  return false
               }) {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
 
         let history = try XCTUnwrap(observer.recordedEvents.compactMap(\.bodyAppendForTest).last)
-        let translation = try XCTUnwrap(observer.recordedEvents
-            .compactMap(\.sr1TranslationForTest)
-            .last(where: { $0.itemId != nil }))
         XCTAssertTrue(SR2WirePolicy.isCurrentSR2(history), history)
         XCTAssertEqual(SR2WirePolicy.providerOriginal(in: history), compressed)
-        XCTAssertEqual(translation.originalText, history)
-        XCTAssertEqual(translation.rewrittenText, expected,
-                       "reasoning/commentary must keep natural prose on the typed UI leg")
+        XCTAssertFalse(observer.recordedEvents.contains { $0.sr1TranslationForTest?.itemId != nil },
+                       "reasoning must not auto-write a typed UI translation")
+        XCTAssertFalse(translatedInputs.snapshot().contains(compressed),
+                       "auto thought humanize must not invoke the local LLM")
     }
 
     func test_normalFinalResponseDoesNotInvokeSR1Translator() async throws {
@@ -1693,8 +1720,8 @@ final class TokenSaverCompressionTests: XCTestCase {
 
     func test_allProvidersKeepFinalCommentaryAndReasoningHistoryCanonicalV1() async throws {
         // WHY: the paid feature contract is provider- and text-surface-wide.
-        // A final-only or Claude-only fix would still let commentary/thinking
-        // re-enter durable history as legacy wire or natural prose.
+        // Commentary/final still auto-humanize. Reasoning stays canonical on
+        // the history leg without a typed UI translation until the user asks.
         for provider in [AgentProvider.claude, .codex, .grok] {
             for itemType in [AssistantItemType.assistantMessage, .reasoning] {
                 let surface = itemType == .assistantMessage ? "commentary" : "reasoning"
@@ -1752,21 +1779,27 @@ final class TokenSaverCompressionTests: XCTestCase {
                 XCTAssertEqual(finalTranslation.rewrittenText, "Natural UI: \(finalRaw)")
 
                 let deadline = Date().addingTimeInterval(3)
-                while Date() < deadline,
-                      !coordinator.latestStreamEvents(threadId: thread.id).contains(where: {
-                          $0.sr1TranslationForTest?.itemId == "stream-item"
-                      }) {
+                while Date() < deadline {
+                    let events = coordinator.latestStreamEvents(threadId: thread.id)
+                    let hasHistory = events.contains { $0.bodyAppendForTest != nil }
+                    let hasItemTranslation = events.contains { $0.sr1TranslationForTest?.itemId == "stream-item" }
+                    if hasHistory && (itemType == .reasoning || hasItemTranslation) { break }
                     try? await Task.sleep(nanoseconds: 10_000_000)
                 }
                 let events = coordinator.latestStreamEvents(threadId: thread.id)
                 let history = try XCTUnwrap(events.compactMap(\.bodyAppendForTest).first)
                 XCTAssertTrue(SR2WirePolicy.isCurrentSR2(history), history)
                 XCTAssertEqual(SR2WirePolicy.providerOriginal(in: history), itemRaw)
-                let itemTranslation = try XCTUnwrap(events.compactMap(\.sr1TranslationForTest).first {
-                    $0.itemId == "stream-item"
-                })
-                XCTAssertEqual(itemTranslation.originalText, history)
-                XCTAssertEqual(itemTranslation.rewrittenText, "Natural UI: \(itemRaw)")
+                if itemType == .reasoning {
+                    XCTAssertNil(events.compactMap(\.sr1TranslationForTest).first { $0.itemId == "stream-item" },
+                                 "thoughts stay on the wire until on-demand Translate")
+                } else {
+                    let itemTranslation = try XCTUnwrap(events.compactMap(\.sr1TranslationForTest).first {
+                        $0.itemId == "stream-item"
+                    })
+                    XCTAssertEqual(itemTranslation.originalText, history)
+                    XCTAssertEqual(itemTranslation.rewrittenText, "Natural UI: \(itemRaw)")
+                }
             }
         }
     }
@@ -1777,7 +1810,6 @@ final class TokenSaverCompressionTests: XCTestCase {
         // parser -> coordinator so ON cannot persist/paint raw provider text,
         // while OFF remains a byte-for-byte pass-through.
         let raw = "S /distill ativo."
-        let natural = "O modo /distill está ativo."
 
         for tokenSaverEnabled in [true, false] {
             let tmp = NSTemporaryDirectory()
@@ -1803,11 +1835,10 @@ final class TokenSaverCompressionTests: XCTestCase {
             coordinator.addObserver(observer)
             coordinator.tokenSaverRuntimeActive = { tokenSaverEnabled }
             coordinator.finalResponseTranslator = { response, provider, threadId, _ in
-                XCTAssertTrue(tokenSaverEnabled, "OFF must never invoke the reasoning humanizer")
-                XCTAssertEqual(response, raw)
+                XCTFail("reasoning must not auto-invoke the local LLM (tokenSaver=\(tokenSaverEnabled)); got \(response)")
                 XCTAssertEqual(provider, .codex)
                 XCTAssertEqual(threadId, thread.id)
-                return natural
+                return "O modo /distill está ativo."
             }
 
             _ = try await coordinator.startRun(AgentRunRequest(
@@ -1825,10 +1856,7 @@ final class TokenSaverCompressionTests: XCTestCase {
                     if case .itemCompleted("reasoning-fallback", .completed) = $0 { return true }
                     return false
                 }
-                let translated = events.contains {
-                    $0.sr1TranslationForTest?.itemId == "reasoning-fallback"
-                }
-                if completed && (translated || !tokenSaverEnabled) { break }
+                if completed { break }
                 try? await Task.sleep(nanoseconds: 10_000_000)
             }
 
@@ -1849,12 +1877,9 @@ final class TokenSaverCompressionTests: XCTestCase {
                                "view-original provenance must recover the exact Codex reasoning")
                 XCTAssertFalse(bodies.contains(raw),
                                "raw provider reasoning must not paint or persist on the history leg")
-                let translation = try XCTUnwrap(events.compactMap(\.sr1TranslationForTest).first {
-                    $0.itemId == "reasoning-fallback"
-                })
-                XCTAssertEqual(translation.originalText, history)
-                XCTAssertEqual(translation.rewrittenText, natural,
-                               "the typed UI leg must remain natural language")
+                XCTAssertFalse(events.contains {
+                    $0.sr1TranslationForTest?.itemId == "reasoning-fallback"
+                }, "thoughts must wait for on-demand Translate instead of auto-humanize")
             } else {
                 XCTAssertEqual(bodies, [raw], "Token Saver OFF must preserve Codex reasoning verbatim")
                 XCTAssertFalse(events.contains {
@@ -1900,6 +1925,7 @@ final class TokenSaverCompressionTests: XCTestCase {
             XCTAssertEqual(provider, .codex)
             XCTAssertNotEqual(threadId, offThread.id,
                               "an OFF-admitted run must never invoke the provider-text translator")
+            XCTFail("reasoning must not auto-humanize after admission is frozen; got \(response)")
             return "Natural UI: \(response)"
         }
 
@@ -1986,9 +2012,8 @@ final class TokenSaverCompressionTests: XCTestCase {
             XCTAssertTrue(SR2WirePolicy.isCurrentSR2(history), history)
             XCTAssertEqual(SR2WirePolicy.providerOriginal(in: history), raw,
                            "every provider source byte must survive exactly once")
-            let rendered = try XCTUnwrap(translation(for: itemId))
-            XCTAssertEqual(rendered.originalText, history)
-            XCTAssertEqual(rendered.rewrittenText, "Natural UI: \(raw)")
+            XCTAssertNil(translation(for: itemId),
+                         "ON-admitted thoughts stay on the wire until the user clicks Translate")
         }
 
         let offBodies = bodyDeltas(for: itemIds[1])

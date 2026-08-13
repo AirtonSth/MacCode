@@ -11,8 +11,8 @@ import SocketServer
 @MainActor
 final class TokenSaverAppContextTests: XCTestCase {
     func testUserPromptAlwaysUsesLosslessSR2Wire() {
-        // WHY: Token Saver's paid-provider leg has one SR2 wire contract, even
-        // when the envelope costs more than a short natural-language prompt.
+        // WHY: a shorter compressed phrase still beats the long original, but
+        // wrapping that phrase in `u:` is more verbose than the phrase itself.
         let original = Array(repeating: "Please inspect the duplicate controller implementation.", count: 80)
             .joined(separator: " ")
         let compressed = "inspect duplicate controller implementation"
@@ -21,57 +21,91 @@ final class TokenSaverAppContextTests: XCTestCase {
             compressed: compressed
         )
 
-        XCTAssertTrue(SR2WirePolicy.isSR2(adopted), adopted)
-        XCTAssertTrue(SR2WirePolicy.isCurrentSR2(adopted), adopted)
-        XCTAssertEqual(SR2WirePolicy.userInstruction(in: adopted), compressed)
+        XCTAssertEqual(adopted, compressed)
+        XCTAssertLessThan(
+            TokenEstimator.estimate(adopted),
+            TokenEstimator.estimate(original)
+        )
+        XCTAssertLessThanOrEqual(
+            TokenEstimator.estimate(adopted),
+            TokenEstimator.estimate(SR2WirePolicy.userInstructionWire(compressed))
+        )
 
         let short = "fix typo"
         let shortWire = AppContext.netPositiveSR2UserInstruction(original: short, compressed: short)
-        XCTAssertTrue(SR2WirePolicy.isSR2(shortWire), shortWire)
-        XCTAssertTrue(SR2WirePolicy.isCurrentSR2(shortWire), shortWire)
-        XCTAssertEqual(SR2WirePolicy.userInstruction(in: shortWire), short)
+        XCTAssertEqual(shortWire, short,
+                       "a short prompt must not pay a more verbose SR2 envelope")
 
-        let optimized = SR2WirePolicy.userInstructionWire(short)
+        let compact = """
+        @sr2 v1
+        flow:inspect>verify
+        done:flow
+        """
         XCTAssertEqual(
-            AppContext.netPositiveSR2UserInstruction(original: short, compressed: optimized),
-            optimized,
-            "an already-valid SR2 candidate must be preserved byte-for-byte"
+            AppContext.netPositiveSR2UserInstruction(original: original, compressed: compact),
+            compact,
+            "compiled SR2 that is cheaper than the original stays on the provider wire"
         )
     }
 
     func testAlwaysOnUserPromptUsesSR2EvenWhenShortOrCompressionUnavailable() {
-        // WHY: the paid runtime has one provider wire contract. A short prompt
-        // must still be lossless SR2 on the wire while the UI keeps natural text.
+        // WHY: wrapping a short prompt in `@sr2 v1 / u: / o:cont` is more
+        // verbose than the prose. Providers must receive the natural text.
         let short = "fix typo"
         let wire = AppContext.alwaysOnSR2UserInstruction(short)
-        XCTAssertTrue(SR2WirePolicy.isSR2(wire), wire)
-        XCTAssertTrue(SR2WirePolicy.isCurrentSR2(wire), wire)
-        XCTAssertEqual(SR2WirePolicy.userInstruction(in: wire), short)
+        XCTAssertEqual(wire, short)
+        XCTAssertFalse(SR2WirePolicy.isSR2(wire), wire)
 
         let whitespacePrompt = "  fix typo  \n"
         let whitespaceWire = AppContext.alwaysOnSR2UserInstruction(whitespacePrompt)
-        XCTAssertEqual(SR2WirePolicy.userInstruction(in: whitespaceWire), whitespacePrompt,
-                       "always-on SR2 must preserve the complete natural prompt byte-for-byte")
+        XCTAssertEqual(whitespaceWire, whitespacePrompt)
 
         let malformedCandidate = "@sr2 v0\no:ok\nprovider prose leaked here"
         let escaped = AppContext.alwaysOnSR2UserInstruction(malformedCandidate)
-        XCTAssertTrue(SR2WirePolicy.isSR2(escaped), escaped)
-        XCTAssertTrue(SR2WirePolicy.isCurrentSR2(escaped), escaped)
-        XCTAssertEqual(SR2WirePolicy.userInstruction(in: escaped), malformedCandidate)
+        XCTAssertEqual(escaped, malformedCandidate)
+    }
+
+    func testAlwaysOnSendsNaturalLanguageWhenSR2EnvelopeIsMoreVerbose() {
+        // WHY: Claude/Codex/Grok should not pay banner+escape overhead for a
+        // short ask. Compact compiled SR2 still wins on a long source.
+        let short = "fix typo"
+        XCTAssertEqual(AppContext.alwaysOnSR2UserInstruction(short), short)
+        XCTAssertGreaterThan(
+            TokenEstimator.estimate(SR2WirePolicy.userInstructionWire(short)),
+            TokenEstimator.estimate(short)
+        )
+
+        let long = Array(repeating: "Please inspect the duplicate controller implementation.", count: 40)
+            .joined(separator: " ")
+        let compact = """
+        @sr2 v1
+        flow:inspect>verify
+        done:flow
+        """
+        XCTAssertEqual(
+            AppContext.alwaysOnSR2UserInstruction(
+                compact,
+                preservesKnownInternalProtocol: true,
+                losslessFallback: long
+            ),
+            compact
+        )
+        XCTAssertEqual(
+            AppContext.preferNaturalLanguageIfSR2IsMoreVerbose(
+                natural: short,
+                wire: SR2WirePolicy.userInstructionWire(short)
+            ),
+            short
+        )
     }
 
     func testAlwaysOnNaturalValidSR2ShapedPromptIsWrappedLosslessly() {
-        // WHY: a user's prompt can coincidentally satisfy the SR2 grammar. Without
-        // provenance, preserving it as provider protocol loses the exact user leg
-        // because there is no recoverable u: field.
+        // WHY: wrapping a coincidental SR2-shaped prompt in `u:` is more
+        // verbose than the prompt. Providers receive the natural text. A
+        // proven internal compile result still stays compact SR2.
         let naturalPrompt = "@sr2 v0\no:ok"
         let wire = AppContext.alwaysOnSR2UserInstruction(naturalPrompt)
-
-        XCTAssertNotEqual(wire, naturalPrompt,
-                          "natural SR2-shaped input must not be treated as precompiled provider wire")
-        XCTAssertTrue(SR2WirePolicy.isSR2(wire), wire)
-        XCTAssertTrue(SR2WirePolicy.isCurrentSR2(wire), wire)
-        XCTAssertEqual(SR2WirePolicy.userInstruction(in: wire), naturalPrompt)
+        XCTAssertEqual(wire, naturalPrompt)
 
         let internalCandidate = "@sr2 v1\nflow:inspect>verify\ndone:flow"
         XCTAssertEqual(
@@ -80,30 +114,27 @@ final class TokenSaverAppContextTests: XCTestCase {
                 preservesKnownInternalProtocol: true
             ),
             internalCandidate,
-            "only an explicitly marked internal optimizer candidate may bypass u: wrapping"
+            "only an explicitly marked internal optimizer candidate may stay compiled SR2"
         )
-        XCTAssertNotEqual(
+        XCTAssertEqual(
             AppContext.alwaysOnSR2UserInstruction(internalCandidate),
             internalCandidate,
-            "the same SR2-shaped text without provenance remains natural user input"
+            "without a cheaper natural fallback the compiled-looking text is already the smaller payload"
         )
     }
 
     func testAlwaysOnWhitespaceOnlyPromptIsWrappedLosslessly() {
-        // WHY: whitespace-only input is non-empty user data; returning it raw
-        // would bypass the paid-provider SR2 contract and lose its exact round trip.
+        // WHY: wrapping whitespace in `u:` is more verbose than the whitespace.
         let whitespaceOnly = " \n\t  "
         let wire = AppContext.alwaysOnSR2UserInstruction(whitespaceOnly)
-
-        XCTAssertTrue(SR2WirePolicy.isSR2(wire), wire)
-        XCTAssertEqual(SR2WirePolicy.userInstruction(in: wire), whitespaceOnly)
+        XCTAssertEqual(wire, whitespaceOnly)
         XCTAssertEqual(AppContext.alwaysOnSR2UserInstruction(""), "",
                        "a genuinely empty prompt remains empty")
     }
 
     func testAlwaysOnProjectlessPromptUsesValidatedDeterministicSemanticV1() {
-        // WHY: projectless work cannot enter project-scoped MLX recovery, but a
-        // self-contained exact command contract should still avoid a prose v0.
+        // WHY: the sync wrap is not a compiler. Without a local-LLM compile
+        // result, the paid wire is lossless `u:` even for an exact command prompt.
         let prompt = "Execute apenas `command -v swift; command -v distill` e retorne exatamente as duas linhas. Não edite arquivos."
         let wire = AppContext.alwaysOnSR2UserInstruction(prompt)
 
@@ -113,8 +144,6 @@ final class TokenSaverAppContextTests: XCTestCase {
         out:=2lines
         !file-edit
         """)
-        XCTAssertNil(SR2WirePolicy.userInstruction(in: wire),
-                     "accepted semantic v1 must not be hidden inside a lossless u: wrapper")
 
         let targetTokenizerRejects = AppContext.alwaysOnSR2UserInstruction(
             prompt,
@@ -123,8 +152,73 @@ final class TokenSaverAppContextTests: XCTestCase {
             targetTokenizer: "codex/gpt-test-tokenizer",
             targetTokenCount: { text in text.hasPrefix("@sr2 v1") ? 100 : 10 }
         )
-        XCTAssertEqual(SR2WirePolicy.userInstruction(in: targetTokenizerRejects), prompt,
-                       "an available provider/model tokenizer must override the fallback estimate")
+        XCTAssertEqual(targetTokenizerRejects, prompt,
+                       "a more expensive SR2 estimate must not replace the natural prompt")
+    }
+
+    func testProjectlessPortugueseTrelloGoalCompilesToTrackerDeliveryV1() {
+        // WHY: sending the live STAR Trello /goal used to emit lossless
+        // `@sr2 v1\nu:/goal \\n\\n...` instead of compiling the ordered
+        // delivery contract. The always-on projectless path must produce
+        // the same semantic v1 for Claude, Codex, and Grok.
+        let prompt = """
+        /goal
+
+        Usando a skill do trello faça a primeira tarefa que está no Doing e depois que tiver certeza de que tudo foi feito corretamente de merge para main garanta que o merge passou e mova para Testing.
+
+        Use o meu Google Chrome ou Computer Use se precisar.
+
+        Use /sam-task .
+
+        É obrigatório seguir todos os passos da /sam-task e principalmente os passos envolvendo playwright.
+
+        Por fim comente no trello card o link da gh PR.
+
+        Teste sempre depois do deploy feito.
+
+        Usuario:
+        jgregory@starsacramento.org
+
+        Senha:
+        zoey is the best
+
+        Seu goal só estará completo quando voce tiver certeza de que aplicou todos os passos da sam-task e testou tudo depois do deploy.
+
+        Estamos usando gh e não glab.
+        """
+        let expected = """
+        @sr2 v1
+        goal:trello.Doing[0]>implement>verify>merge:main>verify-merge>trello:Testing
+        use:trello-skill,/sam-task
+        must:/sam-task.all,/sam-task.playwright,postdeploy-test
+        browser:chrome|computer-use?
+        auth:jgregory@starsacramento.org|zoey is the best
+        pr:gh,!glab
+        trello-comment:gh.PR.url
+        done:sam-task.all+playwright+deploy+postdeploy-test+merge-verified+trello-testing
+        """
+        let targets = [
+            (AgentProvider.claude.rawValue, "claude-opus-test"),
+            (AgentProvider.codex.rawValue, "gpt-test"),
+            (AgentProvider.grok.rawValue, "grok-test"),
+        ]
+
+        let wires = targets.map { provider, model in
+            AppContext.alwaysOnSR2UserInstruction(prompt, provider: provider, model: model)
+        }
+
+        XCTAssertEqual(Set(wires).count, 1,
+                       "provider/model labels must not fork the cheaper compiled tracker-delivery wire")
+        XCTAssertEqual(wires.first, expected)
+        XCTAssertEqual(
+            AppContext.alwaysOnSR2UserInstruction(
+                expected,
+                preservesKnownInternalProtocol: true,
+                losslessFallback: prompt
+            ),
+            expected,
+            "a cheaper compiled Trello SR2 stays on the provider wire"
+        )
     }
 
     func testProjectlessNaturalTaskWireIsCanonicalAcrossAllProviderModelLabels() {
@@ -165,11 +259,16 @@ final class TokenSaverAppContextTests: XCTestCase {
         }
 
         XCTAssertEqual(Set(wires).count, 1,
-                       "provider/model labels must not fork the deterministic projectless contract")
+                       "provider/model labels must not fork the cheaper compiled natural-task wire")
         XCTAssertEqual(wires.first, expected)
-        XCTAssertFalse(expected.contains("\nu:"), expected)
-        XCTAssertNil(SR2WirePolicy.userInstruction(in: expected),
-                     "the canonical semantic task must not masquerade as lossless u: passthrough")
+        XCTAssertEqual(
+            AppContext.alwaysOnSR2UserInstruction(
+                expected,
+                preservesKnownInternalProtocol: true,
+                losslessFallback: prompt
+            ),
+            expected
+        )
     }
 
     func testProductionEstimatorCompilesExactPortugueseCompoundIntoOrderedToolGroups() {
@@ -191,11 +290,15 @@ final class TokenSaverAppContextTests: XCTestCase {
         !file-edit
         done:run+summary
         """)
-        XCTAssertLessThan(
-            TokenEstimator.estimate(wire),
-            TokenEstimator.estimate(SR2WirePolicy.userInstructionWire(prompt)),
-            "the production estimator must choose grouped SR2 because it is actually cheaper"
-        )
+        let compiled = SR2Optimizer.compile(original: prompt)
+        XCTAssertTrue(compiled.accepted, compiled.rejectionReason ?? "")
+        XCTAssertEqual(compiled.output, """
+        @sr2 v1
+        run:[command -v swift;command -v distill]>[rg -n UNIQUE_EXACT_MATCH README.md]>[swift noisy.swift]
+        out:1=2lines,2=1line
+        !file-edit
+        done:run+summary
+        """)
     }
 
     func testAlwaysOnSemanticWireUsesTrustedSourceAndExcludesSpoofedOrchestrationText() {
@@ -227,7 +330,16 @@ final class TokenSaverAppContextTests: XCTestCase {
         !file-edit
         done:run
         """)
-        XCTAssertFalse(wire.contains("remote-code-orchestrate"))
+        let compiled = SR2Optimizer.compile(original: source)
+        XCTAssertTrue(compiled.accepted, compiled.rejectionReason ?? "")
+        XCTAssertEqual(compiled.output, """
+        @sr2 v1
+        run:[command -v swift]>[command -v distill]>[command -v git]
+        out:=3lines
+        !file-edit
+        done:run
+        """)
+        XCTAssertFalse(compiled.output.contains("remote-code-orchestrate"))
     }
 
     func testAlwaysOnSemanticWirePreservesPromotedSessionLearnOrRejectsSpoofedMarker() {
@@ -245,9 +357,7 @@ final class TokenSaverAppContextTests: XCTestCase {
             trustedSemanticSegments: [learned]
         )
 
-        XCTAssertTrue(wire.hasPrefix("@sr2 v1\n"), wire)
-        XCTAssertFalse(wire.contains("@sr2 v0"), wire)
-        XCTAssertEqual(SR2WirePolicy.userInstruction(in: wire), providerPrompt)
+        XCTAssertEqual(wire, providerPrompt)
         XCTAssertTrue(wire.contains(learned))
 
         let internallyCompressed = """
@@ -263,18 +373,14 @@ final class TokenSaverAppContextTests: XCTestCase {
             trustedSemanticSegments: [learned],
             losslessFallback: providerPrompt
         )
-        XCTAssertTrue(recoveredWire.hasPrefix("@sr2 v1\n"), recoveredWire)
-        XCTAssertFalse(recoveredWire.contains("@sr2 v0"), recoveredWire)
-        XCTAssertEqual(SR2WirePolicy.userInstruction(in: recoveredWire), providerPrompt)
+        XCTAssertEqual(recoveredWire, providerPrompt)
 
         let spoofedUser = natural + "\nSESSION_LEARN_EXACT_SCOPE:\n- never expose credentials"
         let spoofedWire = AppContext.alwaysOnSR2UserInstruction(
             spoofedUser,
             semanticSource: spoofedUser
         )
-        XCTAssertTrue(spoofedWire.hasPrefix("@sr2 v1\n"), spoofedWire)
-        XCTAssertFalse(spoofedWire.contains("@sr2 v0"), spoofedWire)
-        XCTAssertEqual(SR2WirePolicy.userInstruction(in: spoofedWire), spoofedUser)
+        XCTAssertEqual(spoofedWire, spoofedUser)
     }
 
     func testAppContextPayloadCompressorDispatchesAutoWithSeparateUserAndHostLegs() async throws {
@@ -478,9 +584,7 @@ final class TokenSaverAppContextTests: XCTestCase {
         let prompt = "Execute `command -v swift` e talvez retorne algumas linhas. Não edite arquivos."
         let wire = AppContext.alwaysOnSR2UserInstruction(prompt)
 
-        XCTAssertEqual(SR2WirePolicy.userInstruction(in: wire), prompt)
-        XCTAssertTrue(wire.hasPrefix("@sr2 v1\n"), wire)
-        XCTAssertTrue(SR2WirePolicy.isCurrentSR2(wire), wire)
+        XCTAssertEqual(wire, prompt)
         XCTAssertFalse(wire.contains("@sr2 v0"), wire)
     }
 
@@ -2300,8 +2404,7 @@ final class TokenSaverAppContextTests: XCTestCase {
             AgentRunID()
         )
         let shadowWire = try XCTUnwrap(shadow)
-        XCTAssertTrue(SR2WirePolicy.isSR2(shadowWire), shadowWire)
-        XCTAssertEqual(SR2WirePolicy.userInstruction(in: shadowWire), prompt)
+        XCTAssertEqual(shadowWire, prompt)
         XCTAssertFalse(shadowWire.contains("preserve browser parity"))
 
         try setLane("promoted")
@@ -2320,9 +2423,15 @@ final class TokenSaverAppContextTests: XCTestCase {
         // Reproduce the command-compilable user request that previously let
         // the v1 compiler drop the trusted SessionLearn suffix.
         let commandPrompt = "Execute apenas `command -v swift; command -v distill` e retorne exatamente as duas linhas. Não edite arquivos."
-        XCTAssertTrue(
-            AppContext.alwaysOnSR2UserInstruction(commandPrompt).hasPrefix("@sr2 v1\n"),
-            "the natural command contract must be v1-compilable before SessionLearn is promoted"
+        XCTAssertEqual(
+            AppContext.alwaysOnSR2UserInstruction(commandPrompt),
+            """
+            @sr2 v1
+            run:command -v swift;command -v distill
+            out:=2lines
+            !file-edit
+            """,
+            "a cheaper compiled command contract stays on the provider wire"
         )
         // Match the selector query while retaining a learned instruction that
         // the bounded v1 command grammar cannot represent.
@@ -2342,9 +2451,9 @@ final class TokenSaverAppContextTests: XCTestCase {
         let expectedProviderPrompt = commandPrompt
             + "\n\nSESSION_LEARN_EXACT_SCOPE:\n- preserve command output"
         XCTAssertEqual(
-            SR2WirePolicy.userInstruction(in: commandWire),
+            commandWire,
             expectedProviderPrompt,
-            "an unrepresentable trusted SessionLearn segment must fail open to the complete v0 prompt: \(commandWire)"
+            "an unrepresentable trusted SessionLearn segment must fail open to the complete prompt: \(commandWire)"
         )
         XCTAssertTrue(commandWire.contains("preserve command output"), commandWire)
     }
@@ -2465,7 +2574,7 @@ final class TokenSaverAppContextTests: XCTestCase {
         let sidecarCallCount = await runtime.count
         XCTAssertEqual(sidecarCallCount, 1, "the regression must exercise the promoted sidecar path")
         XCTAssertEqual(
-            SR2WirePolicy.userInstruction(in: output),
+            SR2WirePolicy.userInstruction(in: output) ?? output,
             expectedProviderPrompt,
             "legacy v0 must fail open to the complete provider prompt when trusted semantics cannot compile"
         )
