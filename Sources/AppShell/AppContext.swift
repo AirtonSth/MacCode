@@ -4466,9 +4466,9 @@ public final class AppContext {
         let spanish = targetLanguage.localizedCaseInsensitiveContains("Spanish")
 
         // SR2 Opaque Agent IR (T-FF-01 fail-open without Fieldfare): expand o:/p:/e: fields.
-        if SR2WirePolicy.isSR2(response) || SR2WirePolicy.hasSR2Banner(response) {
-            if !portuguese, !spanish,
-               let rendered = SR2WirePolicy.deterministicHumanizedWire(response) {
+        if SR2WirePolicy.isSR2(response) || SR2WirePolicy.hasSR2Banner(response)
+            || SR2WirePolicy.looksLikeCompressedAgentIR(response) {
+            if let rendered = SR2WirePolicy.deterministicHumanizedWire(response) {
                 return rendered
             }
             var outcomes: [String] = []

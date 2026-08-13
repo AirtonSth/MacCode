@@ -1454,6 +1454,11 @@ public struct LocalDistillRuntime: DistillRuntime {
             source = String(input[range.upperBound...])
         }
         source = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        if SR2WirePolicy.isSR2(source) || SR2WirePolicy.hasSR2Banner(source)
+            || SR2WirePolicy.looksLikeCompressedAgentIR(source),
+           let rendered = SR2WirePolicy.deterministicHumanizedWire(source) {
+            return String(rendered.prefix(maxOutputCharacters))
+        }
         // O-first prose: surface outcome lines; drop S/C/D/N chrome.
         var outcomes: [String] = []
         var extras: [String] = []
@@ -1843,11 +1848,11 @@ public struct MLXDistillRuntime: DistillRuntime {
         switch mode {
         case .sr1Humanize:
             return """
-            You translate /distill output into human language for a software engineer.
-            /distill output is compressed Military English + AR-0/AR-1 for prompts, task specs, commands, or agent instructions.
-            It may contain Dict/Dict+, dynamic inline variables, and fixed prefixes S, C, D, R, O, N, P.
+            You translate compressed agent output into human language for a software engineer.
+            Input may be SR1 (Dict/Dict+ and prefixes S, C, D, R, O, N, P) or SR2 (@sr2 v1 field lines such as g/d/p/o/e/h, Action, Proof, and e:status keys).
             Prefix meanings are usually S=state/status, C=cause/context, D=action/decision, R=risk/blocker, O=outcome/output, N=constraint/no-go, P=pass criteria/proof.
             Expand aliases from Dict and Dict+ when present. Keep aliases unchanged when no definition is present.
+            Expand every SR2 field into ordinary sentences or a short status list. Never echo @sr2, e:, g:, o:, p:, or other wire syntax.
             Preserve constraints, pass criteria, required output, blockers, uncertainty, file names, paths, commands, environment variables, IDs, security warnings, and production/data-loss warnings.
             Do not invent missing facts. Do not claim execution happened unless the input says it happened.
             Write concise natural language in the requested language or locale.
@@ -1950,7 +1955,7 @@ public struct MLXDistillRuntime: DistillRuntime {
             Output only the final user-facing answer.
             Preserve exact commands, paths, IDs, errors, numbers, statuses, and proof.
             Do not output markdown unless the answer needs a short list.
-            Do not output SR1 prefixes, prefix dictionaries, XML tags, or instructions.
+            Do not output SR1 prefixes, @sr2 banners, raw e:/g:/o:/p: field dumps, prefix dictionaries, XML tags, or instructions.
 
             \(request.input)
 

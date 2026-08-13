@@ -581,4 +581,74 @@ final class SR2WirePolicyTests: XCTestCase {
             display
         )
     }
+
+    func testTrackerDeliveryBlockedDeployProofHumanizesToNarrative() {
+        // WHY: the live Codex/Trello final used mixed SR2 (`Action:`/`Proof:`/
+        // bare `blocked` + `e:` status keys). The old expander skipped those
+        // lines and left `e:railway-...` on screen. Humans need the status
+        // list, not the protocol dump.
+        let wire = """
+        @sr2 v1
+        g:trello-doing-delivery
+        Action: blocked-deploy-proof
+        Proof: path:final
+        blocked
+        e:PRs-merged:19,14
+        e:railway-main-admin:SUCCESS
+        e:railway-prod-api:INITIALIZING
+        e:railway-prod-access-pins:404-before-clean-deploy
+        e:playwright:unverified
+        e:trello:unchanged-Doing
+        e:comments:not-posted
+        e:PR19:https://github.com/si-ncs/star-api-v3/pull/19
+        e:PR14:https://github.com/si-ncs/admin-foundation-v3/pull/14
+        e:next:wait-for-deploy-then-run-authenticated-playwright-postdeploy-and-update-Trello
+        """
+        XCTAssertFalse(SR2WirePolicy.isSR2(wire), "Action/Proof/blocked stay outside the strict grammar")
+        XCTAssertTrue(SR2WirePolicy.hasSR2Banner(wire))
+        XCTAssertTrue(SR2WirePolicy.looksLikeCompressedAgentIR(wire))
+
+        let display = try? XCTUnwrap(SR2WirePolicy.deterministicHumanizedWire(wire))
+        let expected = """
+        The goal is to deliver the Trello task currently in Doing.
+        The current action is blocked while waiting for deployment proof.
+        Current status:
+        * PR #19 has been merged: si-ncs/star-api-v3#19.
+        * PR #14 has been merged: si-ncs/admin-foundation-v3#14.
+        * The Railway deployment for main-admin succeeded.
+        * The Railway production API deployment is still initializing.
+        * The production access-pins endpoint returned a 404 before the clean deployment.
+        * Post-deployment Playwright testing has not yet been verified.
+        * The Trello card remains in Doing.
+        * No comments have been posted to the Trello card yet.
+        The next step is to wait for the deployment to finish, then run authenticated post-deployment Playwright tests. If everything is verified successfully, update the Trello card accordingly.
+        """
+        XCTAssertEqual(display, expected)
+        XCTAssertFalse(display?.contains("@sr2") == true, display ?? "")
+        XCTAssertFalse(display?.contains("e:") == true, display ?? "")
+        XCTAssertFalse(display?.contains("g:") == true, display ?? "")
+        XCTAssertEqual(SR2WirePolicy.humanReadableDisplay(stored: wire), expected)
+
+        let plan = SR2WirePolicy.dualChannelPersistPlan(
+            modelOutput: wire,
+            humanizeOutput: wire,
+            tokenSaverOn: true,
+            isSR1: { _ in false },
+            storeProse: { _ in "trello-doing-handle" }
+        )
+        XCTAssertEqual(plan.uiText, expected)
+        XCTAssertTrue(plan.shouldEmitTranslation)
+        XCTAssertNotEqual(plan.historyText, wire)
+
+        let stripped = wire
+            .split(whereSeparator: \.isNewline)
+            .dropFirst()
+            .joined(separator: "\n")
+        XCTAssertFalse(SR2WirePolicy.hasSR2Banner(stripped))
+        XCTAssertEqual(
+            SR2WirePolicy.humanReadableDisplay(stored: stripped),
+            expected,
+            "a humanizer that only dropped the banner must still expand"
+        )
+    }
 }

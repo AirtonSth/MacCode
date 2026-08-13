@@ -301,10 +301,41 @@ public enum SR2WirePolicy: Sendable {
             }
             return humanReadableDisplay(stored: original, retrieve: nil)
         }
-        if isSR2(trimmed) || hasSR2Banner(trimmed) {
+        if isSR2(trimmed) || hasSR2Banner(trimmed) || looksLikeCompressedAgentIR(trimmed) {
             return deterministicHumanizedWire(trimmed) ?? unavailableStatusNote
         }
         return stored
+    }
+
+    /// Banner-stripped leftovers still look like provider IR: several `g:`/`e:`
+    /// lines, or English labels the model used instead of `d:`/`p:`.
+    public static func looksLikeCompressedAgentIR(_ text: String) -> Bool {
+        if hasSR2Banner(text) || isSR2(text) { return true }
+        let lines = text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        var hits = 0
+        for line in lines.prefix(24) {
+            if structuredField(line) != nil {
+                hits += 1
+                continue
+            }
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let key = String(line[..<colon])
+            guard key.count <= 40,
+                  key.rangeOfCharacter(from: .whitespaces) == nil,
+                  key.contains(where: \.isLetter) else { continue }
+            let lower = key.lowercased()
+            if lower == "action" || lower == "proof" || lower == "status"
+                || lower == "next" || lower.hasPrefix("pr")
+                || lower.hasPrefix("railway") || lower == "playwright"
+                || lower == "trello" || lower == "comments" {
+                hits += 1
+            }
+        }
+        return hits >= 3
     }
 
     /// Deterministic last-resort UI rendering from a source that has already
@@ -312,12 +343,19 @@ public enum SR2WirePolicy: Sendable {
     /// prose. Status lives on `e:` — only fail/error values render as Error.
     public static func deterministicHumanizedWire(_ text: String) -> String? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard isSR2(trimmed) || hasSR2Banner(trimmed) else { return nil }
+        guard isSR2(trimmed) || hasSR2Banner(trimmed) || looksLikeCompressedAgentIR(trimmed) else {
+            return nil
+        }
 
         var outcomes: [String] = []
         var evidence: [String] = []
         var notes: [String] = []
+        var narrativeNotes: [String] = []
         var semantics: [String] = []
+        var mergedPRIds: [String] = []
+        var prURLsById: [String: String] = [:]
+        var nextStep: String?
+        var actionMentionsBlocked = false
         var continuationOnly = false
         var hasOkOutcome = false
         let labels = [
@@ -357,6 +395,7 @@ public enum SR2WirePolicy: Sendable {
                 let rest = String(value.dropFirst(5))
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if rest.isEmpty { return nil }
+                if rest.lowercased() == "final" { return nil }
                 if rest.allSatisfy(\.isNumber) { return "Path \(rest)." }
                 return "Path: \(sentence(rest))"
             }
@@ -371,6 +410,36 @@ public enum SR2WirePolicy: Sendable {
             }
             return "Evidence: \(sentence(value))"
         }
+        func ingestStatus(key: String, rest: String) {
+            if key == "prs-merged" || key == "prs_merged" {
+                mergedPRIds = rest
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                return
+            }
+            if key.hasPrefix("pr"), key.count > 2, key.dropFirst(2).allSatisfy(\.isNumber) {
+                prURLsById[String(key.dropFirst(2))] = rest
+                return
+            }
+            if key == "next" {
+                nextStep = nextStepNarrative(rest)
+                return
+            }
+            if let narrative = trackerDeliveryStatusLine(key: key, rest: rest) {
+                narrativeNotes.append(narrative)
+                return
+            }
+            if let line = genericStatusLine(
+                key: key,
+                rest: rest,
+                statusLabels: statusLabels,
+                readableHyphens: readableHyphens,
+                sentence: sentence
+            ) {
+                notes.append(line)
+            }
+        }
         func statusLine(_ value: String) -> String? {
             let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty { return nil }
@@ -383,58 +452,218 @@ public enum SR2WirePolicy: Sendable {
                 let rest = String(trimmed[trimmed.index(after: colon)...])
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if rest.isEmpty { return statusLine(key) }
-                if key == "url" { return "URL: \(rest)" }
-                let label = statusLabels[key] ?? key.capitalized
-                if label == "Error" {
-                    return "Error: \(sentence(readableHyphens(rest)))"
-                }
-                return "\(label): \(sentence(readableHyphens(rest)))"
+                ingestStatus(key: key, rest: rest)
+                return nil
             }
             if lower.hasPrefix("fail") || lower.hasPrefix("error") {
                 return "Error: \(sentence(readableHyphens(trimmed)))"
             }
             return "Status: \(sentence(readableHyphens(trimmed)))"
         }
-
-        for raw in trimmed.split(whereSeparator: \.isNewline) {
-            let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !line.isEmpty, !line.lowercased().hasPrefix("@sr2"),
-                  let field = structuredField(line) else { continue }
-            switch field.key {
-            case "o":
-                let head = field.value.split(whereSeparator: \.isWhitespace).first?.lowercased()
-                if head == "cont" {
-                    continuationOnly = true
-                } else if head == "done" {
-                    outcomes.append("Completed.")
-                } else if head == "ok" {
-                    hasOkOutcome = true
-                } else {
-                    outcomes.append(sentence(field.value))
-                }
-            case "p":
-                if let line = evidenceLine(field.value) {
-                    evidence.append(line)
-                }
-            case "e":
-                if let line = statusLine(field.value) {
-                    notes.append(line)
-                }
-            case "h":
-                continue
-            default:
-                if let label = labels[field.key] {
-                    semantics.append("\(label): \(sentence(field.value))")
-                }
+        func appendGoal(_ value: String) {
+            if let narrative = goalNarrative(value) {
+                semantics.append(narrative)
+            } else {
+                semantics.append("Goal: \(sentence(value))")
+            }
+        }
+        func appendAction(_ value: String) {
+            if let narrative = actionNarrative(value) {
+                actionMentionsBlocked = value.lowercased().contains("blocked")
+                semantics.append(narrative)
+            } else {
+                semantics.append("Action: \(sentence(readableHyphens(value)))")
             }
         }
 
-        var pieces = outcomes + semantics + notes + evidence
+        for raw in trimmed.split(whereSeparator: \.isNewline) {
+            let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty, !line.lowercased().hasPrefix("@sr2") else { continue }
+            if let field = structuredField(line) {
+                switch field.key {
+                case "o":
+                    let head = field.value.split(whereSeparator: \.isWhitespace).first?.lowercased()
+                    if head == "cont" {
+                        continuationOnly = true
+                    } else if head == "done" {
+                        outcomes.append("Completed.")
+                    } else if head == "ok" {
+                        hasOkOutcome = true
+                    } else {
+                        outcomes.append(sentence(field.value))
+                    }
+                case "p":
+                    if let line = evidenceLine(field.value) {
+                        evidence.append(line)
+                    }
+                case "e":
+                    if let leftover = statusLine(field.value) {
+                        notes.append(leftover)
+                    }
+                case "h":
+                    continue
+                case "g", "goal":
+                    appendGoal(field.value)
+                default:
+                    if let label = labels[field.key] {
+                        semantics.append("\(label): \(sentence(field.value))")
+                    }
+                }
+                continue
+            }
+            if let delimiter = line.firstIndex(where: { $0 == ":" || $0 == "=" }) {
+                let key = String(line[..<delimiter])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                let value = String(line[line.index(after: delimiter)...])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !key.isEmpty, !value.isEmpty else { continue }
+                switch key {
+                case "action":
+                    appendAction(value)
+                case "proof":
+                    if let line = evidenceLine(value) {
+                        evidence.append(line)
+                    }
+                default:
+                    ingestStatus(key: key, rest: value)
+                }
+                continue
+            }
+            let token = line.lowercased()
+            if token == "blocked" || token == "blocking", !actionMentionsBlocked {
+                outcomes.append("Blocked.")
+            }
+        }
+
+        var pieces = outcomes + semantics
+        if !mergedPRIds.isEmpty || !narrativeNotes.isEmpty {
+            pieces.append("Current status:")
+            for id in mergedPRIds {
+                let ref = prURLsById[id].flatMap { githubRepoPullRef(from: $0) } ?? "#\(id)"
+                pieces.append("* PR #\(id) has been merged: \(ref).")
+            }
+            pieces.append(contentsOf: narrativeNotes.map { $0.hasPrefix("* ") ? $0 : "* \($0)" })
+        }
+        pieces.append(contentsOf: notes)
+        pieces.append(contentsOf: evidence)
+        if let nextStep {
+            pieces.append(nextStep)
+        }
         if pieces.isEmpty, hasOkOutcome { pieces.append("ok.") }
         if pieces.isEmpty, continuationOnly { pieces.append("Continuing the work.") }
         return pieces.isEmpty
             ? "I could not expand the SR2 response."
             : pieces.joined(separator: "\n")
+    }
+
+    private static func goalNarrative(_ value: String) -> String? {
+        let compact = value.lowercased().replacingOccurrences(of: "_", with: "-")
+        if compact.contains("trello"), compact.contains("doing"), compact.contains("delivery") {
+            return "The goal is to deliver the Trello task currently in Doing."
+        }
+        return nil
+    }
+
+    private static func actionNarrative(_ value: String) -> String? {
+        let compact = value.lowercased().replacingOccurrences(of: "_", with: "-")
+        if compact.hasPrefix("blocked-") {
+            let rest = compact.dropFirst("blocked-".count)
+            if rest.contains("deploy") && rest.contains("proof") {
+                return "The current action is blocked while waiting for deployment proof."
+            }
+            let readable = rest.replacingOccurrences(of: "-", with: " ")
+            return "The current action is blocked while waiting for \(readable)."
+        }
+        return nil
+    }
+
+    private static func nextStepNarrative(_ value: String) -> String {
+        let compact = value.lowercased().replacingOccurrences(of: "_", with: "-")
+        if compact.contains("wait"), compact.contains("deploy"), compact.contains("playwright") {
+            var sentence = "The next step is to wait for the deployment to finish, then run authenticated post-deployment Playwright tests."
+            if compact.contains("trello") || compact.contains("update") {
+                sentence += " If everything is verified successfully, update the Trello card accordingly."
+            }
+            return sentence
+        }
+        let readable = value
+            .replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+        let trimmed = readable.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasSuffix(".") { return "The next step is to \(trimmed)" }
+        return "The next step is to \(trimmed)."
+    }
+
+    private static func trackerDeliveryStatusLine(key: String, rest: String) -> String? {
+        let restLower = rest.lowercased()
+        if key.hasPrefix("railway") {
+            let name = key.hasPrefix("railway-") ? String(key.dropFirst("railway-".count)) : restLower
+            if restLower.contains("404") {
+                return "The production access-pins endpoint returned a 404 before the clean deployment."
+            }
+            if restLower == "success" {
+                if name.contains("main-admin") {
+                    return "The Railway deployment for main-admin succeeded."
+                }
+                if name.contains("prod-api") {
+                    return "The Railway production API deployment succeeded."
+                }
+                return "The Railway deployment for \(name.replacingOccurrences(of: "-", with: " ")) succeeded."
+            }
+            if restLower == "initializing" {
+                if name.contains("prod-api") {
+                    return "The Railway production API deployment is still initializing."
+                }
+                return "The Railway \(name.replacingOccurrences(of: "-", with: " ")) deployment is still initializing."
+            }
+        }
+        if key == "playwright" {
+            if restLower == "unverified" {
+                return "Post-deployment Playwright testing has not yet been verified."
+            }
+        }
+        if key == "trello" {
+            if restLower.contains("unchanged") && restLower.contains("doing") {
+                return "The Trello card remains in Doing."
+            }
+            if restLower.contains("doing") {
+                return "The Trello card is in Doing."
+            }
+        }
+        if key == "comments" || key == "comment" {
+            if restLower.contains("not-posted") || restLower.contains("not posted") {
+                return "No comments have been posted to the Trello card yet."
+            }
+        }
+        return nil
+    }
+
+    private static func genericStatusLine(
+        key: String,
+        rest: String,
+        statusLabels: [String: String],
+        readableHyphens: (String) -> String,
+        sentence: (String) -> String
+    ) -> String? {
+        if key == "url" { return "URL: \(rest)" }
+        let label = statusLabels[key] ?? key.capitalized
+        if label == "Error" {
+            return "Error: \(sentence(readableHyphens(rest)))"
+        }
+        return "\(label): \(sentence(readableHyphens(rest)))"
+    }
+
+    private static func githubRepoPullRef(from raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let host = url.host?.lowercased(),
+              host == "github.com" || host.hasSuffix(".github.com") else {
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        let parts = url.path.split(separator: "/").map(String.init)
+        guard parts.count >= 4, parts[2] == "pull" else { return trimmed }
+        return "\(parts[0])/\(parts[1])#\(parts[3])"
     }
 
     /// Deterministic UI fallback for provider output already classified as

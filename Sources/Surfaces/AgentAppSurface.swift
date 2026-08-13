@@ -10032,6 +10032,8 @@ public struct AgentAppView: View {
     /// the human-readable expansion; the stored wire stays behind View original.
     static func shouldUseHumanReadableProviderBody(storedBody: String) -> Bool {
         SR2WirePolicy.hasSR2Banner(storedBody)
+            || SR2WirePolicy.isSR2(storedBody)
+            || SR2WirePolicy.looksLikeCompressedAgentIR(storedBody)
     }
 
     /// Prefer a trusted local-LLM rewrite when it is actually prose. Otherwise
@@ -10045,7 +10047,9 @@ public struct AgentAppView: View {
            !trusted.isEmpty,
            !SR2WirePolicy.hasSR2Banner(trusted),
            !SR2WirePolicy.isSR2(trusted),
-           !SR2WirePolicy.isCanonicalHistoryEnvelope(trusted) {
+           !SR2WirePolicy.isCanonicalHistoryEnvelope(trusted),
+           !SR2WirePolicy.containsHumanizationWireSyntax(trusted),
+           !SR2WirePolicy.looksLikeCompressedAgentIR(trusted) {
             let stored = storedBody.trimmingCharacters(in: .whitespacesAndNewlines)
             if trusted != stored {
                 return trustedDisplay!

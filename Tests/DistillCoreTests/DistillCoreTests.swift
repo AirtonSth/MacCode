@@ -783,6 +783,49 @@ final class DistillCoreTests: XCTestCase {
         )
     }
 
+    func test_sr1HumanizeFallbackExpandsTrackerDeliverySR2InsteadOfEchoingWire() async throws {
+        // WHY: when the sidecar model fails open, humanizeSR1Fallback used to
+        // append leftover @sr2 / e: lines as "extras". The UI then showed the
+        // protocol dump as the answer.
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        let wire = """
+        @sr2 v1
+        g:trello-doing-delivery
+        Action: blocked-deploy-proof
+        Proof: path:final
+        blocked
+        e:PRs-merged:19,14
+        e:railway-main-admin:SUCCESS
+        e:railway-prod-api:INITIALIZING
+        e:railway-prod-access-pins:404-before-clean-deploy
+        e:playwright:unverified
+        e:trello:unchanged-Doing
+        e:comments:not-posted
+        e:PR19:https://github.com/si-ncs/star-api-v3/pull/19
+        e:PR14:https://github.com/si-ncs/admin-foundation-v3/pull/14
+        e:next:wait-for-deploy-then-run-authenticated-playwright-postdeploy-and-update-Trello
+        """
+        let response = try await scheduler.submit(DistillRequest(
+            mode: .sr1Humanize,
+            input: """
+            TARGET_LANGUAGE: English
+            SR1_RESPONSE:
+            \(wire)
+            """,
+            maxOutputCharacters: 4_000
+        ))
+        XCTAssertFalse(response.output.contains("@sr2"), response.output)
+        XCTAssertFalse(response.output.contains("e:playwright"), response.output)
+        XCTAssertTrue(
+            response.output.contains("The goal is to deliver the Trello task currently in Doing."),
+            response.output
+        )
+        XCTAssertTrue(
+            response.output.contains("si-ncs/admin-foundation-v3#14"),
+            response.output
+        )
+    }
+
     func test_mlxSR1HumanizeRejectsExactR9PartialSR2Rendering() {
         // WHY: a projectless live thread produced this exact model result. A
         // leading natural word must not hide a raw protocol banner farther down.

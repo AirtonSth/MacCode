@@ -202,6 +202,48 @@ final class AgentAppViewModelTests: XCTestCase {
         )
     }
 
+    func testPartialSR2HumanizeCannotStayAsDefaultDisplay() {
+        // WHY: the local model sometimes only rewrites d:/p:/o: into Action/
+        // Proof/blocked and leaves g: plus e: keys. That leftover is not prose
+        // and must not beat the deterministic narrative.
+        let wire = """
+        @sr2 v1
+        g:trello-doing-delivery
+        Action: blocked-deploy-proof
+        Proof: path:final
+        blocked
+        e:PRs-merged:19,14
+        e:railway-main-admin:SUCCESS
+        e:railway-prod-api:INITIALIZING
+        e:railway-prod-access-pins:404-before-clean-deploy
+        e:playwright:unverified
+        e:trello:unchanged-Doing
+        e:comments:not-posted
+        e:PR19:https://github.com/si-ncs/star-api-v3/pull/19
+        e:PR14:https://github.com/si-ncs/admin-foundation-v3/pull/14
+        e:next:wait-for-deploy-then-run-authenticated-playwright-postdeploy-and-update-Trello
+        """
+        let leaked = wire
+            .split(whereSeparator: \.isNewline)
+            .dropFirst()
+            .joined(separator: "\n")
+        XCTAssertTrue(AgentAppView.shouldUseHumanReadableProviderBody(storedBody: wire))
+        XCTAssertTrue(AgentAppView.shouldUseHumanReadableProviderBody(storedBody: leaked))
+        let expanded = AgentAppView.humanReadableProviderDisplay(storedBody: wire)
+        XCTAssertEqual(
+            AgentAppView.humanReadableProviderDisplay(
+                storedBody: wire,
+                trustedDisplay: leaked
+            ),
+            expanded
+        )
+        XCTAssertTrue(expanded.contains("The goal is to deliver the Trello task currently in Doing."))
+        XCTAssertTrue(expanded.contains("The current action is blocked while waiting for deployment proof."))
+        XCTAssertTrue(expanded.contains("si-ncs/star-api-v3#19"))
+        XCTAssertFalse(expanded.contains("@sr2"), expanded)
+        XCTAssertFalse(expanded.contains("e:playwright"), expanded)
+    }
+
     func testOnDemandThoughtTranslationUsesLocalLLMOnlyAfterClick() async throws {
         // WHY: auto-humanize of every thought is the expensive path. The
         // default paint is the deterministic expansion; the local LLM runs

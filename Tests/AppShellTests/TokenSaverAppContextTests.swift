@@ -3639,6 +3639,61 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertTrue(humanized.contains("Complete when: flow."), humanized)
     }
 
+    func test_tokenSaverHumanizeFallbackExpandsTrackerDeliveryBlockedDeployProof() async throws {
+        // WHY: the live Trello/Codex final painted mixed SR2 (`Action:`/`e:` keys).
+        // The host fallback must emit the status narrative, not the protocol dump.
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverSR2Trello-" + UUID().uuidString
+        let context = try makeTestContext(appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        let thread = AgentThread(title: "trello sr2 fallback", provider: .codex, model: "fake-model")
+        try context.threadRepo.upsert(thread)
+        try admitTokenSaver(in: context, threadID: thread.id)
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .user,
+            content: "Please keep the visible transcript in English."
+        ))
+        let wire = """
+        @sr2 v1
+        g:trello-doing-delivery
+        Action: blocked-deploy-proof
+        Proof: path:final
+        blocked
+        e:PRs-merged:19,14
+        e:railway-main-admin:SUCCESS
+        e:railway-prod-api:INITIALIZING
+        e:railway-prod-access-pins:404-before-clean-deploy
+        e:playwright:unverified
+        e:trello:unchanged-Doing
+        e:comments:not-posted
+        e:PR19:https://github.com/si-ncs/star-api-v3/pull/19
+        e:PR14:https://github.com/si-ncs/admin-foundation-v3/pull/14
+        e:next:wait-for-deploy-then-run-authenticated-playwright-postdeploy-and-update-Trello
+        """
+
+        let humanized = await context.tokenSaverHumanizeSR1Response(
+            wire,
+            provider: .codex,
+            threadId: thread.id
+        )
+
+        XCTAssertFalse(humanized.contains("@sr2"), humanized)
+        XCTAssertFalse(humanized.contains("e:playwright"), humanized)
+        XCTAssertTrue(
+            humanized.contains("The goal is to deliver the Trello task currently in Doing."),
+            humanized
+        )
+        XCTAssertTrue(
+            humanized.contains("The current action is blocked while waiting for deployment proof."),
+            humanized
+        )
+        XCTAssertTrue(humanized.contains("si-ncs/star-api-v3#19"), humanized)
+        XCTAssertTrue(
+            humanized.contains("The next step is to wait for the deployment to finish"),
+            humanized
+        )
+    }
+
     func test_tokenSaverUsageForDistillSkillRunDoesNotRecordSavingsWithoutSidecarCall() throws {
         let appSupport = NSTemporaryDirectory() + "RC2TokenSaverDistillSkillSavings-" + UUID().uuidString
         let context = try makeTestContext(appSupportOverride: appSupport)
