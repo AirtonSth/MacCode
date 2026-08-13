@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 
 public struct TokenSaverMemoryScope: Sendable, Hashable, Equatable {
     public let projectPath: String

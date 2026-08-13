@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 
 public enum ProsePruningLane {
     public static func prune(

@@ -1,5 +1,6 @@
 import XCTest
 @testable import DistillCore
+@testable import CoreModel
 
 /// Wave 3 — deterministic polish: I6.2 floor exemption, I6.3 Python frames,
 /// I9.4 hex/SHA volatility, C5/M5 metrics wiring.

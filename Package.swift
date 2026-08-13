@@ -183,6 +183,7 @@ let package = Package(
             name: "DistillCoreTests",
             dependencies: [
                 "DistillCore",
+                "CoreModel",
                 "AgentRuntime",
                 .product(name: "MLXLLM", package: "mlx-swift-lm")
             ],

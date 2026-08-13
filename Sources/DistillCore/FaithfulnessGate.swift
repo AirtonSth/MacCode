@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 
 public enum FaithfulnessGate {
     public struct Result: Equatable, Sendable {

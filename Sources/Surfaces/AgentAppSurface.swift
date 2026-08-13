@@ -849,13 +849,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func assistantDisplayText(
         for content: String,
         itemId: String? = nil,
-        turnId: String? = nil
+        turnId: String? = nil,
+        preferStoredWire: Bool = false
     ) -> String {
         if let itemId,
            let trusted = trustedProviderDisplayByItemId[itemId],
            trusted.wireSHA256 == Self.providerWireSHA256(content) {
             return trusted.displayText
         }
+        if preferStoredWire { return content }
         if let turnId,
            let trusted = trustedProviderDisplayByTurnId[turnId],
            trusted.wireSHA256 == Self.providerWireSHA256(content) {
@@ -14248,16 +14250,14 @@ public struct AgentAppView: View {
     @ViewBuilder
     private func reasoningRow(_ item: AssistantItem) -> some View {
         let rawText = item.body.isEmpty ? (AgentTimelineItemPresentation.make(for: item).detail ?? "") : item.body
-        let translated = vm.assistantDisplayText(for: rawText, itemId: item.id, turnId: item.turnId)
-        // Untranslated thoughts stay on the provider original (or the stored
-        // wire). Never spend Distill until the user clicks Translate.
-        let text: String = {
-            if translated != rawText { return translated }
-            return SR2WirePolicy.providerOriginal(
-                in: rawText,
-                retrieve: vm.coordinator.reversibleProseRetriever
-            ) ?? rawText
-        }()
+        // Only an explicit Translate click may replace the stored wire.
+        // Recovery/deterministic expansion is not auto-humanize.
+        let text = vm.assistantDisplayText(
+            for: rawText,
+            itemId: item.id,
+            turnId: item.turnId,
+            preferStoredWire: true
+        )
         let streaming = item.state == .streaming
         let expanded = streaming || expandedReasoning.contains(item.id)
         VStack(alignment: .leading, spacing: DS.Space.xs) {

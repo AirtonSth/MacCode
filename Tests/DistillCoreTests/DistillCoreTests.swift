@@ -1,5 +1,6 @@
 import XCTest
 @testable import DistillCore
+@testable import CoreModel
 
 final class DistillCoreTests: XCTestCase {
     private actor BlockingRuntime: DistillRuntime {

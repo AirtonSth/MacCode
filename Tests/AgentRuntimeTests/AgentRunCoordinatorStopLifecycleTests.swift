@@ -822,10 +822,10 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
             cwd: tmp,
             prompt: "do work"
         ))
-        // Let the SR1 item complete path schedule translation.
+        // Item wires no longer auto-humanize. The hang translator is only
+        // entered for the final response; Stop must still be live immediately.
         try await Task.sleep(nanoseconds: 80_000_000)
-        XCTAssertTrue(translatorEntered,
-                      "precondition: SR1 item completion must start humanize so the gate is live")
+        _ = translatorEntered
 
         let stopStarted = Date()
         coordinator.stopRun(threadId: thread.id)

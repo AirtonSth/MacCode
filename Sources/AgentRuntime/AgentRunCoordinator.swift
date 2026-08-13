@@ -7413,28 +7413,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lock.unlock()
             guard let buffered else { return nil }
             let target = buffered.itemType == .reasoning ? ProviderTextTarget.body : buffered.target
-            // Thoughts: keep history canonical (SR2/stub) but never spend the
-            // local LLM here. The user clicks Translate if they want prose.
-            if buffered.itemType == .reasoning {
-                return .emit(canonicalizedProviderTextEvents(
-                    itemId: itemId,
-                    text: buffered.text,
-                    target: target,
-                    finalState: finalState,
-                    runId: runId
-                ))
-            }
-            if shouldTranslateProviderText(buffered.text, itemType: buffered.itemType, runId: runId) {
-                return .translate(itemId: itemId, text: buffered.text, target: target, finalState: finalState)
-            }
-            let delta: AssistantEvent
-            switch buffered.target {
-            case .body:
-                delta = .itemDelta(itemId: itemId, bodyAppend: buffered.text, outputAppend: nil, summary: nil)
-            case .output:
-                delta = .itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: buffered.text, summary: nil)
-            }
-            return .emit([delta, .itemCompleted(itemId: itemId, finalState: finalState)])
+            // Item text stays on the wire until the user clicks Translate.
+            // The local LLM auto-humanize is only for the turn's final message.
+            return .emit(canonicalizedProviderTextEvents(
+                itemId: itemId,
+                text: buffered.text,
+                target: target,
+                finalState: finalState,
+                runId: runId
+            ))
         default:
             return nil
         }
@@ -7450,21 +7437,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         type == .assistantMessage || type == .reasoning
     }
 
-    private func shouldTranslateProviderText(
-        _ text: String,
-        itemType: AssistantItemType,
-        runId: AgentRunID
-    ) -> Bool {
-        // Defense in depth for future callers: canonical provider history and
-        // the natural UI leg are paid Token Saver behavior only.
-        guard tokenSaverWasAdmitted(for: runId) else { return false }
-        // Auto-LLM is reserved for the final / commentary assistant message.
-        // Reasoning stays on the wire until the user clicks Translate.
-        if itemType == .reasoning { return false }
-        return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    /// Wrap Token Saver reasoning/history without calling the local LLM.
+    /// Wrap Token Saver item history without calling the local LLM.
     private func canonicalizedProviderTextEvents(
         itemId: String,
         text: String,

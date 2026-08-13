@@ -10,8 +10,10 @@ import Tokenizers
 
 public enum DistillMode: String, Codable, Sendable, Equatable {
     case commandOutput
+    /// Sidecar job id for the SR2 compiler. The IR lives in CoreModel.
     case longText
     case watchSummary
+    /// Sidecar job id for SR2/SR1 UI humanize. The wire policy lives in CoreModel.
     case sr1Humanize
 }
 
@@ -432,38 +434,6 @@ public struct DistillEmbedResponse: Codable, Sendable, Equatable {
 /// never observed from the provider — it must be estimated. The same estimator
 /// is applied to input and output, so the delta is an honest, consistent
 /// measure of how much compression removed (an estimate, not a billed count).
-public enum TokenEstimator {
-    /// Deterministic token estimate for savings deltas (not billed counts).
-    ///
-    /// PERF: `String.count` is an O(n) grapheme walk and `split` materializes a
-    /// Substring array on every Token Saver savings record / audit. `utf8.count`
-    /// is O(1); a single UTF-8 pass counts space/LF/tab/CR separators without
-    /// allocating. ASCII-heavy agent text matches the prior Character/split
-    /// estimates exactly; multi-byte aligns with Token Saver's byte orientation.
-    public static func estimate(_ text: String) -> Int {
-        let chars = text.utf8.count
-        guard chars > 0 else { return 0 }
-        // OpenAI's published rule of thumb (~4 chars/token for English) blended
-        // with a word-count floor so short, word-dense lines aren't undercounted.
-        let byChars = Int((Double(chars) / 4.0).rounded())
-        var words = 0
-        var inWord = false
-        for byte in text.utf8 {
-            switch byte {
-            case 0x20, 0x0A, 0x09, 0x0D: // space, LF, tab, CR
-                inWord = false
-            default:
-                if !inWord {
-                    inWord = true
-                    words += 1
-                }
-            }
-        }
-        let byWords = Int((Double(words) * 1.3).rounded())
-        return max(1, max(byChars, byWords))
-    }
-}
-
 public enum TokenSaverSR1SavingsEstimator {
     /// Estimated tokens avoided by sending the compressed reply instead of its
     /// humanized form, using the same deterministic estimator on both legs so the

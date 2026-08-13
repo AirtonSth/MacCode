@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 
 public enum DistillClientError: Error, Sendable, CustomStringConvertible {
     case invalidBaseURL(String)

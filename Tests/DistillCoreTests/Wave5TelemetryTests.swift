@@ -1,5 +1,6 @@
 import XCTest
 @testable import DistillCore
+@testable import CoreModel
 
 /// Wave 5 — M6 latency percentiles, M8 seeded-corruption canaries, V5 embedding cache.
 final class Wave5TelemetryTests: XCTestCase {

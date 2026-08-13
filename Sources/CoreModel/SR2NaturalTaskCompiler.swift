@@ -1,5 +1,4 @@
 import Foundation
-import CoreModel
 
 /// Deterministic compiler for one bounded, common orchestration shape:
 /// discover one prioritized work item, implement it under explicit constraints,

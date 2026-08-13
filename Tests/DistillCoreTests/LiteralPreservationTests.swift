@@ -1,5 +1,6 @@
 import XCTest
 @testable import DistillCore
+@testable import CoreModel
 
 final class LiteralPreservationTests: XCTestCase {
     func test_pinsLoadBearingLiterals() {

@@ -1,5 +1,4 @@
 import Foundation
-import CoreModel
 
 public enum SR2Modality: String, Sendable, Equatable, Hashable {
     case must

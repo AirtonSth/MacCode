@@ -1144,16 +1144,10 @@ final class TokenSaverCompressionTests: XCTestCase {
         coordinator.finalResponseTranslator = { response, provider, threadId, _ in
             XCTAssertEqual(provider, .codex)
             XCTAssertEqual(threadId, thread.id)
-            guard response == compressed else {
-                XCTAssertEqual(response, "done")
-                return "Completed."
-            }
-            XCTAssertTrue(SR1ResponseDetector.isSR1(response))
-            // Force the provider terminal callback to arrive while stream
-            // humanization is still in flight. The translated delta must cross
-            // the same durability barrier before terminal cleanup.
-            try? await Task.sleep(nanoseconds: 50_000_000)
-            return "Recebi o pedido em /distill e vou criar um jogo Snake HTML mínimo em /tmp."
+            XCTAssertNotEqual(response, compressed,
+                              "streamed item wires must not auto-call the local LLM")
+            XCTAssertEqual(response, "done")
+            return "Completed."
         }
 
         _ = try await coordinator.startRun(AgentRunRequest(
@@ -1164,41 +1158,25 @@ final class TokenSaverCompressionTests: XCTestCase {
             prompt: "/distill crie o snage game em html"
         ))
 
-        let expected = "Recebi o pedido em /distill e vou criar um jogo Snake HTML mínimo em /tmp."
         let liveDeadline = Date().addingTimeInterval(3)
         while Date() < liveDeadline,
-              !observer.recordedEvents.contains(where: {
-                  $0.sr1TranslationForTest?.itemId != nil
-                      && $0.sr1TranslationForTest?.rewrittenText == expected
-              }) {
+              observer.recordedEvents.compactMap(\.bodyAppendForTest).last == nil {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
 
-        let liveTranslations = observer.recordedEvents
-            .compactMap(\.sr1TranslationForTest)
-            .filter { $0.itemId != nil }
         let liveHistory = try XCTUnwrap(observer.recordedEvents.compactMap(\.bodyAppendForTest).last)
-        XCTAssertEqual(liveTranslations.last?.rewrittenText, expected,
-                       "typed UI provenance must carry the natural-language rendering")
-        XCTAssertEqual(liveTranslations.last?.originalText, liveHistory)
+        XCTAssertFalse(observer.recordedEvents.contains { $0.sr1TranslationForTest?.itemId != nil },
+                       "item wires stay on the wire until on-demand Translate")
         XCTAssertTrue(SR2WirePolicy.isCurrentSR2(liveHistory), liveHistory)
         XCTAssertEqual(SR2WirePolicy.providerOriginal(in: liveHistory), compressed)
         XCTAssertFalse(liveHistory.contains("Dict: S=state"),
                        "legacy SR1 must be wrapped, not newly persisted as current history")
 
-        let replayDeadline = Date().addingTimeInterval(3)
-        while Date() < replayDeadline,
-              !coordinator.latestStreamEvents(threadId: thread.id).contains(where: {
-                  $0.sr1TranslationForTest?.itemId != nil
-                      && $0.sr1TranslationForTest?.rewrittenText == expected
-              }) {
-            try? await Task.sleep(nanoseconds: 10_000_000)
-        }
         let replay = coordinator.latestStreamEvents(threadId: thread.id)
         let persistedHistory = try XCTUnwrap(replay.compactMap(\.bodyAppendForTest).last)
         XCTAssertTrue(SR2WirePolicy.isCurrentSR2(persistedHistory), persistedHistory)
-        XCTAssertEqual(replay.compactMap(\.sr1TranslationForTest).last(where: { $0.itemId != nil })?.rewrittenText, expected,
-                       "replay must retain the typed natural UI leg")
+        XCTAssertNil(replay.compactMap(\.sr1TranslationForTest).last(where: { $0.itemId != nil }),
+                     "replay must not invent an auto-humanized item UI leg")
     }
 
     func test_activeTokenSaverHumanizesFreeProseIntermediateBeforeLiveOrReplayTimeline() async throws {
@@ -1224,7 +1202,8 @@ final class TokenSaverCompressionTests: XCTestCase {
         coordinator.addObserver(observer)
         coordinator.tokenSaverRuntimeActive = { true }
         coordinator.finalResponseTranslator = { response, _, _, _ in
-            response == raw ? "Verificando o acesso por função antes de editar o controller." : "Continuando."
+            XCTAssertNotEqual(response, raw, "intermediate commentary must not auto-humanize")
+            return "Continuando."
         }
         coordinator.reversibleProseStore = { _ in "stream-handle" }
 
@@ -1236,22 +1215,15 @@ final class TokenSaverCompressionTests: XCTestCase {
             prompt: "Check access"
         ))
 
-        let expected = "Verificando o acesso por função antes de editar o controller."
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline,
-              !observer.recordedEvents.contains(where: {
-                  $0.sr1TranslationForTest?.itemId != nil
-                      && $0.sr1TranslationForTest?.rewrittenText == expected
-              }) {
+              observer.recordedEvents.compactMap(\.bodyAppendForTest).last == nil {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         let liveHistory = try XCTUnwrap(observer.recordedEvents.compactMap(\.bodyAppendForTest).last)
-        let liveTranslation = try XCTUnwrap(observer.recordedEvents
-            .compactMap(\.sr1TranslationForTest)
-            .last(where: { $0.itemId != nil }))
         XCTAssertTrue(SR2WirePolicy.isCurrentSR2(liveHistory), liveHistory)
-        XCTAssertEqual(liveTranslation.originalText, liveHistory)
-        XCTAssertEqual(liveTranslation.rewrittenText, expected)
+        XCTAssertFalse(observer.recordedEvents.contains { $0.sr1TranslationForTest?.itemId != nil },
+                       "intermediate commentary must stay on the history wire")
         XCTAssertEqual(
             SR2WirePolicy.providerOriginal(in: liveHistory) { marker in
                 marker == "[[rc:stream-handle]]" ? raw : nil
@@ -1262,10 +1234,7 @@ final class TokenSaverCompressionTests: XCTestCase {
         let replayEvents = coordinator.latestStreamEvents(threadId: thread.id)
         let replayHistory = try XCTUnwrap(replayEvents.compactMap(\.bodyAppendForTest).last)
         XCTAssertTrue(SR2WirePolicy.isCurrentSR2(replayHistory), replayHistory)
-        XCTAssertEqual(
-            replayEvents.compactMap(\.sr1TranslationForTest).last(where: { $0.itemId != nil })?.rewrittenText,
-            expected
-        )
+        XCTAssertNil(replayEvents.compactMap(\.sr1TranslationForTest).last(where: { $0.itemId != nil }))
     }
 
     func test_tokenSaverOffStreamsFreeProseIntermediateVerbatim() async throws {
@@ -1391,13 +1360,10 @@ final class TokenSaverCompressionTests: XCTestCase {
         coordinator.finalResponseTranslator = { response, provider, threadId, _ in
             XCTAssertEqual(provider, .codex)
             XCTAssertEqual(threadId, thread.id)
-            guard response == compressed else {
-                XCTAssertEqual(response, "done")
-                return "Completed."
-            }
-            XCTAssertTrue(SR1ResponseDetector.isSR1(response),
-                          "inline SR1 clauses like 'S ... C ... D ...' must be detected before the Agent App renders them")
-            return "O contexto é /tmp. Vou carregar a regra /distill e criar um jogo Snake HTML mínimo."
+            XCTAssertNotEqual(response, compressed,
+                              "inline SR1 item wires must not auto-call the local LLM")
+            XCTAssertEqual(response, "done")
+            return "Completed."
         }
 
         _ = try await coordinator.startRun(AgentRunRequest(
@@ -1408,24 +1374,17 @@ final class TokenSaverCompressionTests: XCTestCase {
             prompt: "/distill crie o snage game em html"
         ))
 
-        let expected = "O contexto é /tmp. Vou carregar a regra /distill e criar um jogo Snake HTML mínimo."
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline,
-              !observer.recordedEvents.contains(where: {
-                  $0.sr1TranslationForTest?.itemId != nil
-                      && $0.sr1TranslationForTest?.rewrittenText == expected
-              }) {
+              observer.recordedEvents.compactMap(\.bodyAppendForTest).last == nil {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
 
         let history = try XCTUnwrap(observer.recordedEvents.compactMap(\.bodyAppendForTest).last)
-        let translation = try XCTUnwrap(observer.recordedEvents
-            .compactMap(\.sr1TranslationForTest)
-            .last(where: { $0.itemId != nil }))
         XCTAssertTrue(SR2WirePolicy.isCurrentSR2(history), history)
         XCTAssertEqual(SR2WirePolicy.providerOriginal(in: history), compressed)
-        XCTAssertEqual(translation.originalText, history)
-        XCTAssertEqual(translation.rewrittenText, expected)
+        XCTAssertFalse(observer.recordedEvents.contains { $0.sr1TranslationForTest?.itemId != nil },
+                       "inline SR1 item wires stay untranslated until on-demand Translate")
     }
 
     func test_singleSemanticSR1ReasoningLineStaysOnWireUntilOnDemandHumanize() async throws {
@@ -1782,24 +1741,15 @@ final class TokenSaverCompressionTests: XCTestCase {
                 while Date() < deadline {
                     let events = coordinator.latestStreamEvents(threadId: thread.id)
                     let hasHistory = events.contains { $0.bodyAppendForTest != nil }
-                    let hasItemTranslation = events.contains { $0.sr1TranslationForTest?.itemId == "stream-item" }
-                    if hasHistory && (itemType == .reasoning || hasItemTranslation) { break }
+                    if hasHistory { break }
                     try? await Task.sleep(nanoseconds: 10_000_000)
                 }
                 let events = coordinator.latestStreamEvents(threadId: thread.id)
                 let history = try XCTUnwrap(events.compactMap(\.bodyAppendForTest).first)
                 XCTAssertTrue(SR2WirePolicy.isCurrentSR2(history), history)
                 XCTAssertEqual(SR2WirePolicy.providerOriginal(in: history), itemRaw)
-                if itemType == .reasoning {
-                    XCTAssertNil(events.compactMap(\.sr1TranslationForTest).first { $0.itemId == "stream-item" },
-                                 "thoughts stay on the wire until on-demand Translate")
-                } else {
-                    let itemTranslation = try XCTUnwrap(events.compactMap(\.sr1TranslationForTest).first {
-                        $0.itemId == "stream-item"
-                    })
-                    XCTAssertEqual(itemTranslation.originalText, history)
-                    XCTAssertEqual(itemTranslation.rewrittenText, "Natural UI: \(itemRaw)")
-                }
+                XCTAssertNil(events.compactMap(\.sr1TranslationForTest).first { $0.itemId == "stream-item" },
+                             "item wires stay untranslated until on-demand Translate; only the final is auto-humanized")
             }
         }
     }

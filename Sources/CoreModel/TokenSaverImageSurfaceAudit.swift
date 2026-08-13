@@ -99,27 +99,7 @@ public enum TokenSaverImageSurfaceAudit {
         return TokenSaverImageRouterDecision(disposition: .eligibleForRouter, reason: "image_surface_measured")
     }
 
-    /// Same estimator shape as DistillCore.TokenEstimator (CoreModel cannot import
-    /// DistillCore). PERF: O(1) utf8 size + single-pass word count (no grapheme
-    /// walk / Substring array from split).
     private static func estimateTextTokens(_ text: String) -> Int {
-        let chars = text.utf8.count
-        guard chars > 0 else { return 0 }
-        let byChars = Int((Double(chars) / 4.0).rounded())
-        var words = 0
-        var inWord = false
-        for byte in text.utf8 {
-            switch byte {
-            case 0x20, 0x0A, 0x09, 0x0D:
-                inWord = false
-            default:
-                if !inWord {
-                    inWord = true
-                    words += 1
-                }
-            }
-        }
-        let byWords = Int((Double(words) * 1.3).rounded())
-        return max(1, max(byChars, byWords))
+        TokenEstimator.estimate(text)
     }
 }

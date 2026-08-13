@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 
 /// MCP server core (P3-T5): a native tool surface so Claude/Codex can fetch the byte-exact
 /// original behind a `[[rc:HANDLE]]` marker without shelling out. It exposes read-only

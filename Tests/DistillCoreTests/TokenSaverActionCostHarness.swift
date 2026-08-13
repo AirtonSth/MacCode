@@ -1,5 +1,6 @@
 import Foundation
 import DistillCore
+import CoreModel
 
 /// Scores a compressor on **successful agent actions per token**, not compression ratio.
 ///

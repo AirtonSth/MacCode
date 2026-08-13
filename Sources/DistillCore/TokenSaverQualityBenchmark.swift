@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 
 public struct TokenSaverBenchmarkCase: Sendable, Equatable {
     public let id: String

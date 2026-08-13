@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 
 /// I12.7: the four stacked gates the lossy prose-pruning lane must pass, all
 /// reject-toward-original, applied in order. The lane refuses to run at all without a
