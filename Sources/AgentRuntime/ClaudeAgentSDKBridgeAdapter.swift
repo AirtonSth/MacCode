@@ -1684,8 +1684,18 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         if let effort = ClaudeRunner.effortArgs(request.reasoningEffort).last {
             payload["effort"] = effort
         }
-        if let settings = ClaudeRunner.ultracodeSettingsArgs(request.reasoningEffort).last {
-            payload["settings"] = settings
+        if let raw = ClaudeRunner.ultracodeSettingsArgs(
+            request.reasoningEffort,
+            environment: request.environment
+        ).last {
+            // SDK `settings` is an object. Keep the CLI JSON string as a
+            // fallback so a parse failure cannot drop ultracode / SR2 style.
+            if let data = raw.data(using: .utf8),
+               let object = try? JSONSerialization.jsonObject(with: data) {
+                payload["settings"] = object
+            } else {
+                payload["settings"] = raw
+            }
         }
         payload["system_prompt"] = Self.claudeSystemPrompt(
             environment: request.environment,

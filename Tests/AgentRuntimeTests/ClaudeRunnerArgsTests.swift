@@ -419,6 +419,85 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         XCTAssertEqual(settingsArgs.count, 2)
     }
 
+    /// WHY: Claude is the only provider whose default engine (`--append-system-prompt`)
+    /// cannot change response format. Codex uses `developer_instructions`, Grok uses
+    /// `--rules`. Official Claude docs say output styles are the format channel and
+    /// send mid-conversation reminders. Without `outputStyle` in `--settings`,
+    /// Token Saver Claude keeps speaking natural-language monologue.
+    func test_tokenSaverDistillHint_injectsSR2OutputStyleWithoutUltracodeKeys() throws {
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .claude,
+            model: "opus",
+            cwd: "/tmp",
+            prompt: "continue",
+            permissionMode: .supervised,
+            reasoningEffort: .high,
+            environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
+        )
+        let args = ClaudeRunner.buildStreamingArgs(request)
+        XCTAssertEqual(settingsFlagCount(args), 1,
+                       "Token Saver Claude must emit exactly one --settings for outputStyle")
+        let settings = try parsedSettingsObject(args)
+        XCTAssertEqual(settings["outputStyle"] as? String, ClaudeRunner.sr2OutputStyleName,
+                       "Claude must activate the Token Saver SR2 output style")
+        XCTAssertNil(settings["ultracode"],
+                     "plain high effort must not gain ultracode keys from the SR2 style")
+        XCTAssertNil(settings["enableWorkflows"])
+        XCTAssertNil(settings["hooks"],
+                     "distill hint alone must not register PostToolUse")
+
+        let off = ClaudeRunner.buildStreamingArgs(
+            AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .claude,
+                model: "opus",
+                cwd: "/tmp",
+                prompt: "continue",
+                permissionMode: .supervised,
+                reasoningEffort: .high
+            )
+        )
+        XCTAssertNil(settingsValue(off),
+                     "Token Saver off must not inject outputStyle or any --settings")
+    }
+
+    func test_tokenSaverDistillHint_mergesOutputStyleWithPostToolUseAndUltracode() throws {
+        let args = ClaudeRunner.buildStreamingArgs(
+            AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .claude,
+                model: "opus",
+                cwd: "/tmp",
+                prompt: "build it",
+                permissionMode: .supervised,
+                reasoningEffort: .ultracode,
+                environment: [
+                    "RC_TOKEN_SAVER_DISTILL_HINT": "1",
+                    ClaudeRunner.tokenSaverPostToolUseEnvKey: "1"
+                ]
+            )
+        )
+        XCTAssertEqual(settingsFlagCount(args), 1)
+        let settings = try parsedSettingsObject(args)
+        XCTAssertEqual(settings["outputStyle"] as? String, ClaudeRunner.sr2OutputStyleName)
+        XCTAssertEqual(settings["ultracode"] as? Bool, true)
+        XCTAssertEqual(settings["enableWorkflows"] as? Bool, true)
+        XCTAssertNotNil(settings["hooks"])
+    }
+
+    func test_sr2OutputStyleMarkdownKeepsCodingInstructionsAndForbidsMonologue() {
+        let markdown = ClaudeRunner.sr2OutputStyleMarkdown
+        XCTAssertTrue(markdown.contains("keep-coding-instructions: true"),
+                      "style must keep Claude Code coding/safety instructions")
+        XCTAssertTrue(markdown.contains("name: \(ClaudeRunner.sr2OutputStyleName)"))
+        XCTAssertTrue(markdown.contains(SR2WirePolicy.instructBlockMarker))
+        XCTAssertTrue(markdown.contains("@sr2 v1"))
+        XCTAssertTrue(markdown.contains("No articles, filler"))
+        XCTAssertFalse(markdown.contains("@sr2 v0 Opaque"),
+                       "must not advertise legacy v0 as a legal wire")
+    }
+
     func test_ultracodeIsOfferedToClaudeButNotCodexPicker() {
         XCTAssertTrue(AgentReasoningEffort.claudeSupportedCases.contains(.ultracode),
                       "Claude reasoning models must offer Ultracode in the effort picker")

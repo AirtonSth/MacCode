@@ -398,6 +398,29 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("NEVER Distill skill content"))
     }
 
+    func test_ensureClaudeSR2OutputStyleWritesUserOutputStylesNotSkills() throws {
+        // WHY: Claude Code only loads custom output styles from
+        // ~/.claude/output-styles (or project .claude/output-styles). Token Saver
+        // must not revive ~/.claude/skills/distill, and must be idempotent so
+        // every admitted turn can repair a deleted file.
+        let home = tempDir("ClaudeSR2Style")
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let url = try installer.ensureClaudeSR2OutputStyle()
+        let again = try installer.ensureClaudeSR2OutputStyle()
+        XCTAssertEqual(url.path, again.path)
+        XCTAssertEqual(url.lastPathComponent, ClaudeRunner.sr2OutputStyleFileName)
+        XCTAssertTrue(url.path.contains("/.claude/output-styles/"),
+                      "style must live in Claude's output-styles directory: \(url.path)")
+        let text = try String(contentsOf: url)
+        XCTAssertEqual(text, ClaudeRunner.sr2OutputStyleMarkdown)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: home.appendingPathComponent(".claude/skills/distill/SKILL.md").path
+            ),
+            "output-style install must not write a provider-home Distill skill"
+        )
+    }
+
     func test_installAppPrivateDistillSkillNeverTouchesProviderHomes() throws {
         let home = tempDir()
         let appPrivateRoot = tempDir().appendingPathComponent("AgentSkills", isDirectory: true)
@@ -543,7 +566,21 @@ final class TokenSaverInstallTests: XCTestCase {
         )
 
         XCTAssertEqual(Array(grok.prefix(grokABI.count)), grokABI)
-        XCTAssertEqual(Array(claude.prefix(claudeABI.count)), claudeABI)
+        XCTAssertTrue(
+            {
+                guard claude.count >= claudeABI.count else { return false }
+                return (0...(claude.count - claudeABI.count)).contains { start in
+                    claude[start..<(start + claudeABI.count)].elementsEqual(claudeABI)
+                }
+            }(),
+            "Claude skill ABI must survive the Token Saver --settings prepend: \(claude)"
+        )
+        XCTAssertEqual(claude.first, "--settings")
+        XCTAssertTrue(
+            claude.dropFirst().first?.contains("\"outputStyle\"") == true
+                && claude.dropFirst().first?.contains(ClaudeRunner.sr2OutputStyleName) == true,
+            "Claude proxy must prepend the SR2 output style: \(claude)"
+        )
         XCTAssertTrue(codex.suffix(codexABI.count).elementsEqual(codexABI))
         XCTAssertTrue(grok.contains("--rules"))
         XCTAssertTrue(claude.contains("--append-system-prompt"))

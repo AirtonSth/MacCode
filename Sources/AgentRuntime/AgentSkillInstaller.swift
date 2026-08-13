@@ -431,14 +431,15 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         }
     }
 
-    /// Inject Claude CLI `--settings` PostToolUse hooks on the raw provider-proxy
-    /// path when Token Saver has admitted the Claude PostToolUse lane.
+    /// Inject Claude CLI `--settings` Token Saver keys on the raw provider-proxy
+    /// path: PostToolUse hooks when that lane is admitted, and the SR2
+    /// `outputStyle` when distill is admitted.
     ///
     /// Fail-open rules:
     /// - Non-Claude providers: unchanged.
-    /// - Flag absent / not admitted: unchanged (byte-identical argv).
+    /// - Neither distill hint nor PostToolUse admitted: unchanged (byte-identical argv).
     /// - Administrative / unsupported turns: unchanged.
-    /// - Caller already passed `--settings`: leave intact (never double-inject).
+    /// - Path-form `--settings`: leave intact (cannot safely merge).
     /// - Settings builder fails: leave argv unchanged.
     static func ensuringClaudePostToolUseSettings(
         provider: AgentProvider,
@@ -446,22 +447,22 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         environment: [String: String]
     ) -> [String] {
         guard provider == .claude else { return arguments }
-        guard environment[ClaudeRunner.tokenSaverPostToolUseEnvKey] == "1" else {
-            return arguments
-        }
+        let wantsPostToolUse = environment[ClaudeRunner.tokenSaverPostToolUseEnvKey] == "1"
+        let wantsSR2Style = environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
+        guard wantsPostToolUse || wantsSR2Style else { return arguments }
         guard isSupportedProviderTurn(provider: .claude, arguments: arguments) else {
             return arguments
         }
         // Reuse the Agent App settings builder so proxy and ClaudeRunner never
-        // drift on hook command, matcher, or timeout.
+        // drift on hook command, matcher, timeout, or outputStyle.
         let settingsArgs = ClaudeRunner.ultracodeSettingsArgs(
             nil,
             environment: environment
         )
         guard settingsArgs.count == 2, settingsArgs[0] == "--settings",
-              let ptuJSON = settingsArgs[1].data(using: .utf8),
-              let ptuObject = try? JSONSerialization.jsonObject(with: ptuJSON) as? [String: Any],
-              let ptuHooks = ptuObject["hooks"] as? [String: Any] else {
+              let additionJSON = settingsArgs[1].data(using: .utf8),
+              let addition = try? JSONSerialization.jsonObject(with: additionJSON) as? [String: Any]
+        else {
             return arguments
         }
         // Merge into an existing inline JSON --settings when present (nested CLIs
@@ -471,28 +472,42 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             let existing = arguments[settingsIndex + 1]
             if existing.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{"),
                let existingData = existing.data(using: .utf8),
-               var existingObject = try? JSONSerialization.jsonObject(with: existingData) as? [String: Any] {
-                var hooks = existingObject["hooks"] as? [String: Any] ?? [:]
-                if hooks["PostToolUse"] == nil {
-                    hooks["PostToolUse"] = ptuHooks["PostToolUse"]
-                    existingObject["hooks"] = hooks
-                    if let merged = try? JSONSerialization.data(
-                        withJSONObject: existingObject,
-                        options: [.sortedKeys]
-                    ),
-                       let mergedJSON = String(data: merged, encoding: .utf8) {
-                        var out = arguments
-                        out[settingsIndex + 1] = mergedJSON
-                        return out
-                    }
-                }
-                // Already has PostToolUse — leave intact.
-                return arguments
+               let existingObject = try? JSONSerialization.jsonObject(with: existingData) as? [String: Any],
+               let mergedJSON = mergedClaudeSettingsJSON(existing: existingObject, addition: addition) {
+                var out = arguments
+                out[settingsIndex + 1] = mergedJSON
+                return out
             }
             // Path-form --settings: cannot safely merge; leave intact (fail open).
             return arguments
         }
         return settingsArgs + arguments
+    }
+
+    /// Merge Token Saver Claude `--settings` keys into a caller-supplied JSON
+    /// object. PostToolUse is added only when missing (never replace a caller's
+    /// hook). `outputStyle` is overwritten so a user Explanatory/Learning style
+    /// cannot keep Claude on natural-language monologue while Token Saver is on.
+    private static func mergedClaudeSettingsJSON(
+        existing: [String: Any],
+        addition: [String: Any]
+    ) -> String? {
+        var merged = existing
+        if let addedHooks = addition["hooks"] as? [String: Any] {
+            var hooks = merged["hooks"] as? [String: Any] ?? [:]
+            if hooks["PostToolUse"] == nil, let postToolUse = addedHooks["PostToolUse"] {
+                hooks["PostToolUse"] = postToolUse
+                merged["hooks"] = hooks
+            }
+        }
+        if let style = addition["outputStyle"] as? String, !style.isEmpty {
+            merged["outputStyle"] = style
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: merged, options: [.sortedKeys]),
+              let json = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return json
     }
 
     /// Restrict prompt/rules injection to provider invocations whose turn ABI
@@ -791,6 +806,36 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         try data.write(to: skillURL, options: .atomic)
         try encoder.encode(manifest).write(to: manifestURL, options: .atomic)
         return AgentSkillInstallResult(action: .installed, manifest: manifest)
+    }
+
+    /// Claude Code discovers custom output styles from `~/.claude/output-styles`.
+    /// Token Saver writes a dedicated style (not a CLAUDE.md mutation) so the
+    /// CLI/SDK `outputStyle` setting can load it. Derived from the skills root
+    /// so sandboxed tests never touch the developer's real home.
+    public func claudeOutputStylesDirectory() -> URL {
+        claudeSkillsRoot
+            .deletingLastPathComponent()
+            .appendingPathComponent("output-styles", isDirectory: true)
+    }
+
+    public func claudeSR2OutputStyleURL() -> URL {
+        claudeOutputStylesDirectory()
+            .appendingPathComponent(ClaudeRunner.sr2OutputStyleFileName)
+    }
+
+    /// Idempotent install of the Token Saver SR2 output style. Missing or stale
+    /// files are rewritten; identical bytes are a no-op.
+    @discardableResult
+    public func ensureClaudeSR2OutputStyle() throws -> URL {
+        let directory = claudeOutputStylesDirectory()
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = claudeSR2OutputStyleURL()
+        let data = Data(ClaudeRunner.sr2OutputStyleMarkdown.utf8)
+        if let existing = try? Data(contentsOf: url), existing == data {
+            return url
+        }
+        try data.write(to: url, options: .atomic)
+        return url
     }
 
     /// Remove legacy Distill copies that used to live in each provider's home skill tree.

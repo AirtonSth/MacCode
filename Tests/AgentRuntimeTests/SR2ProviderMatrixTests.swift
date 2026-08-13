@@ -61,6 +61,11 @@ final class SR2ProviderMatrixTests: XCTestCase {
                 || claudeArgs.contains(where: { $0.contains(SR2WirePolicy.instructBlockMarker) }),
             "Claude proxy args must carry SR2 instruct: \(claudeArgs)"
         )
+        XCTAssertTrue(
+            claudeArgs.contains("--settings")
+                && claudeArgs.contains(where: { $0.contains("\"outputStyle\"") && $0.contains(ClaudeRunner.sr2OutputStyleName) }),
+            "Claude proxy args must activate the SR2 output style: \(claudeArgs)"
+        )
 
         // Codex: developer_instructions config
         let codexArgs = AgentSkillInstaller.providerProxyArguments(

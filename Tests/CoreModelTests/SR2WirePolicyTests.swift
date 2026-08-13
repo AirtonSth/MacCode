@@ -497,4 +497,88 @@ final class SR2WirePolicyTests: XCTestCase {
         XCTAssertTrue(plan.wasEnforced)
         XCTAssertTrue(plan.complianceMiss)
     }
+
+    func testHumanReadableDisplayNeverPaintsHistoryEnvelope() {
+        // WHY: the work log was painting host stubs (`p:sha256=` / `[[rc:]]`)
+        // as if they were the agent's message. Humans need the recovered
+        // original or a one-line unavailable note — never the digest.
+        let prose = "Checking the Chrome control skill before the next shell."
+        let digest = SHA256.hash(data: Data(prose.utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        let envelope = """
+        @sr2 v1
+        o:ok
+        p:sha256=\(digest)
+        h:[[rc:\(digest)]]
+        """
+        XCTAssertTrue(SR2WirePolicy.isCanonicalHistoryEnvelope(envelope))
+        XCTAssertFalse(
+            SR2WirePolicy.isCanonicalHistoryEnvelope("""
+            @sr2 v1
+            o:ok
+            g:ataca-pr18
+            p:path:20
+            """)
+        )
+        XCTAssertEqual(
+            SR2WirePolicy.humanReadableDisplay(stored: envelope) { marker in
+                marker == "[[rc:\(digest)]]" ? prose : nil
+            },
+            prose
+        )
+        XCTAssertEqual(
+            SR2WirePolicy.humanReadableDisplay(stored: envelope, retrieve: nil),
+            SR2WirePolicy.unavailableStatusNote
+        )
+        XCTAssertFalse(
+            SR2WirePolicy.humanReadableDisplay(stored: envelope, retrieve: nil)
+                .contains("sha256")
+        )
+    }
+
+    func testHumanReadableDisplayExpandsProviderSR2WithoutErrorFalseAlarms() {
+        // WHY: Codex/Claude status fields live on `e:`. Calling every one
+        // "Error:" made passing CI and a mergeable PR look like a failure.
+        let wire = """
+        @sr2 v1
+        o:ok
+        g:ataca-pr18
+        d:all-pipelines-pass
+        e:fix:f792c48
+        e:ci:all-tests-passed
+        e:pr:OPEN and MERGEABLE and CLEAN
+        e:none
+        p:path:20
+        """
+        let display = SR2WirePolicy.humanReadableDisplay(stored: wire)
+        XCTAssertFalse(display.contains("@sr2"), display)
+        XCTAssertFalse(display.contains("sha256"), display)
+        XCTAssertFalse(display.hasPrefix("ok."), display)
+        XCTAssertTrue(display.contains("Goal: ataca-pr18."), display)
+        XCTAssertTrue(display.contains("Decision: all-pipelines-pass."), display)
+        XCTAssertTrue(display.contains("Fix: f792c48."), display)
+        XCTAssertTrue(display.contains("Checks: all tests passed."), display)
+        XCTAssertTrue(display.contains("Pull request: OPEN and MERGEABLE and CLEAN."), display)
+        XCTAssertTrue(display.contains("Path 20."), display)
+        XCTAssertFalse(display.contains("Error:"), display)
+        XCTAssertFalse(display.contains("none"), display)
+        XCTAssertEqual(
+            SR2WirePolicy.humanReadableDisplay(stored: "@sr2 v1\no:fail\ne:fail:lint"),
+            "fail.\nError: lint."
+        )
+
+        let digest = SHA256.hash(data: Data(wire.utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        let envelope = """
+        @sr2 v1
+        o:ok
+        p:sha256=\(digest)
+        h:[[rc:\(digest)]]
+        """
+        XCTAssertTrue(SR2WirePolicy.isCanonicalHistoryEnvelope(envelope))
+        XCTAssertEqual(
+            SR2WirePolicy.humanReadableDisplay(stored: envelope) { _ in wire },
+            display
+        )
+    }
 }

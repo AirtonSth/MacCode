@@ -1282,6 +1282,11 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                       "legacy v0/SR1 is prohibited rather than advertised")
         XCTAssertFalse(on.contains("S=state"),
                        "the canonical v1 prompt must not advertise legacy SR1 field aliases")
+        XCTAssertTrue(
+            on.contains("\"outputStyle\":\"\(ClaudeRunner.sr2OutputStyleName)\"")
+                || on.contains("\"outputStyle\": \"\(ClaudeRunner.sr2OutputStyleName)\""),
+            "SDK rc_configure must set the SR2 output style when Token Saver is on: \(on)"
+        )
 
         let off = try await configureCommand(tokenSaverOn: false)
         // Background-await stays; Distill is paid (Token Saver only).

@@ -438,6 +438,11 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
         }
         XCTAssertTrue(command.hasSuffix("distill hook post-tool-use"),
                       "hook must point at managed distill post-tool-use: \(command)")
+        XCTAssertEqual(
+            object["outputStyle"] as? String,
+            ClaudeRunner.sr2OutputStyleName,
+            "nested Claude must also switch off the default natural-language output style"
+        )
         // Original advisor ABI must survive (prompt transport, tools, plan mode).
         XCTAssertTrue(args.contains("--print"))
         XCTAssertTrue(args.contains("plan"))
@@ -475,6 +480,11 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
         XCTAssertEqual(obj["custom"] as? Bool, true, "caller keys must survive merge")
         let hooks = try XCTUnwrap(obj["hooks"] as? [String: Any])
         XCTAssertNotNil(hooks["PostToolUse"], "PostToolUse must be merged in")
+        XCTAssertEqual(
+            obj["outputStyle"] as? String,
+            ClaudeRunner.sr2OutputStyleName,
+            "inline --settings merge must still activate the SR2 output style"
+        )
     }
 
     func test_tokenSaverDialect_forcesShellAndGraphifyCoverageForAllProviders() {

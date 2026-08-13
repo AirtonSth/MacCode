@@ -7,13 +7,11 @@ import DistillCore
 @testable import AppShell
 
 /// 100 free-form user prompts through the **local Distill LLM**, then the
-/// same adopt + always-on send path production uses.
+/// same always-on send path production uses.
 ///
 /// CI skips this (no model, no GPU budget). Locally it loads the installed
-/// Token Saver MLX model and requires a real `llm_mlx` hop. The final wire
-/// must be `@sr2 v1`. If the model echo or a candidate is not cheaper than
-/// the source, adopt returns the original — that is correct. The host then
-/// still emits protocol (`goal:` / other compact IR, or lossless `u:`).
+/// Token Saver MLX model and requires a real `llm_mlx` hop. The send path
+/// ships the typed prompt; it does not compile user text to `@sr2 v1`.
 ///
 /// Force-run in CI: `RC_SR2_LIVE_LLM_TEST=1`. Skip locally: `RC_SR2_LIVE_LLM_TEST=0`.
 /// Limit: `RC_SR2_LIVE_PROMPT_LIMIT=5`. Model dir override: `REMOTE_CODE_TOKEN_SAVER_E4B_DIR`.
@@ -118,33 +116,11 @@ final class SR2VariedUserPromptMatrixTests: XCTestCase {
             preservesKnownInternalProtocol: decision.accepted,
             losslessFallback: prompt
         )
-        XCTAssertNil(
-            SR2WirePolicy.userInstruction(in: wire),
-            "#\(index) send path dumped the prompt into u: instead of compact SR2 or natural language:\n\(wire)"
+        XCTAssertEqual(
+            wire,
+            prompt,
+            "#\(index) send path must ship the typed prompt, never compiled SR2:\n\(wire)"
         )
-        if decision.accepted {
-            XCTAssertTrue(
-                SR2WirePolicy.isCurrentSR2(wire),
-                "#\(index) adopted LLM compile is not current @sr2 v1:\n\(wire)"
-            )
-            XCTAssertLessThan(
-                TokenEstimator.estimate(wire),
-                TokenEstimator.estimate(prompt),
-                "#\(index) adopted SR2 is not cheaper than the natural prompt:\n\(wire)"
-            )
-        } else if SR2WirePolicy.isCurrentSR2(wire) {
-            XCTAssertLessThan(
-                TokenEstimator.estimate(wire),
-                TokenEstimator.estimate(prompt),
-                "#\(index) host compact IR is not cheaper than the natural prompt:\n\(wire)"
-            )
-        } else {
-            XCTAssertEqual(
-                wire,
-                prompt,
-                "#\(index) when SR2 is not cheaper the wire must be the natural prompt"
-            )
-        }
         let surviving = wire
         if let dropped = firstMissingIdentityPin(original: prompt, surviving: surviving) {
             XCTFail("#\(index) identity pin dropped (\(dropped)):\nPROMPT:\n\(prompt)\nWIRE:\n\(wire)")

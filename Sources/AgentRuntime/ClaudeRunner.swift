@@ -61,15 +61,52 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     /// when Token Saver is on; absent means no hook registration (fail open).
     static let tokenSaverPostToolUseEnvKey = "RC_TOKEN_SAVER_POST_TOOL_USE"
 
+    /// Claude Code output-style name activated when Token Saver distill is
+    /// admitted. Official Claude docs: `--append-system-prompt` is a one-off
+    /// addition that does not change default response format; output styles
+    /// modify the system prompt and send mid-conversation reminders. Codex
+    /// `developer_instructions` / Grok `--rules` are the privileged format
+    /// channels on those providers; this is Claude's equivalent.
+    static let sr2OutputStyleName = "remote-code-sr2"
+    static let sr2OutputStyleFileName = "remote-code-sr2.md"
+    static let sr2OutputStyleMarkdown = """
+    ---
+    name: \(sr2OutputStyleName)
+    description: RemoteCode Token Saver — emit SR2 wire, never natural-language monologue
+    keep-coding-instructions: true
+    ---
+
+    \(SR2WirePolicy.instructBlockMarker)
+    You are still a coding agent, but every provider-authored text item you emit — reasoning, commentary, and final replies — MUST be `@sr2 v1` Opaque Agent IR. Humans never read this wire; RemoteCode humanizes it for the UI.
+
+    Required shape:
+    @sr2 v1
+    o:ok|done|fail|need|cont
+
+    Optional fields, one per line: g d p e h t u flow done tools must should may not goal use browser auth pr.
+
+    Hard rules:
+    - No articles, filler, hedging, markdown essays, or multi-paragraph prose.
+    - Prefer `o:cont` when only tool calls ran.
+    - Never emit `@sr2 v0`, SR1, or plain chat.
+    - Tool stdout stays exact (do not rewrite rg/sed/cat/jq).
+
+    If you catch yourself writing natural language, stop and emit SR2 instead.
+    """
+
     /// Builds a single `--settings <json>` pair (never two) for the Claude CLI.
     ///
     /// - Ultracode effort always injects `ultracode` + `enableWorkflows`.
     /// - When `RC_TOKEN_SAVER_POST_TOOL_USE=1`, also registers a PostToolUse
     ///   command hook pointing at the managed `distill` CLI
     ///   (`hook post-tool-use`, timeout 10s).
-    /// - Both sources merge into ONE JSON payload so argv never carries two
+    /// - When `RC_TOKEN_SAVER_DISTILL_HINT=1`, also sets `outputStyle` to the
+    ///   Token Saver SR2 style so Claude's response-format channel matches
+    ///   Codex/Grok instead of the default natural-language colleague voice.
+    /// - All sources merge into ONE JSON payload so argv never carries two
     ///   `--settings` flags.
-    /// - Flag absent + non-ultracode returns `[]` (byte-identical to baseline).
+    /// - Flag absent + non-ultracode + Token Saver off returns `[]`
+    ///   (byte-identical to baseline).
     ///
     /// Shape is always `["--settings", "<json>"]` or `[]` so consumers that
     /// take `.last` (SDK bridge payload) still receive the JSON string alone.
@@ -79,11 +116,12 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     ) -> [String] {
         let wantsUltracode = effort == .ultracode
         let wantsPostToolUse = environment[tokenSaverPostToolUseEnvKey] == "1"
-        guard wantsUltracode || wantsPostToolUse else { return [] }
+        let wantsSR2Style = environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
+        guard wantsUltracode || wantsPostToolUse || wantsSR2Style else { return [] }
 
         // Preserve the exact historical ultracode-only payload so SDK bridge
         // equality checks and any string-stable consumers keep matching.
-        if wantsUltracode && !wantsPostToolUse {
+        if wantsUltracode && !wantsPostToolUse && !wantsSR2Style {
             return ["--settings", ultracodeSettingsJSON]
         }
 
@@ -91,6 +129,9 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         if wantsUltracode {
             settings["ultracode"] = true
             settings["enableWorkflows"] = true
+        }
+        if wantsSR2Style {
+            settings["outputStyle"] = sr2OutputStyleName
         }
         if wantsPostToolUse {
             // Prefer the managed bin stamped on the nested child environment so

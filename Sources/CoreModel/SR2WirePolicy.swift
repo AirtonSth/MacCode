@@ -238,20 +238,88 @@ public enum SR2WirePolicy: Sendable {
         return legacySemanticLineCount >= 2
     }
 
+    public static let unavailableStatusNote = "Status note unavailable"
+
+    /// Host dual-channel stub: `@sr2 v1` + `o:ok` + `p:sha256=` + recovery `h:`.
+    /// This is not model-authored SR2 and must never be the default UI body.
+    public static func isCanonicalHistoryEnvelope(_ text: String) -> Bool {
+        let lines = text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard lines.first?.lowercased() == markerLine.lowercased() else { return false }
+        var hasOutcomeOK = false
+        var hasDigest = false
+        var hasHandle = false
+        for line in lines.dropFirst() {
+            guard let field = structuredField(line) else { return false }
+            switch field.key {
+            case "o":
+                let head = field.value
+                    .split(whereSeparator: { $0.isWhitespace })
+                    .first?
+                    .lowercased()
+                guard head == "ok" else { return false }
+                hasOutcomeOK = true
+            case "p":
+                let lower = field.value.lowercased()
+                guard lower.hasPrefix("sha256=") else { return false }
+                let hex = String(field.value.dropFirst("sha256=".count))
+                guard hex.count == 64, hex.allSatisfy(\.isHexDigit) else { return false }
+                hasDigest = true
+            case "h":
+                let payload = field.value
+                let isHandle = payload.hasPrefix("[[rc:") && payload.hasSuffix("]]")
+                let isInline = payload.hasPrefix(inlineOriginalPrefix)
+                guard isHandle || isInline else { return false }
+                hasHandle = true
+            default:
+                return false
+            }
+        }
+        return hasOutcomeOK && hasDigest && hasHandle
+    }
+
+    /// Human-facing body for typed provider text. Recovers envelope originals,
+    /// expands parseable SR2, and never returns protocol bytes as the default.
+    /// Quoted SR2 inside natural prose is out of scope — callers use this only
+    /// after provider provenance (`hasSR2Banner` on an item/final/thought).
+    public static func humanReadableDisplay(
+        stored: String,
+        retrieve: ((String) -> String?)? = nil
+    ) -> String {
+        let trimmed = stored.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return stored }
+        if isCanonicalHistoryEnvelope(trimmed) {
+            guard let original = providerOriginal(in: trimmed, retrieve: retrieve) else {
+                return unavailableStatusNote
+            }
+            let originalTrimmed = original.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !originalTrimmed.isEmpty, !isCanonicalHistoryEnvelope(originalTrimmed) else {
+                return unavailableStatusNote
+            }
+            return humanReadableDisplay(stored: original, retrieve: nil)
+        }
+        if isSR2(trimmed) || hasSR2Banner(trimmed) {
+            return deterministicHumanizedWire(trimmed) ?? unavailableStatusNote
+        }
+        return stored
+    }
+
     /// Deterministic last-resort UI rendering from a source that has already
     /// been classified as trusted wire. It never examines arbitrary natural
-    /// prose, which preserves quoted protocol examples without heuristic text
-    /// stripping. Every proof/evidence field is retained; this is a semantic
-    /// fallback, not a preview truncation.
+    /// prose. Status lives on `e:` — only fail/error values render as Error.
     public static func deterministicHumanizedWire(_ text: String) -> String? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard isSR2(trimmed) || hasSR2Banner(trimmed) else { return nil }
 
         var outcomes: [String] = []
         var evidence: [String] = []
-        var errors: [String] = []
+        var notes: [String] = []
         var semantics: [String] = []
         var continuationOnly = false
+        var hasOkOutcome = false
         let labels = [
             "g": "Goal", "d": "Decision", "t": "Task",
             "flow": "Next steps", "done": "Complete when", "tools": "Tools",
@@ -261,6 +329,12 @@ public enum SR2WirePolicy: Sendable {
             "goal": "Goal", "use": "Use", "browser": "Browser", "auth": "Auth",
             "pr": "Pull request", "comment": "Comment", "trello-comment": "Trello comment",
         ]
+        let statusLabels = [
+            "ci": "Checks", "checks": "Checks", "pr": "Pull request",
+            "url": "URL", "fix": "Fix", "head": "Head", "worktree": "Worktree",
+            "railway": "Railway", "goal": "Goal", "elapsed": "Elapsed",
+            "error": "Error", "fail": "Error",
+        ]
 
         func readable(_ value: String) -> String {
             value
@@ -268,11 +342,24 @@ public enum SR2WirePolicy: Sendable {
                 .replacingOccurrences(of: "+", with: " and ")
                 .replacingOccurrences(of: "|", with: " or ")
         }
+        func readableHyphens(_ value: String) -> String {
+            if value.contains("://") { return value }
+            return value.replacingOccurrences(of: "-", with: " ")
+        }
         func sentence(_ value: String) -> String {
             let value = readable(value)
             return value.hasSuffix(".") ? value : value + "."
         }
-        func evidenceLine(_ value: String) -> String {
+        func evidenceLine(_ value: String) -> String? {
+            let lower = value.lowercased()
+            if lower.hasPrefix("sha256=") { return nil }
+            if lower.hasPrefix("path:") {
+                let rest = String(value.dropFirst(5))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if rest.isEmpty { return nil }
+                if rest.allSatisfy(\.isNumber) { return "Path \(rest)." }
+                return "Path: \(sentence(rest))"
+            }
             if let equals = value.firstIndex(of: "=") {
                 let index = value[..<equals]
                     .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -283,6 +370,30 @@ public enum SR2WirePolicy: Sendable {
                 }
             }
             return "Evidence: \(sentence(value))"
+        }
+        func statusLine(_ value: String) -> String? {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { return nil }
+            let lower = trimmed.lowercased()
+            if lower == "none" { return nil }
+            if let colon = trimmed.firstIndex(of: ":") {
+                let key = String(trimmed[..<colon])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                let rest = String(trimmed[trimmed.index(after: colon)...])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if rest.isEmpty { return statusLine(key) }
+                if key == "url" { return "URL: \(rest)" }
+                let label = statusLabels[key] ?? key.capitalized
+                if label == "Error" {
+                    return "Error: \(sentence(readableHyphens(rest)))"
+                }
+                return "\(label): \(sentence(readableHyphens(rest)))"
+            }
+            if lower.hasPrefix("fail") || lower.hasPrefix("error") {
+                return "Error: \(sentence(readableHyphens(trimmed)))"
+            }
+            return "Status: \(sentence(readableHyphens(trimmed)))"
         }
 
         for raw in trimmed.split(whereSeparator: \.isNewline) {
@@ -296,13 +407,19 @@ public enum SR2WirePolicy: Sendable {
                     continuationOnly = true
                 } else if head == "done" {
                     outcomes.append("Completed.")
+                } else if head == "ok" {
+                    hasOkOutcome = true
                 } else {
                     outcomes.append(sentence(field.value))
                 }
             case "p":
-                evidence.append(evidenceLine(field.value))
+                if let line = evidenceLine(field.value) {
+                    evidence.append(line)
+                }
             case "e":
-                errors.append("Error: \(sentence(field.value))")
+                if let line = statusLine(field.value) {
+                    notes.append(line)
+                }
             case "h":
                 continue
             default:
@@ -312,7 +429,8 @@ public enum SR2WirePolicy: Sendable {
             }
         }
 
-        var pieces = outcomes + semantics + errors + evidence
+        var pieces = outcomes + semantics + notes + evidence
+        if pieces.isEmpty, hasOkOutcome { pieces.append("ok.") }
         if pieces.isEmpty, continuationOnly { pieces.append("Continuing the work.") }
         return pieces.isEmpty
             ? "I could not expand the SR2 response."

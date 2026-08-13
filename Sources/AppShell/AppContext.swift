@@ -892,40 +892,14 @@ public final class AppContext {
             let scopedPrompt = await self.tokenSaverSessionLearnPrompt(
                 prompt, provider: provider, threadId: threadId, runId: runId
             )
-            let trustedSemanticSource = semanticSource.appendingTrustedHostSegments(
-                scopedPrompt.trustedHostSegments
-            )
-            let compressed = await self.tokenSaverCompress(
-                prompt: scopedPrompt.prompt,
-                semanticSource: trustedSemanticSource,
-                provider: provider,
-                threadId: threadId,
-                runId: runId
-            )
-            // Every user prompt is an @sr2 v1 provider wire. Compact compiled
-            // SR2 when the local compiler produced one; otherwise the lossless
-            // u: envelope. Never send raw natural language.
-            let (runtimeActive, targetModel) = await MainActor.run {
-                (self.isTokenSaverRuntimeActive(), (try? self.threadRepo.get(id: threadId))?.model)
-            }
-            let preservesInternalProtocol = compressed != scopedPrompt.prompt
-                && Self.isKnownInternalSR2(compressed)
-            return runtimeActive
-                ? Self.alwaysOnSR2UserInstruction(
-                    compressed,
-                    preservesKnownInternalProtocol: preservesInternalProtocol,
-                    semanticSource: trustedSemanticSource.naturalUserText,
-                    trustedSemanticSegments: trustedSemanticSource.trustedHostSegments,
-                    losslessFallback: scopedPrompt.prompt,
-                    provider: provider.rawValue,
-                    model: targetModel
-                )
-                : compressed
+            // User text stays verbatim. SessionLearn may already be appended
+            // on this string-only seam; do not compile or wrap as SR2.
+            return scopedPrompt.prompt
         }
         self.coordinator.promptPayloadCompressor = { [weak self] prompt, semanticSource, provider, threadId, runId in
             guard let self else { return AgentProviderPromptPayload(userPrompt: prompt) }
             // The typed payload is the production seam: SessionLearn is host
-            // context, while the natural user prompt is compiled on its own.
+            // context. The user prompt is sent verbatim.
             let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
             guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .initial) else {
                 return AgentProviderPromptPayload(userPrompt: prompt)
@@ -937,28 +911,6 @@ public final class AppContext {
             let scopedPrompt = await self.tokenSaverSessionLearnPrompt(
                 prompt, provider: provider, threadId: threadId, runId: runId
             )
-            let compressed = await self.tokenSaverCompress(
-                prompt: prompt,
-                semanticSource: AgentPromptSemanticSource(semanticSource.naturalUserText),
-                provider: provider,
-                threadId: threadId,
-                runId: runId
-            )
-            let targetModel = await MainActor.run {
-                (try? self.threadRepo.get(id: threadId))?.model
-            }
-            let preservesInternalProtocol = compressed != prompt
-                && Self.isKnownInternalSR2(compressed)
-            let userWire = Self.alwaysOnSR2UserInstruction(
-                compressed,
-                preservesKnownInternalProtocol: preservesInternalProtocol,
-                semanticSource: semanticSource.naturalUserText,
-                // SessionLearn is intentionally omitted from the user leg.
-                trustedSemanticSegments: [],
-                losslessFallback: prompt,
-                provider: provider.rawValue,
-                model: targetModel
-            )
             let learned = scopedPrompt.trustedHostSegments
                 .joined(separator: "\n")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -968,7 +920,7 @@ public final class AppContext {
                     text: "REMOTE_CODE_SESSION_LEARN_V1\nSESSION_LEARN_EXACT_SCOPE:\n\(learned)"
                 )
             return AgentProviderPromptPayload(
-                userPrompt: userWire,
+                userPrompt: prompt,
                 trustedHostInstruction: host
             )
         }
@@ -981,32 +933,7 @@ public final class AppContext {
             let scopedPrompt = await self.tokenSaverSessionLearnPrompt(
                 prompt, provider: provider, threadId: threadId, runId: nil
             )
-            let trustedSemanticSource = semanticSource.appendingTrustedHostSegments(
-                scopedPrompt.trustedHostSegments
-            )
-            let compressed = await self.tokenSaverCompress(
-                prompt: scopedPrompt.prompt,
-                semanticSource: trustedSemanticSource,
-                provider: provider,
-                threadId: threadId,
-                cacheState: "prompt_followup"
-            )
-            let (runtimeActive, targetModel) = await MainActor.run {
-                (self.isTokenSaverRuntimeActive(), (try? self.threadRepo.get(id: threadId))?.model)
-            }
-            let preservesInternalProtocol = compressed != scopedPrompt.prompt
-                && Self.isKnownInternalSR2(compressed)
-            return runtimeActive
-                ? Self.alwaysOnSR2UserInstruction(
-                    compressed,
-                    preservesKnownInternalProtocol: preservesInternalProtocol,
-                    semanticSource: trustedSemanticSource.naturalUserText,
-                    trustedSemanticSegments: trustedSemanticSource.trustedHostSegments,
-                    losslessFallback: scopedPrompt.prompt,
-                    provider: provider.rawValue,
-                    model: targetModel
-                )
-                : compressed
+            return scopedPrompt.prompt
         }
         self.coordinator.finalResponseTranslator = { [weak self] response, provider, threadId, runId in
             guard let self else { return response }
@@ -1997,6 +1924,18 @@ public final class AppContext {
         let installer = makeAgentSkillInstaller()
         var runtimeInstaller: AgentSkillInstaller?
         // Managed PATH is host-local (not inside the compact receipt JSON).
+        if receipt.capabilities.distill == true, provider == .claude {
+            // Claude's official response-format channel is an output style,
+            // not `--append-system-prompt`. Repair a missing style file before
+            // the provider starts so `outputStyle: remote-code-sr2` can load.
+            do {
+                _ = try installer.ensureClaudeSR2OutputStyle()
+            } catch {
+                NSLog(
+                    "RemoteCode: ensureClaudeSR2OutputStyle before agent turn failed: \(error.localizedDescription)"
+                )
+            }
+        }
         if receipt.capabilities.managedPath == true {
             // Automatic reinstall for any user on every admitted turn: missing
             // or dangling ~/.remote-code/bin/distill is repaired before PATH is
@@ -2739,6 +2678,9 @@ public final class AppContext {
             }
             capture("Distill CLI ensure") {
                 _ = try installer.ensureDistillCLI(serviceBinaryURL: sharedBinary)
+            }
+            capture("Claude SR2 output style") {
+                _ = try installer.ensureClaudeSR2OutputStyle()
             }
             capture("command wrappers") {
                 _ = try installer.installCommandWrappers(serviceBinaryURL: sharedBinary)
@@ -3738,9 +3680,8 @@ public final class AppContext {
         }
     }
 
-    /// Provider-facing user leg. Compact `@sr2 v1` only when it is cheaper
-    /// than the natural prompt. Otherwise the original text is sent. A
-    /// lossless `u:` dump of the essay is never the fallback.
+    /// Provider-facing user leg. User prompts are sent verbatim — compiling
+    /// them to `@sr2 v1` dropped instruction context.
     nonisolated public static func alwaysOnSR2UserInstruction(
         _ compressed: String,
         preservesKnownInternalProtocol: Bool = false,
@@ -3752,17 +3693,7 @@ public final class AppContext {
         targetTokenizer: String? = nil,
         targetTokenCount: SR2Optimizer.TokenCounter? = nil
     ) -> String {
-        sr2UserInstructionWire(
-            compressed,
-            preservesKnownInternalProtocol: preservesKnownInternalProtocol,
-            semanticSource: semanticSource,
-            trustedSemanticSegments: trustedSemanticSegments,
-            losslessFallback: losslessFallback,
-            provider: provider,
-            model: model,
-            targetTokenizer: targetTokenizer,
-            targetTokenCount: targetTokenCount
-        )
+        losslessFallback ?? compressed
     }
 
     static func netPositiveSR2UserInstruction(original: String, compressed: String) -> String {
