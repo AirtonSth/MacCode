@@ -672,6 +672,65 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertEqual(requests.first?.recordSavings, true)
         XCTAssertEqual(requests.first?.input, rawToolOutput)
         XCTAssertEqual(requests.first?.provider, "claude")
+        XCTAssertEqual(
+            requests.first?.cacheState,
+            "tool_output_hooked",
+            "the durable row must identify PostToolUse as the sole owner"
+        )
+    }
+
+    func test_claudeWrapperAndHookOwnershipProducesOneHookedRequest() async throws {
+        let rawToolOutput = String(repeating: "ordinary build output that should compress\n", count: 40)
+        let compressed = "ordinary build output (40 repeated lines)"
+        let response = DistillResponse(
+            requestID: UUID(),
+            output: compressed,
+            inputCharacters: rawToolOutput.count,
+            inputTokens: TokenEstimator.estimate(rawToolOutput),
+            outputTokens: TokenEstimator.estimate(compressed),
+            originalHandle: "hook-owner",
+            routeStage: .deterministic
+        )
+        let responseData = try JSONEncoder().encode(response)
+        let recorder = RequestRecorder()
+        let admittedEnvironment = ["RC_TOKEN_SAVER_POST_TOOL_USE": "1"]
+
+        XCTAssertEqual(
+            CommandWrapPolicy.passthroughReason(
+                command: "swift",
+                args: ["test", "--filter", "FeatureTests"],
+                environment: admittedEnvironment
+            ),
+            "provider_post_tool_use_owner",
+            "the PATH wrapper must not issue a first Distill request"
+        )
+
+        let hookJSON: [String: Any] = [
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": ["command": "swift test --filter FeatureTests"],
+            "tool_response": rawToolOutput,
+        ]
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "post-tool-use"],
+            stdin: try JSONSerialization.data(withJSONObject: hookJSON),
+            state: state,
+            provider: "claude"
+        ) { request in
+            if let body = request.httpBody,
+               let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
+                await recorder.append(decoded)
+            }
+            return (responseData, 200)
+        }
+
+        let (output, code) = await cli.run()
+        XCTAssertEqual(code, 0)
+        let object = try JSONSerialization.jsonObject(with: output) as? [String: Any]
+        XCTAssertNotNil((object?["hookSpecificOutput"] as? [String: Any])?["updatedToolOutput"])
+        let requests = await recorder.all()
+        XCTAssertEqual(requests.count, 1, "wrapper plus hook must yield exactly one Distill request")
+        XCTAssertEqual(requests.first?.cacheState, "tool_output_hooked")
     }
 
     func test_hookPostToolUse_waveA_deliversUpdatedToolOutputBeforeLedgerTransport() async throws {

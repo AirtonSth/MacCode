@@ -91,6 +91,9 @@ public struct ManagedDistillCLI: Sendable {
     /// Per-request reversible-store floor (nil = server default). The RTK command wrappers set
     /// a low value so compressed output always carries a `[[rc:<handle>]]` recovery marker.
     public let reversibleStoreMinBytes: Int?
+    /// Content-free durable origin for distinguishing explicit pipe, PATH
+    /// wrapper, aggregate interceptor, and provider hook savings.
+    public let cacheState: String?
     public let distillAdmission: DistillAdmission
     public let transport: Transport
 
@@ -103,6 +106,7 @@ public struct ManagedDistillCLI: Sendable {
         invocationID: String = UUID().uuidString.lowercased(),
         maxOutputCharacters: Int = 4_000,
         reversibleStoreMinBytes: Int? = nil,
+        cacheState: String? = nil,
         distillAdmission: @escaping DistillAdmission = { true },
         transport: @escaping Transport
     ) {
@@ -117,6 +121,8 @@ public struct ManagedDistillCLI: Sendable {
         self.invocationID = invocationID
         self.maxOutputCharacters = max(128, maxOutputCharacters)
         self.reversibleStoreMinBytes = reversibleStoreMinBytes
+        let normalizedCacheState = cacheState?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.cacheState = normalizedCacheState?.isEmpty == false ? normalizedCacheState : nil
         self.distillAdmission = distillAdmission
         self.transport = transport
     }
@@ -296,6 +302,7 @@ public struct ManagedDistillCLI: Sendable {
             invocationID: invocationID,
             maxOutputCharacters: maxChars,
             reversibleStoreMinBytes: decision.reversibleStoreMinBytes,
+            cacheState: decision.cacheState,
             distillAdmission: distillAdmission,
             transport: transport
         )
@@ -468,6 +475,7 @@ public struct ManagedDistillCLI: Sendable {
             question: prompt.isEmpty ? nil : prompt,
             provider: provider,
             recordSavings: true,
+            cacheState: cacheState,
             maxOutputCharacters: maxOutputCharacters,
             reversibleStoreMinBytes: reversibleStoreMinBytes
         )
@@ -521,7 +529,8 @@ public struct ManagedDistillCLI: Sendable {
             question: prompt.isEmpty ? nil : prompt,
             provider: provider,
             recordSavings: true,
-            cacheState: "wave_prepass_\(pre.waveID)",
+            cacheState: cacheState.map { "\($0)_wave_prepass_\(pre.waveID)" }
+                ?? "wave_prepass_\(pre.waveID)",
             maxOutputCharacters: maxOutputCharacters,
             reversibleStoreMinBytes: reversibleStoreMinBytes,
             precomputedOutput: pre.output
@@ -598,6 +607,7 @@ public struct ManagedDistillCLI: Sendable {
                 question: question,
                 provider: provider,
                 recordSavings: true,
+                cacheState: cacheState,
                 maxOutputCharacters: maxOutputCharacters,
                 reversibleStoreMinBytes: reversibleStoreMinBytes
             )

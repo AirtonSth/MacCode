@@ -127,6 +127,51 @@ final class TokenSaverAppContextTests: XCTestCase {
                        "an available provider/model tokenizer must override the fallback estimate")
     }
 
+    func testProjectlessNaturalTaskWireIsCanonicalAcrossAllProviderModelLabels() {
+        // WHY: projectless prompts bypass MLX recovery, and provider/model
+        // metadata must not change the deterministic SR2 behavior sent to an
+        // otherwise identical Claude, Codex, or Grok turn.
+        let prompt = """
+        Go to my linear.
+        Get the first task where status is Todo and it’s assigned to me “samuel”.
+        https://linear.app/empathmsp/view/samuel-todo-b3efdb6727f6
+
+        Tasks with [Bug Patrol]  are priority.
+
+        Now do the prompt: “using git worktree from updated main implement: <LINEAR_URL> /sam-task /sam-pr-description (no review da task use /sam-claude-advisor (opus max)) OBS: do not commit the planning. Critical: you should follow all sam-task steps”
+
+        After update linear.
+
+        It’s mandatory to create the playwright videos and upload them into PR description as video players.
+        Use gh to help you.
+
+        api-v2 (backend): https://github.com/EmpathMSP/empath-api-v2
+        ui (frontend): https://github.com/EmpathMSP/empath-ui
+        zitadel login infra: https://github.com/EmpathMSP/empath-auth-infra
+        new monorepo being constructed: https://github.com/EmpathMSP/platform
+        """
+        let expected = """
+        @sr2 v1
+        t:open:linear>pick:1st task(status=Todo,asgn=“samuel”,at=https://linear.app/empathmsp/view/samuel-todo-b3efdb6727f6,prio?=[Bug Patrol]@title-or-text)>impl:<LINEAR_URL>(wt@updated main,/sam-task,/sam-pr-description,/sam-claude-advisor(opus max),!review:task,!commit:planning,must:/sam-task:all,must:create:playwright videos+upload:PR description(video players),tool:gh,repos:api-v2(backend)=https://github.com/EmpathMSP/empath-api-v2&ui(frontend)=https://github.com/EmpathMSP/empath-ui&zitadel login infra=https://github.com/EmpathMSP/empath-auth-infra&new monorepo being constructed=https://github.com/EmpathMSP/platform)>update:linear
+        """
+        let targets = [
+            (AgentProvider.claude.rawValue, "claude-opus-test"),
+            (AgentProvider.codex.rawValue, "gpt-test"),
+            (AgentProvider.grok.rawValue, "grok-test"),
+        ]
+
+        let wires = targets.map { provider, model in
+            AppContext.alwaysOnSR2UserInstruction(prompt, provider: provider, model: model)
+        }
+
+        XCTAssertEqual(Set(wires).count, 1,
+                       "provider/model labels must not fork the deterministic projectless contract")
+        XCTAssertEqual(wires.first, expected)
+        XCTAssertFalse(expected.contains("\nu:"), expected)
+        XCTAssertNil(SR2WirePolicy.userInstruction(in: expected),
+                     "the canonical semantic task must not masquerade as lossless u: passthrough")
+    }
+
     func testProductionEstimatorCompilesExactPortugueseCompoundIntoOrderedToolGroups() {
         // WHY: this is the exact live PT-BR contract that Codex previously
         // flattened into one `/bin/zsh -lc` call, losing the three exact prefix

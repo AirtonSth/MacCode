@@ -652,7 +652,11 @@ public enum SR2Optimizer {
         let source = semanticSegments?.isEmpty == false
             ? semanticSegments!.joined(separator: "\n")
             : (semanticSource ?? original)
-        let candidates = deterministicCandidate(for: source).map { [$0] } ?? []
+        var candidates = deterministicCandidate(for: source).map { [$0] } ?? []
+        if let naturalTask = SR2NaturalTaskCompiler.candidate(for: source),
+           !candidates.contains(naturalTask) {
+            candidates.append(naturalTask)
+        }
         let losslessV1 = SR2WirePolicy.userInstructionWire(original)
         return optimize(
             original: original,
@@ -750,6 +754,16 @@ public enum SR2Optimizer {
         let lower = candidate.lowercased()
         if let dropped = firstMissingLiteral(ir: ir, candidate: candidate) {
             return "literal missing: \(dropped)"
+        }
+        // The bounded natural-task compiler consumes every non-empty source
+        // line, rejects semantic operators inside scalar captures, and owns one
+        // canonical spelling. Recompute it here so an MLX or caller candidate
+        // cannot use `t:` as a bag of source words while changing ordering,
+        // modality, preference policy, or role bindings.
+        if let expectedNaturalTask = SR2NaturalTaskCompiler.candidate(for: ir.source) {
+            return candidate == expectedNaturalTask
+                ? nil
+                : "canonical natural-task binding changed"
         }
         if ir.hasUnboundModality {
             return "source predicate modality could not be bound safely"

@@ -768,6 +768,83 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(finish.2, "codex-thread-1")
     }
 
+    func test_interruptedTurnSettlesPendingApprovalBeforeFinishingRun() async throws {
+        // WHY: an interrupted turn can terminalize while its provider approval
+        // continuation is still open. Resolve it at the terminal boundary so the
+        // provider cannot hang and the persisted callback card cannot stay pending.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "needs approval before interrupt"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        defer { try? adapter.stopSession(threadId: threadId) }
+
+        let approvalTask = Task {
+            try await client.serverRequestHandler?("item/commandExecution/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "cmd-interrupted",
+                "command": "swift test"
+            ])
+        }
+        let userInputTask = Task {
+            try await client.serverRequestHandler?("item/tool/requestUserInput", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "question-interrupted",
+                "questions": [[
+                    "id": "continue",
+                    "header": "Continue",
+                    "question": "Continue?",
+                    "options": []
+                ]]
+            ])
+        }
+        let approval = try await waitForApproval(in: sink)
+        let userInput = try await waitForUserInput(in: sink)
+
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turn": [
+                "id": "turn-app-server-1",
+                "status": "interrupted"
+            ]
+        ])
+
+        let finish = try await waitForFinish(in: sink, timeout: 3)
+        XCTAssertEqual(finish.0, .cancelled)
+        XCTAssertTrue(adapter.hasSession(threadId: threadId), "terminal callback settlement must retain the session for authorized recovery")
+        try await waitForRequestResolution(in: sink, requestId: approval.id)
+        try await waitForUserInputResolution(in: sink, requestId: userInput.id)
+        let rawResponse = try await approvalTask.value
+        let response = try XCTUnwrap(rawResponse as? [String: Any])
+        XCTAssertEqual(response["decision"] as? String, "cancel")
+        let rawUserInputResponse = try await userInputTask.value
+        let userInputResponse = try XCTUnwrap(rawUserInputResponse as? [String: Any])
+        let answers = try XCTUnwrap(userInputResponse["answers"] as? [String: [String: [String]]])
+        XCTAssertEqual(answers["continue"]?["answers"], [""])
+        let events = await sink.snapshot()
+        XCTAssertTrue(events.contains {
+            if case .requestResolved(let id, let state) = $0 {
+                return id == approval.id && state == .cancelled
+            }
+            return false
+        })
+    }
+
     func test_turnCompletedWithTopLevelFailedStatusFinishesRunAsFailed() async throws {
         // WHY: status may appear at top-level as a fallback when turn dict is flat;
         // still must not complete successfully.
@@ -2514,7 +2591,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
     }
 
     func test_adapterCapturesAppServerPlanDeltaAsProposedPlan() async throws {
-        let client = MockCodexAppServerClient(autoComplete: false)
+        let client = MockCodexAppServerClient(autoComplete: false, turnId: "turn-plan-1")
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
             client.notificationHandler = notificationHandler
             return client
@@ -2555,7 +2632,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
     }
 
     func test_adapterPromotesPlanModeFinalAssistantTextToProposedPlan() async throws {
-        let client = MockCodexAppServerClient(autoComplete: false)
+        let client = MockCodexAppServerClient(autoComplete: false, turnId: "turn-plan-final-1")
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
             client.notificationHandler = notificationHandler
             return client
@@ -2593,7 +2670,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
     }
 
     func test_adapterStartsStreamingAssistantItemOnlyOnceAcrossDeltas() async throws {
-        let client = MockCodexAppServerClient(autoComplete: false)
+        let client = MockCodexAppServerClient(autoComplete: false, turnId: "turn-stream-1")
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
             client.notificationHandler = notificationHandler
             return client
@@ -2676,7 +2753,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         // final answer must be the LAST message only, NOT the concatenation of
         // every preamble — otherwise the answer bubble (and the persisted, reload-
         // surviving message) shows the whole narration of the turn.
-        let client = MockCodexAppServerClient(autoComplete: false)
+        let client = MockCodexAppServerClient(autoComplete: false, turnId: "turn-preambles-1")
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
             client.notificationHandler = notificationHandler
             return client
@@ -2723,7 +2800,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
     func test_adapterAccumulatesMultipleDeltasOfSameAgentMessageItem() async throws {
         // Per-item reset must NOT break intra-item streaming: multiple deltas that
         // share one item id are still concatenated into that item's full text.
-        let client = MockCodexAppServerClient(autoComplete: false)
+        let client = MockCodexAppServerClient(autoComplete: false, turnId: "turn-same-item-1")
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
             client.notificationHandler = notificationHandler
             return client
@@ -2770,7 +2847,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
     }
 
     func test_adapterTreatsSnakeCaseAgentMessageCompletionAsFinalAssistantResponse() async throws {
-        let client = MockCodexAppServerClient(autoComplete: false)
+        let client = MockCodexAppServerClient(autoComplete: false, turnId: "turn-snake-agent-message-1")
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
             client.notificationHandler = notificationHandler
             return client
@@ -2814,7 +2891,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
     }
 
     func test_adapterIgnoresRoleUserMessageItemsSoPromptsDoNotBecomeAssistantReplies() async throws {
-        let client = MockCodexAppServerClient(autoComplete: false)
+        let client = MockCodexAppServerClient(autoComplete: false, turnId: "turn-role-user-1")
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
             client.notificationHandler = notificationHandler
             return client
@@ -2922,7 +2999,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
     }
 
     func test_adapterKeepsNestedRuntimeRefsFromAppServerNotifications() async throws {
-        let client = MockCodexAppServerClient(autoComplete: false)
+        let client = MockCodexAppServerClient(autoComplete: false, turnId: "turn-nested-1")
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
             client.notificationHandler = notificationHandler
             return client
@@ -3029,7 +3106,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         ])
         client.notificationHandler?("item/completed", [
             "threadId": "codex-thread-1",
-            "turnId": "turn-app-server-2",
+            "turnId": "turn-app-server-1",
             "item": [
                 "id": "native-context-compaction",
                 "type": "contextCompaction"
@@ -3444,8 +3521,9 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             return client
         }
         let log = OrderedEventLog()
+        let threadId = AgentThreadID()
         _ = try await adapter.sendTurn(AgentRunRequest(
-            threadId: AgentThreadID(),
+            threadId: threadId,
             provider: .codex,
             model: "gpt-5.5",
             cwd: "/tmp/remotecode-app-server-adapter",
@@ -3483,7 +3561,15 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         // A later turn must produce a DIFFERENT goal item id: item ids are
         // unique across turns (invariant relied on by the reducer's
         // newest-first item lookup and SR1 translation eviction).
-        client.notificationHandler?("turn/started", ["threadId": "codex-thread-1", "turnId": "turn-app-server-2"])
+        client.nextTurnId = "turn-app-server-2"
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "/goal follow-up",
+            providerThreadId: "codex-thread-1"
+        )) { log.record($0) }
         client.notificationHandler?("thread/goal/updated", goalPayload)
         let secondTurnGoal = try XCTUnwrap(goalItems(summary: "Goal updated").last)
         XCTAssertEqual(secondTurnGoal.turnId, "turn-app-server-2")
@@ -3885,7 +3971,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
     /// with idle thread status must stamp [[RC_AWAITING]] onto both turnCompleted
     /// and finished — host recovery keys on final-message text only.
     func test_shellDetachedCommandExecution_stampsAwaitingMarkerOnCompletedTurn() async throws {
-        let client = MockCodexAppServerClient(autoComplete: false)
+        let client = MockCodexAppServerClient(autoComplete: false, turnId: "turn-detach-1")
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
             client.notificationHandler = notificationHandler
             return client
@@ -4029,7 +4115,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
     /// reads finished).
     func test_shellDetachedCommandExecution_deferredReleaseCarriesAwaitingMarker() async throws {
         let marker = BackgroundAwaitContinuation.awaitingMarker
-        let client = MockCodexAppServerClient(autoComplete: false)
+        let client = MockCodexAppServerClient(autoComplete: false, turnId: "turn-deferred-detach")
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
             client.notificationHandler = notificationHandler
             return client
@@ -4095,7 +4181,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
     /// slot and the released `.finished` must carry B's unmarked final — never A's.
     func test_deferredDetachThenNonDetachTurn_finishedCarriesLaterUnmarkedFinal() async throws {
         let marker = BackgroundAwaitContinuation.awaitingMarker
-        let client = MockCodexAppServerClient(autoComplete: false)
+        let client = MockCodexAppServerClient(autoComplete: false, turnId: "turn-A")
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
             client.notificationHandler = notificationHandler
             return client
@@ -4188,6 +4274,221 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                        "released .finished must carry B's unmarked final, never A's; got \(finish.1 ?? "nil")")
         XCTAssertFalse(finish.1?.contains(marker) == true)
         XCTAssertFalse(finish.1?.contains("turn-A-detached") == true)
+    }
+
+    /// WHY: Codex can flush buffered stderr/output notifications after a turn has
+    /// already completed or after a newer turn has started. Routing an explicitly
+    /// stale turn through the current session grows the transcript forever and can
+    /// freeze the Agent App, so the adapter must reject the raw runtime row and its
+    /// derived item event together.
+    func test_explicitStaleTurnOutputAndItemNotificationsAreDropped() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let log = OrderedEventLog()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "turn scoped output"
+        )) { log.record($0) }
+
+        let baselineCount = log.assistantEvents.count
+        client.notificationHandler?("item/commandExecution/outputDelta", [
+            "threadId": "codex-thread-1",
+            "turnId": "stale-turn",
+            "itemId": "stale-command",
+            "delta": "late stderr"
+        ])
+        client.notificationHandler?("item/started", [
+            "threadId": "codex-thread-1",
+            "turnId": "stale-turn",
+            "item": ["id": "stale-item", "type": "commandExecution", "command": "echo stale"]
+        ])
+
+        XCTAssertEqual(
+            log.assistantEvents.count,
+            baselineCount,
+            "an explicit non-active turn must emit neither providerRuntime nor item events"
+        )
+
+        client.notificationHandler?("item/commandExecution/outputDelta", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "itemId": "live-command",
+            "delta": "live output"
+        ])
+        let accepted = Array(log.assistantEvents.dropFirst(baselineCount))
+        XCTAssertTrue(accepted.contains {
+            if case .providerRuntime(let event) = $0 {
+                return event.method == "item/commandExecution/outputDelta"
+            }
+            return false
+        })
+        XCTAssertTrue(accepted.contains {
+            if case .itemDelta(let itemId, _, let output, _) = $0 {
+                return itemId == "live-command" && output == "live output"
+            }
+            return false
+        }, "the current active turn must keep streaming legitimate command output")
+    }
+
+    /// WHY: after a terminal notification, a buffered turn/thread lifecycle
+    /// callback must not reopen adapter state or create another visible turn.
+    func test_terminalLifecycleNotificationsAndRequestsAreDropped() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let log = OrderedEventLog()
+        let threadId = AgentThreadID()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "terminal lifecycle"
+        )) { log.record($0) }
+
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1"
+        ])
+        let terminalCount = log.assistantEvents.count
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1"
+        ])
+        client.notificationHandler?("thread/started", [
+            "threadId": "codex-thread-late"
+        ])
+        XCTAssertEqual(log.assistantEvents.count, terminalCount,
+                       "late turn/thread lifecycle notifications must not reopen a terminal adapter session")
+
+        do {
+            _ = try await client.serverRequestHandler?("item/tool/requestUserInput", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "questions": [["question": "late"]]
+            ])
+            XCTFail("a terminal interactive request must be rejected before allocating a continuation")
+        } catch {
+            // Expected: stale requests must never create pending UI state.
+        }
+        XCTAssertEqual(log.assistantEvents.count, terminalCount,
+                       "late interactive requests must not emit request cards")
+    }
+
+    /// WHY: a provider can flush a buffered `turn/started` with a fresh id after
+    /// the host has already terminalized the run. Accepting that id reopens the
+    /// adapter's active turn and lets later raw runtime/output rows through,
+    /// even though no host `sendTurn` authorized a follow-up.
+    func test_terminalDifferentTurnStartedWithoutHostAuthorizationIsDropped() async throws {
+        for terminal in ["completed", "cancelled", "failed"] {
+            let client = MockCodexAppServerClient(autoComplete: false)
+            let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+                client.notificationHandler = notificationHandler
+                return client
+            }
+            let log = OrderedEventLog()
+            let threadId = AgentThreadID()
+            _ = try await adapter.sendTurn(AgentRunRequest(
+                threadId: threadId,
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: "/tmp/remotecode-app-server-adapter",
+                prompt: "late " + terminal
+            )) { log.record($0) }
+
+            switch terminal {
+            case "completed":
+                client.notificationHandler?("turn/completed", [
+                    "threadId": "codex-thread-1",
+                    "turnId": "turn-app-server-1"
+                ])
+            case "cancelled":
+                client.notificationHandler?("turn/completed", [
+                    "threadId": "codex-thread-1",
+                    "turn": ["id": "turn-app-server-1", "status": "interrupted"]
+                ])
+            case "failed":
+                client.notificationHandler?("turn/failed", [
+                    "threadId": "codex-thread-1",
+                    "turnId": "turn-app-server-1",
+                    "error": ["message": "late test failure"]
+                ])
+            default:
+                XCTFail("unexpected terminal fixture " + terminal)
+            }
+
+            let terminalCount = log.assistantEvents.count
+            client.notificationHandler?("turn/started", [
+                "threadId": "codex-thread-1",
+                "turnId": "unsolicited-" + terminal
+            ])
+            client.notificationHandler?("item/commandExecution/outputDelta", [
+                "threadId": "codex-thread-1",
+                "turnId": "unsolicited-" + terminal,
+                "itemId": "late-output",
+                "delta": "must be dropped"
+            ])
+
+            let lateEvents = Array(log.assistantEvents.dropFirst(terminalCount))
+            XCTAssertTrue(lateEvents.isEmpty,
+                          terminal + " terminal must drop a different unsolicited turn id's raw/runtime/output events")
+            XCTAssertNil(lateEvents.first { event in
+                if case .turnStarted = event { return true }
+                return false
+            }, terminal + " terminal must not reopen activeTurn")
+        }
+    }
+
+    /// WHY: sendTurn can receive no turn id before a terminal notification. The
+    /// host-start authorization must still be consumed by terminalization, or a
+    /// later unsolicited explicit turn id can reopen the completed session.
+    func test_terminalWithoutStartedTurnIdClearsHostAuthorization() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false, omitStartTurnId: true)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let log = OrderedEventLog()
+        let threadId = AgentThreadID()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "terminal without turn id"
+        )) { log.record($0) }
+
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1"
+        ])
+        let terminalCount = log.assistantEvents.count
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turnId": "unsolicited-after-no-id"
+        ])
+        client.notificationHandler?("item/commandExecution/outputDelta", [
+            "threadId": "codex-thread-1",
+            "turnId": "unsolicited-after-no-id",
+            "itemId": "late-output",
+            "delta": "must be dropped"
+        ])
+
+        let lateEvents = Array(log.assistantEvents.dropFirst(terminalCount))
+        XCTAssertTrue(lateEvents.isEmpty,
+                      "terminal without a started turn id must drop unsolicited raw/runtime/output events")
+        XCTAssertNil(lateEvents.first { event in
+            if case .turnStarted = event { return true }
+            return false
+        }, "terminal without a started turn id must not reopen activeTurn")
     }
 }
 
@@ -4313,6 +4614,40 @@ private func waitForUserInput(in sink: EventSink) async throws -> AssistantUserI
         try await Task.sleep(nanoseconds: 20_000_000)
     }
     throw CodexAdapterTestWaitError.timedOut("user-input request")
+}
+
+private func waitForRequestResolution(in sink: EventSink, requestId: String) async throws {
+    let deadline = Date().addingTimeInterval(3)
+    while Date() < deadline {
+        let events = await sink.snapshot()
+        if events.contains(where: {
+            if case .requestResolved(let id, let state) = $0 {
+                return id == requestId && state == .cancelled
+            }
+            return false
+        }) {
+            return
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    throw CodexAdapterTestWaitError.timedOut("request resolution \(requestId)")
+}
+
+private func waitForUserInputResolution(in sink: EventSink, requestId: String) async throws {
+    let deadline = Date().addingTimeInterval(3)
+    while Date() < deadline {
+        let events = await sink.snapshot()
+        if events.contains(where: {
+            if case .userInputResolved(let id, let answer) = $0 {
+                return id == requestId && answer == nil
+            }
+            return false
+        }) {
+            return
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    throw CodexAdapterTestWaitError.timedOut("user-input resolution \(requestId)")
 }
 
 private func waitForProposedPlan(in sink: EventSink) async throws -> AssistantProposedPlan {
@@ -4452,6 +4787,9 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     let forkProtocolSupport: CodexForkProtocolSupport
     var readResponse: CodexAppServerClient.JSONObject = ["thread": ["id": "codex-thread-1", "turns": []]]
     let autoComplete: Bool
+    let turnId: String
+    var nextTurnId: String?
+    let omitStartTurnId: Bool
     let interruptDelayNanoseconds: UInt64
     let startTurnError: Error?
     let openThreadBehavior: MockOpenThreadBehavior
@@ -4471,6 +4809,8 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
 
     init(
         autoComplete: Bool = true,
+        turnId: String = "turn-app-server-1",
+        omitStartTurnId: Bool = false,
         interruptDelayNanoseconds: UInt64 = 0,
         startTurnError: Error? = nil,
         openThreadError: Error? = nil,
@@ -4479,6 +4819,8 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
         supportsForkReconciliation: Bool = false
     ) {
         self.autoComplete = autoComplete
+        self.turnId = turnId
+        self.omitStartTurnId = omitStartTurnId
         self.interruptDelayNanoseconds = interruptDelayNanoseconds
         self.startTurnError = startTurnError
         if let openThreadBehavior {
@@ -4594,17 +4936,18 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
             Task {
                 notificationHandler?("item/agentMessage/delta", [
                     "threadId": providerThreadId,
-                    "turnId": "turn-app-server-1",
+                    "turnId": turnId,
                     "itemId": "item-1",
                     "delta": "hello from app-server"
                 ])
                 notificationHandler?("turn/completed", [
                     "threadId": providerThreadId,
-                    "turnId": "turn-app-server-1"
+                    "turnId": turnId
                 ])
             }
         }
-        return ["turn": ["id": "turn-app-server-1"]]
+        guard !omitStartTurnId else { return [:] }
+        return ["turn": ["id": nextTurnId ?? turnId]]
     }
 
     func interruptTurn(providerThreadId: String, turnId: String) async throws {

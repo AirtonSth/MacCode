@@ -58,7 +58,11 @@ public enum ProviderSubprocessLauncher {
     /// an admitted run would reach managed wrappers without its admission
     /// receipt. Pass only the validated, content-free run scope as explicit
     /// `-c` overrides; never inherit the whole host environment.
-    private static func codexShellEnvironmentPolicyArguments(
+    /// Validated `-c shell_environment_policy.set.*` transport shared by the
+    /// UI Codex app-server launch and raw nested Codex provider proxies.
+    /// Returns no arguments unless the receipt, recovery scope, namespace-local
+    /// state path, and installed shell bridge all satisfy the same host policy.
+    static func codexShellEnvironmentPolicyArguments(
         provider: AgentProvider,
         environment: [String: String]
     ) -> [String] {
@@ -101,6 +105,29 @@ public enum ProviderSubprocessLauncher {
             return []
         }
 
+        var policyEnvironment = environment
+        if let binary = nonEmpty(environment[AgentSkillInstaller.toolShellBinaryEnvironmentKey]) {
+            let trustedRoot = nonEmpty(environment[AgentSkillInstaller.runtimeRootEnvironmentKey])
+                .map { URL(fileURLWithPath: $0, isDirectory: true) }
+            let trusted = trustedRoot.map {
+                AgentSkillInstaller.isCurrentOrImmutableRuntimeServiceBinary(
+                    URL(fileURLWithPath: binary),
+                    trustedRuntimeRoot: $0
+                )
+            } == true
+            if !trusted {
+                policyEnvironment.removeValue(forKey: "RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT")
+                policyEnvironment.removeValue(
+                    forKey: AgentSkillInstaller.toolShellProtocolEnvironmentKey
+                )
+                policyEnvironment.removeValue(
+                    forKey: AgentSkillInstaller.toolShellBinaryEnvironmentKey
+                )
+                policyEnvironment.removeValue(
+                    forKey: AgentSkillInstaller.runtimeRootEnvironmentKey
+                )
+            }
+        }
         let keys = [
             TokenSaverExecutionReceipt.envKey,
             "RC_TOKEN_SAVER_DISTILL_HINT",
@@ -110,14 +137,18 @@ public enum ProviderSubprocessLauncher {
             "RC_TOKEN_SAVER_ATTEMPT_ID",
             "RC_TOKEN_SAVER_ROOT_RUN_ID",
             "RC_TOKEN_SAVER_WAVE_LIVE",
+            "RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT",
+            AgentSkillInstaller.toolShellProtocolEnvironmentKey,
+            AgentSkillInstaller.toolShellBinaryEnvironmentKey,
             "REMOTE_CODE_AGENT_PROVIDER",
             "REMOTE_CODE_DISTILL_STATE_PATH",
             "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY",
             "RC_REMOTE_CODE_MANAGED_BIN",
             "RC_REMOTE_CODE_PROVIDER_PROXY_BIN",
-        ] + codexShellBridgeEnvironmentKeys(environment: environment)
+            AgentSkillInstaller.runtimeRootEnvironmentKey,
+        ] + codexShellBridgeEnvironmentKeys(environment: policyEnvironment)
         let forwarded = keys.flatMap { (key) -> [String] in
-            guard let value = environment[key], !value.isEmpty else { return [] }
+            guard let value = policyEnvironment[key], !value.isEmpty else { return [] }
             return ["-c", "shell_environment_policy.set.\(key)=\(tomlString(value))"]
         }
         // Marks stdout as owned by the provider command runner. The wrapper
@@ -175,18 +206,20 @@ public enum ProviderSubprocessLauncher {
 
     private static func isInstalledShellBridge(managedBin: String, bridge: String) -> Bool {
         let managedDirectory = URL(fileURLWithPath: managedBin).standardizedFileURL
-        let expectedBridge = managedDirectory
-            .deletingLastPathComponent()
-            .appendingPathComponent("shell/zsh", isDirectory: true)
-            .standardizedFileURL
-        guard URL(fileURLWithPath: bridge).standardizedFileURL == expectedBridge else {
+        let runtimeRoot = managedDirectory.deletingLastPathComponent()
+        let allowedBridges = [
+            runtimeRoot.appendingPathComponent("shell/zsh", isDirectory: true),
+            runtimeRoot.appendingPathComponent("shell/zsh-tool-v1", isDirectory: true),
+        ].map(\.standardizedFileURL)
+        let actualBridge = URL(fileURLWithPath: bridge).standardizedFileURL
+        guard allowedBridges.contains(actualBridge) else {
             return false
         }
         let fileManager = FileManager.default
         return [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout"]
             .allSatisfy {
                 fileManager.isReadableFile(
-                    atPath: expectedBridge.appendingPathComponent($0).path
+                    atPath: actualBridge.appendingPathComponent($0).path
                 )
             }
     }

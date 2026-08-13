@@ -74,6 +74,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         var client: CodexAppServerControlling
         var providerThreadId: String
         var activeTurnId: String?
+        /// A fresh provider turn may reopen a terminal session only after the
+        /// host has explicitly called sendTurn. Buffered notifications alone
+        /// must never authorize a new active turn.
+        var hostTurnStartAuthorized: Bool
         var threadStatusType: String?
         var pendingFinish: PendingFinish?
         /// Inactivity watchdog for a withheld finish (re-armed by live activity).
@@ -383,6 +387,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             existing.onEvent = onEvent
             existing.interactionMode = request.interactionMode
             existing.permissionMode = request.permissionMode
+            existing.hostTurnStartAuthorized = true
             sessions[request.threadId] = existing
             reusableSession = (existing.client, existing.providerThreadId)
         } else {
@@ -406,6 +411,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             providerThreadId = opened.result.providerThreadId
             resumeFellBackToStart = opened.resumeFellBackToStart
             recordSession(threadId: request.threadId, client: client, providerThreadId: providerThreadId, interactionMode: request.interactionMode, onEvent: onEvent, permissionMode: request.permissionMode)
+            authorizeHostTurnStart(threadId: request.threadId)
         }
         installTerminationHandler(for: client, threadId: request.threadId)
         onEvent(.status(.running))
@@ -983,6 +989,14 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
 
     private func handleServerRequest(method: String, params: Any?, threadId: AgentThreadID) async throws -> Any? {
         let payload = params as? [String: Any] ?? [:]
+        if shouldDropStaleInteractiveRequest(method: method, payload: payload, threadId: threadId) {
+            // The app-server can deliver a request after the host has already
+            // terminalized the turn. Do not allocate a continuation or emit a
+            // pending-request card that can never be resolved.
+            throw AgentProviderAdapterError.unsupported(
+                "Ignoring stale Codex interactive request after terminal turn: \(method)"
+            )
+        }
         switch method {
         case "item/commandExecution/requestApproval", "item.commandExecution.requestApproval":
             return try await awaitApproval(method: method, payload: payload, threadId: threadId, kind: .commandExecution)
@@ -1004,6 +1018,41 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         default:
             emit([runtimeEvent(method: method, payload: payload)], threadId: threadId)
             throw AgentProviderAdapterError.unsupported("Unhandled Codex app-server request: \(method)")
+        }
+    }
+
+    private func shouldDropStaleInteractiveRequest(
+        method: String,
+        payload: [String: Any],
+        threadId: AgentThreadID
+    ) -> Bool {
+        guard Self.isInteractiveRequestMethod(method) else { return false }
+        let requestedTurnId = Self.providerTurnId(from: payload)
+        lock.lock()
+        defer { lock.unlock() }
+        guard let session = sessions[threadId] else { return true }
+        let isLive = session.status == .pending || session.status == .running
+        guard isLive else { return true }
+        if let requestedTurnId,
+           let activeTurnId = session.activeTurnId,
+           requestedTurnId != activeTurnId {
+            return true
+        }
+        return false
+    }
+
+    private static func isInteractiveRequestMethod(_ method: String) -> Bool {
+        switch method {
+        case "item/commandExecution/requestApproval", "item.commandExecution.requestApproval",
+             "item/fileRead/requestApproval", "item.fileRead.requestApproval",
+             "item/fileChange/requestApproval", "item.fileChange.requestApproval",
+             "item/permissions/requestApproval", "item.permissions.requestApproval",
+             "applyPatchApproval", "execCommandApproval",
+             "item/tool/requestUserInput", "item.tool.requestUserInput",
+             "mcpServer/elicitation/request":
+            return true
+        default:
+            return false
         }
     }
 
@@ -1134,6 +1183,21 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             // A provider-native fork is announced on the parent's app-server
             // transport. Do not route child lifecycle events through the parent
             // local session; that would corrupt its identity or leave it active.
+            return
+        }
+        if shouldDropStaleLifecycleNotification(method: method, payload: payload, threadId: threadId) {
+            // A terminal session may still receive a buffered thread/turn
+            // notification. Do not let it reopen the adapter's active-turn
+            // state before the coordinator's terminal firewall sees the event.
+            return
+        }
+        if Self.requiresCurrentTurnForItemOrOutputNotification(method),
+           let notificationTurnId = Self.providerTurnId(from: payload),
+           notificationTurnId != activeTurnId(threadId: threadId) {
+            // A long-running command can flush buffered stderr/output after its
+            // turn has completed or a newer turn has started on the same reused
+            // app-server thread. Reject the raw runtime row and derived item event
+            // together, before either can grow or corrupt the current transcript.
             return
         }
         var events: [AssistantEvent] = [runtimeEvent(method: method, payload: payload)]
@@ -1700,6 +1764,45 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
     }
 
+    private func shouldDropStaleLifecycleNotification(
+        method: String,
+        payload: [String: Any],
+        threadId: AgentThreadID
+    ) -> Bool {
+        let normalized = method.replacingOccurrences(of: ".", with: "/")
+        guard normalized == "thread/started" || normalized == "turn/started" else { return false }
+        let notificationTurnId = Self.providerTurnId(from: payload)
+        lock.lock()
+        defer { lock.unlock() }
+        guard let session = sessions[threadId] else { return true }
+        if normalized == "turn/started" {
+            if let notificationTurnId,
+               session.completedTurnIds.contains(notificationTurnId) {
+                return true
+            }
+            guard session.status == .pending || session.status == .running else {
+                // Once terminal, only the host's next sendTurn may authorize a
+                // fresh provider turn. A buffered notification with a new id
+                // must not reopen activeTurn or route subsequent output.
+                return !session.hostTurnStartAuthorized || notificationTurnId == nil
+            }
+            if let notificationTurnId,
+               let activeTurnId = session.activeTurnId,
+               notificationTurnId != activeTurnId {
+                // A provider may begin a legitimate follow-up while the prior
+                // turn's terminal is deferred until thread idle. Keep the
+                // explicit pending turn stale, but let a different turn id
+                // replace the single pending-finish slot.
+                if let pendingTurnId = session.pendingFinish?.turnId {
+                    return notificationTurnId == pendingTurnId
+                }
+                return true
+            }
+            return false
+        }
+        return session.status != .pending && session.status != .running
+    }
+
     private func runtimeEvent(method: String, payload: [String: Any]) -> AssistantEvent {
         Self.runtimeEvent(method: method, payload: payload)
     }
@@ -1716,6 +1819,13 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             payloadJSON: String(data: data, encoding: .utf8) ?? "{}",
             receivedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
         ))
+    }
+
+    private static func requiresCurrentTurnForItemOrOutputNotification(_ method: String) -> Bool {
+        method.hasPrefix("item/")
+            || method.hasPrefix("item.")
+            || method.hasSuffix("/outputDelta")
+            || method.hasSuffix(".outputDelta")
     }
 
     private func ensureAssistantItem(threadId: AgentThreadID, turnId: String, itemId: String, now: Int64, events: inout [AssistantEvent]) {
@@ -1853,6 +1963,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             client: client,
             providerThreadId: providerThreadId,
             activeTurnId: nil,
+            hostTurnStartAuthorized: false,
             threadStatusType: nil,
             pendingFinish: nil,
             pendingFinishWatchdog: nil,
@@ -1905,9 +2016,16 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         lock.lock()
         if sessions[threadId]?.completedTurnIds.contains(turnId) == false {
             sessions[threadId]?.activeTurnId = turnId
+            sessions[threadId]?.hostTurnStartAuthorized = false
             // New turn must not inherit a prior turn's shell-detach signal.
             sessions[threadId]?.sawDetachedShellSpawn = false
         }
+        lock.unlock()
+    }
+
+    private func authorizeHostTurnStart(threadId: AgentThreadID) {
+        lock.lock()
+        sessions[threadId]?.hostTurnStartAuthorized = true
         lock.unlock()
     }
 
@@ -2219,36 +2337,47 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     }
 
     private func markFinished(threadId: AgentThreadID, status: AgentRunStatus, turnId: String?) {
+        var settledSession: Session?
         lock.lock()
-        sessions[threadId]?.status = status
-        sessions[threadId]?.activeTurnId = nil
-        sessions[threadId]?.threadStatusType = nil
-        sessions[threadId]?.pendingFinish = nil
-        sessions[threadId]?.pendingFinishWatchdog?.cancel()
-        sessions[threadId]?.pendingFinishWatchdog = nil
-        // Invalidate the pending reconciliation loop so it cannot finish a turn
-        // that already completed via the normal notification path.
         if var session = sessions[threadId] {
+            // Keep the terminal session available for explicitly authorized
+            // recovery, but settle callbacks before clearing them so a provider
+            // approval or question cannot remain actionable after this turn.
+            settledSession = session
+            session.status = status
+            session.activeTurnId = nil
+            session.hostTurnStartAuthorized = false
+            session.threadStatusType = nil
+            session.pendingFinish = nil
+            session.pendingFinishWatchdog?.cancel()
+            session.pendingFinishWatchdog = nil
+            session.pendingApprovals.removeAll(keepingCapacity: false)
+            session.pendingUserInputs.removeAll(keepingCapacity: false)
+            // Invalidate the pending reconciliation loop so it cannot finish a turn
+            // that already completed via the normal notification path.
             session.turnReconcileGeneration &+= 1
+            if let turnId, !turnId.isEmpty, !session.completedTurnIds.contains(turnId) {
+                session.completedTurnIds.append(turnId)
+            }
+            // PERF-007: per-turn buffers only matter within the turn they
+            // accumulate in (final-message text, item-start/stream dedup keys,
+            // proposed-plan deltas). Reset them on turn completion so a
+            // long-lived session does not hold an ever-growing final message
+            // and unbounded item-id sets for its whole lifetime. completedTurnIds
+            // (rollback window) and emittedProposedPlanIds (proposed-plan dedup)
+            // are intentionally retained.
+            session.finalAssistantMessage = ""
+            session.finalAssistantMessageItemId = nil
+            session.startedItemIds.removeAll(keepingCapacity: false)
+            session.streamedItemIds.removeAll(keepingCapacity: false)
+            session.proposedPlanBuffers.removeAll(keepingCapacity: false)
+            session.sawDetachedShellSpawn = false
             sessions[threadId] = session
         }
-        if let turnId, !turnId.isEmpty, sessions[threadId]?.completedTurnIds.contains(turnId) == false {
-            sessions[threadId]?.completedTurnIds.append(turnId)
-        }
-        // PERF-007: per-turn buffers only matter within the turn they
-        // accumulate in (final-message text, item-start/stream dedup keys,
-        // proposed-plan deltas). Reset them on turn completion so a
-        // long-lived session does not hold an ever-growing final message
-        // and unbounded item-id sets for its whole lifetime. completedTurnIds
-        // (rollback window) and emittedProposedPlanIds (proposed-plan dedup)
-        // are intentionally retained.
-        sessions[threadId]?.finalAssistantMessage = ""
-        sessions[threadId]?.finalAssistantMessageItemId = nil
-        sessions[threadId]?.startedItemIds.removeAll(keepingCapacity: false)
-        sessions[threadId]?.streamedItemIds.removeAll(keepingCapacity: false)
-        sessions[threadId]?.proposedPlanBuffers.removeAll(keepingCapacity: false)
-        sessions[threadId]?.sawDetachedShellSpawn = false
         lock.unlock()
+        if let settledSession {
+            settlePendingCallbacks(session: settledSession)
+        }
     }
 
     private func mergeCompletedTurnIds(threadId: AgentThreadID, turnIds: [String]) {

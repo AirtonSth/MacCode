@@ -428,6 +428,16 @@ enum ProviderProxyRunner {
 
         let graphifyActive = settings.isGraphifyRuntimeActive
             && receipt.capabilities.graphify == true
+        let toolShellEnabled = environment["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"]
+        let toolShellProtocol = environment[
+            AgentSkillInstaller.toolShellProtocolEnvironmentKey
+        ]
+        let toolShellBinary = environment[
+            AgentSkillInstaller.toolShellBinaryEnvironmentKey
+        ]
+        let trustedRuntimeRoot = environment[
+            AgentSkillInstaller.runtimeRootEnvironmentKey
+        ].map { URL(fileURLWithPath: $0, isDirectory: true) }
         var validated = ProviderProxyPolicy.paidRuntimeEnvironment(
             environment: environment,
             tokenSaverRuntimeActive: true,
@@ -447,7 +457,36 @@ enum ProviderProxyRunner {
                 validated.removeValue(forKey: key)
             }
         }
-        if receipt.capabilities.postToolUse != true {
+        let codexToolShellTransportAdmitted = controller == .codex
+            && receipt.capabilities.distill == true
+            && receipt.capabilities.managedPath == true
+            && receipt.capabilities.recoveryScope == true
+            && !receipt.disabledLanes.contains(CommandWrapPolicy.toolShellLane)
+        if codexToolShellTransportAdmitted,
+           toolShellEnabled == "1",
+           toolShellProtocol == AgentSkillInstaller.toolShellProtocolVersion,
+           let toolShellBinary,
+           AgentSkillInstaller.isCurrentOrImmutableRuntimeServiceBinary(
+                URL(fileURLWithPath: toolShellBinary).standardizedFileURL,
+                trustedRuntimeRoot: trustedRuntimeRoot
+           ) {
+            validated["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"] = "1"
+            validated[AgentSkillInstaller.toolShellProtocolEnvironmentKey] =
+                AgentSkillInstaller.toolShellProtocolVersion
+            validated[AgentSkillInstaller.toolShellBinaryEnvironmentKey] =
+                URL(fileURLWithPath: toolShellBinary).standardizedFileURL.path
+        }
+        if !codexToolShellTransportAdmitted {
+            validated.removeValue(
+                forKey: ProviderProxyPolicy.unownedToolShellEnvironmentKey
+            )
+            validated.removeValue(
+                forKey: ProviderProxyPolicy.providerTerminalStdoutEnvironmentKey
+            )
+        }
+        if receipt.capabilities.distill != true
+            || receipt.capabilities.managedPath != true
+            || receipt.capabilities.recoveryScope != true {
             validated.removeValue(forKey: "REMOTE_CODE_DISTILL_STATE_PATH")
         }
         return ValidatedPaidRuntime(
@@ -493,6 +532,9 @@ enum ProviderProxyRunner {
                 graphifyRuntimeActive: false
             )
         }
+        let trustedRuntimeRoot = environment[
+            AgentSkillInstaller.runtimeRootEnvironmentKey
+        ].map { URL(fileURLWithPath: $0, isDirectory: true) }
 
         let childId = childRunId?.value.uuidString
         let tokenSaverEnvironment: [String: String]? = {
@@ -558,10 +600,18 @@ enum ProviderProxyRunner {
                 waveLive: retargeted.waveLive
             )
             var childRuntime = TokenSaverExecutionReceiptSeam.environment(from: childReceipt)
-            if childCapabilities.postToolUse == true,
-               let statePath {
-                childRuntime["REMOTE_CODE_DISTILL_STATE_PATH"] = statePath
-            }
+            childRuntime.merge(
+                ProviderProxyPolicy.childDistillTransportEnvironment(
+                    targetProvider: targetProvider,
+                    capabilities: .init(
+                        distill: childCapabilities.distill == true,
+                        managedPath: childCapabilities.managedPath == true,
+                        recoveryScope: childCapabilities.recoveryScope == true
+                    ),
+                    statePath: statePath,
+                    disabledLanes: Set(childReceipt.disabledLanes)
+                )
+            ) { _, retargetedValue in retargetedValue }
             // Child process PATH must put managed wrappers first when distill is admitted.
             if childCapabilities.managedPath == true {
                 let managedBin = environment["RC_REMOTE_CODE_MANAGED_BIN"]?
@@ -578,6 +628,52 @@ enum ProviderProxyRunner {
                     .filter { $0 != bin }
                 childRuntime["PATH"] = ([bin] + parts).joined(separator: ":")
                 childRuntime["RC_REMOTE_CODE_MANAGED_BIN"] = bin
+                if let trustedRuntimeRoot,
+                   AgentSkillInstaller.runtimeRoot(forManagedBin: bin) == trustedRuntimeRoot
+                {
+                    childRuntime[AgentSkillInstaller.runtimeRootEnvironmentKey] =
+                        trustedRuntimeRoot.path
+                } else {
+                    childRuntime.removeValue(
+                        forKey: AgentSkillInstaller.runtimeRootEnvironmentKey
+                    )
+                }
+            }
+            // A Codex child gets a fresh receipt. Claude/Grok parents do not
+            // enable the absolute-shell interceptor themselves, so recover the
+            // host-issued artifact sibling from their runtime bin instead of
+            // requiring an interceptor marker in the parent. Never recover via
+            // the mutable per-user symlink; missing or drifted capability fails
+            // open. The resulting marker is child-only.
+            if targetProvider == .codex,
+               childCapabilities.distill == true,
+               childCapabilities.managedPath == true,
+               childCapabilities.recoveryScope == true,
+               !childReceipt.disabledLanes.contains(CommandWrapPolicy.toolShellLane) {
+                let inheritedBinary = environment[
+                    AgentSkillInstaller.toolShellBinaryEnvironmentKey
+                ]
+                let inheritedURL = inheritedBinary.map {
+                    URL(fileURLWithPath: $0).standardizedFileURL
+                }
+                let binary = inheritedURL.flatMap {
+                    AgentSkillInstaller.isCurrentOrImmutableRuntimeServiceBinary(
+                        $0,
+                        trustedRuntimeRoot: trustedRuntimeRoot
+                    )
+                        ? $0
+                        : nil
+                } ?? AgentSkillInstaller.immutableRuntimeServiceBinary(
+                    forManagedBin: environment["RC_REMOTE_CODE_MANAGED_BIN"] ?? "",
+                    trustedRuntimeRoot: trustedRuntimeRoot
+                )
+                if let binary {
+                    childRuntime["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"] = "1"
+                    childRuntime[AgentSkillInstaller.toolShellProtocolEnvironmentKey] =
+                        AgentSkillInstaller.toolShellProtocolVersion
+                    childRuntime[AgentSkillInstaller.toolShellBinaryEnvironmentKey] =
+                        binary.path
+                }
             }
             return childRuntime
         }()

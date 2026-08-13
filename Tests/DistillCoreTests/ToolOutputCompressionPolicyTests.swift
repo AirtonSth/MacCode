@@ -65,6 +65,35 @@ final class ToolOutputCompressionPolicyTests: XCTestCase {
         XCTAssertTrue(make.shouldCompress)
     }
 
+    func test_bashExplicitDistillInvocationSkipsSecondCompressionPass() {
+        let explicitCommands = [
+            "swift test 2>&1 | distill 'test failures'",
+            "distill retrieve 01234567-89ab-cdef-0123-456789abcdef",
+            "/Applications/RemoteCode.app/Contents/MacOS/distill retrieve handle",
+            "command /opt/remotecode/bin/distill 'summarize build'",
+            "env RC_EXPLICIT=1 /opt/remotecode/bin/distill 'summarize build'",
+        ]
+
+        for command in explicitCommands {
+            let decision = policy.decision(
+                toolName: "Bash",
+                output: largeOutput(),
+                toolArgumentsSummary: "command=\(command)"
+            )
+            XCTAssertFalse(decision.shouldCompress, "explicit Distill must own one pass: \(command)")
+            XCTAssertEqual(decision.skipReason, .explicitDistillPipeline)
+            XCTAssertEqual(decision.skipReason?.rawValue, "explicit_distill_pipeline")
+        }
+
+        let ordinary = policy.decision(
+            toolName: "Bash",
+            output: largeOutput(),
+            toolArgumentsSummary: "command=swift test --filter FeatureTests"
+        )
+        XCTAssertTrue(ordinary.shouldCompress, "ordinary noisy Swift output still uses PostToolUse")
+        XCTAssertNil(ordinary.skipReason)
+    }
+
     func test_profilesMatchPlanForSearchShellAndWebFetch() {
         XCTAssertEqual(policy.decision(toolName: "Grep", output: largeOutput()).profile, .conservative)
         XCTAssertEqual(policy.decision(toolName: "Glob", output: largeOutput()).profile, .conservative)

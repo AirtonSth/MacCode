@@ -2,8 +2,53 @@ import XCTest
 import Darwin
 import CoreModel
 import Persistence
-import AgentRuntime
+@testable import AgentRuntime
 @testable import DistillCore
+
+private final class LiveSidecarReadyCapture: @unchecked Sendable {
+    let completed = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var pending = Data()
+    private var event: DistillServiceReadyEvent?
+    private var stdoutBytes = Data()
+    private var diagnosticBytes = Data()
+
+    func receiveStdout(_ data: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !data.isEmpty else {
+            completed.signal()
+            return
+        }
+        stdoutBytes.append(data)
+        pending.append(data)
+        while let newline = pending.firstIndex(of: 0x0A) {
+            let line = Data(pending[..<newline])
+            pending.removeSubrange(...newline)
+            if let ready = try? JSONDecoder().decode(DistillServiceReadyEvent.self, from: line) {
+                event = ready
+                completed.signal()
+                return
+            }
+        }
+    }
+
+    func receiveStderr(_ data: Data) {
+        guard !data.isEmpty else { return }
+        lock.lock()
+        diagnosticBytes.append(data)
+        lock.unlock()
+    }
+
+    func snapshot() -> (event: DistillServiceReadyEvent?, diagnostics: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (
+            event,
+            "stdout=\(String(decoding: stdoutBytes, as: UTF8.self)); stderr=\(String(decoding: diagnosticBytes, as: UTF8.self))"
+        )
+    }
+}
 
 /// End-to-end proof of the NATIVE CLI: runs the actually-built RemoteCodeDistillService
 /// binary in `cli` mode as a subprocess against a live in-process sidecar. Proves both
@@ -139,6 +184,411 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         XCTAssertEqual(failOpen.out, "RAW DATA MUST SURVIVE", "no service => raw stdin echoed verbatim, never lost")
     }
 
+    func test_providerProxyCrossProviderCodexChildCarriesArtifactToolShellHandshake() throws {
+        // WHY: Claude/Grok parents must not own Codex's absolute zsh lane, but
+        // their raw provider proxy still has to issue the complete child
+        // shell_environment_policy transport. This exercises the native
+        // ProviderProxyRunner subprocess path rather than only its policy seam.
+        guard let binary = builtBinary() else {
+            throw XCTSkip("RemoteCodeDistillService debug binary not built")
+        }
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cross-provider-tool-shell-\(UUID().uuidString)", isDirectory: true)
+        let support = root.appendingPathComponent("support", isDirectory: true)
+        let providerHome = root.appendingPathComponent("provider-home", isDirectory: true)
+        let fakeProviderDirectory = root.appendingPathComponent("provider-bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: fakeProviderDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let installer = AgentSkillInstaller(homeDirectory: providerHome)
+        let runtimeInstaller = try XCTUnwrap(installer.runtimeInstaller(for: binary))
+        try runtimeInstaller.installProviderShellBridge()
+        let managedBin = runtimeInstaller.managedCLIBinURL
+        let service = try XCTUnwrap(runtimeInstaller.pinnedServiceBinaryURL)
+        let statePath = support
+            .appendingPathComponent("Distill", isDirectory: true)
+            .appendingPathComponent("DistillCLIState.json")
+        try FileManager.default.createDirectory(
+            at: statePath.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("{}".utf8).write(to: statePath)
+
+        let capturedArguments = root.appendingPathComponent("codex-arguments.txt")
+        _ = try makeExecutable(
+            at: fakeProviderDirectory,
+            name: "codex",
+            body: "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"\(capturedArguments.path)\"\n"
+        )
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: support.path).run()
+        SettingsStore(db: db).update { $0.tokenSaverEnabled = true }
+        try SettingsRepository(db: db).set(
+            "private.account.session",
+            #"{"user":{"subscribed":true}}"#
+        )
+        let runtime = AgentOrchestrationRuntime(
+            repository: AgentOrchestrationRepository(db: db),
+            packageVerification: { true },
+            rolloutGate: { true },
+            killSwitch: { false }
+        )
+
+        for parentProvider in [AgentProvider.claude, .grok] {
+            let thread = AgentThreadID()
+            let rootRun = AgentRunID()
+            let parentCapability = AgentDelegationCapability.issue()
+            _ = try runtime.recordExternalRoot(
+                runId: rootRun,
+                threadId: thread,
+                provider: parentProvider,
+                providerInstanceId: parentProvider.rawValue,
+                model: "test",
+                permissionMode: .fullAccess,
+                delegationCapabilitySHA256: AgentDelegationCapability.sha256Hex(parentCapability)
+            )
+            let receipt = TokenSaverExecutionReceiptSeam.admit(
+                tokenSaverEnabled: true,
+                sameUser: true,
+                sidecarAvailable: true,
+                provider: parentProvider,
+                threadId: thread.value.uuidString,
+                rootRunId: rootRun.value.uuidString,
+                attemptId: rootRun.value.uuidString,
+                workspaceId: UUID().uuidString,
+                projectId: UUID().uuidString
+            )
+            var environment = TokenSaverExecutionReceiptSeam.environment(from: receipt)
+            environment["REMOTE_CODE_AGENT_PROVIDER"] = parentProvider.rawValue
+            environment["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"] = thread.value.uuidString
+            environment["RC_REMOTE_CODE_ROOT_RUN_ID"] = rootRun.value.uuidString
+            environment["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"] = support.path
+            environment["REMOTE_CODE_DISTILL_STATE_PATH"] = statePath.path
+            environment["RC_REMOTE_CODE_MANAGED_BIN"] = managedBin.path
+            environment["RC_REMOTE_CODE_PROVIDER_PROXY_BIN"] = managedBin.path
+            environment[AgentSkillInstaller.runtimeRootEnvironmentKey] =
+                managedBin.deletingLastPathComponent().path
+            environment["PATH"] = [managedBin.path, fakeProviderDirectory.path, "/usr/bin", "/bin"].joined(separator: ":")
+            environment[AgentDelegationCapabilityTransport.environmentKey] = parentCapability
+
+            let result = try runProcess(
+                binary,
+                ["provider-proxy", "codex", "exec", "--json", "-"],
+                env: environment,
+                stdin: ""
+            )
+            XCTAssertEqual(result.code, 0, "\(parentProvider): \(result.err)")
+            let arguments = try String(contentsOf: capturedArguments, encoding: .utf8)
+                .split(whereSeparator: \.isNewline)
+                .map(String.init)
+            let assignments = arguments.filter {
+                $0.hasPrefix("shell_environment_policy.set.")
+            }
+            for key in [
+                TokenSaverExecutionReceipt.envKey,
+                "REMOTE_CODE_DISTILL_STATE_PATH",
+                "RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT",
+                AgentSkillInstaller.toolShellProtocolEnvironmentKey,
+                AgentSkillInstaller.toolShellBinaryEnvironmentKey,
+                ProviderProxyPolicy.unownedToolShellEnvironmentKey,
+                ProviderProxyPolicy.providerTerminalStdoutEnvironmentKey,
+            ] {
+                XCTAssertTrue(
+                    assignments.contains(where: { $0.hasPrefix("shell_environment_policy.set.\(key)=") }),
+                    "\(parentProvider)→codex missing \(key): \(arguments)"
+                )
+            }
+            let binaryAssignment = try XCTUnwrap(
+                assignments.first(where: {
+                    $0.hasPrefix("shell_environment_policy.set.\(AgentSkillInstaller.toolShellBinaryEnvironmentKey)=")
+                })
+            )
+            XCTAssertTrue(binaryAssignment.contains(service.path))
+            XCTAssertTrue(
+                assignments.contains(where: {
+                    $0.contains("RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT")
+                }),
+                "the Codex child must receive the interceptor gate"
+            )
+        }
+    }
+
+    func test_wrappersMapUncaughtTERMToShellExit143() throws {
+        // WHY: Foundation reports an uncaught signal as terminationStatus 15.
+        // Returning that value from the wrapper changes POSIX shell semantics;
+        // callers must observe the conventional 128 + signal status instead.
+        guard let binary = builtBinary() else {
+            throw XCTSkip("RemoteCodeDistillService debug binary not built")
+        }
+
+        let ordinary = try runProcess(
+            binary,
+            ["wrap", "/bin/sh", "-c", "kill -TERM $$"],
+            env: [:],
+            stdin: ""
+        )
+        XCTAssertEqual(
+            ordinary.code,
+            143,
+            "ordinary wrapper must translate uncaught TERM to shell status 128 + 15"
+        )
+
+        let toolShell = try runProcess(
+            binary,
+            ["cli", "tool-shell", "--", "kill -TERM $$"],
+            env: [:],
+            stdin: ""
+        )
+        XCTAssertEqual(
+            toolShell.code,
+            143,
+            "tool-shell passthrough must translate uncaught TERM to shell status 128 + 15"
+        )
+    }
+
+    func test_toolShellBridgePinsCurrentBinaryAndFailsOpenAcrossSentinelsAndDrift() throws {
+        // WHY: a second RemoteCode instance can repoint ~/.remote-code/bin/distill
+        // to an older service that treats `tool-shell` as a compression prompt
+        // and blocks on stdin. The bridge must never invoke that mutable link.
+        guard let binary = builtBinary() else {
+            throw XCTSkip("RemoteCodeDistillService debug binary not built")
+        }
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tool-shell-stale-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let installer = AgentSkillInstaller(homeDirectory: root)
+        let runtime = try XCTUnwrap(installer.runtimeInstaller(for: binary))
+        _ = try runtime.ensureDistillCLI(serviceBinaryURL: binary)
+        let bridge = try runtime.installProviderShellBridge()
+        let managedBin = runtime.managedCLIBinURL
+        let marker = root.appendingPathComponent("stale-invoked")
+        let stale = try makeExecutable(
+            at: root,
+            name: "stale-distill",
+            body: "#!/bin/sh\nprintf stale > \"$STALE_MARKER\"\nIFS= read -r _\n"
+        )
+        // Stamp the run against the artifact-scoped paths first. A concurrent
+        // old app then overwrites both legacy global integration points.
+        let globalBin = installer.managedCLIBinURL
+        try FileManager.default.createDirectory(at: globalBin, withIntermediateDirectories: true)
+        let globalDistill = globalBin.appendingPathComponent("distill")
+        try FileManager.default.createSymbolicLink(at: globalDistill, withDestinationURL: stale)
+        let legacyBridge = installer.providerShellBridgeURL
+        try FileManager.default.createDirectory(at: legacyBridge, withIntermediateDirectories: true)
+        try Data(
+            """
+            if [[ -n "${ZSH_EXECUTION_STRING:-}" ]]; then
+              exec "${RC_LEGACY_GLOBAL_DISTILL}" tool-shell -- "${ZSH_EXECUTION_STRING}"
+            fi
+            """.utf8
+        ).write(to: legacyBridge.appendingPathComponent(".zshenv"))
+
+        let environment: [String: String] = [
+            "HOME": root.path,
+            "PATH": "\(managedBin.path):/usr/bin:/bin",
+            "ZDOTDIR": bridge.path,
+            "RC_REMOTE_CODE_MANAGED_ZDOTDIR": bridge.path,
+            "RC_REMOTE_CODE_ORIGINAL_ZDOTDIR": root.path,
+            "RC_REMOTE_CODE_MANAGED_BIN": managedBin.path,
+            "RC_REMOTE_CODE_UNOWNED_TOOL_SHELL": "1",
+            "RC_TOKEN_SAVER_DISTILL_HINT": "1",
+            "RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT": "1",
+            AgentSkillInstaller.toolShellProtocolEnvironmentKey:
+                AgentSkillInstaller.toolShellProtocolVersion,
+            AgentSkillInstaller.toolShellBinaryEnvironmentKey: binary.path,
+            "STALE_MARKER": marker.path,
+            "RC_LEGACY_GLOBAL_DISTILL": globalDistill.path,
+        ]
+
+        let explicitPipe = try runZshWithTimeout(
+            "printf 'PIPE_CURRENT_ONCE\\n' | distill 'preserve on unavailable sidecar'",
+            environment: environment,
+            timeout: 5,
+            keepStdinOpen: true
+        )
+        XCTAssertFalse(explicitPipe.timedOut, explicitPipe.err)
+        XCTAssertEqual(explicitPipe.code, 0, explicitPipe.err)
+        XCTAssertEqual(explicitPipe.out, "PIPE_CURRENT_ONCE\n")
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: marker.path),
+            "explicit pipe resolved the drifted global distill instead of the artifact bin"
+        )
+
+        let current = try runZshWithTimeout(
+            #"printf 'SENTINELS=%s,%s' "${RC_REMOTE_CODE_TOOL_SHELL_DONE:-0}" "${RC_TOKEN_SAVER_TOOL_SHELL_DONE:-0}""#,
+            environment: environment,
+            timeout: 5,
+            keepStdinOpen: true
+        )
+        XCTAssertFalse(current.timedOut, current.err)
+        XCTAssertEqual(current.code, 0, current.err)
+        XCTAssertEqual(current.out, "SENTINELS=1,1")
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: marker.path),
+            "the mutable stale symlink or overwritten legacy bridge must never be invoked"
+        )
+
+        var cases: [(String, [String: String])] = []
+        var currentDone = environment
+        currentDone[AgentSkillInstaller.toolShellCurrentDoneEnvironmentKey] = "1"
+        currentDone[AgentSkillInstaller.toolShellBinaryEnvironmentKey] = stale.path
+        cases.append(("current_done", currentDone))
+        var legacyDone = environment
+        legacyDone[AgentSkillInstaller.toolShellLegacyDoneEnvironmentKey] = "1"
+        legacyDone[AgentSkillInstaller.toolShellBinaryEnvironmentKey] = stale.path
+        cases.append(("legacy_done", legacyDone))
+        var protocolDrift = environment
+        protocolDrift[AgentSkillInstaller.toolShellProtocolEnvironmentKey] = "0"
+        protocolDrift[AgentSkillInstaller.toolShellBinaryEnvironmentKey] = stale.path
+        cases.append(("protocol_drift", protocolDrift))
+        var missing = environment
+        missing[AgentSkillInstaller.toolShellBinaryEnvironmentKey] =
+            root.appendingPathComponent("missing-service").path
+        cases.append(("missing_binary", missing))
+
+        for (name, caseEnvironment) in cases {
+            let result = try runZshWithTimeout(
+                "printf FAIL_OPEN_\(name)",
+                environment: caseEnvironment,
+                timeout: 1,
+                keepStdinOpen: true
+            )
+            XCTAssertFalse(result.timedOut, "\(name) must fail open immediately")
+            XCTAssertEqual(result.code, 0, "\(name): \(result.err)")
+            XCTAssertEqual(result.out, "FAIL_OPEN_\(name)")
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: marker.path),
+                "\(name) invoked the stale blocking binary"
+            )
+        }
+    }
+
+    func test_toolShellHonorsLiveDisabledLaneAfterReceiptWasIssued() async throws {
+        // WHY: a provider receipt is immutable for the lifetime of a turn. An
+        // operator disabling tool_shell in the live state overlay after that
+        // receipt must stop the next interception without restarting the turn.
+        guard let binary = builtBinary() else {
+            throw XCTSkip("RemoteCodeDistillService debug binary not built")
+        }
+
+        let supportURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tool-shell-live-lane-\(UUID().uuidString)", isDirectory: true)
+        let binURL = supportURL.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: binURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: supportURL) }
+
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: supportURL.path).run()
+        let settings = SettingsStore(db: db)
+        settings.update { $0.tokenSaverEnabled = true }
+        try SettingsRepository(db: db).set(
+            "private.account.session",
+            #"{"user":{"subscribed":true}}"#
+        )
+
+        let config = try DistillServiceConfiguration(
+            authToken: "tool-shell-live-token",
+            appSupportDirectory: supportURL.path
+        )
+        let server = DistillHTTPServer(
+            configuration: config,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2),
+            scopedRecoveryStore: TestScopedRecoveryStore()
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let stateURL = supportURL
+            .appendingPathComponent("Distill", isDirectory: true)
+            .appendingPathComponent("DistillCLIState.json")
+        try FileManager.default.createDirectory(
+            at: stateURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        func writeState(disabledLanes: [String]) throws {
+            let state: [String: Any] = [
+                "base_url": ready.baseURL,
+                "auth_token": "tool-shell-live-token",
+                "pid": ready.pid,
+                "disabled_lanes": disabledLanes,
+                "enabled_lanes": [CommandWrapPolicy.toolShellLane],
+            ]
+            try JSONSerialization.data(withJSONObject: state).write(to: stateURL, options: .atomic)
+        }
+        try writeState(disabledLanes: [])
+
+        let receipt = TokenSaverExecutionReceiptSeam.admit(
+            tokenSaverEnabled: true,
+            sameUser: true,
+            sidecarAvailable: true,
+            provider: .codex,
+            threadId: "10000000-0000-0000-0000-000000000001",
+            rootRunId: "40000000-0000-0000-0000-000000000004",
+            attemptId: "50000000-0000-0000-0000-000000000005",
+            workspaceId: "20000000-0000-0000-0000-000000000002",
+            projectId: "30000000-0000-0000-0000-000000000003"
+        )
+        XCTAssertFalse(
+            receipt.disabledLanes.contains(CommandWrapPolicy.toolShellLane),
+            "the regression requires one unchanged receipt that admits tool_shell"
+        )
+        var environment = TokenSaverExecutionReceiptSeam.environment(from: receipt)
+        environment["REMOTE_CODE_AGENT_PROVIDER"] = "codex"
+        environment["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"] = supportURL.path
+        environment["REMOTE_CODE_DISTILL_STATE_PATH"] = stateURL.path
+        environment["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"] = "1"
+        environment["RC_REMOTE_CODE_UNOWNED_TOOL_SHELL"] = "1"
+
+        let fakeSwift = try makeExecutable(
+            at: binURL,
+            name: "swift",
+            body: "#!/bin/sh\nfor i in $(seq 1 200); do printf 'build line %s: repeated diagnostic output\\n' \"$i\"; done\n"
+        )
+        let payload = "\(fakeSwift.path) noisy.swift"
+        let rawOutput = (1...200)
+            .map { "build line \($0): repeated diagnostic output" }
+            .joined(separator: "\n") + "\n"
+
+        let admitted = try runProcess(
+            binary,
+            ["cli", "tool-shell", "--", payload],
+            env: environment,
+            stdin: "",
+            unset: ["RC_TOKEN_SAVER_DISABLED_LANES", "RC_TOKEN_SAVER_ENABLED_LANES"]
+        )
+        XCTAssertEqual(admitted.code, 0, "stderr=\(admitted.err)")
+        XCTAssertTrue(admitted.out.contains("[[rc:"), "enabled live lane must intercept: \(admitted.out)")
+        let beforeDisable = await server.metrics.snapshot(
+            activeRequests: 0,
+            maxConcurrentRequests: 2
+        )
+        XCTAssertEqual(beforeDisable.totalRequests, 1)
+
+        // The receipt above remains byte-identical; only the authoritative live
+        // overlay changes between executions.
+        // The state keeps tool_shell in enabled_lanes too: the incident kill
+        // switch must win when the same lane appears in both live lists.
+        try writeState(disabledLanes: [CommandWrapPolicy.toolShellLane])
+        let disabled = try runProcess(
+            binary,
+            ["cli", "tool-shell", "--", payload],
+            env: environment,
+            stdin: "",
+            unset: ["RC_TOKEN_SAVER_DISABLED_LANES", "RC_TOKEN_SAVER_ENABLED_LANES"]
+        )
+        XCTAssertEqual(disabled.code, 0, "stderr=\(disabled.err)")
+        XCTAssertEqual(disabled.out, rawOutput, "live disabled_lanes must force exact passthrough")
+        let afterDisable = await server.metrics.snapshot(
+            activeRequests: 0,
+            maxConcurrentRequests: 2
+        )
+        XCTAssertEqual(
+            afterDisable.totalRequests,
+            1,
+            "live kill switch must prevent a second distill request from the stale receipt"
+        )
+    }
+
     func test_explicitDistillUsesAdmittedReceiptAndAppSupportNamespace() async throws {
         // WHY: an explicit `| distill` is a paid Token Saver action. It must
         // require the host-issued receipt and resolve the isolated app's lease
@@ -207,7 +657,7 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
             tokenSaverEnabled: true,
             sameUser: true,
             sidecarAvailable: true,
-            provider: .codex,
+            provider: .claude,
             threadId: "10000000-0000-0000-0000-000000000001",
             rootRunId: "40000000-0000-0000-0000-000000000004",
             attemptId: "50000000-0000-0000-0000-000000000005",
@@ -216,7 +666,8 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         )
         var admittedEnvironment = TokenSaverExecutionReceiptSeam.environment(from: receipt)
         admittedEnvironment["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"] = supportURL.path
-        admittedEnvironment["REMOTE_CODE_AGENT_PROVIDER"] = "codex"
+        admittedEnvironment["REMOTE_CODE_AGENT_PROVIDER"] = "claude"
+        XCTAssertEqual(admittedEnvironment["RC_TOKEN_SAVER_POST_TOOL_USE"], "1")
         // Deliberately omit REMOTE_CODE_DISTILL_STATE_PATH: the isolated
         // namespace must be derived from app support, not stable-channel state.
 
@@ -232,6 +683,50 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         let distill = root.appendingPathComponent("distill")
         try FileManager.default.createSymbolicLink(at: distill, withDestinationURL: binary)
         let path = "\(root.path):\(ProcessInfo.processInfo.environment["PATH"] ?? "")"
+        let rawOutput = (1...200)
+            .map { "build line \($0): repeated diagnostic output" }
+            .joined(separator: "\n") + "\n"
+
+        // Claude's admitted PostToolUse lane owns ordinary Bash output. The
+        // automatic PATH wrapper therefore stays raw and the real hook binary
+        // creates the sole request/ledger row for those bytes.
+        XCTAssertEqual(
+            CommandWrapPolicy.passthroughReason(
+                command: "swift",
+                args: ["noisy.swift"],
+                environment: admittedEnvironment
+            ),
+            "provider_post_tool_use_owner"
+        )
+        let hookEnvelope: [String: Any] = [
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": ["command": "swift noisy.swift"],
+            "tool_response": rawOutput,
+        ]
+        let hookInput = try JSONSerialization.data(withJSONObject: hookEnvelope)
+        let hooked = try runProcess(
+            binary,
+            ["cli", "hook", "post-tool-use"],
+            env: admittedEnvironment,
+            stdin: String(decoding: hookInput, as: UTF8.self)
+        )
+        XCTAssertEqual(hooked.code, 0, "stderr=\(hooked.err)")
+        let hookedJSON = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(hooked.out.utf8)) as? [String: Any]
+        )
+        XCTAssertNotNil(
+            (hookedJSON["hookSpecificOutput"] as? [String: Any])?["updatedToolOutput"],
+            "the real PostToolUse subprocess must replace ordinary noisy output"
+        )
+        let metricsAfterHook = await server.metrics.snapshot(activeRequests: 0, maxConcurrentRequests: 2)
+        XCTAssertEqual(metricsAfterHook.totalRequests, 1,
+                       "wrapper plus hook must make exactly one sidecar request")
+        let rowsAfterHook = try db.prepare("SELECT COUNT(*), MIN(cache_state) FROM token_saver_savings;")
+        XCTAssertTrue(try rowsAfterHook.step())
+        XCTAssertEqual(rowsAfterHook.columnInt64(0), 1)
+        XCTAssertEqual(rowsAfterHook.columnText(1), "tool_output_hooked")
+
         let command = "swift noisy.swift | distill"
         let result = try runShell(command, env: admittedEnvironment.merging(["PATH": path]) { _, value in value })
 
@@ -239,12 +734,17 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         XCTAssertFalse(result.out.split(whereSeparator: \.isNewline).count >= 200, result.out)
         XCTAssertTrue(result.out.contains("[[rc:"), "lossy explicit distill output must carry recovery: \(result.out)")
         let metrics = await server.metrics.snapshot(activeRequests: 0, maxConcurrentRequests: 2)
-        XCTAssertEqual(metrics.totalRequests, 1, "one explicit distill invocation must make exactly one sidecar request")
-        XCTAssertEqual(metrics.successfulRequests, 1)
+        XCTAssertEqual(metrics.totalRequests, 2,
+                       "the explicit pipe must add exactly one request after the hook")
+        XCTAssertEqual(metrics.successfulRequests, 2)
         let savingsRows = try db.prepare("SELECT COUNT(*) FROM token_saver_savings;")
         XCTAssertTrue(try savingsRows.step())
-        XCTAssertEqual(savingsRows.columnInt64(0), 1,
-                       "one admitted compression must create exactly one durable savings row")
+        XCTAssertEqual(savingsRows.columnInt64(0), 2,
+                       "hook and explicit pipe must each create one durable savings row")
+        let cacheStates = try db.prepare("SELECT cache_state FROM token_saver_savings ORDER BY cache_state;")
+        var observedCacheStates: [String] = []
+        while try cacheStates.step() { observedCacheStates.append(cacheStates.columnText(0) ?? "") }
+        XCTAssertEqual(observedCacheStates, ["tool_output_hooked", "tool_output_pipe"])
 
         var noReceiptEnvironment = admittedEnvironment
         noReceiptEnvironment.removeValue(forKey: TokenSaverExecutionReceipt.envKey)
@@ -256,7 +756,7 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         XCTAssertEqual(denied.out.split(whereSeparator: \.isNewline).count, 200,
                        "no receipt must fail open to the exact explicit-pipe bytes")
         let afterDenied = await server.metrics.snapshot(activeRequests: 0, maxConcurrentRequests: 2)
-        XCTAssertEqual(afterDenied.totalRequests, 1, "a denied explicit pipe must not reach the sidecar")
+        XCTAssertEqual(afterDenied.totalRequests, 2, "a denied explicit pipe must not reach the sidecar")
 
         // An explicit app namespace is authoritative. A malformed or removed
         // lease must fail open; it must never fall through to a stable/canary
@@ -298,11 +798,11 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         XCTAssertEqual(noNamespace.out.split(whereSeparator: \.isNewline).count, 200,
                        "receipt without an explicit namespace must fail open to exact bytes")
         let afterNamespaceDenials = await server.metrics.snapshot(activeRequests: 0, maxConcurrentRequests: 2)
-        XCTAssertEqual(afterNamespaceDenials.totalRequests, 1,
+        XCTAssertEqual(afterNamespaceDenials.totalRequests, 2,
                        "invalid app namespace must not reach a sibling sidecar")
         let finalSavingsRows = try db.prepare("SELECT COUNT(*) FROM token_saver_savings;")
         XCTAssertTrue(try finalSavingsRows.step())
-        XCTAssertEqual(finalSavingsRows.columnInt64(0), 1,
+        XCTAssertEqual(finalSavingsRows.columnInt64(0), 2,
                        "denied/fail-open invocations must not create savings rows")
         let providerAttempts = try db.prepare("SELECT COUNT(*) FROM token_saver_attempts;")
         XCTAssertTrue(try providerAttempts.step())
@@ -502,11 +1002,10 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
                        "receipt denial and exact-output bypass must not reach the sidecar")
     }
 
-    func test_liveCodexUnownedShellFailsBareOpenAndExplicitPipeCompressesOnce() async throws {
-        // WHY: Codex's absolute zsh can exec-optimize its final child, erasing
-        // the aggregate command before a managed wrapper can prove ownership.
-        // Exercise the real launcher policy: a bare child must stay raw, while
-        // a separate explicit Distill pipe reaches live MLX exactly once.
+    func test_liveCodexGeneralInterceptorAndExplicitPipeEachCompressExactlyOnce() async throws {
+        // WHY: Codex's absolute zsh bypasses PATH wrapper ownership. The managed
+        // aggregate interceptor must compress one safe bare command, while an
+        // explicit pipe remains its own single pass; both stay recoverable.
         guard ProcessInfo.processInfo.environment["REMOTE_CODE_TOKEN_SAVER_LIVE_MODEL_TEST"] == "1" else {
             throw XCTSkip("Set REMOTE_CODE_TOKEN_SAVER_LIVE_MODEL_TEST=1 (+ live model dir) to run the real sidecar E2E.")
         }
@@ -611,8 +1110,9 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         let providerHome = supportURL.appendingPathComponent("provider-home", isDirectory: true)
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         let installer = AgentSkillInstaller(homeDirectory: providerHome)
-        try installer.installProviderShellBridge()
-        let wrapperBin = installer.managedCLIBinURL
+        let runtimeInstaller = try XCTUnwrap(installer.runtimeInstaller(for: binary))
+        try runtimeInstaller.installProviderShellBridge()
+        let wrapperBin = runtimeInstaller.managedCLIBinURL
         try FileManager.default.createDirectory(at: wrapperBin, withIntermediateDirectories: true)
         let noisySource = """
         for index in 1...200 {
@@ -632,10 +1132,15 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         let systemPath = ProcessInfo.processInfo.environment["PATH"] ?? "/opt/homebrew/bin:/usr/bin:/bin"
         providerEnvironment["PATH"] = "\(wrapperBin.path):\(systemPath)"
         providerEnvironment["RC_REMOTE_CODE_MANAGED_BIN"] = wrapperBin.path
-        providerEnvironment["RC_REMOTE_CODE_MANAGED_ZDOTDIR"] = installer.providerShellBridgeURL.path
+        providerEnvironment["RC_REMOTE_CODE_MANAGED_ZDOTDIR"] = runtimeInstaller.providerShellBridgeURL.path
         providerEnvironment["RC_REMOTE_CODE_ORIGINAL_ZDOTDIR"] = providerHome.path
         providerEnvironment["RC_REMOTE_CODE_EFFECTIVE_ZDOTDIR"] = providerHome.path
-        providerEnvironment["ZDOTDIR"] = installer.providerShellBridgeURL.path
+        providerEnvironment["ZDOTDIR"] = runtimeInstaller.providerShellBridgeURL.path
+        providerEnvironment["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"] = "1"
+        providerEnvironment[AgentSkillInstaller.toolShellProtocolEnvironmentKey] =
+            AgentSkillInstaller.toolShellProtocolVersion
+        providerEnvironment[AgentSkillInstaller.toolShellBinaryEnvironmentKey] =
+            binary.resolvingSymlinksInPath().standardizedFileURL.path
 
         let appServer = try makeExecutable(
             at: supportURL,
@@ -703,6 +1208,8 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         XCTAssertEqual(resolved.code, 0, "stderr=\(resolved.err)")
         XCTAssertEqual(resolved.out, "\(wrapperBin.appendingPathComponent("swift").path)\n")
 
+        let rawOutput = (1...200).map { "SR2 E2E noisy output line \($0)" }.joined(separator: "\n") + "\n"
+        XCTAssertEqual(rawOutput.utf8.count, 5_892, "the E2E must keep the exact R7 noisy-output fixture")
         let bare = try runProvider(
             environment: providerEnvironment,
             command: "swift noisy.swift"
@@ -720,16 +1227,27 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
             bare.arguments.contains(where: { $0.contains("shell_environment_policy.set.RC_REMOTE_CODE_UNOWNED_TOOL_SHELL=") }),
             "the launcher must mark Codex's absolute tool shell as unowned"
         )
-        let rawOutput = (1...200).map { "SR2 E2E noisy output line \($0)" }.joined(separator: "\n") + "\n"
-        XCTAssertEqual(rawOutput.utf8.count, 5_892, "the E2E must keep the exact R7 noisy-output fixture")
-        XCTAssertEqual(bare.out, rawOutput, "unowned bare provider output must fail open byte-for-byte")
+        XCTAssertTrue(
+            bare.arguments.contains(where: { $0.contains("shell_environment_policy.set.RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT=") }),
+            "the admitted Codex shell policy must carry the aggregate-interceptor gate"
+        )
+        XCTAssertTrue(bare.out.contains("[[rc:"), "bare interceptor output must carry recovery: \(bare.out)")
+        XCTAssertLessThan(bare.out.utf8.count, rawOutput.utf8.count)
+        let bareHandle = try XCTUnwrap(SR2WirePolicy.recoveryMarker(in: bare.out))
+        let bareCapability = String(bareHandle.dropFirst("[[rc:".count).dropLast(2))
+        let bareRecovered = try runProvider(
+            environment: providerEnvironment,
+            command: "distill retrieve \(bareCapability)"
+        )
+        XCTAssertEqual(bareRecovered.code, 0, "stderr=\(bareRecovered.err)")
+        XCTAssertEqual(bareRecovered.out, rawOutput, "interceptor recovery must be byte-exact")
 
         let metricsAfterBare = try await liveJSON(
             URL(string: sidecar.ready.baseURL + "/metrics")!,
             authToken: authToken
         )
-        XCTAssertEqual(metricsAfterBare["total_requests"] as? Int, 0,
-                       "an unowned bare provider command must not issue a partial request")
+        XCTAssertEqual(metricsAfterBare["total_requests"] as? Int, 1,
+                       "the general interceptor must issue exactly one request")
 
         let compressed = try runProvider(
             environment: providerEnvironment,
@@ -738,15 +1256,23 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         XCTAssertEqual(compressed.code, 0, "stderr=\(compressed.err)")
         XCTAssertTrue(compressed.out.contains("[[rc:"), "explicit provider pipe must carry recovery: \(compressed.out)")
         XCTAssertLessThan(compressed.out.utf8.count, rawOutput.utf8.count)
+        let pipeHandle = try XCTUnwrap(SR2WirePolicy.recoveryMarker(in: compressed.out))
+        let pipeCapability = String(pipeHandle.dropFirst("[[rc:".count).dropLast(2))
+        let pipeRecovered = try runProvider(
+            environment: providerEnvironment,
+            command: "distill retrieve \(pipeCapability)"
+        )
+        XCTAssertEqual(pipeRecovered.code, 0, "stderr=\(pipeRecovered.err)")
+        XCTAssertEqual(pipeRecovered.out, rawOutput, "explicit-pipe recovery must be byte-exact")
 
         let metrics = try await liveJSON(
             URL(string: sidecar.ready.baseURL + "/metrics")!,
             authToken: authToken
         )
-        XCTAssertEqual(metrics["total_requests"] as? Int, 1,
-                       "one explicit provider pipe must issue exactly one live sidecar request")
-        XCTAssertEqual(metrics["successful_requests"] as? Int, 1)
-        XCTAssertEqual(metrics["tool_output_compressed"] as? Int, 1)
+        XCTAssertEqual(metrics["total_requests"] as? Int, 2,
+                       "interceptor and explicit pipe must each issue one request")
+        XCTAssertEqual(metrics["successful_requests"] as? Int, 2)
+        XCTAssertEqual(metrics["tool_output_compressed"] as? Int, 2)
 
         let savings = try db.prepare("""
             SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(saved_tokens),
@@ -754,11 +1280,15 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
             FROM token_saver_savings;
         """)
         XCTAssertTrue(try savings.step())
-        XCTAssertEqual(savings.columnInt64(0), 1, "one explicit pipe must create exactly one savings row")
+        XCTAssertEqual(savings.columnInt64(0), 2, "pipe and interceptor must create separate savings rows")
         XCTAssertGreaterThan(savings.columnInt64(1), savings.columnInt64(2))
         XCTAssertGreaterThan(savings.columnInt64(3), 0, "explicit-pipe delivered savings must be positive")
-        XCTAssertEqual(savings.columnInt64(4), 1, "only delivered compression counts as savings")
+        XCTAssertEqual(savings.columnInt64(4), 2, "both compressions must be delivered")
         XCTAssertNotEqual(savings.columnText(5), "verbatim")
+        let origins = try db.prepare("SELECT cache_state FROM token_saver_savings ORDER BY id;")
+        var cacheStates: [String] = []
+        while try origins.step() { cacheStates.append(origins.columnText(0) ?? "") }
+        XCTAssertEqual(Set(cacheStates), ["tool_output_interceptor", "tool_output_pipe"])
 
         let pipeline = try runProvider(
             environment: providerEnvironment,
@@ -770,7 +1300,7 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
             URL(string: sidecar.ready.baseURL + "/metrics")!,
             authToken: authToken
         )
-        XCTAssertEqual(metricsAfterPipeline["total_requests"] as? Int, 1,
+        XCTAssertEqual(metricsAfterPipeline["total_requests"] as? Int, 2,
                        "an intermediate pipeline wrapper must remain raw")
 
         var noReceipt = providerEnvironment
@@ -786,7 +1316,7 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
             URL(string: sidecar.ready.baseURL + "/metrics")!,
             authToken: authToken
         )
-        XCTAssertEqual(metricsAfterDenied["total_requests"] as? Int, 1,
+        XCTAssertEqual(metricsAfterDenied["total_requests"] as? Int, 2,
                        "missing receipt must not reach the sidecar")
 
         let exact = try runProvider(
@@ -805,11 +1335,11 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
             URL(string: sidecar.ready.baseURL + "/metrics")!,
             authToken: authToken
         )
-        XCTAssertEqual(metricsAfterBypass["total_requests"] as? Int, 1,
+        XCTAssertEqual(metricsAfterBypass["total_requests"] as? Int, 2,
                        "exact and TUI commands must remain raw and bypass the sidecar")
     }
 
-    func test_absoluteZshCompoundFailsOpenAndSeparateCallsDistillOrdinaryOnce() async throws {
+    func test_absoluteZshCompoundFailsOpenWhileBareInterceptorAndPipeStaySinglePass() async throws {
         // WHY: Codex resolves its user shell independently of PATH and may run
         // an absolute zsh whose mixed compound was not marked by our aggregate
         // wrapper. Compressing only its last ordinary child loses the exact
@@ -894,8 +1424,10 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("managed-distill-compound-bin-\(UUID().uuidString)", isDirectory: true)
         let installer = AgentSkillInstaller(homeDirectory: root)
-        try installer.installProviderShellBridge()
-        let wrapperBin = installer.managedCLIBinURL
+        let runtimeInstaller = try XCTUnwrap(installer.runtimeInstaller(for: binary))
+        try runtimeInstaller.installProviderShellBridge()
+        let pinnedService = try XCTUnwrap(runtimeInstaller.pinnedServiceBinaryURL)
+        let wrapperBin = runtimeInstaller.managedCLIBinURL
         let realBin = root.appendingPathComponent("real", isDirectory: true)
         try FileManager.default.createDirectory(at: wrapperBin, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: realBin, withIntermediateDirectories: true)
@@ -912,15 +1444,22 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         try Data("UNIQUE_EXACT_MATCH\n".utf8).write(to: root.appendingPathComponent("README.md"))
         let wrappedSwift = wrapperBin.appendingPathComponent("swift")
         let wrappedDistill = wrapperBin.appendingPathComponent("distill")
-        try FileManager.default.createSymbolicLink(at: wrappedSwift, withDestinationURL: binary)
-        try FileManager.default.createSymbolicLink(at: wrappedDistill, withDestinationURL: binary)
+        try FileManager.default.createSymbolicLink(at: wrappedSwift, withDestinationURL: pinnedService)
+        try FileManager.default.createSymbolicLink(at: wrappedDistill, withDestinationURL: pinnedService)
         let path = "\(wrapperBin.path):\(realBin.path):\(ProcessInfo.processInfo.environment["PATH"] ?? "")"
         environment["PATH"] = path
         environment["RC_REMOTE_CODE_MANAGED_BIN"] = wrapperBin.path
-        environment["RC_REMOTE_CODE_MANAGED_ZDOTDIR"] = installer.providerShellBridgeURL.path
+        environment["RC_REMOTE_CODE_MANAGED_ZDOTDIR"] = runtimeInstaller.providerShellBridgeURL.path
+        environment[AgentSkillInstaller.runtimeRootEnvironmentKey] =
+            wrapperBin.deletingLastPathComponent().path
         environment["RC_REMOTE_CODE_ORIGINAL_ZDOTDIR"] = root.path
         environment["RC_REMOTE_CODE_EFFECTIVE_ZDOTDIR"] = root.path
-        environment["ZDOTDIR"] = installer.providerShellBridgeURL.path
+        environment["ZDOTDIR"] = runtimeInstaller.providerShellBridgeURL.path
+        environment["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"] = "1"
+        environment[AgentSkillInstaller.toolShellProtocolEnvironmentKey] =
+            AgentSkillInstaller.toolShellProtocolVersion
+        environment[AgentSkillInstaller.toolShellBinaryEnvironmentKey] =
+            pinnedService.resolvingSymlinksInPath().standardizedFileURL.path
 
         // Keep the absolute shell alive after the noisy child, matching the
         // Codex execve-intercept topology where the child retains a shell
@@ -946,7 +1485,7 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
               try { childEnvironment[key] = JSON.parse(assignment.slice(separator + 1)); } catch (_) {}
             }
             const result = spawnSync("/bin/zsh", [
-              "-c", childEnvironment.RC_R9_E2E_COMMAND || \(String(reflecting: payload))
+              "-lc", childEnvironment.RC_R9_E2E_COMMAND || \(String(reflecting: payload))
             ], {
               cwd: \(String(reflecting: root.path)),
               env: childEnvironment,
@@ -1060,14 +1599,23 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         XCTAssertEqual(metricsAfterExactCalls.totalRequests, 0, "separate exact calls must stay raw")
 
         let bareNoisy = try runProvider("swift noisy.swift")
-        XCTAssertEqual(bareNoisy.code, 0, "stderr=\(bareNoisy.err)")
+        XCTAssertEqual(bareNoisy.code, 0, "stderr=\(bareNoisy.err) args=\(bareNoisy.arguments)")
+        XCTAssertFalse(
+            bareNoisy.out.contains("build line 100:"),
+            "the aggregate interceptor must compress one safe bare command; stderr=\(bareNoisy.err); args=\(bareNoisy.arguments)"
+        )
+        let bareRecoveryMarker = try XCTUnwrap(SR2WirePolicy.recoveryMarker(in: bareNoisy.out))
+        let bareRecoveryHandle = String(bareRecoveryMarker.dropFirst("[[rc:".count).dropLast(2))
         XCTAssertEqual(
-            bareNoisy.out,
-            rawNoisyOutput,
-            "an unowned Codex shell cannot transfer aggregate ownership to a bare wrapper"
+            try recoveryStore.retrieveOriginal(
+                capability: bareRecoveryHandle,
+                context: testRecoveryContext()
+            ),
+            Data(rawNoisyOutput.utf8),
+            "automatic-interceptor recovery must preserve every original byte"
         )
         let metricsAfterBareNoisy = await server.metrics.snapshot(activeRequests: 0, maxConcurrentRequests: 2)
-        XCTAssertEqual(metricsAfterBareNoisy.totalRequests, 0, "bare unowned output must fail open")
+        XCTAssertEqual(metricsAfterBareNoisy.totalRequests, 1, "bare interceptor must issue exactly one request")
 
         let noisy = try runProvider("set -o pipefail;swift noisy.swift | distill \"summarize build output\"")
         XCTAssertEqual(noisy.code, 0, "stderr=\(noisy.err)")
@@ -1087,17 +1635,21 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         XCTAssertEqual(recovered, Data(rawNoisyOutput.utf8))
 
         let metrics = await server.metrics.snapshot(activeRequests: 0, maxConcurrentRequests: 2)
-        XCTAssertEqual(metrics.totalRequests, 1, "only the separate explicit Distill call may reach the sidecar")
-        XCTAssertEqual(metrics.successfulRequests, 1)
+        XCTAssertEqual(metrics.totalRequests, 2, "interceptor and explicit pipe must each reach the sidecar once")
+        XCTAssertEqual(metrics.successfulRequests, 2)
         let savingsRows = try db.prepare("SELECT COUNT(*), SUM(delivered), SUM(saved_tokens) FROM token_saver_savings;")
         XCTAssertTrue(try savingsRows.step())
         XCTAssertEqual(
             savingsRows.columnInt64(0),
-            1,
-            "the separate ordinary invocation creates exactly one row"
+            2,
+            "automatic and explicit routes create separate rows"
         )
-        XCTAssertEqual(savingsRows.columnInt64(1), 1, "the noisy child compression must be delivered")
+        XCTAssertEqual(savingsRows.columnInt64(1), 2, "both noisy compressions must be delivered")
         XCTAssertGreaterThan(savingsRows.columnInt64(2), 0, "delivered compound output must report savings")
+        let cacheStateRows = try db.prepare("SELECT cache_state FROM token_saver_savings ORDER BY id;")
+        var cacheStates: [String] = []
+        while try cacheStateRows.step() { cacheStates.append(cacheStateRows.columnText(0) ?? "") }
+        XCTAssertEqual(Set(cacheStates), ["tool_output_interceptor", "tool_output_pipe"])
         let failingPayload = "command -v swift;command -v distill;rg -n UNIQUE_EXACT_MATCH README.md;/usr/bin/false"
         let failing = try runProvider(failingPayload)
         XCTAssertEqual(failing.code, 1, "the validated payload must preserve the original final command status")
@@ -1107,11 +1659,11 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
             "the injected export must stay silent and preserve the original command visibility"
         )
         let metricsAfterFailure = await server.metrics.snapshot(activeRequests: 0, maxConcurrentRequests: 2)
-        XCTAssertEqual(metricsAfterFailure.totalRequests, 1, "empty unwrapped failure must not add a request")
+        XCTAssertEqual(metricsAfterFailure.totalRequests, 2, "empty unwrapped failure must not add a request")
         let rowsAfterFailure = try db.prepare("SELECT COUNT(*), SUM(delivered) FROM token_saver_savings;")
         XCTAssertTrue(try rowsAfterFailure.step())
-        XCTAssertEqual(rowsAfterFailure.columnInt64(0), 1, "empty failing output must not add a savings row")
-        XCTAssertEqual(rowsAfterFailure.columnInt64(1), 1)
+        XCTAssertEqual(rowsAfterFailure.columnInt64(0), 2, "empty failing output must not add a savings row")
+        XCTAssertEqual(rowsAfterFailure.columnInt64(1), 2)
 
         let unsafePayload = "rg -n UNIQUE_EXACT_MATCH README.md;swift noisy.swift | wc -l"
         let unsafe = try runProvider(unsafePayload)
@@ -1122,11 +1674,11 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
             "an ambiguous pipeline must execute once as an entirely raw shell command"
         )
         let metricsAfterUnsafe = await server.metrics.snapshot(activeRequests: 0, maxConcurrentRequests: 2)
-        XCTAssertEqual(metricsAfterUnsafe.totalRequests, 1, "unsafe syntax must not reach Distill")
+        XCTAssertEqual(metricsAfterUnsafe.totalRequests, 2, "unsafe syntax must not reach Distill")
         let rowsAfterUnsafe = try db.prepare("SELECT COUNT(*), SUM(delivered) FROM token_saver_savings;")
         XCTAssertTrue(try rowsAfterUnsafe.step())
-        XCTAssertEqual(rowsAfterUnsafe.columnInt64(0), 1)
-        XCTAssertEqual(rowsAfterUnsafe.columnInt64(1), 1)
+        XCTAssertEqual(rowsAfterUnsafe.columnInt64(0), 2)
+        XCTAssertEqual(rowsAfterUnsafe.columnInt64(1), 2)
 
         // A nonterminal wrapper must mark its real child as parent-owned. npm
         // commonly uses `#!/usr/bin/env node`; without the marker, the nested
@@ -1165,7 +1717,7 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         let metricsAfterNestedPipeline = await server.metrics.snapshot(activeRequests: 0, maxConcurrentRequests: 2)
         XCTAssertEqual(
             metricsAfterNestedPipeline.totalRequests,
-            1,
+            2,
             "npm -> env node in an intermediate pipeline must not create a Distill request"
         )
 
@@ -1186,7 +1738,7 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         XCTAssertEqual(digest.code, 0, "stderr=\(digest.err)")
         XCTAssertEqual(digest.out, "0123456789abcdef  artifact.bin\n")
         let metricsAfterDigest = await server.metrics.snapshot(activeRequests: 0, maxConcurrentRequests: 2)
-        XCTAssertEqual(metricsAfterDigest.totalRequests, 1, "digest output must bypass Distill")
+        XCTAssertEqual(metricsAfterDigest.totalRequests, 2, "digest output must bypass Distill")
 
         let wrappedZsh = wrapperBin.appendingPathComponent("zsh")
         try FileManager.default.createSymbolicLink(at: wrappedZsh, withDestinationURL: binary)
@@ -1200,18 +1752,15 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
             currentDirectory: root
         )
         XCTAssertEqual(ownedAggregate.code, 0, "stderr=\(ownedAggregate.err)")
-        XCTAssertTrue(ownedAggregate.out.hasPrefix(expectedExactPrefix))
-        XCTAssertFalse(
-            ownedAggregate.out.contains("build line 100:"),
-            "an authenticated managed aggregate may selectively compress its ordinary child"
+        XCTAssertEqual(
+            ownedAggregate.out,
+            expectedExactPrefix + rawNoisyOutput,
+            "a mixed aggregate must fail open as one byte-preserving shell payload"
         )
-        XCTAssertNotNil(
-            SR2WirePolicy.recoveryMarker(in: ownedAggregate.out),
-            "authenticated aggregate compression must remain recoverable"
-        )
+        XCTAssertNil(SR2WirePolicy.recoveryMarker(in: ownedAggregate.out))
         let metricsAfterOwnedAggregate = await server.metrics.snapshot(activeRequests: 0, maxConcurrentRequests: 2)
         XCTAssertEqual(metricsAfterOwnedAggregate.totalRequests, 2,
-                       "the genuine managed aggregate adds exactly one request")
+                       "mixed managed-shell syntax must not create a Distill request")
 
         _ = realNpm
         _ = realNode
@@ -1471,6 +2020,48 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         )
     }
 
+    private func runZshWithTimeout(
+        _ payload: String,
+        environment: [String: String],
+        timeout: TimeInterval,
+        keepStdinOpen: Bool
+    ) throws -> (out: String, err: String, code: Int32, timedOut: Bool) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", payload]
+        process.environment = environment
+        let input = keepStdinOpen ? Pipe() : nil
+        let output = Pipe()
+        let error = Pipe()
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = error
+        try process.run()
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning && Date() < deadline {
+            usleep(10_000)
+        }
+        let timedOut = process.isRunning
+        input?.fileHandleForWriting.closeFile()
+        if timedOut {
+            process.terminate()
+            let terminationDeadline = Date().addingTimeInterval(1)
+            while process.isRunning && Date() < terminationDeadline {
+                usleep(10_000)
+            }
+            if process.isRunning {
+                Darwin.kill(process.processIdentifier, SIGKILL)
+            }
+        }
+        process.waitUntilExit()
+        return (
+            String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
+            String(decoding: error.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
+            process.terminationStatus,
+            timedOut
+        )
+    }
+
     private func runShell(
         _ command: String,
         env: [String: String],
@@ -1496,6 +2087,8 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
     ) throws -> (process: Process, output: Pipe, ready: DistillServiceReadyEvent) {
         let process = Process()
         let output = Pipe()
+        let error = Pipe()
+        let capture = LiveSidecarReadyCapture()
         process.executableURL = binary
         process.arguments = [
             "--auth-token", authToken,
@@ -1509,29 +2102,26 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
             "--max-queue-depth", "2",
         ]
         process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-        try process.run()
-
-        var pending = Data()
-        let decoder = JSONDecoder()
-        while process.isRunning {
-            let chunk = output.fileHandleForReading.availableData
-            guard !chunk.isEmpty else { break }
-            pending.append(chunk)
-            while let newline = pending.firstIndex(of: 0x0A) {
-                let line = pending[..<newline]
-                pending.removeSubrange(...newline)
-                if let ready = try? decoder.decode(DistillServiceReadyEvent.self, from: line) {
-                    return (process, output, ready)
-                }
-            }
+        process.standardError = error
+        output.fileHandleForReading.readabilityHandler = { handle in
+            capture.receiveStdout(handle.availableData)
         }
+        error.fileHandleForReading.readabilityHandler = { handle in
+            capture.receiveStderr(handle.availableData)
+        }
+        try process.run()
+        _ = capture.completed.wait(timeout: .now() + 120)
+        let snapshot = capture.snapshot()
+        if let ready = snapshot.event { return (process, output, ready) }
         let status = process.isRunning ? "running" : "exited \(process.terminationStatus)"
         if process.isRunning { process.terminate() }
         throw NSError(
             domain: "ManagedDistillCLISubprocessTests",
             code: 1,
-            userInfo: [NSLocalizedDescriptionKey: "live sidecar did not emit ready event (\(status))"]
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "live sidecar did not emit ready event (\(status)); \(snapshot.diagnostics)"
+            ]
         )
     }
 

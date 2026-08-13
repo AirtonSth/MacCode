@@ -1931,8 +1931,8 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
 
     // The Claude PostToolUse fallback must distill EVERY tool (no 4-tool
     // allowlist) once output passes its hook threshold, excluding only the
-    // exact-byte file tools and Skill content. Explicit `| distill` is governed
-    // by the system prompt for ordinary eligible output.
+    // exact-byte file tools, Skill content, and Bash output already owned by an
+    // explicit Distill invocation.
     func test_agentSDKBridgeTokenSaverCompressesAllToolsAbovePolicyThreshold() throws {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -2039,6 +2039,81 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                              "fixture must exceed presentation truncation limit to prove completeness path")
         // Ensure the harness is grounded in the live bridge (no silent fallback).
         XCTAssertTrue(source.contains("'skill'"), "bridge source must list skill exclusion")
+    }
+
+    /// Behavioral pin: an explicit Distill shell segment owns compression, so
+    /// Claude's PostToolUse fallback must never compress that output a second time.
+    func test_agentSDKBridgeTokenSaverSkipsExplicitDistillBashOutputExactlyOnce() throws {
+        let node = try XCTUnwrap(
+            ProcessLocator.resolve("node"),
+            "node is required for the bridge decision contract test"
+        )
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+
+        let harness = """
+        import { readFileSync } from 'fs';
+        const src = readFileSync(process.argv[2], 'utf8');
+        const start = src.indexOf('const TOKEN_SAVER_MIN_BYTES');
+        const end = src.indexOf('function tokenSaverContractQuestion');
+        if (start < 0 || end < 0) throw new Error('helper slice not found: ' + start + '/' + end);
+        const slice = src.slice(start, end);
+        const mod = new Function(slice + '; return { tokenSaverToolDecision };')();
+        const large = 'OUTPUT_BEGIN\\n' + ('x'.repeat(8000)) + '\\nOUTPUT_END';
+        const decide = (command) => mod.tokenSaverToolDecision('Bash', { command }, large);
+        console.log(JSON.stringify({
+          pipe: decide("swift test 2>&1 | distill 'test failures'"),
+          retrieve: decide('distill retrieve handle'),
+          absolute: decide('/opt/remotecode/bin/distill retrieve handle'),
+          commandPrefix: decide("command /opt/remotecode/bin/distill 'summary'"),
+          envPrefix: decide("env RC_EXPLICIT=1 /opt/remotecode/bin/distill 'summary'"),
+          quoted: decide("echo 'literal | distill remains text'"),
+          ordinary: decide('swift test --filter FeatureTests'),
+        }));
+        """
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-explicit-distill-decision-\(UUID().uuidString).mjs")
+        try harness.write(to: tmp, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: node)
+        process.arguments = [tmp.path, bridge.path]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        process.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        XCTAssertEqual(process.terminationStatus, 0, "node harness failed: \(out)")
+        let data = try XCTUnwrap(out.data(using: .utf8))
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        for key in ["pipe", "retrieve", "absolute", "commandPrefix", "envPrefix"] {
+            let decision = try XCTUnwrap(json[key] as? [String: Any], "missing \(key) decision")
+            XCTAssertEqual(decision["shouldCompress"] as? Bool, false, "\(key) must stay single-pass")
+            XCTAssertEqual(decision["skipReason"] as? String, "explicit_distill_pipeline")
+        }
+        let quoted = try XCTUnwrap(json["quoted"] as? [String: Any])
+        XCTAssertEqual(quoted["shouldCompress"] as? Bool, false,
+                       "the lightweight JS splitter may conservatively protect quoted | distill text")
+        XCTAssertEqual(quoted["skipReason"] as? String, "explicit_distill_pipeline")
+        let ordinary = try XCTUnwrap(json["ordinary"] as? [String: Any])
+        XCTAssertEqual(ordinary["shouldCompress"] as? Bool, true,
+                       "ordinary noisy Swift output must remain PostToolUse-eligible")
+        XCTAssertTrue(ordinary["skipReason"] is NSNull)
+
+        let swiftPolicy = try String(
+            contentsOf: packageRoot.appendingPathComponent("Sources/DistillCore/ToolOutputCompressionPolicy.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(swiftPolicy.contains(#"case explicitDistillPipeline = "explicit_distill_pipeline""#))
+        let bridgeSource = try String(contentsOf: bridge, encoding: .utf8)
+        XCTAssertTrue(bridgeSource.contains("skipReason = 'explicit_distill_pipeline'"),
+                      "Swift and JS must publish the same content-free single-pass reason")
     }
 
     func test_agentSDKBridgeRecoversRawNewlineSplitPromptCommand() throws {

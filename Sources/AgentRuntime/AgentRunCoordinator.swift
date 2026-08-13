@@ -617,17 +617,21 @@ public enum TokenSaverExecutionReceiptSeam {
 
     public static func scrub(_ environment: [String: String]) -> [String: String] {
         var cleaned = environment
+        let stampedManagedBin = environment["RC_REMOTE_CODE_MANAGED_BIN"]
         for key in environment.keys
         where key.hasPrefix("RC_GRAPHIFY_")
             || key.hasPrefix("RC_TOKEN_SAVER_")
             || key.hasPrefix("RC_DISTILL_")
-            || key == "REMOTE_CODE_DISTILL_STATE_PATH" {
+            || key == "REMOTE_CODE_DISTILL_STATE_PATH"
+            || key == AgentSkillInstaller.runtimeRootEnvironmentKey {
             cleaned.removeValue(forKey: key)
         }
         if let path = cleaned["PATH"] {
             let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
             let rawParts = path.split(separator: ":").map(String.init)
-            let scrubbedParts = rawParts.filter { $0 != managedBin }
+            let scrubbedParts = rawParts.filter {
+                $0 != managedBin && $0 != stampedManagedBin
+            }
             cleaned["PATH"] = scrubbedParts.joined(separator: ":")
         }
         return cleaned
@@ -723,6 +727,13 @@ public enum TokenSaverExecutionReceiptSeam {
     ) -> [String: String] {
         let statePath = environment["REMOTE_CODE_DISTILL_STATE_PATH"]
         let appSupport = environment["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"]
+        let toolShellIntercept = environment["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"]
+        let toolShellProtocol = environment[
+            AgentSkillInstaller.toolShellProtocolEnvironmentKey
+        ]
+        let toolShellBinary = environment[
+            AgentSkillInstaller.toolShellBinaryEnvironmentKey
+        ]
         var updated = scrub(environment)
         updated.merge(self.environment(from: receipt)) { _, receiptValue in receiptValue }
         // Codex/Grok do not expose Claude's PostToolUse capability, but their
@@ -746,6 +757,36 @@ public enum TokenSaverExecutionReceiptSeam {
                .appendingPathComponent("DistillCLIState.json")
                .standardizedFileURL {
             updated["REMOTE_CODE_DISTILL_STATE_PATH"] = statePath
+        }
+        if toolShellIntercept == "1",
+           toolShellProtocol == AgentSkillInstaller.toolShellProtocolVersion,
+           receipt.provider == AgentProvider.codex.rawValue,
+           receipt.capabilities.distill == true,
+           receipt.capabilities.managedPath == true,
+           receipt.capabilities.recoveryScope == true,
+           !receipt.disabledLanes.contains("tool_shell"),
+           let toolShellBinary,
+           (toolShellBinary as NSString).isAbsolutePath {
+            let binaryURL = URL(fileURLWithPath: toolShellBinary).standardizedFileURL
+            guard let runtimeRoot = environment[
+                AgentSkillInstaller.runtimeRootEnvironmentKey
+            ]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !runtimeRoot.isEmpty else {
+                return updated
+            }
+            let runtimeRootURL = URL(fileURLWithPath: runtimeRoot, isDirectory: true)
+                .standardizedFileURL
+            guard AgentSkillInstaller.isImmutableRuntimeServiceBinary(
+                at: binaryURL,
+                trustedRuntimeRoot: runtimeRootURL
+            ) else {
+                return updated
+            }
+            updated["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"] = "1"
+            updated[AgentSkillInstaller.toolShellProtocolEnvironmentKey] =
+                AgentSkillInstaller.toolShellProtocolVersion
+            updated[AgentSkillInstaller.toolShellBinaryEnvironmentKey] = binaryURL.path
+            updated[AgentSkillInstaller.runtimeRootEnvironmentKey] = runtimeRootURL.path
         }
         return updated
     }
@@ -1016,6 +1057,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// returned a cancellable handle or failed. Destructive waits must not treat
     /// `activeThreads[thread] == nil` as terminal while one of these exists.
     private var pendingProviderStarts: [AgentThreadID: PendingProviderStart] = [:]
+    /// Recovery may legitimately publish one replacement provider thread for an
+    /// interrupted durable run before it has an active in-memory ownership row.
+    /// Keep that opening authorization scoped to the recovery call and consume
+    /// it on the first typed `.threadStarted` event; it must not authorize late
+    /// content or a second unsolicited opening.
+    private var authorizedRecoveryOpeningRuns: Set<AgentRunID> = []
     private var pendingThreadStops: Set<AgentThreadID> = []
     /// S5: generation-owned preparation lifecycle for the accept→spawn window.
     /// Stop/Escape applies `.stopRequested` so a late `claimSpawn` cannot write.
@@ -3076,6 +3123,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         terminalRetryScheduled.remove(runId)
         pendingStartFailures.removeValue(forKey: runId)
         startFailureRetryScheduled.remove(runId)
+        authorizedRecoveryOpeningRuns.remove(runId)
         awaitingTerminationRuns.remove(runId)
         providerTerminatedRuns.remove(runId)
         pendingGracefulStopFallbacks.remove(runId)
@@ -3522,6 +3570,28 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             _ = try? ledger.append(record)
         }
         return presentation
+    }
+
+    private func settlePendingProviderCallbacks(threadId: AgentThreadID, runId: AgentRunID) {
+        guard let state = durableActiveThreadState(threadId: threadId) else { return }
+        for requestId in state.pendingApprovalRequestIds {
+            handle(
+                event: .event(.requestResolved(requestId: requestId, state: .cancelled)),
+                runId: runId,
+                threadId: threadId,
+                allowFinalResponseTranslation: false,
+                providerTerminalAcknowledged: false
+            )
+        }
+        for requestId in state.pendingUserInputRequestIds {
+            handle(
+                event: .event(.userInputResolved(requestId: requestId, answer: nil)),
+                runId: runId,
+                threadId: threadId,
+                allowFinalResponseTranslation: false,
+                providerTerminalAcknowledged: false
+            )
+        }
     }
 
     private func markStopRequested(threadId: AgentThreadID, runId: AgentRunID?) {
@@ -5109,6 +5179,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             extraArgs: activeTurnId.map { ["remotecode.recovery.activeTurnId=\($0)"] } ?? [],
             runAsUser: thread.runAsUser
         )
+        _ = lock.withLock {
+            authorizedRecoveryOpeningRuns.insert(recoveryEventRunId)
+        }
+        defer {
+            _ = lock.withLock {
+                authorizedRecoveryOpeningRuns.remove(recoveryEventRunId)
+            }
+        }
         try await adapter.recoverSession(request) { [weak self] event in
             self?.handle(event: event, runId: recoveryEventRunId, threadId: threadId)
         }
@@ -5742,6 +5820,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         switch event {
         case .event(let rawEvent):
             let ev = sanitizeFinalAssistantEvent(rawEvent)
+            guard admitsContentEventForCurrentRun(ev, runId: runId, threadId: threadId) else {
+                return
+            }
             persistProviderNativeSubagentLifecycle(
                 from: ev,
                 parentRunId: runId,
@@ -6368,6 +6449,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 // Slot vanished (ownership released elsewhere); nothing to commit.
                 return
             }
+            // A user Stop may have claimed this terminal slot before the provider
+            // transport emitted its interrupt acknowledgement. Resolve the
+            // durable callback cards from the compact runtime payload at the
+            // terminal boundary so they cannot remain actionable after Stop.
+            settlePendingProviderCallbacks(threadId: threadId, runId: runId)
             // Policy BEFORE durable persist: run/thread/session rows must match
             // presentation status (never durable completed while UI says interrupted).
             let requestedStatus = pendingTerminal.status
@@ -6599,6 +6685,86 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 allowFinalResponseTranslation: false
             )
             try? providerSessionRepo?.updateDiagnostics(threadId: threadId, lastEventKind: "error", lastErrorMessage: m)
+        }
+    }
+
+    /// Late accounting and terminal acknowledgements remain admissible after a
+    /// run finishes, but content must never reopen a cancelled/terminal timeline.
+    /// The active path stays memory-only; only an unowned callback consults the
+    /// durable row before it is allowed to persist or broadcast content.
+    private func admitsContentEventForCurrentRun(
+        _ event: AssistantEvent,
+        runId: AgentRunID,
+        threadId: AgentThreadID
+    ) -> Bool {
+        guard Self.isTerminalSuppressedContentEvent(event)
+                || Self.isTerminalSuppressedLifecycleEvent(event) else { return true }
+        let ownership = lock.withLock { () -> Bool? in
+            if pendingTerminalEvents[runId] != nil {
+                return false
+            }
+            if case .threadStarted = event,
+               authorizedRecoveryOpeningRuns.remove(runId) != nil {
+                return true
+            }
+            if activeThreads[threadId] == runId
+                || pendingProviderStarts[threadId]?.runId == runId {
+                return true
+            }
+            return nil
+        }
+        if let ownership { return ownership }
+        guard let run = try? runRepo.get(id: runId) else { return false }
+        return run.finishedAt == nil && (run.status == .pending || run.status == .running)
+    }
+
+    private static func isTerminalSuppressedContentEvent(_ event: AssistantEvent) -> Bool {
+        switch event {
+        case .itemStarted, .itemDelta, .itemState, .itemProgress, .itemCompleted,
+             .turnCompleted, .proposedPlan, .activePlanUpdated, .contextCompaction,
+             .sr1Translation:
+            return true
+        case .providerRuntime(let event):
+            return event.method.hasPrefix("item/")
+                || event.method.hasPrefix("item.")
+                || event.method.hasSuffix("/outputDelta")
+                || event.method.hasSuffix(".outputDelta")
+        default:
+            return false
+        }
+    }
+
+    /// Lifecycle callbacks can arrive after a provider has acknowledged a
+    /// terminal turn (for example, a buffered `turn/started` or a request
+    /// notification racing with cancellation). They are not accounting data:
+    /// admitting them would reopen active-turn or pending-request UI state.
+    /// Resolved request callbacks deliberately remain outside this set so late
+    /// resolution can still reconcile an already-visible request.
+    private static func isTerminalSuppressedLifecycleEvent(_ event: AssistantEvent) -> Bool {
+        switch event {
+        case .threadStarted, .turnStarted, .requestOpened, .userInputRequested:
+            return true
+        case .providerRuntime(let runtime):
+            switch runtime.method {
+            case "thread/started", "thread.started",
+                 "turn/started", "turn.started",
+                 "item/commandExecution/requestApproval",
+                 "item.commandExecution.requestApproval",
+                 "item/fileRead/requestApproval",
+                 "item.fileRead.requestApproval",
+                 "item/fileChange/requestApproval",
+                 "item.fileChange.requestApproval",
+                 "item/permissions/requestApproval",
+                 "item.permissions.requestApproval",
+                 "applyPatchApproval", "execCommandApproval",
+                 "item/tool/requestUserInput", "item.tool.requestUserInput",
+                 "mcpServer/elicitation/request":
+                return true
+            default:
+                return false
+            }
+        default:
+            return false
         }
     }
 
@@ -8032,6 +8198,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         payload.runtimeMode = runtimeMode
         payload.interactionMode = interactionMode
         payload.activeTurnId = activeTurnId
+        // Terminal persistence is the final recovery boundary. Synthetic
+        // callback resolutions may have failed just before this graph commit;
+        // never carry stale actionable request IDs into a terminal session.
+        payload.pendingApprovalRequestIds.removeAll(keepingCapacity: false)
+        payload.pendingUserInputRequestIds.removeAll(keepingCapacity: false)
         payload.updatedAtMs = Int64(updatedAt.timeIntervalSince1970 * 1000)
         return payload.encoded()
     }

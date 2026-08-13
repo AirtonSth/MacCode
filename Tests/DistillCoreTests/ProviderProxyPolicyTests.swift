@@ -121,6 +121,8 @@ final class ProviderProxyPolicyTests: XCTestCase {
             "RC_DISTILL_ENDPOINT": "http://127.0.0.1:1",
             "RC_GRAPHIFY_ENABLED": "1",
             "REMOTE_CODE_DISTILL_STATE_PATH": "/tmp/stale-state",
+            ProviderProxyPolicy.unownedToolShellEnvironmentKey: "1",
+            ProviderProxyPolicy.providerTerminalStdoutEnvironmentKey: "1",
             "RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE": "1",
             "RC_REMOTE_CODE_AGENT_APP_COMMAND": "/managed/remote-code",
             "RC_REMOTE_CODE_SUBAGENT_THREAD_ID": UUID().uuidString,
@@ -136,6 +138,8 @@ final class ProviderProxyPolicyTests: XCTestCase {
         XCTAssertFalse(scrubbed.keys.contains { $0.hasPrefix("RC_DISTILL_") })
         XCTAssertFalse(scrubbed.keys.contains { $0.hasPrefix("RC_GRAPHIFY_") })
         XCTAssertNil(scrubbed["REMOTE_CODE_DISTILL_STATE_PATH"])
+        XCTAssertNil(scrubbed[ProviderProxyPolicy.unownedToolShellEnvironmentKey])
+        XCTAssertNil(scrubbed[ProviderProxyPolicy.providerTerminalStdoutEnvironmentKey])
         XCTAssertEqual(scrubbed["RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE"], "1")
         XCTAssertEqual(scrubbed["RC_REMOTE_CODE_AGENT_APP_COMMAND"], "/managed/remote-code")
         XCTAssertEqual(scrubbed["PATH"], "/managed:/usr/bin")
@@ -239,10 +243,10 @@ final class ProviderProxyPolicyTests: XCTestCase {
         )
     }
 
-    func test_childScopedEnvironment_recomputesClaudeOnlyPostToolUseAcrossProviders() {
-        // WHY: Claude→Codex/Grok must drop Claude's hook, while a
-        // Codex/Grok→Claude child receives it only through the retargeted live
-        // capability environment.
+    func test_childScopedEnvironment_retargetsProviderSpecificOutputOwnershipAcrossProviders() {
+        // WHY: Claude→Codex/Grok must drop Claude's hook. The namespace-local
+        // state path is provider-neutral, while aggregate tool-shell ownership
+        // belongs only to a retargeted Codex child.
         XCTAssertNil(ProviderProxyPolicy.childPostToolUseCapability(
             targetProvider: .codex,
             distillAvailable: true
@@ -264,16 +268,59 @@ final class ProviderProxyPolicyTests: XCTestCase {
         let claudeToCodex = ProviderProxyPolicy.childScopedEnvironment(
             environment: [
                 "REMOTE_CODE_AGENT_PROVIDER": "claude",
-                "REMOTE_CODE_DISTILL_STATE_PATH": "/tmp/claude-parent-state"
+                "REMOTE_CODE_DISTILL_STATE_PATH": "/tmp/claude-parent-state",
+                ProviderProxyPolicy.toolShellInterceptEnvironmentKey: "stale-parent",
+                ProviderProxyPolicy.unownedToolShellEnvironmentKey: "1",
+                ProviderProxyPolicy.providerTerminalStdoutEnvironmentKey: "1"
             ],
             targetProvider: .codex,
             childRunId: child,
             childDelegationCapability: String(repeating: "d", count: 64),
             tokenSaverEnvironment: [
-                "RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1": "codex-child"
+                "RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1": "codex-child",
+                "REMOTE_CODE_DISTILL_STATE_PATH": "/tmp/codex-child-state",
+                ProviderProxyPolicy.toolShellInterceptEnvironmentKey: "1",
+                ProviderProxyPolicy.unownedToolShellEnvironmentKey: "1",
+                ProviderProxyPolicy.providerTerminalStdoutEnvironmentKey: "1"
             ]
         )
-        XCTAssertNil(claudeToCodex["REMOTE_CODE_DISTILL_STATE_PATH"])
+        XCTAssertEqual(
+            claudeToCodex["REMOTE_CODE_DISTILL_STATE_PATH"],
+            "/tmp/codex-child-state"
+        )
+        XCTAssertEqual(
+            claudeToCodex[ProviderProxyPolicy.toolShellInterceptEnvironmentKey],
+            "1"
+        )
+        XCTAssertEqual(
+            claudeToCodex[ProviderProxyPolicy.unownedToolShellEnvironmentKey],
+            "1"
+        )
+        XCTAssertEqual(
+            claudeToCodex[ProviderProxyPolicy.providerTerminalStdoutEnvironmentKey],
+            "1"
+        )
+
+        let incompleteCodex = ProviderProxyPolicy.childScopedEnvironment(
+            environment: ["REMOTE_CODE_AGENT_PROVIDER": "claude"],
+            targetProvider: .codex,
+            childRunId: child,
+            childDelegationCapability: String(repeating: "h", count: 64),
+            tokenSaverEnvironment: [
+                "RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1": "codex-child",
+                "REMOTE_CODE_DISTILL_STATE_PATH": "/tmp/codex-child-state",
+                ProviderProxyPolicy.toolShellInterceptEnvironmentKey: "1",
+                ProviderProxyPolicy.providerTerminalStdoutEnvironmentKey: "1"
+            ]
+        )
+        XCTAssertEqual(
+            incompleteCodex["REMOTE_CODE_DISTILL_STATE_PATH"],
+            "/tmp/codex-child-state",
+            "explicit pipes and wrappers keep their state path"
+        )
+        XCTAssertNil(incompleteCodex[ProviderProxyPolicy.toolShellInterceptEnvironmentKey])
+        XCTAssertNil(incompleteCodex[ProviderProxyPolicy.unownedToolShellEnvironmentKey])
+        XCTAssertNil(incompleteCodex[ProviderProxyPolicy.providerTerminalStdoutEnvironmentKey])
 
         let grokToClaude = ProviderProxyPolicy.childScopedEnvironment(
             environment: ["REMOTE_CODE_AGENT_PROVIDER": "grok"],
@@ -282,13 +329,66 @@ final class ProviderProxyPolicyTests: XCTestCase {
             childDelegationCapability: String(repeating: "e", count: 64),
             tokenSaverEnvironment: [
                 "RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1": "claude-child",
-                "REMOTE_CODE_DISTILL_STATE_PATH": "/tmp/claude-child-state"
+                "REMOTE_CODE_DISTILL_STATE_PATH": "/tmp/claude-child-state",
+                ProviderProxyPolicy.toolShellInterceptEnvironmentKey: "1",
+                ProviderProxyPolicy.unownedToolShellEnvironmentKey: "1",
+                ProviderProxyPolicy.providerTerminalStdoutEnvironmentKey: "1"
             ]
         )
         XCTAssertEqual(
             grokToClaude["REMOTE_CODE_DISTILL_STATE_PATH"],
             "/tmp/claude-child-state"
         )
+        XCTAssertNil(
+            grokToClaude[ProviderProxyPolicy.toolShellInterceptEnvironmentKey],
+            "Claude child must reject a stale or spoofed Codex-only flag"
+        )
+        XCTAssertNil(grokToClaude[ProviderProxyPolicy.unownedToolShellEnvironmentKey])
+        XCTAssertNil(grokToClaude[ProviderProxyPolicy.providerTerminalStdoutEnvironmentKey])
+
+        let codexToGrok = ProviderProxyPolicy.childScopedEnvironment(
+            environment: [
+                "REMOTE_CODE_AGENT_PROVIDER": "codex",
+                ProviderProxyPolicy.toolShellInterceptEnvironmentKey: "1",
+                ProviderProxyPolicy.unownedToolShellEnvironmentKey: "1",
+                ProviderProxyPolicy.providerTerminalStdoutEnvironmentKey: "1"
+            ],
+            targetProvider: .grok,
+            childRunId: child,
+            childDelegationCapability: String(repeating: "f", count: 64),
+            tokenSaverEnvironment: [
+                "RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1": "grok-child",
+                "REMOTE_CODE_DISTILL_STATE_PATH": "/tmp/grok-child-state",
+                ProviderProxyPolicy.toolShellInterceptEnvironmentKey: "1",
+                ProviderProxyPolicy.unownedToolShellEnvironmentKey: "1",
+                ProviderProxyPolicy.providerTerminalStdoutEnvironmentKey: "1"
+            ]
+        )
+        XCTAssertEqual(
+            codexToGrok["REMOTE_CODE_DISTILL_STATE_PATH"],
+            "/tmp/grok-child-state"
+        )
+        XCTAssertNil(codexToGrok[ProviderProxyPolicy.toolShellInterceptEnvironmentKey])
+        XCTAssertNil(codexToGrok[ProviderProxyPolicy.unownedToolShellEnvironmentKey])
+        XCTAssertNil(codexToGrok[ProviderProxyPolicy.providerTerminalStdoutEnvironmentKey])
+
+        let denied = ProviderProxyPolicy.childScopedEnvironment(
+            environment: [
+                "REMOTE_CODE_AGENT_PROVIDER": "codex",
+                "REMOTE_CODE_DISTILL_STATE_PATH": "/tmp/stale-state",
+                ProviderProxyPolicy.toolShellInterceptEnvironmentKey: "1",
+                ProviderProxyPolicy.unownedToolShellEnvironmentKey: "1",
+                ProviderProxyPolicy.providerTerminalStdoutEnvironmentKey: "1"
+            ],
+            targetProvider: .codex,
+            childRunId: child,
+            childDelegationCapability: String(repeating: "g", count: 64),
+            tokenSaverEnvironment: nil
+        )
+        XCTAssertNil(denied["REMOTE_CODE_DISTILL_STATE_PATH"])
+        XCTAssertNil(denied[ProviderProxyPolicy.toolShellInterceptEnvironmentKey])
+        XCTAssertNil(denied[ProviderProxyPolicy.unownedToolShellEnvironmentKey])
+        XCTAssertNil(denied[ProviderProxyPolicy.providerTerminalStdoutEnvironmentKey])
     }
 
     func test_makeNodeId_isBoundedContentFreeAndSafe() {

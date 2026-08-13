@@ -159,6 +159,74 @@ enum CommandWrapRunner {
         }
     }
 
+    /// Own one admitted Codex `/bin/zsh -lc` payload that could not be owned by
+    /// PATH wrappers. The shell source is never rewritten. Negative admission
+    /// or policy gates execute it once with inherited streams; positive gates
+    /// capture stdout only, keep stderr inherited, and preserve the real status.
+    static func runToolShell(
+        payload: String,
+        admitted: Bool,
+        compress: Compressor
+    ) async -> (exitCode: Int32, deferredSideEffect: DeferredSideEffect?) {
+        let executable = "/bin/zsh"
+        let arguments = ["-lc", payload]
+        let doneEnvironment = [
+            AgentSkillInstaller.toolShellCurrentDoneEnvironmentKey: "1",
+            AgentSkillInstaller.toolShellLegacyDoneEnvironmentKey: "1",
+        ]
+        guard admitted,
+              CommandWrapPolicy.isSafeOrdinaryToolShellPayload(payload) else {
+            return (
+                runInheritingAllStreams(
+                    executable: executable,
+                    args: arguments,
+                    markAsParent: true,
+                    settingEnvironment: doneEnvironment
+                ),
+                nil
+            )
+        }
+
+        let captured = runCapturingStdout(
+            executable: executable,
+            args: arguments,
+            settingEnvironment: doneEnvironment
+        )
+        if captured.overflowed || captured.spawnFailed {
+            return (captured.exitCode, nil)
+        }
+
+        let environment = ProcessInfo.processInfo.environment
+        let action = CommandWrapPolicy.decide(
+            command: executable,
+            args: arguments,
+            isTerminalToAgent: true,
+            outputIsValidUTF8: String(data: captured.stdout, encoding: .utf8) != nil,
+            byteCount: captured.stdout.count,
+            lineCount: 0,
+            environment: environment
+        )
+        switch action {
+        case .passthrough:
+            _ = GuardedStdoutWrite.writeAll(captured.stdout)
+            return (captured.exitCode, nil)
+        case .compress:
+            let (bytes, deferred) = await compressedOrRaw(
+                captured.stdout,
+                query: CommandWrapPolicy.extractionQuery(forCommand: executable),
+                compress: compress
+            )
+            let delivered = GuardedStdoutWrite.writeAll(bytes)
+            return (
+                captured.exitCode,
+                GuardedStdoutWrite.deferredSideEffectAfterCompleteDelivery(
+                    deferred,
+                    delivered: delivered
+                )
+            )
+        }
+    }
+
     /// Compress, but emit the RAW bytes whenever compression failed or returned an implausibly
     /// small result (the distill model occasionally answers with a "NONE"/"PASS" token). The
     /// agent's command output is never replaced by garbage.
@@ -252,12 +320,13 @@ enum CommandWrapRunner {
         executable: String,
         args: [String],
         markAsParent: Bool = false,
-        removingEnvironmentKeys: Set<String> = []
+        removingEnvironmentKeys: Set<String> = [],
+        settingEnvironment: [String: String] = [:]
     ) -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = args
-        if markAsParent || !removingEnvironmentKeys.isEmpty {
+        if markAsParent || !removingEnvironmentKeys.isEmpty || !settingEnvironment.isEmpty {
             var environment = ProcessInfo.processInfo.environment
             for key in removingEnvironmentKeys {
                 environment.removeValue(forKey: key)
@@ -265,6 +334,7 @@ enum CommandWrapRunner {
             if markAsParent {
                 environment["REMOTE_CODE_WRAP_PARENT"] = "1"
             }
+            environment.merge(settingEnvironment) { _, new in new }
             process.environment = environment
         }
         // Leave standardInput/Output/Error unset so the child inherits ours verbatim.
@@ -275,7 +345,7 @@ enum CommandWrapRunner {
             return 126
         }
         process.waitUntilExit()
-        return process.terminationStatus
+        return shellExitCode(for: process)
     }
 
     private struct CapturedOutput {
@@ -288,14 +358,18 @@ enum CommandWrapRunner {
     /// Runs the real command capturing ONLY stdout; stdin and stderr are inherited so the
     /// command reads its real input and its diagnostics reach the agent unchanged. On overflow
     /// the buffered + remaining bytes are streamed straight to our stdout (raw passthrough).
-    private static func runCapturingStdout(executable: String, args: [String]) -> CapturedOutput {
+    private static func runCapturingStdout(
+        executable: String,
+        args: [String],
+        settingEnvironment: [String: String] = [:]
+    ) -> CapturedOutput {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = args
-        process.environment = ProcessInfo.processInfo.environment.merging(
-            ["REMOTE_CODE_WRAP_PARENT": "1"],
-            uniquingKeysWith: { _, child in child }
-        )
+        var childEnvironment = ProcessInfo.processInfo.environment
+        childEnvironment["REMOTE_CODE_WRAP_PARENT"] = "1"
+        childEnvironment.merge(settingEnvironment) { _, new in new }
+        process.environment = childEnvironment
         let outPipe = Pipe()
         process.standardOutput = outPipe
         // standardInput / standardError remain inherited (unset).
@@ -324,7 +398,20 @@ enum CommandWrapRunner {
             }
         }
         process.waitUntilExit()
-        return CapturedOutput(stdout: buffer, exitCode: process.terminationStatus, overflowed: overflowed, spawnFailed: false)
+        return CapturedOutput(
+            stdout: buffer,
+            exitCode: shellExitCode(for: process),
+            overflowed: overflowed,
+            spawnFailed: false
+        )
+    }
+
+    /// `Process.terminationStatus` is the signal number for an uncaught signal,
+    /// while shells expose `128 + signal` to their callers. Every wrapper path
+    /// must preserve that shell-facing contract.
+    private static func shellExitCode(for process: Process) -> Int32 {
+        let status = process.terminationStatus
+        return process.terminationReason == .uncaughtSignal ? 128 + status : status
     }
 }
 

@@ -43,6 +43,10 @@ public enum SR2WirePolicy: Sendable {
     out:=2lines
     !file-edit
     """
+    public static let naturalTaskV1Sample = """
+    @sr2 v1
+    t:open:tracker>pick:1st issue(status=Todo,asgn=sam,prio?=[urgent]@title-or-text)>impl:<ISSUE>(wt@updated main,/task,!review:task,must:test)>update:tracker
+    """
 
     /// Paid-feature providers that must ship the matrix together (T-SR2-09).
     public static let requiredProviders: [String] = ["claude", "codex", "grok"]
@@ -668,6 +672,9 @@ public enum SR2WirePolicy: Sendable {
     - User semantic input may arrive as:
     \(semanticV1Sample)
       Here `run:a;b` is one shell tool call. `run:[a;b]>[c]` requires two separate ordered shell tool calls; never flatten bracketed groups into one `sh`/`zsh -c` compound. `out:=Nlines` requires one global exact cardinality, and indexed `out:1=2lines,2=1line` binds exact cardinality to individual ordered groups; `!file-edit` forbids file edits. Execute exact groups raw. For an ordinary non-TUI group, preserve its command and add explicit `| distill` in that separate tool call when full stdout is not needed byte-exactly.
+    - A bounded natural orchestration may arrive as:
+    \(naturalTaskV1Sample)
+      In `t:`, `>` is strict order, parentheses bind attributes to that action, comma joins attributes, and `key=value` is a hard constraint. `key?=value@title-or-text` is a soft preference; `@title-or-text` matches the task title or text. Rank matching candidates first, then fall back to candidates satisfying the hard constraints when none match. `!x:y` is MUST NOT, `must:` is mandatory, `should:` is advisory, `wt@updated B` means a worktree based on updated branch B, and `label(role)=URL` preserves repository-role mappings. Keep every literal and binding exact.
     - Tool stdout stays exact: keep exact-output (rg/sed/cat/jq) unpiped; pipe noisy builds/tests/logs via `| distill`.
     - Host-local telemetry labels such as Thinking/Ran Shell/Failed Shell are outside the provider wire.
     """

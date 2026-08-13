@@ -11,6 +11,8 @@ import Foundation
 /// Exact-output tools (sed, rg, grep, cat, head, tail, awk, …) are intentionally NOT
 /// wrapped: agents need full line lists and file slices; distill would drop payload lines.
 public enum CommandWrapPolicy {
+    public static let toolShellLane = "tool_shell"
+
     /// Output ownership for a shell payload. A mixed payload cannot be safely
     /// compressed as one aggregate because exact-output commands (for example
     /// `rg` or `command -v`) share the shell's stdout with ordinary commands.
@@ -158,6 +160,13 @@ public enum CommandWrapPolicy {
         // opt these commands back into compression.
         if isExactPatchInvocation(command: name, args: args) {
             return "exact_patch_output"
+        }
+        // Claude is the only provider that can replace Bash tool output in its
+        // native PostToolUse hook. Once that admitted lane is present, it owns
+        // ordinary command stdout; PATH wrappers must execute raw so the same
+        // bytes cannot be compressed once here and again by the provider hook.
+        if environment["RC_TOKEN_SAVER_POST_TOOL_USE"] == "1" {
+            return "provider_post_tool_use_owner"
         }
         // No subcommand allowlist: every other wrapped invocation is compress-eligible.
         return nil
@@ -654,6 +663,26 @@ public enum CommandWrapPolicy {
         return .ordinaryOnly
     }
 
+    /// Whether the Codex absolute tool shell may be owned as one aggregate
+    /// command. This is deliberately narrower than the runtime-discovered PATH
+    /// wrapper set: the shell bridge only captures one finite command from the
+    /// reviewed noisy-command catalog. Exact output, pipelines, redirects,
+    /// shell state, substitution, and unknown executables all fail open raw.
+    public static func isSafeOrdinaryToolShellPayload(_ payload: String) -> Bool {
+        guard shellOutputClassification(payload) == .ordinaryOnly,
+              !shellPayloadContainsDistill(payload),
+              let invocation = boundedSingleShellInvocation(payload),
+              wrappedCommands.contains(commandBasename(invocation.command)),
+              passthroughReason(
+                command: invocation.command,
+                args: invocation.args,
+                environment: [:]
+              ) == nil else {
+            return false
+        }
+        return true
+    }
+
     /// Split only an unambiguous sequence of simple commands separated by
     /// semicolons. The returned source is still interpreted by the real shell,
     /// but each segment has one output owner: exact segments pass through and
@@ -752,6 +781,61 @@ public enum CommandWrapPolicy {
             return nil
         }
         return result
+    }
+
+    private static func boundedSingleShellInvocation(_ payload: String) -> ShellInvocation? {
+        let source = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !source.isEmpty,
+              source == payload,
+              source.utf8.count <= 16 * 1024 else {
+            return nil
+        }
+
+        var quote: Character?
+        var escaped = false
+        for character in source {
+            if escaped {
+                escaped = false
+                continue
+            }
+            if let activeQuote = quote {
+                if character == activeQuote {
+                    quote = nil
+                } else if activeQuote == "\"" && character == "\\" {
+                    escaped = true
+                } else if activeQuote == "\"" && (character == "$" || character == "`") {
+                    return nil
+                }
+                continue
+            }
+            if character == "'" || character == "\"" {
+                quote = character
+                continue
+            }
+            if character == "\\"
+                || character.isNewline
+                || character == ";" || character == "|" || character == "&"
+                || character == "<" || character == ">"
+                || character == "(" || character == ")"
+                || character == "`" || character == "$" || character == "#"
+                || character == "{" || character == "}" {
+                return nil
+            }
+        }
+        guard quote == nil, !escaped else { return nil }
+
+        let tokenGroups = shellSimpleCommandTokens(source)
+        guard tokenGroups.count == 1,
+              let tokens = tokenGroups.first,
+              let first = tokens.first,
+              !isShellAssignment(first),
+              let invocation = shellInvocation(tokens),
+              !shellControlWords.contains(invocation.command.lowercased()),
+              !shellStatefulBuiltins.contains(invocation.command.lowercased()),
+              !isShellAssignment(invocation.command) else {
+            return nil
+        }
+        return invocation
     }
 
     private struct ShellInvocation {

@@ -36,6 +36,7 @@ public enum TokenSaverLaneKillSwitch: Sendable {
         "visual_artifact",
         "sr1-humanize",
         "sr1_humanize",
+        "tool_shell",
     ]
 
     public struct CLIStateOverlay: Sendable, Equatable {
@@ -1993,24 +1994,122 @@ public final class AppContext {
         env["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"] = appSupportDirectory.path
         env["REMOTE_CODE_AGENT_MODEL"] = thread?.model ?? "unknown"
         env["REMOTE_CODE_PROVIDER_INSTANCE_ID"] = thread?.providerInstanceId ?? provider.rawValue
+        let currentServiceBinary = AgentSkillInstaller.resolveCurrentServiceBinary()
+        let installer = makeAgentSkillInstaller()
+        var runtimeInstaller: AgentSkillInstaller?
         // Managed PATH is host-local (not inside the compact receipt JSON).
         if receipt.capabilities.managedPath == true {
-            let installer = makeAgentSkillInstaller()
             // Automatic reinstall for any user on every admitted turn: missing
             // or dangling ~/.remote-code/bin/distill is repaired before PATH is
-            // stamped (PostToolUse + `| distill` need a live binary).
+            // stamped. The global entrypoint stays for external shells, while
+            // this run uses an artifact-scoped bin/ZDOTDIR that another app
+            // bundle cannot repoint after admission.
             do {
-                _ = try installer.ensureDistillCLI()
+                _ = try installer.ensureDistillCLI(serviceBinaryURL: currentServiceBinary)
             } catch {
                 NSLog(
                     "RemoteCode: ensureDistillCLI before agent turn failed: \(error.localizedDescription)"
                 )
             }
-            let managedBin = installer.managedCLIBinURL.path
-            let currentPath = baseEnvironment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
-            let pathParts = currentPath.split(separator: ":").map(String.init).filter { $0 != managedBin }
-            env["PATH"] = ([managedBin] + pathParts).joined(separator: ":")
-            env["RC_REMOTE_CODE_MANAGED_BIN"] = managedBin
+            if let currentServiceBinary,
+               let candidate = installer.runtimeInstaller(for: currentServiceBinary) {
+                do {
+                    _ = try candidate.ensureDistillCLI(serviceBinaryURL: currentServiceBinary)
+                    _ = try candidate.installCommandWrappers(
+                        serviceBinaryURL: currentServiceBinary
+                    )
+                    let proxies = try candidate.installProviderProxies(
+                        serviceBinaryURL: currentServiceBinary,
+                        binDirectory: candidate.managedCLIBinURL
+                    )
+                    _ = try candidate.installProviderShellBridge()
+                    guard completeArtifactRuntime(
+                        candidate,
+                        serviceBinaryURL: currentServiceBinary,
+                        installedProviderProxies: proxies
+                    ) else {
+                        throw AgentSkillCLIError.serviceBinaryUnavailable
+                    }
+                    runtimeInstaller = candidate
+                } catch {
+                    NSLog(
+                        "RemoteCode: artifact-scoped Distill runtime unavailable; failing open: \(error.localizedDescription)"
+                    )
+                }
+            }
+            if let runtimeInstaller {
+                let managedBin = runtimeInstaller.managedCLIBinURL.path
+                let globalBin = installer.managedCLIBinURL.path
+                let providerProxyBin = runtimeInstaller.managedCLIBinURL.path
+                let legacyPathBin = installer.distillPathLinkURL()
+                    .deletingLastPathComponent().path
+                let currentPath = baseEnvironment["PATH"]
+                    ?? ProcessInfo.processInfo.environment["PATH"]
+                    ?? ""
+                let pathParts = currentPath.split(separator: ":").map(String.init).filter {
+                    $0 != managedBin
+                        && $0 != globalBin
+                        && $0 != providerProxyBin
+                        && $0 != legacyPathBin
+                }
+                env["PATH"] = ([managedBin, providerProxyBin] + pathParts)
+                    .joined(separator: ":")
+                env["RC_REMOTE_CODE_MANAGED_BIN"] = managedBin
+                env["RC_REMOTE_CODE_PROVIDER_PROXY_BIN"] = providerProxyBin
+                env[AgentSkillInstaller.runtimeRootEnvironmentKey] =
+                    runtimeInstaller.managedCLIBinURL.deletingLastPathComponent().path
+                let bridge = runtimeInstaller.providerShellBridgeURL.path
+                let home = baseEnvironment["HOME"]
+                    ?? ProcessInfo.processInfo.environment["HOME"]
+                    ?? FileManager.default.homeDirectoryForCurrentUser.path
+                let original = baseEnvironment["ZDOTDIR"]?.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                )
+                env["RC_REMOTE_CODE_ORIGINAL_ZDOTDIR"] =
+                    (original?.isEmpty == false
+                        && original != bridge
+                        && !AgentSkillInstaller.isManagedProviderShellBridgePath(original!)
+                        && original != installer.providerShellBridgeURL.path)
+                    ? original!
+                    : home
+                env["RC_REMOTE_CODE_EFFECTIVE_ZDOTDIR"] =
+                    env["RC_REMOTE_CODE_ORIGINAL_ZDOTDIR"]
+                env["RC_REMOTE_CODE_MANAGED_ZDOTDIR"] = bridge
+                env["ZDOTDIR"] = bridge
+                let bashBridge = runtimeInstaller.providerShellBridgeBashEnvURL.path
+                if let originalBash = baseEnvironment["BASH_ENV"]?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                   !originalBash.isEmpty,
+                   originalBash != bashBridge,
+                   originalBash != installer.providerShellBridgeBashEnvURL.path,
+                   !AgentSkillInstaller.isManagedProviderShellBridgePath(
+                        URL(fileURLWithPath: originalBash)
+                            .deletingLastPathComponent()
+                            .path
+                   ) {
+                    env["RC_REMOTE_CODE_ORIGINAL_BASH_ENV"] = originalBash
+                }
+                env["BASH_ENV"] = bashBridge
+            } else {
+                // Do not fall back to a mutable global distill path. Keep only
+                // the always-on provider proxies; paid command interception is
+                // unavailable for this run and therefore fails open.
+                let globalBin = installer.managedCLIBinURL.path
+                let providerProxyBin = installer.providerProxyBinURL.path
+                let currentPath = baseEnvironment["PATH"]
+                    ?? ProcessInfo.processInfo.environment["PATH"]
+                    ?? ""
+                let legacyPathBin = installer.distillPathLinkURL()
+                    .deletingLastPathComponent().path
+                let pathParts = currentPath.split(separator: ":").map(String.init).filter {
+                    $0 != globalBin && $0 != providerProxyBin && $0 != legacyPathBin
+                }
+                var failOpen = TokenSaverExecutionReceiptSeam.scrub(env)
+                failOpen["PATH"] = ([providerProxyBin] + pathParts).joined(separator: ":")
+                failOpen["RC_REMOTE_CODE_MANAGED_BIN"] = providerProxyBin
+                failOpen["RC_REMOTE_CODE_PROVIDER_PROXY_BIN"] = providerProxyBin
+                return failOpen
+            }
         }
         // Every admitted distill/managed-wrapper lane needs the namespace-local
         // sidecar lease.  Claude used to be the only caller because its
@@ -2023,6 +2122,24 @@ public final class AppContext {
                 .appendingPathComponent("Distill", isDirectory: true)
                 .appendingPathComponent("DistillCLIState.json")
                 .path
+        }
+        // Codex alone has an absolute provider-owned zsh boundary that PATH
+        // wrappers cannot safely own. The bridge still revalidates receipt,
+        // complete recovery scope, live lease, toggle, and this lane before it
+        // captures one bounded ordinary command.
+        if provider == .codex,
+           receipt.capabilities.distill == true,
+           receipt.capabilities.managedPath == true,
+           receipt.capabilities.recoveryScope == true,
+           let currentServiceBinary,
+           runtimeInstaller != nil,
+           !receipt.disabledLanes.contains(CommandWrapPolicy.toolShellLane) {
+            env["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"] = "1"
+            env[AgentSkillInstaller.toolShellProtocolEnvironmentKey] =
+                AgentSkillInstaller.toolShellProtocolVersion
+            env[AgentSkillInstaller.toolShellBinaryEnvironmentKey] =
+                runtimeInstaller?.pinnedServiceBinaryURL?.standardizedFileURL.path
+                    ?? currentServiceBinary.standardizedFileURL.path
         }
         return env
     }
@@ -2095,6 +2212,7 @@ public final class AppContext {
         let installer = makeAgentSkillInstaller()
         // Nested launches inherit provider aliases always; keep distill healthy
         // whenever Token Saver is admitted so child shells never see a gap.
+        var runtimeInstaller: AgentSkillInstaller?
         if tokenSaverRuntimeAdmitted {
             do {
                 _ = try installer.ensureDistillCLI()
@@ -2103,20 +2221,55 @@ public final class AppContext {
                     "RemoteCode: ensureDistillCLI before subagent env failed: \(error.localizedDescription)"
                 )
             }
+            if let currentBinary = AgentSkillInstaller.resolveCurrentServiceBinary(),
+               let candidate = installer.runtimeInstaller(for: currentBinary) {
+                do {
+                    _ = try candidate.installCommandWrappers(
+                        serviceBinaryURL: currentBinary
+                    )
+                    let proxies = try candidate.installProviderProxies(
+                        serviceBinaryURL: currentBinary,
+                        binDirectory: candidate.managedCLIBinURL
+                    )
+                    _ = try candidate.installProviderShellBridge()
+                    guard completeArtifactRuntime(
+                        candidate,
+                        serviceBinaryURL: currentBinary,
+                        installedProviderProxies: proxies
+                    ) else {
+                        throw AgentSkillCLIError.serviceBinaryUnavailable
+                    }
+                    runtimeInstaller = candidate
+                } catch {
+                    NSLog(
+                        "RemoteCode: nested artifact runtime verification failed; failing open: \(error.localizedDescription)"
+                    )
+                }
+            }
         }
-        let managedBin = installer.managedCLIBinURL.path
-        let providerProxyBin = installer.providerProxyBinURL.path
+        let managedBin = (runtimeInstaller?.managedCLIBinURL ?? installer.providerProxyBinURL).path
+        let providerProxyBin = runtimeInstaller?.managedCLIBinURL.path
+            ?? installer.providerProxyBinURL.path
         let basePath = environment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
+        let excludedPaths = Set([
+            installer.managedCLIBinURL.path,
+            providerProxyBin,
+            installer.distillPathLinkURL().deletingLastPathComponent().path,
+            runtimeInstaller?.managedCLIBinURL.path,
+        ].compactMap { $0 })
+        let sanitizedBasePath = basePath.split(separator: ":").map(String.init)
+            .filter { !excludedPaths.contains($0) }
+            .joined(separator: ":")
         if tokenSaverRuntimeAdmitted {
             environment["PATH"] = AppCommandRouter.providerPathWithManagedWrappers(
-                currentPath: basePath,
+                currentPath: sanitizedBasePath,
                 managedBin: managedBin,
                 providerProxyBin: providerProxyBin
             )
             environment["RC_REMOTE_CODE_MANAGED_BIN"] = managedBin
         } else {
             environment["PATH"] = AppCommandRouter.providerPathWithManagedWrappers(
-                currentPath: basePath,
+                currentPath: sanitizedBasePath,
                 managedBin: providerProxyBin
             )
             // The shell bridge uses this key to reassert the provider-only
@@ -2124,6 +2277,12 @@ public final class AppContext {
             environment["RC_REMOTE_CODE_MANAGED_BIN"] = providerProxyBin
         }
         environment["RC_REMOTE_CODE_PROVIDER_PROXY_BIN"] = providerProxyBin
+        if let runtimeInstaller {
+            environment[AgentSkillInstaller.runtimeRootEnvironmentKey] =
+                runtimeInstaller.managedCLIBinURL.deletingLastPathComponent().path
+        } else {
+            environment.removeValue(forKey: AgentSkillInstaller.runtimeRootEnvironmentKey)
+        }
         environment.removeValue(forKey: "RC_REMOTE_CODE_AGENT_APP_COMMAND")
         if let agentAppCommand = installer.verifiedAgentAppMiddlewareURL(
             binDirectory: installer.providerProxyBinURL
@@ -2131,11 +2290,13 @@ public final class AppContext {
             environment["RC_REMOTE_CODE_AGENT_APP_COMMAND"] = agentAppCommand.path
         }
 
-        let shellBridge = installer.providerShellBridgeURL
+        let shellBridge = runtimeInstaller?.providerShellBridgeURL
+            ?? (tokenSaverRuntimeAdmitted ? nil : installer.providerShellBridgeURL)
         let shellBridgeFiles = [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout"]
-        if shellBridgeFiles.allSatisfy({
-            FileManager.default.fileExists(atPath: shellBridge.appendingPathComponent($0).path)
-        }) {
+        if let shellBridge,
+           shellBridgeFiles.allSatisfy({
+               FileManager.default.fileExists(atPath: shellBridge.appendingPathComponent($0).path)
+           }) {
             let originalZDOTDIR = environment["ZDOTDIR"]?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let providerHome = environment["HOME"]?
@@ -2152,19 +2313,26 @@ public final class AppContext {
                 : effectiveHome
             environment["RC_REMOTE_CODE_ORIGINAL_ZDOTDIR"] =
                 originalDirectory == shellBridge.path
+                || AgentSkillInstaller.isManagedProviderShellBridgePath(originalDirectory)
                 ? effectiveHome
                 : originalDirectory
             environment["RC_REMOTE_CODE_EFFECTIVE_ZDOTDIR"] =
                 environment["RC_REMOTE_CODE_ORIGINAL_ZDOTDIR"]
             environment["RC_REMOTE_CODE_MANAGED_ZDOTDIR"] = shellBridge.path
             environment["ZDOTDIR"] = shellBridge.path
-            let bashEnv = installer.providerShellBridgeBashEnvURL
+            let bashEnv = runtimeInstaller?.providerShellBridgeBashEnvURL
+                ?? installer.providerShellBridgeBashEnvURL
             if FileManager.default.fileExists(atPath: bashEnv.path) {
                 let originalBashEnv = environment["BASH_ENV"]?
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if let originalBashEnv,
                    !originalBashEnv.isEmpty,
-                   originalBashEnv != bashEnv.path {
+                   originalBashEnv != bashEnv.path,
+                   !AgentSkillInstaller.isManagedProviderShellBridgePath(
+                        URL(fileURLWithPath: originalBashEnv)
+                            .deletingLastPathComponent()
+                            .path
+                   ) {
                     environment["RC_REMOTE_CODE_ORIGINAL_BASH_ENV"] = originalBashEnv
                 } else {
                     environment.removeValue(forKey: "RC_REMOTE_CODE_ORIGINAL_BASH_ENV")
@@ -2184,6 +2352,42 @@ public final class AppContext {
             environment["REMOTE_CODE_SUBAGENT_TELEMETRY_COMMAND"] = telemetryExecutable
         }
         return environment
+    }
+
+    private func completeArtifactRuntime(
+        _ candidate: AgentSkillInstaller,
+        serviceBinaryURL: URL,
+        installedProviderProxies: [String]
+    ) -> Bool {
+        let expectedBinary = candidate.pinnedServiceBinaryURL ?? serviceBinaryURL
+        let expected = expectedBinary.resolvingSymlinksInPath().path
+        func pointsToExpected(_ link: URL) -> Bool {
+            guard let raw = try? FileManager.default.destinationOfSymbolicLink(
+                atPath: link.path
+            ) else { return false }
+            let target = (raw as NSString).isAbsolutePath
+                ? URL(fileURLWithPath: raw)
+                : link.deletingLastPathComponent().appendingPathComponent(raw)
+            return target.resolvingSymlinksInPath().path == expected
+        }
+        let proxyLinksPinned = installedProviderProxies.allSatisfy {
+            pointsToExpected(candidate.managedCLIBinURL.appendingPathComponent($0))
+        }
+        let existingProviderLinksPinned = ProviderProxyCatalog.providers.allSatisfy {
+            let link = candidate.managedCLIBinURL.appendingPathComponent($0)
+            guard FileManager.default.fileExists(atPath: link.path) else { return true }
+            return pointsToExpected(link)
+        }
+        let bridgeFiles = [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout"]
+        return candidate.isDistillCLIPinned(to: serviceBinaryURL)
+            && candidate.areCommandWrappersPinned(to: expectedBinary)
+            && proxyLinksPinned
+            && existingProviderLinksPinned
+            && bridgeFiles.allSatisfy {
+                FileManager.default.fileExists(
+                    atPath: candidate.providerShellBridgeURL.appendingPathComponent($0).path
+                )
+            }
     }
 
     private static func subagentTelemetryExecutableURL() -> URL? {
@@ -2544,6 +2748,29 @@ public final class AppContext {
             // from hosts where only wrappers survived a prior partial install.
             capture("Distill CLI re-ensure") {
                 _ = try installer.ensureDistillCLI(serviceBinaryURL: sharedBinary)
+            }
+            // Provider runs use a per-artifact namespace; keep the shared bin
+            // above as a compatibility entrypoint for external user shells.
+            if let currentBinary = AgentSkillInstaller.resolveCurrentServiceBinary(),
+               let runtimeInstaller = installer.runtimeInstaller(for: currentBinary) {
+                capture("artifact-scoped Distill CLI") {
+                    _ = try runtimeInstaller.ensureDistillCLI(
+                        serviceBinaryURL: currentBinary
+                    )
+                }
+                capture("artifact-scoped command wrappers") {
+                    _ = try runtimeInstaller.installCommandWrappers(
+                        serviceBinaryURL: currentBinary
+                    )
+                }
+                capture("artifact-scoped provider proxies") {
+                    _ = try runtimeInstaller.installProviderProxies(
+                        serviceBinaryURL: currentBinary
+                    )
+                }
+                capture("artifact-scoped shell bridge") {
+                    _ = try runtimeInstaller.installProviderShellBridge()
+                }
             }
             capture("retrieve MCP") {
                 try installer.installRetrieveMCP()

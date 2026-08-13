@@ -174,6 +174,17 @@ public struct RemoteCodeSubagentTelemetryScope: Sendable, Equatable {
 }
 
 public final class AgentSkillInstaller: @unchecked Sendable {
+    public static let toolShellProtocolVersion = "1"
+    public static let toolShellProtocolEnvironmentKey =
+        "RC_TOKEN_SAVER_TOOL_SHELL_PROTOCOL"
+    public static let toolShellBinaryEnvironmentKey =
+        "RC_TOKEN_SAVER_TOOL_SHELL_BINARY"
+    public static let runtimeRootEnvironmentKey =
+        "RC_REMOTE_CODE_RUNTIME_ROOT"
+    public static let toolShellCurrentDoneEnvironmentKey =
+        "RC_REMOTE_CODE_TOOL_SHELL_DONE"
+    public static let toolShellLegacyDoneEnvironmentKey =
+        "RC_TOKEN_SAVER_TOOL_SHELL_DONE"
     public static let distillSkillID = "distill"
     public static let distillSourceURL = "https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md"
     public static let distillLocalVersion = "9"
@@ -362,9 +373,18 @@ public final class AgentSkillInstaller: @unchecked Sendable {
 
         let prompt = tokenSaverProviderPrompt("", environment: environment)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty,
-              isSupportedProviderTurn(provider: provider, arguments: rewritten)
-        else {
+        let supportedTurn = isSupportedProviderTurn(provider: provider, arguments: rewritten)
+        // Codex exec resume is a continuation ABI, not a fresh prompt turn:
+        // do not inject developer instructions or dialect text, but still carry
+        // the validated shell policy so its tool shells retain the host-issued
+        // artifact transport.
+        if provider == .codex, !supportedTurn || prompt.isEmpty {
+            return ProviderSubprocessLauncher.codexShellEnvironmentPolicyArguments(
+                provider: provider,
+                environment: environment
+            ) + rewritten
+        }
+        guard !prompt.isEmpty, supportedTurn else {
             return rewritten
         }
 
@@ -386,19 +406,28 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         case .codex:
             let scan = scanProviderArguments(provider: provider, arguments: rewritten)
             guard !scan.malformed else { return rewritten }
+            let shellEnvironmentPolicy = ProviderSubprocessLauncher
+                .codexShellEnvironmentPolicyArguments(
+                    provider: provider,
+                    environment: environment
+                )
             let configValues = (scan.optionValues["--config"] ?? [])
                 + (scan.optionValues["-c"] ?? [])
             let hasDeveloperOverride = configValues.contains {
                 $0.hasPrefix("developer_instructions=")
             }
-            guard !hasDeveloperOverride else { return rewritten }
+            guard !hasDeveloperOverride else {
+                return shellEnvironmentPolicy + rewritten
+            }
             let quoted = "\""
                 + prompt
                     .replacingOccurrences(of: "\\", with: "\\\\")
                     .replacingOccurrences(of: "\"", with: "\\\"")
                     .replacingOccurrences(of: "\n", with: "\\n")
                 + "\""
-            return ["--config", "developer_instructions=\(quoted)"] + rewritten
+            return shellEnvironmentPolicy
+                + ["--config", "developer_instructions=\(quoted)"]
+                + rewritten
         }
     }
 
@@ -778,6 +807,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     private let codexInstructionsURL: URL
     private let cliBinDirectory: URL
     private let pathBinDirectory: URL
+    private let shellBridgeDirectory: URL?
+    private let linksDistillOntoUserPath: Bool
+    private let artifactServiceBinaryURL: URL?
     private let appPrivateSkillsRoot: URL
     private let remoteCodeOrchestratePackage: RemoteCodeOrchestratePackage
     private let fileManager: FileManager
@@ -794,6 +826,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         codexInstructionsURL: URL = AgentSkillInstaller.defaultCodexInstructionsURL(),
         cliBinDirectory: URL = AgentSkillInstaller.defaultManagedCLIBinDirectory(),
         pathBinDirectory: URL = AgentSkillInstaller.defaultPathBinDirectory(),
+        shellBridgeDirectory: URL? = nil,
+        linksDistillOntoUserPath: Bool = true,
+        artifactServiceBinaryURL: URL? = nil,
         appPrivateSkillsRoot: URL = AgentSkillInstaller.defaultAppPrivateSkillsRoot(),
         remoteCodeOrchestratePackage: RemoteCodeOrchestratePackage = AgentSkillInstaller.remoteCodeOrchestratePinnedPackage,
         fileManager: FileManager = .default
@@ -804,6 +839,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         self.codexInstructionsURL = codexInstructionsURL
         self.cliBinDirectory = cliBinDirectory
         self.pathBinDirectory = pathBinDirectory
+        self.shellBridgeDirectory = shellBridgeDirectory
+        self.linksDistillOntoUserPath = linksDistillOntoUserPath
+        self.artifactServiceBinaryURL = artifactServiceBinaryURL
         self.appPrivateSkillsRoot = appPrivateSkillsRoot
         self.remoteCodeOrchestratePackage = remoteCodeOrchestratePackage
         self.fileManager = fileManager
@@ -879,9 +917,88 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     }
 
     public var providerShellBridgeURL: URL {
-        cliBinDirectory
+        shellBridgeDirectory ?? cliBinDirectory
             .deletingLastPathComponent()
             .appendingPathComponent("shell/zsh", isDirectory: true)
+    }
+
+    /// Reject persisted startup pointers into any RemoteCode-owned bridge.
+    /// Passing a prior app instance's managed bridge as a user profile would
+    /// re-enter its interceptor and can recurse forever.
+    public static func isManagedProviderShellBridgePath(_ path: String) -> Bool {
+        let components = URL(fileURLWithPath: path).standardizedFileURL.pathComponents
+        guard let marker = components.lastIndex(of: ".remote-code") else { return false }
+        let suffix = Array(components.dropFirst(marker + 1))
+        return suffix == ["shell", "zsh"]
+            || suffix == ["shell", "zsh-tool-v1"]
+            || (suffix.count >= 4
+                && suffix[0] == "runtime"
+                && suffix[suffix.count - 2] == "shell"
+                && ["zsh", "zsh-tool-v1"].contains(suffix.last))
+    }
+
+    /// Per-artifact runtime install used only by admitted provider runs. Its
+    /// PATH and ZDOTDIR cannot be overwritten by another app bundle's global
+    /// compatibility reconcile. The namespace is content-addressed and owns a
+    /// private executable copy, so replacing the source bundle in place cannot
+    /// change a running provider's tool-shell target.
+    public func runtimeInstaller(for serviceBinaryURL: URL) -> AgentSkillInstaller? {
+        let binary = serviceBinaryURL.resolvingSymlinksInPath().standardizedFileURL
+        guard binary.lastPathComponent == "RemoteCodeDistillService",
+              fileManager.isExecutableFile(atPath: binary.path) else {
+            return nil
+        }
+        guard let digest = Self.serviceBinaryIdentity(at: binary) else { return nil }
+        let root = cliBinDirectory
+            .deletingLastPathComponent()
+            .appendingPathComponent("runtime", isDirectory: true)
+            .appendingPathComponent(digest, isDirectory: true)
+        let artifact = root.appendingPathComponent("RemoteCodeDistillService")
+        do {
+            try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+            if fileManager.fileExists(atPath: artifact.path) {
+                guard fileManager.isExecutableFile(atPath: artifact.path),
+                      Self.serviceBinaryIdentity(at: artifact) == digest else {
+                    return nil
+                }
+            } else {
+                let temporary = root.appendingPathComponent(
+                    ".RemoteCodeDistillService.\(UUID().uuidString)"
+                )
+                try fileManager.copyItem(at: binary, to: temporary)
+                try fileManager.setAttributes(
+                    [.posixPermissions: 0o755],
+                    ofItemAtPath: temporary.path
+                )
+                do {
+                    try fileManager.moveItem(at: temporary, to: artifact)
+                } catch {
+                    try? fileManager.removeItem(at: temporary)
+                    guard fileManager.isExecutableFile(atPath: artifact.path),
+                          Self.serviceBinaryIdentity(at: artifact) == digest else {
+                        return nil
+                    }
+                }
+            }
+        } catch {
+            return nil
+        }
+        return AgentSkillInstaller(
+            claudeSkillsRoot: claudeSkillsRoot,
+            codexSkillsRoot: codexSkillsRoot,
+            claudeInstructionsURL: claudeInstructionsURL,
+            codexInstructionsURL: codexInstructionsURL,
+            cliBinDirectory: root.appendingPathComponent("bin", isDirectory: true),
+            pathBinDirectory: pathBinDirectory,
+            shellBridgeDirectory: root
+                .appendingPathComponent("shell", isDirectory: true)
+                .appendingPathComponent("zsh-tool-v1", isDirectory: true),
+            linksDistillOntoUserPath: false,
+            artifactServiceBinaryURL: artifact,
+            appPrivateSkillsRoot: appPrivateSkillsRoot,
+            remoteCodeOrchestratePackage: remoteCodeOrchestratePackage,
+            fileManager: fileManager
+        )
     }
 
     /// Bash's non-interactive startup hook. Grok ACP's persistent terminal uses
@@ -956,11 +1073,13 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             try? fileManager.removeItem(at: url)
             try fileManager.createSymbolicLink(at: url, withDestinationURL: binary)
         }
-        linkManagedDistillOntoPath(target: url)
-        // Second path-bridge pass: if ~/.local/bin/distill still missing (first
-        // attempt failed on a race), retry once.
-        if !fileManager.fileExists(atPath: distillPathLinkURL().path) {
+        if linksDistillOntoUserPath {
             linkManagedDistillOntoPath(target: url)
+            // Second path-bridge pass: if ~/.local/bin/distill still missing
+            // (first attempt failed on a race), retry once.
+            if !fileManager.fileExists(atPath: distillPathLinkURL().path) {
+                linkManagedDistillOntoPath(target: url)
+            }
         }
         guard isHealthyDistillLink(at: url) else {
             throw AgentSkillCLIError.serviceBinaryUnavailable
@@ -973,7 +1092,28 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         isHealthyDistillLink(at: distillCLIURL())
     }
 
+    public func isDistillCLIPinned(to serviceBinaryURL: URL) -> Bool {
+        guard let expected = artifactServiceBinaryURL ?? Optional(serviceBinaryURL),
+              fileManager.isExecutableFile(atPath: expected.path),
+              symbolicLink(at: distillCLIURL(), pointsTo: expected) else {
+            return false
+        }
+        return Self.serviceBinaryIdentity(at: expected)
+            == Self.serviceBinaryIdentity(at: serviceBinaryURL)
+    }
+
+    /// The immutable executable selected for an artifact-scoped provider run.
+    /// A nil value means this is a legacy/global installer.
+    public var pinnedServiceBinaryURL: URL? {
+        artifactServiceBinaryURL
+    }
+
     private func resolveServiceBinaryForManagedInstall(preferred: URL?) throws -> URL {
+        if let artifactServiceBinaryURL,
+           fileManager.isExecutableFile(atPath: artifactServiceBinaryURL.path),
+           Self.serviceBinaryIdentity(at: artifactServiceBinaryURL) != nil {
+            return artifactServiceBinaryURL
+        }
         if let preferred, fileManager.isExecutableFile(atPath: preferred.path) {
             return preferred.resolvingSymlinksInPath()
         }
@@ -1071,9 +1211,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         searchDirectoriesOverride: [String]? = nil
     ) throws -> [String] {
         try fileManager.createDirectory(at: cliBinDirectory, withIntermediateDirectories: true)
-        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
-            throw AgentSkillCLIError.serviceBinaryUnavailable
-        }
+        let binary = try resolveServiceBinaryForManagedInstall(preferred: serviceBinaryURL)
         let searchDirectories = searchDirectoriesOverride ?? systemCommandSearchDirectories()
         let discovered = Set(autoWrappableCommands(searchDirectories: searchDirectories))
         let reserved = Set(
@@ -1114,6 +1252,25 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return installed
     }
 
+    /// Verify the complete discovered wrapper set, including names that an
+    /// install deliberately skipped because a user-owned file occupies the
+    /// managed bin. A partial returned list is not sufficient evidence that
+    /// the artifact runtime is safe to advertise.
+    public func areCommandWrappersPinned(to serviceBinaryURL: URL) -> Bool {
+        let expected = serviceBinaryURL.resolvingSymlinksInPath().path
+        let discovered = autoWrappableCommands(searchDirectories: systemCommandSearchDirectories())
+        return discovered.allSatisfy { command in
+            let link = cliBinDirectory.appendingPathComponent(command)
+            guard let raw = try? fileManager.destinationOfSymbolicLink(atPath: link.path) else {
+                return false
+            }
+            let target = (raw as NSString).isAbsolutePath
+                ? URL(fileURLWithPath: raw)
+                : link.deletingLastPathComponent().appendingPathComponent(raw)
+            return target.resolvingSymlinksInPath().path == expected
+        }
+    }
+
     /// Remove the command-wrapper symlinks — but only those still pointing at our service binary,
     /// so a user's own command on the managed path (unexpected) is never deleted.
     /// Includes legacy exact-output basenames so Token Saver off cleans old sed/rg wrappers.
@@ -1152,9 +1309,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     ) throws -> [String] {
         let targetDirectory = binDirectory ?? cliBinDirectory
         try fileManager.createDirectory(at: targetDirectory, withIntermediateDirectories: true)
-        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
-            throw AgentSkillCLIError.serviceBinaryUnavailable
-        }
+        let binary = try resolveServiceBinaryForManagedInstall(preferred: serviceBinaryURL)
         let searchDirectories = searchDirectoriesOverride ?? systemCommandSearchDirectories()
         var installed: [String] = []
         for command in ProviderProxyCatalog.providers {
@@ -1243,7 +1398,26 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             let startupRoot = fileName == ".zshenv"
                 ? "${RC_REMOTE_CODE_ORIGINAL_ZDOTDIR:-${HOME:-}}"
                 : "${RC_REMOTE_CODE_EFFECTIVE_ZDOTDIR:-${RC_REMOTE_CODE_ORIGINAL_ZDOTDIR:-${HOME:-}}}"
-            let body = """
+            let toolShellInterceptor = fileName == ".zshenv" ? """
+            # Codex launches tool calls through an absolute zsh, bypassing PATH
+            # wrappers. Hand the untouched -c source to the exact service binary
+            # selected by this host before sourcing user startup. The shared
+            # managed symlink is deliberately not consulted: another app instance
+            # may have repointed it to an incompatible build. Every negative gate
+            # runs the original source raw.
+            if [[ "${RC_TOKEN_SAVER_DISTILL_HINT:-}" == "1" \
+               && "${RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT:-}" == "1" \
+               && "${RC_REMOTE_CODE_UNOWNED_TOOL_SHELL:-}" == "1" \
+               && "${RC_TOKEN_SAVER_TOOL_SHELL_PROTOCOL:-}" == "1" \
+               && "${RC_REMOTE_CODE_TOOL_SHELL_DONE:-}" != "1" \
+               && "${RC_TOKEN_SAVER_TOOL_SHELL_DONE:-}" != "1" \
+               && -n "${ZSH_EXECUTION_STRING:-}" \
+               && -x "${RC_TOKEN_SAVER_TOOL_SHELL_BINARY:-}" ]]; then
+              exec "$RC_TOKEN_SAVER_TOOL_SHELL_BINARY" cli tool-shell -- "$ZSH_EXECUTION_STRING"
+            fi
+
+            """ : ""
+            let body = toolShellInterceptor + """
             # RemoteCode managed provider shell bridge.
             if [[ -n "${RC_REMOTE_CODE_MANAGED_ZDOTDIR:-}" ]]; then
               export ZDOTDIR="\(startupRoot)"
@@ -1627,10 +1801,10 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return nil
     }
 
-    /// Resolve the RemoteCodeDistillService binary (which also serves CLI mode) the same
-    /// way the service controller does: bundled aux executable, then a sibling of the
-    /// current executable, then SwiftPM build products and XCTest bundle siblings (for dev/tests).
-    public static func resolveServiceBinary(fileManager: FileManager = .default) -> URL? {
+    /// Resolve only a service executable shipped beside this app/test process.
+    /// This intentionally never recovers through the mutable per-user wrapper
+    /// directory, so the result is safe to pin into a host-issued capability.
+    public static func resolveCurrentServiceBinary(fileManager: FileManager = .default) -> URL? {
         if let bundled = Bundle.main.url(forAuxiliaryExecutable: "RemoteCodeDistillService"),
            fileManager.isExecutableFile(atPath: bundled.path) {
             return bundled.resolvingSymlinksInPath()
@@ -1643,18 +1817,29 @@ public final class AgentSkillInstaller: @unchecked Sendable {
                 return sibling.resolvingSymlinksInPath()
             }
         }
-        let executableDirectory = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
+        let executableDirectory = URL(fileURLWithPath: CommandLine.arguments[0])
+            .standardizedFileURL
+            .deletingLastPathComponent()
         if let sibling = firstServiceSibling(in: [executableDirectory], fileManager: fileManager) {
             return sibling.resolvingSymlinksInPath()
+        }
+        if let sibling = firstServiceSibling(in: xctestBundleSearchDirectories(), fileManager: fileManager) {
+            return sibling.resolvingSymlinksInPath()
+        }
+        return nil
+    }
+
+    /// Resolve the service for legacy managed-wrapper install/repair. Prefer
+    /// this process's exact artifact, then retain existing dev/recovery fallbacks.
+    public static func resolveServiceBinary(fileManager: FileManager = .default) -> URL? {
+        if let current = resolveCurrentServiceBinary(fileManager: fileManager) {
+            return current
         }
         let cwd = URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
         for candidate in swiftPMServiceBinaryCandidates(in: cwd, fileManager: fileManager) {
             if fileManager.isExecutableFile(atPath: candidate.path) {
                 return candidate.resolvingSymlinksInPath()
             }
-        }
-        if let sibling = firstServiceSibling(in: xctestBundleSearchDirectories(), fileManager: fileManager) {
-            return sibling.resolvingSymlinksInPath()
         }
         // Last resort for any user: recover from their existing managed wrappers
         // under the default home managed bin (installers with custom homes use
@@ -2375,6 +2560,125 @@ public final class AgentSkillInstaller: @unchecked Sendable {
 
     public static func sha256Hex(_ data: Data) -> String {
         hexDigest(SHA256.hash(data: data))
+    }
+
+    public static func serviceBinaryIdentity(at url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        do {
+            while let chunk = try handle.read(upToCount: 1024 * 1024), !chunk.isEmpty {
+                hasher.update(data: chunk)
+            }
+        } catch {
+            return nil
+        }
+        return hexDigest(hasher.finalize())
+    }
+
+    /// True for a runtime copy created by runtimeInstaller(for:) whose
+    /// content still matches its 64-hex content-addressed namespace.
+    ///
+    /// The `.remote-code/runtime/<digest>` shape is part of the host-issued
+    /// capability, not merely a convenient directory name. A self-hashing
+    /// executable in an arbitrary `/tmp/runtime/...` directory must not be
+    /// accepted as an interceptor binary.
+    public static func isImmutableRuntimeServiceBinary(
+        at url: URL,
+        trustedRuntimeRoot: URL? = nil
+    ) -> Bool {
+        guard let trustedRuntimeRoot else {
+            return false
+        }
+        let standardized = url.resolvingSymlinksInPath().standardizedFileURL
+        guard standardized.lastPathComponent == "RemoteCodeDistillService" else {
+            return false
+        }
+        let components = standardized.pathComponents
+        guard let runtimeIndex = components.lastIndex(of: "runtime"),
+              components.count == runtimeIndex + 3,
+              runtimeIndex > 0,
+              components[runtimeIndex - 1] == ".remote-code",
+              components[runtimeIndex + 1].count == 64,
+              components[runtimeIndex + 1].allSatisfy({ $0.isHexDigit }),
+              serviceBinaryIdentity(at: standardized) == components[runtimeIndex + 1]
+        else {
+            return false
+        }
+        let actualRoot = standardized.deletingLastPathComponent()
+            .standardizedFileURL
+        guard actualRoot == trustedRuntimeRoot.standardizedFileURL else {
+            return false
+        }
+        return true
+    }
+
+    /// Returns the artifact runtime root only for the host-created managed-bin
+    /// shape. Callers must still compare it with the host-issued runtime-root
+    /// environment value before forwarding a child capability.
+    public static func runtimeRoot(forManagedBin managedBin: String) -> URL? {
+        let bin = URL(fileURLWithPath: managedBin).standardizedFileURL
+        guard bin.lastPathComponent == "bin" else { return nil }
+        let root = bin.deletingLastPathComponent()
+        let components = root.pathComponents
+        guard root.lastPathComponent.count == 64,
+              root.lastPathComponent.allSatisfy({ $0.isHexDigit }),
+              components.dropLast().last == "runtime",
+              components.dropLast(2).last == ".remote-code" else {
+            return nil
+        }
+        return root
+    }
+
+    /// Resolve the immutable service sibling of a host-issued runtime bin.
+    /// This is intentionally stricter than searching PATH: a nested provider
+    /// may only borrow the artifact namespace already selected by the host.
+    public static func immutableRuntimeServiceBinary(
+        forManagedBin managedBin: String,
+        trustedRuntimeRoot: URL? = nil
+    ) -> URL? {
+        guard let runtimeRoot = runtimeRoot(forManagedBin: managedBin),
+              let trustedRuntimeRoot,
+              runtimeRoot == trustedRuntimeRoot.standardizedFileURL else {
+            return nil
+        }
+        let service = runtimeRoot.appendingPathComponent("RemoteCodeDistillService")
+        guard isImmutableRuntimeServiceBinary(
+            at: service,
+            trustedRuntimeRoot: runtimeRoot
+        ) else {
+            return nil
+        }
+        return service.standardizedFileURL
+    }
+
+    public static func isCurrentOrImmutableRuntimeServiceBinary(
+        _ url: URL,
+        current: URL? = nil,
+        trustedRuntimeRoot: URL? = nil
+    ) -> Bool {
+        if let trustedRuntimeRoot,
+           isImmutableRuntimeServiceBinary(
+               at: url,
+               trustedRuntimeRoot: trustedRuntimeRoot
+           ) {
+            return true
+        }
+        let currentURL = current ?? resolveCurrentServiceBinary()
+        guard let currentURL else {
+            return false
+        }
+        // The live service itself is host-issued. Do not accept a byte-identical
+        // copy from an arbitrary path as a substitute for its immutable runtime.
+        let candidate = url.resolvingSymlinksInPath().standardizedFileURL
+        let current = currentURL.resolvingSymlinksInPath().standardizedFileURL
+        guard candidate == current,
+              FileManager.default.isExecutableFile(atPath: candidate.path),
+              let candidateIdentity = serviceBinaryIdentity(at: candidate),
+              let currentIdentity = serviceBinaryIdentity(at: current) else {
+            return false
+        }
+        return candidateIdentity == currentIdentity
     }
 
     private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {

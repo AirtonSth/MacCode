@@ -377,6 +377,29 @@ public struct ProviderProxyFinalizationTracker: Sendable {
 /// - Fail open: missing real binary or missing telemetry scope is a non-proxy path.
 /// - Do not invent Token Saver admission; the parent environment is authoritative.
 public enum ProviderProxyPolicy {
+    public static let toolShellInterceptEnvironmentKey =
+        "RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"
+    public static let unownedToolShellEnvironmentKey =
+        "RC_REMOTE_CODE_UNOWNED_TOOL_SHELL"
+    public static let providerTerminalStdoutEnvironmentKey =
+        "RC_REMOTE_CODE_PROVIDER_TERMINAL_STDOUT"
+
+    public struct ChildDistillTransportCapabilities: Sendable, Equatable {
+        public let distill: Bool
+        public let managedPath: Bool
+        public let recoveryScope: Bool
+
+        public init(
+            distill: Bool,
+            managedPath: Bool,
+            recoveryScope: Bool
+        ) {
+            self.distill = distill
+            self.managedPath = managedPath
+            self.recoveryScope = recoveryScope
+        }
+    }
+
     public static var providerCommands: Set<String> { ProviderProxyCatalog.providerSet }
 
     public static func isProviderProxy(_ command: String) -> Bool {
@@ -449,7 +472,9 @@ public enum ProviderProxyPolicy {
             where key.hasPrefix("RC_TOKEN_SAVER_")
                 || key.hasPrefix("RC_DISTILL_")
                 || key.hasPrefix("RC_GRAPHIFY_")
-                || key == "REMOTE_CODE_DISTILL_STATE_PATH" {
+                || key == "REMOTE_CODE_DISTILL_STATE_PATH"
+                || key == unownedToolShellEnvironmentKey
+                || key == providerTerminalStdoutEnvironmentKey {
                 updated.removeValue(forKey: key)
             }
             return updated
@@ -460,6 +485,34 @@ public enum ProviderProxyPolicy {
             }
         }
         return updated
+    }
+
+    /// Build the provider-neutral Distill transport for one retargeted child.
+    /// The state path is needed by explicit pipes and managed PATH wrappers on
+    /// all providers. Aggregate tool-shell ownership is Codex-only and remains
+    /// separately kill-switchable through the receipt lane list.
+    public static func childDistillTransportEnvironment(
+        targetProvider: AgentProvider,
+        capabilities: ChildDistillTransportCapabilities,
+        statePath: String?,
+        disabledLanes: Set<String>
+    ) -> [String: String] {
+        guard capabilities.distill,
+              capabilities.managedPath,
+              capabilities.recoveryScope,
+              let statePath = statePath?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !statePath.isEmpty else {
+            return [:]
+        }
+        var environment = ["REMOTE_CODE_DISTILL_STATE_PATH": statePath]
+        if targetProvider == .codex,
+           !disabledLanes.contains(CommandWrapPolicy.toolShellLane) {
+            environment[toolShellInterceptEnvironmentKey] = "1"
+            environment[unownedToolShellEnvironmentKey] = "1"
+            environment[providerTerminalStdoutEnvironmentKey] = "1"
+        }
+        return environment
     }
 
     /// Retarget one raw provider process to its recorded external child. This
@@ -513,11 +566,26 @@ public enum ProviderProxyPolicy {
         for key in updated.keys where key.hasPrefix("RC_TOKEN_SAVER_") {
             updated.removeValue(forKey: key)
         }
-        // This hook is Claude-only. A Claude parent cannot leak it into a
-        // Codex/Grok child, and a Claude child receives it only when the
-        // retargeted, host-validated environment explicitly includes it.
+        // Never inherit provider-specific ownership or a stale namespace path.
+        // Both must come from the retargeted, host-validated child transport.
         updated.removeValue(forKey: "REMOTE_CODE_DISTILL_STATE_PATH")
+        updated.removeValue(forKey: toolShellInterceptEnvironmentKey)
+        updated.removeValue(forKey: unownedToolShellEnvironmentKey)
+        updated.removeValue(forKey: providerTerminalStdoutEnvironmentKey)
         updated.merge(tokenSaverEnvironment) { _, receiptValue in receiptValue }
+        let hasChildStatePath = updated["REMOTE_CODE_DISTILL_STATE_PATH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty == false
+        let hasCompleteCodexToolShellTransport = targetProvider == .codex
+            && updated[toolShellInterceptEnvironmentKey] == "1"
+            && updated[unownedToolShellEnvironmentKey] == "1"
+            && updated[providerTerminalStdoutEnvironmentKey] == "1"
+            && hasChildStatePath
+        if !hasCompleteCodexToolShellTransport {
+            updated.removeValue(forKey: toolShellInterceptEnvironmentKey)
+            updated.removeValue(forKey: unownedToolShellEnvironmentKey)
+            updated.removeValue(forKey: providerTerminalStdoutEnvironmentKey)
+        }
         // Root and attempt are deliberately the same external-child identity:
         // there is one raw provider process and one lifecycle receipt.
         updated["RC_TOKEN_SAVER_ROOT_RUN_ID"] = childRunId

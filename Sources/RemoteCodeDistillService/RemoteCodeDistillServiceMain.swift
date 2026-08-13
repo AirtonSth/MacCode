@@ -185,12 +185,20 @@ struct RemoteCodeDistillServiceMain {
                 await runSubagentTelemetry(arguments: Array(rawArgs.dropFirst(2)))
                 return
             }
+            if rawArgs.dropFirst().first == "tool-shell" {
+                await runToolShell(arguments: Array(rawArgs.dropFirst(2)))
+                return
+            }
             await runCLI(arguments: Array(rawArgs.dropFirst()), requiresReceipt: true)
             return
         }
         if rawArgs.dropFirst().first == "cli" {
             if rawArgs.dropFirst(2).first == "subagent" {
                 await runSubagentTelemetry(arguments: Array(rawArgs.dropFirst(3)))
+                return
+            }
+            if rawArgs.dropFirst(2).first == "tool-shell" {
+                await runToolShell(arguments: Array(rawArgs.dropFirst(3)))
                 return
             }
             await runCLI(arguments: Array(rawArgs.dropFirst(2)))
@@ -409,6 +417,7 @@ struct RemoteCodeDistillServiceMain {
             provider: provider,
             recoveryContext: recoveryContext,
             maxOutputCharacters: maxChars,
+            cacheState: requiresReceipt ? "tool_output_pipe" : nil,
             distillAdmission: { receiptAdmitted && admission?.isAdmitted() == true }
         ) { request in
             guard receiptAdmitted, admission?.isAdmitted() == true else { return nil }
@@ -543,55 +552,131 @@ struct RemoteCodeDistillServiceMain {
     /// Stdout is written inside `CommandWrapRunner.run` before any deferred Wave A ledger POST
     /// (mirrors `runCLI`: deliver bytes first, then await the side effect).
     private static func runWrap(command: String, arguments: [String]) async {
-        let session = createConfiguredURLSession()
-        let (exitCode, deferred) = await CommandWrapRunner.run(command: command, args: arguments) { captured, query, storeFloorBytes in
-            let env = ProcessInfo.processInfo.environment
-            let recoveryContext = ManagedDistillCLI.recoveryContext(environment: env)
-            let provider = ManagedDistillCLI.resolveProvider(
-                explicit: env["REMOTE_CODE_AGENT_PROVIDER"],
-                recoveryProvider: recoveryContext?.provider
+        let (exitCode, deferred) = await CommandWrapRunner.run(
+            command: command,
+            args: arguments
+        ) { captured, query, storeFloorBytes in
+            await compressCommandOutput(
+                captured,
+                query,
+                storeFloorBytes,
+                cacheState: "tool_output_wrapper"
             )
-            let maxChars = Int(env["REMOTE_CODE_DISTILL_MAX_OUTPUT_CHARS"] ?? "") ?? 4_000
-            let loadedState = loadCLIStateSnapshot()
-            let admission = LiveTokenSaverDistillAdmission(
-                state: loadedState?.state,
-                statePath: loadedState?.path
-            )
-            // Per-command extraction query: nil (no question → deterministic router) for
-            // search/listings; a neutral extractive query for cat/sed so the service routes to its
-            // BERT lane (verbatim line selection) instead of the misfiring intent extractor.
-            let cli = ManagedDistillCLI(
-                arguments: query.map { [$0] } ?? [],
-                stdin: captured,
-                state: loadedState?.state,
-                provider: provider,
-                recoveryContext: recoveryContext,
-                maxOutputCharacters: maxChars,
-                reversibleStoreMinBytes: storeFloorBytes,
-                distillAdmission: { admission?.isAdmitted() == true }
-            ) { request in
-                guard admission?.isAdmitted() == true else { return nil }
-                do {
-                    var scopedRequest = request
-                    applyRecoveryHeaders(to: &scopedRequest, environment: env)
-                    let (data, response) = try await session.data(for: scopedRequest)
-                    return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
-                } catch {
-                    return nil
-                }
-            }
-            // runResult (not run): keep Wave A ledger POST deferred until after stdout is written.
-            let result = await cli.runResult()
-            // compress() is fail-open: code 0 carries either the compressed text (+handle) or, on
-            // any sidecar failure, the raw bytes verbatim. A non-zero code is the oversize-input
-            // rejection — fall back to the captured bytes rather than emitting that error.
-            guard result.exitCode == 0 else { return nil }
-            return (result.stdout, result.deferredSideEffect)
         }
         if let deferred {
             await deferred()
         }
         Darwin.exit(exitCode)
+    }
+
+    /// Reserved aggregate route used only by the managed zsh bridge. Invalid
+    /// syntax fails loud; every missing/stale admission gate executes the
+    /// original shell source once and byte-preserves its streams/status.
+    private static func runToolShell(arguments: [String]) async {
+        guard arguments.count == 2, arguments[0] == "--" else {
+            FileHandle.standardError.write(
+                Data("distill tool-shell: expected -- <zsh-source>\n".utf8)
+            )
+            Darwin.exit(64)
+        }
+        let environment = ProcessInfo.processInfo.environment
+        let loadedState = loadCLIStateSnapshot(requireExplicitNamespace: true)
+        let liveAdmission = LiveTokenSaverDistillAdmission(
+            state: loadedState?.state,
+            statePath: loadedState?.path
+        )
+        let receipt = TokenSaverExecutionReceiptSeam.receipt(from: environment)
+        let liveToolShellDisabled = loadedState.map {
+            liveDisabledLanes(statePath: $0.path).contains(CommandWrapPolicy.toolShellLane)
+        } ?? true
+        let admitted = environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
+            && environment["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"] == "1"
+            && environment["RC_REMOTE_CODE_UNOWNED_TOOL_SHELL"] == "1"
+            && receipt?.disabledLanes.contains(CommandWrapPolicy.toolShellLane) != true
+            && !liveToolShellDisabled
+            && hasAdmittedExplicitDistillReceipt(environment: environment)
+            && liveAdmission?.isAdmitted() == true
+        let (exitCode, deferred) = await CommandWrapRunner.runToolShell(
+            payload: arguments[1],
+            admitted: admitted
+        ) { captured, query, storeFloorBytes in
+            await compressCommandOutput(
+                captured,
+                query,
+                storeFloorBytes,
+                cacheState: "tool_output_interceptor"
+            )
+        }
+        if let deferred { await deferred() }
+        Darwin.exit(exitCode)
+    }
+
+    /// Re-read the operator-controlled lane overlay at execution time. A receipt
+    /// is immutable for a turn, but `DistillCLIState.json` is the shared live
+    /// incident-control surface; malformed or unreadable state fails closed.
+    private static func liveDisabledLanes(statePath: String) -> Set<String> {
+        guard let data = try? Data(
+            contentsOf: URL(fileURLWithPath: statePath),
+            options: [.uncached]
+        ),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return [CommandWrapPolicy.toolShellLane]
+        }
+        guard let rawLanes = object["disabled_lanes"] else { return [] }
+        if let lanes = rawLanes as? [String] {
+            return Set(lanes.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+        }
+        if let lanes = rawLanes as? String {
+            return Set(
+                lanes.split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            )
+        }
+        return [CommandWrapPolicy.toolShellLane]
+    }
+
+    private static func compressCommandOutput(
+        _ captured: Data,
+        _ query: String?,
+        _ storeFloorBytes: Int,
+        cacheState: String
+    ) async -> (bytes: Data, deferredSideEffect: CommandWrapRunner.DeferredSideEffect?)? {
+        let environment = ProcessInfo.processInfo.environment
+        let recoveryContext = ManagedDistillCLI.recoveryContext(environment: environment)
+        let provider = ManagedDistillCLI.resolveProvider(
+            explicit: environment["REMOTE_CODE_AGENT_PROVIDER"],
+            recoveryProvider: recoveryContext?.provider
+        )
+        let loadedState = loadCLIStateSnapshot()
+        let admission = LiveTokenSaverDistillAdmission(
+            state: loadedState?.state,
+            statePath: loadedState?.path
+        )
+        let cli = ManagedDistillCLI(
+            arguments: query.map { [$0] } ?? [],
+            stdin: captured,
+            state: loadedState?.state,
+            provider: provider,
+            recoveryContext: recoveryContext,
+            maxOutputCharacters: Int(environment["REMOTE_CODE_DISTILL_MAX_OUTPUT_CHARS"] ?? "") ?? 4_000,
+            reversibleStoreMinBytes: storeFloorBytes,
+            cacheState: cacheState,
+            distillAdmission: { admission?.isAdmitted() == true }
+        ) { request in
+            guard admission?.isAdmitted() == true else { return nil }
+            do {
+                var scopedRequest = request
+                applyRecoveryHeaders(to: &scopedRequest, environment: environment)
+                let (data, response) = try await createConfiguredURLSession().data(for: scopedRequest)
+                return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
+            } catch {
+                return nil
+            }
+        }
+        let result = await cli.runResult()
+        guard result.exitCode == 0 else { return nil }
+        return (result.stdout, result.deferredSideEffect)
     }
 
     // PERF: MCP stats/compress (and concurrent tool calls) allocated

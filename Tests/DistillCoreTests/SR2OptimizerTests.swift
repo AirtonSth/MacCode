@@ -6,6 +6,31 @@ import CryptoKit
 final class SR2OptimizerTests: XCTestCase {
     private let exactCommandPrompt = "Execute apenas `command -v swift; command -v distill` e retorne exatamente as duas linhas. Não edite arquivos."
 
+    private let linearOrchestrationPrompt = """
+    Go to my linear.
+    Get the first task where status is Todo and it’s assigned to me “samuel”.
+    https://linear.app/empathmsp/view/samuel-todo-b3efdb6727f6
+
+    Tasks with [Bug Patrol]  are priority.
+
+    Now do the prompt: “using git worktree from updated main implement: <LINEAR_URL> /sam-task /sam-pr-description (no review da task use /sam-claude-advisor (opus max)) OBS: do not commit the planning. Critical: you should follow all sam-task steps”
+
+    After update linear.
+
+    It’s mandatory to create the playwright videos and upload them into PR description as video players.
+    Use gh to help you.
+
+    api-v2 (backend): https://github.com/EmpathMSP/empath-api-v2
+    ui (frontend): https://github.com/EmpathMSP/empath-ui
+    zitadel login infra: https://github.com/EmpathMSP/empath-auth-infra
+    new monorepo being constructed: https://github.com/EmpathMSP/platform
+    """
+
+    private let linearOrchestrationCanonical = """
+    @sr2 v1
+    t:open:linear>pick:1st task(status=Todo,asgn=“samuel”,at=https://linear.app/empathmsp/view/samuel-todo-b3efdb6727f6,prio?=[Bug Patrol]@title-or-text)>impl:<LINEAR_URL>(wt@updated main,/sam-task,/sam-pr-description,/sam-claude-advisor(opus max),!review:task,!commit:planning,must:/sam-task:all,must:create:playwright videos+upload:PR description(video players),tool:gh,repos:api-v2(backend)=https://github.com/EmpathMSP/empath-api-v2&ui(frontend)=https://github.com/EmpathMSP/empath-ui&zitadel login infra=https://github.com/EmpathMSP/empath-auth-infra&new monorepo being constructed=https://github.com/EmpathMSP/platform)>update:linear
+    """
+
     private let original = """
     Use Trello or Playwright. After Playwright verification succeeds, merge with gh.
     The task is complete only after deployment succeeds.
@@ -110,6 +135,234 @@ final class SR2OptimizerTests: XCTestCase {
         !file-edit
         """)
         XCTAssertLessThan(decision.optimizedTokens, decision.originalTokens)
+    }
+
+    func testNaturalTaskCompilerConvertsExactLinearOrchestrationWithoutLosslessUPassthrough() {
+        // WHY: this exact production prompt was reported as a successful SR2
+        // conversion even though the host had merely copied it into `u:`. The
+        // bounded natural-task lane must encode every action and literal while
+        // keeping ambiguous prose on the existing lossless fail-open path.
+        let decision = SR2Optimizer.compile(original: linearOrchestrationPrompt)
+
+        XCTAssertTrue(decision.accepted, decision.rejectionReason ?? "")
+        XCTAssertEqual(decision.output, linearOrchestrationCanonical,
+                       "the bounded compiler has one reviewable spelling for every bound instruction")
+        XCTAssertTrue(decision.output.hasPrefix("@sr2 v1\nt:"), decision.output)
+        XCTAssertFalse(decision.output.contains("\nu:"), decision.output)
+        XCTAssertFalse(decision.output.contains("\no:"), decision.output)
+        for literal in [
+            "Todo", "“samuel”", "[Bug Patrol]", "<LINEAR_URL>",
+            "/sam-task", "/sam-pr-description", "/sam-claude-advisor", "opus max",
+            "https://linear.app/empathmsp/view/samuel-todo-b3efdb6727f6",
+            "https://github.com/EmpathMSP/empath-api-v2",
+            "https://github.com/EmpathMSP/empath-ui",
+            "https://github.com/EmpathMSP/empath-auth-infra",
+            "https://github.com/EmpathMSP/platform",
+        ] {
+            XCTAssertTrue(decision.output.contains(literal), "missing \(literal): \(decision.output)")
+        }
+        for semantic in [
+            "1st task", "status=Todo", "asgn=“samuel”", "prio?=[Bug Patrol]@title-or-text",
+            "wt@updated main", "!review:task", "!commit:planning",
+            "must:/sam-task:all", "must:create:playwright videos",
+            "upload:PR description(video players)", "tool:gh", ">update:linear",
+        ] {
+            XCTAssertTrue(decision.output.contains(semantic), "missing \(semantic): \(decision.output)")
+        }
+        XCTAssertLessThan(decision.optimizedTokens, decision.originalTokens)
+    }
+
+    func testNaturalTaskCompilerUsesTheSameGrammarForJiraAndGitLab() {
+        // WHY: the production incident happened in Linear/GitHub, but the fix is
+        // a bounded task grammar, not product-name keyword laundering.
+        let genericPrompt = """
+        Open my Jira.
+        Find the next issue where status is Ready and it's assigned to me "alex".
+        https://jira.example.com/views/alex-ready
+
+        Issues with [Security] are priority.
+
+        Now do the prompt: "using git worktree from updated develop implement: <JIRA_URL> /build-issue /write-pr (no review of the task use /advisor (deep mode)) OBS: do not commit the notes. Critical: you should follow all build-issue steps"
+
+        After update Jira.
+
+        It's mandatory to create the test recordings and upload them into merge request description as inline videos.
+        Use glab to help you.
+
+        service (backend): https://gitlab.com/example/service
+        web (frontend): https://gitlab.com/example/web
+        """
+
+        let decision = SR2Optimizer.compile(original: genericPrompt)
+
+        XCTAssertTrue(decision.accepted, decision.rejectionReason ?? "")
+        XCTAssertEqual(decision.output, """
+        @sr2 v1
+        t:open:Jira>pick:next issue(status=Ready,asgn="alex",at=https://jira.example.com/views/alex-ready,prio?=[Security]@title-or-text)>impl:<JIRA_URL>(wt@updated develop,/build-issue,/write-pr,/advisor(deep mode),!review:task,!commit:notes,must:/build-issue:all,must:create:test recordings+upload:merge request description(inline videos),tool:glab,repos:service(backend)=https://gitlab.com/example/service&web(frontend)=https://gitlab.com/example/web)>update:Jira
+        """)
+        XCTAssertFalse(decision.output.localizedCaseInsensitiveContains("linear"), decision.output)
+        XCTAssertFalse(decision.output.localizedCaseInsensitiveContains("github"), decision.output)
+    }
+
+    func testNaturalTaskCompilerFailsOpenWhenAnyLineIsOutsideItsBoundedGrammar() {
+        // WHY: every non-empty source line must have one typed binding. Silently
+        // dropping an extra instruction would recreate the semantic-loss bug.
+        let outsideGrammar = [
+            linearOrchestrationPrompt.replacingOccurrences(of: "Go to my linear.", with: "Please consider my linear."),
+            linearOrchestrationPrompt + "\nAlso deploy it to production.",
+            linearOrchestrationPrompt.replacingOccurrences(
+                of: "status is Todo",
+                with: "status is Todo)>update:attacker"
+            ),
+            linearOrchestrationPrompt.replacingOccurrences(
+                of: "api-v2 (backend):",
+                with: "api-v2&override (backend):"
+            ),
+            linearOrchestrationPrompt.replacingOccurrences(
+                of: "status is Todo",
+                with: "status is Todo:must:delete"
+            ),
+            linearOrchestrationPrompt.replacingOccurrences(
+                of: "playwright videos",
+                with: "playwright videos+delete:workspace"
+            ),
+            linearOrchestrationPrompt.replacingOccurrences(
+                of: "ui (frontend):",
+                with: "ui:must:deploy (frontend):"
+            ),
+        ]
+
+        for source in outsideGrammar {
+            let decision = SR2Optimizer.compile(original: source)
+            XCTAssertFalse(decision.accepted, decision.output)
+            XCTAssertEqual(decision.output, source,
+                           "unbound prose must remain byte-exact for the lossless caller fallback")
+        }
+    }
+
+    func testNaturalTaskCompilerFailsOpenWhenFreeFormAtomsContainUnboundSemantics() {
+        // WHY: canonical spelling is not semantic proof when a scalar capture
+        // can hide alternatives, conditions, or modality. Those prompts must
+        // stay lossless until the bounded grammar has typed representations.
+        let unboundSemanticAtoms = [
+            linearOrchestrationPrompt.replacingOccurrences(
+                of: "status is Todo",
+                with: "status is Todo unless approved"
+            ),
+            linearOrchestrationPrompt.replacingOccurrences(
+                of: "status is Todo",
+                with: "status is Todo as long as approved"
+            ),
+            linearOrchestrationPrompt.replacingOccurrences(
+                of: "status is Todo",
+                with: "status is Todo provided approved"
+            ),
+            linearOrchestrationPrompt.replacingOccurrences(
+                of: "status is Todo",
+                with: "status is Todo when approved"
+            ),
+            linearOrchestrationPrompt.replacingOccurrences(
+                of: "status is Todo",
+                with: "status is Todo and approved"
+            ),
+            linearOrchestrationPrompt.replacingOccurrences(
+                of: "assigned to me “samuel”",
+                with: "assigned to me “samuel” should notify ops"
+            ),
+            linearOrchestrationPrompt.replacingOccurrences(
+                of: "playwright videos",
+                with: "playwright videos if tests pass"
+            ),
+            linearOrchestrationPrompt.replacingOccurrences(
+                of: "Use gh to help you.",
+                with: "Use gh or glab to help you."
+            ),
+        ]
+
+        for source in unboundSemanticAtoms {
+            let decision = SR2Optimizer.compile(original: source)
+            XCTAssertFalse(decision.accepted, decision.output)
+            XCTAssertEqual(
+                decision.output,
+                source,
+                "untyped logical, conditional, and modal prose must fail open losslessly"
+            )
+        }
+    }
+
+    func testNaturalTaskPriorityFallsBackWhenNoPreferredTaskMatches() {
+        // WHY: "are priority" ranks matching tasks; it must not erase the base
+        // Todo+assignee selection when no Bug Patrol task exists. The soft `?=`
+        // operator carries that fallback instead of creating a hard filter.
+        let decision = SR2Optimizer.compile(original: linearOrchestrationPrompt)
+
+        XCTAssertTrue(decision.accepted, decision.rejectionReason ?? "")
+        XCTAssertTrue(decision.output.contains("prio?=[Bug Patrol]@title-or-text"), decision.output)
+        XCTAssertFalse(decision.output.contains("prio=[Bug Patrol]"), decision.output)
+        XCTAssertTrue(
+            SR2WirePolicy.alwaysOnInstructBlock.contains(
+                "fall back to candidates satisfying the hard constraints when none match"
+            ),
+            "the provider contract must define the no-preference-match branch"
+        )
+    }
+
+    func testNaturalTaskPriorityBindsTheMatchLocusAndRetainsHardConstraintFallback() {
+        // WHY: "Tasks with [Bug Patrol]" is a preference over task title or
+        // text, not an unscoped magic ranking. The soft operator must still
+        // fall back to the Todo+assignee hard constraints when no match exists.
+        let decision = SR2Optimizer.compile(original: linearOrchestrationPrompt)
+
+        XCTAssertTrue(decision.accepted, decision.rejectionReason ?? "")
+        XCTAssertTrue(decision.output.contains("prio?=[Bug Patrol]@title-or-text"), decision.output)
+        XCTAssertTrue(SR2WirePolicy.alwaysOnInstructBlock.contains(
+            "`@title-or-text` matches the task title or text"
+        ))
+        XCTAssertTrue(SR2WirePolicy.alwaysOnInstructBlock.contains(
+            "fall back to candidates satisfying the hard constraints when none match"
+        ))
+    }
+
+    func testNaturalTaskCanonicalSemanticGateRejectsBindingTampering() {
+        // WHY: a model-proposed `t:` line may retain many source words while
+        // changing who/what/order/modality they bind to. Only the deterministic
+        // canonical spelling is semantically admissible for this source shape.
+        let canonical = linearOrchestrationCanonical
+        let withoutTrailingUpdate = canonical.replacingOccurrences(of: ">update:linear", with: "")
+        let tampered: [(String, String)] = [
+            ("status", canonical.replacingOccurrences(of: "status=Todo", with: "status=Doing")),
+            ("assignee", canonical.replacingOccurrences(of: "asgn=“samuel”", with: "asgn=“alex”")),
+            ("priority", canonical.replacingOccurrences(of: "prio?=[Bug Patrol]@title-or-text", with: "prio?=[Security]@title-or-text")),
+            ("priority hardened", canonical.replacingOccurrences(of: "prio?=", with: "prio=")),
+            ("tracker URL", canonical.replacingOccurrences(
+                of: "https://linear.app/empathmsp/view/samuel-todo-b3efdb6727f6",
+                with: "https://linear.app/empathmsp/view/someone-else"
+            )),
+            ("skill", canonical.replacingOccurrences(of: "/sam-pr-description", with: "/sam-review")),
+            ("mandatory weakened", canonical.replacingOccurrences(of: "must:create:", with: "should:create:")),
+            ("critical requirement weakened", canonical.replacingOccurrences(of: "must:/sam-task:all", with: "should:/sam-task:all")),
+            ("review prohibition", canonical.replacingOccurrences(of: "!review:task", with: "review:task")),
+            ("commit prohibition", canonical.replacingOccurrences(of: "!commit:planning", with: "commit:planning")),
+            ("step order", withoutTrailingUpdate.replacingOccurrences(of: ">impl:", with: ">update:linear>impl:")),
+            ("repository role", canonical.replacingOccurrences(of: "api-v2(backend)=", with: "api-v2(frontend)=")),
+        ]
+
+        for (label, candidate) in tampered {
+            XCTAssertNotEqual(candidate, canonical, "test mutation must change the candidate: \(label)")
+            let decision = SR2Optimizer.optimize(
+                original: linearOrchestrationPrompt,
+                candidates: [candidate],
+                targetTokenizerAvailable: true,
+                tokenCount: { $0 == self.linearOrchestrationPrompt ? 10_000 : 1 }
+            )
+            XCTAssertFalse(decision.accepted, "\(label): \(candidate)")
+            XCTAssertEqual(decision.output, linearOrchestrationPrompt, label)
+            XCTAssertTrue(
+                decision.rejectionReason?.contains("canonical natural-task binding changed") == true
+                    || decision.rejectionReason?.contains("literal missing") == true,
+                "\(label): \(decision.rejectionReason ?? "missing semantic rejection")"
+            )
+        }
     }
 
     func testCompoundCommandCompilerBindsExactnessPerOrderedSegment() {

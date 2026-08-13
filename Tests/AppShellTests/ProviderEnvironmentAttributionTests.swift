@@ -141,7 +141,18 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             )
             let path = env["PATH"] ?? ""
             let managed = env["RC_REMOTE_CODE_MANAGED_BIN"] ?? ""
+            let zdotdir = env["ZDOTDIR"] ?? ""
             XCTAssertFalse(managed.isEmpty, "\(provider) managed bin")
+            XCTAssertTrue(
+                managed.contains("/.remote-code/runtime/") && managed.hasSuffix("/bin"),
+                "\(provider) must use its bundle artifact runtime bin: \(managed)"
+            )
+            XCTAssertTrue(
+                zdotdir.contains("/.remote-code/runtime/")
+                    && zdotdir.hasSuffix("/shell/zsh-tool-v1"),
+                "\(provider) must use its bundle artifact shell bridge: \(zdotdir)"
+            )
+            XCTAssertEqual(env["RC_REMOTE_CODE_MANAGED_ZDOTDIR"], zdotdir)
             XCTAssertTrue(
                 path.hasPrefix(managed + ":") || path == managed,
                 "\(provider) PATH must front managed wrappers for | distill / proxies: \(path)"
@@ -433,11 +444,43 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         XCTAssertNil(codex["RC_TOKEN_SAVER_ATTEMPT_ID"], "the coordinator binds a fresh attempt per run")
         XCTAssertNil(codex["RC_TOKEN_SAVER_POST_TOOL_USE"],
                      "PostToolUse auto-compression is Claude-SDK-only; Codex must not carry it")
+        XCTAssertEqual(codex["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"], "1")
+        XCTAssertEqual(
+            codex[AgentSkillInstaller.toolShellProtocolEnvironmentKey],
+            AgentSkillInstaller.toolShellProtocolVersion
+        )
+        let toolShellBinary = try XCTUnwrap(
+            codex[AgentSkillInstaller.toolShellBinaryEnvironmentKey]
+        )
+        XCTAssertEqual(
+            URL(fileURLWithPath: toolShellBinary).lastPathComponent,
+            "RemoteCodeDistillService"
+        )
+        XCTAssertNotEqual(
+            toolShellBinary,
+            AgentSkillInstaller.defaultManagedCLIBinDirectory()
+                .appendingPathComponent("distill").path,
+            "the aggregate intercept must not execute the mutable managed symlink"
+        )
 
         let claude = ctx.tokenSaverAgentEnvironment(provider: .claude, threadId: claudeThread.id)
         XCTAssertEqual(claude["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
         XCTAssertEqual(claude["RC_TOKEN_SAVER_POST_TOOL_USE"], "1")
+        XCTAssertNil(claude["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"])
+        XCTAssertNil(claude[AgentSkillInstaller.toolShellBinaryEnvironmentKey])
         XCTAssertNotNil(claude["REMOTE_CODE_DISTILL_STATE_PATH"])
+        for (provider, environment) in [("codex", codex), ("claude", claude)] {
+            XCTAssertTrue(
+                environment["RC_REMOTE_CODE_MANAGED_BIN"]?.contains(
+                    "/.remote-code/runtime/"
+                ) == true,
+                "\(provider) explicit | distill must use the artifact runtime bin"
+            )
+            XCTAssertTrue(
+                environment["ZDOTDIR"]?.hasSuffix("/shell/zsh-tool-v1") == true,
+                "\(provider) must use the artifact runtime bridge"
+            )
+        }
     }
 
     /// WHY: production threads are often projectless (project_id nil). Previously
@@ -482,13 +525,234 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         let codexThread = try admittedThread(in: ctx, provider: .codex)
         let claudeThread = try admittedThread(in: ctx, provider: .claude)
 
-        let managedBin = managedIntegrationHome(for: appSupport)
-            .appendingPathComponent(".remote-code/bin", isDirectory: true).path
-        let codexPath = try XCTUnwrap(router.providerEnvironment(provider: .codex, instanceId: nil, threadId: codexThread.id)["PATH"])
-        let claudePath = try XCTUnwrap(router.providerEnvironment(provider: .claude, instanceId: nil, threadId: claudeThread.id)["PATH"])
+        for (provider, thread) in [(AgentProvider.codex, codexThread), (.claude, claudeThread)] {
+            let environment = router.providerEnvironment(
+                provider: provider,
+                instanceId: nil,
+                threadId: thread.id
+            )
+            let managedBin = try XCTUnwrap(environment["RC_REMOTE_CODE_MANAGED_BIN"])
+            let path = try XCTUnwrap(environment["PATH"])
+            XCTAssertTrue(managedBin.contains("/.remote-code/runtime/"), "\(provider)")
+            XCTAssertTrue(
+                path.hasPrefix(managedBin + ":") || path == managedBin,
+                "\(provider) provider shell must resolve its artifact-scoped wrappers first"
+            )
+            XCTAssertEqual(
+                environment["RC_REMOTE_CODE_PROVIDER_PROXY_BIN"],
+                managedBin,
+                "\(provider) admitted proxies must resolve from the same artifact namespace"
+            )
+            let globalProxyBin = AgentSkillInstaller(homeDirectory: managedIntegrationHome(for: appSupport))
+                .providerProxyBinURL.path
+            XCTAssertFalse(
+                path.split(separator: ":").map(String.init).contains(globalProxyBin),
+                "\(provider) admitted PATH must not fall back to mutable global proxies"
+            )
+        }
+    }
 
-        XCTAssertTrue(codexPath.hasPrefix(managedBin + ":"), "Codex provider shell must resolve wrapped commands through managed bin first")
-        XCTAssertTrue(claudePath.hasPrefix(managedBin + ":"), "Claude provider shell must resolve wrapped commands through managed bin first")
+    @MainActor
+    func test_admittedProviderEnvironmentRepairsMissingArtifactWrapperBeforeAcceptance() throws {
+        // WHY: an accepted Distill symlink is insufficient when a concurrent
+        // reconcile removed an ordinary wrapper; the next provider turn must
+        // restore the pinned interceptor before exposing managed PATH.
+        let appSupport = NSTemporaryDirectory() + "RC2WrapperRepair-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let context = try makeContext(appSupport: appSupport)
+        try enableTokenSaver(in: context)
+        let thread = try admittedThread(in: context, provider: .codex)
+        let router = AppCommandRouter(context: context)
+
+        let first = router.providerEnvironment(
+            provider: .codex,
+            instanceId: nil,
+            threadId: thread.id
+        )
+        let managedBin = try XCTUnwrap(first["RC_REMOTE_CODE_MANAGED_BIN"])
+        let wrapper = URL(fileURLWithPath: managedBin).appendingPathComponent("ls")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: wrapper.path))
+        try FileManager.default.removeItem(at: wrapper)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: wrapper.path))
+
+        let repaired = router.providerEnvironment(
+            provider: .codex,
+            instanceId: nil,
+            threadId: thread.id
+        )
+        XCTAssertEqual(repaired["RC_REMOTE_CODE_MANAGED_BIN"], managedBin)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: wrapper.path))
+        let destination = try XCTUnwrap(
+            FileManager.default.destinationOfSymbolicLink(atPath: wrapper.path)
+        )
+        let expected = URL(fileURLWithPath: managedBin)
+            .deletingLastPathComponent()
+            .appendingPathComponent("RemoteCodeDistillService")
+            .standardizedFileURL.path
+        XCTAssertEqual(
+            URL(fileURLWithPath: destination).standardizedFileURL.path,
+            expected,
+            "ordinary wrapper must be repaired to the accepted artifact service"
+        )
+    }
+
+    @MainActor
+    func test_admittedProviderEnvironmentRejectsForeignOrdinaryWrapper() throws {
+        // WHY: a user-owned real file in the discovered wrapper set is a
+        // partial runtime, not a successful install. Paid PATH/ZDOTDIR must
+        // fail open instead of accepting the installer's short return list.
+        let appSupport = NSTemporaryDirectory() + "RC2WrapperCollision-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let context = try makeContext(appSupport: appSupport)
+        try enableTokenSaver(in: context)
+        let thread = try admittedThread(in: context, provider: .codex)
+        let router = AppCommandRouter(context: context)
+
+        let first = router.providerEnvironment(
+            provider: .codex,
+            instanceId: nil,
+            threadId: thread.id
+        )
+        let runtimeBin = try XCTUnwrap(first["RC_REMOTE_CODE_MANAGED_BIN"])
+        let ls = URL(fileURLWithPath: runtimeBin).appendingPathComponent("ls")
+        try FileManager.default.removeItem(at: ls)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: ls)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: ls.path)
+
+        let rejected = router.providerEnvironment(
+            provider: .codex,
+            instanceId: nil,
+            threadId: thread.id
+        )
+        XCTAssertNil(rejected[AgentSkillInstaller.runtimeRootEnvironmentKey])
+        XCTAssertFalse(rejected["PATH"]?.contains("/.remote-code/runtime/") == true)
+        XCTAssertFalse(rejected["ZDOTDIR"]?.contains("/.remote-code/runtime/") == true)
+    }
+
+    @MainActor
+    func test_subagentEnvironmentRepairsMissingArtifactProxyBeforeAcceptance() throws {
+        // WHY: nested providers must receive the same immutable namespace as
+        // the parent. A concurrent reconcile may remove either class of link;
+        // acceptance is valid only after both are repaired and pinned.
+        let appSupport = NSTemporaryDirectory() + "RC2SubagentProxyRepair-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let context = try makeContext(appSupport: appSupport)
+        try enableTokenSaver(in: context)
+        let thread = try admittedThread(in: context, provider: .codex)
+
+        let first = context.subagentTelemetryEnvironment(
+            provider: .codex,
+            threadId: thread.id
+        )
+        let runtimeBin = try XCTUnwrap(first["RC_REMOTE_CODE_MANAGED_BIN"])
+        let runtimeRoot = URL(fileURLWithPath: runtimeBin).deletingLastPathComponent()
+        let service = runtimeRoot.appendingPathComponent("RemoteCodeDistillService")
+        let wrapper = URL(fileURLWithPath: runtimeBin).appendingPathComponent("ls")
+        let proxy = URL(fileURLWithPath: runtimeBin).appendingPathComponent("codex")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: wrapper.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: proxy.path))
+        try FileManager.default.removeItem(at: wrapper)
+        try FileManager.default.removeItem(at: proxy)
+
+        let repaired = context.subagentTelemetryEnvironment(
+            provider: .codex,
+            threadId: thread.id
+        )
+        XCTAssertEqual(repaired["RC_REMOTE_CODE_MANAGED_BIN"], runtimeBin)
+        XCTAssertEqual(
+            repaired[AgentSkillInstaller.runtimeRootEnvironmentKey],
+            runtimeRoot.path
+        )
+        XCTAssertEqual(
+            URL(fileURLWithPath: try FileManager.default.destinationOfSymbolicLink(atPath: wrapper.path))
+                .standardizedFileURL.path,
+            service.standardizedFileURL.path
+        )
+        XCTAssertEqual(
+            URL(fileURLWithPath: try FileManager.default.destinationOfSymbolicLink(atPath: proxy.path))
+                .standardizedFileURL.path,
+            service.standardizedFileURL.path
+        )
+    }
+
+    @MainActor
+    func test_subagentEnvironmentFailsOpenWhenArtifactProxyCannotBeRepaired() throws {
+        // WHY: a partial runtime must never advertise paid PATH/ZDOTDIR. A
+        // user-owned provider basename blocks repair and therefore rejects the
+        // artifact namespace instead of silently routing through a stale link.
+        let appSupport = NSTemporaryDirectory() + "RC2SubagentProxyFailure-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let context = try makeContext(appSupport: appSupport)
+        try enableTokenSaver(in: context)
+        let thread = try admittedThread(in: context, provider: .codex)
+
+        let first = context.subagentTelemetryEnvironment(
+            provider: .codex,
+            threadId: thread.id
+        )
+        let runtimeBin = try XCTUnwrap(first["RC_REMOTE_CODE_MANAGED_BIN"])
+        let wrapper = URL(fileURLWithPath: runtimeBin).appendingPathComponent("ls")
+        try FileManager.default.removeItem(at: wrapper)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: wrapper)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: wrapper.path)
+        let proxy = URL(fileURLWithPath: runtimeBin).appendingPathComponent("codex")
+        try FileManager.default.removeItem(at: proxy)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: proxy)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: proxy.path)
+
+        let rejected = context.subagentTelemetryEnvironment(
+            provider: .codex,
+            threadId: thread.id
+        )
+        XCTAssertNil(
+            rejected[AgentSkillInstaller.runtimeRootEnvironmentKey],
+            "partial runtime must not expose a trusted artifact root"
+        )
+        XCTAssertFalse(
+            rejected["PATH"]?.contains("/.remote-code/runtime/") == true,
+            "partial runtime must not expose artifact-paid PATH"
+        )
+        XCTAssertFalse(
+            rejected["ZDOTDIR"]?.contains("/.remote-code/runtime/") == true,
+            "partial runtime must not expose artifact-paid ZDOTDIR"
+        )
+    }
+
+    @MainActor
+    func test_subagentEnvironmentRejectsPriorArtifactZDOTDIRAndBASH_ENV() throws {
+        // WHY: a resumed worker can inherit startup pointers from an older
+        // RemoteCode bundle. Treating those pointers as user profiles re-enters
+        // the old interceptor and can recurse or hang the current turn.
+        let appSupport = NSTemporaryDirectory() + "RC2OldBridge-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let context = try makeContext(appSupport: appSupport)
+        try enableTokenSaver(in: context)
+        let thread = try admittedThread(in: context, provider: .codex)
+        let oldBridge = managedIntegrationHome(for: appSupport)
+            .appendingPathComponent(".remote-code/runtime/old-artifact/shell/zsh-tool-v1")
+        let environment = context.subagentTelemetryEnvironment(
+            provider: .codex,
+            threadId: thread.id,
+            baseEnvironment: [
+                "ZDOTDIR": oldBridge.path,
+                "BASH_ENV": oldBridge.appendingPathComponent(".bash_env").path,
+                "PATH": "\(managedIntegrationHome(for: appSupport).path)/.remote-code/bin:/usr/bin:/bin",
+            ]
+        )
+        XCTAssertNotEqual(environment["RC_REMOTE_CODE_ORIGINAL_ZDOTDIR"], oldBridge.path)
+        XCTAssertNotEqual(environment["ZDOTDIR"], oldBridge.path)
+        XCTAssertNil(environment["RC_REMOTE_CODE_ORIGINAL_BASH_ENV"])
+        XCTAssertFalse(environment["PATH"]?.contains("/.remote-code/bin") == true)
+        let runtimeBin = try XCTUnwrap(environment["RC_REMOTE_CODE_MANAGED_BIN"])
+        let expectedRuntimeBashEnv = URL(fileURLWithPath: runtimeBin)
+            .deletingLastPathComponent()
+            .appendingPathComponent("shell/zsh-tool-v1/.bash_env")
+            .path
+        XCTAssertEqual(
+            environment["BASH_ENV"],
+            expectedRuntimeBashEnv,
+            "admitted subagent telemetry must pair BASH_ENV with its immutable runtime namespace"
+        )
     }
 
     /// Nested provider proxies must resolve even when Token Saver is off: Subagents
@@ -664,11 +928,11 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             instanceId: "claude-isolated",
             threadId: thread.id
         )
+        let tokenSaverManagedBin = try XCTUnwrap(tokenSaverEnv["RC_REMOTE_CODE_MANAGED_BIN"])
+        XCTAssertTrue(tokenSaverManagedBin.hasPrefix(skillsHome.path + "/.remote-code/runtime/"))
         XCTAssertTrue(
-            tokenSaverEnv["PATH"]?.hasPrefix(
-                skillsHome.appendingPathComponent(".remote-code/bin").path + ":"
-            ) == true,
-            "Token Saver admission must retain the sandboxed managed bin"
+            tokenSaverEnv["PATH"]?.hasPrefix(tokenSaverManagedBin + ":") == true,
+            "Token Saver admission must retain its sandboxed artifact runtime bin"
         )
         XCTAssertEqual(tokenSaverEnv["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
     }
@@ -730,7 +994,11 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         try enableTokenSaver(in: ctx)
         let enabled = await recoveryEnvironment(.codex, thread.id)
         let enabledPath = try XCTUnwrap(enabled["PATH"])
-        XCTAssertTrue(enabledPath.hasPrefix(managedBin + ":") || enabledPath == managedBin)
+        let enabledManagedBin = try XCTUnwrap(enabled["RC_REMOTE_CODE_MANAGED_BIN"])
+        XCTAssertTrue(enabledManagedBin.contains("/.remote-code/runtime/"))
+        XCTAssertTrue(
+            enabledPath.hasPrefix(enabledManagedBin + ":") || enabledPath == enabledManagedBin
+        )
         XCTAssertEqual(enabled["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
     }
 

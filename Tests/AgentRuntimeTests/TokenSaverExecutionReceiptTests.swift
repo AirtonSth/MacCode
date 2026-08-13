@@ -394,6 +394,149 @@ final class TokenSaverExecutionReceiptTests: XCTestCase {
         XCTAssertEqual(claudeEnv["RC_TOKEN_SAVER_POST_TOOL_USE"], "1")
     }
 
+    func test_toolShellHandshakeSurvivesOnlyAdmittedCodexPropagation() throws {
+        // WHY: Codex rebuilds its tool-shell environment from the receipt. The
+        // host gate must survive that boundary without leaking to other
+        // providers or bypassing the lane kill switch.
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ReceiptPropagationArtifact-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let source = home.appendingPathComponent("source/RemoteCodeDistillService")
+        try FileManager.default.createDirectory(
+            at: source.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("runtime-artifact".utf8).write(to: source)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: source.path)
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let runtime = try XCTUnwrap(installer.runtimeInstaller(for: source))
+        let runtimeRoot = runtime.managedCLIBinURL.deletingLastPathComponent().standardizedFileURL
+        let binary = runtimeRoot.appendingPathComponent("RemoteCodeDistillService")
+        var codexEnvironment = TokenSaverExecutionReceiptSeam.environment(from: receipt())
+        codexEnvironment[AgentSkillInstaller.runtimeRootEnvironmentKey] = runtimeRoot.path
+        codexEnvironment["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"] = "1"
+        codexEnvironment[AgentSkillInstaller.toolShellProtocolEnvironmentKey] =
+            AgentSkillInstaller.toolShellProtocolVersion
+        codexEnvironment[AgentSkillInstaller.toolShellBinaryEnvironmentKey] = binary.path
+        let propagated = TokenSaverExecutionReceiptSeam.propagate(
+            into: codexEnvironment,
+            provider: .codex
+        )
+        XCTAssertEqual(propagated["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"], "1")
+        XCTAssertEqual(
+            propagated[AgentSkillInstaller.toolShellProtocolEnvironmentKey],
+            AgentSkillInstaller.toolShellProtocolVersion
+        )
+        XCTAssertEqual(
+            propagated[AgentSkillInstaller.toolShellBinaryEnvironmentKey],
+            binary.path
+        )
+
+        var staleEnvironment = codexEnvironment
+        staleEnvironment[AgentSkillInstaller.toolShellBinaryEnvironmentKey] =
+            binary.deletingLastPathComponent()
+                .appendingPathComponent("missing-service").path
+        let stale = TokenSaverExecutionReceiptSeam.propagate(
+            into: staleEnvironment,
+            provider: .codex
+        )
+        XCTAssertNil(stale["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"])
+        XCTAssertNil(stale[AgentSkillInstaller.toolShellBinaryEnvironmentKey])
+
+        let disabledReceipt = TokenSaverExecutionReceiptSeam.admit(
+            tokenSaverEnabled: true,
+            sameUser: true,
+            sidecarAvailable: true,
+            provider: .codex,
+            threadId: threadID,
+            rootRunId: rootRunID,
+            attemptId: attemptID,
+            workspaceId: workspaceID,
+            projectId: projectID,
+            disabledLanes: ["tool_shell"]
+        )
+        var disabledEnvironment = TokenSaverExecutionReceiptSeam.environment(from: disabledReceipt)
+        disabledEnvironment["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"] = "1"
+        disabledEnvironment[AgentSkillInstaller.toolShellProtocolEnvironmentKey] =
+            AgentSkillInstaller.toolShellProtocolVersion
+        disabledEnvironment[AgentSkillInstaller.toolShellBinaryEnvironmentKey] = binary.path
+        XCTAssertNil(
+            TokenSaverExecutionReceiptSeam.propagate(
+                into: disabledEnvironment,
+                provider: .codex
+            )["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"]
+        )
+
+        XCTAssertNil(
+            TokenSaverExecutionReceiptSeam.propagate(
+                into: codexEnvironment,
+                provider: .claude
+            )["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"]
+        )
+    }
+
+    func test_stampIdentityPreservesArtifactScopedToolShellHandshakeOnlyForCoherentRoot() throws {
+        // WHY: recovery/restamp crosses a scrub boundary. The absolute Codex
+        // tool-shell capability must survive only when the host-selected
+        // runtime artifact and its content-addressed root still agree.
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ReceiptRuntimeArtifact-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let source = home.appendingPathComponent("source/RemoteCodeDistillService")
+        try FileManager.default.createDirectory(
+            at: source.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("runtime-artifact".utf8).write(to: source)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: source.path)
+
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let runtime = try XCTUnwrap(installer.runtimeInstaller(for: source))
+        let runtimeRoot = runtime.managedCLIBinURL.deletingLastPathComponent().standardizedFileURL
+        let artifact = runtimeRoot.appendingPathComponent("RemoteCodeDistillService")
+        var environment = TokenSaverExecutionReceiptSeam.environment(from: receipt())
+        environment["RC_REMOTE_CODE_MANAGED_BIN"] = runtime.managedCLIBinURL.path
+        environment[AgentSkillInstaller.runtimeRootEnvironmentKey] = runtimeRoot.path
+        environment["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"] = "1"
+        environment[AgentSkillInstaller.toolShellProtocolEnvironmentKey] =
+            AgentSkillInstaller.toolShellProtocolVersion
+        environment[AgentSkillInstaller.toolShellBinaryEnvironmentKey] = artifact.path
+
+        let stamped = TokenSaverExecutionReceiptSeam.stampIdentity(
+            environment: environment,
+            rootRunId: rootRunID,
+            attemptId: "60000000-0000-0000-0000-000000000006",
+            provider: .codex
+        )
+        XCTAssertEqual(stamped["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"], "1")
+        XCTAssertEqual(
+            stamped[AgentSkillInstaller.toolShellProtocolEnvironmentKey],
+            AgentSkillInstaller.toolShellProtocolVersion
+        )
+        XCTAssertEqual(stamped[AgentSkillInstaller.toolShellBinaryEnvironmentKey], artifact.path)
+        XCTAssertEqual(stamped[AgentSkillInstaller.runtimeRootEnvironmentKey], runtimeRoot.path)
+
+        let digest = try XCTUnwrap(AgentSkillInstaller.serviceBinaryIdentity(at: artifact))
+        let siblingRoot = home
+            .appendingPathComponent("sibling/.remote-code/runtime/\(digest)", isDirectory: true)
+        try FileManager.default.createDirectory(at: siblingRoot, withIntermediateDirectories: true)
+        let sibling = siblingRoot.appendingPathComponent("RemoteCodeDistillService")
+        try FileManager.default.copyItem(at: artifact, to: sibling)
+        var adversarial = environment
+        adversarial[AgentSkillInstaller.toolShellBinaryEnvironmentKey] = sibling.path
+
+        let rejected = TokenSaverExecutionReceiptSeam.stampIdentity(
+            environment: adversarial,
+            rootRunId: rootRunID,
+            attemptId: "60000000-0000-0000-0000-000000000006",
+            provider: .codex
+        )
+        XCTAssertNil(rejected["RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT"])
+        XCTAssertNil(rejected[AgentSkillInstaller.toolShellProtocolEnvironmentKey])
+        XCTAssertNil(rejected[AgentSkillInstaller.toolShellBinaryEnvironmentKey])
+        XCTAssertNil(rejected[AgentSkillInstaller.runtimeRootEnvironmentKey])
+    }
+
     func test_secretOrContentShapedReceiptIsRejectedAndScrubbed() throws {
         // WHY: an environment receipt is metadata, never a second channel for
         // prompts, transcripts, tokens, raw tool output, or provider secrets.

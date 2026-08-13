@@ -610,6 +610,146 @@ final class FakeRunnerTests: XCTestCase {
         }
     }
 
+    func test_stopRunResolvesDurablePendingApprovalCallback() async throws {
+        // WHY: UI Stop synthesizes the terminal cancellation before a provider
+        // transport necessarily sends its native interrupt acknowledgement. The
+        // durable callback card must still resolve instead of surviving as an
+        // actionable approval after the run is cancelled.
+        let tmp = NSTemporaryDirectory() + "rc2-stop-pending-callback-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let callbackRepo = ProviderPendingCallbackRepository(db: db)
+        let thread = AgentThread(title: "stop callback", provider: .claude, model: "claude-haiku-4-5-20251001")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providerAdapters: [.claude: PendingApprovalAdapter()]
+        )
+        coordinator.gracefulStopTimeout = 0
+        coordinator.onAssistantEvent = { event, threadId, _ in
+            switch event {
+            case .requestOpened(let request):
+                try? callbackRepo.record(threadId: threadId, request: request)
+            case .requestResolved(let requestId, let state):
+                try? callbackRepo.resolve(
+                    threadId: threadId,
+                    requestId: requestId,
+                    kind: .approval,
+                    state: state
+                )
+            default:
+                break
+            }
+        }
+
+        let runId = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp,
+            prompt: "approve before stop"
+        ))
+        try await waitUntil("durable pending approval callback") {
+            (try? callbackRepo.listOpen(threadId: thread.id).count) == 1
+        }
+
+        coordinator.stopRun(threadId: thread.id)
+
+        try await waitUntil("durable approval callback resolution after Stop") {
+            (try? callbackRepo.listOpen(threadId: thread.id).isEmpty) == true
+        }
+        let callback = try XCTUnwrap(
+            callbackRepo.get(threadId: thread.id, requestId: "approval-runtime-1", kind: .approval)
+        )
+        XCTAssertEqual(callback.state, .cancelled)
+        XCTAssertNotNil(callback.resolvedAt)
+        XCTAssertNotNil(try runRepo.get(id: runId)?.finishedAt)
+        XCTAssertEqual(try runRepo.get(id: runId)?.status, .cancelled)
+    }
+
+    func test_terminalPayloadClearsPendingCallbacksWhenPreTerminalResolutionFailsOnce() async throws {
+        // WHY: synthetic callback resolution runs before the terminal graph. If
+        // one compact-state upsert transiently fails, terminal persistence must
+        // still atomically clear both callback sets instead of resurrecting
+        // actionable approval/input UI after cancellation.
+        let tmp = NSTemporaryDirectory() + "rc2-terminal-pending-atomicity-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "terminal pending atomicity", provider: .claude, model: "claude-haiku-4-5-20251001")
+        try threadRepo.upsert(thread)
+        try db.execute("""
+            CREATE TRIGGER fail_terminal_pending_resolution_once
+            BEFORE UPDATE OF runtime_payload_json ON provider_session_runtime
+            WHEN OLD.runtime_payload_json LIKE '%approval-runtime-1%'
+              AND NEW.runtime_payload_json NOT LIKE '%approval-runtime-1%'
+              AND COALESCE(NEW.last_event_kind, '') <> 'run.finished'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced pre-terminal runtime payload failure');
+            END;
+            """)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providerAdapters: [.claude: PendingApprovalAdapter()]
+        )
+        let issueLock = NSLock()
+        var forcedFailureCount = 0
+        coordinator.onPersistenceIssue = { message, _, _ in
+            guard message.contains("provider_session.runtime_payload.update") else { return }
+            issueLock.lock()
+            forcedFailureCount += 1
+            let firstFailure = forcedFailureCount == 1
+            issueLock.unlock()
+            if firstFailure {
+                try? db.execute("DROP TRIGGER fail_terminal_pending_resolution_once;")
+            }
+        }
+
+        let runId = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp,
+            prompt: "approve before atomic terminal"
+        ))
+        try await waitUntil("pending approval id before terminal") {
+            guard let session = try? sessionRepo.get(threadId: thread.id),
+                  let payload = Self.runtimePayload(session.runtimePayloadJSON) else { return false }
+            return (payload["pendingApprovalRequestIds"] as? [String]) == ["approval-runtime-1"]
+        }
+
+        var session = try XCTUnwrap(sessionRepo.get(threadId: thread.id))
+        session.runtimePayloadJSON = """
+        {"pendingApprovalRequestIds":["approval-runtime-1"],"pendingUserInputRequestIds":["input-atomic-1"]}
+        """
+        try sessionRepo.upsert(session)
+
+        coordinator.stopRun(threadId: thread.id)
+        try await waitUntil("cancelled terminal graph") {
+            (try? runRepo.get(id: runId)?.status) == .cancelled
+        }
+        issueLock.lock()
+        let observedForcedFailures = forcedFailureCount
+        issueLock.unlock()
+        XCTAssertEqual(observedForcedFailures, 1, "the pre-terminal compact-state failure must be forced exactly once")
+        let terminalSession = try XCTUnwrap(sessionRepo.get(threadId: thread.id))
+        let terminalPayload = try XCTUnwrap(Self.runtimePayload(terminalSession.runtimePayloadJSON))
+        XCTAssertEqual(terminalSession.status, .cancelled)
+        XCTAssertEqual(terminalPayload["pendingApprovalRequestIds"] as? [String], [])
+        XCTAssertEqual(terminalPayload["pendingUserInputRequestIds"] as? [String], [])
+    }
+
     func test_coordinatorPersistsClaudeSessionSnapshotRuntimePayload() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-coordinator-claude-snapshot-runtime-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
@@ -1991,6 +2131,171 @@ final class FakeRunnerTests: XCTestCase {
         XCTAssertNil(coordinator.runThreadOwnershipForTesting[runId])
         XCTAssertFalse(coordinator.lateReceiptRunResidueForTesting.contains(runId))
         XCTAssertFalse(coordinator.deletedThreadRuntimeResidueForTesting.contains(thread.id))
+    }
+
+    /// WHY: provider pipes can deliver a buffered output tail after Stop or a
+    /// terminal callback. A durable terminal run must never be reopened by item
+    /// content, while cumulative usage still has to enrich billing and duplicate
+    /// terminal callbacks must remain presentation-idempotent.
+    func test_terminalRunsDropLateContentButKeepUsageAndTerminalIdempotency() throws {
+        for status in [AgentRunStatus.completed, .cancelled] {
+            let tmp = NSTemporaryDirectory() + "rc2-terminal-content-firewall-" + UUID().uuidString
+            let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+            let threadRepo = AgentThreadRepository(db: db)
+            let runRepo = AgentRunRepository(db: db)
+            var thread = AgentThread(title: "terminal content firewall", provider: .codex, model: "m")
+            thread.status = status
+            try threadRepo.upsert(thread)
+            let runId = AgentRunID()
+            try runRepo.upsert(AgentRun(
+                id: runId,
+                threadId: thread.id,
+                provider: .codex,
+                model: "m",
+                status: status,
+                finishedAt: Date()
+            ))
+            let coordinator = AgentRunCoordinator(
+                runRepo: runRepo,
+                messageRepo: AgentMessageRepository(db: db),
+                threadRepo: threadRepo,
+                providers: [.codex: FakeProviderRunner(scenario: .simpleAssistant(reply: "unused"))]
+            )
+            let callbackLock = NSLock()
+            var published: [AssistantEvent] = []
+            var finishedCallbacks = 0
+            coordinator.onAssistantEvent = { event, _, _ in
+                callbackLock.withLock { published.append(event) }
+            }
+            coordinator.onRunFinished = { _, _, _ in
+                callbackLock.withLock { finishedCallbacks += 1 }
+            }
+            let baselineCount = coordinator.countStreamEvents(threadId: thread.id)
+
+            coordinator.handleRunEventForTesting(
+                .event(.providerRuntime(ProviderRuntimeEvent(
+                    provider: .codex,
+                    source: "codex.app-server",
+                    method: "item/commandExecution/outputDelta",
+                    providerTurnId: "finished-turn",
+                    providerItemId: "late-command",
+                    payloadJSON: #"{"delta":"late stderr"}"#,
+                    receivedAtMs: 1
+                ))),
+                runId: runId,
+                threadId: thread.id
+            )
+            coordinator.handleRunEventForTesting(
+                .event(.itemStarted(item: AssistantItem(
+                    id: "late-command",
+                    turnId: "finished-turn",
+                    type: .commandExecution,
+                    state: .streaming,
+                    summary: "late command",
+                    startedAtMs: 1
+                ))),
+                runId: runId,
+                threadId: thread.id
+            )
+            coordinator.handleRunEventForTesting(
+                .event(.itemDelta(
+                    itemId: "late-command",
+                    bodyAppend: nil,
+                    outputAppend: "late stderr",
+                    summary: "Command output"
+                )),
+                runId: runId,
+                threadId: thread.id
+            )
+
+            // Provider transports can deliver lifecycle/request callbacks from
+            // the old turn after cancellation or completion. These must not
+            // recreate active-turn or pending-request UI state. Resolution and
+            // cumulative usage remain admissible below for accounting cleanup.
+            let lateApproval = AssistantPendingRequest(
+                id: "late-approval",
+                turnId: "finished-turn",
+                kind: .commandExecution,
+                title: "Late approval",
+                createdAtMs: 1
+            )
+            let lateUserInput = AssistantUserInputRequest(
+                id: "late-input",
+                turnId: "finished-turn",
+                prompt: "Late input",
+                createdAtMs: 1
+            )
+            for lifecycleEvent in [
+                AssistantEvent.threadStarted(threadId: "late-provider-thread", providerThreadId: "late-provider-thread"),
+                .turnStarted(turnId: "finished-turn"),
+                .requestOpened(lateApproval),
+                .userInputRequested(lateUserInput),
+                .providerRuntime(ProviderRuntimeEvent(
+                    provider: .codex,
+                    source: "codex.app-server",
+                    method: "turn/started",
+                    providerTurnId: "finished-turn",
+                    payloadJSON: "{}",
+                    receivedAtMs: 1
+                )),
+                .providerRuntime(ProviderRuntimeEvent(
+                    provider: .codex,
+                    source: "codex.app-server",
+                    method: "item/commandExecution/requestApproval",
+                    providerTurnId: "finished-turn",
+                    providerRequestId: "late-approval",
+                    payloadJSON: "{}",
+                    receivedAtMs: 1
+                )),
+                .providerRuntime(ProviderRuntimeEvent(
+                    provider: .codex,
+                    source: "codex.app-server",
+                    method: "item/tool/requestUserInput",
+                    providerTurnId: "finished-turn",
+                    providerRequestId: "late-input",
+                    payloadJSON: "{}",
+                    receivedAtMs: 1
+                ))
+            ] {
+                coordinator.handleRunEventForTesting(
+                    .event(lifecycleEvent),
+                    runId: runId,
+                    threadId: thread.id
+                )
+            }
+            _ = try coordinator.withMirrorEventSnapshot(threadId: thread.id) { $0 }
+
+            XCTAssertEqual(coordinator.countStreamEvents(threadId: thread.id), baselineCount)
+            XCTAssertTrue(callbackLock.withLock { published.isEmpty },
+                          "late content for a \(status.rawValue) run must not broadcast")
+
+            coordinator.handleRunEventForTesting(
+                .event(.tokenUsage(AssistantTokenUsage(totalTokens: 29, semantics: .cumulative))),
+                runId: runId,
+                threadId: thread.id
+            )
+            XCTAssertTrue(coordinator.lateReceiptRunResidueForTesting.contains(runId),
+                          "late cumulative usage must remain admitted for receipt enrichment")
+            XCTAssertTrue(callbackLock.withLock {
+                published.contains {
+                    if case .tokenUsage(let usage) = $0 { return usage.totalTokens == 29 }
+                    return false
+                }
+            })
+
+            coordinator.handleRunEventForTesting(
+                .finished(status, finalMessage: nil, providerThreadId: "codex-thread-1"),
+                runId: runId,
+                threadId: thread.id
+            )
+            coordinator.handleRunEventForTesting(
+                .finished(status, finalMessage: nil, providerThreadId: "codex-thread-1"),
+                runId: runId,
+                threadId: thread.id
+            )
+            XCTAssertEqual(callbackLock.withLock { finishedCallbacks }, 0,
+                           "duplicate terminals for an already-durable run must stay presentation-idempotent")
+        }
     }
 
     /// WHY: a durable read can become stale before its result claims ownership.

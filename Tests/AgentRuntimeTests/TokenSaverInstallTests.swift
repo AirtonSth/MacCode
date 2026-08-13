@@ -111,6 +111,127 @@ final class TokenSaverInstallTests: XCTestCase {
             .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
     }
 
+    func test_runtimeInstallerUsesImmutableContentAddressedServiceCopy() throws {
+        // WHY: two app instances can replace a bundle executable at the same
+        // path while an admitted provider turn is still running. The turn must
+        // keep using the exact service bytes it was admitted against.
+        let home = tempDir("ArtifactRuntime")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let binary = home.appendingPathComponent("fake/RemoteCodeDistillService")
+        try FileManager.default.createDirectory(
+            at: binary.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("artifact-v1".utf8).write(to: binary)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: binary.path
+        )
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let runtime = try XCTUnwrap(installer.runtimeInstaller(for: binary))
+        let pinned = try XCTUnwrap(runtime.pinnedServiceBinaryURL)
+        XCTAssertNotEqual(pinned.standardizedFileURL, binary.standardizedFileURL)
+        XCTAssertTrue(pinned.path.contains("/.remote-code/runtime/"))
+        XCTAssertEqual(
+            AgentSkillInstaller.serviceBinaryIdentity(at: pinned),
+            AgentSkillInstaller.serviceBinaryIdentity(at: binary)
+        )
+
+        _ = try runtime.ensureDistillCLI(serviceBinaryURL: binary)
+        XCTAssertTrue(runtime.isDistillCLIPinned(to: binary))
+        let original = try Data(contentsOf: pinned)
+        try Data("artifact-v2".utf8).write(to: binary, options: .atomic)
+
+        _ = try runtime.ensureDistillCLI(serviceBinaryURL: binary)
+        XCTAssertEqual(try Data(contentsOf: pinned), original)
+        XCTAssertFalse(runtime.isDistillCLIPinned(to: binary))
+
+        let replacement = try XCTUnwrap(installer.runtimeInstaller(for: binary))
+        let replacementPinned = try XCTUnwrap(replacement.pinnedServiceBinaryURL)
+        XCTAssertNotEqual(replacementPinned.standardizedFileURL, pinned.standardizedFileURL)
+        XCTAssertNotEqual(
+            AgentSkillInstaller.serviceBinaryIdentity(at: replacementPinned),
+            AgentSkillInstaller.serviceBinaryIdentity(at: pinned)
+        )
+    }
+
+    func test_runtimeIdentityRejectsSelfHashOutsideHostRuntimeNamespace() throws {
+        // WHY: a nested provider must not turn any self-hashing executable into
+        // an interceptor capability. Only the host-issued .remote-code/runtime
+        // namespace (or the exact current service) is trusted.
+        let home = tempDir("UntrustedRuntimeIdentity")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let source = home.appendingPathComponent("source/RemoteCodeDistillService")
+        try FileManager.default.createDirectory(
+            at: source.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("untrusted-service".utf8).write(to: source)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: source.path)
+        let digest = try XCTUnwrap(AgentSkillInstaller.serviceBinaryIdentity(at: source))
+        let untrustedRoot = home.appendingPathComponent("runtime/\(digest)", isDirectory: true)
+        let untrusted = untrustedRoot.appendingPathComponent("RemoteCodeDistillService")
+        try FileManager.default.createDirectory(at: untrustedRoot, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: source, to: untrusted)
+
+        XCTAssertFalse(AgentSkillInstaller.isImmutableRuntimeServiceBinary(at: untrusted))
+        XCTAssertFalse(
+            AgentSkillInstaller.isCurrentOrImmutableRuntimeServiceBinary(
+                untrusted,
+                current: source
+            )
+        )
+        XCTAssertNil(
+            AgentSkillInstaller.immutableRuntimeServiceBinary(
+                forManagedBin: untrustedRoot.appendingPathComponent("bin").path
+            )
+        )
+    }
+
+    func test_runtimeIdentityRejectsSelfHashOutsideSelectedRuntimeRoot() throws {
+        // WHY: a child can inherit a path-shaped self-hash from another build;
+        // content-addressing alone is not host authority. Only the runtime root
+        // selected for this admitted artifact may carry tool-shell capability.
+        let home = tempDir("RuntimeRootBoundary")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let source = home.appendingPathComponent("source/RemoteCodeDistillService")
+        try FileManager.default.createDirectory(
+            at: source.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("trusted-service".utf8).write(to: source)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: source.path)
+
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let runtime = try XCTUnwrap(installer.runtimeInstaller(for: source))
+        let trustedRoot = runtime.managedCLIBinURL.deletingLastPathComponent()
+        let digest = try XCTUnwrap(AgentSkillInstaller.serviceBinaryIdentity(at: source))
+        let siblingRoot = home
+            .appendingPathComponent("sibling/.remote-code/runtime/\(digest)", isDirectory: true)
+        let sibling = siblingRoot.appendingPathComponent("RemoteCodeDistillService")
+        try FileManager.default.createDirectory(at: siblingRoot, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: source, to: sibling)
+
+        XCTAssertTrue(
+            AgentSkillInstaller.isImmutableRuntimeServiceBinary(
+                at: runtime.pinnedServiceBinaryURL!,
+                trustedRuntimeRoot: trustedRoot
+            )
+        )
+        XCTAssertFalse(
+            AgentSkillInstaller.isImmutableRuntimeServiceBinary(
+                at: sibling,
+                trustedRuntimeRoot: trustedRoot
+            )
+        )
+        XCTAssertFalse(
+            AgentSkillInstaller.isCurrentOrImmutableRuntimeServiceBinary(
+                sibling,
+                current: source
+            )
+        )
+    }
+
     private func stubbedSession() -> URLSession {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [URLProtocolStub.self]
@@ -225,8 +346,18 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertEqual(claude.manifest.sourceRevision, "rev-a")
 
         let codexText = try String(contentsOf: URL(fileURLWithPath: codex.manifest.installPath))
-        XCTAssertTrue(codexText.contains("/distill"))
-        XCTAssertTrue(codexText.contains("S=state"))
+        XCTAssertTrue(codexText.contains("@sr2 v1"),
+                      "managed skill must require the canonical SR2 v1 wire")
+        XCTAssertTrue(codexText.contains("o:cont"),
+                      "managed skill must preserve the SR2 tool-only continuation")
+        XCTAssertTrue(codexText.contains("PATH wrappers"),
+                      "managed skill must carry the provider-neutral wrapper policy")
+        XCTAssertTrue(codexText.contains("MANDATORY default-pipe"),
+                      "managed skill must require the default Distill pipe")
+        XCTAssertTrue(codexText.contains("distill retrieve <handle>"),
+                      "managed skill must preserve recovery-handle retrieval")
+        XCTAssertFalse(codexText.contains("S=state"),
+                       "retired SR1 Military English must not be installed")
     }
 
     func test_agentSkillInstallerWritesDistillInstructionsIntoProviderConfigFiles() throws {
@@ -245,9 +376,16 @@ final class TokenSaverInstallTests: XCTestCase {
         let grokText = try String(contentsOf: grokInstructions)
         XCTAssertTrue(codexText.contains(AgentSkillInstaller.distillInstructionsBeginMarker))
         XCTAssertTrue(claudeText.contains(AgentSkillInstaller.distillInstructionsEndMarker))
-        XCTAssertTrue(codexText.contains("Use `/distill` dialect for provider turns"))
+        XCTAssertTrue(codexText.contains("@sr2 v1"),
+                      "provider instructions must carry the canonical SR2 v1 wire")
+        XCTAssertTrue(codexText.contains("o:cont"),
+                      "provider instructions must carry SR2 tool-only continuation")
         XCTAssertTrue(codexText.contains("PATH wrappers"),
                       "provider config must carry the current managed-wrapper policy")
+        XCTAssertTrue(codexText.contains("MANDATORY default-pipe"),
+                      "provider config must carry the mandatory default-pipe policy")
+        XCTAssertTrue(codexText.contains("distill retrieve <handle>"),
+                      "provider config must carry recovery-handle retrieval")
         // CLI recovery language lives in the skill body; on-disk AGENTS.md is the dialect + pipe rules.
         XCTAssertFalse(codexText.contains(TokenSaverProviderSafetyABI.block))
         XCTAssertFalse(claudeText.contains(TokenSaverProviderSafetyABI.block))
@@ -710,6 +848,75 @@ final class TokenSaverInstallTests: XCTestCase {
                 .trimmingCharacters(in: .whitespacesAndNewlines),
             redirectedZDOTDIR.path,
             "the user .zlogout must run with the effective redirected ZDOTDIR"
+        )
+    }
+
+    func test_managedZshBridgeInterceptsBeforeUserStartupAndSourcesUserZshenvOnce() throws {
+        // WHY: the Codex tool-shell bridge must hand the original -c payload to
+        // Distill before user startup. The inner fail-open shell then performs
+        // startup exactly once; appending the hook would duplicate side effects.
+        let home = tempDir("TokenSaverToolShellBridge")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let original = home.appendingPathComponent("original", isDirectory: true)
+        let counter = home.appendingPathComponent("zshenv-count.txt")
+        try FileManager.default.createDirectory(at: original, withIntermediateDirectories: true)
+        try Data(
+            "count=$(($(cat \"\(counter.path)\" 2>/dev/null || echo 0) + 1)); print -r -- $count > \"\(counter.path)\"; export RC_USER_ZSHENV_COUNT=$count\n".utf8
+        ).write(to: original.appendingPathComponent(".zshenv"))
+
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let bridge = try installer.installProviderShellBridge()
+        let managedBin = installer.managedCLIBinURL
+        try FileManager.default.createDirectory(at: managedBin, withIntermediateDirectories: true)
+        let fakeDistill = home.appendingPathComponent("RemoteCodeDistillService")
+        try Data(
+            """
+            #!/bin/sh
+            if [ "$1" = "cli" ] && [ "$2" = "tool-shell" ] && [ "$3" = "--" ]; then
+              shift 3
+              RC_REMOTE_CODE_TOOL_SHELL_DONE=1 RC_TOKEN_SAVER_TOOL_SHELL_DONE=1 exec /bin/zsh -lc "$1"
+            fi
+            exit 64
+            """.utf8
+        ).write(to: fakeDistill)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: fakeDistill.path
+        )
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", "print -r -- ${RC_USER_ZSHENV_COUNT:-0}"]
+        process.environment = [
+            "HOME": home.path,
+            "PATH": "\(managedBin.path):/usr/bin:/bin",
+            "ZDOTDIR": bridge.path,
+            "RC_REMOTE_CODE_ORIGINAL_ZDOTDIR": original.path,
+            "RC_REMOTE_CODE_EFFECTIVE_ZDOTDIR": original.path,
+            "RC_REMOTE_CODE_MANAGED_ZDOTDIR": bridge.path,
+            "RC_REMOTE_CODE_MANAGED_BIN": managedBin.path,
+            "RC_REMOTE_CODE_UNOWNED_TOOL_SHELL": "1",
+            "RC_TOKEN_SAVER_DISTILL_HINT": "1",
+            "RC_TOKEN_SAVER_TOOL_SHELL_INTERCEPT": "1",
+            AgentSkillInstaller.toolShellProtocolEnvironmentKey:
+                AgentSkillInstaller.toolShellProtocolVersion,
+            AgentSkillInstaller.toolShellBinaryEnvironmentKey: fakeDistill.path,
+        ]
+        let output = Pipe()
+        process.standardOutput = output
+        try process.run()
+        process.waitUntilExit()
+
+        XCTAssertEqual(process.terminationStatus, 0)
+        XCTAssertEqual(
+            String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
+            "1\n"
+        )
+        XCTAssertEqual(
+            try String(contentsOf: counter, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "1",
+            "the managed handoff must not source the user's .zshenv twice"
         )
     }
 

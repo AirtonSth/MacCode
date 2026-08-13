@@ -28,6 +28,8 @@ public enum ToolCompressionSkipReason: String, Sendable, Equatable {
     case multimodalImage = "multimodal_image"
     /// Bash/shell tool whose `command` is exact-output (rg/sed/cat/…) or exact git blob/match.
     case exactOutputShell = "exact_output_shell"
+    /// Bash/shell command already invokes Distill, so PostToolUse must not compress it again.
+    case explicitDistillPipeline = "explicit_distill_pipeline"
 }
 
 public struct ToolCompressionDecision: Sendable, Equatable {
@@ -107,6 +109,12 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
         } else if ToolOutputMultimodalGuard.looksLikeImagePayload(output) {
             // Text Distill cannot safely rewrite image/base64 tool payloads.
             skipReason = .multimodalImage
+        } else if isExplicitDistillPipelineShellTool(
+            toolName: toolName,
+            toolArgumentsSummary: toolArgumentsSummary
+        ) {
+            // The explicit CLI invocation owns the single compression pass.
+            skipReason = .explicitDistillPipeline
         } else if isExactOutputShellTool(toolName: toolName, toolArgumentsSummary: toolArgumentsSummary) {
             // Align with CommandWrapPolicy / Claude SDK bridge: never rewrite exact stdout.
             skipReason = .exactOutputShell
@@ -227,21 +235,41 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
     public func isExactOutputShellTool(toolName: String, toolArgumentsSummary: String?) -> Bool {
         let name = normalize(toolName)
         guard name == "bash" || name == "shell" || name == "terminal" else { return false }
+        guard let command = shellCommand(from: toolArgumentsSummary) else { return false }
+        return Self.shellCommandLooksExactOutput(command)
+    }
+
+    /// True when a Bash/shell command already contains a real Distill invocation.
+    /// Reuse the wrapper policy so explicit CLI and PostToolUse ownership cannot
+    /// drift into two lossy passes over the same bytes.
+    public func isExplicitDistillPipelineShellTool(
+        toolName: String,
+        toolArgumentsSummary: String?
+    ) -> Bool {
+        let name = normalize(toolName)
+        guard name == "bash" || name == "shell" || name == "terminal" else { return false }
+        guard let command = shellCommand(from: toolArgumentsSummary) else { return false }
+        return CommandWrapPolicy.passthroughReason(
+            command: "/bin/zsh",
+            args: ["-lc", command],
+            environment: [:]
+        ) == ToolCompressionSkipReason.explicitDistillPipeline.rawValue
+    }
+
+    private func shellCommand(from toolArgumentsSummary: String?) -> String? {
         guard let summary = toolArgumentsSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
               !summary.isEmpty else {
-            return false
+            return nil
         }
-        // Prefer `command=…` field from summarizeToolInput; else use full summary.
-        let command: String
-        if let range = summary.range(of: "command=") {
-            command = String(summary[range.upperBound...])
-                .components(separatedBy: " | ")
-                .first?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? summary
-        } else {
-            command = summary
-        }
-        return Self.shellCommandLooksExactOutput(command)
+        guard let range = summary.range(of: "command=") else { return summary }
+        let tail = String(summary[range.upperBound...])
+        // summarizeToolInput separates fields with ` | key=`. Do not split on
+        // the same token inside a real shell pipeline (` | distill`).
+        let fieldSeparators = [" | pattern=", " | path=", " | glob=", " | url="]
+        let end = fieldSeparators
+            .compactMap { tail.range(of: $0)?.lowerBound }
+            .min() ?? tail.endIndex
+        return String(tail[..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Segment-aware check shared with wrapper intent: pipes/and chains may mix

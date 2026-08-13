@@ -65,6 +65,53 @@ final class CommandWrapPolicyTests: XCTestCase {
         XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "ls", args: ["-la"], environment: noEnv))
     }
 
+    func test_claudePostToolUseOwnsOrdinaryWrapperOutputExactlyOnce() {
+        let postToolUse = ["RC_TOKEN_SAVER_POST_TOOL_USE": "1"]
+
+        for invocation in [
+            ("swift", ["test", "--filter", "FeatureTests"]),
+            ("git", ["status"]),
+            ("/bin/zsh", ["-lc", "swift test --filter FeatureTests"]),
+        ] {
+            XCTAssertEqual(
+                CommandWrapPolicy.passthroughReason(
+                    command: invocation.0,
+                    args: invocation.1,
+                    environment: postToolUse
+                ),
+                "provider_post_tool_use_owner",
+                "Claude PostToolUse must be the sole automatic owner of \(invocation)"
+            )
+        }
+
+        XCTAssertEqual(
+            CommandWrapPolicy.passthroughReason(
+                command: "/bin/zsh",
+                args: ["-lc", "swift test 2>&1 | distill 'test failures'"],
+                environment: postToolUse
+            ),
+            "explicit_distill_pipeline",
+            "an explicit pipe remains the sole owner before the provider fallback"
+        )
+        XCTAssertEqual(
+            CommandWrapPolicy.passthroughReason(
+                command: "rg",
+                args: ["-n", "needle", "Sources"],
+                environment: postToolUse
+            ),
+            "exact_output_command",
+            "exact-output policy remains stronger than provider ownership"
+        )
+        XCTAssertNil(
+            CommandWrapPolicy.passthroughReason(
+                command: "swift",
+                args: ["test"],
+                environment: ["RC_TOKEN_SAVER_POST_TOOL_USE": "0"]
+            ),
+            "only the admitted literal lane transfers ownership"
+        )
+    }
+
     func test_exactGitOutputPreservesGlobalOptionValuesBeforeTheSubcommand() {
         // WHY: paths and config assignments belonging to Git's global options are
         // not subcommands. Treating `/repo` or `color.ui=false` as the operation
@@ -451,6 +498,43 @@ final class CommandWrapPolicyTests: XCTestCase {
             ),
             "segmented_shell"
         )
+    }
+
+    func test_toolShellInterceptorOwnsOnlyOneSafeOrdinaryCatalogCommand() {
+        // WHY: Codex launches an absolute login shell that bypasses PATH wrappers.
+        // The aggregate interceptor may own one finite noisy command, but must
+        // leave exact, compound, redirected, interactive, and unknown commands raw.
+        for payload in [
+            "swift noisy.swift",
+            "/usr/bin/swift noisy.swift",
+            "git status",
+            "xcodebuild test -scheme RemoteCode",
+        ] {
+            XCTAssertTrue(
+                CommandWrapPolicy.isSafeOrdinaryToolShellPayload(payload),
+                "safe ordinary payload should be interceptor-owned: \(payload)"
+            )
+        }
+
+        for payload in [
+            "rg -n UNIQUE_EXACT_MATCH README.md",
+            "command -v swift",
+            "swift noisy.swift | distill summarize",
+            "distill retrieve rc_123",
+            "swift noisy.swift | wc -l",
+            "swift noisy.swift > output.txt",
+            "swift noisy.swift; git status",
+            "swift noisy.swift && git status",
+            "swift \"$SECRET\"",
+            "export MODE=test",
+            "python3",
+            "printenv",
+        ] {
+            XCTAssertFalse(
+                CommandWrapPolicy.isSafeOrdinaryToolShellPayload(payload),
+                "unsafe or exact payload must stay raw: \(payload)"
+            )
+        }
     }
 
     func test_boundedSemicolonSegmentsOwnOnlySafeMixedCommands() throws {

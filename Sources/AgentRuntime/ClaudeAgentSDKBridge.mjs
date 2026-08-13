@@ -237,6 +237,12 @@ function isExactOutputBashCommand(toolInput) {
   return false;
 }
 
+function isExplicitDistillBashCommand(toolInput) {
+  if (!toolInput || typeof toolInput !== 'object') return false;
+  const command = typeof toolInput.command === 'string' ? toolInput.command : '';
+  return shellCommandSegments(command).some((segment) => firstCommandToken(segment) === 'distill');
+}
+
 function tokenSaverToolDecision(toolName, toolInput, output) {
   const normalized = normalizeToolName(toolName);
   // Every tool compresses (no allowlist); only exact-byte tools, Skill content,
@@ -245,6 +251,10 @@ function tokenSaverToolDecision(toolName, toolInput, output) {
   let skipReason = null;
   if (TOKEN_SAVER_EXCLUDED_TOOLS.has(normalized)) {
     skipReason = normalized === 'skill' ? 'skill_content' : 'excluded_tool';
+  } else if (normalized === 'bash' && isExplicitDistillBashCommand(toolInput)) {
+    // The explicit CLI invocation owns these bytes; PostToolUse must not run a
+    // second lossy pass over the already-distilled result.
+    skipReason = 'explicit_distill_pipeline';
   } else if (normalized === 'bash' && isExactOutputBashCommand(toolInput)) {
     skipReason = 'exact_output_shell';
   } else if (Buffer.byteLength(output || '', 'utf8') <= TOKEN_SAVER_MIN_BYTES && lineCount(output) <= TOKEN_SAVER_MIN_LINES) {
