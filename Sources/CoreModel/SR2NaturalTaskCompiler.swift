@@ -266,6 +266,7 @@ enum SR2NaturalTaskCompiler {
         let mergeBranch: String
         let destList: String
         let skill: String
+        let skillPath: String?
         let email: String
         let password: String
         let prTool: String
@@ -287,7 +288,7 @@ enum SR2NaturalTaskCompiler {
         lines = collapseLabeledCredentialLines(lines)
         guard !lines.isEmpty else { return nil }
 
-        var pipeline: (tracker: String, sourceList: String, mergeBranch: String, destList: String)?
+        var pipeline: (tracker: String, sourceList: String, mergeBranch: String, destList: String, skillPath: String?)?
         var sawBrowser = false
         var skill: String?
         var mustSkill: String?
@@ -379,6 +380,7 @@ enum SR2NaturalTaskCompiler {
             mergeBranch: pipeline.mergeBranch,
             destList: pipeline.destList,
             skill: skill,
+            skillPath: pipeline.skillPath,
             email: email,
             password: password,
             prTool: prTool.lowercased(),
@@ -394,10 +396,14 @@ enum SR2NaturalTaskCompiler {
         let commentField = delivery.tracker == "trello"
             ? "trello-comment:\(delivery.prTool).PR.url"
             : "comment:\(delivery.tracker)=\(delivery.prTool).PR.url"
+        var useField = "\(delivery.tracker)-skill,\(delivery.skill)"
+        if let skillPath = delivery.skillPath, !skillPath.isEmpty {
+            useField += ",\(skillPath)"
+        }
         return """
         \(SR2WirePolicy.optimizerMarkerLine)
         goal:\(delivery.tracker).\(delivery.sourceList)[0]>implement>verify>merge:\(delivery.mergeBranch)>verify-merge>\(delivery.tracker):\(delivery.destList)
-        use:\(delivery.tracker)-skill,\(delivery.skill)
+        use:\(useField)
         must:\(delivery.skill).all,\(delivery.skill).playwright,postdeploy-test
         browser:chrome|computer-use?
         auth:\(delivery.email)|\(delivery.password)
@@ -435,13 +441,15 @@ enum SR2NaturalTaskCompiler {
     }
 
     private static func deliveryPipeline(in line: String) -> (
-        tracker: String, sourceList: String, mergeBranch: String, destList: String
+        tracker: String, sourceList: String, mergeBranch: String, destList: String, skillPath: String?
     )? {
         guard let values = captures(
-            #"(?i)^usando a skill do ([A-Za-z][A-Za-z0-9_-]*) fa[cç]a a primeira (?:tarefa|task|card) que est[aá] no ([A-Za-z][A-Za-z0-9_-]*) e depois que tiver certeza de que tudo foi feito corretamente de merge para ([A-Za-z][A-Za-z0-9_-]*) garanta que o merge passou e mova para ([A-Za-z][A-Za-z0-9_-]*)\.?$"#,
+            #"(?i)^usando a skill do ([A-Za-z][A-Za-z0-9_-]*)(?:\s*\(([^)]+)\))? fa[cç]a a primeira (?:tarefa|task|card) que est[aá] no ([A-Za-z][A-Za-z0-9_-]*) e depois que tiver certeza de que tudo foi feito corretamente de merge para ([A-Za-z][A-Za-z0-9_-]*) garanta que o merge passou e mova para ([A-Za-z][A-Za-z0-9_-]*)\.?$"#,
             in: line
-        ), values.count == 4 else { return nil }
-        return (values[0], values[1], values[2], values[3])
+        ), values.count == 5 else { return nil }
+        let skillPath = values[1].isEmpty ? nil : values[1]
+        if let skillPath, skillPath.contains(where: \.isWhitespace) { return nil }
+        return (values[0], values[2], values[3], values[4], skillPath)
     }
 
     private static func isDeliveryBrowser(_ line: String) -> Bool {

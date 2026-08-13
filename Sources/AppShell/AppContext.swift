@@ -902,8 +902,9 @@ public final class AppContext {
                 threadId: threadId,
                 runId: runId
             )
-            // Compact compiled SR2 is sent only when it is cheaper than the
-            // natural prompt. A more verbose `u:` envelope is not sent.
+            // Every user prompt is an @sr2 v1 provider wire. Compact compiled
+            // SR2 when the local compiler produced one; otherwise the lossless
+            // u: envelope. Never send raw natural language.
             let (runtimeActive, targetModel) = await MainActor.run {
                 (self.isTokenSaverRuntimeActive(), (try? self.threadRepo.get(id: threadId))?.model)
             }
@@ -3429,12 +3430,9 @@ public final class AppContext {
             let candidate = response.output.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !candidate.isEmpty else { return (true, nil) }
             let lossless = SR2WirePolicy.userInstructionWire(prompt)
-            let decision = SR2Optimizer.optimize(
+            let decision = SR2Optimizer.adoptCompiledUserInstruction(
                 original: prompt,
-                candidates: [candidate],
-                semanticSource: semanticSource?.naturalUserText,
-                semanticSegments: [semanticSource?.naturalUserText].compactMap { $0 }
-                    + (semanticSource?.trustedHostSegments ?? []),
+                candidate: candidate,
                 targetTokenizer: "\(targetProviderModel) tokenizer-unavailable; model-agnostic-estimator-v1",
                 tokenCount: { text in
                     TokenEstimator.estimate(text == prompt ? lossless : text)
@@ -3442,13 +3440,6 @@ public final class AppContext {
             )
             guard decision.accepted else {
                 NSLog("RemoteCode Token Saver SR2 compile rejected (provider=\(provider.rawValue)): \(decision.rejectionReason ?? "unknown")")
-                return (true, nil)
-            }
-            let cheaper = Self.preferNaturalLanguageIfSR2IsMoreVerbose(
-                natural: prompt,
-                wire: decision.output
-            )
-            guard cheaper == decision.output else {
                 return (true, nil)
             }
             let inputTokens = TokenEstimator.estimate(prompt)
@@ -3503,8 +3494,8 @@ public final class AppContext {
             cacheState: cacheState,
             runId: runId
         )
-        if compiled.attempted {
-            return compiled.output ?? prompt
+        if let compiledSR2 = compiled.output {
+            return compiledSR2
         }
         // Operator per-lane kill switch (incident control) — same decision child env exports.
         if tokenSaverLaneIsDisabled("deterministic_wrapper") {
@@ -3746,10 +3737,8 @@ public final class AppContext {
         }
     }
 
-    /// Provider-facing user leg. Compact compiled SR2 is sent only when it is
-    /// actually cheaper than the natural prompt. A `u:` envelope around a short
-    /// prompt is more verbose than the prose, so Claude/Codex/Grok receive the
-    /// natural language instead.
+    /// Provider-facing user leg. Every non-empty prompt becomes `@sr2 v1`.
+    /// Compact compiled IR is preferred; otherwise the lossless `u:` envelope.
     nonisolated public static func alwaysOnSR2UserInstruction(
         _ compressed: String,
         preservesKnownInternalProtocol: Bool = false,
@@ -3842,40 +3831,10 @@ public final class AppContext {
                 ? compiled.output
                 : SR2WirePolicy.userInstructionWire(candidate)
         }
-        return preferNaturalLanguageIfSR2IsMoreVerbose(
-            natural: providerNaturalUserText(
-                candidate: candidate,
-                wire: wire,
-                losslessFallback: losslessFallback
-            ),
-            wire: wire,
-            tokenCount: targetTokenCount
-        )
+        return wire
     }
 
-    /// Natural text to compare against the SR2 wire. A `u:` envelope is judged
-    /// against the prose it encodes. Compiled SR2 is judged against the original
-    /// user prompt when the caller still has it.
-    private nonisolated static func providerNaturalUserText(
-        candidate: String,
-        wire: String,
-        losslessFallback: String?
-    ) -> String {
-        if let decoded = SR2WirePolicy.userInstruction(in: wire) {
-            return decoded
-        }
-        if let losslessFallback, !losslessFallback.isEmpty,
-           isKnownInternalSR2(wire) || isKnownInternalSR2(candidate) {
-            return losslessFallback
-        }
-        if let decoded = SR2WirePolicy.userInstruction(in: candidate) {
-            return decoded
-        }
-        return losslessFallback ?? candidate
-    }
-
-    /// Providers must not pay an SR2 envelope that is longer than the prose it
-    /// encodes. Token count is the Token Saver unit; character count breaks ties
+    /// Token count is the Token Saver unit; character count breaks ties
     /// when the estimator rounds a short `u:` wrap up to the same token total.
     nonisolated static func preferNaturalLanguageIfSR2IsMoreVerbose(
         natural: String,

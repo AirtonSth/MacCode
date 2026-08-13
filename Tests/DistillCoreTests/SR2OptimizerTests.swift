@@ -233,6 +233,194 @@ final class SR2OptimizerTests: XCTestCase {
         )
     }
 
+    func testCompileTurnsAnyUserPromptIntoCompressedSR2() {
+        // WHY: every user prompt — not just Trello/Linear fixtures — must leave
+        // the host as compact @sr2 v1. A lossless u: dump of the essay is not
+        // compression and is not what the provider should pay for.
+        let snake = "eu quero que voce crie o jogo da cobrinha usando react, vite e typescript"
+        let ads = """
+        Estude a fundo: [AgriciDaniel/claude-ads](https://github.com/AgriciDaniel/claude-ads) (skill instalado aqui globalmente)
+
+        E então use @chrome @Google Ads Editor para exportar todos os dados que você precisa.
+        Exporte sempre somente as campanhas ativas e uma janela de 14 dias.
+
+        E então eu quero que você use o: [AgriciDaniel/claude-ads](https://github.com/AgriciDaniel/claude-ads) para gerar um estudo completo para mim de todo o meu ads.
+
+        Gere tudo aqui nessa pasta e em .html em portugues do brasil orientado para humanos.
+
+        Seu goal só estará completo quando você explorar ao máximo o: [AgriciDaniel/claude-ads](https://github.com/AgriciDaniel/claude-ads) e fazer todo estudo e planejamento do meu ads.
+
+        O nosso objetivo é atrair cada vez mais clientes que pagam, pagamento menos e lucrando mais.
+
+        Você está liberado para exportar e ler todos os dados necessários mas você não pode modificar nada no Google ads, ou seja, READ ONLY TOTAL no Google Ads de produção.
+
+        Atenção: Na conversão Gerou Orçamento - Offline está mostrando o valor de orçamentos gerados não de venda, não considere isso como resultado de vendas ou retorno. São apenas os orçamentos gerados.
+        """
+        let loop = "do a loop of /sam-create-test-coverage and /sam-refine-task untill you have 100% sure that everything works with no bugs."
+        let prAgent = """
+        You are an autonomous GitHub PR maintenance agent.
+
+        Your goal is to bring ALL my open pull requests (user: samuelfaj) to a merge-ready state.
+
+        Check only the Repositories:
+        - https://github.com/EmpathMSP/empath-ui
+        - https://github.com/EmpathMSP/empath-api-v2
+        - https://github.com/EmpathMSP/empath-auth-infra
+
+        user samuelfaj
+
+        You MUST use the GitHub CLI (`gh`) for all operations.
+
+        Do not ask me anything, choose the best actions and be fully autonomous.
+
+        Only stop when ALL conditions are true:
+        1. No PR has merge conflicts
+        2. All CI pipelines are passing
+        3. All review comments have been addressed (resolved or replied)
+        4. No pending requested changes remain
+
+        Fetch all open PRs:
+        - `gh pr list --state open --json number,title,headRefName,baseRefName,reviewDecision`
+
+        If any check is failing, fix the root cause, then `gh pr checks <PR_NUMBER>`.
+        If it is possible to merge (mergeable) to main, do the merge.
+        """
+
+        let cases: [(String, [String])] = [
+            (snake, ["react", "vite", "typescript", "cobrinha"]),
+            (ads, [
+                "https://github.com/AgriciDaniel/claude-ads",
+                "chrome",
+                "14",
+            ]),
+            (loop, ["/sam-create-test-coverage", "/sam-refine-task"]),
+            (prAgent, [
+                "https://github.com/EmpathMSP/empath-ui",
+                "https://github.com/EmpathMSP/empath-api-v2",
+                "https://github.com/EmpathMSP/empath-auth-infra",
+                "gh pr list",
+                "samuelfaj",
+            ]),
+        ]
+
+        for (prompt, required) in cases {
+            let open = SR2OpenPromptCompiler.candidate(for: prompt)
+            XCTAssertNotNil(open, "open compiler must emit compact IR for: \(prompt.prefix(60))…")
+            let decision = SR2Optimizer.compile(original: prompt)
+            XCTAssertTrue(
+                decision.accepted,
+                "\(prompt.prefix(40))… \(decision.rejectionReason ?? "") open=\(open ?? "nil")"
+            )
+            XCTAssertTrue(SR2WirePolicy.isCurrentSR2(decision.output), decision.output)
+            XCTAssertNil(SR2WirePolicy.userInstruction(in: decision.output),
+                         "compressed IR must not be a lossless u: wrap: \(decision.output)")
+            XCTAssertLessThan(decision.optimizedTokens, decision.originalTokens, decision.output)
+            XCTAssertLessThan(decision.output.utf8.count, prompt.utf8.count, decision.output)
+            for needle in required {
+                XCTAssertTrue(
+                    decision.output.localizedCaseInsensitiveContains(needle),
+                    "missing \(needle) in \(decision.output)"
+                )
+            }
+        }
+    }
+
+    func testAdoptCompiledUserInstructionAcceptsArbitraryPromptWithoutTemplateMatch() {
+        // WHY: v1 field names are the wire grammar, not a required source
+        // template. An essay that matches no Trello/Linear regex must still
+        // become compact @sr2 v1 when the local LLM emits a cheaper valid wire.
+        let prompt = """
+        Please write a one-page architecture note about Token Saver dual-channel
+        history, then email the draft to architect@example.com and attach
+        /Users/example/notes/token-saver.md as the only attachment. Keep the
+        file path and email exact. After the note is filed, list three follow-up questions.
+        """
+        let wire = """
+        @sr2 v1
+        goal:write-arch-note>email-draft>list-followups
+        use:/Users/example/notes/token-saver.md
+        must:architect@example.com
+        done:note+email+questions
+        """
+        XCTAssertNil(SR2NaturalTaskCompiler.candidate(for: prompt),
+                     "this fixture must not accidentally match a fixed template")
+        let decision = SR2Optimizer.adoptCompiledUserInstruction(
+            original: prompt,
+            candidate: wire,
+            targetTokenizerAvailable: true,
+            tokenCount: { $0 == prompt ? 10_000 : 80 }
+        )
+        XCTAssertTrue(decision.accepted, decision.rejectionReason ?? "")
+        XCTAssertEqual(decision.output, wire)
+        XCTAssertTrue(SR2WirePolicy.isCurrentSR2(decision.output), decision.output)
+    }
+
+    func testAdoptCompiledUserInstructionRejectsDroppedIdentityLiteral() {
+        // WHY: compiling any prompt is not a license to drop an email, URL, or path.
+        let prompt = """
+        Summarize Token Saver for the on-call doc at /Users/example/notes/oncall.md
+        and send it to architect@example.com before Friday.
+        """
+        let droppedEmail = """
+        @sr2 v1
+        goal:summarize>send
+        use:/Users/example/notes/oncall.md
+        done:summary
+        """
+        let droppedPath = """
+        @sr2 v1
+        goal:summarize>send
+        must:architect@example.com
+        done:summary
+        """
+        for candidate in [droppedEmail, droppedPath] {
+            let decision = SR2Optimizer.adoptCompiledUserInstruction(
+                original: prompt,
+                candidate: candidate,
+                targetTokenizerAvailable: true,
+                tokenCount: { $0 == prompt ? 10_000 : 80 }
+            )
+            XCTAssertFalse(decision.accepted, candidate)
+            XCTAssertEqual(decision.output, prompt)
+            XCTAssertTrue(decision.rejectionReason?.contains("literal missing") == true,
+                          decision.rejectionReason ?? candidate)
+        }
+    }
+
+    func testAdoptCompiledUserInstructionKeepsParentheticalSkillPathWithoutAFixedRegex() {
+        // WHY: live prompts may annotate a skill with `(…/path)`. Compact
+        // compiled v1 must keep the path. LLM adopt and the host compiler
+        // both have to produce cheaper @sr2 v1, not a u: dump of the essay.
+        let prompt = trelloDeliveryPrompt.replacingOccurrences(
+            of: "Usando a skill do trello faça",
+            with: "Usando a skill do trello (/Users/example/skills/star-trello) faça"
+        )
+        let wire = """
+        @sr2 v1
+        goal:trello.Doing[0]>implement>verify>merge:main>verify-merge>trello:Testing
+        use:trello-skill,/sam-task,/Users/example/skills/star-trello
+        must:/sam-task.all,/sam-task.playwright,postdeploy-test
+        browser:chrome|computer-use?
+        auth:jgregory@starsacramento.org|zoey is the best
+        pr:gh,!glab
+        trello-comment:gh.PR.url
+        done:sam-task.all+playwright+deploy+postdeploy-test+merge-verified+trello-testing
+        """
+        let compiled = SR2Optimizer.compile(original: prompt)
+        XCTAssertTrue(compiled.accepted, compiled.rejectionReason ?? "")
+        XCTAssertEqual(compiled.output, wire)
+        let decision = SR2Optimizer.adoptCompiledUserInstruction(
+            original: prompt,
+            candidate: wire,
+            targetTokenizerAvailable: true,
+            tokenCount: { $0 == prompt ? 10_000 : 80 }
+        )
+        XCTAssertTrue(decision.accepted, decision.rejectionReason ?? "")
+        XCTAssertEqual(decision.output, wire)
+        XCTAssertTrue(decision.output.contains("/Users/example/skills/star-trello"), decision.output)
+        XCTAssertLessThan(TokenEstimator.estimate(wire), TokenEstimator.estimate(prompt))
+    }
+
     func testTrackerDeliveryCompilerUsesTheSameGrammarForAnotherTracker() {
         // WHY: the production incident was Trello, but the compiler is a
         // tracker-delivery grammar, not a Trello keyword special case.
@@ -279,10 +467,12 @@ final class SR2OptimizerTests: XCTestCase {
         ]
 
         for source in outsideGrammar {
+            XCTAssertNil(SR2NaturalTaskCompiler.candidate(for: source), source)
             let decision = SR2Optimizer.compile(original: source)
-            XCTAssertFalse(decision.accepted, decision.output)
-            XCTAssertEqual(decision.output, source,
-                           "unbound tracker-delivery prose must remain byte-exact for the lossless caller fallback")
+            XCTAssertTrue(decision.accepted, decision.rejectionReason ?? source)
+            XCTAssertTrue(SR2WirePolicy.isCurrentSR2(decision.output), decision.output)
+            XCTAssertNil(SR2WirePolicy.userInstruction(in: decision.output), decision.output)
+            XCTAssertLessThan(decision.optimizedTokens, decision.originalTokens)
         }
     }
 
@@ -405,10 +595,11 @@ final class SR2OptimizerTests: XCTestCase {
         ]
 
         for source in outsideGrammar {
+            XCTAssertNil(SR2NaturalTaskCompiler.candidate(for: source), source)
             let decision = SR2Optimizer.compile(original: source)
-            XCTAssertFalse(decision.accepted, decision.output)
-            XCTAssertEqual(decision.output, source,
-                           "unbound prose must remain byte-exact for the lossless caller fallback")
+            XCTAssertTrue(decision.accepted, decision.rejectionReason ?? source)
+            XCTAssertTrue(SR2WirePolicy.isCurrentSR2(decision.output), decision.output)
+            XCTAssertLessThan(decision.optimizedTokens, decision.originalTokens)
         }
     }
 
@@ -452,13 +643,11 @@ final class SR2OptimizerTests: XCTestCase {
         ]
 
         for source in unboundSemanticAtoms {
+            XCTAssertNil(SR2NaturalTaskCompiler.candidate(for: source), source)
             let decision = SR2Optimizer.compile(original: source)
-            XCTAssertFalse(decision.accepted, decision.output)
-            XCTAssertEqual(
-                decision.output,
-                source,
-                "untyped logical, conditional, and modal prose must fail open losslessly"
-            )
+            XCTAssertTrue(decision.accepted, decision.rejectionReason ?? source)
+            XCTAssertTrue(SR2WirePolicy.isCurrentSR2(decision.output), decision.output)
+            XCTAssertLessThan(decision.optimizedTokens, decision.originalTokens)
         }
     }
 
@@ -752,10 +941,6 @@ final class SR2OptimizerTests: XCTestCase {
 
         XCTAssertFalse(decision.accepted, decision.rejectionReason ?? "")
         XCTAssertEqual(decision.output, providerPrompt)
-        XCTAssertTrue(
-            decision.rejectionReason?.contains("requirement") == true
-                || decision.rejectionReason?.contains("literal") == true,
-                      decision.rejectionReason ?? "")
         XCTAssertTrue(decision.output.contains("SESSION_LEARN_EXACT_SCOPE:"))
         XCTAssertTrue(decision.output.contains(learned))
 
@@ -1249,8 +1434,9 @@ final class SR2OptimizerTests: XCTestCase {
 
         let shellAmbiguity = "Execute apenas `printf 'a; b'; command -v distill` e retorne exatamente as duas linhas. Não edite arquivos."
         let shellDecision = SR2Optimizer.compile(original: shellAmbiguity)
-        XCTAssertFalse(shellDecision.accepted)
-        XCTAssertEqual(shellDecision.output, shellAmbiguity)
+        XCTAssertTrue(shellDecision.accepted, shellDecision.rejectionReason ?? "")
+        XCTAssertTrue(SR2WirePolicy.isCurrentSR2(shellDecision.output), shellDecision.output)
+        XCTAssertTrue(shellDecision.output.contains("printf"), shellDecision.output)
     }
 
     func testOptimizerRejectsCandidateThatLosesOrderingOrCompletionGate() {

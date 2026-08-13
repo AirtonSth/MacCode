@@ -15,6 +15,29 @@ final class LossyProseGuardTests: XCTestCase {
         XCTAssertEqual(guarded, input, "dropping a load-bearing literal => reject lossy output, send original (N5)")
     }
 
+    func test_longText_adoptsArbitraryValidSR2WithoutAFixedTemplate() {
+        // WHY: longText is the NL → @sr2 v1 compiler. The sidecar must not
+        // wipe a cheaper valid wire just because it is not a Trello/Linear match.
+        let input = """
+        Please write a one-page architecture note about Token Saver dual-channel
+        history, then email the draft to architect@example.com and attach
+        /Users/example/notes/token-saver.md as the only attachment. Keep the
+        file path and email exact. After the note is filed, list three follow-up questions.
+        """
+        let compiled = """
+        @sr2 v1
+        goal:write-arch-note>email-draft>list-followups
+        use:/Users/example/notes/token-saver.md
+        must:architect@example.com
+        done:note+email+questions
+        """
+        let guarded = MLXDistillRuntime.guardLossyProseOutput(
+            compiled,
+            request: DistillRequest(mode: .longText, input: input, skipDeterministicRouting: true)
+        )
+        XCTAssertEqual(guarded, compiled)
+    }
+
     func test_longText_acceptsOutputThatKeepsLiterals() {
         let input = """
         Use Trello or Playwright. After Playwright verification succeeds, merge with gh.

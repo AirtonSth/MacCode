@@ -661,19 +661,109 @@ public enum SR2Optimizer {
             candidates.append(naturalTask)
         }
         let losslessV1 = SR2WirePolicy.userInstructionWire(original)
-        return optimize(
+        let adjustedCount: TokenCounter = { text in
+            // Compare compact IR against the lossless u: envelope the host
+            // would otherwise send, not against raw UI prose.
+            tokenCount(text == original ? losslessV1 : text)
+        }
+        let specialized = optimize(
             original: original,
             candidates: candidates,
             semanticSource: semanticSource,
             semanticSegments: semanticSegments,
             targetTokenizer: targetTokenizer,
             targetTokenizerAvailable: targetTokenizerAvailable,
-            tokenCount: { text in
-                // The always-on provider boundary will emit lossless v1 when
-                // semantic compilation is rejected, so that wire—not raw UI
-                // prose—is the honest target-token comparison baseline.
-                tokenCount(text == original ? losslessV1 : text)
+            tokenCount: adjustedCount
+        )
+        if specialized.accepted { return specialized }
+        // Only encode a general compact IR when no specialized candidate
+        // existed. A rejected command/natural-task candidate must stay
+        // fail-open (token margin, shell ambiguity) rather than be replaced
+        // by a looser bag-of-words spelling.
+        if candidates.isEmpty, let open = SR2OpenPromptCompiler.candidate(for: source) {
+            // Host-encoded compact IR is not an untrusted model guess. Require
+            // only a real token win against the lossless envelope.
+            let adopted = adoptCompiledUserInstruction(
+                original: original,
+                candidate: open,
+                targetTokenizer: targetTokenizer,
+                targetTokenizerAvailable: true,
+                tokenCount: adjustedCount
+            )
+            if adopted.accepted { return adopted }
+            if !specialized.accepted { return adopted }
+        }
+        return specialized
+    }
+
+    /// Adopt a local-LLM compile of any user prompt into `@sr2 v1`.
+    ///
+    /// `goal:` / `use:` / `must:` and the other v1 keys are the wire grammar,
+    /// not a required source template. Exclusive Trello/Linear line-binders are
+    /// not consulted. Identity pins (paths, emails, URLs, file:line, hashes)
+    /// must survive; if the candidate is invalid or not cheaper, fail open.
+    public static func adoptCompiledUserInstruction(
+        original: String,
+        candidate: String,
+        targetTokenizer: String = "target-tokenizer-unavailable; model-agnostic-estimator-v1",
+        targetTokenizerAvailable: Bool = false,
+        tokenCount: TokenCounter = { TokenEstimator.estimate($0) }
+    ) -> SR2OptimizationDecision {
+        let text = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        let originalTokens = max(0, tokenCount(original))
+        func rejected(_ reason: String) -> SR2OptimizationDecision {
+            SR2OptimizationDecision(
+                output: original,
+                targetTokenizer: targetTokenizer,
+                targetTokenizerAvailable: targetTokenizerAvailable,
+                originalTokens: originalTokens,
+                optimizedTokens: originalTokens,
+                reductionPercent: 0,
+                semanticCoverage: 0,
+                accepted: false,
+                rejectionReason: reason
+            )
+        }
+        guard hasSupportedOptimizerBanner(text) else {
+            return rejected("candidate is missing the exact supported optimizer banner: @sr2 v1")
+        }
+        guard SR2WirePolicy.isSR2(text) else {
+            return rejected("candidate is not valid SR2")
+        }
+        let fields = candidateV1Fields(in: text)
+        let keys = Set(fields.map(\.key))
+        if fields.contains(where: { $0.key == "<invalid>" }) {
+            return rejected("candidate is not valid SR2")
+        }
+        if let unknown = keys.subtracting(recognizedV1FieldKeys).sorted().first {
+            return rejected("unrecognized v1 field: \(unknown)")
+        }
+        if let dropped = firstMissingIdentityLiteral(original: original, candidate: text) {
+            return rejected("literal missing: \(dropped)")
+        }
+        let tokens = max(0, tokenCount(text))
+        guard tokens < originalTokens else {
+            return rejected("candidate does not reduce actual target-tokenizer tokens")
+        }
+        if !targetTokenizerAvailable {
+            let saved = originalTokens - tokens
+            guard saved >= 2, tokens * 100 <= originalTokens * 80 else {
+                return rejected("target tokenizer unavailable and estimator margin is not safely net-positive")
             }
+        }
+        let reduction = originalTokens > 0
+            ? (Double(originalTokens - tokens) / Double(originalTokens)) * 100
+            : 0
+        return SR2OptimizationDecision(
+            output: text,
+            targetTokenizer: targetTokenizer,
+            targetTokenizerAvailable: targetTokenizerAvailable,
+            originalTokens: originalTokens,
+            optimizedTokens: tokens,
+            reductionPercent: reduction,
+            semanticCoverage: 1,
+            accepted: true,
+            rejectionReason: nil
         )
     }
 
@@ -1304,13 +1394,27 @@ public enum SR2Optimizer {
         return nil
     }
 
+    private static func firstMissingIdentityLiteral(original: String, candidate: String) -> String? {
+        let ir = SR2SemanticIR.parse(original)
+        if let dropped = firstMissingLiteral(ir: ir, candidate: candidate) {
+            let stripped = dropped.trimmingCharacters(in: CharacterSet(charactersIn: ".,;:!?\"'"))
+            if stripped.isEmpty || !candidate.contains(stripped) {
+                return dropped
+            }
+        }
+        let compactCandidate = compactSemanticKey(candidate)
+        for anchor in ir.anchors where !candidate.localizedCaseInsensitiveContains(anchor)
+            && !compactCandidate.contains(compactSemanticKey(anchor)) {
+            return anchor
+        }
+        return nil
+    }
+
     private static func firstMissingLiteral(ir: SR2SemanticIR, candidate: String) -> String? {
         let command = ir.orderedCommands.joined(separator: "; ")
         for literal in LiteralPreservation.pinnedLiterals(in: ir.source) {
             if candidate.contains(literal) { continue }
-            let literalBody = literal.hasPrefix("`") && literal.hasSuffix("`")
-                ? String(literal.dropFirst().dropLast())
-                : literal
+            let literalBody = SR2OpenPromptCompiler.normalizePin(literal)
             let compactLiteral = literalBody.replacingOccurrences(of: "; ", with: ";")
             if candidate.contains(compactLiteral) { continue }
             if literal.hasPrefix("`"), literal.hasSuffix("`"),

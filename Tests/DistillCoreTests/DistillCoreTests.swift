@@ -288,6 +288,22 @@ final class DistillCoreTests: XCTestCase {
             DistillResultCacheKey(request: base, modelRevision: "model-a", pipelineVersion: "pipeline-v2"),
             "pipelineVersion is part of the cache key so crusher or literal-preservation changes invalidate stale hits"
         )
+        let compileRequest = DistillRequest(
+            mode: .longText,
+            input: "alpha\nbeta",
+            maxOutputCharacters: 400,
+            skipDeterministicRouting: true
+        )
+        let compressRequest = DistillRequest(
+            mode: .longText,
+            input: "alpha\nbeta",
+            maxOutputCharacters: 400
+        )
+        XCTAssertNotEqual(
+            DistillResultCacheKey(request: compileRequest),
+            DistillResultCacheKey(request: compressRequest),
+            "NL→SR2 compile must not reuse a cached compress/echo of the same input"
+        )
     }
 
     func test_schedulerDoesNotCacheOutputsWithUnvalidatedRetrieveHandles() async throws {

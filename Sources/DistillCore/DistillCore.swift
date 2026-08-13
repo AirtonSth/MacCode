@@ -681,6 +681,7 @@ public struct DistillResultCacheKey: Hashable, Sendable, Equatable {
     public let maxOutputCharacters: Int
     public let modelRevision: String
     public let pipelineVersion: String
+    public let skipDeterministicRouting: Bool
 
     public init(
         request: DistillRequest,
@@ -693,6 +694,7 @@ public struct DistillResultCacheKey: Hashable, Sendable, Equatable {
         self.maxOutputCharacters = request.maxOutputCharacters
         self.modelRevision = modelRevision
         self.pipelineVersion = pipelineVersion
+        self.skipDeterministicRouting = request.shouldSkipDeterministicRouting
     }
 
     private static func sha256Hex(_ value: String) -> String {
@@ -1798,9 +1800,11 @@ public struct MLXDistillRuntime: DistillRuntime {
     static func guardLossyProseOutput(_ output: String, request: DistillRequest) -> String {
         switch request.mode {
         case .longText:
-            return SR2Optimizer.optimize(
+            // User-prompt compilation: any NL → @sr2 v1. Do not require a
+            // Trello/Linear template match; wipe only invalid or costlier wires.
+            return SR2Optimizer.adoptCompiledUserInstruction(
                 original: request.input,
-                candidates: [output],
+                candidate: output,
                 targetTokenizer: request.provider.map {
                     "\($0)-unavailable; model-agnostic-estimator-v1"
                 } ?? "model-agnostic-estimator-v1"
