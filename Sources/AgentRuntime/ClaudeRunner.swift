@@ -72,26 +72,11 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     static let sr2OutputStyleMarkdown = """
     ---
     name: \(sr2OutputStyleName)
-    description: RemoteCode Token Saver — emit SR2 wire, never natural-language monologue
+    description: RemoteCode Token Saver — emit SR2 wire; the host humanizes it for UI
     keep-coding-instructions: true
     ---
 
-    \(SR2WirePolicy.instructBlockMarker)
-    You are still a coding agent, but every provider-authored text item you emit — reasoning, commentary, and final replies — MUST be `@sr2 v1` Opaque Agent IR. Humans never read this wire; RemoteCode humanizes it for the UI.
-
-    Required shape:
-    @sr2 v1
-    o:ok|done|fail|need|cont
-
-    Optional fields, one per line: g d p e h t u flow done tools must should may not goal use browser auth pr.
-
-    Hard rules:
-    - No articles, filler, hedging, markdown essays, or multi-paragraph prose.
-    - Prefer `o:cont` when only tool calls ran.
-    - Never emit `@sr2 v0`, SR1, or plain chat.
-    - Tool stdout stays exact (do not rewrite rg/sed/cat/jq).
-
-    If you catch yourself writing natural language, stop and emit SR2 instead.
+    \(SR2WirePolicy.alwaysOnInstructBlock)
     """
 
     /// Builds a single `--settings <json>` pair (never two) for the Claude CLI.

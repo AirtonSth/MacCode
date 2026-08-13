@@ -179,7 +179,6 @@ final class SR2WirePolicyTests: XCTestCase {
         let wire = SR2WirePolicy.trackerDeliveryV1Sample
         XCTAssertTrue(SR2WirePolicy.isSR2(wire), wire)
         XCTAssertTrue(SR2WirePolicy.isCurrentSR2(wire), wire)
-        XCTAssertTrue(SR2WirePolicy.alwaysOnInstructBlock.contains(wire), wire)
         XCTAssertTrue(SR2WirePolicy.structuredFieldKeys.contains("goal"))
         XCTAssertTrue(SR2WirePolicy.structuredFieldKeys.contains("trello-comment"))
     }
@@ -194,8 +193,6 @@ final class SR2WirePolicyTests: XCTestCase {
 
         XCTAssertTrue(SR2WirePolicy.isSR2(wire), wire)
         XCTAssertTrue(SR2WirePolicy.isCurrentSR2(wire), wire)
-        XCTAssertTrue(SR2WirePolicy.alwaysOnInstructBlock.contains("run:a;b"))
-        XCTAssertTrue(SR2WirePolicy.alwaysOnInstructBlock.contains("!file-edit"))
     }
 
     func testAcceptsIndexedPerCommandOutputCardinalityV1Field() {
@@ -209,9 +206,6 @@ final class SR2WirePolicyTests: XCTestCase {
 
         XCTAssertTrue(SR2WirePolicy.isSR2(wire), wire)
         XCTAssertTrue(SR2WirePolicy.isCurrentSR2(wire), wire)
-        XCTAssertTrue(SR2WirePolicy.alwaysOnInstructBlock.contains("run:[a;b]>[c]"))
-        XCTAssertTrue(SR2WirePolicy.alwaysOnInstructBlock.contains("separate ordered shell tool calls"))
-        XCTAssertTrue(SR2WirePolicy.alwaysOnInstructBlock.contains("explicit `| distill`"))
     }
 
     func testMalformedBannerFallsIntoFreeProseEnforcement() {
@@ -297,6 +291,20 @@ final class SR2WirePolicyTests: XCTestCase {
             providerHistoryText: wire,
             uiHumanizedText: "Fixed the bug in a.swift line 1."
         ))
+    }
+
+    func testAlwaysOnInstructDocumentsSparseV1ResponseContract() {
+        // WHY: providers receive typed user text. The always-on block only
+        // teaches the reply wire — not how to decode a compiled user prompt.
+        let block = SR2WirePolicy.alwaysOnInstructBlock
+        XCTAssertTrue(block.contains("Humans never read this wire; the host humanizes it for UI."))
+        XCTAssertTrue(block.contains("Every response MUST start with exactly:"))
+        XCTAssertTrue(block.contains(SR2WirePolicy.advertisedV1Sample))
+        XCTAssertTrue(block.contains("All other fields are optional"))
+        XCTAssertTrue(block.contains("Never emit empty, null, unknown, or placeholder fields"))
+        XCTAssertFalse(block.contains("User input may arrive"))
+        XCTAssertFalse(block.contains("goal:trello.Doing[0]"))
+        XCTAssertFalse(block.contains("u:<lossless"))
     }
 
     func testAlwaysOnInstructAppendsOnce() {

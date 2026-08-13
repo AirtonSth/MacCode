@@ -492,8 +492,9 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                       "style must keep Claude Code coding/safety instructions")
         XCTAssertTrue(markdown.contains("name: \(ClaudeRunner.sr2OutputStyleName)"))
         XCTAssertTrue(markdown.contains(SR2WirePolicy.instructBlockMarker))
+        XCTAssertTrue(markdown.contains(SR2WirePolicy.alwaysOnInstructBlock))
         XCTAssertTrue(markdown.contains("@sr2 v1"))
-        XCTAssertTrue(markdown.contains("No articles, filler"))
+        XCTAssertTrue(markdown.contains("Humans never read this wire; the host humanizes it for UI."))
         XCTAssertFalse(markdown.contains("@sr2 v0 Opaque"),
                        "must not advertise legacy v0 as a legal wire")
     }

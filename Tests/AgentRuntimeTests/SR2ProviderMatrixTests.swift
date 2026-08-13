@@ -20,19 +20,22 @@ final class SR2ProviderMatrixTests: XCTestCase {
 
     func testTokenSaverProviderPromptRequiresSR2ForEveryProviderAuthoredTextItem() {
         // WHY: a final-only rule still lets visible reasoning/commentary leak
-        // PT/EN into the transcript and provider history.
+        // PT/EN into the transcript and provider history. Distill names every
+        // authored item; the always-on block is the sparse reply wire.
         let prompt = AgentSkillInstaller.tokenSaverProviderPrompt(
             "",
             environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
         )
 
-        XCTAssertTrue(prompt.contains("Every provider-authored text item"), prompt)
+        XCTAssertTrue(prompt.contains("every provider-authored text item"), prompt)
         XCTAssertTrue(prompt.contains("reasoning"), prompt)
         XCTAssertTrue(prompt.contains("commentary"), prompt)
         XCTAssertTrue(prompt.contains("Tool stdout stays exact"), prompt)
-        XCTAssertTrue(prompt.contains("@sr2 v1"), prompt)
+        XCTAssertTrue(prompt.contains("Every response MUST start with exactly:"), prompt)
+        XCTAssertTrue(prompt.contains(SR2WirePolicy.advertisedV1Sample), prompt)
+        XCTAssertTrue(prompt.contains("All other fields are optional"), prompt)
         XCTAssertFalse(prompt.contains("Format:\n@sr2 v0"), prompt)
-        XCTAssertTrue(prompt.contains("Never emit legacy `@sr2 v0`"), prompt)
+        XCTAssertTrue(prompt.contains("Never emit legacy @sr2 v0"), prompt)
         XCTAssertFalse(prompt.contains("fallback only if you cannot emit SR2"), prompt)
     }
 

@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import CoreModel
 
 // MARK: - Scoped recovery
 
@@ -302,7 +303,7 @@ public final class TokenSaverScopedRecoveryStore: @unchecked Sendable {
         scope: TokenSaverPersistentScope,
         now: Date = Date()
     ) throws -> Data? {
-        guard capability.hasPrefix("rcv1.") else { return nil }
+        guard TokenSaverRecoveryCapability.isValid(capability) else { return nil }
         let capabilityHash = Self.sha256(Data(capability.utf8))
         let nowMS = Self.milliseconds(now)
         return try db.performSync { database in
@@ -428,9 +429,9 @@ public final class TokenSaverScopedRecoveryStore: @unchecked Sendable {
         guard scope.isComplete else { throw TokenSaverRecoveryStoreError.incompleteScope }
         let stageKey = stage.idempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let fullKey = fullOriginal.map { $0.idempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines) }
-        guard !stageKey.isEmpty, stage.capability.hasPrefix("rcv1.") else { return false }
+        guard !stageKey.isEmpty, TokenSaverRecoveryCapability.isValid(stage.capability) else { return false }
         if let fullOriginal {
-            guard let fullKey, !fullKey.isEmpty, fullOriginal.capability.hasPrefix("rcv1.") else {
+            guard let fullKey, !fullKey.isEmpty, TokenSaverRecoveryCapability.isValid(fullOriginal.capability) else {
                 return false
             }
         }
@@ -659,7 +660,7 @@ public final class TokenSaverScopedRecoveryStore: @unchecked Sendable {
     ) throws -> Bool {
         guard scope.isComplete else { throw TokenSaverRecoveryStoreError.incompleteScope }
         let normalizedKey = idempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedKey.isEmpty, capability.hasPrefix("rcv1.") else { return false }
+        guard !normalizedKey.isEmpty, TokenSaverRecoveryCapability.isValid(capability) else { return false }
         let nowMS = Self.milliseconds(now)
         let capabilityHash = Self.sha256(Data(capability.utf8))
         return try db.performSync { database in
@@ -1003,19 +1004,30 @@ public final class TokenSaverScopedRecoveryStore: @unchecked Sendable {
             try revoke.bind(2, objectID)
             _ = try revoke.step()
         }
-        let secret = UUID().uuidString.lowercased() + UUID().uuidString.lowercased()
-        let capability = "rcv1.\(objectID).\(secret)"
+        let exists = try database.prepare("""
+            SELECT 1 FROM token_saver_recovery_capabilities WHERE capability_hash = ? LIMIT 1;
+        """)
+        defer { exists.reset() }
         let statement = try database.prepare("""
             INSERT INTO token_saver_recovery_capabilities
                 (capability_hash, object_id, revoked_at_ms, created_at_ms)
             VALUES (?, ?, NULL, ?);
         """)
         defer { statement.reset() }
-        try statement.bind(1, Self.sha256(Data(capability.utf8)))
-        try statement.bind(2, objectID)
-        try statement.bind(3, nowMS)
-        _ = try statement.step()
-        return capability
+        for _ in 0..<8 {
+            let capability = TokenSaverRecoveryCapability.mint()
+            let hash = Self.sha256(Data(capability.utf8))
+            try exists.bind(1, hash)
+            let taken = try exists.step()
+            exists.reset()
+            if taken { continue }
+            try statement.bind(1, hash)
+            try statement.bind(2, objectID)
+            try statement.bind(3, nowMS)
+            _ = try statement.step()
+            return capability
+        }
+        throw TokenSaverRecoveryStoreError.operationUnavailable
     }
 
     private func authorizedObjectID(
@@ -1024,7 +1036,7 @@ public final class TokenSaverScopedRecoveryStore: @unchecked Sendable {
         scope: TokenSaverPersistentScope,
         nowMS: Int64
     ) throws -> String? {
-        guard capability.hasPrefix("rcv1.") else { return nil }
+        guard TokenSaverRecoveryCapability.isValid(capability) else { return nil }
         let statement = try database.prepare("""
             SELECT o.id
             FROM token_saver_recovery_capabilities c

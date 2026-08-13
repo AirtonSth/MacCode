@@ -33,11 +33,11 @@ final class TokenSaverTypedCrushersBridgeTests: XCTestCase {
     }
 
     func test_extractRecoveryHandles_hexAndRcv1() {
-        let out = "see [[rc:deadbeefcafebabe]] and [[rc:rcv1.550e8400-e29b-41d4-a716-446655440000.secret]]"
+        let out = "see [[rc:deadbeefcafebabe]] and [[rc:rcv1.ae525256]]"
         let hs = TokenSaverTypedCrushersBridge.extractRecoveryHandles(from: out)
         XCTAssertEqual(hs.count, 2)
         XCTAssertTrue(hs.contains("deadbeefcafebabe"))
-        XCTAssertTrue(hs.contains("rcv1.550e8400-e29b-41d4-a716-446655440000.secret"))
+        XCTAssertTrue(hs.contains("rcv1.ae525256"))
     }
 
     func test_searchScopeRequiresBindingDigestMatch() {

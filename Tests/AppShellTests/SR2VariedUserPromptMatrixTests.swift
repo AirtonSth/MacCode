@@ -1,27 +1,9 @@
 import XCTest
-import Foundation
-import Persistence
-import AgentRuntime
-import DistillCore
 @testable import CoreModel
-@testable import AppShell
 
-/// 100 free-form user prompts through the **local Distill LLM**, then the
-/// same always-on send path production uses.
-///
-/// CI skips this (no model, no GPU budget). Locally it loads the installed
-/// Token Saver MLX model and requires a real `llm_mlx` hop. The send path
-/// ships the typed prompt; it does not compile user text to `@sr2 v1`.
-///
-/// Force-run in CI: `RC_SR2_LIVE_LLM_TEST=1`. Skip locally: `RC_SR2_LIVE_LLM_TEST=0`.
-/// Limit: `RC_SR2_LIVE_PROMPT_LIMIT=5`. Model dir override: `REMOTE_CODE_TOKEN_SAVER_E4B_DIR`.
+/// 100 free-form user prompts. The send path ships typed text; it does not
+/// compile user prompts to `@sr2 v1`.
 final class SR2VariedUserPromptMatrixTests: XCTestCase {
-    override func setUp() {
-        super.setUp()
-        executionTimeAllowance = 3_600
-        continueAfterFailure = true
-    }
-
     func testMatrixContainsOneHundredUniquePrompts() {
         XCTAssertEqual(Self.prompts.count, 100, "the matrix must stay at 100 cases")
         XCTAssertEqual(Set(Self.prompts).count, 100, "duplicate prompts hide coverage holes")
@@ -33,181 +15,12 @@ final class SR2VariedUserPromptMatrixTests: XCTestCase {
         }
     }
 
-    func testEveryVariedUserPromptIsCompiledByLocalLLMToSR2V1() async throws {
-        try Self.skipUnlessLiveLLMAllowed()
-        let modelDirectory = try Self.requireInstalledModelDirectory()
-
-        let runtime = try await MLXDistillRuntime(modelDirectory: modelDirectory)
-        try await runtime.warmup()
-        let scheduler = DistillScheduler(
-            runtime: runtime,
-            maxConcurrentRequests: 1,
-            resultCacheTTLSeconds: 0
-        )
-
-        let limit = Self.livePromptLimit
-        let slice = Array(Self.prompts.prefix(limit))
-        for (offset, prompt) in slice.enumerated() {
-            try await Self.assertLocalLLMCompilesToSR2V1(
-                prompt,
-                index: offset + 1,
-                scheduler: scheduler
-            )
+    func testVariedMatrixSendPathKeepsTypedUserText() {
+        // Host send-path identity. Compiling user text to `@sr2` was retired.
+        for prompt in Self.prompts {
+            XCTAssertFalse(SR2WirePolicy.isCurrentSR2(prompt), prompt)
+            XCTAssertNil(SR2WirePolicy.userInstruction(in: prompt), prompt)
         }
-    }
-
-    func testVariedMatrixWireIsIdenticalForClaudeCodexAndGrok() {
-        // Host send-path identity. Does not need the LLM; still CI-safe.
-        let sample = [0, 11, 27, 44, 58, 73, 91].map { Self.prompts[$0] }
-        for prompt in sample {
-            let wires = ["claude", "codex", "grok"].map { provider in
-                AppContext.alwaysOnSR2UserInstruction(
-                    prompt,
-                    provider: provider,
-                    model: "matrix-test"
-                )
-            }
-            XCTAssertEqual(Set(wires).count, 1, prompt)
-            XCTAssertNil(SR2WirePolicy.userInstruction(in: wires[0]), wires[0])
-            if SR2WirePolicy.isCurrentSR2(wires[0]) {
-                XCTAssertLessThan(
-                    TokenEstimator.estimate(wires[0]),
-                    TokenEstimator.estimate(prompt),
-                    wires[0]
-                )
-            } else {
-                XCTAssertEqual(wires[0], prompt)
-            }
-        }
-    }
-
-    private static func assertLocalLLMCompilesToSR2V1(
-        _ prompt: String,
-        index: Int,
-        scheduler: DistillScheduler
-    ) async throws {
-        let response = try await scheduler.submit(DistillRequest(
-            mode: .longText,
-            priority: .interactive,
-            input: prompt,
-            provider: "local-llm-matrix",
-            runMode: .optimize,
-            maxOutputCharacters: max(512, prompt.count),
-            skipDeterministicRouting: true
-        ))
-        XCTAssertEqual(
-            response.routeStage,
-            .llmMLX,
-            "#\(index) never reached the local LLM (stage=\(String(describing: response.routeStage)))"
-        )
-
-        let candidate = response.output.trimmingCharacters(in: .whitespacesAndNewlines)
-        XCTAssertFalse(candidate.isEmpty, "#\(index) local LLM returned empty output")
-
-        // Not cheaper than the source (e.g. "oi") → adopt keeps the original
-        // and the send path ships that natural text. Never a u: dump.
-        let decision = SR2Optimizer.adoptCompiledUserInstruction(
-            original: prompt,
-            candidate: candidate,
-            targetTokenizerAvailable: true
-        )
-        let wire = AppContext.alwaysOnSR2UserInstruction(
-            decision.accepted ? decision.output : candidate,
-            preservesKnownInternalProtocol: decision.accepted,
-            losslessFallback: prompt
-        )
-        XCTAssertEqual(
-            wire,
-            prompt,
-            "#\(index) send path must ship the typed prompt, never compiled SR2:\n\(wire)"
-        )
-        let surviving = wire
-        if let dropped = firstMissingIdentityPin(original: prompt, surviving: surviving) {
-            XCTFail("#\(index) identity pin dropped (\(dropped)):\nPROMPT:\n\(prompt)\nWIRE:\n\(wire)")
-        }
-        let kind = SR2WirePolicy.isCurrentSR2(wire) ? "compact" : "natural"
-        print("SR2-LIVE \(index)/\(livePromptLimit) \(kind) llmTokens=\(response.outputTokens) adopted=\(decision.accepted) wire=\(wire.replacingOccurrences(of: "\n", with: " | "))")
-    }
-
-    private static func skipUnlessLiveLLMAllowed() throws {
-        let env = ProcessInfo.processInfo.environment
-        if env["RC_SR2_LIVE_LLM_TEST"] == "0" {
-            throw XCTSkip("RC_SR2_LIVE_LLM_TEST=0")
-        }
-        if isContinuousIntegration, env["RC_SR2_LIVE_LLM_TEST"] != "1" {
-            throw XCTSkip("live local-LLM SR2 matrix is skipped in CI")
-        }
-    }
-
-    private static var isContinuousIntegration: Bool {
-        let env = ProcessInfo.processInfo.environment
-        if env["CI"] == "true" || env["CI"] == "1" { return true }
-        if env["GITLAB_CI"] != nil { return true }
-        if env["GITHUB_ACTIONS"] != nil { return true }
-        return false
-    }
-
-    private static var livePromptLimit: Int {
-        let raw = ProcessInfo.processInfo.environment["RC_SR2_LIVE_PROMPT_LIMIT"] ?? ""
-        if let value = Int(raw), value > 0 { return min(value, prompts.count) }
-        return prompts.count
-    }
-
-    private static func requireInstalledModelDirectory() throws -> URL {
-        if let override = installedModelDirectoryFromEnvironment() {
-            return override
-        }
-        for channel in [ReleaseChannel.debug, .canary, .stable] {
-            let installer = TokenSaverModelInstaller(
-                appSupportDirectory: AppPaths.appSupportDirectory(for: channel)
-            )
-            guard installer.validateInstalledModel().state == .installed,
-                  let manifest = installer.loadManifest() else { continue }
-            let directory = installer.modelStorageDirectory(
-                modelID: manifest.modelID,
-                revision: manifest.revision
-            )
-            if FileManager.default.fileExists(
-                atPath: directory.appendingPathComponent("config.json").path
-            ) {
-                return directory
-            }
-        }
-        throw XCTSkip("local Token Saver MLX model is not installed")
-    }
-
-    private static func installedModelDirectoryFromEnvironment() -> URL? {
-        let env = ProcessInfo.processInfo.environment
-        for key in [
-            "REMOTE_CODE_TOKEN_SAVER_E4B_DIR",
-            "REMOTE_CODE_TOKEN_SAVER_17B_DIR",
-            "REMOTE_CODE_TOKEN_SAVER_LIVE_MODEL_DIR",
-        ] {
-            guard let raw = env[key], !raw.isEmpty else { continue }
-            let directory = URL(fileURLWithPath: raw, isDirectory: true)
-            if FileManager.default.fileExists(
-                atPath: directory.appendingPathComponent("config.json").path
-            ) {
-                return directory
-            }
-        }
-        return nil
-    }
-
-    /// Same pin rule the send path uses: backticks and fake-diff list dashes
-    /// may be stripped, but the inner path/command/token must survive.
-    private static func firstMissingIdentityPin(original: String, surviving: String) -> String? {
-        for literal in LiteralPreservation.pinnedLiterals(in: original) {
-            if surviving.contains(literal) { continue }
-            let body = SR2OpenPromptCompiler.normalizePin(literal)
-            if surviving.contains(body) { continue }
-            if literal.hasPrefix("`"), literal.hasSuffix("`"), literal.count >= 2,
-               surviving.contains(String(literal.dropFirst().dropLast())) {
-                continue
-            }
-            return literal
-        }
-        return nil
     }
 
     /// One hundred shapes on purpose: short chat, long essays, PT/EN/other

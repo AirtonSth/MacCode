@@ -55,6 +55,12 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
         )
 
         XCTAssertNotEqual(prepared.capability, prepared.integritySHA256)
+        XCTAssertTrue(TokenSaverRecoveryCapability.isValid(prepared.capability), prepared.capability)
+        XCTAssertEqual(
+            prepared.capability.count,
+            TokenSaverRecoveryCapability.prefix.count + TokenSaverRecoveryCapability.tokenHexLength,
+            prepared.capability
+        )
         XCTAssertEqual(try store.retrieve(capability: prepared.capability, scope: scope()), original)
         XCTAssertNil(try store.retrieve(capability: prepared.integritySHA256, scope: scope()), "raw SHA proves integrity only")
         XCTAssertNil(try store.retrieve(capability: prepared.capability, scope: scope(project: "other")))

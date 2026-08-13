@@ -225,8 +225,6 @@ final class SR2OptimizerTests: XCTestCase {
             XCTAssertTrue(decision.output.contains(literal), "missing \(literal): \(decision.output)")
         }
         XCTAssertLessThan(decision.optimizedTokens, decision.originalTokens)
-        XCTAssertTrue(SR2WirePolicy.alwaysOnInstructBlock.contains("goal:trello.Doing[0]"))
-        XCTAssertTrue(SR2WirePolicy.alwaysOnInstructBlock.contains("trello-comment:"))
         XCTAssertFalse(
             SR2WirePolicy.alwaysOnInstructBlock.contains("jgregory@starsacramento.org"),
             "provider instruct must not ship the live login"
@@ -736,12 +734,6 @@ final class SR2OptimizerTests: XCTestCase {
         XCTAssertTrue(decision.accepted, decision.rejectionReason ?? "")
         XCTAssertTrue(decision.output.contains("prio?=[Bug Patrol]@title-or-text"), decision.output)
         XCTAssertFalse(decision.output.contains("prio=[Bug Patrol]"), decision.output)
-        XCTAssertTrue(
-            SR2WirePolicy.alwaysOnInstructBlock.contains(
-                "fall back to candidates satisfying the hard constraints when none match"
-            ),
-            "the provider contract must define the no-preference-match branch"
-        )
     }
 
     func testNaturalTaskPriorityBindsTheMatchLocusAndRetainsHardConstraintFallback() {
@@ -752,12 +744,6 @@ final class SR2OptimizerTests: XCTestCase {
 
         XCTAssertTrue(decision.accepted, decision.rejectionReason ?? "")
         XCTAssertTrue(decision.output.contains("prio?=[Bug Patrol]@title-or-text"), decision.output)
-        XCTAssertTrue(SR2WirePolicy.alwaysOnInstructBlock.contains(
-            "`@title-or-text` matches the task title or text"
-        ))
-        XCTAssertTrue(SR2WirePolicy.alwaysOnInstructBlock.contains(
-            "fall back to candidates satisfying the hard constraints when none match"
-        ))
     }
 
     func testNaturalTaskCanonicalSemanticGateRejectsBindingTampering() {

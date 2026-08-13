@@ -1016,31 +1016,19 @@ public enum SR2WirePolicy: Sendable {
     // MARK: - Instruct (Claude / Codex / Grok)
 
     /// Compact always-on block injected when `RC_TOKEN_SAVER_DISTILL_HINT=1`.
+    /// User prompts stay natural language; this only governs provider replies.
     public static let alwaysOnInstructBlock = """
     \(instructBlockMarker)
-    Token Saver ON — assistant wire is MANDATORY for Claude, Codex, and Grok (no free monologue).
-    Every provider-authored text item MUST be SR2 Opaque Agent IR (machine-only): reasoning, commentary/intermediate updates, and final replies. Humans never read this wire; the host humanizes for UI.
+    Token Saver ON — Claude, Codex, and Grok.
+    Humans never read this wire; the host humanizes it for UI.
+
+    Every response MUST start with exactly:
+    @sr2 v1
+
+    All other fields are optional. Include a field only when it has a meaningful value; omit it otherwise. Never emit empty, null, unknown, or placeholder fields.
+
     Format:
     \(advertisedV1Sample)
-    Each field is on its own line; omit optional lines instead of joining fields.
-    Rules:
-    - No articles, filler, hedging, markdown essays, or multi-paragraph prose on the wire.
-    - Prefer action-only `o:cont` when only tool calls ran (see actionOnlyWire).
-    - Long answers: answer-as-handle — short o: + h:[[rc:<handle>]] + p: anchors (not full prose on wire).
-    - Keep paths, SHAs, exit codes, error strings exact when present.
-    - `@sr2 v1` is the only current provider wire. Never emit legacy `@sr2 v0`, SR1 (S/C/D/R/O/N/P), or plain chat prose.
-    - User input may arrive as `u:<lossless escaped instruction>` plus `o:cont`; decode `\\n`, `\\r`, and `\\\\` before acting.
-    - User semantic input may arrive as:
-    \(semanticV1Sample)
-      Here `run:a;b` is one shell tool call. `run:[a;b]>[c]` requires two separate ordered shell tool calls; never flatten bracketed groups into one `sh`/`zsh -c` compound. `out:=Nlines` requires one global exact cardinality, and indexed `out:1=2lines,2=1line` binds exact cardinality to individual ordered groups; `!file-edit` forbids file edits. Execute exact groups raw. For an ordinary non-TUI group, preserve its command and add explicit `| distill` in that separate tool call when full stdout is not needed byte-exactly.
-    - A bounded natural orchestration may arrive as:
-    \(naturalTaskV1Sample)
-      In `t:`, `>` is strict order, parentheses bind attributes to that action, comma joins attributes, and `key=value` is a hard constraint. `key?=value@title-or-text` is a soft preference; `@title-or-text` matches the task title or text. Rank matching candidates first, then fall back to candidates satisfying the hard constraints when none match. `!x:y` is MUST NOT, `must:` is mandatory, `should:` is advisory, `wt@updated B` means a worktree based on updated branch B, and `label(role)=URL` preserves repository-role mappings. Keep every literal and binding exact.
-    - A bounded tracker-delivery goal may arrive as:
-    \(trackerDeliveryV1Sample)
-      In this shape `goal:` is ordered work (`>` means the prior step must succeed), `use:` names required skills/tools, `must:` is mandatory, `browser:A|B?` is an optional fallback, `auth:user|secret` is a login pair, `pr:tool,!other` selects the proposal CLI, and `trello-comment:` / `comment:tracker=` is the required tracker comment. `done:` is the completion gate. Keep every literal and binding exact.
-    - Tool stdout stays exact: keep exact-output (rg/sed/cat/jq) unpiped; pipe noisy builds/tests/logs via `| distill`.
-    - Host-local telemetry labels such as Thinking/Ran Shell/Failed Shell are outside the provider wire.
     """
 
     // MARK: - T-SR2-08 action-only / answer-as-handle

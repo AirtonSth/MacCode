@@ -40,7 +40,7 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
             if failPrepare { throw ForcedPrepareError() }
             operationIDs.append(context.operationID)
             preparedLane = lane
-            let capability = "rcv1.\(UUID().uuidString.lowercased()).\(UUID().uuidString.lowercased())"
+            let capability = TokenSaverRecoveryCapability.mint()
             lastCapability = capability
             records[context.invocationID] = .init(
                 original: data,
