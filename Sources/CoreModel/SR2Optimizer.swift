@@ -660,12 +660,8 @@ public enum SR2Optimizer {
            !candidates.contains(naturalTask) {
             candidates.append(naturalTask)
         }
-        let losslessV1 = SR2WirePolicy.userInstructionWire(original)
-        let adjustedCount: TokenCounter = { text in
-            // Compare compact IR against the lossless u: envelope the host
-            // would otherwise send, not against raw UI prose.
-            tokenCount(text == original ? losslessV1 : text)
-        }
+        // Compare compact IR against the natural user text. A `u:` dump of
+        // the essay is never the baseline and never a win.
         let specialized = optimize(
             original: original,
             candidates: candidates,
@@ -673,7 +669,7 @@ public enum SR2Optimizer {
             semanticSegments: semanticSegments,
             targetTokenizer: targetTokenizer,
             targetTokenizerAvailable: targetTokenizerAvailable,
-            tokenCount: adjustedCount
+            tokenCount: tokenCount
         )
         if specialized.accepted { return specialized }
         // Only encode a general compact IR when no specialized candidate
@@ -682,13 +678,13 @@ public enum SR2Optimizer {
         // by a looser bag-of-words spelling.
         if candidates.isEmpty, let open = SR2OpenPromptCompiler.candidate(for: source) {
             // Host-encoded compact IR is not an untrusted model guess. Require
-            // only a real token win against the lossless envelope.
+            // a real token win against the original natural language.
             let adopted = adoptCompiledUserInstruction(
                 original: original,
                 candidate: open,
                 targetTokenizer: targetTokenizer,
                 targetTokenizerAvailable: true,
-                tokenCount: adjustedCount
+                tokenCount: tokenCount
             )
             if adopted.accepted { return adopted }
             if !specialized.accepted { return adopted }
@@ -709,7 +705,9 @@ public enum SR2Optimizer {
         targetTokenizerAvailable: Bool = false,
         tokenCount: TokenCounter = { TokenEstimator.estimate($0) }
     ) -> SR2OptimizationDecision {
-        let text = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = dropInventedInstructionOutcomes(
+            candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
         let originalTokens = max(0, tokenCount(original))
         func rejected(_ reason: String) -> SR2OptimizationDecision {
             SR2OptimizationDecision(
@@ -1392,6 +1390,29 @@ public enum SR2Optimizer {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return nil
+    }
+
+    /// User-instruction compiles must not invent `o:`. A small local model
+    /// often emits `o:optimized` / `o:fix` after a compact `g:`/`p:` body.
+    /// Those values are illegal on the outcome protocol and used to reject the
+    /// whole wire. Drop only unrecognized outcomes; keep `ok|done|fail|need|cont`.
+    private static func dropInventedInstructionOutcomes(_ candidate: String) -> String {
+        let allowed = Set(["ok", "done", "fail", "need", "cont"])
+        let rewritten = candidate
+            .split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+            .compactMap { raw -> String? in
+                let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard line.lowercased().hasPrefix("o:") else { return String(raw) }
+                let value = String(line.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                let head = value
+                    .split(whereSeparator: { $0.isWhitespace })
+                    .first
+                    .map(String.init)?
+                    .lowercased()
+                if let head, allowed.contains(head) { return String(raw) }
+                return nil
+            }
+        return rewritten.joined(separator: "\n")
     }
 
     private static func firstMissingIdentityLiteral(original: String, candidate: String) -> String? {

@@ -3575,7 +3575,8 @@ public final class AppContext {
                 candidate,
                 preservesKnownInternalProtocol: preservesKnownInternalProtocol,
                 semanticSource: semanticSource?.naturalUserText,
-                trustedSemanticSegments: semanticSource?.trustedHostSegments ?? []
+                trustedSemanticSegments: semanticSource?.trustedHostSegments ?? [],
+                losslessFallback: prompt
             )
         }
 
@@ -3737,8 +3738,9 @@ public final class AppContext {
         }
     }
 
-    /// Provider-facing user leg. Every non-empty prompt becomes `@sr2 v1`.
-    /// Compact compiled IR is preferred; otherwise the lossless `u:` envelope.
+    /// Provider-facing user leg. Compact `@sr2 v1` only when it is cheaper
+    /// than the natural prompt. Otherwise the original text is sent. A
+    /// lossless `u:` dump of the essay is never the fallback.
     nonisolated public static func alwaysOnSR2UserInstruction(
         _ compressed: String,
         preservesKnownInternalProtocol: Bool = false,
@@ -3785,53 +3787,74 @@ public final class AppContext {
         targetTokenizer: String? = nil,
         targetTokenCount: SR2Optimizer.TokenCounter? = nil
     ) -> String {
-        // Preserve a genuinely empty prompt as empty. A non-empty whitespace-only
-        // prompt is still user data and must travel through the lossless envelope.
+        // Empty stays empty. Incoming `u:` envelopes are unwrapped back to
+        // the natural user bytes — never re-emitted as the provider wire.
         guard !candidate.isEmpty else {
             return candidate
         }
-        let wire: String
         if let decoded = SR2WirePolicy.userInstruction(in: candidate) {
-            wire = SR2WirePolicy.isCurrentSR2(candidate)
-                ? candidate
-                : SR2WirePolicy.userInstructionWire(decoded)
-        } else if preservesKnownInternalProtocol,
-                  isKnownInternalSR2(candidate) {
+            return losslessFallback ?? decoded
+        }
+        let natural = losslessFallback ?? candidate
+        let count = targetTokenCount ?? { TokenEstimator.estimate($0) }
+        if preservesKnownInternalProtocol,
+           isKnownInternalSR2(candidate),
+           SR2WirePolicy.userInstruction(in: candidate) == nil {
+            let kept: String
             if trustedSemanticSegments.isEmpty {
-                wire = candidate
+                kept = candidate
             } else {
                 let trustedSource = AgentPromptSemanticSource(
                     semanticSource ?? "",
                     trustedHostSegments: trustedSemanticSegments
                 )
-                wire = isSemanticallyCoveredInternalSR2(
+                kept = isSemanticallyCoveredInternalSR2(
                     candidate,
-                    original: losslessFallback ?? candidate,
+                    original: natural,
                     semanticSource: trustedSource
                 )
                     ? candidate
-                    : SR2WirePolicy.userInstructionWire(losslessFallback ?? candidate)
+                    : natural
             }
-        } else {
-            let target = [provider, model]
-                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-                .joined(separator: "/")
-            let tokenizerLabel = targetTokenizer
-                ?? "\(target.isEmpty ? "unknown-provider/model" : target) tokenizer-unavailable; model-agnostic-estimator-v1"
-            let compiled = SR2Optimizer.compile(
-                original: losslessFallback ?? candidate,
-                semanticSource: semanticSource,
-                semanticSegments: [semanticSource].compactMap { $0 } + trustedSemanticSegments,
-                targetTokenizer: tokenizerLabel,
-                targetTokenizerAvailable: targetTokenCount != nil,
-                tokenCount: targetTokenCount ?? { TokenEstimator.estimate($0) }
+            return preferNaturalLanguageIfSR2IsMoreVerbose(
+                natural: natural,
+                wire: kept,
+                tokenCount: targetTokenCount
             )
-            wire = compiled.accepted
-                ? compiled.output
-                : SR2WirePolicy.userInstructionWire(candidate)
         }
-        return wire
+        // A prior lossless stage (dedup) is already smaller natural language.
+        // Keep it. Do not re-encode it into a bag-of-words `u:` or `goal:` dump.
+        if candidate != natural,
+           !isKnownInternalSR2(candidate),
+           candidate.utf8.count < natural.utf8.count {
+            return candidate
+        }
+        let compileSource = natural
+        let target = [provider, model]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "/")
+        let tokenizerLabel = targetTokenizer
+            ?? "\(target.isEmpty ? "unknown-provider/model" : target) tokenizer-unavailable; model-agnostic-estimator-v1"
+        let compiled = SR2Optimizer.compile(
+            original: compileSource,
+            semanticSource: semanticSource,
+            semanticSegments: [semanticSource].compactMap { $0 } + trustedSemanticSegments,
+            targetTokenizer: tokenizerLabel,
+            targetTokenizerAvailable: targetTokenCount != nil,
+            tokenCount: targetTokenCount ?? { TokenEstimator.estimate($0) }
+        )
+        if compiled.accepted,
+           SR2WirePolicy.userInstruction(in: compiled.output) == nil,
+           count(compiled.output) < count(natural) {
+            return compiled.output
+        }
+        if candidate != natural,
+           !isKnownInternalSR2(candidate),
+           candidate.utf8.count < natural.utf8.count {
+            return candidate
+        }
+        return natural
     }
 
     /// Token count is the Token Saver unit; character count breaks ties

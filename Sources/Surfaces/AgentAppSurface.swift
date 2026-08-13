@@ -157,6 +157,7 @@ struct AgentStableWorkRowsRevision: Equatable {
     let expandedTools: Set<String>
     let expandedToolGroups: Set<String>
     let expandedReasoning: Set<String>
+    let showingNaturalLanguageProviderItems: Set<String>
     let assistantDisplayRevision: UInt64
 }
 
@@ -874,8 +875,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         onDemandItemTranslationInFlight.contains(itemId)
     }
 
-    /// Local-LLM humanize for a Thought row. Auto-humanize never runs on
-    /// reasoning; this is the only path that spends Distill on a thought.
+    /// Local-LLM humanize for an SR2 thought or work-stream message. Auto-humanize
+    /// never runs on those rows; this is the only path that spends Distill there.
     public func requestOnDemandItemTranslation(itemId: String, wire: String) {
         guard !itemId.isEmpty,
               !wire.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
@@ -883,6 +884,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard !onDemandItemTranslationInFlight.contains(itemId) else { return }
         if let existing = timeline.sr1TranslationsByItemId[itemId],
            !existing.rewrittenText.isEmpty {
+            return
+        }
+        if let trusted = trustedProviderDisplayByItemId[itemId],
+           trusted.wireSHA256 == Self.providerWireSHA256(wire),
+           !trusted.displayText.isEmpty,
+           !SR2WirePolicy.hasSR2Banner(trusted.displayText),
+           !SR2WirePolicy.isSR2(trusted.displayText) {
             return
         }
         onDemandItemTranslationInFlight.insert(itemId)
@@ -9876,6 +9884,9 @@ public struct AgentAppView: View {
     /// User-message ids whose bubble temporarily shows the exact provider-bound
     /// SR2 payload instead of the natural-language original.
     @State private var showingOutboundUserMessages: Set<AgentMessageID> = []
+    /// Work-stream / thought item ids whose body temporarily shows the local-LLM
+    /// natural-language expansion instead of the stored `@sr2 v1` wire.
+    @State private var showingNaturalLanguageProviderItems: Set<String> = []
     @State private var selectedThreadIds: Set<AgentThreadID> = []
     @State private var lastSelectedThreadId: AgentThreadID?
     @State private var draggingThreadId: AgentThreadID?
@@ -9987,10 +9998,41 @@ public struct AgentAppView: View {
             : "translated from compressed output"
     }
 
+    /// Bannered provider SR2 on a work-stream message or thought. These rows
+    /// stay on the wire until the user flips Natural Language.
+    static func shouldOfferProviderSR2NaturalLanguageToggle(storedBody: String) -> Bool {
+        SR2WirePolicy.hasSR2Banner(storedBody)
+    }
+
+    static func providerSR2NaturalLanguageToggleLabel(showingNaturalLanguage: Bool) -> String {
+        showingNaturalLanguage ? "Natural Language" : "SR2"
+    }
+
+    /// Default (toggle off) is always the stored wire. Toggle on uses a trusted
+    /// local-LLM translation only when that text is actually natural language.
+    static func providerSR2RowDisplayText(
+        storedBody: String,
+        showingNaturalLanguage: Bool,
+        translatedText: String?
+    ) -> String {
+        guard showingNaturalLanguage,
+              let translatedText,
+              !translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return storedBody }
+        let translated = translatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stored = storedBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard translated != stored,
+              !SR2WirePolicy.hasSR2Banner(translatedText),
+              !SR2WirePolicy.isSR2(translatedText),
+              !SR1ResponseDetector.isSR1(translatedText) else {
+            return storedBody
+        }
+        return translatedText
+    }
+
     /// Thoughts stay on the provider/host wire until the user asks. Offer
-    /// Translate only when the painted body is still SR1/SR2 (or identical to
-    /// that wire). Already-natural thoughts — recovered free prose or a prior
-    /// on-demand humanize — must not spend the local LLM again.
+    /// Translate only for leftover SR1 thoughts. Bannered SR2 uses the
+    /// SR2 / Natural Language toggle instead of this control.
     static func shouldOfferOnDemandThoughtTranslation(
         storedBody: String,
         displayText: String,
@@ -10000,13 +10042,14 @@ public struct AgentAppView: View {
         let stored = storedBody.trimmingCharacters(in: .whitespacesAndNewlines)
         let display = displayText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !stored.isEmpty else { return false }
+        if SR2WirePolicy.hasSR2Banner(stored) || SR2WirePolicy.isSR2(stored) {
+            return false
+        }
         let displayIsNatural = display != stored
             && !SR2WirePolicy.isSR2(display)
             && !SR1ResponseDetector.isSR1(display)
         if displayIsNatural { return false }
-        return SR2WirePolicy.hasSR2Banner(stored)
-            || SR2WirePolicy.isSR2(stored)
-            || SR1ResponseDetector.isSR1(stored)
+        return SR1ResponseDetector.isSR1(stored)
     }
 
     static let fullAccessScopeDescription =
@@ -12551,6 +12594,7 @@ public struct AgentAppView: View {
             .onChange(of: vm.selectedThreadId) { _ in
                 vm.transcriptHistoryRevealCount = 0
                 showingOutboundUserMessages = []
+                showingNaturalLanguageProviderItems = []
                 pendingSessionApproval = nil
                 collapseAllWorkDisclosures()
                 knownFinishedWorkTurnIds = []
@@ -14116,6 +14160,7 @@ public struct AgentAppView: View {
             expandedTools: expandedTools,
             expandedToolGroups: expandedToolGroups,
             expandedReasoning: expandedReasoning,
+            showingNaturalLanguageProviderItems: showingNaturalLanguageProviderItems,
             assistantDisplayRevision: vm.assistantDisplayRevision
         )
         VStack(alignment: .leading, spacing: DS.Space.md) {
@@ -14180,7 +14225,7 @@ public struct AgentAppView: View {
                             LazyVStack(alignment: .leading, spacing: DS.Space.lg) {
                                 ForEach(workRows.stable) { block in
                                     switch block {
-                                    case .item(let item): itemRow(item)
+                                    case .item(let item): itemRow(item, isWorkStream: true)
                                     case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
                                     }
                                 }
@@ -14190,7 +14235,7 @@ public struct AgentAppView: View {
                     }
                     ForEach(workRows.liveTail) { block in
                         switch block {
-                        case .item(let item): itemRow(item)
+                        case .item(let item): itemRow(item, isWorkStream: true)
                         case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
                         }
                     }
@@ -14205,26 +14250,38 @@ public struct AgentAppView: View {
 
 
     @ViewBuilder
-    private func itemRow(_ item: AssistantItem) -> some View {
+    private func itemRow(_ item: AssistantItem, isWorkStream: Bool = false) -> some View {
         switch item.type {
         case .assistantMessage:
             if Self.shouldRenderAssistantItemBody(item.body, persistedAssistantTexts: persistedAssistantTexts) {
-                let displayText = vm.assistantDisplayText(
-                    for: item.body,
-                    itemId: item.id,
-                    turnId: item.turnId
-                )
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    assistantOriginalWireDisclosure(
-                        originalWire: item.body,
-                        displayText: displayText,
-                        accessibilityIdentifier: "agent.assistantItem.original.\(item.id)"
+                if isWorkStream,
+                   Self.shouldOfferProviderSR2NaturalLanguageToggle(storedBody: item.body) {
+                    providerSR2InteractiveBody(
+                        itemId: item.id,
+                        turnId: item.turnId,
+                        storedBody: item.body,
+                        streaming: item.state == .streaming,
+                        cacheMarkdown: item.state != .streaming,
+                        thoughtStyle: false
                     )
-                    assistantProse(displayText, cacheMarkdown: item.state != .streaming)
-                    assistantCopyBar(
-                        text: BackgroundAwaitContinuation.strippingAwaitingMarker(displayText),
-                        identifierSuffix: item.id
+                } else {
+                    let displayText = vm.assistantDisplayText(
+                        for: item.body,
+                        itemId: item.id,
+                        turnId: item.turnId
                     )
+                    VStack(alignment: .leading, spacing: DS.Space.xs) {
+                        assistantOriginalWireDisclosure(
+                            originalWire: item.body,
+                            displayText: displayText,
+                            accessibilityIdentifier: "agent.assistantItem.original.\(item.id)"
+                        )
+                        assistantProse(displayText, cacheMarkdown: item.state != .streaming)
+                        assistantCopyBar(
+                            text: BackgroundAwaitContinuation.strippingAwaitingMarker(displayText),
+                            identifierSuffix: item.id
+                        )
+                    }
                 }
             }
         case .reasoning:
@@ -14250,9 +14307,10 @@ public struct AgentAppView: View {
     @ViewBuilder
     private func reasoningRow(_ item: AssistantItem) -> some View {
         let rawText = item.body.isEmpty ? (AgentTimelineItemPresentation.make(for: item).detail ?? "") : item.body
-        // Only an explicit Translate click may replace the stored wire.
-        // Recovery/deterministic expansion is not auto-humanize.
-        let text = vm.assistantDisplayText(
+        let isSR2 = Self.shouldOfferProviderSR2NaturalLanguageToggle(storedBody: rawText)
+        // SR2 thoughts stay on the stored wire until Natural Language is on.
+        // Legacy SR1 still uses preferStoredWire + Translate.
+        let text = isSR2 ? rawText : vm.assistantDisplayText(
             for: rawText,
             itemId: item.id,
             turnId: item.turnId,
@@ -14262,11 +14320,11 @@ public struct AgentAppView: View {
         let expanded = streaming || expandedReasoning.contains(item.id)
         VStack(alignment: .leading, spacing: DS.Space.xs) {
             Button {
-                guard !streaming, !text.isEmpty else { return }
+                guard !streaming, !rawText.isEmpty else { return }
                 if expanded { expandedReasoning.remove(item.id) } else { expandedReasoning.insert(item.id) }
             } label: {
                 HStack(spacing: DS.Space.xs) {
-                    if !streaming, !text.isEmpty {
+                    if !streaming, !rawText.isEmpty {
                         Image(systemName: expanded ? "chevron.down" : "chevron.right")
                             .font(.system(size: 8)).foregroundColor(DS.Palette.textTertiary)
                     }
@@ -14278,48 +14336,149 @@ public struct AgentAppView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help(streaming ? "" : (text.isEmpty ? "" : (expanded ? "Hide reasoning" : "Show reasoning")))
-            if expanded, !text.isEmpty {
-                let translating = vm.isOnDemandItemTranslationInFlight(item.id)
-                let offerTranslate = !streaming && Self.shouldOfferOnDemandThoughtTranslation(
-                    storedBody: rawText,
-                    displayText: text,
-                    isTranslating: translating
-                )
-                if offerTranslate {
-                    Button {
-                        vm.requestOnDemandItemTranslation(itemId: item.id, wire: rawText)
-                    } label: {
-                        Text("Translate")
-                            .font(DS.Font.caption2)
-                            .foregroundColor(DS.Palette.accent)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Translate this thought with the local Token Saver model")
-                    .accessibilityLabel("Translate thought")
-                    .accessibilityIdentifier("agent.reasoning.translate.\(item.id)")
-                } else if translating {
-                    Text("Translating…")
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .accessibilityIdentifier("agent.reasoning.translating.\(item.id)")
+            .help(streaming ? "" : (rawText.isEmpty ? "" : (expanded ? "Hide reasoning" : "Show reasoning")))
+            if expanded, !rawText.isEmpty {
+                if isSR2 {
+                    providerSR2InteractiveBody(
+                        itemId: item.id,
+                        turnId: item.turnId,
+                        storedBody: rawText,
+                        streaming: streaming,
+                        cacheMarkdown: false,
+                        thoughtStyle: true
+                    )
                 } else {
-                    assistantOriginalWireDisclosure(
-                        originalWire: rawText,
+                    let translating = vm.isOnDemandItemTranslationInFlight(item.id)
+                    let offerTranslate = !streaming && Self.shouldOfferOnDemandThoughtTranslation(
+                        storedBody: rawText,
                         displayText: text,
-                        accessibilityIdentifier: "agent.reasoning.original.\(item.id)"
+                        isTranslating: translating
+                    )
+                    if offerTranslate {
+                        Button {
+                            vm.requestOnDemandItemTranslation(itemId: item.id, wire: rawText)
+                        } label: {
+                            Text("Translate")
+                                .font(DS.Font.caption2)
+                                .foregroundColor(DS.Palette.accent)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Translate this thought with the local Token Saver model")
+                        .accessibilityLabel("Translate thought")
+                        .accessibilityIdentifier("agent.reasoning.translate.\(item.id)")
+                    } else if translating {
+                        Text("Translating…")
+                            .font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .accessibilityIdentifier("agent.reasoning.translating.\(item.id)")
+                    } else {
+                        assistantOriginalWireDisclosure(
+                            originalWire: rawText,
+                            displayText: text,
+                            accessibilityIdentifier: "agent.reasoning.original.\(item.id)"
+                        )
+                    }
+                    AgentSelectablePlainText(
+                        text: text,
+                        fontSize: 12,
+                        textColor: DS.NS.textTertiary,
+                        lineSpacing: 3
                     )
                 }
-                AgentSelectablePlainText(
-                    text: text,
-                    fontSize: 12,
-                    textColor: DS.NS.textTertiary,
-                    lineSpacing: 3
-                )
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityIdentifier("agent.reasoning.\(item.id)")
+    }
+
+    /// Work-stream / thought SR2: paint the stored wire by default. The mini
+    /// switch matches the user-prompt "SR2 sent" control; on asks the local LLM.
+    @ViewBuilder
+    private func providerSR2InteractiveBody(
+        itemId: String,
+        turnId: String,
+        storedBody: String,
+        streaming: Bool,
+        cacheMarkdown: Bool,
+        thoughtStyle: Bool
+    ) -> some View {
+        let showingNL = showingNaturalLanguageProviderItems.contains(itemId)
+        let translated = showingNL
+            ? vm.assistantDisplayText(for: storedBody, itemId: itemId, turnId: turnId)
+            : nil
+        let displayText = Self.providerSR2RowDisplayText(
+            storedBody: storedBody,
+            showingNaturalLanguage: showingNL,
+            translatedText: translated
+        )
+        let translating = vm.isOnDemandItemTranslationInFlight(itemId)
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            if thoughtStyle {
+                AgentSelectablePlainText(
+                    text: displayText,
+                    fontSize: 12,
+                    textColor: DS.NS.textTertiary,
+                    lineSpacing: 3
+                )
+            } else {
+                assistantProse(displayText, cacheMarkdown: cacheMarkdown)
+            }
+            if !streaming {
+                HStack(spacing: DS.Space.xs) {
+                    if translating {
+                        Text("Translating…")
+                            .font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .accessibilityIdentifier("agent.providerSR2.translating.\(itemId)")
+                    }
+                    Toggle(isOn: Binding(
+                        get: { showingNaturalLanguageProviderItems.contains(itemId) },
+                        set: { on in
+                            if on {
+                                showingNaturalLanguageProviderItems.insert(itemId)
+                                let current = vm.assistantDisplayText(
+                                    for: storedBody,
+                                    itemId: itemId,
+                                    turnId: turnId
+                                )
+                                let needsLLM = Self.providerSR2RowDisplayText(
+                                    storedBody: storedBody,
+                                    showingNaturalLanguage: true,
+                                    translatedText: current
+                                ) == storedBody
+                                if needsLLM {
+                                    vm.requestOnDemandItemTranslation(itemId: itemId, wire: storedBody)
+                                }
+                            } else {
+                                showingNaturalLanguageProviderItems.remove(itemId)
+                            }
+                        }
+                    )) {
+                        Text(Self.providerSR2NaturalLanguageToggleLabel(
+                            showingNaturalLanguage: showingNaturalLanguageProviderItems.contains(itemId)
+                        ))
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityIdentifier("agent.providerSR2.toggle.\(itemId)")
+                    .accessibilityLabel(
+                        showingNaturalLanguageProviderItems.contains(itemId)
+                            ? "Show SR2"
+                            : "Show natural language"
+                    )
+                    .help("Translate this SR2 with the local Token Saver model")
+                    Spacer(minLength: 0)
+                }
+            }
+            if !thoughtStyle {
+                assistantCopyBar(
+                    text: BackgroundAwaitContinuation.strippingAwaitingMarker(displayText),
+                    identifierSuffix: itemId
+                )
+            }
+        }
     }
 
     @ViewBuilder

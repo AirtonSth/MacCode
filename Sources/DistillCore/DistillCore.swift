@@ -1875,9 +1875,9 @@ public struct MLXDistillRuntime: DistillRuntime {
             Encoding:
             - One field per line after the banner `@sr2 v1`. No markdown, preamble, or prose.
             - `>` = strict order (prior step must succeed). `+` = AND. `|` = OR. `?` = optional. `!` / `not:` = MUST NOT. `X:Y` = scoped op. `[a,b]` = required members.
-            - goal: or flow: = ordered work. use: or tools: = skills/tools. must:/should:/may:/not:. done: = completion gate. browser:A|B? = optional UI fallback. auth:user|secret = login pair, copy bytes exactly. pr:tool,!other = proposal CLI. comment:tracker=artifact or trello-comment:. run: = exact shell. out:=Nlines or out:1=2lines. t: = packed natural-task plan.
+            - goal: or flow: = ordered work. use: or tools: = skills/tools. must:/should:/may:/not:. done: = completion gate. browser:A|B? = optional UI fallback. auth:user|secret = login pair, copy bytes exactly. pr:tool,!other = proposal CLI. comment:tracker=artifact or trello-comment:. run: = exact shell. out:=Nlines or out:1=2lines. t: = packed natural-task plan. p: = URL/API routes as path[size,latency];path[size,latency].
             - Host chrome such as a leading `/goal` is not a source action. Keep `/sam-task` and other requested skills.
-            - Do not invent `o:ok|fail|need|cont` on an instruction prompt. Preserve commands, emails, passwords, URLs, paths, IDs, list names, and branch names verbatim.
+            - Do not invent `o:` on an instruction prompt. Never wrap the essay in `u:`. Never return the source unchanged. Preserve commands, emails, passwords, URLs, paths, IDs, list names, and branch names verbatim.
             Examples:
             @sr2 v1
             goal:trello.Doing[0]>implement>verify>merge:main>verify-merge>trello:Testing
@@ -1894,7 +1894,9 @@ public struct MLXDistillRuntime: DistillRuntime {
             run:[command -v swift]>[command -v distill]
             out:=2lines
             !file-edit
-            If no cheaper equivalent SR2 exists, return the source unchanged.
+            @sr2 v1
+            goal:fix-heavy-routes
+            p:/v2/attendance-tracker/school/*/calendar[~1.4MB,2.2-2.9s];/v2/attendance-tracker/bulk-add-events[5-13s];/v1/auth/admin/families[2-28s];/v1/auth/reg/register-schedule/contract-slugs[10s]
             """
         case .watchSummary:
             return """

@@ -95,9 +95,116 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(display.contains("Evidence 3: swift noisy.swift completed."), display)
     }
 
+    func testProviderSR2WorkStreamDefaultsToWireUntilNaturalLanguageToggle() {
+        // WHY: intermediate provider messages and thoughts are the live work
+        // log. Auto-humanize + "View original wire" hid the cheap SR2 the
+        // model actually emitted. Default must stay on the wire; the local
+        // LLM runs only after the user flips the same style of toggle used
+        // on the user-prompt "SR2 sent" control.
+        let wire = """
+        @sr2 v1
+        g:trello-delivery
+        d:task-skill-read
+        p:path:6
+        o:cont
+        e:none
+        h:skill-contracts
+        """
+        let natural = """
+        The goal is to complete a Trello-related delivery.
+        Read the task skill and follow path/step 6.
+        Continue execution. There is no specific final outcome expected at this stage.
+        Follow all skill contracts and instructions.
+        """
+
+        XCTAssertTrue(
+            AgentAppView.shouldOfferProviderSR2NaturalLanguageToggle(storedBody: wire),
+            "bannered SR2 work-stream rows must expose the SR2 / Natural Language toggle"
+        )
+        XCTAssertTrue(
+            AgentAppView.shouldOfferProviderSR2NaturalLanguageToggle(
+                storedBody: "\n@sr2 v1\no:inspecting the trello card before editing"
+            )
+        )
+        XCTAssertFalse(
+            AgentAppView.shouldOfferProviderSR2NaturalLanguageToggle(storedBody: "plain thinking"),
+            "natural thoughts must not grow an SR2 toggle"
+        )
+        XCTAssertFalse(
+            AgentAppView.shouldOfferProviderSR2NaturalLanguageToggle(
+                storedBody: "Here is an example:\n@sr2 v1\ng:quoted"
+            ),
+            "a quoted banner after prose is not a provider SR2 row"
+        )
+
+        XCTAssertEqual(
+            AgentAppView.providerSR2NaturalLanguageToggleLabel(showingNaturalLanguage: false),
+            "SR2"
+        )
+        XCTAssertEqual(
+            AgentAppView.providerSR2NaturalLanguageToggleLabel(showingNaturalLanguage: true),
+            "Natural Language"
+        )
+
+        XCTAssertEqual(
+            AgentAppView.providerSR2RowDisplayText(
+                storedBody: wire,
+                showingNaturalLanguage: false,
+                translatedText: natural
+            ),
+            wire,
+            "toggle off must keep the exact SR2 wire even if a translation is already cached"
+        )
+        XCTAssertEqual(
+            AgentAppView.providerSR2RowDisplayText(
+                storedBody: wire,
+                showingNaturalLanguage: true,
+                translatedText: natural
+            ),
+            natural,
+            "toggle on shows the local-LLM natural language"
+        )
+        XCTAssertEqual(
+            AgentAppView.providerSR2RowDisplayText(
+                storedBody: wire,
+                showingNaturalLanguage: true,
+                translatedText: nil
+            ),
+            wire,
+            "until the local LLM returns, keep painting the wire"
+        )
+        XCTAssertEqual(
+            AgentAppView.providerSR2RowDisplayText(
+                storedBody: wire,
+                showingNaturalLanguage: true,
+                translatedText: wire
+            ),
+            wire,
+            "fail open: a humanize that echoes SR2 must not replace the wire"
+        )
+
+        XCTAssertFalse(
+            AgentAppView.shouldOfferOnDemandThoughtTranslation(
+                storedBody: wire,
+                displayText: wire,
+                isTranslating: false
+            ),
+            "SR2 thoughts use the SR2 / Natural Language toggle, not Translate"
+        )
+        XCTAssertFalse(
+            AgentAppView.showsAssistantOriginalToggle(
+                messageContent: wire,
+                displayText: wire,
+                wasSR1Translated: false
+            ),
+            "an untranslated SR2 work-stream row must not grow View original wire"
+        )
+    }
+
     func testOnDemandThoughtTranslationUsesLocalLLMOnlyAfterClick() async throws {
         // WHY: auto-humanize of every thought is the expensive path. The
-        // Thought row must keep the wire until the user clicks Translate.
+        // Thought / work-stream row must keep the SR2 wire until the user
+        // flips Natural Language.
         let (vm, threadRepo) = try makeVM()
         let thread = AgentThread(
             workspaceId: vm.workspaceID,
@@ -112,8 +219,10 @@ final class AgentAppViewModelTests: XCTestCase {
 
         let wire = "@sr2 v1\no:inspecting the trello card before editing"
         let natural = "I am inspecting the Trello card before editing."
+        var translatorCalls = 0
         vm.coordinator.tokenSaverRuntimeActive = { true }
         vm.coordinator.finalResponseTranslator = { response, provider, threadId, _ in
+            translatorCalls += 1
             XCTAssertEqual(provider, .grok)
             XCTAssertEqual(threadId, thread.id)
             XCTAssertEqual(response, wire)
@@ -131,21 +240,25 @@ final class AgentAppViewModelTests: XCTestCase {
         )))
 
         XCTAssertEqual(vm.assistantDisplayText(for: wire, itemId: "thought-1"), wire)
+        XCTAssertEqual(
+            AgentAppView.providerSR2RowDisplayText(
+                storedBody: wire,
+                showingNaturalLanguage: false,
+                translatedText: vm.assistantDisplayText(for: wire, itemId: "thought-1")
+            ),
+            wire,
+            "default paint stays on the wire before the toggle"
+        )
         XCTAssertTrue(
+            AgentAppView.shouldOfferProviderSR2NaturalLanguageToggle(storedBody: wire)
+        )
+        XCTAssertFalse(
             AgentAppView.shouldOfferOnDemandThoughtTranslation(
                 storedBody: wire,
                 displayText: wire,
                 isTranslating: false
             ),
-            "an untranslated SR2 thought must offer Translate"
-        )
-        XCTAssertFalse(
-            AgentAppView.shouldOfferOnDemandThoughtTranslation(
-                storedBody: wire,
-                displayText: natural,
-                isTranslating: false
-            ),
-            "already-natural thoughts must not offer another LLM pass"
+            "SR2 must not keep the old Translate control"
         )
         XCTAssertFalse(
             AgentAppView.shouldOfferOnDemandThoughtTranslation(
@@ -157,11 +270,11 @@ final class AgentAppViewModelTests: XCTestCase {
         )
         XCTAssertTrue(
             AgentAppView.shouldOfferOnDemandThoughtTranslation(
-                storedBody: wire,
-                displayText: "S /distill ativo.",
+                storedBody: "O: inspecting the card\nP: login cookie present",
+                displayText: "O: inspecting the card\nP: login cookie present",
                 isTranslating: false
             ),
-            "a thought painted as the provider original still offers Translate"
+            "legacy SR1 thoughts still offer Translate"
         )
 
         vm.requestOnDemandItemTranslation(itemId: "thought-1", wire: wire)
@@ -172,13 +285,27 @@ final class AgentAppViewModelTests: XCTestCase {
         }
         XCTAssertEqual(vm.assistantDisplayText(for: wire, itemId: "thought-1"), natural)
         XCTAssertFalse(vm.isOnDemandItemTranslationInFlight("thought-1"))
-        XCTAssertFalse(
-            AgentAppView.shouldOfferOnDemandThoughtTranslation(
+        XCTAssertEqual(
+            AgentAppView.providerSR2RowDisplayText(
                 storedBody: wire,
-                displayText: vm.assistantDisplayText(for: wire, itemId: "thought-1"),
-                isTranslating: false
-            )
+                showingNaturalLanguage: false,
+                translatedText: natural
+            ),
+            wire,
+            "toggling back to SR2 must show the wire, not keep the humanize"
         )
+        XCTAssertEqual(
+            AgentAppView.providerSR2RowDisplayText(
+                storedBody: wire,
+                showingNaturalLanguage: true,
+                translatedText: natural
+            ),
+            natural
+        )
+
+        vm.requestOnDemandItemTranslation(itemId: "thought-1", wire: wire)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(translatorCalls, 1, "a cached humanize must not spend the local LLM again")
     }
 
     override func setUp() {

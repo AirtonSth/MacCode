@@ -9,9 +9,13 @@ enum SR2OpenPromptCompiler {
         guard !text.isEmpty, !SR2WirePolicy.hasSR2Banner(text) else { return nil }
 
         let ir = SR2SemanticIR.parse(text)
+        let routes = unique(extractRouteAtoms(in: text))
         let urls = unique(extractURLs(in: text))
         let skills = unique(extractSlashSkills(in: text)).filter { skill in
-            skill.hasPrefix("/sam") || !urls.contains(where: { $0.contains(skill) })
+            if skill.hasPrefix("/sam") { return true }
+            if urls.contains(where: { $0.contains(skill) }) { return false }
+            if routes.contains(where: { $0.contains(skill) }) { return false }
+            return true
         }
         let mentions = unique(extractAtMentions(in: text))
         let commands = unique(extractBacktickCommands(in: text))
@@ -22,11 +26,14 @@ enum SR2OpenPromptCompiler {
         let useAtoms = unique(
             (urls + skills + mentions + windows + emails + paths + placeholders + toolAnchors(in: ir.anchors, source: text))
                 .filter(isUsefulUseAtom)
+                .filter { atom in !routes.contains(where: { $0.contains(atom) }) }
         )
-        let goal = goalValue(ir: ir, excluding: Set(useAtoms.map { $0.lowercased() }))
+        let goal = performanceRouteGoal(in: text, routeCount: routes.count)
+            ?? goalValue(ir: ir, excluding: Set(useAtoms.map { $0.lowercased() }))
 
         var fields: [(String, String)] = []
         if !goal.isEmpty { fields.append(("goal", goal)) }
+        if !routes.isEmpty { fields.append(("p", routes.joined(separator: ";"))) }
         if !useAtoms.isEmpty { fields.append(("use", useAtoms.sorted().joined(separator: ","))) }
         if !commands.isEmpty {
             fields.append(("run", commands.joined(separator: ">")))
@@ -127,6 +134,90 @@ enum SR2OpenPromptCompiler {
         return Array(fromAnchors) + Array(fromWords)
     }
 
+    private static func performanceRouteGoal(in text: String, routeCount: Int) -> String? {
+        guard routeCount >= 2 else { return nil }
+        let lower = text.lowercased()
+        let mentionsRoutes = lower.contains("route") || lower.contains("endpoint") || lower.contains("api")
+        let mentionsPerf = containsAny(lower, [
+            "heavy", "slow", "latency", "timeout", "perf", "mb ", "mb,", "mb\n", "seconds",
+        ]) || lower.range(of: #"\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?s\b"#, options: .regularExpression) != nil
+        let mentionsFix = containsAny(lower, ["fix", "optimize", "speed up", "speedup"])
+        guard mentionsRoutes || mentionsPerf else { return nil }
+        if mentionsFix && mentionsPerf { return "fix-heavy-routes" }
+        if mentionsFix { return "fix-routes" }
+        if mentionsPerf { return "optimize-heavy-routes" }
+        return nil
+    }
+
+    private static func containsAny(_ text: String, _ needles: [String]) -> Bool {
+        needles.contains(where: text.contains)
+    }
+
+    /// Multi-segment URL/API paths plus same-line size/latency. `/sam-task`
+    /// stays a skill (one segment); `/v2/foo/*/bar — 2-3s` becomes a `p:` atom.
+    private static func extractRouteAtoms(in text: String) -> [String] {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"(?m)(/[A-Za-z0-9._~+-]+(?:/[A-Za-z0-9._~+*-]+)+)"#
+        ) else { return [] }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        var atoms: [String] = []
+        for match in regex.matches(in: text, range: range) {
+            guard let routeRange = Range(match.range(at: 1), in: text) else { continue }
+            var route = String(text[routeRange])
+            while let last = route.last, ".,);".contains(last) {
+                route.removeLast()
+            }
+            guard route.filter({ $0 == "/" }).count >= 2 else { continue }
+            if route.hasPrefix("/Users/") || route.hasPrefix("/home/") { continue }
+            let lineEnd = text[routeRange.upperBound...].firstIndex(of: "\n") ?? text.endIndex
+            let rest = String(text[routeRange.upperBound..<lineEnd])
+            let metrics = extractMetrics(in: rest)
+            if metrics.isEmpty {
+                atoms.append(route)
+            } else {
+                atoms.append("\(route)[\(metrics.joined(separator: ","))]")
+            }
+        }
+        return atoms
+    }
+
+    private static func extractMetrics(in text: String) -> [String] {
+        var result: [String] = []
+        if let sizes = try? NSRegularExpression(
+            pattern: #"(~?\d+(?:\.\d+)?)\s*(MB|KB|GB)"#,
+            options: .caseInsensitive
+        ) {
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            for match in sizes.matches(in: text, range: range) {
+                guard let number = Range(match.range(at: 1), in: text),
+                      let unit = Range(match.range(at: 2), in: text) else { continue }
+                result.append("\(text[number])\(text[unit].uppercased())")
+            }
+        }
+        if let durations = try? NSRegularExpression(
+            pattern: #"(~?\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?))\s*s\b"#,
+            options: .caseInsensitive
+        ) {
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            for match in durations.matches(in: text, range: range) {
+                guard let value = Range(match.range(at: 1), in: text) else { continue }
+                let compact = String(text[value]).replacingOccurrences(of: " ", with: "")
+                result.append("\(compact)s")
+            }
+        }
+        if let singles = try? NSRegularExpression(
+            pattern: #"(?<![\d.\-])(~?\d+(?:\.\d+)?)\s*s\b"#,
+            options: .caseInsensitive
+        ) {
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            for match in singles.matches(in: text, range: range) {
+                guard let value = Range(match.range(at: 1), in: text) else { continue }
+                result.append("\(text[value])s")
+            }
+        }
+        return unique(result)
+    }
+
     private static func extractURLs(in text: String) -> [String] {
         let markdown = captures(#"\[[^\]]+\]\((https?://[^)\s]+)\)"#, in: text)
         let bare = captures(#"https?://[^\s)>\]]+"#, in: text)
@@ -223,6 +314,7 @@ enum SR2OpenPromptCompiler {
         if trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://") { return true }
         if trimmed.hasPrefix("/sam") { return true }
         if trimmed.hasPrefix("/Users") || trimmed.hasPrefix("/home") { return true }
+        if trimmed.hasPrefix("/"), trimmed.filter({ $0 == "/" }).count >= 2 { return true }
         if trimmed.contains("@") { return true }
         if toolTokens.contains(trimmed.lowercased()) { return true }
         if trimmed.contains(" ") { return true }

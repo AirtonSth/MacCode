@@ -325,6 +325,82 @@ final class SR2OptimizerTests: XCTestCase {
         }
     }
 
+    func testCompileEncodesHeavyAPIRoutesInsteadOfLosslessUWrap() {
+        // WHY: the live bubble sent a u: dump of this exact prompt. The provider
+        // paid the full essay plus escaping. Compact IR must keep every route
+        // and its size/latency, not wrap the paragraph.
+        let prompt = """
+        You need to fix These routes are consistently heavy:
+
+        /v2/attendance-tracker/school/*/calendar — ~1.4 MB responses, 2.2-2.9s every time
+
+        /v2/attendance-tracker/bulk-add-events — 5-13s
+
+        /v1/auth/admin/families — 2-28s
+
+        /v1/auth/reg/register-schedule/contract-slugs — 10s
+        """
+        let decision = SR2Optimizer.compile(original: prompt)
+        XCTAssertTrue(decision.accepted, decision.rejectionReason ?? "")
+        XCTAssertTrue(SR2WirePolicy.isCurrentSR2(decision.output), decision.output)
+        XCTAssertNil(
+            SR2WirePolicy.userInstruction(in: decision.output),
+            "must not fail open to a u: wrap: \(decision.output)"
+        )
+        XCTAssertTrue(decision.output.contains("fix-heavy-routes"), decision.output)
+        for route in [
+            "/v2/attendance-tracker/school/*/calendar",
+            "/v2/attendance-tracker/bulk-add-events",
+            "/v1/auth/admin/families",
+            "/v1/auth/reg/register-schedule/contract-slugs",
+        ] {
+            XCTAssertTrue(decision.output.contains(route), "missing \(route) in \(decision.output)")
+        }
+        XCTAssertTrue(decision.output.contains("1.4MB") || decision.output.contains("1.4 MB"), decision.output)
+        XCTAssertTrue(decision.output.contains("2.2-2.9s"), decision.output)
+        XCTAssertTrue(decision.output.contains("5-13s"), decision.output)
+        XCTAssertTrue(decision.output.contains("2-28s"), decision.output)
+        XCTAssertTrue(decision.output.contains("10s"), decision.output)
+        XCTAssertLessThan(decision.output.utf8.count, prompt.utf8.count, decision.output)
+        XCTAssertLessThan(decision.optimizedTokens, decision.originalTokens, decision.output)
+    }
+
+    func testAdoptKeepsCompactRouteListEvenWhenLocalLLMInventedAnOutcome() {
+        // WHY: the local compiler's examples are Trello/task shaped. A small
+        // model that still finds the routes may emit o:optimized, which is not
+        // a legal outcome token. Rejecting that wire is what forced the u: dump.
+        let prompt = """
+        You need to fix These routes are consistently heavy:
+
+        /v2/attendance-tracker/school/*/calendar — ~1.4 MB responses, 2.2-2.9s every time
+
+        /v2/attendance-tracker/bulk-add-events — 5-13s
+
+        /v1/auth/admin/families — 2-28s
+
+        /v1/auth/reg/register-schedule/contract-slugs — 10s
+        """
+        let llmGuess = """
+        @sr2 v1
+        g:fix-heavy-routes
+        p:/v2/attendance-tracker/school/*/calendar[~1.4MB,2.2-2.9s];/v2/attendance-tracker/bulk-add-events[5-13s];/v1/auth/admin/families[2-28s];/v1/auth/reg/register-schedule/contract-slugs[10s]
+        o:optimized
+        e:none
+        h:perf
+        """
+        let decision = SR2Optimizer.adoptCompiledUserInstruction(
+            original: prompt,
+            candidate: llmGuess,
+            targetTokenizerAvailable: true
+        )
+        XCTAssertTrue(decision.accepted, decision.rejectionReason ?? "")
+        XCTAssertTrue(SR2WirePolicy.isCurrentSR2(decision.output), decision.output)
+        XCTAssertFalse(decision.output.contains("o:optimized"), decision.output)
+        XCTAssertTrue(decision.output.contains("/v2/attendance-tracker/school/*/calendar"), decision.output)
+        XCTAssertTrue(decision.output.contains("2.2-2.9s"), decision.output)
+        XCTAssertNil(SR2WirePolicy.userInstruction(in: decision.output), decision.output)
+    }
+
     func testAdoptCompiledUserInstructionAcceptsArbitraryPromptWithoutTemplateMatch() {
         // WHY: v1 field names are the wire grammar, not a required source
         // template. An essay that matches no Trello/Linear regex must still
@@ -1394,7 +1470,7 @@ final class SR2OptimizerTests: XCTestCase {
         XCTAssertFalse(nonWinning.accepted)
         XCTAssertEqual(nonWinning.output, exactCommandPrompt)
 
-        let beatsLosslessV1 = SR2Optimizer.compile(
+        let beatsLosslessV1ButNotNatural = SR2Optimizer.compile(
             original: exactCommandPrompt,
             tokenCount: { text in
                 if text.contains("\nrun:") { return 20 }
@@ -1402,8 +1478,22 @@ final class SR2OptimizerTests: XCTestCase {
                 return 10
             }
         )
-        XCTAssertTrue(beatsLosslessV1.accepted,
-                      "semantic v1 competes with the actual lossless v1 provider wire, not raw UI prose")
+        XCTAssertFalse(
+            beatsLosslessV1ButNotNatural.accepted,
+            "a candidate cheaper than a u: dump but more expensive than the natural prompt must not be adopted"
+        )
+
+        let beatsNaturalLanguage = SR2Optimizer.compile(
+            original: exactCommandPrompt,
+            tokenCount: { text in
+                if text.contains("\nrun:") { return 8 }
+                return 20
+            }
+        )
+        XCTAssertTrue(
+            beatsNaturalLanguage.accepted,
+            beatsNaturalLanguage.rejectionReason ?? "compact IR must win when it is cheaper than the natural prompt"
+        )
 
         let unsafeEstimatorMargin = SR2Optimizer.compile(
             original: exactCommandPrompt,
@@ -1434,9 +1524,15 @@ final class SR2OptimizerTests: XCTestCase {
 
         let shellAmbiguity = "Execute apenas `printf 'a; b'; command -v distill` e retorne exatamente as duas linhas. Não edite arquivos."
         let shellDecision = SR2Optimizer.compile(original: shellAmbiguity)
-        XCTAssertTrue(shellDecision.accepted, shellDecision.rejectionReason ?? "")
-        XCTAssertTrue(SR2WirePolicy.isCurrentSR2(shellDecision.output), shellDecision.output)
-        XCTAssertTrue(shellDecision.output.contains("printf"), shellDecision.output)
+        if shellDecision.accepted {
+            XCTAssertTrue(SR2WirePolicy.isCurrentSR2(shellDecision.output), shellDecision.output)
+            XCTAssertTrue(shellDecision.output.contains("printf"), shellDecision.output)
+            XCTAssertNil(SR2WirePolicy.userInstruction(in: shellDecision.output), shellDecision.output)
+            XCTAssertLessThan(shellDecision.optimizedTokens, shellDecision.originalTokens)
+        } else {
+            XCTAssertEqual(shellDecision.output, shellAmbiguity,
+                           "if shell quoting is too ambiguous, fail open to the natural prompt — never a u: dump")
+        }
     }
 
     func testOptimizerRejectsCandidateThatLosesOrderingOrCompletionGate() {
@@ -1529,6 +1625,9 @@ final class SR2OptimizerTests: XCTestCase {
         XCTAssertTrue(instructions.contains("ordering") || instructions.contains("strict order"), instructions)
         XCTAssertTrue(instructions.contains("completion"), instructions)
         XCTAssertTrue(instructions.contains("@sr2 v1"), instructions)
+        XCTAssertTrue(instructions.contains("p:"), instructions)
+        XCTAssertTrue(instructions.contains("Never wrap"), instructions)
+        XCTAssertTrue(instructions.contains("fix-heavy-routes"), instructions)
         XCTAssertFalse(instructions.contains("jgregory@starsacramento.org"), instructions)
     }
 }
