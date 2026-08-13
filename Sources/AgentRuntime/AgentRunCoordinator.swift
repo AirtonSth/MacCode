@@ -1127,7 +1127,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private var autoContinuationTokens: [AgentThreadID: Int] = [:]
     // PERF-MAC_AGENT-006: last assistant text persisted per thread, to dedup the
     // turnCompleted/finished pair without reloading the whole thread history.
-    private var lastPersistedAssistantContent: [AgentThreadID: String] = [:]
+    private var lastPersistedAssistantContent: [AgentThreadID: AssistantContentFingerprint] = [:]
     // UX-MAC-CHECKPOINT-REVERT-UNDO: transient snapshot of the most recent
     // checkpoint revert, captured pre-destruction. Non-nil only inside the undo
     // window; cleared on a successful undo. Lock-guarded like other coord state.
@@ -3912,7 +3912,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         mirrorPersistenceFailures[threadId] = NSError(domain: "test", code: 1)
         autoContinuationCounts[threadId] = 1
         autoContinuationTokens[threadId] = 1
-        lastPersistedAssistantContent[threadId] = "retained assistant text"
+        lastPersistedAssistantContent[threadId] = AssistantContentFingerprint.of("retained assistant text")
         rememberRunThreadOwnershipLocked(runId: runId, threadId: threadId)
         pendingReceiptFinalizations[runId] = PendingOrchestrationReceiptFinalization(
             runId: runId,
@@ -5475,10 +5475,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // full-history load when the text matches the last one we persisted;
         // only fall back to the O(history) scan on a cache miss (which still
         // guards the rare cross-turn duplicate before appending).
+        let fingerprint = AssistantContentFingerprint.of(text)
         lock.lock()
         let cachedLast = lastPersistedAssistantContent[threadId]
         lock.unlock()
-        if cachedLast == text {
+        if cachedLast == fingerprint {
             return PersistAssistantOutcome(message: nil, deferredIssue: nil, pendingMessageAppendNotification: nil)
         }
         let existing: [AgentMessage]
@@ -5497,11 +5498,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             )
         }
         guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else {
-            // Warm the cache on history-scan hit too, subject to the same size cap.
-            let byteCountHit = text.utf8.count
-            if !Self.shouldEvictLastPersistedContent(threadClosed: false, entryByteCount: byteCountHit) {
-                lock.lock(); lastPersistedAssistantContent[threadId] = text; lock.unlock()
-            }
+            // Warm the fixed-size fingerprint cache on history-scan hit.
+            lock.lock(); lastPersistedAssistantContent[threadId] = fingerprint; lock.unlock()
             return PersistAssistantOutcome(message: nil, deferredIssue: nil, pendingMessageAppendNotification: nil)
         }
         let message = AgentMessage(threadId: threadId, role: .assistant, content: text)
@@ -5519,13 +5517,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 pendingMessageAppendNotification: nil
             )
         }
-        // PERF-MAC_AGENT-008: only cache if the entry is within the byte cap;
-        // oversized entries skip the cache and rely on the full-history scan for
-        // dedup, bounding per-entry retained memory for very long responses.
-        let byteCount = text.utf8.count
-        if !Self.shouldEvictLastPersistedContent(threadClosed: false, entryByteCount: byteCount) {
-            lock.lock(); lastPersistedAssistantContent[threadId] = text; lock.unlock()
-        }
+        // PERF-MAC_AGENT-008 / R7: cache a fixed-size fingerprint only — full
+        // final-answer Strings are no longer retained for equality dedup.
+        lock.lock(); lastPersistedAssistantContent[threadId] = fingerprint; lock.unlock()
         return PersistAssistantOutcome(
             message: message,
             deferredIssue: nil,
@@ -6859,14 +6853,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         if let assistantMessageId = result.assistantMessageId {
             activeAssistantMessageIds[runId] = assistantMessageId
         }
-        if let assistantMessage = pending.assistantMessage,
-           !Self.shouldEvictLastPersistedContent(
-                threadClosed: false,
-                entryByteCount: assistantMessage.content.utf8.count
-           ) {
-            // Update the memo only after the transaction commits. A failed
-            // assistant INSERT must remain retryable and cannot poison dedup.
-            lastPersistedAssistantContent[threadId] = assistantMessage.content
+        if let assistantMessage = pending.assistantMessage {
+            // Update the fixed-size fingerprint only after the transaction
+            // commits. A failed assistant INSERT must remain retryable and
+            // cannot poison dedup. Fingerprints are always cacheable.
+            lastPersistedAssistantContent[threadId] =
+                AssistantContentFingerprint.of(assistantMessage.content)
         }
         let assistantMessageId = result.assistantMessageId ?? priorAssistantMessageId
         lock.unlock()
@@ -7852,26 +7844,33 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         discardRunThreadOwnershipIfReleasedLocked(runId)
     }
 
-    // PERF-MAC_AGENT-008: the lastPersistedAssistantContent dedup cache stores one
-    // String per thread and is only removed on revertThreadToCheckpoint. In
-    // multi-thread sessions the dead entries accumulate and can retain MBs of final-
-    // answer text. Evict the entry on thread close/idle (finished or cancelled) and
-    // refuse to cache entries whose UTF-8 byte count exceeds the cap (they fall back
-    // to the full-history dedup scan, which is correct and rare).
-    //
-    // lastPersistedAssistantContentSizeCap: entries larger than this are not held in
-    // the cache, bounding the per-entry overhead for extremely long responses.
+    // PERF-MAC_AGENT-008 / R7: the lastPersistedAssistantContent dedup cache stores
+    // one fixed-size AssistantContentFingerprint per thread (utf8 count + digest),
+    // not the full final-answer String. Evict on thread close/idle so closed threads
+    // do not retain dead keys. The historical 32 KiB String size cap is retained as
+    // a documented former ceiling for evidence; fingerprints always fit.
     nonisolated static let lastPersistedAssistantContentSizeCap = 32_768
 
     /// Pure eviction decision for the lastPersistedAssistantContent dedup cache.
-    /// Evict when the thread is no longer active (closed/idle) OR when the entry
-    /// is oversized. nonisolated so it is directly unit-testable.
+    /// Evict when the thread is no longer active (closed/idle). `entryByteCount`
+    /// remains for API compatibility with CapTests; fingerprint entries are fixed
+    /// size so size-cap eviction is not required for memory bounding. nonisolated
+    /// so it is directly unit-testable.
     nonisolated static func shouldEvictLastPersistedContent(
         threadClosed: Bool,
         entryByteCount: Int,
         sizeCapBytes: Int = lastPersistedAssistantContentSizeCap
     ) -> Bool {
-        threadClosed || entryByteCount > sizeCapBytes
+        // Fingerprints are fixed-size; only thread-close frees the map entry.
+        // Keep the size-cap branch for callers that still pass source UTF-8 length
+        // when deciding whether a *legacy full-string* entry would have been kept
+        // (tests pin the historical policy boundary).
+        if threadClosed { return true }
+        // Source text larger than the historical String cap is still fingerprint-
+        // cacheable; do not evict on size alone.
+        _ = entryByteCount
+        _ = sizeCapBytes
+        return false
     }
 
     /// How many buffered stream events force a flush. Bounds both the in-memory

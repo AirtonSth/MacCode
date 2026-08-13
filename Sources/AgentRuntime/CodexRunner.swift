@@ -517,26 +517,68 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
 /// outputs lost their terminal `agent_message`/`turn.completed` and the
 /// run hung "running" forever. Only complete lines are emitted; the
 /// trailing partial is held until the next read (or `flush()` at EOF).
+///
+/// PERF: an unterminated fragment without `\\n` previously retained unbounded
+/// `Data` (multi-MB single NDJSON lines). The retained buffer is hard-capped
+/// at `defaultMaxBytes` (512 KiB, aligned with Unix socket stream / memory-loop
+/// ceilings). Complete lines under the cap reassemble losslessly. When a single
+/// line exceeds the ceiling, the partial is discarded and remaining bytes up to
+/// the next newline are skipped so a later suffix cannot splice onto a truncated
+/// prefix and form corrupted-but-parseable JSON.
 final class LineBuffer {
+    /// Peak retained bytes for an unterminated NDJSON fragment.
+    static let defaultMaxBytes = 512 * 1_024
+
     private var buffer = Data()
+    private let maxBytes: Int
+    /// After an oversize partial is dropped, discard inbound bytes until `\n`.
+    private var discardUntilNewline = false
+
+    init(maxBytes: Int = defaultMaxBytes) {
+        self.maxBytes = max(1, maxBytes)
+    }
+
+    /// Bytes currently held waiting for a newline (after overflow discard).
+    var retainedByteCount: Int { buffer.count }
 
     /// Append a chunk, return any now-complete lines (trimmed, non-empty).
     func take(_ data: Data) -> [String] {
-        buffer.append(data)
+        var input = data
+        if discardUntilNewline {
+            if let nl = input.firstIndex(of: 0x0A) {
+                input = Data(input[input.index(after: nl)...])
+                discardUntilNewline = false
+                buffer.removeAll(keepingCapacity: false)
+            } else {
+                // Still inside the oversize line — retain nothing.
+                return []
+            }
+        }
+
+        buffer.append(input)
         var lines: [String] = []
         while let nl = buffer.firstIndex(of: 0x0A) {
             let lineData = buffer.subdata(in: buffer.startIndex..<nl)
             buffer.removeSubrange(buffer.startIndex...nl)
             if let s = Self.decode(lineData) { lines.append(s) }
         }
+        // Hard ceiling: drop the entire oversize partial and skip until the next
+        // newline arrives so we never emit a spliced prefix+suffix frame.
+        if buffer.count > maxBytes {
+            buffer.removeAll(keepingCapacity: false)
+            discardUntilNewline = true
+        }
         return lines
     }
 
     /// Emit any final, unterminated line (last record before EOF).
     func flush() -> [String] {
-        guard !buffer.isEmpty else { return [] }
+        defer {
+            buffer.removeAll(keepingCapacity: false)
+            discardUntilNewline = false
+        }
+        guard !discardUntilNewline, !buffer.isEmpty else { return [] }
         let rest = buffer
-        buffer.removeAll()
         return Self.decode(rest).map { [$0] } ?? []
     }
 

@@ -18,6 +18,8 @@ import AgentRuntime
 /// completion in a session) a one-time reload guards against a prior session
 /// or path having already persisted the same text.
 ///
+/// R7: content keys are `AssistantContentFingerprint` (utf8 count + digest).
+///
 /// Correctness argument:
 /// - If id == nil → unknown DB state → reload (pessimistic, correct).
 /// - If id != nil → we persisted the previous final; content memo already
@@ -28,6 +30,10 @@ import AgentRuntime
 @MainActor
 final class PersistFinalAssistantMemoTests: XCTestCase {
 
+    private func fp(_ text: String) -> AssistantContentFingerprint {
+        AssistantContentFingerprint.of(text)
+    }
+
     // MARK: - shouldReloadForFinal
 
     /// No session ID → reload required.
@@ -37,7 +43,7 @@ final class PersistFinalAssistantMemoTests: XCTestCase {
         let result = AgentAppViewModel.shouldReloadForFinal(
             lastPersistedId: nil,
             lastPersistedKey: nil,
-            incomingKey: "some final answer"
+            incomingKey: fp("some final answer")
         )
         XCTAssertTrue(result,
                       "no session ID means DB state is unknown — reload required to prevent a duplicate persist")
@@ -49,8 +55,8 @@ final class PersistFinalAssistantMemoTests: XCTestCase {
     func test_shouldReload_whenNoSessionId_evenIfContentKeyPresent() {
         let result = AgentAppViewModel.shouldReloadForFinal(
             lastPersistedId: nil,
-            lastPersistedKey: "old answer",
-            incomingKey: "new answer"
+            lastPersistedKey: fp("old answer"),
+            incomingKey: fp("new answer")
         )
         XCTAssertTrue(result,
                       "the ID memo is the session ownership proof; a content key without an ID is not sufficient to skip the reload")
@@ -63,8 +69,8 @@ final class PersistFinalAssistantMemoTests: XCTestCase {
         let id = AgentMessageID()
         let result = AgentAppViewModel.shouldReloadForFinal(
             lastPersistedId: id,
-            lastPersistedKey: "previous final",
-            incomingKey: "new final"
+            lastPersistedKey: fp("previous final"),
+            incomingKey: fp("new final")
         )
         XCTAssertFalse(result,
                        "session ID present means this surface owns the last persisted row; the new text can be appended without a full thread reload")
@@ -78,7 +84,7 @@ final class PersistFinalAssistantMemoTests: XCTestCase {
         let result = AgentAppViewModel.shouldReloadForFinal(
             lastPersistedId: id,
             lastPersistedKey: nil,
-            incomingKey: "some answer"
+            incomingKey: fp("some answer")
         )
         XCTAssertFalse(result,
                        "ID presence alone is sufficient to skip reload; content key absence is irrelevant")
