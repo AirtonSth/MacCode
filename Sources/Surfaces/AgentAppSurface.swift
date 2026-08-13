@@ -9887,6 +9887,9 @@ public struct AgentAppView: View {
     /// Work-stream / thought item ids whose body temporarily shows the local-LLM
     /// natural-language expansion instead of the stored `@sr2 v1` wire.
     @State private var showingNaturalLanguageProviderItems: Set<String> = []
+    /// Final-answer ids the user flipped back to the stored `@sr2 v1` wire.
+    /// Absent means Natural Language is on (the default for finals).
+    @State private var showingSR2WireFinals: Set<String> = []
     @State private var selectedThreadIds: Set<AgentThreadID> = []
     @State private var lastSelectedThreadId: AgentThreadID?
     @State private var draggingThreadId: AgentThreadID?
@@ -10006,6 +10009,18 @@ public struct AgentAppView: View {
 
     static func providerSR2NaturalLanguageToggleLabel(showingNaturalLanguage: Bool) -> String {
         showingNaturalLanguage ? "Natural Language" : "SR2"
+    }
+
+    /// Final answers default to Natural Language. Work-stream rows default to SR2.
+    static func providerSR2ShowsNaturalLanguage(
+        id: String,
+        defaultNaturalLanguage: Bool,
+        showingNaturalLanguageIds: Set<String>,
+        showingSR2FinalIds: Set<String>
+    ) -> Bool {
+        defaultNaturalLanguage
+            ? !showingSR2FinalIds.contains(id)
+            : showingNaturalLanguageIds.contains(id)
     }
 
     /// Default (toggle off) is always the stored wire. Toggle on uses a trusted
@@ -12595,6 +12610,7 @@ public struct AgentAppView: View {
                 vm.transcriptHistoryRevealCount = 0
                 showingOutboundUserMessages = []
                 showingNaturalLanguageProviderItems = []
+                showingSR2WireFinals = []
                 pendingSessionApproval = nil
                 collapseAllWorkDisclosures()
                 knownFinishedWorkTurnIds = []
@@ -14043,6 +14059,17 @@ public struct AgentAppView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .accessibilityLabel("Content omitted: message body was too large to display")
                 } else {
+                    if Self.shouldOfferProviderSR2NaturalLanguageToggle(storedBody: msg.content) {
+                        providerSR2InteractiveBody(
+                            itemId: msg.id.value.uuidString,
+                            turnId: nil,
+                            storedBody: msg.content,
+                            streaming: false,
+                            cacheMarkdown: true,
+                            thoughtStyle: false,
+                            defaultNaturalLanguage: true
+                        )
+                    } else {
                     let showBadge = Self.showsTranslatedBadge(
                         wasSR1Translated: vm.sr1TranslatedMessageIds.contains(msg.id)
                     )
@@ -14070,6 +14097,7 @@ public struct AgentAppView: View {
                             }
                         assistantProse(displayBody)
                         assistantCopyBar(text: BackgroundAwaitContinuation.strippingAwaitingMarker(displayBody), identifierSuffix: msg.id.value.uuidString)
+                    }
                     }
                 }
             }
@@ -14129,15 +14157,27 @@ public struct AgentAppView: View {
             // Only show the turn's final text if no assistant-message item
             // already rendered it (prevents the answer showing twice).
             if let final = turn.finalAssistantMessage, inputs.shouldRenderFinal {
-                let displayFinal = vm.assistantDisplayText(for: final, turnId: turn.turnId)
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    assistantOriginalWireDisclosure(
-                        originalWire: final,
-                        displayText: displayFinal,
-                        accessibilityIdentifier: "agent.turnFinal.original.\(turn.turnId)"
+                if Self.shouldOfferProviderSR2NaturalLanguageToggle(storedBody: final) {
+                    providerSR2InteractiveBody(
+                        itemId: "final:\(turn.turnId)",
+                        turnId: turn.turnId,
+                        storedBody: final,
+                        streaming: false,
+                        cacheMarkdown: turn.finished,
+                        thoughtStyle: false,
+                        defaultNaturalLanguage: true
                     )
-                    assistantProse(displayFinal, cacheMarkdown: turn.finished)
-                    assistantCopyBar(text: BackgroundAwaitContinuation.strippingAwaitingMarker(displayFinal), identifierSuffix: turn.turnId)
+                } else {
+                    let displayFinal = vm.assistantDisplayText(for: final, turnId: turn.turnId)
+                    VStack(alignment: .leading, spacing: DS.Space.xs) {
+                        assistantOriginalWireDisclosure(
+                            originalWire: final,
+                            displayText: displayFinal,
+                            accessibilityIdentifier: "agent.turnFinal.original.\(turn.turnId)"
+                        )
+                        assistantProse(displayFinal, cacheMarkdown: turn.finished)
+                        assistantCopyBar(text: BackgroundAwaitContinuation.strippingAwaitingMarker(displayFinal), identifierSuffix: turn.turnId)
+                    }
                 }
             }
         }
@@ -14254,15 +14294,15 @@ public struct AgentAppView: View {
         switch item.type {
         case .assistantMessage:
             if Self.shouldRenderAssistantItemBody(item.body, persistedAssistantTexts: persistedAssistantTexts) {
-                if isWorkStream,
-                   Self.shouldOfferProviderSR2NaturalLanguageToggle(storedBody: item.body) {
+                if Self.shouldOfferProviderSR2NaturalLanguageToggle(storedBody: item.body) {
                     providerSR2InteractiveBody(
                         itemId: item.id,
                         turnId: item.turnId,
                         storedBody: item.body,
                         streaming: item.state == .streaming,
                         cacheMarkdown: item.state != .streaming,
-                        thoughtStyle: false
+                        thoughtStyle: false,
+                        defaultNaturalLanguage: !isWorkStream
                     )
                 } else {
                     let displayText = vm.assistantDisplayText(
@@ -14391,18 +14431,24 @@ public struct AgentAppView: View {
         .accessibilityIdentifier("agent.reasoning.\(item.id)")
     }
 
-    /// Work-stream / thought SR2: paint the stored wire by default. The mini
-    /// switch matches the user-prompt "SR2 sent" control; on asks the local LLM.
+    /// Work-stream / thought SR2: paint the stored wire by default.
+    /// Final answers default to Natural Language and auto-translate.
     @ViewBuilder
     private func providerSR2InteractiveBody(
         itemId: String,
-        turnId: String,
+        turnId: String?,
         storedBody: String,
         streaming: Bool,
         cacheMarkdown: Bool,
-        thoughtStyle: Bool
+        thoughtStyle: Bool,
+        defaultNaturalLanguage: Bool = false
     ) -> some View {
-        let showingNL = showingNaturalLanguageProviderItems.contains(itemId)
+        let showingNL = Self.providerSR2ShowsNaturalLanguage(
+            id: itemId,
+            defaultNaturalLanguage: defaultNaturalLanguage,
+            showingNaturalLanguageIds: showingNaturalLanguageProviderItems,
+            showingSR2FinalIds: showingSR2WireFinals
+        )
         let translated = showingNL
             ? vm.assistantDisplayText(for: storedBody, itemId: itemId, turnId: turnId)
             : nil
@@ -14412,6 +14458,13 @@ public struct AgentAppView: View {
             translatedText: translated
         )
         let translating = vm.isOnDemandItemTranslationInFlight(itemId)
+        let needsLLM = showingNL
+            && !translating
+            && Self.providerSR2RowDisplayText(
+                storedBody: storedBody,
+                showingNaturalLanguage: true,
+                translatedText: translated
+            ) == storedBody
         VStack(alignment: .leading, spacing: DS.Space.xs) {
             if thoughtStyle {
                 AgentSelectablePlainText(
@@ -14432,30 +14485,38 @@ public struct AgentAppView: View {
                             .accessibilityIdentifier("agent.providerSR2.translating.\(itemId)")
                     }
                     Toggle(isOn: Binding(
-                        get: { showingNaturalLanguageProviderItems.contains(itemId) },
+                        get: { showingNL },
                         set: { on in
-                            if on {
+                            if defaultNaturalLanguage {
+                                if on {
+                                    showingSR2WireFinals.remove(itemId)
+                                } else {
+                                    showingSR2WireFinals.insert(itemId)
+                                }
+                            } else if on {
                                 showingNaturalLanguageProviderItems.insert(itemId)
+                            } else {
+                                showingNaturalLanguageProviderItems.remove(itemId)
+                            }
+                            if on {
                                 let current = vm.assistantDisplayText(
                                     for: storedBody,
                                     itemId: itemId,
                                     turnId: turnId
                                 )
-                                let needsLLM = Self.providerSR2RowDisplayText(
+                                let needsRequest = Self.providerSR2RowDisplayText(
                                     storedBody: storedBody,
                                     showingNaturalLanguage: true,
                                     translatedText: current
                                 ) == storedBody
-                                if needsLLM {
+                                if needsRequest {
                                     vm.requestOnDemandItemTranslation(itemId: itemId, wire: storedBody)
                                 }
-                            } else {
-                                showingNaturalLanguageProviderItems.remove(itemId)
                             }
                         }
                     )) {
                         Text(Self.providerSR2NaturalLanguageToggleLabel(
-                            showingNaturalLanguage: showingNaturalLanguageProviderItems.contains(itemId)
+                            showingNaturalLanguage: showingNL
                         ))
                     }
                     .toggleStyle(.switch)
@@ -14464,9 +14525,7 @@ public struct AgentAppView: View {
                     .foregroundColor(DS.Palette.textTertiary)
                     .accessibilityIdentifier("agent.providerSR2.toggle.\(itemId)")
                     .accessibilityLabel(
-                        showingNaturalLanguageProviderItems.contains(itemId)
-                            ? "Show SR2"
-                            : "Show natural language"
+                        showingNL ? "Show SR2" : "Show natural language"
                     )
                     .help("Translate this SR2 with the local Token Saver model")
                     Spacer(minLength: 0)
@@ -14477,6 +14536,11 @@ public struct AgentAppView: View {
                     text: BackgroundAwaitContinuation.strippingAwaitingMarker(displayText),
                     identifierSuffix: itemId
                 )
+            }
+        }
+        .onAppear {
+            if needsLLM {
+                vm.requestOnDemandItemTranslation(itemId: itemId, wire: storedBody)
             }
         }
     }

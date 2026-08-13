@@ -145,6 +145,33 @@ final class AgentAppViewModelTests: XCTestCase {
             AgentAppView.providerSR2NaturalLanguageToggleLabel(showingNaturalLanguage: true),
             "Natural Language"
         )
+        XCTAssertTrue(
+            AgentAppView.providerSR2ShowsNaturalLanguage(
+                id: "final:turn-1",
+                defaultNaturalLanguage: true,
+                showingNaturalLanguageIds: [],
+                showingSR2FinalIds: []
+            ),
+            "the final answer toggle starts ON — Natural Language"
+        )
+        XCTAssertFalse(
+            AgentAppView.providerSR2ShowsNaturalLanguage(
+                id: "final:turn-1",
+                defaultNaturalLanguage: true,
+                showingNaturalLanguageIds: [],
+                showingSR2FinalIds: ["final:turn-1"]
+            ),
+            "flipping the final toggle off must show the stored SR2 wire"
+        )
+        XCTAssertFalse(
+            AgentAppView.providerSR2ShowsNaturalLanguage(
+                id: "work-1",
+                defaultNaturalLanguage: false,
+                showingNaturalLanguageIds: [],
+                showingSR2FinalIds: []
+            ),
+            "work-stream rows still default to SR2"
+        )
 
         XCTAssertEqual(
             AgentAppView.providerSR2RowDisplayText(
