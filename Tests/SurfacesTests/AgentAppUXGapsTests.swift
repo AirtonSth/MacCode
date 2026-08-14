@@ -405,6 +405,40 @@ final class AgentAppUXGapsTests: XCTestCase {
         )
     }
 
+    /// WHY: SwiftUI's DisclosureGroup recursively duplicated the Token Saver
+    /// accessibility node and could trap a full AX traversal in a render loop.
+    /// The custom button must own one stable popover per durable message.
+    func test_tokenSaverDisclosureToggleOwnsStablePerMessageExpansion() {
+        let first = AgentMessageID()
+        let second = AgentMessageID()
+
+        let presented = AgentAppView.toggledTokenSaverDisclosureMessageID(nil, messageId: first)
+        XCTAssertEqual(presented, first)
+        XCTAssertEqual(
+            AgentAppView.toggledTokenSaverDisclosureMessageID(presented, messageId: second),
+            second,
+            "Opening another reply must move the single bounded popover to that durable message"
+        )
+        XCTAssertNil(
+            AgentAppView.toggledTokenSaverDisclosureMessageID(presented, messageId: first),
+            "Toggling the same durable message must collapse exactly that disclosure"
+        )
+    }
+
+    /// WHY: A short transcript with very tall self-sizing text rows does not benefit
+    /// from lazy rematerialization. Crossing that lazy boundary while scrolling used
+    /// to enter an unbounded AttributeGraph layout loop and grow RSS continuously.
+    func test_shortTranscriptUsesEagerHistoryLayoutToKeepScrollBounded() {
+        XCTAssertFalse(
+            AgentAppView.usesLazyTranscriptHistoryLayout(entryCount: 6),
+            "the six-row real-world reproduction must stay mounted while scrolling"
+        )
+        XCTAssertTrue(
+            AgentAppView.usesLazyTranscriptHistoryLayout(entryCount: 9),
+            "larger transcript windows still need viewport virtualization"
+        )
+    }
+
     /// WHY: completed turns hide their duplicate durable assistant row. The
     /// visible turn must still inherit that row's persisted Token Saver badge.
     func test_tokenSaverOptimizedMessageID_matchesTimelineOwnedFinal() {

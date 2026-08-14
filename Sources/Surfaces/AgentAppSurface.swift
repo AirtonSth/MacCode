@@ -9263,6 +9263,7 @@ public struct AgentAppView: View {
     @State private var queuedMessagePendingCancel: AgentQueuedMessage?
     @State private var pendingSessionApproval: PendingSessionApprovalConfirmation?
     @State private var expandedRequestPreviews: Set<String> = []
+    @State private var presentedTokenSaverDisclosureMessageID: AgentMessageID?
     @State private var declineReasonDrafts: [String: String] = [:]
     // P1: thread delete confirmation — ids staged here until user confirms.
     @State private var pendingDeleteThreadIds: Set<AgentThreadID> = []
@@ -9297,6 +9298,13 @@ public struct AgentAppView: View {
         hasOriginalText
             ? "Token Saver optimized - View transport details"
             : "Token Saver optimized"
+    }
+
+    static func toggledTokenSaverDisclosureMessageID(
+        _ presentedID: AgentMessageID?,
+        messageId: AgentMessageID
+    ) -> AgentMessageID? {
+        presentedID == messageId ? nil : messageId
     }
 
     /// Resolve the durable assistant row represented by a timeline-owned final.
@@ -10003,6 +10011,9 @@ public struct AgentAppView: View {
     // idle render to a recent tail, mirroring the running-state window; the older
     // slice stays one tap away via the existing "earlier transcript items" reveal.
     nonisolated static let idleTranscriptWindowCount = 20
+    /// Very small histories stay mounted. Lazy rematerialization of tall,
+    /// self-sizing NSTextView rows can cycle in AttributeGraph during scroll.
+    nonisolated static let eagerTranscriptHistoryEntryLimit = 8
     nonisolated static let hiddenTranscriptRevealPageCount = 50
     /// Entries kept *before* the newest user message during a follow-up.
     /// 0 = start clean at the user's bubble (prior history via reveal row).
@@ -10459,6 +10470,10 @@ public struct AgentAppView: View {
         }
         guard entries.count > idleWindowCount else { return entries }
         return Array(entries.suffix(idleWindowCount))
+    }
+
+    nonisolated static func usesLazyTranscriptHistoryLayout(entryCount: Int) -> Bool {
+        entryCount > eagerTranscriptHistoryEntryLimit
     }
 
     /// Entries from the last user message (minus optional preceding context) to end.
@@ -11603,11 +11618,22 @@ public struct AgentAppView: View {
                                 )
                                 .id("agent.transcript.revealControl")
                             }
-                            // Finished / stable history — Lazy releases off-screen.
-                            LazyVStack(alignment: .leading, spacing: 32) {
-                                ForEach(historyEntries) { entry in
-                                    transcriptEntryRow(entry, columnWidth: timelineColumnWidth)
-                                        .id(entry.id)
+                            // Short histories stay mounted so scrolling tall,
+                            // self-sizing text rows cannot cross a Lazy rematerialization
+                            // boundary. Larger windows retain viewport virtualization.
+                            if Self.usesLazyTranscriptHistoryLayout(entryCount: historyEntries.count) {
+                                LazyVStack(alignment: .leading, spacing: 32) {
+                                    ForEach(historyEntries) { entry in
+                                        transcriptEntryRow(entry, columnWidth: timelineColumnWidth)
+                                            .id(entry.id)
+                                    }
+                                }
+                            } else {
+                                VStack(alignment: .leading, spacing: 32) {
+                                    ForEach(historyEntries) { entry in
+                                        transcriptEntryRow(entry, columnWidth: timelineColumnWidth)
+                                            .id(entry.id)
+                                    }
                                 }
                             }
                             // Live streaming turns — eager, outside Lazy.
@@ -11757,6 +11783,7 @@ public struct AgentAppView: View {
             .onChange(of: vm.selectedThreadId) { _ in
                 vm.transcriptHistoryRevealCount = 0
                 pendingSessionApproval = nil
+                presentedTokenSaverDisclosureMessageID = nil
                 collapseAllWorkDisclosures()
                 knownFinishedWorkTurnIds = []
                 // Opening a thread: rejoin bottom (user expectation) and re-enable auto-follow.
@@ -13142,54 +13169,36 @@ public struct AgentAppView: View {
     @ViewBuilder
     private func tokenSaverOptimizedDisclosure(messageId: AgentMessageID) -> some View {
         if let original = vm.tokenSaverOriginalText(for: messageId) {
-            DisclosureGroup {
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    if let request = vm.tokenSaverWireRequestText(for: messageId) {
-                        Text("What was sent")
-                            .font(DS.Font.caption2)
-                            .foregroundColor(DS.Palette.textTertiary)
-                        Text(request)
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textSecondary)
-                            .textSelection(.enabled)
-                        Button("Copy what was sent") {
-                            copyToPasteboard(request)
-                        }
-                        .buttonStyle(.plain)
-                        .font(DS.Font.caption2)
-                        .accessibilityIdentifier("agent.assistantMessage.copyTokenSaverRequest.\(messageId.value.uuidString)")
-                    }
-                    Text("Original provider response")
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
-                    Text(original)
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textSecondary)
-                        .textSelection(.enabled)
-                    Button("Copy original provider response") {
-                        copyToPasteboard(original)
-                    }
-                    .buttonStyle(.plain)
-                    .font(DS.Font.caption2)
-                    .accessibilityIdentifier("agent.assistantMessage.copyTokenSaverOriginal.\(messageId.value.uuidString)")
-                    Button(vm.tokenSaverTranslationRetryMessageIds.contains(messageId) ? "Retrying translation…" : "Retry translation") {
-                        vm.retryTokenSaverTranslation(for: messageId)
-                    }
-                    .buttonStyle(.plain)
-                    .font(DS.Font.caption2)
-                    .disabled(vm.tokenSaverTranslationRetryMessageIds.contains(messageId))
-                    .accessibilityLabel("Retry local translation")
-                    .accessibilityIdentifier("agent.assistantMessage.retryTokenSaverTranslation.\(messageId.value.uuidString)")
-                }
-                .padding(DS.Space.sm)
-                .background(DS.Palette.surface, in: RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            let presented = presentedTokenSaverDisclosureMessageID == messageId
+            Button {
+                presentedTokenSaverDisclosureMessageID = Self.toggledTokenSaverDisclosureMessageID(
+                    presentedTokenSaverDisclosureMessageID,
+                    messageId: messageId
+                )
             } label: {
-                Text(Self.tokenSaverBadgeLabel(hasOriginalText: true))
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
+                HStack(spacing: DS.Space.xs) {
+                    Image(systemName: presented ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                    Text(Self.tokenSaverBadgeLabel(hasOriginalText: true))
+                        .font(DS.Font.caption2)
+                }
+                .foregroundColor(DS.Palette.textTertiary)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
             .accessibilityLabel("Token Saver optimized this reply. View transport details.")
+            .accessibilityValue(presented ? "Expanded" : "Collapsed")
             .accessibilityIdentifier("agent.assistantMessage.tokenSaverOriginal.\(messageId.value.uuidString)")
+            .popover(isPresented: Binding(
+                get: { presentedTokenSaverDisclosureMessageID == messageId },
+                set: { isPresented in
+                    if !isPresented, presentedTokenSaverDisclosureMessageID == messageId {
+                        presentedTokenSaverDisclosureMessageID = nil
+                    }
+                }
+            )) {
+                tokenSaverTransportDetails(messageId: messageId, original: original)
+            }
         } else {
             Text(Self.tokenSaverBadgeLabel(hasOriginalText: false))
                 .font(DS.Font.caption2)
@@ -13197,6 +13206,52 @@ public struct AgentAppView: View {
                 .accessibilityLabel("Token Saver optimized this reply")
                 .accessibilityIdentifier("agent.assistantMessage.tokenSaverBadge.\(messageId.value.uuidString)")
         }
+    }
+
+    private func tokenSaverTransportDetails(messageId: AgentMessageID, original: String) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                if let request = vm.tokenSaverWireRequestText(for: messageId) {
+                    Text("What was sent")
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textTertiary)
+                    Text(request)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .textSelection(.enabled)
+                    Button("Copy what was sent") {
+                        copyToPasteboard(request)
+                    }
+                    .buttonStyle(.plain)
+                    .font(DS.Font.caption2)
+                    .accessibilityIdentifier("agent.assistantMessage.copyTokenSaverRequest.\(messageId.value.uuidString)")
+                }
+                Text("Original provider response")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                Text(original)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .textSelection(.enabled)
+                Button("Copy original provider response") {
+                    copyToPasteboard(original)
+                }
+                .buttonStyle(.plain)
+                .font(DS.Font.caption2)
+                .accessibilityIdentifier("agent.assistantMessage.copyTokenSaverOriginal.\(messageId.value.uuidString)")
+                Button(vm.tokenSaverTranslationRetryMessageIds.contains(messageId) ? "Retrying translation…" : "Retry translation") {
+                    vm.retryTokenSaverTranslation(for: messageId)
+                }
+                .buttonStyle(.plain)
+                .font(DS.Font.caption2)
+                .disabled(vm.tokenSaverTranslationRetryMessageIds.contains(messageId))
+                .accessibilityLabel("Retry local translation")
+                .accessibilityIdentifier("agent.assistantMessage.retryTokenSaverTranslation.\(messageId.value.uuidString)")
+            }
+            .padding(DS.Space.md)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(width: 520, height: 420)
     }
 
     private func tokenSaverOptimizedMessageID(matching visibleText: String) -> AgentMessageID? {
