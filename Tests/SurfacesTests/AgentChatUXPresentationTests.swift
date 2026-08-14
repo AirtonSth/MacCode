@@ -367,7 +367,7 @@ final class AgentChatUXPresentationTests: XCTestCase {
             inverted,
             turnFinalText: { $0.kind == .turn ? $0.text : nil },
             assistantMessageText: { $0.kind == .assistant ? $0.text : nil },
-            textsMatch: AgentTranscriptOrder.finalTextsMatch
+            normalizedText: AgentTranscriptOrder.normalizedFinalText
         )
         XCTAssertEqual(
             fixed.map(\.id),
@@ -378,9 +378,42 @@ final class AgentChatUXPresentationTests: XCTestCase {
             fixed,
             turnFinalText: { $0.kind == .turn ? $0.text : nil },
             assistantMessageText: { $0.kind == .assistant ? $0.text : nil },
-            textsMatch: AgentTranscriptOrder.finalTextsMatch
+            normalizedText: AgentTranscriptOrder.normalizedFinalText
         )
         XCTAssertEqual(alreadyGood.map(\.id), fixed.map(\.id), "idempotent when order is already correct")
+    }
+
+    /// WHY: scrolling recomputes transcript paint order. Normalizing every turn
+    /// final again for every persisted message made that render path explode on
+    /// long histories even though each source string only needs one compact form.
+    func test_placingMatchingFinalsAfterTurns_normalizesEachCandidateOnceAtScale() {
+        struct Row: Equatable {
+            enum Kind { case turn, assistant }
+            let id: String
+            let kind: Kind
+            let text: String
+        }
+        let messages = (0..<25).map {
+            Row(id: "message-\($0)", kind: .assistant, text: "answer-\($0)")
+        }
+        let turns = (0..<5_000).map {
+            Row(id: "turn-\($0)", kind: .turn, text: "answer-\($0)")
+        }
+        var normalizationCount = 0
+
+        let fixed = AgentTranscriptOrder.placingMatchingFinalsAfterTurns(
+            messages + turns,
+            turnFinalText: { $0.kind == .turn ? $0.text : nil },
+            assistantMessageText: { $0.kind == .assistant ? $0.text : nil },
+            normalizedText: { text in
+                normalizationCount += 1
+                return text
+            }
+        )
+
+        XCTAssertEqual(normalizationCount, messages.count + turns.count)
+        XCTAssertEqual(fixed.first?.id, "turn-0")
+        XCTAssertEqual(fixed.dropFirst().first?.id, "message-0")
     }
 
     func test_finalTextsMatch_ignoresWhitespaceNoise() {
@@ -410,6 +443,35 @@ final class AgentChatUXPresentationTests: XCTestCase {
         )
         XCTAssertEqual(preview.rows.count, 10)
         XCTAssertEqual(preview.hiddenCount, 40)
+    }
+
+    /// WHY: one outer Work-so-far block can contain thousands of grouped tool
+    /// items. Expanding that single block must not eagerly mount every tool row.
+    func test_workDisclosureLayout_toolGroupPaintAndThumbnailPreviewStayBounded() {
+        let all = Array(0..<5_000)
+        let slice = AgentWorkDisclosureLayout.toolGroupPaintSlice(all: all, revealCount: 0)
+        XCTAssertEqual(slice.rows.count, AgentWorkDisclosureLayout.toolGroupPaintWindow)
+        XCTAssertEqual(slice.hiddenCount, 5_000 - AgentWorkDisclosureLayout.toolGroupPaintWindow)
+
+        let more = AgentWorkDisclosureLayout.toolGroupPaintSlice(
+            all: all,
+            revealCount: AgentWorkDisclosureLayout.toolGroupRevealPage
+        )
+        XCTAssertEqual(
+            more.rows.count,
+            AgentWorkDisclosureLayout.toolGroupPaintWindow + AgentWorkDisclosureLayout.toolGroupRevealPage
+        )
+        XCTAssertEqual(
+            AgentWorkDisclosureLayout.toolGroupThumbnailPreview(
+                all: all,
+                isThumbnail: { $0.isMultiple(of: 100) }
+            ),
+            Array(
+                all.filter { $0.isMultiple(of: 100) }
+                    .suffix(AgentWorkDisclosureLayout.toolGroupThumbnailPreviewWindow)
+            ),
+            "collapsed image bursts must not decode thousands of thumbnails"
+        )
     }
 
     func test_turnChatComposition_liveAllInWork_finishedFinalOutside() {

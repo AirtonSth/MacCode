@@ -514,16 +514,20 @@ public enum AgentTranscriptOrder {
         _ entries: [Entry],
         turnFinalText: (Entry) -> String?,
         assistantMessageText: (Entry) -> String?,
-        textsMatch: (String, String) -> Bool
+        normalizedText: (String) -> String
     ) -> [Entry] {
         guard entries.count > 1 else { return entries }
 
-        var turnFinals: [(index: Int, final: String)] = []
+        var turnFinals: [(index: Int, normalized: String)] = []
         turnFinals.reserveCapacity(entries.count)
+        var lastTurnIndexByExactText: [String: Int] = [:]
         for (index, entry) in entries.enumerated() {
             if let final = turnFinalText(entry)?.trimmingCharacters(in: .whitespacesAndNewlines),
                !final.isEmpty {
-                turnFinals.append((index, final))
+                let normalized = normalizedText(final)
+                guard !normalized.isEmpty else { continue }
+                turnFinals.append((index, normalized))
+                lastTurnIndexByExactText[normalized] = index
             }
         }
         guard !turnFinals.isEmpty else { return entries }
@@ -533,10 +537,16 @@ public enum AgentTranscriptOrder {
         for (index, entry) in entries.enumerated() {
             guard let text = assistantMessageText(entry)?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !text.isEmpty else { continue }
-            guard let match = turnFinals.last(where: { textsMatch(text, $0.final) }) else { continue }
+            let normalized = normalizedText(text)
+            guard !normalized.isEmpty else { continue }
+            let matchIndex = lastTurnIndexByExactText[normalized]
+                ?? turnFinals.last(where: {
+                    normalizedFinalTextsMatch(normalized, $0.normalized)
+                })?.index
+            guard let matchIndex else { continue }
             // Only lift messages that currently paint *above* their Work so far turn.
-            if index < match.index {
-                moveAfterTurn[index] = match.index
+            if index < matchIndex {
+                moveAfterTurn[index] = matchIndex
             }
         }
         guard !moveAfterTurn.isEmpty else { return entries }
@@ -563,6 +573,16 @@ public enum AgentTranscriptOrder {
     public static func finalTextsMatch(_ lhs: String, _ rhs: String) -> Bool {
         let a = compactFinalText(lhs)
         let b = compactFinalText(rhs)
+        return normalizedFinalTextsMatch(a, b)
+    }
+
+    public static func normalizedFinalText(_ text: String) -> String {
+        compactFinalText(text)
+    }
+
+    private static func normalizedFinalTextsMatch(_ lhs: String, _ rhs: String) -> Bool {
+        let a = lhs
+        let b = rhs
         guard !a.isEmpty, !b.isEmpty else { return false }
         return a == b || a.contains(b) || b.contains(a)
     }
@@ -626,6 +646,11 @@ public enum AgentWorkDisclosureLayout {
     /// Max step blocks painted in the lazy list before "show earlier".
     public static let expandedPaintWindow = 48
     public static let expandedRevealPage = 48
+    /// A grouped run is one outer block, so it needs its own strict member cap.
+    public static let toolGroupPaintWindow = 24
+    public static let toolGroupRevealPage = 24
+    /// Bound eager thumbnail decoding while the group remains collapsed.
+    public static let toolGroupThumbnailPreviewWindow = 8
     /// Diff card: collapsed by default; preview this many non-meta lines when open.
     public static let diffDefaultExpanded = false
     public static let diffPreviewLineLimit = 32
@@ -646,6 +671,30 @@ public enum AgentWorkDisclosureLayout {
 
     public static func advancedRevealCount(current: Int, hiddenBase: Int, page: Int = expandedRevealPage) -> Int {
         min(hiddenBase, max(0, current) + max(1, page))
+    }
+
+    public static func toolGroupPaintSlice<T>(
+        all: [T],
+        revealCount: Int
+    ) -> (hiddenCount: Int, rows: [T]) {
+        paintSlice(all: all, revealCount: revealCount, window: toolGroupPaintWindow)
+    }
+
+    public static func toolGroupAdvancedRevealCount(current: Int, hiddenBase: Int) -> Int {
+        advancedRevealCount(current: current, hiddenBase: hiddenBase, page: toolGroupRevealPage)
+    }
+
+    public static func toolGroupThumbnailPreview<T>(
+        all: [T],
+        isThumbnail: (T) -> Bool
+    ) -> [T] {
+        var reversedPreview: [T] = []
+        reversedPreview.reserveCapacity(toolGroupThumbnailPreviewWindow)
+        for item in all.reversed() where isThumbnail(item) {
+            reversedPreview.append(item)
+            if reversedPreview.count == toolGroupThumbnailPreviewWindow { break }
+        }
+        return reversedPreview.reversed()
     }
 
     /// Visible code lines for a diff card (non-meta), with optional full expand.

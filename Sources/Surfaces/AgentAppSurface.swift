@@ -9224,6 +9224,8 @@ public struct AgentAppView: View {
     @State private var renameText: String = ""
     @State private var expandedTools: Set<String> = []
     @State private var expandedToolGroups: Set<String> = []
+    /// Older grouped tool members revealed beyond the strict initial paint window.
+    @State private var toolGroupRevealByID: [String: Int] = [:]
     // UX-MAC_AGENT-010: reasoning rows collapse to "Thought" by default once
     // completed; ids here are the ones the user explicitly expanded.
     @State private var expandedReasoning: Set<String> = []
@@ -10220,7 +10222,7 @@ public struct AgentAppView: View {
                 }
                 return nil
             },
-            textsMatch: AgentTranscriptOrder.finalTextsMatch
+            normalizedText: AgentTranscriptOrder.normalizedFinalText
         )
     }
 
@@ -11797,6 +11799,9 @@ public struct AgentAppView: View {
         if !expandedTools.isEmpty { expandedTools.formIntersection(liveItemIds) }
         // A tool group is keyed by its first item's id, so it lives in the same id space.
         if !expandedToolGroups.isEmpty { expandedToolGroups.formIntersection(liveItemIds) }
+        if !toolGroupRevealByID.isEmpty {
+            toolGroupRevealByID = toolGroupRevealByID.filter { liveItemIds.contains($0.key) }
+        }
         if !expandedReasoning.isEmpty { expandedReasoning.formIntersection(liveItemIds) }
         let liveRequestIds = Set(vm.timeline.pendingRequests.map(\.id))
         if !expandedRequestPreviews.isEmpty { expandedRequestPreviews.formIntersection(liveRequestIds) }
@@ -13040,6 +13045,7 @@ public struct AgentAppView: View {
         expandedCompletedWorkTurns = cleared.expanded
         userCollapsedLiveWorkTurns = cleared.collapsedLive
         workDisclosureRevealByTurn = [:]
+        toolGroupRevealByID = [:]
         expandedLiveWorkCache.clear()
     }
 
@@ -13785,8 +13791,15 @@ public struct AgentAppView: View {
         let failed = items.contains { $0.state == .failed }
         let liveAnchor = AgentAppView.liveElapsedAnchor(in: items)
         let expanded = expandedToolGroups.contains(id)
+        let reveal = toolGroupRevealByID[id] ?? 0
+        let slice = AgentWorkDisclosureLayout.toolGroupPaintSlice(all: items, revealCount: reveal)
         let imageOnly = !items.isEmpty && items.allSatisfy { $0.type == .imageView }
-        let imagePresentations = AgentImageViewPresentation.presentations(in: items)
+        let imagePresentations = AgentImageViewPresentation.presentations(
+            in: AgentWorkDisclosureLayout.toolGroupThumbnailPreview(
+                all: items,
+                isThumbnail: { $0.type == .imageView }
+            )
+        )
         let headerIcon = streaming
             ? "circle.dotted"
             : (failed ? "exclamationmark.triangle" : (imageOnly ? "photo" : "terminal"))
@@ -13870,7 +13883,23 @@ public struct AgentAppView: View {
                         .frame(width: 1.5)
                         .padding(.leading, 4)
                     VStack(alignment: .leading, spacing: DS.Space.md) {
-                        ForEach(items, id: \.id) { item in
+                        if slice.hiddenCount > 0 {
+                            Button {
+                                let hiddenBase = max(0, items.count - AgentWorkDisclosureLayout.toolGroupPaintWindow)
+                                toolGroupRevealByID[id] = AgentWorkDisclosureLayout.toolGroupAdvancedRevealCount(
+                                    current: reveal,
+                                    hiddenBase: hiddenBase
+                                )
+                                workDisclosureLayoutEpoch &+= 1
+                            } label: {
+                                Text("Show earlier items (\(slice.hiddenCount) hidden)")
+                                    .font(DS.Font.caption)
+                                    .foregroundColor(DS.Palette.accent)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("agent.toolGroup.revealEarlier.\(id)")
+                        }
+                        ForEach(slice.rows, id: \.id) { item in
                             // Image members keep the thumbnail card; other tools
                             // stay on the compact command row.
                             if item.type == .imageView {
@@ -16654,6 +16683,18 @@ enum ScrollPinTransition {
 }
 
 enum ScrollPinPolicy {
+    /// `NSApp.currentEvent` retains the last event after dispatch. Accept its
+    /// scroll-wheel fallback only while that event is genuinely in flight;
+    /// otherwise later layout growth is misclassified as a user scroll.
+    nonisolated static func isRecentScrollInput(
+        eventTimestamp: TimeInterval,
+        now: TimeInterval,
+        maximumAge: TimeInterval = 0.25
+    ) -> Bool {
+        let age = now - eventTimestamp
+        return age >= 0 && age <= maximumAge
+    }
+
     /// Decide the pin-state transition that a clip-bounds change implies.
     ///
     /// UX contract (Agent App iOS + macOS):
@@ -16896,7 +16937,10 @@ private struct TimelineScrollFollower: NSViewRepresentable {
             guard let event = NSApp.currentEvent else { return false }
             switch event.type {
             case .scrollWheel, .magnify:
-                return true
+                return ScrollPinPolicy.isRecentScrollInput(
+                    eventTimestamp: event.timestamp,
+                    now: ProcessInfo.processInfo.systemUptime
+                )
             default:
                 return false
             }

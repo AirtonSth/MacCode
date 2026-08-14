@@ -12,6 +12,24 @@ import XCTest
 /// Each test encodes the business rule it guards, not just the return value.
 final class ScrollPinPolicyTests: XCTestCase {
 
+    /// WHY: NSApp.currentEvent keeps the last wheel event after dispatch. Treating
+    /// that stale event as active made later group expansion look user-owned and
+    /// detached a transcript that was still pinned to the bottom.
+    func testRecentScrollInputRejectsStaleCurrentEvent() {
+        XCTAssertTrue(
+            ScrollPinPolicy.isRecentScrollInput(eventTimestamp: 100, now: 100.1),
+            "a wheel event still being dispatched must own its bounds change"
+        )
+        XCTAssertFalse(
+            ScrollPinPolicy.isRecentScrollInput(eventTimestamp: 100, now: 101),
+            "an old currentEvent must not turn later SwiftUI layout growth into audit scroll"
+        )
+        XCTAssertFalse(
+            ScrollPinPolicy.isRecentScrollInput(eventTimestamp: 101, now: 100),
+            "timestamps from a different/future clock must fail closed"
+        )
+    }
+
     // MARK: - reachedBottom
 
     /// gap == 0: flush at the bottom => must re-pin.
