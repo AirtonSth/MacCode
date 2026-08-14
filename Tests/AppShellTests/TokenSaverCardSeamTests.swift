@@ -73,6 +73,37 @@ final class TokenSaverCardSeamTests: XCTestCase {
         XCTAssertEqual(SidebarRootView.modelDirSize(at: dir), 350)
     }
 
+    func test_tokenSaverDistillDirectory_matchesInstallerLeaf() {
+        // WHY: the footer must not construct TokenSaverModelInstaller (codecs)
+        // just to resolve Distill/; the seam has to stay the same leaf path.
+        let root = URL(fileURLWithPath: "/tmp/rc-appsupport-\(UUID().uuidString)", isDirectory: true)
+        let installer = TokenSaverModelInstaller(appSupportDirectory: root)
+        XCTAssertEqual(
+            SidebarRootView.tokenSaverDistillDirectory(appSupportDirectory: root),
+            installer.distillDirectory
+        )
+    }
+
+    func test_cachedInstalledModelBytes_hit_sameURL() {
+        // WHY: a second sidebar body with the same Distill URL must not walk
+        // the tree again — that's the per-invalidation stall we removed.
+        let url = URL(fileURLWithPath: "/tmp/Distill")
+        let cache = TokenSaverInstalledModelSizeCache(url: url, bytes: 6_700_000_000)
+        XCTAssertEqual(SidebarRootView.cachedInstalledModelBytes(at: url, cache: cache), 6_700_000_000)
+    }
+
+    func test_cachedInstalledModelBytes_miss_emptyAndDifferentURL() {
+        // WHY: first paint and a changed app-support path must remesure so the
+        // delete button does not show a stale size or hide after a real download.
+        let url = URL(fileURLWithPath: "/tmp/Distill")
+        XCTAssertNil(SidebarRootView.cachedInstalledModelBytes(at: url, cache: TokenSaverInstalledModelSizeCache()))
+        let other = TokenSaverInstalledModelSizeCache(
+            url: URL(fileURLWithPath: "/tmp/other"),
+            bytes: 1
+        )
+        XCTAssertNil(SidebarRootView.cachedInstalledModelBytes(at: url, cache: other))
+    }
+
     func test_modelDirSize_sumsNestedFiles() throws {
         // WHY: revision sub-directories nest files; the enumerator must recurse.
         let dir = try makeTempDir(suffix: "nested")

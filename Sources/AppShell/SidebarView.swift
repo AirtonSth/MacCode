@@ -412,6 +412,10 @@ public final class SidebarViewModel: ObservableObject {
     /// task so a burst of per-provider `.rc2TokenSaverUsageChanged` events
     /// coalesces into a single off-main read instead of N main-thread reads.
     private var tokenSaverHeavyReloadTask: Task<Void, Never>?
+    /// Distill tree size for the disabled-footer "Delete model" row. Measured
+    /// once per URL; SwiftUI body must not re-stat the model directory on every
+    /// sidebar @Published invalidation (active-thread badge, usage, filter).
+    var tokenSaverInstalledModelSizeCache = TokenSaverInstalledModelSizeCache()
     private var tokenSaverLocalUsageBaseline: [AgentProvider: Int]?
     private var sidecarStatusObserver: NSObjectProtocol?
     private var tokenSaverToggleObserver: NSObjectProtocol?
@@ -1083,6 +1087,7 @@ public final class SidebarViewModel: ObservableObject {
             guard confirmed else { return }
             tokenSaverEnabled = false
             graphifyRuntimeActive = false
+            invalidateInstalledTokenSaverModelBytes()
             settingsStore.update {
                 $0.tokenSaverEnabled = false
             }
@@ -1251,11 +1256,36 @@ public final class SidebarViewModel: ObservableObject {
     public func markTokenSaverModelInstalledForTesting() {
         tokenSaverModelDownloadState = .ready
         showsTokenSaverModelDownload = false
+        invalidateInstalledTokenSaverModelBytes()
         tokenSaverEnabled = true
         settingsStore.update {
             $0.tokenSaverEnabled = true
         }
         refreshTokenSaverDistillService(modelValidation: .installed)
+    }
+
+    /// Distill size for the disabled footer. First call walks the tree; later
+    /// sidebar bodies reuse the cache until disable / download / delete.
+    func installedTokenSaverModelBytes() -> Int64 {
+        guard !tokenSaverEnabled, let ctx = context else { return 0 }
+        let url = SidebarRootView.tokenSaverDistillDirectory(appSupportDirectory: ctx.appSupportDirectory)
+        if let cached = SidebarRootView.cachedInstalledModelBytes(
+            at: url,
+            cache: tokenSaverInstalledModelSizeCache
+        ) {
+            return cached
+        }
+        let bytes = SidebarRootView.modelDirSize(at: url)
+        tokenSaverInstalledModelSizeCache = TokenSaverInstalledModelSizeCache(url: url, bytes: bytes)
+        return bytes
+    }
+
+    func invalidateInstalledTokenSaverModelBytes() {
+        tokenSaverInstalledModelSizeCache = TokenSaverInstalledModelSizeCache()
+    }
+
+    func recordInstalledTokenSaverModelBytes(_ bytes: Int64, at url: URL) {
+        tokenSaverInstalledModelSizeCache = TokenSaverInstalledModelSizeCache(url: url, bytes: bytes)
     }
 
     private func validateTokenSaverModel(requireSelectedModel: Bool = false) -> TokenSaverModelValidation {
@@ -1314,6 +1344,7 @@ public final class SidebarViewModel: ObservableObject {
                 }
                 self.tokenSaverModelDownloadState = .ready
                 self.showsTokenSaverModelDownload = false
+                self.invalidateInstalledTokenSaverModelBytes()
                 self.tokenSaverEnabled = true
                 self.settingsStore.update {
                     $0.tokenSaverEnabled = true
@@ -2337,6 +2368,23 @@ public enum TokenSaverSavingsDisplay {
     }
 }
 
+/// Cached Distill tree size for the disabled Token Saver footer.
+///
+/// WHY: `tokenSaverControl` lives in the always-on sidebar. While Token Saver
+/// is off, a body walk of Distill (multi-GB, many files) plus a fresh
+/// `TokenSaverModelInstaller` (JSONEncoder/Decoder) ran on every sidebar
+/// `@Published` invalidation. Cache by directory URL; invalidate on disable,
+/// download, and delete.
+public struct TokenSaverInstalledModelSizeCache: Equatable {
+    public var url: URL?
+    public var bytes: Int64?
+
+    public init(url: URL? = nil, bytes: Int64? = nil) {
+        self.url = url
+        self.bytes = bytes
+    }
+}
+
 public struct SidebarRootView: View {
     private enum TokenSaverUsageScope: String, CaseIterable {
         case currentSession
@@ -2842,14 +2890,11 @@ public struct SidebarRootView: View {
     }
 
     private var tokenSaverControl: some View {
-        // :186 -- compute model dir size once for this render pass.
-        // Only evaluated when !tokenSaverEnabled so the hot (enabled) path
-        // pays zero cost.
-        let modelDirURL: URL? = {
-            guard !vm.tokenSaverEnabled, let ctx = vm.context else { return nil }
-            return TokenSaverModelInstaller(appSupportDirectory: ctx.appSupportDirectory).distillDirectory
-        }()
-        let modelDirBytes: Int64 = modelDirURL.map { Self.modelDirSize(at: $0) } ?? 0
+        // :186 -- delete-model row only when disabled + Distill files exist.
+        // Size is cached on the VM: constructing TokenSaverModelInstaller and
+        // walking the tree from body re-allocated codecs and re-statted every
+        // sidebar invalidation while Token Saver was off.
+        let modelDirBytes = vm.installedTokenSaverModelBytes()
         let showDeleteModel = !vm.tokenSaverEnabled && modelDirBytes > 0
 
         return VStack(alignment: .leading, spacing: DS.Space.xs) {
@@ -3019,6 +3064,7 @@ public struct SidebarRootView: View {
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         try? FileManager.default.removeItem(at: installer.distillDirectory)
+        vm.recordInstalledTokenSaverModelBytes(0, at: installer.distillDirectory)
     }
 
     private var tokenSaverPillText: String {
@@ -4156,26 +4202,41 @@ public struct SidebarRootView: View {
         return 0
     }
 
-    /// :186 -- Sums the byte sizes of all regular files under `url` (non-recursive
-    /// into sub-directories is fine; the model dir is flat).  Uses a recursive
-    /// enumerator so nested revision sub-directories are included.
+    /// Distill directory next to app support. Same path as
+    /// `TokenSaverModelInstaller.distillDirectory` without allocating installer codecs.
+    nonisolated public static func tokenSaverDistillDirectory(appSupportDirectory: URL) -> URL {
+        appSupportDirectory.appendingPathComponent("Distill", isDirectory: true)
+    }
+
+    /// Hit when `cache` already measured `url`. Miss (nil) means walk once.
+    nonisolated public static func cachedInstalledModelBytes(
+        at url: URL,
+        cache: TokenSaverInstalledModelSizeCache
+    ) -> Int64? {
+        guard cache.url == url else { return nil }
+        return cache.bytes
+    }
+
+    /// :186 -- Sums the byte sizes of all regular files under `url`. Uses a
+    /// recursive enumerator so nested revision sub-directories are included.
     ///
     /// WHY pure/nonisolated: lets tests exercise the calculation with a temp-dir
     /// fixture without any AppContext or UI setup.  Returns 0 when the directory
     /// does not exist (model not installed).
     nonisolated public static func modelDirSize(at url: URL) -> Int64 {
         let fm = FileManager.default
+        let keys: Set<URLResourceKey> = [.fileSizeKey, .isRegularFileKey]
         guard let enumerator = fm.enumerator(
             at: url,
-            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            includingPropertiesForKeys: Array(keys),
             options: [.skipsHiddenFiles]
         ) else { return 0 }
         var total: Int64 = 0
         for case let fileURL as URL in enumerator {
-            guard (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else { continue }
-            if let size = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize {
-                total += Int64(size)
-            }
+            guard let values = try? fileURL.resourceValues(forKeys: keys),
+                  values.isRegularFile == true,
+                  let size = values.fileSize else { continue }
+            total += Int64(size)
         }
         return total
     }
