@@ -96,6 +96,54 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         )
     }
 
+    /// WHY: a 7-day heal used to construct a fresh SettingsStore + UsageStore
+    /// per day (empty cache → 7 SQLite reads + 7 usage.json decodes) on the
+    /// MainActor. Shared snapshot must load once per window call.
+    func test_economyWindow_loadsSharedSettingsAndUsageOnce() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2TokenSaverEconomyWindow-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        context.tokenSaverDailyEconomySharedSnapshotLoadsForTesting = 0
+
+        context.recomputeTokenSaverDailyEconomyWindow(dayCount: 7)
+
+        XCTAssertEqual(
+            context.tokenSaverDailyEconomySharedSnapshotLoadsForTesting,
+            1,
+            "7-day heal must share one settings+usage.json snapshot, not load per day"
+        )
+    }
+
+    /// WHY: AppContext already recomputes today before posting usage-changed.
+    /// Reloading the sidebar snapshot must not stall MainActor on another
+    /// 7-day settings+usage walk — historical days are unchanged by this event.
+    func test_usageChangedNotification_doesNotRehealSevenDayWindow() async throws {
+        let (context, viewModel, appSupport) = try makeViewModel()
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let healsAfterInit = viewModel.tokenSaverEconomyWindowHealCountForTesting
+        XCTAssertGreaterThanOrEqual(healsAfterInit, 1, "boot must heal the week once")
+
+        _ = try TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).record(
+            provider: .claude,
+            actualProviderTokens: 10,
+            estimatedRawTokens: 10,
+            eligibleRuns: 1
+        )
+        NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+
+        let refreshed = await waitUntil {
+            viewModel.tokenSaverUsageSnapshot.providers
+                .contains(where: { $0.provider == .claude && $0.actualProviderTokens >= 10 })
+        }
+        XCTAssertTrue(refreshed)
+        XCTAssertEqual(
+            viewModel.tokenSaverEconomyWindowHealCountForTesting,
+            healsAfterInit,
+            "usage notification must not re-run the 7-day economy heal"
+        )
+    }
+
     private func makeViewModel() throws -> (AppContext, SidebarViewModel, URL) {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2TokenSaverLocalSignal-\(UUID().uuidString)", isDirectory: true)

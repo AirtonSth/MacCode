@@ -418,6 +418,8 @@ public final class SidebarViewModel: ObservableObject {
     /// task so a burst of per-provider `.rc2TokenSaverUsageChanged` events
     /// coalesces into a single off-main read instead of N main-thread reads.
     private var tokenSaverHeavyReloadTask: Task<Void, Never>?
+    /// Test seam: 7-day economy heals requested from this VM (boot / AndWait).
+    var tokenSaverEconomyWindowHealCountForTesting = 0
     /// Distill tree size for the disabled-footer "Delete model" row. Measured
     /// once per URL; SwiftUI body must not re-stat the model directory on every
     /// sidebar @Published invalidation (active-thread badge, usage, filter).
@@ -528,7 +530,9 @@ public final class SidebarViewModel: ObservableObject {
         workspacePrompter = AppKitWorkspacePrompter(viewModel: self)
         reload()
         reloadInsomnia()
-        reloadTokenSaver()
+        // Heal last-7-days formula rows once at boot. Usage notifications
+        // only need today, which AppContext already recomputes before notify.
+        reloadTokenSaver(healEconomyWindow: true)
         sidecarStatus = context.tokenSaverDistillServiceController.status
     }
 
@@ -671,7 +675,10 @@ public final class SidebarViewModel: ObservableObject {
     /// aggregate (`tokenSaverSavingsRepo.summary()`) -- runs OFF the main
     /// thread and is coalesced: a fresh notification cancels the prior task,
     /// so a per-provider burst collapses to a single background read.
-    private func reloadTokenSaver(trackLocalUsageChange: Bool = false) {
+    private func reloadTokenSaver(
+        trackLocalUsageChange: Bool = false,
+        healEconomyWindow: Bool = false
+    ) {
         let settings = settingsStore.load()
         tokenSaverEnabled = settings.tokenSaverEnabled
         graphifyRuntimeActive = settings.isGraphifyRuntimeActive
@@ -687,9 +694,13 @@ public final class SidebarViewModel: ObservableObject {
             tokenSaverLocalUsageUpdate = nil
             return
         }
-        // Recompute the retained week so pre-v6 permanent-amort rows do not
-        // keep painting a ~999M Week headline after the formula heal.
-        context.recomputeTokenSaverDailyEconomyWindow(dayCount: 7)
+        // Week heal is for formula-version rows (boot / explicit wait). A
+        // usage notification already recomputed today on the write path;
+        // redoing 7 days here stalled MainActor on 7× settings + usage.json.
+        if healEconomyWindow {
+            tokenSaverEconomyWindowHealCountForTesting += 1
+            context.recomputeTokenSaverDailyEconomyWindow(dayCount: 7)
+        }
         let appSupport = context.appSupportDirectory
         let savingsRepo = context.tokenSaverSavingsRepo
         let economyRepo = context.tokenSaverDailyEconomyRepo

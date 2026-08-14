@@ -419,6 +419,9 @@ public final class AppContext {
     /// store mutation. Production never sets this.
     var beforeTokenSaverUsageWriteForTesting: (@Sendable () throws -> Void)?
     var tokenSaverUsageTombstoneLimitForTesting: Int?
+    /// Test seam: shared settings+usage.json loads for daily-economy heal.
+    /// One window(7) must increment this once, not once per day.
+    var tokenSaverDailyEconomySharedSnapshotLoadsForTesting = 0
     var completedUsageTombstoneCountForTesting: Int { completedUsageByRun.count }
     func hasCompletedUsageTombstoneForTesting(runId: AgentRunID) -> Bool {
         completedUsageByRun[runId] != nil
@@ -4456,28 +4459,50 @@ public final class AppContext {
         }
     }
 
+    private struct TokenSaverDailyEconomySharedSnapshot {
+        let settings: AppSettings
+        let usage: TokenSaverUsageSnapshot
+    }
+
     /// Persist today's credible total so Week = Σ(daily.total_credible).
     public func recomputeTokenSaverDailyEconomyToday(now: Date = Date()) {
-        recomputeTokenSaverDailyEconomy(for: now, now: now)
+        let snapshot = loadTokenSaverDailyEconomySharedSnapshot()
+        recomputeTokenSaverDailyEconomy(for: now, now: now, snapshot: snapshot)
     }
 
     /// Recompute the last `dayCount` calendar days (inclusive of today) so Week
     /// totals heal after formula changes (e.g. v5 permanent-amort → v6 day-scoped).
     /// Older formula rows would otherwise keep painting ~999M until each day ages out.
     public func recomputeTokenSaverDailyEconomyWindow(dayCount: Int = 7, now: Date = Date()) {
+        let snapshot = loadTokenSaverDailyEconomySharedSnapshot()
         let cal = Calendar.current
         let todayStart = cal.startOfDay(for: now)
         let count = max(1, min(dayCount, 14))
         for offset in 0..<count {
             guard let day = cal.date(byAdding: .day, value: -offset, to: todayStart) else { continue }
-            recomputeTokenSaverDailyEconomy(for: day, now: now)
+            recomputeTokenSaverDailyEconomy(for: day, now: now, snapshot: snapshot)
         }
     }
 
+    /// Settings + usage.json are identical for every day in a window. A new
+    /// `SettingsStore` has an empty cache, so the previous per-day path did
+    /// 7 SQLite loads + 7 usage.json decode passes on the MainActor.
+    private func loadTokenSaverDailyEconomySharedSnapshot() -> TokenSaverDailyEconomySharedSnapshot {
+        tokenSaverDailyEconomySharedSnapshotLoadsForTesting += 1
+        return TokenSaverDailyEconomySharedSnapshot(
+            settings: SettingsStore(db: db).load(),
+            usage: TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).load()
+        )
+    }
+
     /// Persist one calendar day's credible total (day-scoped amort + caps).
-    private func recomputeTokenSaverDailyEconomy(for day: Date, now: Date) {
-        let settings = SettingsStore(db: db).load()
-        let usage = TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).load()
+    private func recomputeTokenSaverDailyEconomy(
+        for day: Date,
+        now: Date,
+        snapshot: TokenSaverDailyEconomySharedSnapshot
+    ) {
+        let settings = snapshot.settings
+        let usage = snapshot.usage
         let cal = Calendar.current
         let dayStart = cal.startOfDay(for: day)
         let windowUsage = usage.daily
