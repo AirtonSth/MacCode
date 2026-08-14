@@ -306,6 +306,54 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         )
     }
 
+    /// WHY: after detect records the pending row, later itemDelta chunks
+    /// still copied the growing command body (~30 Hz) and then copied it
+    /// again in processGraphifyBuffer only to return. Answer tokens come
+    /// from result-phase output, so command-body growth is wasted.
+    func test_graphifyBuffer_stopsGrowingBodyAfterInvocationRecorded() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2GraphifyBodyCap-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true, graphifyEnabled: true))
+        let threadId = AgentThreadID()
+        let runId = AgentRunID()
+        let itemId = "bash-body"
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: itemId,
+            bodyAppend: #"{"command":"graphify query where is X"}"#,
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        let afterMatch = context.graphifyBufferBodyUTF8CountForTesting(runId: runId, itemId: itemId)
+        XCTAssertGreaterThan(afterMatch, 0, "first matching chunk must populate the command body")
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: itemId,
+            bodyAppend: String(repeating: "x", count: 2048),
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: itemId,
+            bodyAppend: String(repeating: "y", count: 2048),
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        XCTAssertEqual(
+            context.graphifyBufferBodyUTF8CountForTesting(runId: runId, itemId: itemId),
+            afterMatch,
+            "later command-text deltas must not grow the body after the pending row exists"
+        )
+    }
+
     private func makeViewModel() throws -> (AppContext, SidebarViewModel, URL) {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2TokenSaverLocalSignal-\(UUID().uuidString)", isDirectory: true)

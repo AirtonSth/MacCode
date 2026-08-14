@@ -667,6 +667,14 @@ public final class AppContext {
         var createdAtMs: Int64
         var recordedInvocation: Bool = false
         var recordedExploration: Bool = false
+
+        /// After the pending row exists, later command-text chunks are unused
+        /// until finalize (detect already ran; answer tokens come from output).
+        var isCommandBodyClosed: Bool {
+            recordedInvocation
+                && (recordedExploration
+                    || !GraphifyUsageDetector.isExplorationTool(summary: summary))
+        }
     }
     private var graphifyItemBuffers: [String: GraphifyItemBuffer] = [:]
     private let graphifyItemBuffersLock = NSLock()
@@ -687,6 +695,14 @@ public final class AppContext {
     var graphifyProviderLookupCountForTesting = 0
     /// Test seam: GraphifyUsageDetector.detect / commandText runs.
     var graphifyDetectCountForTesting = 0
+
+    /// Test seam: accumulated command-body bytes for one Graphify item buffer.
+    func graphifyBufferBodyUTF8CountForTesting(runId: AgentRunID, itemId: String) -> Int {
+        let key = "\(runId.value.uuidString)|\(itemId)"
+        graphifyItemBuffersLock.lock()
+        defer { graphifyItemBuffersLock.unlock() }
+        return graphifyItemBuffers[key]?.body.utf8.count ?? 0
+    }
 
     public init(
         channel: ReleaseChannel = .debug,
@@ -4713,17 +4729,20 @@ public final class AppContext {
         graphifyItemBuffersLock.lock()
         if var existing = graphifyItemBuffers[bufferKey] {
             if let s = summary, !s.isEmpty { existing.summary = s }
-            if let b = bodyAppend { existing.body += b }
-            if let o = outputAppend {
-                let resultPhase = (summary == "result") || (existing.summary == "result")
-                if resultPhase {
-                    existing.output += o
-                } else {
-                    existing.body += o
-                }
+            let resultPhase = (summary == "result") || (existing.summary == "result")
+            let bodyClosed = existing.isCommandBodyClosed
+            // Mid-stream command text is only needed until detect records a
+            // pending row. After that, += copies a growing multi-KB body on
+            // every itemDelta and processGraphifyBuffer copies it again just
+            // to return. Result-phase output still accumulates for finalize.
+            if !bodyClosed {
+                if let b = bodyAppend { existing.body += b }
+                if let o = outputAppend, !resultPhase { existing.body += o }
             }
+            if let o = outputAppend, resultPhase { existing.output += o }
             graphifyItemBuffers[bufferKey] = existing
             graphifyItemBuffersLock.unlock()
+            if bodyClosed, !finalize { return }
             processGraphifyBuffer(
                 bufferKey: bufferKey,
                 itemId: itemId,
