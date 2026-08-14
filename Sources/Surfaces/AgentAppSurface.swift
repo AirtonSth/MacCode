@@ -76,9 +76,17 @@ public final class AgentComposerState: ObservableObject {
 /// fields on the parent `AgentAppViewModel`.
 @MainActor
 public final class AgentTranscriptState: ObservableObject {
-    @Published public var messages: [AgentMessage] = []
-    @Published public var timeline = AssistantTimelineState()
+    @Published public var messages: [AgentMessage] = [] {
+        didSet { contentGeneration &+= 1 }
+    }
+    @Published public var timeline = AssistantTimelineState() {
+        didSet { contentGeneration &+= 1 }
+    }
     @Published public var timelineUpdateTick: Int = 0
+    /// Bumped only when `messages` / `timeline` are assigned. Paint ticks
+    /// republish this object (~30 Hz) without new content; hide-set memos
+    /// key off this so they skip the O(thread) body hash on tick-only passes.
+    public private(set) var contentGeneration: UInt64 = 0
 }
 
 /// F1: scopes @ObservedObject observation to the composer subtree. A change to the
@@ -10859,6 +10867,7 @@ public struct AgentAppView: View {
     }
 
     private final class HiddenPersistedAssistantMessageCache {
+        var generation: UInt64?
         var key: String?
         var ids: Set<AgentMessageID> = []
     }
@@ -10874,14 +10883,20 @@ public struct AgentAppView: View {
     }
 
     private var hiddenPersistedAssistantMessageIDs: Set<AgentMessageID> {
-        // R4-C: key on content fingerprint (message ids/utf8 lengths + assistant
-        // body/final lengths), not timelineUpdateTick. Pure paint ticks (~30 Hz)
-        // with unchanged content must hit; streaming body growth must recompute.
+        // R4-C: key on content fingerprint, not timelineUpdateTick. Paint
+        // ticks republish transcriptState (~30 Hz) even when messages/timeline
+        // are unchanged; contentGeneration skips the O(thread) hash+hide
+        // recompute on those passes. Streaming assigns still bump generation.
+        let generation = vm.transcriptState.contentGeneration
+        if hiddenPersistedAssistantMessageCache.generation == generation {
+            return hiddenPersistedAssistantMessageCache.ids
+        }
         let key = Self.hiddenPersistedAssistantContentKey(
             messages: vm.messages,
             timelineTurns: vm.timeline.turns
         )
         if hiddenPersistedAssistantMessageCache.key == key {
+            hiddenPersistedAssistantMessageCache.generation = generation
             return hiddenPersistedAssistantMessageCache.ids
         }
         let ids = Self.hiddenPersistedAssistantMessageIDs(
@@ -10889,6 +10904,7 @@ public struct AgentAppView: View {
             timelineTurns: vm.timeline.turns,
             persistedAssistantTexts: persistedAssistantTexts
         )
+        hiddenPersistedAssistantMessageCache.generation = generation
         hiddenPersistedAssistantMessageCache.key = key
         hiddenPersistedAssistantMessageCache.ids = ids
         return ids

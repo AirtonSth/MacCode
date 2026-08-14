@@ -67,3 +67,38 @@ final class AgentAppCompletedWorkTickTests: XCTestCase {
         XCTAssertFalse(update.hasNewlyFinished)
     }
 }
+
+/// WHY: conversation-column rebuilds on `timelineUpdateTick` (~30 Hz) used to
+/// rehash every assistant body to rebuild `hiddenPersistedAssistantContentKey`
+/// even when messages/timeline were unchanged. Generation must ignore ticks.
+@MainActor
+final class AgentTranscriptStateGenerationTests: XCTestCase {
+    func test_contentGeneration_ignoresPaintTickAndBumpsOnTranscriptAssign() {
+        let state = AgentTranscriptState()
+        let start = state.contentGeneration
+
+        state.timelineUpdateTick &+= 1
+        state.timelineUpdateTick &+= 1
+        XCTAssertEqual(
+            state.contentGeneration,
+            start,
+            "paint ticks must not invalidate hide-set memos"
+        )
+
+        state.messages = [
+            AgentMessage(
+                id: AgentMessageID(),
+                threadId: AgentThreadID(),
+                role: .assistant,
+                content: "hello",
+                createdAt: Date(timeIntervalSince1970: 1)
+            )
+        ]
+        XCTAssertEqual(state.contentGeneration, start + 1)
+
+        var timeline = state.timeline
+        timeline.turns.append(AssistantTurnSnapshot(turnId: "t1", finished: false))
+        state.timeline = timeline
+        XCTAssertEqual(state.contentGeneration, start + 2)
+    }
+}
