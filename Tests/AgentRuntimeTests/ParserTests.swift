@@ -23,6 +23,36 @@ final class CodexParserTests: XCTestCase {
         XCTAssertEqual(state.turns[0].items[0].body, "Hello")
     }
 
+    func test_parseObject_matchesParseLineForItemDelta() throws {
+        // WHY: CodexRunner now feeds the already-decoded dict. parseObject must
+        // keep the same itemDelta as parseLine or exec --json tokens vanish.
+        let line = #"{"type":"item.delta","item_id":"i1","body_delta":"Hello"}"#
+        func warmUp(_ p: CodexParser) {
+            _ = p.parseObject(["type": "turn.started", "turn_id": "t1"], now: 1)
+            _ = p.parseObject([
+                "type": "item.started", "item_id": "i1", "turn_id": "t1",
+                "item_type": "assistantMessage",
+            ], now: 1)
+        }
+        let viaLine = CodexParser()
+        let viaObject = CodexParser()
+        warmUp(viaLine)
+        warmUp(viaObject)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+        )
+        let lineText = viaLine.parseLine(line).compactMap { ev -> String? in
+            if case .itemDelta(_, let body, _, _) = ev { return body }
+            return nil
+        }
+        let objectText = viaObject.parseObject(object, now: 1).compactMap { ev -> String? in
+            if case .itemDelta(_, let body, _, _) = ev { return body }
+            return nil
+        }
+        XCTAssertEqual(lineText, objectText)
+        XCTAssertEqual(lineText, ["Hello"])
+    }
+
     func test_realExecSchema_agentMessageSurfacesAsFinal() {
         // `codex exec --json`: reply arrives as item.completed{item:...},
         // turn.completed carries NO message.

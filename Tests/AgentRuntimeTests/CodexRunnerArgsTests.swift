@@ -340,4 +340,31 @@ final class CodexRunnerArgsTests: XCTestCase {
         XCTAssertEqual(resolved, cli.path,
                        "leading and trailing whitespace in the configured CLI name must be trimmed; otherwise a user-typed ' claude ' in Settings produces a silent not-found failure")
     }
+
+    func test_interpretStreamJSONLine_decodesJSONOnce() {
+        // WHY: emitLine used to JSONSerialization via fromJSONLine and again
+        // in CodexParser.parseLine on every exec --json line.
+        let parser = CodexParser()
+        _ = parser.parseObject(["type": "turn.started", "turn_id": "t1"], now: 1)
+        _ = parser.parseObject([
+            "type": "item.started", "item_id": "i1", "turn_id": "t1",
+            "item_type": "assistantMessage",
+        ], now: 1)
+        CodexRunner.streamJSONDecodeCountForTesting = 0
+        let line = #"{"type":"item.delta","item_id":"i1","body_delta":"Hi"}"#
+        let interpreted = CodexRunner.interpretStreamJSONLine(line, parser: parser, receivedAtMs: 1)
+        XCTAssertEqual(
+            CodexRunner.streamJSONDecodeCountForTesting, 1,
+            "runtime + parser must share one JSONSerialization"
+        )
+        XCTAssertEqual(interpreted.runtimeEvent?.method, "item.delta")
+        XCTAssertEqual(interpreted.runtimeEvent?.source, "codex.exec.json")
+        XCTAssertTrue(
+            interpreted.parsedEvents.contains { event in
+                if case .itemDelta(_, let body, _, _) = event { return body == "Hi" }
+                return false
+            },
+            "decode-once must still surface the token: \(interpreted.parsedEvents)"
+        )
+    }
 }
