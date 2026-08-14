@@ -957,12 +957,7 @@ public struct LocalDistillRuntime: DistillRuntime {
         case .longText, .watchSummary:
             return String(request.input.prefix(request.maxOutputCharacters))
         case .wireEncode:
-            let frame = RCWireFrame(
-                direction: .request,
-                sequence: 1,
-                records: [.init(kind: .goal, value: request.input)]
-            )
-            return (try? RCWireProtocol.serialize(frame)) ?? request.input
+            return (try? RCWireProtocol.serializeRequestText(request.input)) ?? request.input
         case .wireRenderEnglish:
             guard let frames = try? RCWireProtocol.parse(request.input) else { return request.input }
             return RCWireProtocol.renderEnglish(frames)
@@ -1524,11 +1519,7 @@ public struct MLXDistillRuntime: DistillRuntime {
         }
         // Never hide a malformed protocol-looking model response inside a goal.
         guard !brief.hasPrefix("RCW") else { return nil }
-        return try? RCWireProtocol.serialize(RCWireFrame(
-            direction: .request,
-            sequence: 1,
-            records: [.init(kind: .goal, value: brief)]
-        ))
+        return try? RCWireProtocol.serializeRequestText(brief)
     }
 
     static func requestByProtectingTagsAndMarkers(_ request: DistillRequest) -> (request: DistillRequest, payload: ProtectedTagPayload) {
@@ -1604,17 +1595,17 @@ public struct MLXDistillRuntime: DistillRuntime {
         switch mode {
         case .wireEncode:
             return """
-            Compress an English software task into a compact semantic brief for another AI agent.
+            Compress a software task in any human language into a compact English semantic brief for another AI agent.
             Preserve negation, modality, ordering, conditions, commands, paths, URLs, IDs, hashes, numbers, units, errors, quotes, code, approvals, security warnings, and data-loss warnings verbatim.
             Drop repetition, filler, hedging, and politeness. Never invent facts, aliases, tags, or a transport grammar.
             Output only the compact English brief. Swift owns the RC Wire framing.
             """
         case .wireRenderEnglish:
             return """
-            Render valid RC Wire v1 response frames as concise fluent English for a software engineer.
+            Render valid RC Wire v1 response frames as concise fluent prose in the trusted target language supplied by the host (default English).
             Preserve every fact, negation, condition, command, path, URL, ID, hash, number, unit, error, quote, code span, approval, warning, outcome, evidence, risk, and question.
             Do not invent facts or claim work that the frames do not report.
-            Return only the English answer. Never output RCW1 tags or explain the protocol.
+            Return only the answer in that language. Never output RCW1 tags or explain the protocol.
             """
         case .naturalLanguage:
             return """
@@ -1680,7 +1671,7 @@ public struct MLXDistillRuntime: DistillRuntime {
         case .wireEncode:
             return """
             /no_think
-            Compress this English user task into one compact semantic brief.
+            Compress this user task, in any language, into one compact English semantic brief.
             Keep every protected literal and intent-critical condition verbatim.
 
             \(request.input)
@@ -1688,13 +1679,14 @@ public struct MLXDistillRuntime: DistillRuntime {
             BRIEF:
             """
         case .wireRenderEnglish:
+            let language = wireRenderLanguageIdentifier(request.question)
             return """
             /no_think
-            Render these RC Wire v1 response frames as concise English.
+            Render these RC Wire v1 response frames in BCP-47 language \(language).
 
             \(request.input)
 
-            ENGLISH:
+            ANSWER:
             """
         case .naturalLanguage:
             return """
@@ -1800,6 +1792,18 @@ public struct MLXDistillRuntime: DistillRuntime {
         return first.joined(separator: "\n")
     }
 
+    static func wireRenderLanguageIdentifier(_ rawValue: String?) -> String {
+        let trimmed = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty,
+              trimmed.utf8.count <= 35,
+              trimmed.unicodeScalars.allSatisfy({
+                  CharacterSet.alphanumerics.contains($0) || $0.value == 45
+              }) else {
+            return "en"
+        }
+        return trimmed
+    }
+
     static func isUsefulDistillOutput(_ output: String) -> Bool {
         isUsefulOutput(output, mode: .longText)
     }
@@ -1815,10 +1819,7 @@ public struct MLXDistillRuntime: DistillRuntime {
         case .longText, .watchSummary, .naturalLanguage:
             return String(request.input.prefix(request.maxOutputCharacters))
         case .wireEncode:
-            let frame = RCWireFrame(direction: .request, sequence: 1, records: [
-                .init(kind: .goal, value: request.input)
-            ])
-            return (try? RCWireProtocol.serialize(frame)) ?? request.input
+            return (try? RCWireProtocol.serializeRequestText(request.input)) ?? request.input
         case .wireRenderEnglish:
             guard let frames = try? RCWireProtocol.parse(request.input) else { return request.input }
             return RCWireProtocol.renderEnglish(frames)

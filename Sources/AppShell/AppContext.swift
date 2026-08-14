@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import NaturalLanguage
 import CoreModel
 import Persistence
 import AgentRuntime
@@ -428,7 +429,6 @@ public final class AppContext {
     }
     private var cachedDistillClientKey: String?
     private var cachedDistillClient: DistillServiceClient?
-    private var tokenSaverPromptSkipSet: [DistillResultCacheKey: Date] = [:]
     /// Test seam: when set, used instead of resolving a client from the live
     /// sidecar status. Production code never sets this.
     var distillClientOverrideForTesting: DistillServiceClient?
@@ -512,12 +512,6 @@ public final class AppContext {
     /// Production leaves this nil and calls the ownership-safe installer scrub.
     var legacyDistillCleanupOverrideForTesting: (() throws -> Void)?
     var tokenSaverRolloverBeforeCommitForTesting: (() throws -> Void)?
-    /// Prompts shorter than this are sent verbatim: distillation overhead/latency
-    /// isn't worth it and tiny instructions have nothing to compress.
-    // Raised from 600: below ~2k chars a model round-trip on the awaited prompt path
-    // rarely nets out positive once MLX latency is counted (NetPositiveGate floor, G3).
-    private static let tokenSaverMinCompressChars = 2_000
-    private static let tokenSaverPromptSkipSetTTL: TimeInterval = 1_800
     private static let tokenSaverUsageNotificationMinimumInterval: TimeInterval = 2
     /// Process-local once flag for empty lane_state diagnostic (silent-death condition).
     private static var didLogEmptyTokenSaverLaneState = false
@@ -923,16 +917,22 @@ public final class AppContext {
             )
             return await self.tokenSaverCompress(prompt: scopedPrompt, provider: provider, threadId: threadId, runId: runId)
         }
-        self.coordinator.followUpPromptCompressor = { [weak self] prompt, provider, threadId in
+        self.coordinator.followUpPromptCompressor = { [weak self] prompt, provider, threadId, runId in
             guard let self else { return prompt }
             let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
             guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .followUp) else {
                 return prompt
             }
             let scopedPrompt = await self.tokenSaverSessionLearnPrompt(
-                prompt, provider: provider, threadId: threadId, runId: nil
+                prompt, provider: provider, threadId: threadId, runId: runId
             )
-            return await self.tokenSaverCompress(prompt: scopedPrompt, provider: provider, threadId: threadId, cacheState: "prompt_followup")
+            return await self.tokenSaverCompress(
+                prompt: scopedPrompt,
+                provider: provider,
+                threadId: threadId,
+                cacheState: "prompt_followup",
+                runId: runId
+            )
         }
         self.coordinator.finalResponseTranslator = { [weak self] response, provider, threadId, runId in
             guard let self else { return response }
@@ -2859,16 +2859,9 @@ public final class AppContext {
 
     /// Token Saver prompt compression. Returns the distilled text to send to the
     /// provider, or the original prompt unchanged when Token Saver is off, the
-    /// prompt is too small, the sidecar is unavailable, compression doesn't
-    /// help, or anything fails. Every real compression is measured and written
-    /// to the local savings ledger. Fail-open by contract.
-    /// Seconds since this thread's last provider turn, from provider_session_runtime
-    /// staleness (a heuristic — that table has no billed-cache columns). nil when there
-    /// is no prior turn, which the gate treats as COLD (never wrongly skip a fresh prompt).
-    private func secondsSinceLastTurn(threadId: AgentThreadID) -> Double? {
-        guard let runtime = try? providerSessionRuntimeRepo.get(threadId: threadId) else { return nil }
-        return max(0, Date().timeIntervalSince(runtime.updatedAt))
-    }
+    /// sidecar/recovery path is unavailable, literal preservation fails, or
+    /// anything else makes RCW1 unsafe. Every non-empty prompt otherwise uses
+    /// RCW1 v1 regardless of language, length, or risk class.
 
     private func tokenSaverProjectAdmission(
         threadId: AgentThreadID,
@@ -3060,12 +3053,14 @@ public final class AppContext {
         cacheState: String = "prompt",
         runId: AgentRunID? = nil
     ) async -> String {
-        let traceEligible = prompt.count >= Self.tokenSaverMinCompressChars
         func trace(_ checkpoint: String) {
-            guard traceEligible else { return }
             NSLog("RemoteCode RCW1 admission checkpoint=\(checkpoint) provider=\(provider.rawValue) cache=\(cacheState)")
         }
         trace("entered")
+        guard !prompt.isEmpty else {
+            trace("empty_prompt")
+            return prompt
+        }
         let turn: TokenSaverAdapterMatrix.CrossUserTurn =
             cacheState.contains("follow") ? .followUp : .initial
         guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(
@@ -3073,10 +3068,6 @@ public final class AppContext {
             turn: turn
         ) else {
             trace("denied_user_or_turn")
-            return prompt
-        }
-        guard Self.isWireEligibleEnglishPrompt(prompt) else {
-            trace("ineligible_language_or_risk")
             return prompt
         }
         guard !tokenSaverLaneIsDisabled("wire-encode"),
@@ -3119,62 +3110,31 @@ public final class AppContext {
             trace("legacy_session")
             return prompt
         }
-        // NetPositiveGate (G3): there is no app-side cached prefix to preserve (resume sends
-        // the full wrapped prompt), so this is a numeric decision — compress the new-turn
-        // argv only when it is large enough AND the session is not a warm follow-up.
-        let floor = Self.tokenSaverMinCompressChars
-        if prompt.count < floor {
-            return prompt
-        }
-        let gate = NetPositiveGate(floorCharacters: floor, warmResumeTTLSeconds: 300)
-        let secondsSinceLastTurn = secondsSinceLastTurn(threadId: threadId)
-        guard gate.shouldCompress(inputCharacters: prompt.count, secondsSinceLastTurn: secondsSinceLastTurn) else {
-            trace("net_gate")
-            return prompt
-        }
-        let promptBytes = prompt.utf8.count
-        // A prior no-win should suppress duplicate local work for the same prompt.
-        let skipKey = DistillResultCacheKey(request: DistillRequest(
-            mode: .wireEncode,
-            priority: .interactive,
-            input: prompt,
-            maxOutputCharacters: max(512, prompt.count)
-        ), pipelineVersion: DistillResultCacheKey.pipelineVersion + "-wire-v1")
-        if tokenSaverPromptSkipSetContains(skipKey) {
-            trace("known_no_win")
-            return prompt
-        }
         trace("admitted")
         // Wire encoding is one atomic semantic transform. If the local encoder
         // is unavailable or rejected, the exact human prompt must reach the
         // provider; an unrelated prose/dedupe transform is not a valid fallback.
         let deterministicCandidate = prompt
-        let deterministicBytes = deterministicCandidate.utf8.count
-        let deterministicCharacters = deterministicCandidate.count
 
-        // Adopt `candidate` only if it beats the ORIGINAL prompt; record honest end-to-end
-        // savings (original -> final), tagged with the caller's cache_state AND the engine
-        // that produced the win (deterministic pre-pass vs the model) so the Token Saver
-        // breakdown attributes the wire encoding technique.
+        // RCW1 is the transport contract whenever Token Saver is active. Savings
+        // remain honest: a longer wire prompt is sent but records no savings.
         func adopt(_ candidate: String, stage: TokenSaverRouteStage) -> String {
             let inputTokens = TokenEstimator.estimate(prompt)
             let outputTokens = TokenEstimator.estimate(candidate)
             let grammarTokens = TokenEstimator.estimate(AgentSkillInstaller.rcWireAgentInstructionsTemplate)
-            guard RCWireProtocol.isWire(candidate),
-                  outputTokens + grammarTokens < inputTokens else {
-                self.tokenSaverPromptSkipSet[skipKey] = Date()
-                return prompt
+            guard RCWireProtocol.isWire(candidate) else { return prompt }
+            if outputTokens + grammarTokens < inputTokens {
+                recordTokenSaverSidecarSavings(
+                    provider: provider,
+                    threadId: threadId,
+                    mode: DistillMode.wireEncode.rawValue,
+                    inputTokens: inputTokens,
+                    outputTokens: outputTokens + grammarTokens,
+                    savedTokens: inputTokens - outputTokens - grammarTokens,
+                    cacheState: cacheState,
+                    routeStage: stage
+                )
             }
-            recordTokenSaverSidecarSavings(
-                provider: provider,
-                threadId: threadId,
-                mode: DistillMode.wireEncode.rawValue,
-                inputTokens: inputTokens,
-                outputTokens: outputTokens + grammarTokens,
-                savedTokens: max(inputTokens - outputTokens - grammarTokens, 0),
-                cacheState: cacheState,
-                routeStage: stage
-            )
             return candidate
         }
 
@@ -3186,12 +3146,19 @@ public final class AppContext {
             trace("sidecar_not_ready")
             return prompt
         }
+        let inputByteCount = deterministicCandidate.utf8.count
+        let wireOutputBudget: Int
+        if inputByteCount > (Int.max - 1_024) / 2 {
+            wireOutputBudget = Int.max
+        } else {
+            wireOutputBudget = max(512, inputByteCount * 2 + 1_024)
+        }
         let request = DistillRequest(
             mode: .wireEncode,
             priority: .interactive,
             input: deterministicCandidate,
             runMode: .optimize,
-            maxOutputCharacters: max(512, deterministicCharacters)
+            maxOutputCharacters: wireOutputBudget
         )
         let scopedRecoveryAvailable = runId != nil
             && tokenSaverPersistentScope(threadId: threadId) != nil
@@ -3223,22 +3190,14 @@ public final class AppContext {
             let modelOutput = response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? deterministicCandidate : response.output
             let wireFrames = try? RCWireProtocol.parse(modelOutput)
             let isValidRequestWire = wireFrames?.allSatisfy { $0.direction == .request } == true
-            let literalSafeModelOutput = isValidRequestWire
+            let literalSafeModelOutput: String? = isValidRequestWire
                 && RCWireProtocol.preservesProtectedSemantics(original: prompt, wire: modelOutput)
                 && LiteralPreservation.guarded(original: prompt, compressed: modelOutput).droppedLiteral == nil
                 ? modelOutput
-                : deterministicCandidate
-            // A wire candidate is live only after schema/literal/net-savings gates
+                : nil
+            // A wire candidate is live only after schema/literal gates
             // and exact-scope recovery has been durably stored and read back.
-            let modelWon = literalSafeModelOutput.utf8.count < deterministicBytes
-            let modelNetPositive = TokenEstimator.estimate(literalSafeModelOutput)
-                + TokenEstimator.estimate(AgentSkillInstaller.rcWireAgentInstructionsTemplate)
-                < TokenEstimator.estimate(prompt)
-            if !modelWon, deterministicBytes >= promptBytes {
-                tokenSaverPromptSkipSet[skipKey] = Date()
-            }
-            guard modelWon,
-                  modelNetPositive,
+            guard let literalSafeModelOutput,
                   let recoveredCandidate = prepareWireCandidate(
                     original: prompt,
                     stageOriginal: deterministicCandidate,
@@ -3347,16 +3306,9 @@ public final class AppContext {
                 recoveryMarkers.append("[[rc:\(preparedFull.capability)]]")
             }
 
-            // Final marker-inclusive net-positive gate before durable delivery/ack.
             var recoverable = candidate
             for marker in recoveryMarkers {
                 recoverable = try RCWireProtocol.addingExactRecord(marker, to: recoverable)
-            }
-            guard TokenEstimator.estimate(recoverable)
-                    + TokenEstimator.estimate(AgentSkillInstaller.rcWireAgentInstructionsTemplate)
-                    < TokenEstimator.estimate(original) else {
-                discardProvisionals()
-                return nil
             }
 
             // Atomic multi-object finalization: stage (+ optional full-original) in one
@@ -3411,15 +3363,6 @@ public final class AppContext {
             scope: scope,
             idempotencyKey: idempotencyKey
         )
-    }
-
-    private func tokenSaverPromptSkipSetContains(_ key: DistillResultCacheKey) -> Bool {
-        guard let insertedAt = tokenSaverPromptSkipSet[key] else { return false }
-        if Date().timeIntervalSince(insertedAt) > Self.tokenSaverPromptSkipSetTTL {
-            tokenSaverPromptSkipSet.removeValue(forKey: key)
-            return false
-        }
-        return true
     }
 
     /// Stores only bounded, exact-thread private learning. The production read path
@@ -3660,7 +3603,7 @@ public final class AppContext {
         guard isTokenSaverRuntimeActive() else { return nil }
         guard let client = currentDistillClient() else { return nil }
 
-        let targetLanguage = threadId.map { inferredUserLanguage(threadId: $0) } ?? "English"
+        let targetLanguage = threadId.map { inferredUserLanguageIdentifier(threadId: $0) } ?? "en"
         let request = DistillRequest(
             mode: .naturalLanguage,
             priority: .background,
@@ -3706,6 +3649,7 @@ public final class AppContext {
             mode: .wireRenderEnglish,
             priority: .interactive,
             input: response,
+            question: inferredUserLanguageIdentifier(threadId: threadId),
             maxOutputCharacters: max(1_200, min(12_000, response.count * 4))
         )
         do {
@@ -3754,22 +3698,41 @@ public final class AppContext {
         }
     }
 
-    private func inferredUserLanguage(threadId: AgentThreadID) -> String {
+    private func inferredUserLanguageIdentifier(threadId: AgentThreadID) -> String {
         let recent = (try? messageRepo.listRecent(threadId: threadId, limit: 20)) ?? []
         let latestUserText = recent.last(where: { $0.role == .user })?.content ?? ""
-        if Self.looksPortuguese(latestUserText) {
-            return "Portuguese (Brazil)"
-        }
-        if Self.looksSpanish(latestUserText) {
-            return "Spanish"
-        }
-        if Locale.preferredLanguages.first?.lowercased().hasPrefix("pt") == true {
-            return "Portuguese (Brazil)"
-        }
-        return "English"
+        return Self.inferredUserLanguageIdentifier(
+            text: latestUserText,
+            preferredLanguages: Locale.preferredLanguages
+        )
     }
 
-    // PERF: language sniff for wire/Live Activity recompiled character-class
+    static func inferredUserLanguageIdentifier(
+        text: String,
+        preferredLanguages: [String]
+    ) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if looksPortuguese(trimmed) { return "pt-BR" }
+        if looksSpanish(trimmed) { return "es" }
+        if !trimmed.isEmpty,
+           let language = NLLanguageRecognizer.dominantLanguage(for: trimmed),
+           language != .undetermined {
+            return language.rawValue
+        }
+        if let preferred = preferredLanguages.first?
+            .replacingOccurrences(of: "_", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !preferred.isEmpty,
+           preferred.utf8.count <= 35,
+           preferred.unicodeScalars.allSatisfy({
+               CharacterSet.alphanumerics.contains($0) || $0.value == 45
+           }) {
+            return preferred
+        }
+        return "en"
+    }
+
+    // PERF: language sniff for wire rendering/Live Activity recompiled character-class
     // regexes per call. CharacterSet membership is O(n) over scalars without
     // regex compile (same accent/marker contract as before).
     private static let portugueseAccentScalars = CharacterSet(charactersIn: "áàâãçéêíóôõú")
@@ -3796,27 +3759,6 @@ public final class AppContext {
         }
         let markers = [" por favor ", " gracias ", " respuesta ", " usuario ", " prueba "]
         return markers.contains { lower.contains($0) }
-    }
-
-    /// RCW1 v1 is deliberately English-only. Uncertain locale and turns whose
-    /// meaning is unusually risky stay byte-identical on the provider path.
-    private static func isWireEligibleEnglishPrompt(_ text: String) -> Bool {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty,
-              !looksPortuguese(trimmed),
-              !looksSpanish(trimmed) else { return false }
-        let letters = trimmed.unicodeScalars.filter(CharacterSet.letters.contains)
-        guard !letters.isEmpty else { return false }
-        let nonASCII = letters.filter { !$0.isASCII }.count
-        guard Double(nonASCII) / Double(letters.count) <= 0.10 else { return false }
-
-        let lower = " " + trimmed.lowercased() + " "
-        let highRiskMarkers = [
-            " rm -rf ", " sudo ", " delete production ", " drop database ",
-            " irreversible ", " approval ", " approve ", " permission ",
-            " password ", " secret ", " security confirmation ", " data loss "
-        ]
-        return !highRiskMarkers.contains { lower.contains($0) }
     }
 
     private func recordTokenSaverPreparedObservation(request: AgentRunRequest, originalPrompt: String) {

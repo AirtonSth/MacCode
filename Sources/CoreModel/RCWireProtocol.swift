@@ -179,8 +179,44 @@ public enum RCWireProtocol {
         return output
     }
 
+    /// Losslessly frames an arbitrarily long user prompt into independently
+    /// bounded RCW1 request frames. The provider reads the ordered goal records
+    /// as one turn; Swift never truncates input to satisfy the per-frame bound.
+    public static func serializeRequestText(_ text: String) throws -> String {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw RCWireProtocolError.empty
+        }
+        let payloadBudget = maximumFrameBytes - 128
+        var chunks: [String] = []
+        var current = ""
+        var currentEscapedBytes = 0
+
+        for scalar in text.unicodeScalars {
+            let scalarText = String(scalar)
+            let escapedBytes = scalarText.utf8.reduce(into: 0) { count, byte in
+                count += byte == 0x5C || byte == 0x09 || byte == 0x0A || byte == 0x0D ? 2 : 1
+            }
+            if !current.isEmpty, currentEscapedBytes + escapedBytes > payloadBudget {
+                chunks.append(current)
+                current = ""
+                currentEscapedBytes = 0
+            }
+            current.append(contentsOf: scalarText)
+            currentEscapedBytes += escapedBytes
+        }
+        if !current.isEmpty { chunks.append(current) }
+
+        return try chunks.enumerated().map { offset, chunk in
+            try serialize(.init(
+                direction: .request,
+                sequence: offset + 1,
+                records: [.init(kind: .goal, value: chunk)]
+            ))
+        }.joined()
+    }
+
     /// Attaches a recoverable exact-span handle without leaving the RCW1
-    /// grammar. V1 request encoding is deliberately one frame per user turn.
+    /// grammar.
     public static func addingExactRecord(_ value: String, to request: String) throws -> String {
         try addingRequestRecords([RCWireRecord(kind: .exact, value: value)], to: request)
     }
@@ -192,15 +228,26 @@ public enum RCWireProtocol {
         _ records: [RCWireRecord],
         to request: String
     ) throws -> String {
-        let frames = try parse(request)
-        guard frames.count == 1, let frame = frames.first, frame.direction == .request else {
+        var frames = try parse(request)
+        guard let frame = frames.last,
+              frames.allSatisfy({ $0.direction == .request }) else {
             throw RCWireProtocolError.invalidRecord
         }
-        return try serialize(RCWireFrame(
+        let appended = RCWireFrame(
             direction: frame.direction,
             sequence: frame.sequence,
             records: frame.records + records
-        ))
+        )
+        if let serialized = try? serialize(appended) {
+            frames[frames.count - 1] = appended
+            return try frames.dropLast().map(serialize).joined() + serialized
+        }
+        let trailing = RCWireFrame(
+            direction: .request,
+            sequence: frame.sequence + 1,
+            records: records
+        )
+        return try frames.map(serialize).joined() + serialize(trailing)
     }
 
     public static func parse(_ text: String) throws -> [RCWireFrame] {

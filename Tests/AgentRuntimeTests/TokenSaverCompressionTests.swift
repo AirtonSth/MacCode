@@ -549,13 +549,23 @@ final class TokenSaverCompressionTests: XCTestCase {
             threadRepo: threadRepo,
             providerAdapters: [.claude: adapter]
         )
+        let activeRun = AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "fake-model",
+            status: .running,
+            startedAt: Date()
+        )
+        try runRepo.upsert(activeRun)
         coordinator.promptCompressor = { _, _, _, _ in
             XCTFail("free-form follow-up answers should use followUpPromptCompressor when present")
             return "WRONG"
         }
-        coordinator.followUpPromptCompressor = { prompt, provider, threadId in
+        coordinator.followUpPromptCompressor = { prompt, provider, threadId, runId in
             XCTAssertEqual(provider, .claude)
             XCTAssertEqual(threadId, thread.id)
+            XCTAssertEqual(runId, activeRun.id,
+                           "follow-up RCW1 recovery must use the active provider attempt scope")
             return "COMPRESSED::" + prompt
         }
 

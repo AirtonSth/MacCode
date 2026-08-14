@@ -22,6 +22,29 @@ final class RCWireProtocolTests: XCTestCase {
                       "byte zero must identify the protocol before any provider text can leak")
     }
 
+    func test_longMultilingualRequestUsesSequentialFramesWithoutTruncation() throws {
+        let original = String(
+            repeating: "日本語の指示を保持 \\server\\path\n",
+            count: 2_000
+        )
+
+        let encoded = try RCWireProtocol.serializeRequestText(original)
+        let withRecovery = try RCWireProtocol.addingExactRecord("[[rc:long-prompt]]", to: encoded)
+        let frames = try RCWireProtocol.parse(withRecovery)
+        let recovered = frames
+            .flatMap(\.records)
+            .filter { $0.kind == .goal }
+            .map(\.value)
+            .joined()
+
+        XCTAssertGreaterThan(frames.count, 1,
+                             "the 8 KiB limit applies per frame, never to the whole user prompt")
+        XCTAssertEqual(frames.map(\.sequence), Array(1...frames.count))
+        XCTAssertEqual(Data(recovered.utf8), Data(original.utf8),
+                       "multiframe RCW1 must preserve every original UTF-8 byte")
+        XCTAssertEqual(frames.last?.records.last, .init(kind: .exact, value: "[[rc:long-prompt]]"))
+    }
+
     func test_recoveryHandleIsAttachedAsAValidExactRecord() throws {
         let request = try RCWireProtocol.serialize(.init(
             direction: .request,

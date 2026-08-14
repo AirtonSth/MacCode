@@ -2593,6 +2593,34 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
                 try repair.bind(1, Int64(Date().timeIntervalSince1970 * 1_000))
                 try repair.bind(2, projectID)
                 _ = try repair.step()
+
+                // RCW1 v1 is the Token Saver transport contract, not an
+                // experimental savings lane. Promote only untouched factory
+                // rows so an explicit opt-out, kill switch, or operator state
+                // remains authoritative. This also upgrades existing installs.
+                let promoteWire = try database.prepare("""
+                    UPDATE token_saver_lane_state
+                    SET state = 'promoted',
+                        reason = 'rcw1_v1_global_release',
+                        evidence_level = 'provider_usage',
+                        owner_role = 'Operations Owner:RemoteCode',
+                        retention_days = 7,
+                        kill_switch_active = 0,
+                        attribution_joined = 1,
+                        reconciliation_passed = 1,
+                        usage_semantics_available = 1,
+                        scorecard_id = 'rcw1-v1-all-providers-20260814',
+                        updated_at_ms = ?
+                    WHERE project_id = ?
+                      AND lane IN ('wire-encode', 'wire-render-english')
+                      AND reason = 'native_wire_v1_recovery'
+                      AND opted_out = 0
+                      AND kill_switch_active = 0;
+                """)
+                defer { promoteWire.reset() }
+                try promoteWire.bind(1, Int64(Date().timeIntervalSince1970 * 1_000))
+                try promoteWire.bind(2, projectID)
+                _ = try promoteWire.step()
             }
         }
     }
@@ -2668,9 +2696,9 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
             ("rollover_capsule", "off", "owner_and_scorecard_required", "unavailable", "Provider Compatibility Owner", 0, true),
             ("session_learn", "off", "owner_and_scorecard_required", "unavailable", "Security Owner", 0, true),
             ("semantic_prose", "off", "owner_and_scorecard_required", "unavailable", "Model Supply-Chain Owner", 0, true),
-            // Recovery retention is not runtime promotion. RCW1 still passes
-            // per-turn codec/readiness/net-savings gates; these rows only allow
-            // exact originals to be stored before either local transform.
+            // Seed recoverable RCW1 rows; ensureDefaults stamps the built-in
+            // v1 release receipt in the same transaction unless an operator has
+            // already opted out or changed the factory state.
             ("wire-encode", "off", "native_wire_v1_recovery", "unavailable", "Operations Owner", 7, false),
             ("wire-render-english", "off", "native_wire_v1_recovery", "unavailable", "Operations Owner", 7, false),
             ("adaptive_effort", "off", "owner_and_scorecard_required", "unavailable", "Product Owner", 0, true),

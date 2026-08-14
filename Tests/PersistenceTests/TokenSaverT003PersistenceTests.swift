@@ -867,12 +867,12 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
         XCTAssertNil(try repo.get(projectID: "p2", lane: "semantic_prose"))
     }
 
-    func test_defaultLaneStatesKeepMeasurementAndProviderNativeShadowOnly() throws {
+    func test_defaultLaneStatesPromoteRCW1ButKeepMeasurementAndProviderNativeShadowOnly() throws {
         let repo = TokenSaverLaneStateRepository(db: try makeDB())
         try repo.ensureDefaults(projectID: "p1")
         let states = try repo.list(projectID: "p1")
         XCTAssertFalse(states.isEmpty)
-        XCTAssertEqual(states.count, 10)
+        XCTAssertEqual(states.count, 12)
         XCTAssertEqual(states.first { $0.lane == "measurement" }?.state, "shadow_only")
         XCTAssertEqual(states.first { $0.lane == "measurement" }?.retentionDays, 0)
         XCTAssertEqual(states.first { $0.lane == "provider_native" }?.state, "shadow_only")
@@ -883,14 +883,27 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
         XCTAssertEqual(wrapper.state, "off")
         XCTAssertEqual(wrapper.retentionDays, 7)
         XCTAssertFalse(wrapper.killSwitchActive)
+        for laneName in ["wire-encode", "wire-render-english"] {
+            let wire = try XCTUnwrap(states.first { $0.lane == laneName })
+            XCTAssertEqual(wire.state, "promoted",
+                           "factory RCW1 lanes must be admitted whenever Token Saver is enabled")
+            XCTAssertEqual(wire.evidenceLevel, "provider_usage")
+            XCTAssertEqual(wire.ownerRole, "Operations Owner:RemoteCode")
+            XCTAssertTrue(wire.attributionJoined)
+            XCTAssertTrue(wire.reconciliationPassed)
+            XCTAssertTrue(wire.usageSemanticsAvailable)
+            XCTAssertFalse(wire.scorecardID.isEmpty)
+            XCTAssertFalse(wire.killSwitchActive)
+        }
         XCTAssertTrue(states.filter {
-            !["measurement", "provider_native", "deterministic_wrapper"].contains($0.lane)
+            !["measurement", "provider_native", "deterministic_wrapper", "wire-encode", "wire-render-english"].contains($0.lane)
         }.allSatisfy { $0.state == "off" && $0.killSwitchActive })
-        XCTAssertTrue(states.allSatisfy { $0.ownerRole.hasPrefix("unassigned:") })
-        XCTAssertTrue(states.allSatisfy {
+        XCTAssertTrue(states.filter { !["wire-encode", "wire-render-english"].contains($0.lane) }
+            .allSatisfy { $0.ownerRole.hasPrefix("unassigned:") })
+        XCTAssertTrue(states.filter { !["wire-encode", "wire-render-english"].contains($0.lane) }.allSatisfy {
             !$0.attributionJoined && !$0.reconciliationPassed
                 && !$0.usageSemanticsAvailable && $0.scorecardID.isEmpty
-        }, "default lane rows must not carry an authoritative promotion receipt")
+        }, "non-wire factory rows must not carry an authoritative promotion receipt")
         XCTAssertTrue(states.contains { $0.lane == "rollover_capsule" })
         XCTAssertTrue(states.contains { $0.lane == "semantic_prose" })
         XCTAssertTrue(states.contains { $0.lane == "visual_artifact" })
@@ -907,15 +920,15 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
         let repo = TokenSaverLaneStateRepository(db: try makeDB())
 
         try repo.setOptOut(projectID: "opt-out", optedOut: true)
-        XCTAssertEqual(try repo.list(projectID: "opt-out").count, 10)
+        XCTAssertEqual(try repo.list(projectID: "opt-out").count, 12)
         XCTAssertTrue(try repo.list(projectID: "opt-out").allSatisfy(\.optedOut))
 
         try repo.setRetentionDays(projectID: "retention", days: 14)
-        XCTAssertEqual(try repo.list(projectID: "retention").count, 10)
+        XCTAssertEqual(try repo.list(projectID: "retention").count, 12)
         XCTAssertTrue(try repo.list(projectID: "retention").allSatisfy { $0.retentionDays == 14 })
 
         try repo.forceVerbatim(projectID: "verbatim")
-        XCTAssertEqual(try repo.list(projectID: "verbatim").count, 10)
+        XCTAssertEqual(try repo.list(projectID: "verbatim").count, 12)
         XCTAssertTrue(try repo.list(projectID: "verbatim").allSatisfy {
             $0.state == "off" && $0.reason == "verbatim_forced" && $0.killSwitchActive
         })

@@ -74,7 +74,7 @@ final class TokenSaverUXGatingTests: XCTestCase {
         return (ctx, router, vm)
     }
 
-    func test_projectGovernanceIsWorkspaceScopedAndDefaultsGuardedOff() throws {
+    func test_projectGovernanceIsWorkspaceScopedAndOnlyRCW1DefaultsAreActive() throws {
         let (context, _, vm) = try makeVM()
         let selectedWorkspace = WorkspaceID()
         let otherWorkspace = WorkspaceID()
@@ -103,11 +103,11 @@ final class TokenSaverUXGatingTests: XCTestCase {
         XCTAssertEqual(vm.tokenSaverProjectGovernance.map(\.projectName), ["Selected"],
                        "project controls must not expose a different workspace scope")
         let governance = try XCTUnwrap(vm.tokenSaverProjectGovernance.first)
-        XCTAssertEqual(governance.lanes.count, 10)
-        XCTAssertEqual(governance.stateLabel, "Shadow only")
-        XCTAssertEqual(governance.promotedLaneCount, 0)
+        XCTAssertEqual(governance.lanes.count, 12)
+        XCTAssertEqual(governance.stateLabel, "Active")
+        XCTAssertEqual(governance.promotedLaneCount, 2)
         XCTAssertEqual(governance.shadowLaneCount, 2)
-        XCTAssertEqual(governance.activeLaneCount, 0)
+        XCTAssertEqual(governance.activeLaneCount, 2)
         XCTAssertFalse(governance.rolloverAvailable,
                        "rollover stays disabled until its owner and scorecard promote the lane")
     }

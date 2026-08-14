@@ -1104,7 +1104,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// Token Saver hook for free-form follow-up answers. Defaults to
     /// `promptCompressor` when nil, but app shells can provide a separate hook
     /// to tag telemetry as `prompt_followup`.
-    public var followUpPromptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider, _ threadId: AgentThreadID) async -> String)?
+    public var followUpPromptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider, _ threadId: AgentThreadID, _ runId: AgentRunID?) async -> String)?
     /// P3: optionally compact large tool output in a persisted stream-event payload before it
     /// is written (CCR-backed, structure-preserving). nil => payloads stored verbatim.
     public var streamPayloadCompactor: (@Sendable (_ payloadJSON: String) -> String)?
@@ -4069,11 +4069,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     public func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) async throws {
         let adapter = try adapterForThread(threadId)
+        let activeRunID = (try? durableActiveRun(threadId: threadId))?.id
         let outboundText: String
         if let followUpPromptCompressor {
-            outboundText = await followUpPromptCompressor(text, adapter.provider, threadId)
+            outboundText = await followUpPromptCompressor(text, adapter.provider, threadId, activeRunID)
         } else if let promptCompressor {
-            outboundText = await promptCompressor(text, adapter.provider, threadId, nil)
+            outboundText = await promptCompressor(text, adapter.provider, threadId, activeRunID)
         } else {
             outboundText = text
         }

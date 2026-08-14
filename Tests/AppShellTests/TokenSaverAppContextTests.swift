@@ -91,6 +91,35 @@ final class TokenSaverAppContextTests: XCTestCase {
         var callCount: Int { count }
     }
 
+    /// Returns the deterministic RCW1 fallback for every request and records
+    /// how many requests reached the local codec.
+    private actor WireFallbackRuntime: DistillRuntime {
+        private var count = 0
+
+        func distill(_ request: DistillRequest) async throws -> String {
+            count += 1
+            return MLXDistillRuntime.fallbackOutput(for: request)
+        }
+
+        var callCount: Int { count }
+    }
+
+    private actor CapturingRuntime: DistillRuntime {
+        let output: String
+        private var lastRequest: DistillRequest?
+
+        init(output: String) {
+            self.output = output
+        }
+
+        func distill(_ request: DistillRequest) async throws -> String {
+            lastRequest = request
+            return output
+        }
+
+        var capturedRequest: DistillRequest? { lastRequest }
+    }
+
     private struct FixedOutputRuntime: DistillRuntime {
         let output: String
 
@@ -1187,21 +1216,43 @@ final class TokenSaverAppContextTests: XCTestCase {
                        "rejected lossy output must not fabricate savings")
     }
 
-    func test_tokenSaverGateSkipsBelowFloorPrompt() async throws {
+    func test_tokenSaverEncodesPromptBelowFormerSavingsFloor() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2GateFloor-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
 
-        // Under the NetPositiveGate floor (~2k) the gate must skip BEFORE any distill
-        // call — a model round-trip on a tiny prompt is not net-positive (G3).
+        let configuration = try DistillServiceConfiguration(
+            authToken: "wire-small-token",
+            appSupportDirectory: appSupport
+        )
+        let runtime = WireFallbackRuntime()
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: runtime, maxConcurrentRequests: 2),
+            scopedRecoveryStore: TestScopedRecoveryStore(db: context.db)
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+        context.distillClientOverrideForTesting = DistillServiceClient(
+            ready: ready,
+            authToken: "wire-small-token"
+        )
+
         let small = "tiny prompt well under the compression floor"
         XCTAssertLessThan(small.count, 2_000)
         let threadID = try makeAdmittedTokenSaverThread(in: context, provider: .claude)
-        let out = await context.tokenSaverCompress(prompt: small, provider: .claude, threadId: threadID)
-        XCTAssertEqual(out, small, "below floor => returned verbatim, no compression")
+        let out = await context.tokenSaverCompress(
+            prompt: small,
+            provider: .claude,
+            threadId: threadID,
+            runId: AgentRunID()
+        )
+        XCTAssertTrue(RCWireProtocol.isWire(out),
+                      "Token Saver ON must use RCW1 even when grammar overhead exceeds the prompt")
+        XCTAssertTrue(RCWireProtocol.preservesProtectedSemantics(original: small, wire: out))
     }
 
-    func test_tokenSaverSkipSetAvoidsRepeatingKnownNoWinPrompt() async throws {
+    func test_tokenSaverRetriesNonSavingPromptInsteadOfPersistingVerbatimBypass() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2PromptSkipSet-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
@@ -1210,21 +1261,22 @@ final class TokenSaverAppContextTests: XCTestCase {
             authToken: "skip-set-token",
             appSupportDirectory: appSupport
         )
-        let runtime = CountingEchoRuntime()
+        let runtime = WireFallbackRuntime()
         let scheduler = DistillScheduler(
             runtime: runtime,
             maxConcurrentRequests: 2,
             resultCacheCapacity: 0
         )
-        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: scheduler,
+            scopedRecoveryStore: TestScopedRecoveryStore(db: context.db)
+        )
         let ready = try await server.start()
         defer { server.stop() }
         context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "skip-set-token")
 
-        let prompt = (1...45)
-            .map { "unique non-compressible instruction line \($0) with path /tmp/file-\($0).swift and code \($0)" }
-            .joined(separator: "\n")
-        XCTAssertGreaterThan(prompt.count, 2_000)
+        let prompt = "repeat this exact request"
 
         let threadID = try makeAdmittedTokenSaverThread(in: context, provider: .claude)
         try context.tokenSaverLaneStateRepo.upsert(.init(
@@ -1233,16 +1285,20 @@ final class TokenSaverAppContextTests: XCTestCase {
             evidenceLevel: "diagnostic_heuristic", ownerRole: "Security Owner:test",
             permissionBoundary: "project", retentionDays: 30, optedOut: false, killSwitchActive: false
         ))
-        let first = await context.tokenSaverCompress(prompt: prompt, provider: .claude, threadId: threadID)
-        let second = await context.tokenSaverCompress(prompt: prompt, provider: .claude, threadId: threadID)
+        let first = await context.tokenSaverCompress(
+            prompt: prompt, provider: .claude, threadId: threadID, runId: AgentRunID()
+        )
+        let second = await context.tokenSaverCompress(
+            prompt: prompt, provider: .claude, threadId: threadID, runId: AgentRunID()
+        )
 
-        XCTAssertEqual(first, prompt)
-        XCTAssertEqual(second, prompt)
+        XCTAssertTrue(RCWireProtocol.isWire(first))
+        XCTAssertTrue(RCWireProtocol.isWire(second))
         let callCount = await runtime.callCount
-        XCTAssertEqual(callCount, 1,
-                       "a known no-win prompt should be remembered locally instead of paying the sidecar again")
+        XCTAssertEqual(callCount, 2,
+                       "a previous non-saving turn must not disable mandatory RCW1 on a later turn")
         XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0,
-                       "no-win skip-set entries must not fabricate savings rows")
+                       "non-saving RCW1 turns must not fabricate savings rows")
     }
 
     func test_tokenSaverDiffPromptFailsOpenUntilScopedRecoveryShips() async throws {
@@ -1974,54 +2030,112 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0)
     }
 
-    func test_wireEncoderBypassesNonEnglishAndHighRiskPromptsBeforeLocalModel() async throws {
+    func test_wireRendererUsesLatestUserLanguage() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2WireLocale-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        let runtime = CapturingRuntime(output: "Compilação concluída.")
+        let configuration = try DistillServiceConfiguration(
+            authToken: "wire-locale-token",
+            appSupportDirectory: appSupport
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: runtime, maxConcurrentRequests: 2),
+            scopedRecoveryStore: TestScopedRecoveryStore(db: context.db)
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+        context.distillClientOverrideForTesting = DistillServiceClient(
+            ready: ready,
+            authToken: "wire-locale-token"
+        )
+        let threadID = try makeAdmittedTokenSaverThread(in: context, provider: .codex)
+        try context.messageRepo.append(.init(
+            threadId: threadID,
+            role: .user,
+            content: "Rode a compilação e me diga quantos testes passaram."
+        ))
+        let wire = try RCWireProtocol.serialize(.init(
+            direction: .response,
+            sequence: 1,
+            records: [.init(kind: .outcome, value: "Build completed.")]
+        ))
+
+        let rendered = await context.tokenSaverRenderWireResponse(
+            wire,
+            provider: .codex,
+            threadId: threadID,
+            runId: AgentRunID()
+        )
+
+        XCTAssertEqual(rendered, "Compilação concluída.")
+        let capturedRequest = await runtime.capturedRequest
+        XCTAssertEqual(capturedRequest?.question, "pt-BR",
+                       "RCW1 responses should return in the user's latest language")
+    }
+
+    func test_wireLanguageDetectionSupportsNonLatinPrompts() {
+        XCTAssertEqual(
+            AppContext.inferredUserLanguageIdentifier(
+                text: "エラーの原因を説明してください。",
+                preferredLanguages: ["en-US"]
+            ),
+            "ja"
+        )
+        XCTAssertEqual(
+            AppContext.inferredUserLanguageIdentifier(
+                text: "اشرح سبب الخطأ بالتفصيل.",
+                preferredLanguages: ["en-US"]
+            ),
+            "ar"
+        )
+    }
+
+    func test_wireEncoderAcceptsEveryLanguageAndHighRiskPromptAcrossProviders() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2WireEligibility-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        let runtime = CountingEchoRuntime()
+        let runtime = WireFallbackRuntime()
         let configuration = try DistillServiceConfiguration(
             authToken: "wire-eligibility-token",
             appSupportDirectory: appSupport
         )
-        let scheduler = DistillScheduler(runtime: runtime, maxConcurrentRequests: 2)
-        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let scheduler = DistillScheduler(runtime: runtime, maxConcurrentRequests: 2, resultCacheCapacity: 0)
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: scheduler,
+            scopedRecoveryStore: TestScopedRecoveryStore(db: context.db)
+        )
         let ready = try await server.start()
         defer { server.stop() }
         context.distillClientOverrideForTesting = DistillServiceClient(
             ready: ready,
             authToken: "wire-eligibility-token"
         )
-        let threadID = try makeAdmittedTokenSaverThread(in: context, provider: .claude)
-        try admitTokenSaver(in: context, threadID: threadID, lane: "semantic_prose")
-
-        let portuguese = String(
-            repeating: "Por favor explique o problema e preserve exatamente todos os dados do usuario. ",
-            count: 45
-        )
-        let highRisk = String(
-            repeating: "Approve deleting production data only after an explicit security confirmation. ",
-            count: 45
-        )
-        let portugueseResult = await context.tokenSaverCompress(
-            prompt: portuguese,
-            provider: .claude,
-            threadId: threadID,
-            runId: AgentRunID()
-        )
-        let highRiskResult = await context.tokenSaverCompress(
-            prompt: highRisk,
-            provider: .claude,
-            threadId: threadID,
-            runId: AgentRunID()
-        )
-
-        XCTAssertEqual(Data(portugueseResult.utf8), Data(portuguese.utf8),
-                       "non-English v1 input must reach the provider byte-identically")
-        XCTAssertEqual(Data(highRiskResult.utf8), Data(highRisk.utf8),
-                       "approval and destructive turns must bypass lossy wire encoding")
+        let prompts = [
+            "Por favor explique o problema e preserve /tmp/Foo.swift:42 exatamente.",
+            "エラー 17 を説明し、/tmp/Foo.swift:42 を正確に保持してください。",
+            "اشرح الخطأ 17 مع الحفاظ على /tmp/Foo.swift:42 كما هو.",
+            "Approve deleting production data only after security confirmation 17.",
+            String(repeating: "Contexto multilíngue sem truncamento. ", count: 500)
+        ]
+        for provider in AgentProvider.allCases {
+            let threadID = try makeAdmittedTokenSaverThread(in: context, provider: provider)
+            for prompt in prompts {
+                let result = await context.tokenSaverCompress(
+                    prompt: prompt,
+                    provider: provider,
+                    threadId: threadID,
+                    runId: AgentRunID()
+                )
+                XCTAssertTrue(RCWireProtocol.isWire(result),
+                              "Token Saver ON must use RCW1 for \(provider.rawValue) and every language/risk class")
+                XCTAssertTrue(RCWireProtocol.preservesProtectedSemantics(original: prompt, wire: result))
+            }
+        }
         let localModelCalls = await runtime.callCount
-        XCTAssertEqual(localModelCalls, 0,
-                       "locale and risk gates must run before invoking the local model")
+        XCTAssertEqual(localModelCalls, AgentProvider.allCases.count * prompts.count)
         XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0)
     }
 
@@ -2432,13 +2546,17 @@ final class TokenSaverAppContextTests: XCTestCase {
                        "input-only token usage is not compressed output and must not inflate Saved")
     }
 
-    func test_tokenSaverCompressionIsNoOpWhenDisabledOrTooShort() async throws {
+    func test_tokenSaverCompressionIsNoOpOnlyWhenDisabled() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2TokenSaverNoop-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
 
         let configuration = try DistillServiceConfiguration(authToken: "t", appSupportDirectory: appSupport)
-        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
-        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let scheduler = DistillScheduler(runtime: WireFallbackRuntime(), maxConcurrentRequests: 2)
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: scheduler,
+            scopedRecoveryStore: TestScopedRecoveryStore(db: context.db)
+        )
         let ready = try await server.start()
         defer { server.stop() }
         context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "t")
@@ -2451,10 +2569,15 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertEqual(disabled, bigPrompt)
         XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0)
 
-        // Enabled but tiny prompt → below threshold, passthrough, no DB rows.
+        // Enabled means even a tiny prompt uses RCW1; savings may honestly remain zero.
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        let tiny = await context.tokenSaverCompress(prompt: "fix typo", provider: .claude, threadId: threadID)
-        XCTAssertEqual(tiny, "fix typo")
+        let tiny = await context.tokenSaverCompress(
+            prompt: "fix typo",
+            provider: .claude,
+            threadId: threadID,
+            runId: AgentRunID()
+        )
+        XCTAssertTrue(RCWireProtocol.isWire(tiny))
         XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0)
     }
 
