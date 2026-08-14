@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 import AgentRuntime
 import CoreModel
 import Persistence
@@ -93,6 +94,28 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         XCTAssertNil(
             viewModel.tokenSaverLocalUsageUpdate,
             "WHY: an account percentage refresh changes no locally observed provider-token total"
+        )
+    }
+
+    /// WHY: usage-changed fires during agent runs. Rewriting equal
+    /// tokenSaverEnabled / snapshot @Published values rebuilt the always-on
+    /// sidebar and pushed a widget digest with a new timestamp.
+    func test_unchangedUsageReload_doesNotPublishSidebar() async throws {
+        let (_, viewModel, appSupport) = try makeViewModel()
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        await viewModel.reloadTokenSaverAndWait()
+
+        var publishes = 0
+        let sub = viewModel.objectWillChange.sink { publishes += 1 }
+        NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+        let settled = await waitUntil(timeout: 1.0) { publishes > 0 }
+        _ = sub
+
+        XCTAssertFalse(settled)
+        XCTAssertEqual(
+            publishes,
+            0,
+            "equal flags/snapshot must not invalidate the sidebar on a usage notification"
         )
     }
 

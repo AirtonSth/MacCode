@@ -680,18 +680,23 @@ public final class SidebarViewModel: ObservableObject {
         healEconomyWindow: Bool = false
     ) {
         let settings = settingsStore.load()
-        tokenSaverEnabled = settings.tokenSaverEnabled
-        graphifyRuntimeActive = settings.isGraphifyRuntimeActive
+        applyTokenSaverSettingsFlags(settings)
         guard let context else {
             tokenSaverHeavyReloadTask?.cancel()
             tokenSaverHeavyReloadTask = nil
-            tokenSaverUsageSnapshot = .empty()
-            tokenSaverSavingsSummary = .empty
-            tokenSaverDailyEconomyToday = nil
-            tokenSaverDailyEconomyWeekTotal = 0
-            tokenSaverProviderCacheAmortToday = [:]
+            applyTokenSaverHeavyResult(
+                snapshot: .empty(),
+                summary: .empty,
+                economyToday: nil,
+                economyWeekTotal: 0,
+                providerCacheAmortToday: [:],
+                trackLocalUsageChange: false,
+                publishDigest: false
+            )
             tokenSaverLocalUsageBaseline = nil
-            tokenSaverLocalUsageUpdate = nil
+            if tokenSaverLocalUsageUpdate != nil {
+                tokenSaverLocalUsageUpdate = nil
+            }
             return
         }
         // Week heal is for formula-version rows (boot / explicit wait). A
@@ -714,16 +719,15 @@ public final class SidebarViewModel: ObservableObject {
             guard !Task.isCancelled else { return }
             await MainActor.run { [weak self] in
                 guard let self, !Task.isCancelled else { return }
-                self.tokenSaverUsageSnapshot = result.snapshot
-                self.tokenSaverSavingsSummary = result.summary
-                self.tokenSaverDailyEconomyToday = result.economyToday
-                self.tokenSaverDailyEconomyWeekTotal = result.economyWeekTotal
-                self.tokenSaverProviderCacheAmortToday = result.providerCacheAmortToday
-                self.updateTokenSaverLocalUsage(
-                    from: result.snapshot,
-                    emitPositiveChange: trackLocalUsageChange
+                self.applyTokenSaverHeavyResult(
+                    snapshot: result.snapshot,
+                    summary: result.summary,
+                    economyToday: result.economyToday,
+                    economyWeekTotal: result.economyWeekTotal,
+                    providerCacheAmortToday: result.providerCacheAmortToday,
+                    trackLocalUsageChange: trackLocalUsageChange,
+                    publishDigest: true
                 )
-                self.publishTokenSaverWidgetDigest()
             }
         }
     }
@@ -924,16 +928,19 @@ public final class SidebarViewModel: ObservableObject {
     /// notification cannot cancel it) before assigning the published values.
     func reloadTokenSaverAndWait() async {
         let settings = settingsStore.load()
-        tokenSaverEnabled = settings.tokenSaverEnabled
-        graphifyRuntimeActive = settings.isGraphifyRuntimeActive
+        applyTokenSaverSettingsFlags(settings)
         guard let context else {
             tokenSaverHeavyReloadTask?.cancel()
             tokenSaverHeavyReloadTask = nil
-            tokenSaverUsageSnapshot = .empty()
-            tokenSaverSavingsSummary = .empty
-            tokenSaverDailyEconomyToday = nil
-            tokenSaverDailyEconomyWeekTotal = 0
-            tokenSaverProviderCacheAmortToday = [:]
+            applyTokenSaverHeavyResult(
+                snapshot: .empty(),
+                summary: .empty,
+                economyToday: nil,
+                economyWeekTotal: 0,
+                providerCacheAmortToday: [:],
+                trackLocalUsageChange: false,
+                publishDigest: false
+            )
             return
         }
         // Heal last 7 days with current formula (day-scoped amort) so Week
@@ -944,13 +951,65 @@ public final class SidebarViewModel: ObservableObject {
             savingsRepo: context.tokenSaverSavingsRepo,
             economyRepo: context.tokenSaverDailyEconomyRepo
         )
-        tokenSaverUsageSnapshot = result.snapshot
-        tokenSaverSavingsSummary = result.summary
-        tokenSaverDailyEconomyToday = result.economyToday
-        tokenSaverDailyEconomyWeekTotal = result.economyWeekTotal
-        tokenSaverProviderCacheAmortToday = result.providerCacheAmortToday
-        updateTokenSaverLocalUsage(from: result.snapshot, emitPositiveChange: false)
-        publishTokenSaverWidgetDigest()
+        applyTokenSaverHeavyResult(
+            snapshot: result.snapshot,
+            summary: result.summary,
+            economyToday: result.economyToday,
+            economyWeekTotal: result.economyWeekTotal,
+            providerCacheAmortToday: result.providerCacheAmortToday,
+            trackLocalUsageChange: false,
+            publishDigest: true
+        )
+    }
+
+    private func applyTokenSaverSettingsFlags(_ settings: AppSettings) {
+        if tokenSaverEnabled != settings.tokenSaverEnabled {
+            tokenSaverEnabled = settings.tokenSaverEnabled
+        }
+        if graphifyRuntimeActive != settings.isGraphifyRuntimeActive {
+            graphifyRuntimeActive = settings.isGraphifyRuntimeActive
+        }
+    }
+
+    /// Assign Token Saver published fields only when the value changed.
+    /// Usage notifications used to rewrite equal snapshots and force a full
+    /// sidebar body (and a widget EventBus publish with a new timestamp).
+    @discardableResult
+    private func applyTokenSaverHeavyResult(
+        snapshot: TokenSaverUsageSnapshot,
+        summary: TokenSaverSavingsSummary,
+        economyToday: TokenSaverDailyEconomyRecord?,
+        economyWeekTotal: Int,
+        providerCacheAmortToday: [String: Int],
+        trackLocalUsageChange: Bool,
+        publishDigest: Bool
+    ) -> Bool {
+        var changed = false
+        if tokenSaverUsageSnapshot != snapshot {
+            tokenSaverUsageSnapshot = snapshot
+            changed = true
+        }
+        if tokenSaverSavingsSummary != summary {
+            tokenSaverSavingsSummary = summary
+            changed = true
+        }
+        if tokenSaverDailyEconomyToday != economyToday {
+            tokenSaverDailyEconomyToday = economyToday
+            changed = true
+        }
+        if tokenSaverDailyEconomyWeekTotal != economyWeekTotal {
+            tokenSaverDailyEconomyWeekTotal = economyWeekTotal
+            changed = true
+        }
+        if tokenSaverProviderCacheAmortToday != providerCacheAmortToday {
+            tokenSaverProviderCacheAmortToday = providerCacheAmortToday
+            changed = true
+        }
+        updateTokenSaverLocalUsage(from: snapshot, emitPositiveChange: trackLocalUsageChange)
+        if changed, publishDigest {
+            publishTokenSaverWidgetDigest()
+        }
+        return changed
     }
 
     /// Runs the heavy Token Saver reads off the main actor. `repo` is
