@@ -262,6 +262,50 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         XCTAssertEqual(context.graphifyProviderLabel(for: threadId), "unknown")
     }
 
+    /// WHY: after a Graphify invocation is recorded, later itemDelta chunks
+    /// used to JSON-parse the growing tool body and re-detect on MainActor.
+    func test_graphifyDetect_skipsAfterInvocationRecorded() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2GraphifyDetectSkip-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true, graphifyEnabled: true))
+        context.graphifyDetectCountForTesting = 0
+        let threadId = AgentThreadID()
+        let runId = AgentRunID()
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "bash-1",
+            bodyAppend: #"{"command":"graphify query where is X"}"#,
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        XCTAssertEqual(context.graphifyDetectCountForTesting, 1)
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "bash-1",
+            bodyAppend: " && echo more",
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "bash-1",
+            bodyAppend: " && echo again",
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        XCTAssertEqual(
+            context.graphifyDetectCountForTesting,
+            1,
+            "after the pending Graphify row is recorded, later deltas must not re-parse/detect"
+        )
+    }
+
     private func makeViewModel() throws -> (AppContext, SidebarViewModel, URL) {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2TokenSaverLocalSignal-\(UUID().uuidString)", isDirectory: true)

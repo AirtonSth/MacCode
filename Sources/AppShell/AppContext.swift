@@ -685,6 +685,8 @@ public final class AppContext {
     private static let graphifyProviderByThreadLimit = 128
     /// Test seam: threadRepo.get calls for Graphify provider labels.
     var graphifyProviderLookupCountForTesting = 0
+    /// Test seam: GraphifyUsageDetector.detect / commandText runs.
+    var graphifyDetectCountForTesting = 0
 
     public init(
         channel: ReleaseChannel = .debug,
@@ -4812,6 +4814,17 @@ public final class AppContext {
         let alreadyExploration = buf.recordedExploration
         graphifyItemBuffersLock.unlock()
 
+        // After a pending row is recorded, mid-stream deltas only grow the
+        // body. Re-running commandText (JSON parse) + detect on a multi-KB
+        // tool payload at itemDelta rate is wasted until finalize.
+        if alreadyInvocation, !finalizeOutput {
+            if alreadyExploration
+                || !GraphifyUsageDetector.isExplorationTool(summary: summary) {
+                return
+            }
+        }
+
+        graphifyDetectCountForTesting += 1
         let combinedBody = GraphifyUsageDetector.commandText(fromBody: body)
         let haystackBody = [body, combinedBody].joined(separator: "\n")
         let invocations = GraphifyUsageDetector.detect(summary: summary, body: haystackBody)
