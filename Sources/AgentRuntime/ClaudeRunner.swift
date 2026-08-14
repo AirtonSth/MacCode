@@ -263,12 +263,13 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         let stdoutReadLock = NSLock()
         let cancelFlag = AgentCancelFlag()
         let emitLine: (String) -> Void = { line in
-            if let runtimeEvent = ProviderRuntimeEvent.fromJSONLine(line, provider: .claude, source: "claude.stream-json") {
+            let interpreted = Self.interpretStreamJSONLine(line, parser: parser)
+            if let runtimeEvent = interpreted.runtimeEvent {
                 let ev = AssistantEvent.providerRuntime(runtimeEvent)
                 timeline.apply(ev)
                 onEvent(.event(ev))
             }
-            for ev in parser.parseLine(line) {
+            for ev in interpreted.parsedEvents {
                 timeline.apply(ev)
                 onEvent(.event(ev))
             }
@@ -351,6 +352,36 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             cancelFlag.cancel()
             ProcessTerminator.terminateTree(proc)
         }
+    }
+
+#if DEBUG
+    static var streamJSONDecodeCountForTesting = 0
+#endif
+
+    static func jsonObject(from line: String) -> [String: Any]? {
+#if DEBUG
+        streamJSONDecodeCountForTesting += 1
+#endif
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    /// Decode once, then runtime + parser events.
+    static func interpretStreamJSONLine(
+        _ line: String,
+        parser: ClaudeParser,
+        receivedAtMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    ) -> (runtimeEvent: ProviderRuntimeEvent?, parsedEvents: [AssistantEvent]) {
+        let object = jsonObject(from: line)
+        return (
+            object.flatMap {
+                ProviderRuntimeEvent.fromJSONObject(
+                    $0, provider: .claude, source: "claude.stream-json", receivedAtMs: receivedAtMs
+                )
+            },
+            object.map { parser.parseObject($0, now: receivedAtMs) } ?? []
+        )
     }
 
     public static func shouldDisplayStderr(_ raw: String) -> Bool {
