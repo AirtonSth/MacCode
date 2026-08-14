@@ -389,11 +389,11 @@ final class AgentAppUXGapsTests: XCTestCase {
         )
     }
 
-    func test_tokenSaverBadgeLabel_exposesViewOriginalWhenOriginalTextExists() {
+    func test_tokenSaverBadgeLabel_staysCompactWhenOriginalTextExists() {
         XCTAssertEqual(
             AgentAppView.tokenSaverBadgeLabel(hasOriginalText: true),
-            "Token Saver optimized - View transport details",
-            "Badge must expose the raw provider response when persisted metadata is available"
+            "Token Saver optimized",
+            "The visible Translated/RCW1 control owns disclosure, so the badge must not repeat an obsolete popover action"
         )
     }
 
@@ -405,24 +405,36 @@ final class AgentAppUXGapsTests: XCTestCase {
         )
     }
 
-    /// WHY: SwiftUI's DisclosureGroup recursively duplicated the Token Saver
-    /// accessibility node and could trap a full AX traversal in a render loop.
-    /// The custom button must own one stable popover per durable message.
-    func test_tokenSaverDisclosureToggleOwnsStablePerMessageExpansion() {
-        let first = AgentMessageID()
-        let second = AgentMessageID()
+    /// WHY: a corrupt/old persisted preference must never hide the readable
+    /// transcript. The durable toggle fails back to translated content.
+    func test_tokenSaverDisplayMode_invalidPersistedValueFallsBackToTranslated() {
+        XCTAssertEqual(AgentAppView.resolvedTokenSaverDisplayMode("unknown"), .translated)
+    }
 
-        let presented = AgentAppView.toggledTokenSaverDisclosureMessageID(nil, messageId: first)
-        XCTAssertEqual(presented, first)
+    /// WHY: switching to RCW1 must expose the exact provider-bound request and
+    /// raw provider response, while normal Copy continues to copy human text.
+    func test_tokenSaverCopyText_tracksVisibleTranslatedOrOriginalMode() {
+        let translated = "Focused tests passed."
+        let request = "RCW1\tQ\t1\nG\tRun focused tests.\n.\n"
+        let response = "RCW1\tA\t1\nO\tFocused tests passed.\n.\n"
+
         XCTAssertEqual(
-            AgentAppView.toggledTokenSaverDisclosureMessageID(presented, messageId: second),
-            second,
-            "Opening another reply must move the single bounded popover to that durable message"
+            AgentAppView.tokenSaverCopyText(
+                translated: translated,
+                original: response,
+                request: request,
+                mode: .translated
+            ),
+            translated
         )
-        XCTAssertNil(
-            AgentAppView.toggledTokenSaverDisclosureMessageID(presented, messageId: first),
-            "Toggling the same durable message must collapse exactly that disclosure"
+        let original = AgentAppView.tokenSaverCopyText(
+            translated: translated,
+            original: response,
+            request: request,
+            mode: .original
         )
+        XCTAssertTrue(original.contains(request), "RCW1 mode must copy exactly what RemoteCode sent")
+        XCTAssertTrue(original.hasSuffix(response), "RCW1 mode must copy the exact raw provider response")
     }
 
     /// WHY: A short transcript with very tall self-sizing text rows does not benefit

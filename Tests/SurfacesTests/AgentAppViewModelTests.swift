@@ -7389,11 +7389,25 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.selectThread(a.id)
         let msgId = AgentMessageID(UUID())
         vm.coordinator.onWireTranslatedMessageId?(msgId)   // live badge -> Task { @MainActor }
-        for _ in 0..<200 where !vm.tokenSaverOptimizedMessageIds.contains(msgId) {
+        vm.runCoordinator(
+            vm.coordinator,
+            didReceive: .wireTranslation(AssistantWireTranslation(
+                itemId: "progress-item",
+                originalText: "RCW1\tA\t1\nA\tInspecting.\n.\n",
+                rewrittenText: "Action: Inspecting.",
+                wireRequestText: "RCW1\tQ\t1\nG\tInspect.\n.\n"
+            )),
+            run: AgentRunID(),
+            threadId: a.id
+        )
+        for _ in 0..<200 where !vm.tokenSaverOptimizedMessageIds.contains(msgId)
+            || vm.tokenSaverTranslation(forItemId: "progress-item") == nil {
             try await Task.sleep(nanoseconds: 2_000_000)
         }
         XCTAssertTrue(vm.tokenSaverOptimizedMessageIds.contains(msgId),
                       "a live wire translation must mark the message on the current thread")
+        XCTAssertNotNil(vm.tokenSaverTranslation(forItemId: "progress-item"),
+                        "live progress transport must be visible on the current thread")
 
         // Re-selecting the SAME thread must NOT wipe live translation state.
         vm.selectThread(a.id)
@@ -7408,6 +7422,8 @@ final class AgentAppViewModelTests: XCTestCase {
                       "switching threads must also drop the retained original texts")
         XCTAssertTrue(vm.tokenSaverWireRequestTextsByMessageId.isEmpty,
                       "switching threads must also drop private provider-bound request metadata")
+        XCTAssertTrue(vm.tokenSaverTranslationsByItemId.isEmpty,
+                      "switching threads must also drop timeline-item transport metadata")
     }
 
     // F9: deleting a thread must evict its per-thread VM caches and the coordinator's

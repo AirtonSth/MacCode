@@ -5453,7 +5453,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         runId: AgentRunID,
         threadId: AgentThreadID,
         allowFinalResponseTranslation: Bool = true,
-        providerTerminalAcknowledged: Bool = true
+        providerTerminalAcknowledged: Bool = true,
+        continuationSourceFinalMessage: String? = nil
     ) {
         guard let lease = admitRunCallback(runId: runId, threadId: threadId) else { return }
         #if DEBUG
@@ -6058,7 +6059,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                         event: .finished(reportedStatus, finalMessage: translated, providerThreadId: providerThreadId),
                         runId: runId,
                         threadId: threadId,
-                        allowFinalResponseTranslation: false
+                        allowFinalResponseTranslation: false,
+                        continuationSourceFinalMessage: rawWire
                     )
                     // Signal callers that a translated message was persisted.
                     // activeAssistantMessageIds[runId] is set by the turnCompleted
@@ -6119,7 +6121,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                         assistantMessage: assistantMessage,
                         finishedAt: Date(),
                         providerTerminalAcknowledged: providerTerminalAcknowledged,
-                        errorMessage: resolved.errorMessage
+                        errorMessage: resolved.errorMessage,
+                        continuationSourceFinalMessage: continuationSourceFinalMessage
                     )
                 }
                 lock.unlock()
@@ -6288,7 +6291,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             maybeScheduleBackgroundAwaitContinuation(
                 threadId: threadId,
                 status: status,
-                finalMessage: finalMessage,
+                finalMessage: pendingTerminal.continuationSourceFinalMessage ?? finalMessage,
                 runMetadata: runMetadata,
                 resumeCursor: resumeCursor
             )
@@ -6764,7 +6767,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 runId: runId,
                 threadId: threadId,
                 allowFinalResponseTranslation: false,
-                providerTerminalAcknowledged: pending.providerTerminalAcknowledged
+                providerTerminalAcknowledged: pending.providerTerminalAcknowledged,
+                continuationSourceFinalMessage: pending.continuationSourceFinalMessage
             )
         }
     }
@@ -6865,9 +6869,27 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             if isProviderTextItem(item.type) {
                 lock.lock()
                 var items = activeProviderTextItemTypes[runId] ?? [:]
+                let isFirstObservation = items[item.id] == nil
                 items[item.id] = item.type
                 activeProviderTextItemTypes[runId] = items
                 lock.unlock()
+                if isFirstObservation, let request = wireRequestText(runId: runId) {
+                    // The outbound half already used RCW1 even if the provider
+                    // later falls back to streaming ordinary prose. Persist the
+                    // admission at item start so Work-so-far can expose the
+                    // Translated/RCW1 control immediately. A decoded response
+                    // frame replaces this placeholder under the same item id.
+                    return .emit([
+                        .wireTranslation(AssistantWireTranslation(
+                            itemId: item.id,
+                            originalText: "",
+                            rewrittenText: "",
+                            fallbackReason: "provider_response_pending",
+                            wireRequestText: request
+                        )),
+                        ev
+                    ])
+                }
             }
             return nil
         case .itemDelta(let itemId, let bodyAppend, let outputAppend, _):
@@ -7877,6 +7899,10 @@ private struct PendingTerminalEvent {
     var providerTerminalAcknowledged: Bool
     /// Durable `agent_runs.error_message` for this terminal (nil for cancel/success).
     var errorMessage: String?
+    /// Raw provider final used only for incomplete-turn classification when the
+    /// user-facing final was locally rendered from RCW1. Never persisted as the
+    /// canonical assistant message.
+    var continuationSourceFinalMessage: String? = nil
 }
 
 private struct DeferredProviderTerminalEvent {

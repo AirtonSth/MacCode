@@ -220,6 +220,17 @@ final class AgentAppPerfBundleTests: XCTestCase {
             run: runId,
             threadId: tid
         )
+        vm.runCoordinator(
+            vm.coordinator,
+            didReceive: .wireTranslation(AssistantWireTranslation(
+                itemId: "progress-item",
+                originalText: original,
+                rewrittenText: "State, patch, tests.",
+                wireRequestText: request
+            )),
+            run: runId,
+            threadId: tid
+        )
 
         await Task.yield()
 
@@ -229,6 +240,11 @@ final class AgentAppPerfBundleTests: XCTestCase {
                        "batched stream flush must preserve the original compressed text for the View original disclosure")
         XCTAssertEqual(vm.tokenSaverWireRequestText(for: messageId), request,
                        "the disclosure must expose exactly what RemoteCode sent while keeping the human prompt canonical")
+        let itemTranslation = try XCTUnwrap(vm.tokenSaverTranslation(forItemId: "progress-item"))
+        XCTAssertEqual(itemTranslation.originalText, original,
+                       "streamed progress must expose its exact raw provider frame, not only the final message")
+        XCTAssertEqual(itemTranslation.wireRequestText, request,
+                       "streamed progress must retain the exact provider-bound request for the Translated/RCW1 toggle")
     }
 
     func test_tokenSaverPublishedCacheDropsTranslationsEvictedByHotBudget() throws {

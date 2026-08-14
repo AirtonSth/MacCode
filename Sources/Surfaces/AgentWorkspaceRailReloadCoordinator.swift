@@ -12,7 +12,7 @@ import AgentRuntime
 /// Contract:
 /// - At most one cap+list per workspace per debounce window.
 /// - At most one queue reload apply pass per workspace per debounce window.
-/// - At most one subagent activity poll tick per workspace (not per surface).
+/// - One shared subagent activity poll round runs across all workspaces.
 /// - Cap/list run off the MainActor; apply stays on MainActor.
 @MainActor
 public final class AgentWorkspaceRailReloadCoordinator {
@@ -44,7 +44,7 @@ public final class AgentWorkspaceRailReloadCoordinator {
     private var members: [WorkspaceID: [ObjectIdentifier: WeakBox]] = [:]
     private var railDebounceTasks: [WorkspaceID: Task<Void, Never>] = [:]
     private var queueDebounceTasks: [WorkspaceID: Task<Void, Never>] = [:]
-    private var subagentPollTasks: [WorkspaceID: Task<Void, Never>] = [:]
+    private var subagentPollTask: Task<Void, Never>?
     /// Debounce window for EventBus fan-out storms.
     public var debounceNanoseconds: UInt64 = 50_000_000
     /// Shared subagent badge poll interval (was 2s per open surface).
@@ -57,7 +57,7 @@ public final class AgentWorkspaceRailReloadCoordinator {
         var bucket = members[viewModel.workspaceID] ?? [:]
         bucket[key] = WeakBox(viewModel: viewModel)
         members[viewModel.workspaceID] = bucket
-        ensureSubagentPoll(for: viewModel.workspaceID)
+        ensureSubagentPoll()
     }
 
     public func unregister(_ viewModel: AgentAppViewModel) {
@@ -71,11 +71,12 @@ public final class AgentWorkspaceRailReloadCoordinator {
             railDebounceTasks.removeValue(forKey: workspaceID)
             queueDebounceTasks[workspaceID]?.cancel()
             queueDebounceTasks.removeValue(forKey: workspaceID)
-            subagentPollTasks[workspaceID]?.cancel()
-            subagentPollTasks.removeValue(forKey: workspaceID)
         } else {
             members[workspaceID] = bucket
         }
+        // Keep the singleton's lightweight poll loop alive for the app lifetime.
+        // Cancelling it here can overlap an uncancellable detached receipt read
+        // with a newly registered workspace's replacement loop.
     }
 
     /// EventBus / external path: coalesce N surface notifications into one rail load.
@@ -100,18 +101,20 @@ public final class AgentWorkspaceRailReloadCoordinator {
         }
     }
 
-    private func ensureSubagentPoll(for workspaceID: WorkspaceID) {
-        guard subagentPollTasks[workspaceID] == nil else { return }
-        // Intentionally NOT @MainActor for the whole loop: sleep + SQLite/JSON
-        // load run off the main thread; only snapshot apply hops to MainActor.
-        // WHY: sample stacks under 5 agent threads showed hang_breach on
-        // refreshSubagentActivity → activityReceipts decode on the main thread.
-        subagentPollTasks[workspaceID] = Task { [weak self] in
+    private func ensureSubagentPoll() {
+        guard subagentPollTask == nil else { return }
+        // One loop owns every workspace round. The receipt reads themselves run
+        // off-main, but they must not overlap: all workspaces share one receipt
+        // store and its cross-process mutex. Starting one repeating task per
+        // workspace caused concurrent full scans every two seconds.
+        subagentPollTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                let interval = await MainActor.run { self?.subagentPollNanoseconds ?? 2_000_000_000 }
+                let interval = self?.subagentPollNanoseconds ?? 2_000_000_000
                 try? await Task.sleep(nanoseconds: interval)
                 guard !Task.isCancelled else { return }
-                await self?.flushSubagent(workspaceID)
+                guard let self else { return }
+                let workspaceIDs = Array(self.members.keys)
+                await self.flushSubagents(workspaceIDs)
             }
         }
     }
@@ -131,22 +134,26 @@ public final class AgentWorkspaceRailReloadCoordinator {
         }
     }
 
-    private func flushSubagent(_ workspaceID: WorkspaceID) async {
-        // One tick per workspace: only surfaces with a selected thread (badge context)
-        // refresh; others stay empty without extra SQLite work.
-        let targets: [(viewModel: AgentAppViewModel, threadId: AgentThreadID)] = await MainActor.run {
+    private func flushSubagents(_ workspaceIDs: [WorkspaceID]) async {
+        // One receipt-store scan serves the complete app round. Surfaces with no
+        // selected thread stay empty without adding work.
+        let targets: [(viewModel: AgentAppViewModel, threadId: AgentThreadID)] = workspaceIDs.flatMap { workspaceID in
             liveViewModels(for: workspaceID).compactMap { viewModel in
                 guard let threadId = viewModel.selectedThreadId else { return nil }
+                guard viewModel.selectedThreadRunIsStartingOrRunning || viewModel.subagentActivity.isLive else {
+                    return nil
+                }
                 return (viewModel, threadId)
             }
         }
+        guard let lead = targets.first else { return }
+        let threadIDs = Array(Set(targets.map(\.threadId)))
+        let snapshots = await lead.viewModel.loadSubagentActivitySnapshotsOffMainActor(for: threadIDs)
         for target in targets {
-            let snapshot = await target.viewModel.loadSubagentActivitySnapshotOffMainActor(
-                for: target.threadId
+            target.viewModel.applySubagentActivity(
+                snapshots[target.threadId] ?? .empty,
+                loadedFor: target.threadId
             )
-            await MainActor.run {
-                target.viewModel.applySubagentActivity(snapshot, loadedFor: target.threadId)
-            }
         }
     }
 

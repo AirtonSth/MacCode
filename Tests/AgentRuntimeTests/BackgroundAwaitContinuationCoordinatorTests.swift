@@ -139,6 +139,45 @@ final class BackgroundAwaitContinuationCoordinatorTests: XCTestCase {
                        "a self-declared (marker) stall must auto-continue to the bound regardless of phrasing")
     }
 
+    func test_fullAccessMarkerBeforeRCW1_autoNudgesAfterHumanTranslation() async throws {
+        // Regression: RCW1 transport extraction intentionally removes provider
+        // preamble text before local rendering. When the preamble was the host's
+        // [[RC_AWAITING]] signal, terminal handling classified only the translated
+        // prose and silently left an incomplete full-access run as completed.
+        let wire = "RCW1\tA\t1\nO\tIN_PROGRESS\nA\tAwaiting delegated worker result.\n.\n"
+        for provider in [AgentProvider.claude, .codex, .grok] {
+            let runner = StallingRunner(
+                provider: provider,
+                finalMessage: "\(BackgroundAwaitContinuation.awaitingMarker)\n\(wire)"
+            )
+            let (coordinator, thread, tmp) = try makeCoordinator(runner: runner)
+            coordinator.finalResponseTranslator = { response, translatedProvider, _, _ in
+                XCTAssertEqual(translatedProvider, provider)
+                XCTAssertEqual(response, wire.trimmingCharacters(in: .whitespacesAndNewlines),
+                               "the renderer must still receive only the strict RCW1 payload")
+                return "IN_PROGRESS\n\nAction: Awaiting delegated worker result."
+            }
+
+            _ = try await coordinator.startRun(AgentRunRequest(
+                threadId: thread.id, provider: provider, model: "fake-model", cwd: tmp,
+                prompt: "finish the delegated workflow", permissionMode: .fullAccess
+            ))
+
+            let expected = BackgroundAwaitContinuation.maxAutoContinuations + 1
+            await waitUntil { runner.startCount >= expected }
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            XCTAssertTrue(
+                coordinator.autoContinuationThreadIdsForTesting.contains(thread.id),
+                "the raw RCW1 terminal must reach the incomplete-turn classifier for \(provider.rawValue)"
+            )
+            XCTAssertEqual(
+                runner.startCount,
+                expected,
+                "RCW1 translation must not erase the raw incomplete-turn marker for \(provider.rawValue)"
+            )
+        }
+    }
+
     func test_supervisedStall_isNotAutoNudged() async throws {
         let runner = StallingRunner(finalMessage: "Standing by for the demo recording to complete.")
         let (coordinator, thread, tmp) = try makeCoordinator(runner: runner)

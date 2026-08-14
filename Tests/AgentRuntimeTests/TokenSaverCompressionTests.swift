@@ -1006,6 +1006,54 @@ final class TokenSaverCompressionTests: XCTestCase {
                        "the disclosure must retain what RemoteCode actually sent")
     }
 
+    func test_plainStreamOnAdmittedWirePublishesInspectableRequestWithoutBufferingProse() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-wire-plain-stream-disclosure-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let plain = "Action: Inspecting the live workspace now."
+        let runner = ScriptedStreamRunner(provider: .codex, body: plain)
+        let thread = AgentThread(title: "wire plain stream", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providers: [.codex: runner]
+        )
+        let observer = RecordingObserver()
+        coordinator.addObserver(observer)
+        let requestWire = try RCWireProtocol.serialize(.init(
+            direction: .request,
+            sequence: 1,
+            records: [.init(kind: .goal, value: "Inspect the live workspace now.")]
+        ))
+        coordinator.promptCompressor = { _, _, _, _ in requestWire }
+        coordinator.finalResponseTranslator = { response, _, _, _ in response }
+
+        _ = try await coordinator.startRun(.init(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "Inspect the live workspace now."
+        ))
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline,
+              !observer.recordedEvents.compactMap(\.bodyAppendForTest).joined().contains(plain) {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(observer.recordedEvents.compactMap(\.bodyAppendForTest).joined(), plain,
+                       "provider plaintext must keep streaming immediately instead of waiting for translation")
+        var timeline = AssistantTimelineState()
+        for event in coordinator.latestStreamEvents(threadId: thread.id) { timeline.apply(event) }
+        let metadata = try XCTUnwrap(timeline.tokenSaverTranslationsByItemId["stream-item"])
+        XCTAssertEqual(metadata.wireRequestText, requestWire,
+                       "the progress item must expose the exact admitted RCW1 request before the final reply")
+        XCTAssertEqual(metadata.originalText, "",
+                       "plaintext remains canonical in the item body; the placeholder must not duplicate it in memory")
+    }
+
     private func waitForAssistantMessage(
         _ messageRepo: AgentMessageRepository,
         threadId: AgentThreadID

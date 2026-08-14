@@ -328,6 +328,31 @@ final class ScrollPinPolicyTests: XCTestCase {
         XCTAssertFalse(follower.contains("updateConstraintsForSubtreeIfNeeded()"))
     }
 
+    /// Expanded work rows are already bounded by `paintSlice`. Nesting another
+    /// lazy stack inside the transcript's lazy stack makes SwiftUI repeatedly
+    /// re-place self-sizing linked-text rows while the user scrolls, which can
+    /// pin the main thread in AttributeGraph indefinitely.
+    func test_completedWorkDisclosureDoesNotNestLazyLayoutInsideTranscript() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        let start = try XCTUnwrap(source.range(of: "private func completedWorkDisclosure"))
+        let tail = source[start.lowerBound...]
+        let end = try XCTUnwrap(tail.range(of: "private func itemRow"))
+        let disclosure = String(tail[..<end.lowerBound])
+
+        XCTAssertTrue(disclosure.contains("AgentWorkDisclosureLayout.paintSlice"))
+        XCTAssertFalse(
+            disclosure.contains("LazyVStack("),
+            "bounded work rows must use eager layout so scrolling cannot enter a nested LazyStack placement loop"
+        )
+    }
+
     /// Stream follow must not dual-scroll content+BOTTOM (multipass jump).
     func test_programmaticScrollTargets_streamUsesBottomOnly() {
         let targets = AgentAppView.programmaticScrollTargets(
