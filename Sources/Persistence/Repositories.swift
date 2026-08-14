@@ -3283,6 +3283,10 @@ public final class AgentRunRepository: @unchecked Sendable {
     private let streamEventCodecLock = NSLock()
     private let streamEventDecoder = JSONDecoder()
     public init(db: SQLiteDB) { self.db = db }
+#if DEBUG
+    /// `iso.string(from:)` calls from `persistStreamBatch` (one per flush).
+    private(set) var streamBatchISO8601FormatCountForTesting = 0
+#endif
 
     /// Store-before-loss soft bound used by coordinator + repository (S3).
     public func boundPayloadForPersistence(
@@ -3784,14 +3788,24 @@ public final class AgentRunRepository: @unchecked Sendable {
         )
         try db.performSync { db in
             try db.transaction {
+                // ISO8601DateFormatter is second-precision. A 16-event / 250ms
+                // flush already stores the same created_at on every row; format
+                // once instead of lock+calendar per INSERT (stream + provider).
+                let createdAt = items.isEmpty ? nil : iso.string(from: Date())
+#if DEBUG
+                if createdAt != nil { streamBatchISO8601FormatCountForTesting += 1 }
+#endif
                 for item in items {
-                    try persistStreamEventIdempotently(db: db, runId: runId, item: item)
+                    try persistStreamEventIdempotently(
+                        db: db, runId: runId, item: item, createdAt: createdAt
+                    )
                     if let providerEvent = item.providerEvent {
                         try persistProviderEventIdempotently(
                             db: db,
                             threadId: threadId,
                             runId: runId,
-                            event: providerEvent
+                            event: providerEvent,
+                            createdAt: createdAt
                         )
                     }
                 }
@@ -4005,7 +4019,8 @@ public final class AgentRunRepository: @unchecked Sendable {
     private func persistStreamEventIdempotently(
         db: SQLiteDB,
         runId: AgentRunID,
-        item: StreamWriteIntent
+        item: StreamWriteIntent,
+        createdAt: String? = nil
     ) throws {
         let bounded = try boundedStreamRow(kind: item.kind, payloadJSON: item.payloadJSON)
         let existing = try db.prepare("SELECT event_kind, payload_json FROM agent_stream_events WHERE run_id = ? AND seq = ? LIMIT 1;")
@@ -4030,7 +4045,7 @@ public final class AgentRunRepository: @unchecked Sendable {
         try insert.bind(2, Int64(item.seq))
         try insert.bind(3, bounded.kind)
         try insert.bind(4, bounded.payloadJSON)
-        try insert.bind(5, iso.string(from: Date()))
+        try insert.bind(5, createdAt ?? iso.string(from: Date()))
         _ = try insert.step()
     }
 
@@ -4038,7 +4053,8 @@ public final class AgentRunRepository: @unchecked Sendable {
         db: SQLiteDB,
         threadId: AgentThreadID,
         runId: AgentRunID,
-        event: ProviderRuntimeEvent
+        event: ProviderRuntimeEvent,
+        createdAt: String? = nil
     ) throws {
         let boundedPayload = try boundedProviderPayload(event.payloadJSON)
         let existing = try db.prepare("""
@@ -4082,7 +4098,7 @@ public final class AgentRunRepository: @unchecked Sendable {
         try insert.bind(9, event.providerRequestId)
         try insert.bind(10, boundedPayload)
         try insert.bind(11, Int64(event.receivedAtMs))
-        try insert.bind(12, iso.string(from: Date()))
+        try insert.bind(12, createdAt ?? iso.string(from: Date()))
         _ = try insert.step()
     }
 

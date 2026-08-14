@@ -474,6 +474,71 @@ final class PersistenceTests: XCTestCase {
         ], "reopening or following up must replay every persisted run event, not only the latest response")
     }
 
+    func test_persistStreamBatch_formatsCreatedAtOnceForTheFlush() throws {
+        // WHY: persistStreamBatch used to iso.string(from: Date()) on every
+        // stream + provider INSERT. ISO8601 is second-precision, so a 16-event
+        // / 250ms flush already stored the same created_at; the extra formats
+        // were lock+calendar under the SQLite writer.
+        let tmp = NSTemporaryDirectory() + "RC2BatchCreatedAt-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let thread = AgentThread(title: "flush", provider: .codex, model: "m")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "m")
+        let runs = AgentRunRepository(db: db)
+        try runs.upsert(run)
+
+        var items: [AgentRunRepository.StreamWriteIntent] = []
+        for seq in 1...16 {
+            items.append(AgentRunRepository.StreamWriteIntent(
+                seq: seq,
+                kind: "itemDelta(i1)",
+                payloadJSON: #"{"itemDelta":{"itemId":"i1"}}"#,
+                providerEvent: ProviderRuntimeEvent(
+                    id: "evt-\(seq)",
+                    provider: .codex,
+                    source: "test",
+                    method: "event",
+                    payloadJSON: #"{"i":\#(seq)}"#,
+                    receivedAtMs: Int64(seq)
+                )
+            ))
+        }
+
+        XCTAssertEqual(runs.streamBatchISO8601FormatCountForTesting, 0)
+        try runs.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: items,
+            shouldPruneStreamEvents: false
+        )
+        XCTAssertEqual(
+            runs.streamBatchISO8601FormatCountForTesting, 1,
+            "one 16-event flush must format created_at once, not once per stream/provider row"
+        )
+
+        let created = try db.prepare(
+            "SELECT DISTINCT created_at FROM agent_stream_events WHERE run_id = ?;"
+        )
+        try created.bind(1, run.id.value.uuidString)
+        var stamps: [String] = []
+        while try created.step() {
+            stamps.append(created.columnText(0) ?? "")
+        }
+        XCTAssertEqual(stamps.count, 1, "all flushed stream rows must share the batch created_at")
+        XCTAssertFalse(stamps[0].isEmpty)
+
+        let providerStamps = try db.prepare(
+            "SELECT DISTINCT created_at FROM agent_provider_event_logs WHERE thread_id = ?;"
+        )
+        try providerStamps.bind(1, thread.id.value.uuidString)
+        var provider: [String] = []
+        while try providerStamps.step() {
+            provider.append(providerStamps.columnText(0) ?? "")
+        }
+        XCTAssertEqual(provider, stamps, "paired provider rows must reuse the same batch timestamp")
+    }
+
     func test_streamEventReplayLimitKeepsNewestEventsInChronologicalOrder() throws {
         let tmp = NSTemporaryDirectory() + "RC2Test-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: tmp) }
