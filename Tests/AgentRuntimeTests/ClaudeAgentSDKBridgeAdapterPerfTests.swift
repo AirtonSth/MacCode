@@ -100,4 +100,70 @@ final class ClaudeAgentSDKBridgeAdapterPerfTests: XCTestCase {
             ClaudeAgentSDKBridgeAdapter.sdkInstallTimeoutSeconds(), 0,
             "Install timeout must be > 0 so the async Task.sleep guard is meaningful")
     }
+
+    // MARK: - decode-once SDK line ingest
+
+    // WHY: handleLine used to JSONSerialization the same token line 3–4 times
+    // (sdk_error probe, user_input_request, fromJSONLine, parseLine). Each
+    // Claude SDK stdout line must decode once; extra parses allocate at token
+    // rate without changing events.
+    func test_interpretSDKLine_decodesJSONOnce() {
+        ClaudeAgentSDKBridgeAdapter.sdkLineJSONDecodeCountForTesting = 0
+        let line = #"{"type":"content_block_delta","index":0,"session_id":"sid","delta":{"type":"text_delta","text":"Hi"}}"#
+        let parser = ClaudeParser()
+        _ = parser.parseObject([
+            "type": "system",
+            "subtype": "init",
+            "session_id": "sid",
+        ], now: 1)
+        _ = parser.parseObject([
+            "type": "message_start",
+            "message": ["id": "m1"],
+        ], now: 1)
+        _ = parser.parseObject([
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": ["type": "text", "id": "item0"],
+        ], now: 1)
+        ClaudeAgentSDKBridgeAdapter.sdkLineJSONDecodeCountForTesting = 0
+        let interpretation = ClaudeAgentSDKBridgeAdapter.interpretSDKLine(line, parser: parser)
+        XCTAssertEqual(
+            ClaudeAgentSDKBridgeAdapter.sdkLineJSONDecodeCountForTesting, 1,
+            "sdk_error + user-input + runtime + parser must share one JSONSerialization"
+        )
+        XCTAssertFalse(interpretation.isSDKError)
+        XCTAssertNil(interpretation.userInputRequest)
+        XCTAssertEqual(interpretation.runtimeEvent?.method, "content_block_delta")
+        XCTAssertEqual(interpretation.runtimeEvent?.source, "claude.agent-sdk")
+        XCTAssertTrue(
+            interpretation.parsedEvents.contains { event in
+                if case .itemDelta(_, let body, _, _) = event { return body == "Hi" }
+                return false
+            },
+            "decode-once must still surface the text delta: \(interpretation.parsedEvents)"
+        )
+    }
+
+    func test_interpretSDKLine_detectsSDKErrorAndUserInputWithoutSecondParse() {
+        ClaudeAgentSDKBridgeAdapter.sdkLineJSONDecodeCountForTesting = 0
+        let errorLine = #"{"type":"sdk_error","message":"spawn claude ENOENT"}"#
+        let error = ClaudeAgentSDKBridgeAdapter.interpretSDKLine(errorLine, parser: ClaudeParser())
+        XCTAssertEqual(ClaudeAgentSDKBridgeAdapter.sdkLineJSONDecodeCountForTesting, 1)
+        XCTAssertTrue(error.isSDKError)
+        XCTAssertEqual(error.runtimeEvent?.method, "sdk_error")
+
+        ClaudeAgentSDKBridgeAdapter.sdkLineJSONDecodeCountForTesting = 0
+        let inputLine = #"{"type":"user_input_request","request_id":"q1","requested_schema":{"properties":{"a":{"type":"string"}}}}"#
+        let input = ClaudeAgentSDKBridgeAdapter.interpretSDKLine(inputLine, parser: ClaudeParser())
+        XCTAssertEqual(ClaudeAgentSDKBridgeAdapter.sdkLineJSONDecodeCountForTesting, 1)
+        XCTAssertEqual(input.userInputRequest?.id, "q1")
+        XCTAssertNotNil(input.userInputRequest?.requestedSchema)
+        XCTAssertTrue(
+            input.parsedEvents.contains { event in
+                if case .userInputRequested(let request) = event { return request.id == "q1" }
+                return false
+            },
+            "user_input_request must still become a parser event: \(input.parsedEvents)"
+        )
+    }
 }
