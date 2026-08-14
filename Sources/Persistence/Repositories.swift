@@ -3290,12 +3290,22 @@ public final class AgentRunRepository: @unchecked Sendable {
     private let committedStreamSeqLock = NSLock()
     private var lastCommittedStreamSeqByRun: [String: Int] = [:]
     private static let committedStreamSeqCacheLimit = 128
+    /// Durable `event_id`s already written for a thread on this instance.
+    /// Token-rate flushes used to SELECT the full provider row (payload
+    /// included) before every INSERT even when the coordinator had just
+    /// minted a new UUID. Seed the set from `event_id` on first touch so a
+    /// new instance still probes retries.
+    private let committedProviderEventLock = NSLock()
+    private var knownProviderEventIdsByThread: [String: Set<String>] = [:]
+    private static let committedProviderEventCacheLimit = 128
     public init(db: SQLiteDB) { self.db = db }
 #if DEBUG
     /// `iso.string(from:)` calls from `persistStreamBatch` (one per flush).
     private(set) var streamBatchISO8601FormatCountForTesting = 0
     /// Identity `SELECT` probes from `persistStreamEventIdempotently`.
     private(set) var streamEventIdentitySelectCountForTesting = 0
+    /// Identity `SELECT` probes from `persistProviderEventIdempotently`.
+    private(set) var providerEventIdentitySelectCountForTesting = 0
 #endif
 
     /// Store-before-loss soft bound used by coordinator + repository (S3).
@@ -4136,6 +4146,85 @@ public final class AgentRunRepository: @unchecked Sendable {
         createdAt: String? = nil
     ) throws {
         let boundedPayload = try boundedProviderPayload(event.payloadJSON)
+        let known = try knownProviderEventIds(db: db, threadId: threadId)
+        // First write of a freshly minted event_id cannot collide. Retry and
+        // relaunch still SELECT so matching bytes stay idempotent and a
+        // different identity still fails loud.
+        if known.contains(event.id) {
+            try probeExistingProviderEventIdentity(
+                db: db,
+                threadId: threadId,
+                runId: runId,
+                event: event,
+                boundedPayload: boundedPayload,
+                createdAt: createdAt
+            )
+            return
+        }
+        try insertProviderEvent(
+            db: db,
+            threadId: threadId,
+            runId: runId,
+            event: event,
+            boundedPayload: boundedPayload,
+            createdAt: createdAt
+        )
+        rememberProviderEventId(threadId: threadId, eventId: event.id)
+    }
+
+    private func knownProviderEventIds(db: SQLiteDB, threadId: AgentThreadID) throws -> Set<String> {
+        let key = threadId.value.uuidString
+        committedProviderEventLock.lock()
+        if let cached = knownProviderEventIdsByThread[key] {
+            let copy = cached
+            committedProviderEventLock.unlock()
+            return copy
+        }
+        committedProviderEventLock.unlock()
+
+        let st = try db.prepare(
+            "SELECT event_id FROM agent_provider_event_logs WHERE thread_id = ?;"
+        )
+        try st.bind(1, key)
+        var ids = Set<String>()
+        while try st.step() {
+            if let id = st.columnText(0) { ids.insert(id) }
+        }
+
+        committedProviderEventLock.lock()
+        defer { committedProviderEventLock.unlock() }
+        if knownProviderEventIdsByThread.count >= Self.committedProviderEventCacheLimit,
+           knownProviderEventIdsByThread[key] == nil {
+            knownProviderEventIdsByThread.removeAll(keepingCapacity: true)
+        }
+        if var existing = knownProviderEventIdsByThread[key] {
+            existing.formUnion(ids)
+            knownProviderEventIdsByThread[key] = existing
+            return existing
+        }
+        knownProviderEventIdsByThread[key] = ids
+        return ids
+    }
+
+    private func rememberProviderEventId(threadId: AgentThreadID, eventId: String) {
+        let key = threadId.value.uuidString
+        committedProviderEventLock.lock()
+        defer { committedProviderEventLock.unlock() }
+        guard knownProviderEventIdsByThread[key] != nil else { return }
+        knownProviderEventIdsByThread[key]?.insert(eventId)
+    }
+
+    private func probeExistingProviderEventIdentity(
+        db: SQLiteDB,
+        threadId: AgentThreadID,
+        runId: AgentRunID,
+        event: ProviderRuntimeEvent,
+        boundedPayload: String,
+        createdAt: String?
+    ) throws {
+#if DEBUG
+        providerEventIdentitySelectCountForTesting += 1
+#endif
         let existing = try db.prepare("""
             SELECT provider, source, method, provider_turn_id, provider_item_id,
                    provider_request_id, payload_json, received_at_ms
@@ -4159,6 +4248,25 @@ public final class AgentRunRepository: @unchecked Sendable {
             return
         }
 
+        try insertProviderEvent(
+            db: db,
+            threadId: threadId,
+            runId: runId,
+            event: event,
+            boundedPayload: boundedPayload,
+            createdAt: createdAt
+        )
+        rememberProviderEventId(threadId: threadId, eventId: event.id)
+    }
+
+    private func insertProviderEvent(
+        db: SQLiteDB,
+        threadId: AgentThreadID,
+        runId: AgentRunID,
+        event: ProviderRuntimeEvent,
+        boundedPayload: String,
+        createdAt: String?
+    ) throws {
         let insert = try db.prepare("""
             INSERT INTO agent_provider_event_logs(
                 thread_id, run_id, event_id, provider, source, method,
