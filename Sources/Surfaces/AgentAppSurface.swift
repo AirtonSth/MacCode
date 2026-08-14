@@ -10034,6 +10034,40 @@ public struct AgentAppView: View {
         text
     }
 
+    /// Visible-text check without allocating a trimmed copy.
+    /// `collapseAllCompletedWorkOnFinalIfNeeded` runs on every
+    /// `timelineUpdateTick` (~30 Hz) and used to `trimmingCharacters`
+    /// every finished answer, including already-collapsed turns.
+    nonisolated static func finalAssistantHasVisibleText(_ text: String?) -> Bool {
+        guard let text else { return false }
+        for scalar in text.unicodeScalars {
+            if !CharacterSet.whitespacesAndNewlines.contains(scalar) { return true }
+        }
+        return false
+    }
+
+    /// Rebuilds the finished-turn set from the live timeline (so pruned
+    /// turns drop out) without rescanning already-known finals.
+    nonisolated static func completedWorkTurnIds(
+        turns: [AssistantTurnSnapshot],
+        previouslyKnown: Set<String>
+    ) -> (ids: Set<String>, hasNewlyFinished: Bool) {
+        var ids = Set<String>()
+        ids.reserveCapacity(turns.count)
+        var hasNewlyFinished = false
+        for turn in turns {
+            if previouslyKnown.contains(turn.turnId) {
+                ids.insert(turn.turnId)
+                continue
+            }
+            if turn.finished || finalAssistantHasVisibleText(turn.finalAssistantMessage) {
+                ids.insert(turn.turnId)
+                hasNewlyFinished = true
+            }
+        }
+        return (ids, hasNewlyFinished)
+    }
+
     /// Cap live-render text to the first `limit` graphemes (head window).
     ///
     /// PERF: `text.count` is an O(n) grapheme walk paid on every live-render copy
@@ -13045,17 +13079,12 @@ public struct AgentAppView: View {
 
     /// When a turn first gains a final answer / finishes, collapse every Work so far.
     private func collapseAllCompletedWorkOnFinalIfNeeded() {
-        let finishedIds = Set(
-            vm.timeline.turns
-                .filter { turn in
-                    turn.finished
-                        || !(turn.finalAssistantMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-                }
-                .map(\.turnId)
+        let update = Self.completedWorkTurnIds(
+            turns: vm.timeline.turns,
+            previouslyKnown: knownFinishedWorkTurnIds
         )
-        let newlyFinished = finishedIds.subtracting(knownFinishedWorkTurnIds)
-        knownFinishedWorkTurnIds = finishedIds
-        guard !newlyFinished.isEmpty else { return }
+        knownFinishedWorkTurnIds = update.ids
+        guard update.hasNewlyFinished else { return }
         collapseAllWorkDisclosures()
     }
 
