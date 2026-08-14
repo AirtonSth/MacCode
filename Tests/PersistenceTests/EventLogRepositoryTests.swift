@@ -90,6 +90,29 @@ final class EventLogRepositoryTests: XCTestCase {
 
     /// WHY: append and retention are one atomic write. If pruning fails, callers
     /// must not receive an error after the new event has already been committed.
+    /// WHY: every append used to run two retention DELETEs (events + orphan
+    /// receipt links) even when COUNT(*) was far below the cap. A DELETE
+    /// abort must not fail those under-cap writes.
+    func test_append_underCapSkipsRetentionDeletes() throws {
+        let db = try makeDB()
+        let repo = EventLogRepository(db: db)
+        try db.execute("""
+            CREATE TRIGGER reject_event_retention_delete
+            BEFORE DELETE ON events
+            BEGIN
+                SELECT RAISE(ABORT, 'injected retention failure');
+            END;
+        """)
+
+        XCTAssertNoThrow(try repo.append(seq: 1, kind: "test", payloadJSON: "{}"))
+        XCTAssertNoThrow(try repo.append(seq: 2, kind: "test", payloadJSON: "{}"))
+
+        let countSt = try db.prepare("SELECT COUNT(*) FROM events;")
+        XCTAssertTrue(try countSt.step())
+        XCTAssertEqual(Int(countSt.columnInt64(0)), 2,
+            "under-cap appends must not touch retention DELETEs")
+    }
+
     func test_T009c_pruneFailureRollsBackAppendAndPreservesHardCap() throws {
         let db = try makeDB()
         let repo = EventLogRepository(db: db)

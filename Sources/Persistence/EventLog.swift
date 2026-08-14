@@ -10,6 +10,12 @@ enum EventRetentionPolicy {
     /// retention deletes commit or roll back together. Receipt rows are permanent.
     static func prune(db: SQLiteDB, cap: Int = cap) throws {
         let boundedCap = max(0, cap)
+        // Under the cap both DELETEs are no-ops, but the receipt-orphan
+        // subquery still scans command_receipt_events on every append.
+        // COUNT(*) is cheaper and keeps the hard cap exact once over.
+        let count = try db.prepare("SELECT COUNT(*) FROM events;")
+        _ = try count.step()
+        guard count.columnInt64(0) > Int64(boundedCap) else { return }
         try db.execute("""
             DELETE FROM events
             WHERE id <= (SELECT MAX(id) FROM events) - \(boundedCap);
