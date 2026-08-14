@@ -6434,6 +6434,7 @@ public final class CommandReceiptRepository {
                     // The just-finalized events are newest and therefore remain
                     // available to `persistedEvents` for ambiguous-commit reread.
                     // Only old replay payloads and their now-useless links prune.
+                    db.noteEventRowsInserted(Int64(persisted.count))
                     try EventRetentionPolicy.prune(db: db, cap: eventRetentionCap)
                 }
                 return persisted

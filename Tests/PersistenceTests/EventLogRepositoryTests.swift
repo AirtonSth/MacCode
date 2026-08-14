@@ -256,4 +256,29 @@ final class EventLogRepositoryTests: XCTestCase {
         XCTAssertEqual(rows.map(\.seq), [1, 2, 3],
                        "cursor pagination must return the first matching page in reducer order")
     }
+
+    func test_append_skipsEventCountSelectWhileUnderCap() throws {
+        // WHY: every EventLog.append used to SELECT COUNT(*) FROM events even
+        // when the table was far under the 5000-row cap (lifecycle persist
+        // after stream kinds were already live-only). The connection caches
+        // occupancy after the first count so later under-cap appends skip it.
+        let db = try makeDB()
+        let repo = EventLogRepository(db: db)
+        XCTAssertEqual(db.eventRowCountSelectCountForTesting, 0)
+        try repo.append(seq: 1, kind: "agent.run.started", payloadJSON: "{}")
+        XCTAssertEqual(
+            db.eventRowCountSelectCountForTesting, 1,
+            "first append must COUNT once to seed the connection cache"
+        )
+        for seq in 2...10 {
+            try repo.append(seq: Int64(seq), kind: "agent.run.started", payloadJSON: "{}")
+        }
+        XCTAssertEqual(
+            db.eventRowCountSelectCountForTesting, 1,
+            "nine more under-cap appends must not COUNT again"
+        )
+        let countSt = try db.prepare("SELECT COUNT(*) FROM events;")
+        XCTAssertTrue(try countSt.step())
+        XCTAssertEqual(countSt.columnInt64(0), 10)
+    }
 }

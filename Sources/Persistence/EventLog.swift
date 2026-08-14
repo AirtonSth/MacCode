@@ -13,9 +13,17 @@ enum EventRetentionPolicy {
         // Under the cap both DELETEs are no-ops, but the receipt-orphan
         // subquery still scans command_receipt_events on every append.
         // COUNT(*) is cheaper and keeps the hard cap exact once over.
+        if let known = db.cachedEventRowCountIfKnown(), known <= Int64(boundedCap) {
+            return
+        }
+#if DEBUG
+        db.noteEventRowCountSelectForTesting()
+#endif
         let count = try db.prepare("SELECT COUNT(*) FROM events;")
         _ = try count.step()
-        guard count.columnInt64(0) > Int64(boundedCap) else { return }
+        let rows = count.columnInt64(0)
+        db.rememberEventRowCount(rows)
+        guard rows > Int64(boundedCap) else { return }
         try db.execute("""
             DELETE FROM events
             WHERE id <= (SELECT MAX(id) FROM events) - \(boundedCap);
@@ -26,6 +34,12 @@ enum EventRetentionPolicy {
                 SELECT 1 FROM events WHERE events.seq = command_receipt_events.seq
             );
         """)
+#if DEBUG
+        db.noteEventRowCountSelectForTesting()
+#endif
+        let after = try db.prepare("SELECT COUNT(*) FROM events;")
+        _ = try after.step()
+        db.rememberEventRowCount(after.columnInt64(0))
     }
 }
 
@@ -55,6 +69,7 @@ public final class EventLogRepository {
                 try st.bind(3, payloadJSON)
                 try st.bind(4, iso.string(from: Date()))
                 _ = try st.step()
+                db.noteEventRowsInserted(1)
                 try EventRetentionPolicy.prune(db: db, cap: EventLogRepository.cap)
             }
         }
