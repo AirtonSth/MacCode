@@ -204,6 +204,73 @@ final class PersistenceTests: XCTestCase {
                        "completed sessions with a resume cursor must be classified as recoverable, not silently lost")
     }
 
+    func test_updateDiagnostics_skipsNoOpUpsertWhileStreamingSameKind() throws {
+        // WHY: persistStreamBatch calls updateDiagnostics on every 16-event /
+        // 250ms flush. Token deltas on one item keep lastEventKind as
+        // `itemDelta(id)` but used to rewrite the whole provider_session_runtime
+        // row (runtime_payload_json included) just to bump updatedAt.
+        let tmp = NSTemporaryDirectory() + "RC2DiagnosticsNoOp-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let thread = AgentThread(title: "stream", provider: .codex, model: "m")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let repo = ProviderSessionRuntimeRepository(db: db)
+        let frozen = Date(timeIntervalSince1970: 1_700_000_000)
+        let payload = String(repeating: "x", count: 8_192)
+        try repo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .running,
+            lastEventKind: "itemDelta(item-1)",
+            runtimePayloadJSON: payload,
+            updatedAt: frozen
+        ))
+
+        var upserts = 0
+        db.beforeStatementStepForTesting = { sql in
+            if sql.contains("INSERT INTO provider_session_runtime") {
+                upserts += 1
+            }
+        }
+        defer { db.beforeStatementStepForTesting = nil }
+
+        try repo.updateDiagnostics(
+            threadId: thread.id,
+            lastEventKind: "itemDelta(item-1)",
+            lastErrorMessage: nil,
+            at: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+
+        XCTAssertEqual(upserts, 0, "same lastEventKind must not WAL-write the session row")
+        let afterNoop = try XCTUnwrap(try repo.get(threadId: thread.id))
+        XCTAssertEqual(afterNoop.lastEventKind, "itemDelta(item-1)")
+        XCTAssertEqual(afterNoop.updatedAt.timeIntervalSince1970, frozen.timeIntervalSince1970,
+                       "updatedAt must stay put so skip is observable; reaper only lists completed sessions")
+        XCTAssertEqual(afterNoop.runtimePayloadJSON, payload)
+
+        try repo.updateDiagnostics(
+            threadId: thread.id,
+            lastEventKind: "itemDelta(item-2)",
+            lastErrorMessage: nil,
+            at: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+        XCTAssertEqual(upserts, 1, "a new lastEventKind must still persist")
+        let afterChange = try XCTUnwrap(try repo.get(threadId: thread.id))
+        XCTAssertEqual(afterChange.lastEventKind, "itemDelta(item-2)")
+        XCTAssertEqual(afterChange.updatedAt.timeIntervalSince1970, 1_800_000_000)
+
+        try repo.updateDiagnostics(
+            threadId: thread.id,
+            lastEventKind: "itemDelta(item-2)",
+            lastErrorMessage: "boom",
+            at: Date(timeIntervalSince1970: 1_900_000_000)
+        )
+        XCTAssertEqual(upserts, 2, "a new lastErrorMessage must still persist")
+        let afterError = try XCTUnwrap(try repo.get(threadId: thread.id))
+        XCTAssertEqual(afterError.lastErrorMessage, "boom")
+        XCTAssertEqual(afterError.lastEventKind, "itemDelta(item-2)")
+    }
+
     func test_interruptedProviderSessionWithCursorIsRecoverableButCancelledSessionIsStopped() throws {
         let tmp = NSTemporaryDirectory() + "RC2InterruptedRecovery-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: tmp) }

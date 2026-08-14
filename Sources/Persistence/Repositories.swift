@@ -5816,8 +5816,20 @@ public final class ProviderSessionRuntimeRepository {
 
     public func updateDiagnostics(threadId: AgentThreadID, lastEventKind: String?, lastErrorMessage: String?, at date: Date = Date()) throws {
         guard var session = try get(threadId: threadId) else { return }
-        session.lastEventKind = lastEventKind ?? session.lastEventKind
-        session.lastErrorMessage = lastErrorMessage ?? session.lastErrorMessage
+        let nextKind = lastEventKind ?? session.lastEventKind
+        let nextError = lastErrorMessage ?? session.lastErrorMessage
+        // Stream flushes (~16 events / 250 ms) call this with the last
+        // buffered kind. Token deltas on one item keep `itemDelta(id)`
+        // unchanged, but the previous path still upserted the whole row
+        // (including runtime_payload_json) just to bump updatedAt.
+        // Reaper only lists completed sessions; running lastEventKind
+        // identity is what recovery reads. Skip the WAL write when both
+        // diagnostic fields are already stored.
+        guard session.lastEventKind != nextKind || session.lastErrorMessage != nextError else {
+            return
+        }
+        session.lastEventKind = nextKind
+        session.lastErrorMessage = nextError
         session.updatedAt = date
         try upsert(session)
     }
