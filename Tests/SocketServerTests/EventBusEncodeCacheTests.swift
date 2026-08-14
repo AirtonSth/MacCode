@@ -161,6 +161,14 @@ final class EventBusEncodeCacheTests: XCTestCase {
                 "progress": .number(1.0 / 3.0),
             ]), ts: 1_786_682_163.2664108),
             EventBus.Event(seq: 8, kind: "num", payload: .number(Double.pi), ts: -0.0),
+            // Unsorted insertion order must still match encoder+sortedKeys length.
+            EventBus.Event(seq: 9, kind: "agent.item.delta", payload: .object([
+                "thread_id": .string("t"),
+                "summary": .string("s"),
+                "output_append": .string("o"),
+                "item_id": .string("i"),
+                "body_append": .string("b"),
+            ]), ts: 2),
         ]
         for ev in cases {
             let encoded = try encoder.encode(ev)

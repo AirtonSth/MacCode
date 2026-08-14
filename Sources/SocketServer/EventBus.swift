@@ -692,13 +692,15 @@ public final class EventBus: @unchecked Sendable {
             }
             return count
         case .object(let object):
+            // Key order does not change JSON length (`"a":1,"b":2` ==
+            // `"b":2,"a":1`). Skip `keys.sorted()` so token-rate retain
+            // does not allocate an Array under the EventBus lock.
             var count = 2
-            let keys = object.keys.sorted()
-            if !keys.isEmpty {
-                count += keys.count - 1
-                for key in keys {
+            if !object.isEmpty {
+                count += object.count - 1
+                for (key, value) in object {
                     count += jsonStringByteCount(key) + 1
-                    count += jsonValueByteCount(object[key] ?? .null)
+                    count += jsonValueByteCount(value)
                 }
             }
             return count
