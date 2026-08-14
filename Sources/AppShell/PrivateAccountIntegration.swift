@@ -661,8 +661,16 @@ public final class PrivateAccountSessionStore: @unchecked Sendable {
     }
 
     public func load() -> PrivateAccountSession? {
-        guard let json = try? repo.get(key),
-              let data = json.data(using: .utf8) else { return nil }
+        session(fromJSON: loadRawJSON())
+    }
+
+    /// Raw settings blob so callers can skip JSONDecoder when the session is unchanged.
+    public func loadRawJSON() -> String? {
+        try? repo.get(key)
+    }
+
+    public func session(fromJSON json: String?) -> PrivateAccountSession? {
+        guard let json, !json.isEmpty, let data = json.data(using: .utf8) else { return nil }
         return try? decoder.decode(PrivateAccountSession.self, from: data)
     }
 

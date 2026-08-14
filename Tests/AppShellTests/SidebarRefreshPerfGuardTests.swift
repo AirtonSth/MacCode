@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 @testable import AppShell
 @testable import CoreModel
 import Persistence
@@ -100,5 +101,82 @@ final class SidebarRefreshPerfGuardTests: XCTestCase {
 
         XCTAssertEqual(vm.threadListCallCount, 0,
             "busyTooltip must remain read-free after repeated runtime refreshes")
+    }
+
+    // MARK: - PERF-MAC_SIDEBAR-002 no-op reload
+
+    /// WHY: `sidebar.refresh()` runs on every coalesced refreshFromState and
+    /// busy projection. The account blob is peeked so save+reload stays
+    /// synchronous, but an unchanged blob must not JSONDecoder or assign
+    /// `@Published` (that rebuilt the always-on sidebar).
+    func test_reload_doesNotRedecodeUnchangedPrivateAccount() throws {
+        let (_, _, vm) = try make(prefix: "account-hot")
+        let afterInit = vm.privateAccountLoadCount
+        XCTAssertGreaterThan(afterInit, 0, "init must materialize the account once")
+
+        vm.reload()
+        vm.reload()
+
+        XCTAssertEqual(
+            vm.privateAccountLoadCount,
+            afterInit,
+            "unchanged account JSON must not be decoded again on workspace reload"
+        )
+    }
+
+    /// WHY: a true account change still has to paint (Token Saver footer,
+    /// subscribe CTA). The `.rc2PrivateAccountChanged` observer is the only
+    /// intended reread path after init.
+    func test_privateAccountNotification_stillReloadsUser() async throws {
+        let (ctx, _, vm) = try make(prefix: "account-note")
+        XCTAssertNil(vm.privateAccountUser)
+        let loadsBefore = vm.privateAccountLoadCount
+
+        PrivateAccountSessionStore(repo: ctx.settingsRepo).save(
+            PrivateAccountSession(
+                accessToken: "access",
+                refreshToken: "refresh",
+                user: PrivateAccountUser(
+                    daysRemaing: nil,
+                    daysRemaining: 30,
+                    email: "paid@example.com",
+                    id: "paid",
+                    subscribed: true
+                )
+            )
+        )
+
+        let deadline = Date().addingTimeInterval(1.0)
+        while vm.privateAccountUser == nil, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(vm.privateAccountUser?.id, "paid")
+        XCTAssertGreaterThan(
+            vm.privateAccountLoadCount,
+            loadsBefore,
+            "account notification must still decode the new session"
+        )
+    }
+
+    /// WHY: a no-op refresh (same workspaces, selection, busy, account) must
+    /// not fire objectWillChange. `@Published` assignment always publishes,
+    /// so even an equal Set/optional rewrite rebuilt the sidebar body.
+    func test_reload_doesNotPublishWhenSnapshotUnchanged() throws {
+        let (_, router, vm) = try make(prefix: "noop-publish")
+        _ = try router.createWorkspace(name: "w", cwd: NSTemporaryDirectory())
+        vm.reload()
+
+        var publishes = 0
+        let sub = vm.objectWillChange.sink { publishes += 1 }
+        vm.reload()
+        vm.reload()
+        _ = sub
+
+        XCTAssertEqual(
+            publishes,
+            0,
+            "unchanged reload must not invalidate the sidebar SwiftUI tree"
+        )
     }
 }

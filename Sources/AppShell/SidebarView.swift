@@ -404,6 +404,12 @@ public final class SidebarViewModel: ObservableObject {
     /// Legacy test seam retained for source compatibility. Busy tooltips are
     /// now derived from live in-memory surfaces and must not read SQLite.
     var threadListCallCount: Int = 0
+    /// PERF-MAC_SIDEBAR-002 (test seam): JSONDecoder of the private account
+    /// session. `reload()` still peeks the settings blob so save+reload stays
+    /// synchronous, but an unchanged blob must not decode or publish.
+    var privateAccountLoadCount: Int = 0
+    private var lastPrivateAccountJSON: String?
+    private var didPeekPrivateAccountJSON = false
     private var privateAccountObserver: NSObjectProtocol?
     private var tokenSaverUsageObserver: NSObjectProtocol?
     private var tokenSaverDistributedUsageObserver: NSObjectProtocol?
@@ -561,10 +567,10 @@ public final class SidebarViewModel: ObservableObject {
         // row deselected so the destination is unambiguous.
         let shellDestinationSelected = isScheduledTasksSelected || isActiveThreadsSelected
         if shellDestinationSelected {
-            selectedWorkspaceID = nil
-            selectedWorkspaceIDs.removeAll()
+            if selectedWorkspaceID != nil { selectedWorkspaceID = nil }
+            if !selectedWorkspaceIDs.isEmpty { selectedWorkspaceIDs.removeAll() }
             selectionAnchorID = nil
-        } else {
+        } else if selectedWorkspaceID != ctx.state.window.selectedWorkspaceID {
             selectedWorkspaceID = ctx.state.window.selectedWorkspaceID
         }
         updateCompletedWorkspaces(from: ordered)
@@ -572,13 +578,19 @@ public final class SidebarViewModel: ObservableObject {
             workspaces = ordered
         }
         if !shellDestinationSelected {
-            selectedWorkspaceIDs = selectedWorkspaceIDs.intersection(Set(workspaces.map(\.id)))
+            let nextIDs = selectedWorkspaceIDs.intersection(Set(workspaces.map(\.id)))
+            if nextIDs != selectedWorkspaceIDs {
+                selectedWorkspaceIDs = nextIDs
+            }
         }
         // Live Active Threads badge: host projection count, same source as Pet.
         let nextActiveCount = ctx.coordinator.activeThreadIdsSnapshot().count
         if nextActiveCount != activeThreadCount {
             activeThreadCount = nextActiveCount
         }
+        // Peek the account blob so save+reload stays synchronous (Insomnia /
+        // Token Saver tests). Unchanged JSON must not decode or assign
+        // `@Published` — that rebuilt the sidebar on every refreshFromState.
         reloadPrivateAccount()
     }
 
@@ -587,12 +599,15 @@ public final class SidebarViewModel: ObservableObject {
     /// already batch-computes (agent run / terminal job), so no extra DB work.
     private func updateCompletedWorkspaces(from list: [Workspace]) {
         let nowBusy = Set(list.filter { $0.metadata["busy"] == "true" }.map(\.id))
-        completedWorkspaces = Self.completedWorkspacesAfterReload(
+        let next = Self.completedWorkspacesAfterReload(
             previousBusy: previousBusyWorkspaces,
             nowBusy: nowBusy,
             current: completedWorkspaces,
             existing: Set(list.map(\.id)),
             selected: selectedWorkspaceID)
+        if next != completedWorkspaces {
+            completedWorkspaces = next
+        }
         previousBusyWorkspaces = nowBusy
     }
 
@@ -627,7 +642,16 @@ public final class SidebarViewModel: ObservableObject {
 
     private func reloadPrivateAccount() {
         guard let ctx = context else { return }
-        privateAccountUser = PrivateAccountSessionStore(repo: ctx.settingsRepo).load()?.user
+        let store = PrivateAccountSessionStore(repo: ctx.settingsRepo)
+        let json = store.loadRawJSON()
+        if didPeekPrivateAccountJSON, json == lastPrivateAccountJSON { return }
+        didPeekPrivateAccountJSON = true
+        lastPrivateAccountJSON = json
+        privateAccountLoadCount += 1
+        let next = store.session(fromJSON: json)?.user
+        if next != privateAccountUser {
+            privateAccountUser = next
+        }
     }
 
     private func reloadInsomnia() {
