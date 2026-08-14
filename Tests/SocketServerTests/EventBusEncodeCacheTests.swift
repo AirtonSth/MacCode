@@ -156,6 +156,11 @@ final class EventBusEncodeCacheTests: XCTestCase {
             ]), ts: 42),
             EventBus.Event(seq: 6, kind: "emoji", payload: .string("café 🐱"), ts: 99.125),
             EventBus.Event(seq: Int64.max, kind: "big.seq", payload: .object([:]), ts: 1),
+            // Live publish clock is Date().timeIntervalSince1970 (fractional).
+            EventBus.Event(seq: 7, kind: "agent.item.delta", payload: .object([
+                "progress": .number(1.0 / 3.0),
+            ]), ts: 1_786_682_163.2664108),
+            EventBus.Event(seq: 8, kind: "num", payload: .number(Double.pi), ts: -0.0),
         ]
         for ev in cases {
             let encoded = try encoder.encode(ev)
@@ -185,5 +190,25 @@ final class EventBusEncodeCacheTests: XCTestCase {
         )
         XCTAssertEqual(bus.recentCountForTests, 1)
         XCTAssertGreaterThan(bus.recentBytesForTests, 0)
+    }
+
+    /// Publish `ts` is never an Int64. The walk must still equal the encoder
+    /// for a live clock sample so ring eviction stays identical.
+    func test_jsonNumberByteCount_liveTimestampAndFractions_matchEncoder() throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let now = Date().timeIntervalSince1970
+        let values: [Double] = [
+            now, -0.0, 0.5, 99.125, Double.pi, 1.0 / 3.0, 1e20, 1e-10, -1.25,
+        ]
+        for value in values {
+            let ev = EventBus.Event(seq: 1, kind: "n", payload: .number(value), ts: value)
+            let encoded = try encoder.encode(ev)
+            XCTAssertEqual(
+                EventBus.retainedJSONByteCount(ev),
+                encoded.count,
+                "walk != encoder for \(value) json=\(String(data: encoded, encoding: .utf8) ?? "?")"
+            )
+        }
     }
 }

@@ -742,20 +742,24 @@ public final class EventBus: @unchecked Sendable {
         return count
     }
 
-    /// Match `JSONEncoder` / `JSONSerialization` fragment encoding for Doubles
-    /// (seq/ts and JSONValue numbers). Allocates only for the number fragment.
+    /// Match `JSONEncoder` + `.sortedKeys` number fragments for `ts` and
+    /// `JSONValue.number`. Exact integers stay digit-count only. Fractional
+    /// values use Swift's `Double` description, which matches the encoder
+    /// (unlike `JSONSerialization` of `NSNumber`, which lengthens π / 1/3).
+    /// Publish `ts` is `Date().timeIntervalSince1970` — almost never an
+    /// integer — so the previous `JSONSerialization.data` allocated on every
+    /// token-rate retain under `lock`.
     nonisolated static func jsonNumberByteCount(_ value: Double) -> Int {
+        if value == 0 {
+            // `Int64(exactly: -0.0)` is 0, but JSONEncoder emits `-0`.
+            return value.sign == .minus ? 2 : 1
+        }
         if value.isFinite, value.rounded(.towardZero) == value,
            let exact = Int64(exactly: value) {
             return jsonInt64ByteCount(exact)
         }
-        guard let data = try? JSONSerialization.data(
-            withJSONObject: NSNumber(value: value),
-            options: .fragmentsAllowed
-        ) else {
-            return 24
-        }
-        return data.count
+        guard value.isFinite else { return 24 }
+        return String(value).utf8.count
     }
 }
 
