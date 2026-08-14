@@ -13763,7 +13763,27 @@ public struct AgentAppView: View {
                 }
             }
         case .reasoning:
-            reasoningRow(item)
+            if let translation = vm.tokenSaverTranslation(forItemId: item.id) {
+                let text = reasoningText(item)
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    tokenSaverDisplayControl(
+                        identifierSuffix: item.id,
+                        original: translation.originalText.isEmpty ? text : translation.originalText,
+                        request: translation.wireRequestText
+                    )
+                    if tokenSaverDisplayMode == .translated {
+                        reasoningRow(item)
+                    } else {
+                        tokenSaverOriginalContent(
+                            original: translation.originalText.isEmpty ? text : translation.originalText,
+                            request: translation.wireRequestText,
+                            identifierSuffix: item.id
+                        )
+                    }
+                }
+            } else {
+                reasoningRow(item)
+            }
         case .plan:
             VStack(alignment: .leading, spacing: DS.Space.xs) {
                 Text("PLAN").font(DS.Font.caption2.weight(.semibold)).tracking(0.6)
@@ -13781,7 +13801,7 @@ public struct AgentAppView: View {
     // It stays open while streaming, then collapses to a tappable "Thought" row.
     @ViewBuilder
     private func reasoningRow(_ item: AssistantItem) -> some View {
-        let text = item.body.isEmpty ? (AgentTimelineItemPresentation.make(for: item).detail ?? "") : item.body
+        let text = reasoningText(item)
         let streaming = item.state == .streaming
         let expanded = streaming || expandedReasoning.contains(item.id)
         VStack(alignment: .leading, spacing: DS.Space.xs) {
@@ -13813,6 +13833,10 @@ public struct AgentAppView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityIdentifier("agent.reasoning.\(item.id)")
+    }
+
+    private func reasoningText(_ item: AssistantItem) -> String {
+        item.body.isEmpty ? (AgentTimelineItemPresentation.make(for: item).detail ?? "") : item.body
     }
 
     @ViewBuilder

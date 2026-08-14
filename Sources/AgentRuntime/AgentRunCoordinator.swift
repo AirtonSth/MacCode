@@ -6866,7 +6866,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         guard finalResponseTranslator != nil else { return nil }
         switch ev {
         case .itemStarted(let item):
-            if isProviderTextItem(item.type) {
+            if isWireDisclosureItem(item.type) {
                 lock.lock()
                 var items = activeProviderTextItemTypes[runId] ?? [:]
                 let isFirstObservation = items[item.id] == nil
@@ -7134,6 +7134,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     private func isProviderTextItem(_ type: AssistantItemType) -> Bool {
         type == .assistantMessage
+    }
+
+    /// Narrative reasoning is intentionally not decoded as RCW1, but it is the
+    /// only visible provider text during many live Grok turns. Record the
+    /// run's outbound wire admission for it so the UI can expose the exact
+    /// request immediately without waiting for a final assistant message.
+    private func isWireDisclosureItem(_ type: AssistantItemType) -> Bool {
+        type == .assistantMessage || type == .reasoning
     }
 
     private func shouldBufferProviderTextPrefix(_ text: String) -> Bool {

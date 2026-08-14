@@ -936,6 +936,9 @@ public struct LocalDistillRuntime: DistillRuntime {
         // Deterministic content routing (G4): lossless structural compression of
         // JSON/log payloads on the pure "compress this" modes, before any heuristic
         // summarization. Translation and wire modes have their own contracts.
+        if let routed = structuredCommandOutput(for: request) {
+            return routed
+        }
         if request.mode == .longText || request.mode == .watchSummary,
            let routed = contentRouter.route(request.input, options: routerOptions(for: request)) {
             return routed.output
@@ -1002,6 +1005,32 @@ public struct LocalDistillRuntime: DistillRuntime {
         }
 
         return boundedCommandOutput(output, maxOutputCharacters: maxOutputCharacters)
+    }
+
+    /// `gh api --jq` honors the provider's forced color environment and emits valid JSON
+    /// wrapped in ANSI CSI sequences. Classifying those bytes as prose sends them through the
+    /// model, where a rejected answer fails open to the full multi-KB payload. Remove display-
+    /// only control sequences, then losslessly minify the JSON before any intent/model path.
+    /// The service still stores the byte-exact colored original before serving this reduction.
+    static func structuredCommandOutput(for request: DistillRequest) -> String? {
+        guard request.mode == .commandOutput else { return nil }
+        let parsed = splitLegacyCommandPayload(request.input)
+        let source = strippingANSIControlSequences(parsed.output)
+        guard JSONCrusher.looksLikeJSON(source),
+              let routed = contentRouter.route(source, options: routerOptions(for: request)),
+              routed.contentType == .json else {
+            return nil
+        }
+        return boundedCommandOutput(routed.output, maxOutputCharacters: request.maxOutputCharacters)
+    }
+
+    private static let ansiCSIRegex = try! NSRegularExpression(
+        pattern: "\u{001B}\\[[0-?]*[ -/]*[@-~]"
+    )
+
+    private static func strippingANSIControlSequences(_ text: String) -> String {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return ansiCSIRegex.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: "")
     }
 
     static func commandOutputExtraction(
@@ -1441,6 +1470,9 @@ public struct MLXDistillRuntime: DistillRuntime {
     }
 
     public func distillStaged(_ request: DistillRequest) async throws -> DistillStageResult {
+        if let structured = LocalDistillRuntime.structuredCommandOutput(for: request) {
+            return DistillStageResult(output: structured, stage: .deterministic)
+        }
         if let deterministic = Self.deterministicCommandOutput(for: request) {
             return DistillStageResult(output: deterministic, stage: .deterministic)
         }

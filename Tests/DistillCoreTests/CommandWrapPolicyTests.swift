@@ -203,7 +203,64 @@ final class CommandWrapPolicyTests: XCTestCase {
             let q = CommandWrapPolicy.extractionQuery(forCommand: command)
             XCTAssertNotNil(q, "\(command) must send a query")
             XCTAssertTrue(q?.lowercased().contains("verbatim") == true, "\(command) query must signal verbatim line selection")
+            XCTAssertNil(
+                q.flatMap { LocalDistillRuntime.commandOutputIntent(question: $0) },
+                "the generic wrapper query must not accidentally select a narrow deterministic contract"
+            )
         }
+    }
+
+    func test_extractionQuery_keepsLargeReviewOutputOutOfPathsOnlyNONEFallback() throws {
+        // WHY: the transparent `gh api` wrapper used to ask to preserve "file paths".
+        // That phrase selected the paths-only extractor, which returned NONE for a large
+        // review body; the wrapper then rejected the tiny result and exposed raw output.
+        let question = try XCTUnwrap(CommandWrapPolicy.extractionQuery(forCommand: "gh"))
+        let review = (1...30).map { "review finding \($0): preserve the requested change and evidence" }
+            .joined(separator: "\n")
+
+        let output = LocalDistillRuntime.commandOutputFallback(
+            input: review,
+            question: question,
+            maxOutputCharacters: 4_000
+        )
+
+        XCTAssertNotEqual(output, "NONE")
+        XCTAssertTrue(output.contains("review finding 1:"))
+    }
+
+    func test_structuredCommandOutput_minifiesANSIColoredGHJSONWithoutLosingFields() throws {
+        // WHY: Grok forces color for `gh api --jq`; the ANSI bytes made valid JSON look like
+        // prose, bypassed the deterministic router, and frequently failed open to full output.
+        let rows: [[String: Any]] = (1...24).map { index in
+            ["id": 4_941_500_000 + index, "state": "CHANGES_REQUESTED", "body": "finding \(index)"]
+        }
+        let prettyData = try JSONSerialization.data(withJSONObject: rows, options: [.prettyPrinted, .sortedKeys])
+        let pretty = try XCTUnwrap(String(data: prettyData, encoding: .utf8))
+        let colored = "\u{001B}[1;38m\(pretty)\u{001B}[0m"
+        let request = DistillRequest(
+            mode: .commandOutput,
+            input: colored,
+            question: try XCTUnwrap(CommandWrapPolicy.extractionQuery(forCommand: "gh")),
+            maxOutputCharacters: 4_000,
+            reversibleStoreMinBytes: 256
+        )
+
+        let output = try XCTUnwrap(LocalDistillRuntime.structuredCommandOutput(for: request))
+        let decoded = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(output.utf8)) as? [[String: Any]]
+        )
+
+        XCTAssertEqual(decoded.count, rows.count)
+        XCTAssertEqual(decoded.first?["body"] as? String, "finding 1")
+        XCTAssertFalse(output.contains("\u{001B}"))
+        XCTAssertLessThan(output.utf8.count, colored.utf8.count)
+        XCTAssertTrue(
+            CommandWrapPolicy.isFaithfulCompression(
+                rawByteCount: colored.utf8.count,
+                compressedContentByteCount: output.utf8.count
+            ),
+            "the wrapper must accept the structured result instead of falling back to raw stdout"
+        )
     }
 
     func test_faithfulnessGuard_rejectsTinyGarbageTokens() {

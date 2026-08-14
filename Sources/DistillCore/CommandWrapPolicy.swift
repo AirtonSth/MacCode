@@ -285,7 +285,7 @@ public enum CommandWrapPolicy {
     /// sidesteps the no-question intent-extractor misfire (code "FAIL" / markdown "PASS" tokens).
     /// The optional return keeps room for a future command that should not compress at all.
     public static func extractionQuery(forCommand command: String) -> String? {
-        "Keep the lines most important for understanding this output, verbatim; preserve file paths, line numbers, identifiers, signatures, numbers, and code exactly; drop only boilerplate and repetition."
+        "Keep the lines most important for understanding this output, verbatim; preserve exact literals, identifiers, signatures, numbers, and code; drop only boilerplate and repetition."
     }
 
     // MARK: - faithfulness guard

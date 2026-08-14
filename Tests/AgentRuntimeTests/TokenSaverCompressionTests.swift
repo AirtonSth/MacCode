@@ -924,6 +924,78 @@ final class TokenSaverCompressionTests: XCTestCase {
         XCTAssertEqual(output, raw)
     }
 
+    /// WHY: reasoning is the only provider narrative visible while many Grok
+    /// turns are running. When the outbound turn used RCW1, its transport
+    /// disclosure must be available at item start instead of waiting for the
+    /// eventual final assistant message.
+    func test_reasoningStreamPublishesWireAdmissionBeforeItemCompletes() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-wire-reasoning-disclosure-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let runner = ScriptedStreamRunner(
+            provider: .grok,
+            itemType: .reasoning,
+            body: "Inspecting the merge state."
+        )
+        let thread = AgentThread(title: "reasoning disclosure", provider: .grok, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providers: [.grok: runner]
+        )
+        let observer = RecordingObserver()
+        coordinator.addObserver(observer)
+        let wireRequest = "RCW1\tQ\t1\nG\tInspect the merge state.\n.\n"
+        coordinator.promptCompressor = { _, _, _, _ in wireRequest }
+        coordinator.finalResponseTranslator = { response, _, _, _ in response }
+
+        _ = try await coordinator.startRun(.init(
+            threadId: thread.id,
+            provider: .grok,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "Inspect the merge state."
+        ))
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline,
+              !observer.recordedEvents.contains(where: {
+                  if case .itemCompleted(let itemId, _) = $0 { return itemId == "stream-item" }
+                  return false
+              }) {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        let events = observer.recordedEvents
+        let admissionIndex = events.firstIndex { event in
+            guard case .wireTranslation(let translation) = event else { return false }
+            return translation.itemId == "stream-item"
+                && translation.fallbackReason == "provider_response_pending"
+                && translation.wireRequestText == wireRequest
+        }
+        let completionIndex = events.firstIndex { event in
+            if case .itemCompleted(let itemId, _) = event { return itemId == "stream-item" }
+            return false
+        }
+
+        XCTAssertNotNil(admissionIndex, "the running reasoning row must receive RCW1 disclosure metadata")
+        XCTAssertNotNil(completionIndex)
+        if let admissionIndex, let completionIndex {
+            XCTAssertLessThan(admissionIndex, completionIndex, "the toggle must not wait for thread completion")
+        }
+
+        var timeline = AssistantTimelineState()
+        for event in coordinator.latestStreamEvents(threadId: thread.id) {
+            timeline.apply(event)
+        }
+        let persisted = try XCTUnwrap(timeline.tokenSaverTranslationsByItemId["stream-item"])
+        XCTAssertEqual(persisted.wireRequestText, wireRequest)
+        XCTAssertEqual(persisted.originalText, "",
+                       "the running row uses its current visible reasoning as the raw-response fallback")
+    }
+
     func test_normalFinalResponseDoesNotInvokeWireTranslator() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-ts-response-normal-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
