@@ -85,19 +85,126 @@ public final class AgentTranscriptPaintTick: ObservableObject {
 @MainActor
 public final class AgentTranscriptState: ObservableObject {
     @Published public var messages: [AgentMessage] = [] {
-        didSet { contentGeneration &+= 1 }
+        didSet {
+            if oldValue != messages { contentGeneration &+= 1 }
+        }
     }
     @Published public var timeline = AssistantTimelineState() {
-        didSet { contentGeneration &+= 1 }
+        didSet {
+            if !Self.hideSetRelevantTimelineEquals(oldValue, timeline) {
+                contentGeneration &+= 1
+            }
+        }
     }
     public let paintTick = AgentTranscriptPaintTick()
     public var timelineUpdateTick: Int {
         get { paintTick.timelineUpdateTick }
         set { paintTick.timelineUpdateTick = newValue }
     }
-    /// Bumped only when `messages` / `timeline` are assigned. Paint ticks
-    /// live on `paintTick` so they do not republish this object.
+    /// Bumped when messages change or hide-set-relevant timeline fields change
+    /// (assistant bodies / finals / work presence). Tool-body-only stream
+    /// assigns still publish `timeline` for paint, but must not rehash hide-set.
     public private(set) var contentGeneration: UInt64 = 0
+
+    /// Hide-set depends on persisted assistant text, live assistant item
+    /// bodies, finals, and whether a turn has any work item. Growing a tool
+    /// / reasoning body does not change those inputs — walking every
+    /// assistant body to rebuild `hiddenPersistedAssistantContentKey` on
+    /// each ~30 Hz tool delta is wasted.
+    #if DEBUG
+    /// How many historical turns took the item-walk path. Live stream apply
+    /// CoW-copies only the active turn's `items`; walking every prior
+    /// assistant body on each ~30 Hz tool delta is wasted.
+    nonisolated(unsafe) static var hideSetHistoricalTurnWalksForTesting: UInt64 = 0
+    #endif
+
+    nonisolated static func hideSetRelevantTimelineEquals(
+        _ lhs: AssistantTimelineState,
+        _ rhs: AssistantTimelineState
+    ) -> Bool {
+        let left = lhs.turns
+        let right = rhs.turns
+        guard left.count == right.count else { return false }
+        if left.isEmpty { return true }
+        let last = left.count - 1
+        // Live stream ticks mutate the last turn. Compare it fully, then
+        // skip historical item walks when `items` still share storage.
+        if !hideSetRelevantTurnEquals(left[last], right[last]) { return false }
+        for index in 0..<last {
+            if !hideSetRelevantHistoricalTurnEquals(left[index], right[index]) {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Historical turns are unchanged on a typical itemDelta (CoW shares
+    /// their `items`). Fall back to the full item walk when storage diverges
+    /// (budget eviction, a delta targeting an older item).
+    nonisolated static func hideSetRelevantHistoricalTurnEquals(
+        _ lhs: AssistantTurnSnapshot,
+        _ rhs: AssistantTurnSnapshot
+    ) -> Bool {
+        guard lhs.turnId == rhs.turnId,
+              lhs.finished == rhs.finished,
+              lhs.finalAssistantMessage == rhs.finalAssistantMessage else {
+            return false
+        }
+        if itemsShareStorage(lhs.items, rhs.items) { return true }
+        #if DEBUG
+        hideSetHistoricalTurnWalksForTesting &+= 1
+        #endif
+        return hideSetRelevantTurnEquals(lhs, rhs)
+    }
+
+    nonisolated static func itemsShareStorage(
+        _ lhs: [AssistantItem],
+        _ rhs: [AssistantItem]
+    ) -> Bool {
+        if lhs.isEmpty && rhs.isEmpty { return true }
+        guard lhs.count == rhs.count, !lhs.isEmpty else { return false }
+        return lhs.withUnsafeBufferPointer { leftBuf in
+            rhs.withUnsafeBufferPointer { rightBuf in
+                leftBuf.baseAddress == rightBuf.baseAddress
+            }
+        }
+    }
+
+    nonisolated static func hideSetRelevantTurnEquals(
+        _ lhs: AssistantTurnSnapshot,
+        _ rhs: AssistantTurnSnapshot
+    ) -> Bool {
+        guard lhs.turnId == rhs.turnId,
+              lhs.finished == rhs.finished,
+              lhs.finalAssistantMessage == rhs.finalAssistantMessage else {
+            return false
+        }
+        var leftIndex = 0
+        var rightIndex = 0
+        var leftHasWork = false
+        var rightHasWork = false
+        while leftIndex < lhs.items.count || rightIndex < rhs.items.count {
+            while leftIndex < lhs.items.count,
+                  lhs.items[leftIndex].type != .assistantMessage {
+                leftHasWork = true
+                leftIndex += 1
+            }
+            while rightIndex < rhs.items.count,
+                  rhs.items[rightIndex].type != .assistantMessage {
+                rightHasWork = true
+                rightIndex += 1
+            }
+            if leftIndex == lhs.items.count && rightIndex == rhs.items.count { break }
+            if leftIndex == lhs.items.count || rightIndex == rhs.items.count { return false }
+            if lhs.items[leftIndex].id != rhs.items[rightIndex].id
+                || lhs.items[leftIndex].body != rhs.items[rightIndex].body {
+                return false
+            }
+            leftIndex += 1
+            rightIndex += 1
+        }
+        return leftHasWork == rightHasWork
+    }
 }
 
 /// F1: scopes @ObservedObject observation to the composer subtree. A change to the
@@ -10928,7 +11035,8 @@ public struct AgentAppView: View {
         // R4-C: key on content fingerprint, not timelineUpdateTick. Paint
         // ticks republish transcriptState (~30 Hz) even when messages/timeline
         // are unchanged; contentGeneration skips the O(thread) hash+hide
-        // recompute on those passes. Streaming assigns still bump generation.
+        // recompute on those passes. Tool-body-only stream assigns also
+        // leave generation still so hide-set is not rehashed at token rate.
         let generation = vm.transcriptState.contentGeneration
         if hiddenPersistedAssistantMessageCache.generation == generation {
             return hiddenPersistedAssistantMessageCache.ids

@@ -364,6 +364,46 @@ final class AssistantTimelineTests: XCTestCase {
                       "canonical runtime events must keep the raw payload so unknown Codex/Claude fields are not lost")
     }
 
+    func test_tokenRateStreamObjectsSkipProviderRuntimeConstruction() {
+        // WHY: fromJSONObjectIfNeeded must refuse token-rate types before
+        // JSONSerialization.data(.sortedKeys). fromJSONObject stays available
+        // for tests/debug reconstruction of those same payloads.
+        XCTAssertNil(ProviderRuntimeEvent.fromJSONObjectIfNeeded(
+            ["type": "content_block_delta", "delta": ["type": "text_delta", "text": "Hi"]],
+            provider: .claude,
+            source: "claude.stream-json",
+            receivedAtMs: 1
+        ))
+        XCTAssertNil(ProviderRuntimeEvent.fromJSONObjectIfNeeded(
+            ["type": "item.delta", "item_id": "i1", "body_delta": "Hi"],
+            provider: .codex,
+            source: "codex.exec.json",
+            receivedAtMs: 1
+        ))
+        XCTAssertNil(ProviderRuntimeEvent.fromJSONObjectIfNeeded(
+            [
+                "type": "stream_event",
+                "event": ["type": "content_block_delta", "delta": ["type": "text_delta", "text": "Hi"]],
+            ],
+            provider: .claude,
+            source: "claude.agent-sdk",
+            receivedAtMs: 1
+        ))
+        let lifecycle = ProviderRuntimeEvent.fromJSONObjectIfNeeded(
+            ["type": "system", "subtype": "init"],
+            provider: .claude,
+            source: "claude.stream-json",
+            receivedAtMs: 1
+        )
+        XCTAssertEqual(lifecycle?.method, "system")
+        XCTAssertNotNil(ProviderRuntimeEvent.fromJSONObject(
+            ["type": "content_block_delta"],
+            provider: .claude,
+            source: "debug",
+            receivedAtMs: 1
+        ), "debug reconstruction of a skipped type must still work via fromJSONObject")
+    }
+
     func test_workActivitiesSummarizeToolRequestAndRuntimeProgress() {
         let runtime = ProviderRuntimeEvent(
             id: "runtime-1",

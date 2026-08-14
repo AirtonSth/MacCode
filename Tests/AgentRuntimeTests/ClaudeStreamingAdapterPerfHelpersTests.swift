@@ -83,8 +83,10 @@ final class ClaudeStreamingAdapterPerfHelpersTests: XCTestCase {
             ClaudeStreamingCLIAdapter.streamJSONDecodeCountForTesting, 1,
             "runtime + parser must share one JSONSerialization"
         )
-        XCTAssertEqual(interpreted.runtimeEvent?.method, "content_block_delta")
-        XCTAssertEqual(interpreted.runtimeEvent?.source, "claude.stream-json")
+        XCTAssertNil(
+            interpreted.runtimeEvent,
+            "token-rate deltas must not mint providerRuntime; itemDelta is the product event"
+        )
         XCTAssertTrue(
             interpreted.parsedEvents.contains { event in
                 if case .itemDelta(_, let body, _, _) = event { return body == "Hi" }

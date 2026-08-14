@@ -653,6 +653,48 @@ public struct ProviderRuntimeEvent: Codable, Sendable, Equatable, Identifiable {
         }
     }
 
+    /// Token-rate stream types already become `itemDelta`. Building
+    /// `providerRuntime` still `JSONSerialization.data(.sortedKeys)` the full
+    /// payload, persists a second stream row + provider log, and EventBus-
+    /// publishes `agent.provider_runtime.event` (~30 Hz). Grok CLI already
+    /// omits `thought`/`text`; Codex app-server omits `/delta`;
+    /// `codex exec --json` still used to emit `item.delta`.
+    public static func isHighFrequencyStreamingMethod(_ method: String) -> Bool {
+        switch method {
+        case "thought", "text",
+             "content_block_delta", "input_json_delta", "ping",
+             "item.delta":
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Skip token-rate lines (and SDK `stream_event` wrappers around them).
+    /// Lifecycle / tool / error objects still emit.
+    public static func shouldEmitFromDecodedStreamObject(_ obj: [String: Any]) -> Bool {
+        guard let method = obj["type"] as? String else { return true }
+        if isHighFrequencyStreamingMethod(method) { return false }
+        if method == "stream_event",
+           let inner = obj["event"] as? [String: Any],
+           let innerType = inner["type"] as? String {
+            return !isHighFrequencyStreamingMethod(innerType)
+        }
+        return true
+    }
+
+    /// Same as `fromJSONObject` but skips the sortedKeys serialize when the
+    /// line is already represented as `itemDelta`.
+    public static func fromJSONObjectIfNeeded(
+        _ obj: [String: Any],
+        provider: AgentProvider,
+        source: String,
+        receivedAtMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    ) -> ProviderRuntimeEvent? {
+        guard shouldEmitFromDecodedStreamObject(obj) else { return nil }
+        return fromJSONObject(obj, provider: provider, source: source, receivedAtMs: receivedAtMs)
+    }
+
     /// F12: dict-accepting variant so a caller that has already decoded the line
     /// (e.g. ClaudeStreamingCLIAdapter.handleLine) does not pay a second
     /// JSONSerialization decode of the same line just to build the runtime event.

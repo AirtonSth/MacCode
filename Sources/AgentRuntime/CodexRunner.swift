@@ -319,7 +319,7 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         let object = jsonObject(from: line)
         return (
             object.flatMap {
-                ProviderRuntimeEvent.fromJSONObject(
+                ProviderRuntimeEvent.fromJSONObjectIfNeeded(
                     $0, provider: .codex, source: "codex.exec.json", receivedAtMs: receivedAtMs
                 )
             },

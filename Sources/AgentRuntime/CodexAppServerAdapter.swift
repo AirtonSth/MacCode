@@ -1123,6 +1123,25 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
     }
 
+    /// Token-rate app-server methods already become `itemDelta` / `itemProgress`.
+    /// Prepending `providerRuntime` used to `JSONSerialization.data(.sortedKeys)`
+    /// the full payload, persist a second stream row + provider log, and EventBus-
+    /// persist `agent.provider_runtime.event` on the delivery queue (~30 Hz).
+    /// Grok ACP already omits runtime events on `agent_message_chunk`.
+    static func shouldEmitProviderRuntime(for method: String) -> Bool {
+        !isHighFrequencyStreamingMethod(method)
+    }
+
+    static func isHighFrequencyStreamingMethod(_ method: String) -> Bool {
+        if method.hasSuffix("/delta") || method.hasSuffix(".delta") { return true }
+        if method.contains("Delta") { return true }
+        if method.hasSuffix("/progress") || method.hasSuffix(".progress") { return true }
+        if method.contains("terminalInteraction") { return true }
+        if method.contains("summaryPartAdded") { return true }
+        if method.contains("patchUpdated") { return true }
+        return false
+    }
+
     private func handleNotification(method: String, params: Any?, threadId: AgentThreadID) {
         let payload = params as? [String: Any] ?? [:]
         let notificationProviderThreadId = string(payload, "threadId")
@@ -1135,7 +1154,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             // local session; that would corrupt its identity or leave it active.
             return
         }
-        var events: [AssistantEvent] = [runtimeEvent(method: method, payload: payload)]
+        var events: [AssistantEvent] = []
+        if Self.shouldEmitProviderRuntime(for: method) {
+            events.append(runtimeEvent(method: method, payload: payload))
+        }
         var finished: AgentRunEvent?
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         func appendCompletedTool(summary: String, output: String?) {

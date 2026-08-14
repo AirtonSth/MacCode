@@ -60,8 +60,13 @@ final class GrokRunnerArgsTests: XCTestCase {
     }
 
     /// Token-level NDJSON lines are already parsed into Thought/answer items.
-    /// Emitting them as providerRuntime floods Work log above the user message.
+    /// Emitting them as providerRuntime floods Work log above the user message
+    /// and used to JSONSerialization.data(.sortedKeys) before the drop.
     func test_streamTokenLinesDoNotBecomeProviderRuntimeEvents() {
+        // WHY: providerRuntimeEventIfNeeded used to fromJSONObject then drop
+        // thought/text. That still paid sortedKeys serialize + would persist
+        // and EventBus if the drop were ever reordered. fromJSONObjectIfNeeded
+        // refuses before serialize. itemDelta already carries the bytes.
         XCTAssertNil(GrokRunner.providerRuntimeEventIfNeeded(
             line: #"{"type":"thought","data":"The"}"#,
             source: "grok.streaming-json"
@@ -70,6 +75,9 @@ final class GrokRunnerArgsTests: XCTestCase {
             line: #"{"type":"text","data":"hi"}"#,
             source: "grok.streaming-json"
         ), "text tokens must not become Work log / runtime noise")
+        XCTAssertTrue(GrokRunner.isTokenStreamMethod("thought"))
+        XCTAssertTrue(GrokRunner.isTokenStreamMethod("text"))
+        XCTAssertFalse(GrokRunner.isTokenStreamMethod("end"))
         let end = GrokRunner.providerRuntimeEventIfNeeded(
             line: #"{"type":"end","stopReason":"EndTurn","sessionId":"s1"}"#,
             source: "grok.streaming-json"
