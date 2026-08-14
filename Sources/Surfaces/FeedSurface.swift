@@ -79,7 +79,22 @@ public final class FeedPanelViewModel: ObservableObject {
     private let now: () -> Date
     public init(now: @escaping () -> Date = Date.init) { self.now = now }
 
+    /// Token-rate / terminal-chunk kinds already live-only for EventLog and
+    /// prefiltered by Pet. Ingesting them here hops every EventBus publish
+    /// to MainActor, FormatStyle-s at 30 Hz, and evicts the 200-row cap.
+    /// Domain / lifecycle kinds still ingest. Matches the empty-state copy.
+    nonisolated public static func shouldIngest(kind: String) -> Bool {
+        switch kind {
+        case "agent.item.delta", "agent.item.progress",
+             "surface.output", "surface.output.summary":
+            return false
+        default:
+            return true
+        }
+    }
+
     public func receive(seq: Int64, kind: String, title: String, ts: Double) {
+        guard Self.shouldIngest(kind: kind) else { return }
         let item = Item(id: seq, kind: kind, title: title, ts: Date(timeIntervalSince1970: ts))
         if paused {
             pending.append(item)

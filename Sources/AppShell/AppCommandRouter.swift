@@ -6438,9 +6438,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     // replay retained backlog as if it were live activity.
                     let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { [weak feed] ev in
                         guard feed != nil else { return }
+                        // Drop stream firehose on the delivery thread (same kinds
+                        // as EventLog live-only / Pet prefilter) so each open Feed
+                        // does not hop ~30 Hz item.delta onto main.
+                        guard FeedPanelViewModel.shouldIngest(kind: ev.kind) else { return }
                         let kind = ev.kind
-                        let payload = JSONValue.object(ev.payload.objectValue ?? [:])
-                        let summary = Self.summary(of: payload)
+                        let summary = Self.summary(of: ev.payload)
                         DispatchQueue.main.async { [weak feed] in
                             feed?.viewModel.receive(seq: ev.seq, kind: kind, title: summary, ts: ev.ts)
                         }

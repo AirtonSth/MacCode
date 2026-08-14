@@ -69,6 +69,30 @@ final class FeedPanelViewModelClockTests: XCTestCase {
 
     // MARK: - T058: filter + clear reset
 
+    func test_shouldIngest_dropsStreamKindsAndKeepsDomainAndLifecycle() {
+        // WHY: Feed empty-state copy is domain events. Token-rate stream
+        // kinds already skip EventLog persist; ingesting them here is a
+        // 30 Hz main hop + FormatStyle + 200-cap eviction for empty titles.
+        XCTAssertFalse(FeedPanelViewModel.shouldIngest(kind: "agent.item.delta"))
+        XCTAssertFalse(FeedPanelViewModel.shouldIngest(kind: "agent.item.progress"))
+        XCTAssertFalse(FeedPanelViewModel.shouldIngest(kind: "surface.output"))
+        XCTAssertFalse(FeedPanelViewModel.shouldIngest(kind: "surface.output.summary"))
+        XCTAssertTrue(FeedPanelViewModel.shouldIngest(kind: "agent.item.started"))
+        XCTAssertTrue(FeedPanelViewModel.shouldIngest(kind: "agent.run.started"))
+        XCTAssertTrue(FeedPanelViewModel.shouldIngest(kind: "workspace.selected"))
+        XCTAssertTrue(FeedPanelViewModel.shouldIngest(kind: "notification.created"))
+    }
+
+    func test_receive_streamKindsDoNotEnterItems() {
+        let vm = FeedPanelViewModel()
+        vm.receive(seq: 1, kind: "agent.item.delta", title: "tok", ts: 0)
+        vm.receive(seq: 2, kind: "surface.output", title: "", ts: 1)
+        vm.receive(seq: 3, kind: "workspace.created", title: "ws", ts: 2)
+        XCTAssertEqual(vm.items.map(\.id), [3],
+                       "stream chunks must not occupy Feed rows or the 200-cap")
+        XCTAssertEqual(vm.items.first?.kind, "workspace.created")
+    }
+
     func test_filter_matchesKindAndTitle() {
         let vm = FeedPanelViewModel()
         vm.receive(seq: 1, kind: "agent.run", title: "started", ts: 0)
