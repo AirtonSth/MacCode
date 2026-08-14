@@ -274,8 +274,10 @@ public enum AgentThreadCapacityError: Error, Equatable, CustomStringConvertible,
 public final class AgentThreadRepository {
     /// Best-effort retention cap: keep each workspace's disposable empty shells
     /// bounded without deleting user-owned or operational state.
-    /// Hard product ceiling: at most 5 threads per workspace (storage pressure).
-    public static let maxThreadsPerWorkspace = 5
+    /// Hard product ceiling: last 20 threads per workspace. Rail list and cap
+    /// enforcement must stay one-shot (no per-thread SQLite) so 20 rows cannot
+    /// stall MainActor the way a correlated snapshot walk would.
+    public static let maxThreadsPerWorkspace = 20
     /// Each maintenance transaction processes at most this many historical
     /// terminal rows. This bounds work, not eligibility: recoverable rows are
     /// never candidates regardless of age or count.
@@ -385,8 +387,10 @@ public final class AgentThreadRepository {
     /// Keep this predicate shared by preflight, selection, and the guarded DELETE.
     private func workspaceThreadLimitEligibilityPredicate(candidateAlias: String) -> String {
         """
-        -- Everything except an active run is reclaimable under the hard 5-thread
-        -- ceiling (includes pending shells and completed history with messages).
+        -- Everything except an active run is reclaimable under the hard
+        -- 20-thread ceiling (includes pending shells and completed history
+        -- with messages). Persisted surface bindings are excluded by the
+        -- caller after one json_tree walk — do not correlate that walk here.
         AND \(candidateAlias).status NOT IN ('running')
         AND \(candidateAlias).pinned = 0
         AND NULLIF(TRIM(COALESCE(\(candidateAlias).worktree_path, '')), '') IS NULL
@@ -412,15 +416,26 @@ public final class AgentThreadRepository {
               AND (intent.source_thread_id = \(candidateAlias).id
                    OR intent.child_thread_id = \(candidateAlias).id)
         )
-        AND NOT EXISTS (
-            SELECT 1
+        """
+    }
+
+    /// UUID text atoms in the newest session snapshot. One walk per cap
+    /// transaction; callers union the result into the victim exclusion set.
+    private func persistedSurfaceBoundThreadIDs() throws -> Set<AgentThreadID> {
+        let statement = try db.prepare("""
+            SELECT DISTINCT value.atom
             FROM session_snapshots AS snapshot, json_tree(snapshot.payload_json) AS value
             WHERE snapshot.id = (SELECT MAX(id) FROM session_snapshots)
               AND json_valid(snapshot.payload_json) = 1
-              AND value.type = 'text'
-              AND value.atom = \(candidateAlias).id
-        )
-        """
+              AND value.type = 'text';
+        """)
+        var ids = Set<AgentThreadID>()
+        while try statement.step() {
+            if let raw = statement.columnText(0), let uuid = UUID(uuidString: raw) {
+                ids.insert(AgentThreadID(uuid))
+            }
+        }
+        return ids
     }
 
     private func workspaceThreadCapacityDiagnostics(
@@ -530,7 +545,9 @@ public final class AgentThreadRepository {
                 let requiredVictims = max(0, projectedCount - cap)
                 guard requiredVictims > 0 else { return }
 
-                var excludedIDs = excludedVictimIDs.union(liveBindings)
+                var excludedIDs = excludedVictimIDs
+                    .union(liveBindings)
+                    .union(try persistedSurfaceBoundThreadIDs())
                 if let prospectiveThreadId { excludedIDs.insert(prospectiveThreadId) }
                 let excludedRawIDs = excludedIDs.map { $0.value.uuidString }.sorted()
                 let exclusion = excludedRawIDs.isEmpty
@@ -615,7 +632,9 @@ public final class AgentThreadRepository {
             let victims = try workspaceThreadLimitVictims(
                 workspaceId: workspaceId,
                 limit: cap,
-                excluding: excludedThreadIDs.union(liveBindings)
+                excluding: excludedThreadIDs
+                    .union(liveBindings)
+                    .union(try persistedSurfaceBoundThreadIDs())
             )
             for id in victims {
                 guard try deleteWorkspaceThreadLimitVictimIfStillEligible(id) else {
@@ -645,9 +664,15 @@ public final class AgentThreadRepository {
         // threads float to the top. Pin is a visual/retention marker only —
         // it does not override recency. Manual sort_order is retained for
         // reorder APIs but no longer drives the visible rail.
+        // JOIN routing so a 20-thread rail is one statement, not 1+N.
+        let columns = """
+            t.id, t.project_id, t.workspace_id, t.title, t.provider, t.provider_instance_id, t.model, t.provider_thread_id, t.status, t.created_at, t.updated_at, t.diff_additions, t.diff_deletions, t.has_unread, t.color, t.pinned, t.sort_order, t.permission_mode, t.reasoning_effort, t.execution_mode, t.base_branch, t.worktree_path, t.service_tier, t.model_selection_json, t.interaction_mode, t.run_as_user_json, r.mode, r.configuration_json, r.revision
+            """
+        let from = "FROM agent_threads t LEFT JOIN agent_thread_routing r ON r.thread_id = t.id"
+        let order = "ORDER BY t.updated_at DESC, t.id DESC"
         let sql = workspaceId == nil
-            ? "SELECT id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json FROM agent_threads ORDER BY updated_at DESC, id DESC;"
-            : "SELECT id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json FROM agent_threads WHERE workspace_id = ? ORDER BY updated_at DESC, id DESC;"
+            ? "SELECT \(columns) \(from) \(order);"
+            : "SELECT \(columns) \(from) WHERE t.workspace_id = ? \(order);"
         let st = try db.prepare(sql)
         if let wid = workspaceId { try st.bind(1, wid.value.uuidString) }
         var out: [AgentThread] = []
@@ -659,6 +684,17 @@ public final class AgentThreadRepository {
             let model = st.columnText(6) ?? ""
             let reasoningEffort = AgentReasoningEffort(rawValue: st.columnText(18) ?? "") ?? .medium
             let serviceTier = AgentServiceTier(rawValue: st.columnText(22) ?? "") ?? .auto
+            let routingJSON = st.columnText(27)
+            let routing: AgentRoutingConfiguration?
+            if routingJSON != nil {
+                routing = try decodeRoutingConfiguration(
+                    json: routingJSON,
+                    storedMode: st.columnText(26),
+                    storedRevision: Int(st.columnInt64(28))
+                )
+            } else {
+                routing = nil
+            }
             out.append(AgentThread(
                 id: id,
                 projectId: pid,
@@ -686,7 +722,7 @@ public final class AgentThreadRepository {
                 modelSelection: decodeModelSelection(st.columnText(23), provider: provider, model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier),
                 interactionMode: AgentInteractionMode(rawValue: st.columnText(24) ?? "") ?? .default,
                 runAsUser: decodeRunAsUser(st.columnText(25)),
-                routingConfiguration: try loadRoutingConfiguration(threadId: id)
+                routingConfiguration: routing
             ))
         }
         return out

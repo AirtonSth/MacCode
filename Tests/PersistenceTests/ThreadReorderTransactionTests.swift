@@ -131,8 +131,8 @@ final class ThreadReorderTransactionTests: XCTestCase {
             "list must order by updated_at DESC so the most recent activity is first")
     }
 
-    /// WHY: each workspace keeps at most maxThreadsPerWorkspace (5) so scheduled
-    /// runs cannot grow SQLite without bound. Only empty terminal shells are
+    /// WHY: each workspace keeps at most maxThreadsPerWorkspace (20) so scheduled
+    /// runs cannot grow SQLite without bound. Oldest terminal history is
     /// eligible; among those, the oldest updated_at go first. Active runs never
     /// qualify.
     func test_enforceWorkspaceThreadLimit_prunesOldestBeyond100() throws {
@@ -531,6 +531,92 @@ final class ThreadReorderTransactionTests: XCTestCase {
             XCTAssertNotNil(try repo.get(id: child.id))
             XCTAssertNotNil(try repo.get(id: producer.id))
         }
+    }
+
+    /// WHY: the product rail must keep the last 20 threads per workspace so a
+    /// week of Agent App work survives relaunch. The 21st oldest completed
+    /// thread is the only reclaimable row.
+    func test_productWorkspaceCapKeepsLast20TerminalThreads() throws {
+        let db = try makeDB()
+        let repo = AgentThreadRepository(db: db)
+        let wid = try makeWorkspace(db: db)
+        XCTAssertEqual(AgentThreadRepository.maxThreadsPerWorkspace, 20,
+                       "product retention is last 20 threads per workspace")
+
+        var created: [AgentThread] = []
+        for index in 0...AgentThreadRepository.maxThreadsPerWorkspace {
+            var thread = AgentThread(workspaceId: wid, title: "t\(index)", provider: .codex, model: "m")
+            thread.status = .completed
+            thread.updatedAt = Date(timeIntervalSince1970: TimeInterval(index))
+            try repo.upsert(thread)
+            created.append(thread)
+        }
+
+        let pruned = try repo.enforceWorkspaceThreadLimit(workspaceId: wid)
+        XCTAssertEqual(pruned, [created[0].id],
+                       "only the oldest completed thread is over the product cap")
+        XCTAssertEqual(try repo.count(workspaceId: wid), 20)
+        let remaining = Set(try repo.list(workspaceId: wid).map(\.id))
+        XCTAssertFalse(remaining.contains(created[0].id))
+        XCTAssertTrue(remaining.contains(created[20].id),
+                      "the newest thread must survive the product cap")
+        XCTAssertEqual(remaining.count, 20)
+    }
+
+    /// WHY: raising the cap to 20 must not reintroduce a per-candidate
+    /// json_tree walk of the session snapshot. One walk protects the persisted
+    /// surface binding; an unbound older thread is still reclaimable.
+    func test_workspaceThreadLimitProtectsPersistedSnapshotBindingWithoutPerRowJsonTree() throws {
+        let db = try makeDB()
+        let repo = AgentThreadRepository(db: db)
+        let wid = try makeWorkspace(db: db)
+
+        var bound = AgentThread(workspaceId: wid, title: "snapshot bound", provider: .codex, model: "m")
+        bound.status = .completed
+        bound.updatedAt = Date(timeIntervalSince1970: 1)
+        var older = AgentThread(workspaceId: wid, title: "older unbound", provider: .codex, model: "m")
+        older.status = .completed
+        older.updatedAt = Date(timeIntervalSince1970: 2)
+        var newer = AgentThread(workspaceId: wid, title: "newer unbound", provider: .codex, model: "m")
+        newer.status = .completed
+        newer.updatedAt = Date(timeIntervalSince1970: 3)
+        for thread in [bound, older, newer] {
+            try repo.upsert(thread)
+        }
+
+        let padding = String(repeating: "x", count: 64 * 1024)
+        let payload = """
+        {"selected_thread":"\(bound.id.value.uuidString)","padding":"\(padding)"}
+        """
+        try db.execute("""
+            INSERT INTO session_snapshots(version, payload_json, created_at)
+            VALUES(1, '\(payload)', '2026-01-01T00:00:00Z');
+        """)
+
+        var sawStandaloneJsonTree = false
+        var sawCorrelatedJsonTree = false
+        db.beforeStatementStepForTesting = { sql in
+            guard sql.contains("json_tree") else { return }
+            if sql.contains("value.atom =") || sql.contains("value.atom=") {
+                sawCorrelatedJsonTree = true
+            } else {
+                sawStandaloneJsonTree = true
+            }
+        }
+        defer { db.beforeStatementStepForTesting = nil }
+
+        let created = AgentThread(workspaceId: wid, title: "new thread", provider: .codex, model: "m")
+        let pruned = try repo.upsertEnforcingWorkspaceThreadLimit(created, limit: 3)
+
+        XCTAssertEqual(pruned, [older.id],
+                       "oldest unbound history is reclaimed; the snapshot-bound thread is not")
+        XCTAssertNotNil(try repo.get(id: bound.id),
+                        "a thread id stored only in the latest session snapshot must survive")
+        XCTAssertNil(try repo.get(id: older.id))
+        XCTAssertTrue(sawStandaloneJsonTree,
+                      "cap enforcement still reads persisted surface bindings from the snapshot")
+        XCTAssertFalse(sawCorrelatedJsonTree,
+                       "a per-candidate json_tree walk would hitch create/reload at 20 threads")
     }
 
     // MARK: - promoteToFront: final positions after transaction wrap

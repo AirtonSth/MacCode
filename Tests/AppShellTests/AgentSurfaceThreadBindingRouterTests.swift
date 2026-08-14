@@ -284,11 +284,12 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         firstSurface.viewModel.reloadThreads()
         secondSurface.viewModel.reloadThreads()
 
+        let firstSelection = survivors[survivors.count - 1].id
         let secondSelection = survivors[1].id
-        firstSurface.viewModel.selectThread(victim.id)
-        firstSurface.viewModel.prompt = "first surface victim draft"
+        // Cap victims cannot be a live surface selection. Bind each tab to a
+        // survivor and only cache the oldest row so it stays reclaimable.
+        firstSurface.viewModel.selectThread(firstSelection)
         firstSurface.viewModel.seedAdditionalThreadCachesForTesting(victim.id)
-        secondSurface.viewModel.selectThread(victim.id)
         secondSurface.viewModel.seedAdditionalThreadCachesForTesting(victim.id)
         secondSurface.viewModel.selectThread(secondSelection)
         ctx.coordinator.seedAutoContinuationStateForTesting(victim.id)
@@ -302,7 +303,7 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
                        "precondition: the first surface projects the future victim run")
         XCTAssertTrue(ctx.coordinator.autoContinuationThreadIdsForTesting.contains(victim.id),
                       "precondition: the shared coordinator caches the future victim")
-        XCTAssertEqual(firstSurface.viewModel.selectedThreadId, victim.id)
+        XCTAssertEqual(firstSurface.viewModel.selectedThreadId, firstSelection)
         XCTAssertEqual(secondSurface.viewModel.selectedThreadId, secondSelection)
 
         var createdEvents: [EventBus.Event] = []
@@ -344,9 +345,8 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         XCTAssertEqual(firstSurface.viewModel.activeThreadCount, 0,
                        "synchronous deletion must remove the victim run projection")
         XCTAssertFalse(ctx.coordinator.autoContinuationThreadIdsForTesting.contains(victim.id))
-        XCTAssertNil(firstSurface.viewModel.selectedThreadId)
-        XCTAssertEqual(firstSurface.viewModel.prompt, "first surface victim draft",
-                       "synchronous selected-victim recovery must preserve the unsent draft")
+        XCTAssertEqual(firstSurface.viewModel.selectedThreadId, firstSelection,
+                       "quiet creation must not yank the first open Agent App tab")
 
         for _ in 0..<100 where firstSurface.viewModel.threadCacheResidueForTesting.contains(victim.id)
             || secondSurface.viewModel.threadCacheResidueForTesting.contains(victim.id)
@@ -369,7 +369,7 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         XCTAssertEqual(try ctx.threadRepo.count(workspaceId: workspace.id),
                        AgentThreadRepository.maxThreadsPerWorkspace)
         XCTAssertNil(try ctx.threadRepo.get(id: victim.id),
-                     "the router must pre-prune the oldest completed victim at 101 rows")
+                     "the router must pre-prune the oldest unbound completed victim")
         XCTAssertNotNil(try ctx.threadRepo.get(id: created.id))
         XCTAssertFalse(firstSurface.viewModel.threadCacheResidueForTesting.contains(victim.id),
                        "the first EventBus-subscribed surface must evict the pre-pruned victim")
@@ -379,10 +379,8 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
                        "the shared coordinator must forget the pre-pruned victim before the failed rail reload")
         XCTAssertFalse(firstSurface.viewModel.threads.contains(where: { $0.id == victim.id }),
                        "the authoritative delete event must remove the stale rail row before list failure")
-        XCTAssertNil(firstSurface.viewModel.selectedThreadId,
-                     "a selected externally pruned victim must recover even when list fails")
-        XCTAssertEqual(firstSurface.viewModel.prompt, "first surface victim draft",
-                       "external-prune recovery must preserve the selected unsent draft")
+        XCTAssertEqual(firstSurface.viewModel.selectedThreadId, firstSelection,
+                       "quiet creation must not yank the first open Agent App tab after list failure")
         XCTAssertEqual(secondSurface.viewModel.selectedThreadId, secondSelection,
                        "quiet creation must not yank the second open Agent App tab")
         XCTAssertTrue(firstSurface.viewModel.statusMessage.contains("Could not reload threads"))
@@ -399,10 +397,13 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         XCTAssertTrue(secondSurface.viewModel.threadCacheResidueForTesting.contains(uiVictim.id))
         createdEvents.removeAll()
         deletedEvents.removeAll()
+        firstSurface.viewModel.dismissStatusMessage()
         secondSurface.viewModel.dismissStatusMessage()
-        secondSurface.viewModel.setReloadThreadListForTesting {
+        let localReloadFailure: () throws -> [AgentThread] = {
             throw NSError(domain: "AgentSurfaceThreadBindingRouterTests.localReload", code: 3)
         }
+        firstSurface.viewModel.setReloadThreadListForTesting(localReloadFailure)
+        secondSurface.viewModel.setReloadThreadListForTesting(localReloadFailure)
 
         firstSurface.viewModel.createThread(title: "local UI create")
 
@@ -410,6 +411,7 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             || !secondSurface.viewModel.statusMessage.contains("Could not reload threads") {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
+        firstSurface.viewModel.setReloadThreadListForTesting(nil)
         secondSurface.viewModel.setReloadThreadListForTesting(nil)
 
         XCTAssertEqual(deletedEvents.count, 1,
@@ -1335,8 +1337,10 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         }
         producer.viewModel.reloadThreads()
         receiver.viewModel.reloadThreads()
-        receiver.viewModel.selectThread(victim.id)
-        receiver.viewModel.prompt = "preserve reload victim draft"
+        let receiverSelection = try XCTUnwrap(
+            receiver.viewModel.threads.first(where: { $0.id != victim.id })?.id
+        )
+        receiver.viewModel.selectThread(receiverSelection)
         receiver.viewModel.seedAdditionalThreadCachesForTesting(victim.id)
         receiver.viewModel.seedRunThreadProjectionForTesting(victim.id)
         ctx.coordinator.seedAutoContinuationStateForTesting(victim.id)
@@ -1350,9 +1354,11 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         )
         overflow.updatedAt = Date(timeIntervalSince1970: 10_000)
         try ctx.threadRepo.upsert(overflow)
-        receiver.viewModel.setReloadThreadListForTesting {
+        let reloadFailure: () throws -> [AgentThread] = {
             throw NSError(domain: "AgentSurfaceThreadBindingRouterTests.reloadCapFanout", code: 1)
         }
+        producer.viewModel.setReloadThreadListForTesting(reloadFailure)
+        receiver.viewModel.setReloadThreadListForTesting(reloadFailure)
         var deletedEvents: [EventBus.Event] = []
         let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
             guard event.kind == "agent.thread.deleted" else { return }
@@ -1366,6 +1372,7 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             || !receiver.viewModel.statusMessage.contains("Could not reload threads") {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
+        producer.viewModel.setReloadThreadListForTesting(nil)
         receiver.viewModel.setReloadThreadListForTesting(nil)
 
         XCTAssertEqual(try ctx.threadRepo.count(workspaceId: workspace.id),
@@ -1378,8 +1385,8 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         XCTAssertFalse(receiver.viewModel.threadCacheResidueForTesting.contains(victim.id),
                        "the sibling surface must apply the authoritative victim before its list fails")
         XCTAssertFalse(ctx.coordinator.autoContinuationThreadIdsForTesting.contains(victim.id))
-        XCTAssertNil(receiver.viewModel.selectedThreadId)
-        XCTAssertEqual(receiver.viewModel.prompt, "preserve reload victim draft")
+        XCTAssertEqual(receiver.viewModel.selectedThreadId, receiverSelection,
+                       "reload-time prune must not yank the sibling tab off its live selection")
         XCTAssertTrue(receiver.viewModel.statusMessage.contains("Could not reload threads"))
     }
 

@@ -177,4 +177,45 @@ final class AgentRoutingPersistenceTests: XCTestCase {
                            .modeConflict(column: .manual, configuration: .auto))
         }
     }
+
+    /// WHY: rail reload lists every retained thread. A per-row routing SELECT
+    /// would multiply with the 20-thread workspace cap and hitch the list path.
+    func test_listJoinsRoutingInsteadOfPerThreadSelect() throws {
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repo = AgentThreadRepository(db: db)
+        var expected: [AgentThreadID: Int] = [:]
+        for index in 0..<AgentThreadRepository.maxThreadsPerWorkspace {
+            let routing = AgentRoutingConfiguration(
+                mode: .manual,
+                manualSelection: AgentModelSelection(provider: .codex, modelId: "gpt-5.6-sol"),
+                revision: index + 1
+            )
+            let thread = AgentThread(
+                title: "rail-\(index)",
+                provider: .codex,
+                model: "gpt-5.6-sol",
+                routingConfiguration: routing
+            )
+            try repo.upsert(thread)
+            expected[thread.id] = routing.revision
+        }
+
+        var standaloneRoutingSelects = 0
+        db.beforeStatementStepForTesting = { sql in
+            if sql.contains("FROM agent_thread_routing") && !sql.contains("LEFT JOIN") {
+                standaloneRoutingSelects += 1
+            }
+        }
+        defer { db.beforeStatementStepForTesting = nil }
+
+        let listed = try repo.list()
+        XCTAssertEqual(listed.count, AgentThreadRepository.maxThreadsPerWorkspace)
+        for thread in listed {
+            XCTAssertEqual(thread.routingConfiguration?.revision, expected[thread.id],
+                           "list must return the persisted routing revision without a follow-up get()")
+        }
+        XCTAssertEqual(standaloneRoutingSelects, 0,
+                       "list must JOIN routing; a per-thread SELECT would stall a 20-row rail")
+    }
 }

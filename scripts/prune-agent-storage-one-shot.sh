@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-shot prune of RemoteCode SQLite to match product retention:
-#   - hard max 5 threads per workspace (oldest terminal history first;
+#   - hard max 20 threads per workspace (oldest terminal history first;
 #     never running/pending/pinned/draft/worktree)
 #   - last 100 agent_messages per thread
 #   - last 100 stream events / provider logs per run or thread
@@ -10,7 +10,7 @@
 set -euo pipefail
 
 DB="${1:-$HOME/Library/Application Support/RemoteCode/remotecode.sqlite}"
-MAX_THREADS=5
+MAX_THREADS=20
 MAX_MSGS=100
 MAX_EVENTS=100
 
