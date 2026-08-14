@@ -3638,6 +3638,23 @@ public final class AgentRunRepository: @unchecked Sendable {
         }
     }
 
+    /// Whether `persistStreamBatch` should run per-thread window retention.
+    /// Token-rate flushes pass `shouldPruneStreamEvents: false`; a single
+    /// oversize frame still reclaims immediately so older history drops first.
+    nonisolated public static func streamBatchNeedsRetentionReclaim(
+        shouldPruneStreamEvents: Bool,
+        itemPayloadBytes: [Int],
+        providerPayloadBytes: [Int],
+        streamEventBytesPerThread: Int64,
+        providerLogBytesPerThread: Int64
+    ) -> Bool {
+        if shouldPruneStreamEvents { return true }
+        if itemPayloadBytes.contains(where: { Int64($0) > streamEventBytesPerThread }) {
+            return true
+        }
+        return providerPayloadBytes.contains(where: { Int64($0) > providerLogBytesPerThread })
+    }
+
     public struct TerminalCommitResult: Sendable {
         public let assistantMessageId: AgentMessageID?
         public let insertedAssistantMessage: Bool
@@ -3752,9 +3769,19 @@ public final class AgentRunRepository: @unchecked Sendable {
         retentionPolicy policy: AgentEventRetentionPolicy = .production
     ) throws {
         guard !items.isEmpty || shouldPruneStreamEvents else { return }
-        // Always reclaim after any write so a large new frame never fails closed
-        // with an "omitted" banner — older history is dropped first.
-        let shouldReclaim = !items.isEmpty || shouldPruneStreamEvents
+        // Inserts never fail-closed (store-before-loss). The coordinator already
+        // asks for prune every `streamEventPruneInterval` events. Running the
+        // JOIN + ROW_NUMBER + running-SUM DELETE on every 16-event / 250ms flush
+        // rescanned up to 8 MiB of blobs while the thread was still under cap.
+        // Reclaim on the caller's cadence, or immediately when a single frame
+        // already exceeds the per-thread byte budget.
+        let shouldReclaim = Self.streamBatchNeedsRetentionReclaim(
+            shouldPruneStreamEvents: shouldPruneStreamEvents,
+            itemPayloadBytes: items.map(\.payloadJSON.utf8.count),
+            providerPayloadBytes: items.compactMap { $0.providerEvent?.payloadJSON.utf8.count },
+            streamEventBytesPerThread: policy.streamEventBytesPerThread,
+            providerLogBytesPerThread: policy.providerLogBytesPerThread
+        )
         try db.performSync { db in
             try db.transaction {
                 for item in items {
@@ -3918,6 +3945,14 @@ public final class AgentRunRepository: @unchecked Sendable {
         maxPayloadBytes: Int64
     ) throws -> Bool {
         guard limit > 0, maxPayloadBytes > 0 else { return false }
+        if try providerRetentionIsUnderBudget(
+            db: db,
+            threadId: threadId,
+            limit: limit,
+            maxPayloadBytes: maxPayloadBytes
+        ) {
+            return false
+        }
         let st = try db.prepare("""
             WITH ranked AS (
                 SELECT id,
@@ -4059,6 +4094,14 @@ public final class AgentRunRepository: @unchecked Sendable {
         maxPayloadBytes: Int64
     ) throws -> Bool {
         guard limit > 0, maxPayloadBytes > 0 else { return false }
+        if try streamRetentionIsUnderBudget(
+            db: db,
+            threadId: threadId,
+            limit: limit,
+            maxPayloadBytes: maxPayloadBytes
+        ) {
+            return false
+        }
         let st = try db.prepare("""
             WITH ranked AS (
                 SELECT e.id,
@@ -4086,6 +4129,56 @@ public final class AgentRunRepository: @unchecked Sendable {
         try st.bind(3, maxPayloadBytes)
         _ = try st.step()
         return try changedRowCount(db) > 0
+    }
+
+    /// COUNT first; SUM payloads only while still under the row cap so a
+    /// long stream at the 100-row ceiling does not rescan 8 MiB just to
+    /// decide it must window-DELETE.
+    private func streamRetentionIsUnderBudget(
+        db: SQLiteDB,
+        threadId: AgentThreadID,
+        limit: Int,
+        maxPayloadBytes: Int64
+    ) throws -> Bool {
+        let countSt = try db.prepare("""
+            SELECT COUNT(*)
+            FROM agent_stream_events e
+            JOIN agent_runs r ON r.id = e.run_id
+            WHERE r.thread_id = ?;
+        """)
+        try countSt.bind(1, threadId.value.uuidString)
+        let count = try countSt.step() ? countSt.columnInt64(0) : 0
+        guard count <= Int64(limit) else { return false }
+        let bytesSt = try db.prepare("""
+            SELECT COALESCE(SUM(LENGTH(CAST(e.payload_json AS BLOB))), 0)
+            FROM agent_stream_events e
+            JOIN agent_runs r ON r.id = e.run_id
+            WHERE r.thread_id = ?;
+        """)
+        try bytesSt.bind(1, threadId.value.uuidString)
+        let bytes = try bytesSt.step() ? bytesSt.columnInt64(0) : 0
+        return bytes <= maxPayloadBytes
+    }
+
+    private func providerRetentionIsUnderBudget(
+        db: SQLiteDB,
+        threadId: AgentThreadID,
+        limit: Int,
+        maxPayloadBytes: Int64
+    ) throws -> Bool {
+        let countSt = try db.prepare("""
+            SELECT COUNT(*) FROM agent_provider_event_logs WHERE thread_id = ?;
+        """)
+        try countSt.bind(1, threadId.value.uuidString)
+        let count = try countSt.step() ? countSt.columnInt64(0) : 0
+        guard count <= Int64(limit) else { return false }
+        let bytesSt = try db.prepare("""
+            SELECT COALESCE(SUM(LENGTH(CAST(payload_json AS BLOB))), 0)
+            FROM agent_provider_event_logs WHERE thread_id = ?;
+        """)
+        try bytesSt.bind(1, threadId.value.uuidString)
+        let bytes = try bytesSt.step() ? bytesSt.columnInt64(0) : 0
+        return bytes <= maxPayloadBytes
     }
 
     private func changedRowCount(_ db: SQLiteDB) throws -> Int {

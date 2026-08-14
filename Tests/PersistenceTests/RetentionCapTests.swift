@@ -611,4 +611,168 @@ final class RetentionCapTests: XCTestCase {
         let retained = try repo.readWindow(surfaceID: dormantB, maxBytes: 1_024).chunks.map(\.chunkIndex)
         XCTAssertEqual(retained, retained.sorted(), "surviving dormant chunks must retain FIFO order")
     }
+
+    // MARK: - persistStreamBatch prune cadence
+
+    func test_streamBatchNeedsRetentionReclaim_honorsCadenceAndOversizedFrame() {
+        // WHY: token-rate flushes (~16 events / 250ms) must not pay JOIN+window
+        // DELETE. The coordinator already sets shouldPrune every 25 events; a
+        // single frame over the thread byte cap still reclaims immediately.
+        XCTAssertFalse(
+            AgentRunRepository.streamBatchNeedsRetentionReclaim(
+                shouldPruneStreamEvents: false,
+                itemPayloadBytes: [32, 64, 128],
+                providerPayloadBytes: [16],
+                streamEventBytesPerThread: 8 * 1_024 * 1_024,
+                providerLogBytesPerThread: 8 * 1_024 * 1_024
+            ),
+            "small token-rate batch with prune=false must skip window retention"
+        )
+        XCTAssertTrue(
+            AgentRunRepository.streamBatchNeedsRetentionReclaim(
+                shouldPruneStreamEvents: true,
+                itemPayloadBytes: [32],
+                providerPayloadBytes: [],
+                streamEventBytesPerThread: 8 * 1_024 * 1_024,
+                providerLogBytesPerThread: 8 * 1_024 * 1_024
+            ),
+            "coordinator prune cadence must still reclaim"
+        )
+        XCTAssertTrue(
+            AgentRunRepository.streamBatchNeedsRetentionReclaim(
+                shouldPruneStreamEvents: false,
+                itemPayloadBytes: [8 * 1_024 * 1_024 + 1],
+                providerPayloadBytes: [],
+                streamEventBytesPerThread: 8 * 1_024 * 1_024,
+                providerLogBytesPerThread: 8 * 1_024 * 1_024
+            ),
+            "a frame larger than the thread byte cap must reclaim immediately"
+        )
+    }
+
+    func test_persistStreamBatch_skipsWindowDeleteWhenCadenceSaysNo() throws {
+        // WHY: the hot stream write path used to run ROW_NUMBER/running-SUM
+        // DELETE after every flush even with shouldPruneStreamEvents=false.
+        let db = try makeDB()
+        let runs = AgentRunRepository(db: db)
+        let thread = try makeThread(db: db)
+        let run = try makeRun(db: db, threadId: thread.id)
+        let items = (1...8).map { index in
+            AgentRunRepository.StreamWriteIntent(
+                seq: index,
+                kind: "delta",
+                payloadJSON: #"{"n":\#(index)}"#,
+                providerEvent: nil
+            )
+        }
+
+        var sawWindowDelete = false
+        db.beforeStatementStepForTesting = { sql in
+            let upper = sql.uppercased()
+            if upper.contains("ROW_NUMBER()") { sawWindowDelete = true }
+        }
+        defer { db.beforeStatementStepForTesting = nil }
+
+        try runs.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: items,
+            shouldPruneStreamEvents: false
+        )
+
+        XCTAssertFalse(sawWindowDelete,
+                       "token-rate persist with prune=false must not run window retention SQL")
+        XCTAssertEqual(try runs.countStreamEvents(threadId: thread.id), 8,
+                       "skipping prune must still persist every flushed event")
+    }
+
+    func test_persistStreamBatch_prunesWhenCadenceDue() throws {
+        // WHY: honoring the cadence must not disable the cap — 20 events with
+        // keepLatest=5 must still drop the oldest 15 when prune is requested.
+        let db = try makeDB()
+        let runs = AgentRunRepository(db: db)
+        let thread = try makeThread(db: db)
+        let run = try makeRun(db: db, threadId: thread.id)
+        let items = (1...20).map { index in
+            AgentRunRepository.StreamWriteIntent(
+                seq: index,
+                kind: "delta",
+                payloadJSON: #"{"n":\#(index)}"#,
+                providerEvent: nil
+            )
+        }
+        let policy = AgentEventRetentionPolicy(
+            streamEventCountPerThread: 5,
+            streamEventBytesPerThread: 8 * 1_024 * 1_024,
+            providerLogCountPerThread: 5,
+            providerLogBytesPerThread: 8 * 1_024 * 1_024
+        )
+
+        try runs.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: items,
+            shouldPruneStreamEvents: true,
+            retentionPolicy: policy
+        )
+
+        XCTAssertEqual(try runs.countStreamEvents(threadId: thread.id), 5,
+                       "prune-due batch must still enforce the per-thread count cap")
+        XCTAssertTrue(try runs.streamHistoryWasPruned(threadId: thread.id),
+                      "count-cap eviction must mark the thread history partial")
+    }
+
+    func test_pruneStreamEvents_underCapSkipsWindowDelete() throws {
+        // WHY: explicit prune (appendStreamEvent / pruneDue) must COUNT first
+        // and skip JOIN+window DELETE while both caps still have headroom.
+        let db = try makeDB()
+        let runs = AgentRunRepository(db: db)
+        let thread = try makeThread(db: db)
+        let run = try makeRun(db: db, threadId: thread.id)
+        for index in 1...4 {
+            try runs.appendStreamEvent(
+                runId: run.id,
+                seq: index,
+                kind: "delta",
+                payloadJSON: #"{"n":\#(index)}"#
+            )
+        }
+
+        var sawWindowDelete = false
+        db.beforeStatementStepForTesting = { sql in
+            if sql.uppercased().contains("ROW_NUMBER()") { sawWindowDelete = true }
+        }
+        defer { db.beforeStatementStepForTesting = nil }
+
+        try runs.pruneStreamEvents(threadId: thread.id, keepLatest: 100, maxPayloadBytes: 8 * 1_024 * 1_024)
+
+        XCTAssertFalse(sawWindowDelete,
+                       "under-cap prune must not run ROW_NUMBER window DELETE")
+        XCTAssertEqual(try runs.countStreamEvents(threadId: thread.id), 4,
+                       "under-cap prune must leave every row in place")
+    }
+
+    func test_pruneProviderEventLogs_underCapSkipsWindowDelete() throws {
+        // WHY: same COUNT-then-skip as stream events — belowCapIsNoop already
+        // checks rows survive; this pins that the expensive SQL is not issued.
+        let db = try makeDB()
+        let runs = AgentRunRepository(db: db)
+        let thread = try makeThread(db: db)
+        let run = try makeRun(db: db, threadId: thread.id)
+        for index in 0..<4 {
+            try appendEvent(runs: runs, run: run, index: index)
+        }
+
+        var sawWindowDelete = false
+        db.beforeStatementStepForTesting = { sql in
+            if sql.uppercased().contains("ROW_NUMBER()") { sawWindowDelete = true }
+        }
+        defer { db.beforeStatementStepForTesting = nil }
+
+        try runs.pruneProviderEventLogs(threadId: thread.id, keepLatest: 100)
+
+        XCTAssertFalse(sawWindowDelete,
+                       "under-cap provider prune must not run ROW_NUMBER window DELETE")
+        XCTAssertEqual(try runs.countProviderEventLogs(threadId: thread.id), 4)
+    }
 }
