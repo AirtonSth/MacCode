@@ -679,6 +679,12 @@ public final class AppContext {
     )?
     /// Test seam: SettingsStore loads performed for the Graphify usage gate.
     var graphifyUsageSettingsLoadCountForTesting = 0
+    /// Thread provider labels for Graphify usage rows. itemDelta used to
+    /// SQLite-get the thread on every chunk when Graphify was admitted.
+    private var graphifyProviderByThread: [AgentThreadID: String] = [:]
+    private static let graphifyProviderByThreadLimit = 128
+    /// Test seam: threadRepo.get calls for Graphify provider labels.
+    var graphifyProviderLookupCountForTesting = 0
 
     public init(
         channel: ReleaseChannel = .debug,
@@ -4624,6 +4630,19 @@ public final class AppContext {
         return admitted
     }
 
+    /// Provider label for Graphify usage rows. Thread identity is stable for a
+    /// run; itemDelta must not SQLite-get the thread on every stream chunk.
+    func graphifyProviderLabel(for threadId: AgentThreadID) -> String {
+        if let cached = graphifyProviderByThread[threadId] { return cached }
+        graphifyProviderLookupCountForTesting += 1
+        let label = (try? threadRepo.get(id: threadId))?.provider.rawValue ?? "unknown"
+        if graphifyProviderByThread.count >= Self.graphifyProviderByThreadLimit {
+            graphifyProviderByThread.removeAll(keepingCapacity: true)
+        }
+        graphifyProviderByThread[threadId] = label
+        return label
+    }
+
     /// Record Graphify CLI uses (and exploration samples) from assistant tool events.
     /// Fail-open: never blocks the event funnel. Writes on backgroundWriterQueue.
     /// Counts only succeed after a non-failed tool result (`ok=1`).
@@ -4640,7 +4659,6 @@ public final class AppContext {
         }
         guard isGraphifyUsageRecordingAdmitted() else { return }
 
-        let provider = (try? threadRepo.get(id: threadId))?.provider.rawValue ?? "unknown"
         let runKey = runId.value.uuidString
         let createdAtMs = item.startedAtMs > 0
             ? item.startedAtMs
@@ -4651,7 +4669,7 @@ public final class AppContext {
         graphifyItemBuffersLock.lock()
         var buf = graphifyItemBuffers[bufferKey] ?? GraphifyItemBuffer(
             summary: item.summary,
-            provider: provider,
+            provider: graphifyProviderLabel(for: threadId),
             createdAtMs: createdAtMs
         )
         if let s = item.summary, !s.isEmpty { buf.summary = s }
@@ -4686,11 +4704,36 @@ public final class AppContext {
         guard isGraphifyUsageRecordingAdmitted() else { return }
         guard bodyAppend != nil || outputAppend != nil || summary != nil else { return }
 
-        let provider = (try? threadRepo.get(id: threadId))?.provider.rawValue ?? "unknown"
         let runKey = runId.value.uuidString
         let bufferKey = "\(runKey)|\(itemId)"
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
 
+        graphifyItemBuffersLock.lock()
+        if var existing = graphifyItemBuffers[bufferKey] {
+            if let s = summary, !s.isEmpty { existing.summary = s }
+            if let b = bodyAppend { existing.body += b }
+            if let o = outputAppend {
+                let resultPhase = (summary == "result") || (existing.summary == "result")
+                if resultPhase {
+                    existing.output += o
+                } else {
+                    existing.body += o
+                }
+            }
+            graphifyItemBuffers[bufferKey] = existing
+            graphifyItemBuffersLock.unlock()
+            processGraphifyBuffer(
+                bufferKey: bufferKey,
+                itemId: itemId,
+                runKey: runKey,
+                finalizeOutput: finalize
+            )
+            return
+        }
+        graphifyItemBuffersLock.unlock()
+
+        // First chunk for this item: need a provider label once per thread.
+        let provider = graphifyProviderLabel(for: threadId)
         graphifyItemBuffersLock.lock()
         var buf = graphifyItemBuffers[bufferKey] ?? GraphifyItemBuffer(
             summary: summary,

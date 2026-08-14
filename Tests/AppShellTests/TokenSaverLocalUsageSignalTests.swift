@@ -216,6 +216,52 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         )
     }
 
+    /// WHY: when Graphify is admitted, itemDelta used to threadRepo.get on
+    /// every chunk (~30 Hz). Provider is stable per thread; first chunk
+    /// fills the cache, later chunks must not hit SQLite.
+    func test_graphifyProviderLabel_cachedAcrossItemDeltas() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2GraphifyProviderCache-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true, graphifyEnabled: true))
+        context.graphifyProviderLookupCountForTesting = 0
+        let threadId = AgentThreadID()
+        let runId = AgentRunID()
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "tool-1",
+            bodyAppend: "graphify",
+            outputAppend: nil,
+            summary: nil,
+            threadId: threadId,
+            runId: runId
+        )
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "tool-1",
+            bodyAppend: " query",
+            outputAppend: nil,
+            summary: nil,
+            threadId: threadId,
+            runId: runId
+        )
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "tool-2",
+            bodyAppend: "graphify path",
+            outputAppend: nil,
+            summary: nil,
+            threadId: threadId,
+            runId: runId
+        )
+
+        XCTAssertEqual(
+            context.graphifyProviderLookupCountForTesting,
+            1,
+            "thread provider must be SQLite-loaded once per thread, not per itemDelta"
+        )
+        XCTAssertEqual(context.graphifyProviderLabel(for: threadId), "unknown")
+    }
+
     private func makeViewModel() throws -> (AppContext, SidebarViewModel, URL) {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2TokenSaverLocalSignal-\(UUID().uuidString)", isDirectory: true)
