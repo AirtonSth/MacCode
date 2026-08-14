@@ -74,6 +74,14 @@ public final class AgentComposerState: ObservableObject {
 /// Stream/transcript paint state on its OWN ObservableObject so token/tool storms
 /// re-render the conversation column without republishing chrome, rail, or composer
 /// fields on the parent `AgentAppViewModel`.
+/// Coalesced scroll/collapse pulse (~30 Hz). Kept off `AgentTranscriptState`
+/// so tick publishes do not rebuild the conversation column — content already
+/// published when `messages` / `timeline` were assigned.
+@MainActor
+public final class AgentTranscriptPaintTick: ObservableObject {
+    @Published public var timelineUpdateTick: Int = 0
+}
+
 @MainActor
 public final class AgentTranscriptState: ObservableObject {
     @Published public var messages: [AgentMessage] = [] {
@@ -82,10 +90,13 @@ public final class AgentTranscriptState: ObservableObject {
     @Published public var timeline = AssistantTimelineState() {
         didSet { contentGeneration &+= 1 }
     }
-    @Published public var timelineUpdateTick: Int = 0
+    public let paintTick = AgentTranscriptPaintTick()
+    public var timelineUpdateTick: Int {
+        get { paintTick.timelineUpdateTick }
+        set { paintTick.timelineUpdateTick = newValue }
+    }
     /// Bumped only when `messages` / `timeline` are assigned. Paint ticks
-    /// republish this object (~30 Hz) without new content; hide-set memos
-    /// key off this so they skip the O(thread) body hash on tick-only passes.
+    /// live on `paintTick` so they do not republish this object.
     public private(set) var contentGeneration: UInt64 = 0
 }
 
@@ -106,6 +117,22 @@ private struct TranscriptReactiveScope<Content: View>: View {
     @ObservedObject var transcriptState: AgentTranscriptState
     @ViewBuilder var content: () -> Content
     var body: some View { content() }
+}
+
+/// Observes only the coalesced paint tick so scroll/collapse can run at ~30 Hz
+/// without `TranscriptReactiveScope` rebuilding the transcript.
+private struct TranscriptPaintTickScope: View {
+    @ObservedObject var paintTick: AgentTranscriptPaintTick
+    let onTick: () -> Void
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+            .onChange(of: paintTick.timelineUpdateTick) { _ in
+                onTick()
+            }
+    }
 }
 
 /// Thread mutations performed by the macOS UI itself (create/rename/pin/color/
@@ -11777,20 +11804,23 @@ public struct AgentAppView: View {
                 }
             }
             .onAppear { rejoinTimelineBottom(proxy) }
+            .overlay(alignment: .topLeading) {
+                // Tick lives on a sibling ObservableObject. Observing it here
+                // (not on TranscriptReactiveScope) keeps scroll/collapse at
+                // ~30 Hz without rebuilding the transcript for unchanged content.
+                TranscriptPaintTickScope(paintTick: vm.transcriptState.paintTick) {
+                    collapseAllCompletedWorkOnFinalIfNeeded()
+                    // One coalesced schedule. A second async pass raced TimelineScrollFollower
+                    // post-layout snaps and multipass-jumped the viewport during streams.
+                    // Follower handleContentGrowth re-snaps after Lazy materialize.
+                    scheduleTimelineScrollToBottom(proxy, force: false)
+                }
+            }
             .onChange(of: vm.focusTick) { _ in
                 // focusTick bumps on outgoing user send — collapse before the
                 // new turn paints so pending follow-ups do not keep prior expands.
                 collapseTranscriptForNewTurn()
                 rejoinTimelineBottom(proxy)
-            }
-            // Prefer coalesced paint tick over raw message/turn counts so every
-            // token delta does not schedule redundant scroll work.
-            .onChange(of: vm.timelineUpdateTick) { _ in
-                collapseAllCompletedWorkOnFinalIfNeeded()
-                // One coalesced schedule. A second async pass raced TimelineScrollFollower
-                // post-layout snaps and multipass-jumped the viewport during streams.
-                // Follower handleContentGrowth re-snaps after Lazy materialize.
-                scheduleTimelineScrollToBottom(proxy, force: false)
             }
             .onChange(of: workDisclosureLayoutEpoch) { _ in
                 // Height change while following live output: re-assert bottom.

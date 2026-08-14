@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 import CoreModel
 @testable import Surfaces
 
@@ -100,5 +101,35 @@ final class AgentTranscriptStateGenerationTests: XCTestCase {
         timeline.turns.append(AssistantTurnSnapshot(turnId: "t1", finished: false))
         state.timeline = timeline
         XCTAssertEqual(state.contentGeneration, start + 2)
+    }
+
+    func test_paintTick_doesNotPublishTranscriptState() {
+        // WHY: TranscriptReactiveScope observes AgentTranscriptState. If the
+        // ~30 Hz scroll tick stayed @Published on that object, the whole
+        // conversation column rebuilt after every flush even when content
+        // had already been published via `timeline =`.
+        let state = AgentTranscriptState()
+        var transcriptPublishes = 0
+        var tickPublishes = 0
+        let transcriptBag = state.objectWillChange.sink { transcriptPublishes += 1 }
+        let tickBag = state.paintTick.objectWillChange.sink { tickPublishes += 1 }
+
+        state.timelineUpdateTick &+= 1
+        XCTAssertEqual(transcriptPublishes, 0, "paint ticks must not invalidate TranscriptReactiveScope")
+        XCTAssertEqual(tickPublishes, 1, "scroll/collapse still needs a tick publish")
+
+        state.messages = [
+            AgentMessage(
+                id: AgentMessageID(),
+                threadId: AgentThreadID(),
+                role: .user,
+                content: "hi",
+                createdAt: Date(timeIntervalSince1970: 1)
+            )
+        ]
+        XCTAssertEqual(transcriptPublishes, 1, "content assigns must still rebuild the conversation column")
+
+        _ = transcriptBag
+        _ = tickBag
     }
 }
