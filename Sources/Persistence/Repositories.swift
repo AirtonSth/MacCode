@@ -7605,14 +7605,9 @@ public final class TerminalOutputRepository {
             try st.bind(4, data)
             try st.bind(5, Int64(data.count))
             try st.bind(6, iso.string(from: Date()))
+            // A successful INSERT step already admitted one row. SELECT
+            // changes() was a second statement on every PTY persist.
             _ = try st.step()
-
-            let changes = try database.prepare("SELECT changes();")
-            guard try changes.step(), changes.columnInt64(0) == 1 else {
-                throw SQLiteError.execute(
-                    "Terminal history append did not insert exactly one row for surface \(surfaceID) chunk \(chunkIndex)."
-                )
-            }
         }
     }
 
@@ -7811,14 +7806,9 @@ public final class TerminalOutputRepository {
                 try st.bind(4, data)
                 try st.bind(5, Int64(data.count))
                 try st.bind(6, iso.string(from: Date()))
+                // A successful INSERT step already admitted one row. SELECT
+                // changes() was a second statement on every reserved persist.
                 _ = try st.step()
-
-                let changes = try database.prepare("SELECT changes();")
-                guard try changes.step(), changes.columnInt64(0) == 1 else {
-                    throw SQLiteError.execute(
-                        "Terminal history append did not insert exactly one row for surface \(surfaceID) chunk \(chunkIndex)."
-                    )
-                }
                 try Self.deleteSetting(
                     key: Self.dirtyHistoryKey(surfaceID: surfaceID),
                     database: database

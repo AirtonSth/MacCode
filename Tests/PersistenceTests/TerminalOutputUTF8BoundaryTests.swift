@@ -65,4 +65,26 @@ final class TerminalOutputUTF8BoundaryTests: XCTestCase {
             "terminal history must concatenate raw bytes before UTF-8 decoding so arbitrary persistence boundaries cannot corrupt restored output"
         )
     }
+
+    func test_append_insertsEachChunkWithoutChangesProbe() throws {
+        // WHY: append used to SELECT changes() after every successful INSERT
+        // (~50 Hz PTY persist). step() already fails on UNIQUE/constraint;
+        // the extra statement did not change admission.
+        let directory = NSTemporaryDirectory() + "RC2TerminalNoChanges-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: directory).run()
+        let repo = TerminalOutputRepository(db: db)
+        let surfaceID = "terminal-no-changes"
+        for index in 1...4 {
+            try repo.append(
+                surfaceID: surfaceID,
+                workspaceID: nil,
+                chunkIndex: Int64(index),
+                data: Data("chunk-\(index)\n".utf8)
+            )
+        }
+        let window = try repo.readWindow(surfaceID: surfaceID)
+        XCTAssertEqual(window.chunks.count, 4)
+        XCTAssertEqual(window.text, "chunk-1\nchunk-2\nchunk-3\nchunk-4\n")
+    }
 }
