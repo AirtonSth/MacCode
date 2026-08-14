@@ -183,12 +183,13 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
             // Token lines (thought/text) become Thought/answer items via GrokParser.
             // Do not also emit providerRuntime for them — that floods Work log with
             // "grok runtime: thought" rows above the user message on every token.
-            if let runtimeEvent = Self.providerRuntimeEventIfNeeded(line: line, source: "grok.streaming-json") {
+            let interpreted = Self.interpretStreamJSONLine(line, parser: parser)
+            if let runtimeEvent = interpreted.runtimeEvent {
                 let ev = AssistantEvent.providerRuntime(runtimeEvent)
                 timeline.apply(ev)
                 onEvent(.event(ev))
             }
-            for ev in parser.parseLine(line) {
+            for ev in interpreted.parsedEvents {
                 timeline.apply(ev)
                 onEvent(.event(ev))
             }
@@ -280,6 +281,36 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
         ProviderStderrClassifier.displayableStderr(raw, provider: .grok)
     }
 
+#if DEBUG
+    static var streamJSONDecodeCountForTesting = 0
+#endif
+
+    static func jsonObject(from line: String) -> [String: Any]? {
+#if DEBUG
+        streamJSONDecodeCountForTesting += 1
+#endif
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    /// Decode once, then runtime (non-token) + parser events.
+    static func interpretStreamJSONLine(
+        _ line: String,
+        parser: GrokParser,
+        receivedAtMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    ) -> (runtimeEvent: ProviderRuntimeEvent?, parsedEvents: [AssistantEvent]) {
+        let object = jsonObject(from: line)
+        return (
+            object.flatMap {
+                providerRuntimeEventIfNeeded(
+                    object: $0, source: "grok.streaming-json", receivedAtMs: receivedAtMs
+                )
+            },
+            object.map { parser.parseObject($0, now: receivedAtMs) } ?? []
+        )
+    }
+
     /// Lifecycle / tool / error lines become `providerRuntime` for debug + Work log.
     /// Pure token stream types are excluded — they already map to timeline items.
     public static func providerRuntimeEventIfNeeded(
@@ -287,8 +318,17 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
         source: String,
         receivedAtMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
     ) -> ProviderRuntimeEvent? {
-        guard let event = ProviderRuntimeEvent.fromJSONLine(
-            line, provider: .grok, source: source, receivedAtMs: receivedAtMs
+        guard let object = jsonObject(from: line) else { return nil }
+        return providerRuntimeEventIfNeeded(object: object, source: source, receivedAtMs: receivedAtMs)
+    }
+
+    public static func providerRuntimeEventIfNeeded(
+        object: [String: Any],
+        source: String,
+        receivedAtMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    ) -> ProviderRuntimeEvent? {
+        guard let event = ProviderRuntimeEvent.fromJSONObject(
+            object, provider: .grok, source: source, receivedAtMs: receivedAtMs
         ) else { return nil }
         if Self.isTokenStreamMethod(event.method) { return nil }
         return event

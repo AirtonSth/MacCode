@@ -185,4 +185,35 @@ final class GrokRunnerArgsTests: XCTestCase {
                       "unavailable guidance must name the official Grok install path")
         XCTAssertTrue(msg.contains("grok"))
     }
+
+    func test_interpretStreamJSONLine_decodesJSONOnce() {
+        // WHY: emitLine used to JSONSerialization via fromJSONLine and again
+        // in GrokParser.parseLine on every thought/text token.
+        let parser = GrokParser()
+        GrokRunner.streamJSONDecodeCountForTesting = 0
+        let line = #"{"type":"text","data":"Hi"}"#
+        let interpreted = GrokRunner.interpretStreamJSONLine(line, parser: parser, receivedAtMs: 1)
+        XCTAssertEqual(
+            GrokRunner.streamJSONDecodeCountForTesting, 1,
+            "runtime filter + parser must share one JSONSerialization"
+        )
+        XCTAssertNil(interpreted.runtimeEvent, "pure text tokens must not flood Work log")
+        XCTAssertTrue(
+            interpreted.parsedEvents.contains { event in
+                if case .itemDelta(_, let body, _, _) = event { return body == "Hi" }
+                return false
+            },
+            "decode-once must still surface the text token: \(interpreted.parsedEvents)"
+        )
+
+        GrokRunner.streamJSONDecodeCountForTesting = 0
+        let tool = GrokRunner.interpretStreamJSONLine(
+            #"{"type":"tool_call","toolCallId":"t1"}"#,
+            parser: GrokParser(),
+            receivedAtMs: 1
+        )
+        XCTAssertEqual(GrokRunner.streamJSONDecodeCountForTesting, 1)
+        XCTAssertEqual(tool.runtimeEvent?.method, "tool_call")
+        XCTAssertEqual(tool.runtimeEvent?.source, "grok.streaming-json")
+    }
 }

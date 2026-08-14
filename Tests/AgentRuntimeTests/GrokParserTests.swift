@@ -42,6 +42,27 @@ final class GrokParserTests: XCTestCase {
         XCTAssertEqual(parser.capturedSessionId, "sess-abc-123")
     }
 
+    func test_parseObject_matchesParseLineForTextToken() throws {
+        // WHY: GrokRunner now feeds the already-decoded dict. parseObject must
+        // keep the same itemDelta as parseLine or answer tokens vanish.
+        let line = #"{"type":"text","data":"Hello"}"#
+        let viaLine = GrokParser()
+        let viaObject = GrokParser()
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+        )
+        let lineText = viaLine.parseLine(line).compactMap { ev -> String? in
+            if case .itemDelta(_, let body, _, _) = ev { return body }
+            return nil
+        }
+        let objectText = viaObject.parseObject(object, now: 1).compactMap { ev -> String? in
+            if case .itemDelta(_, let body, _, _) = ev { return body }
+            return nil
+        }
+        XCTAssertEqual(lineText, objectText)
+        XCTAssertEqual(lineText, ["Hello"])
+    }
+
     func test_emptyAndNonJSONLinesAreIgnored() {
         let parser = GrokParser()
         XCTAssertTrue(parser.parseLine("").isEmpty)
