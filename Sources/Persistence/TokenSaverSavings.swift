@@ -222,7 +222,7 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
 
     /// Record one savings event. The column names are historical; sidecar
     /// command-output rows store original/distilled character lengths, while
-    /// SR1 humanization rows store the explicit mode-specific accounting.
+    /// model-rendering rows store the explicit mode-specific accounting.
     /// saved = max(input-output, 0).
     /// Returns the saved tokens persisted. Old event rows beyond the window are
     /// pruned in the same transaction, but the permanent total is not pruned.
@@ -261,7 +261,7 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
 
     /// Record one savings event with an explicit saved value. This is used for
     /// sidecar modes whose accounting is not simply `input - output` in the
-    /// stored units, such as SR1 humanization.
+    /// stored units, such as local model rendering.
     @discardableResult
     public func record(
         provider: String,

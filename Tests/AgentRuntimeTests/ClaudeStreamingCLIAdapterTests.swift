@@ -1785,7 +1785,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
     }
 
     // The SDK bridge has no developer_instructions channel like Codex, so the Token Saver
-    // distill rules (pipe `| distill` + speak distill language) must ride in the SDK
+    // Token Saver rules (eligible `| distill` output plus optional RCW1 ABI) ride in the SDK
     // `systemPrompt`. The host sends it as `system_prompt` on rc_configure; the bridge relays
     // it into the query options. Locks both ends of that wiring.
     func test_agentSDKBridgeSourceWiresTokenSaverSystemPrompt() throws {
@@ -1797,7 +1797,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         let source = try String(contentsOf: bridge, encoding: .utf8)
 
         XCTAssertTrue(source.contains("systemPrompt: current.systemPrompt"),
-                      "SDK query options must pass the host-provided distill system prompt so Claude pipes `| distill` and speaks distill language")
+                      "SDK query options must pass the host-provided Token Saver system prompt")
         XCTAssertTrue(source.contains("systemPrompt: command.system_prompt || undefined"),
                       "rc_configure must relay the host `system_prompt` into session state (undefined keeps the SDK default empty prompt when Token Saver is off)")
     }

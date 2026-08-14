@@ -106,54 +106,54 @@ enum TokenSaverActionCostHarness {
         Case(
             name: "failing-swift-test",
             input: """
-            Test Suite 'SR1ResponseDetectorTests' started at 2026-07-24 09:14:02.113
-            Test Case '-[AgentRuntimeTests.SR1ResponseDetectorTests test_isSR1_shortText_returnsFalse]' passed (0.001 seconds).
-            Test Case '-[AgentRuntimeTests.SR1ResponseDetectorTests test_isSR1_specR0Example_returnsFalse]' started.
-            /Users/dev/app/Tests/AgentRuntimeTests/SR1ResponseDetectorTests.swift:131: error: \
-            -[AgentRuntimeTests.SR1ResponseDetectorTests test_isSR1_specR0Example_returnsFalse] : \
-            XCTAssertFalse failed - the spec's own R0 reply must not be treated as a compressed payload
-            Test Case '-[AgentRuntimeTests.SR1ResponseDetectorTests test_isSR1_specR0Example_returnsFalse]' failed (0.002 seconds).
+            Test Suite 'RCWireProtocolTests' started at 2026-08-14 00:58:28.133
+            Test Case '-[CoreModelTests.RCWireProtocolTests test_plainTextNeverMatchesWirePrefix]' passed (0.001 seconds).
+            Test Case '-[CoreModelTests.RCWireProtocolTests test_splitSentinelNeedsMoreBytes]' started.
+            /Users/dev/app/Tests/CoreModelTests/RCWireProtocolTests.swift:131: error: \
+            -[CoreModelTests.RCWireProtocolTests test_splitSentinelNeedsMoreBytes] : \
+            XCTAssertEqual failed - a partial wire sentinel must remain buffered
+            Test Case '-[CoreModelTests.RCWireProtocolTests test_splitSentinelNeedsMoreBytes]' failed (0.002 seconds).
             Executed 42 tests, with 1 failure (0 unexpected) in 0.412 (0.418) seconds
             """,
             question: "Did tests pass? Return PASS or FAIL, then the failing test names and their file:line.",
             nextAction: "Open the failing test at its exact file:line and read the assertion.",
             requiredForNextAction: [
-                "SR1ResponseDetectorTests.swift:131",
-                "test_isSR1_specR0Example_returnsFalse"
+                "RCWireProtocolTests.swift:131",
+                "test_splitSentinelNeedsMoreBytes"
             ]
         ),
         Case(
             name: "swift-build-error",
             input: """
-            [1/4] Compiling AgentRuntime SR1ResponseDetector.swift
-            /Users/dev/app/Sources/AgentRuntime/SR1ResponseDetector.swift:27:16: error: \
-            cannot find 'DistillSemanticPrefixes' in scope
-                          semanticPrefixes.contains(first) else {
-                          ^~~~~~~~~~~~~~~~
-            /Users/dev/app/Sources/AgentRuntime/SR1ResponseDetector.swift:20:41: note: \
+            [1/4] Compiling CoreModel RCWireProtocol.swift
+            /Users/dev/app/Sources/CoreModel/RCWireProtocol.swift:27:16: error: \
+            cannot find 'LiteralPreservation' in scope
+                          LiteralPreservation.extract(from: input)
+                          ^~~~~~~~~~~~~~~~~~~
+            /Users/dev/app/Sources/CoreModel/RCWireProtocol.swift:20:41: note: \
             add 'import CoreModel' to reference this type
             error: fatalError
             """,
             question: "Did the build succeed? If not, return each error as file:line plus the message.",
             nextAction: "Edit that exact file at that line to add the missing import.",
             requiredForNextAction: [
-                "SR1ResponseDetector.swift:27",
-                "cannot find 'DistillSemanticPrefixes' in scope"
+                "RCWireProtocol.swift:27",
+                "cannot find 'LiteralPreservation' in scope"
             ]
         ),
         Case(
             name: "git-status-before-commit",
             input: """
-             M Sources/AgentRuntime/SR1ResponseDetector.swift
+             M Sources/AgentRuntime/AgentRunCoordinator.swift
              M Sources/DistillCore/DistillCore.swift
-            ?? Sources/CoreModel/DistillSemanticPrefixes.swift
-            ?? Tests/AgentRuntimeTests/DistillSemanticPrefixParityTests.swift
+            ?? Sources/CoreModel/RCWireProtocol.swift
+            ?? Tests/CoreModelTests/RCWireProtocolTests.swift
             """,
             question: "Which files changed, and which are untracked? One per line.",
             nextAction: "Stage exactly the untracked new files by path.",
             requiredForNextAction: [
-                "Sources/CoreModel/DistillSemanticPrefixes.swift",
-                "Tests/AgentRuntimeTests/DistillSemanticPrefixParityTests.swift"
+                "Sources/CoreModel/RCWireProtocol.swift",
+                "Tests/CoreModelTests/RCWireProtocolTests.swift"
             ]
         ),
         Case(

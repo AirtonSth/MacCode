@@ -2750,6 +2750,23 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         """
     }
 
+    /// Preserves the Auto controller contract inside a typed RCW1 request.
+    /// The semantic encoder only sees the human-authored prompt; Swift appends
+    /// this exact host-owned constraint after provider admission.
+    public static func autoOrchestrateProviderWirePrompt(
+        wirePrompt: String,
+        admittedRoute route: AgentOrchestrationRoute
+    ) throws -> String {
+        let host = orchestrateHostKey(for: route.provider)
+        let control = """
+        Run $\(orchestrateSkillInvocationName) controller-only. Auto is on. Follow the complete installed orchestration skill. Host runtime receipt is authoritative: active_host=\(host); provider=\(route.provider.rawValue); provider_instance_id=\(route.providerInstanceId); controller_model=\(route.selection.effectiveModel); controller_effort=\(route.selection.reasoningEffort.rawValue). Bind workers and reviewers only from the host-runtime-matrix row for active_host=\(host). Treat the G, C, K, and X records in this frame as the user request. Distill applies only to eligible ordinary tool output when Token Saver is active, never to skill content.
+        """
+        return try RCWireProtocol.addingRequestRecords(
+            [RCWireRecord(kind: .constraint, value: control)],
+            to: wirePrompt
+        )
+    }
+
     public static func promptAlreadyInvokesOrchestrateSkill(_ prompt: String) -> Bool {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let first = trimmed.first, first == "$" || first == "/" else { return false }

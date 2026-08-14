@@ -2668,6 +2668,11 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
             ("rollover_capsule", "off", "owner_and_scorecard_required", "unavailable", "Provider Compatibility Owner", 0, true),
             ("session_learn", "off", "owner_and_scorecard_required", "unavailable", "Security Owner", 0, true),
             ("semantic_prose", "off", "owner_and_scorecard_required", "unavailable", "Model Supply-Chain Owner", 0, true),
+            // Recovery retention is not runtime promotion. RCW1 still passes
+            // per-turn codec/readiness/net-savings gates; these rows only allow
+            // exact originals to be stored before either local transform.
+            ("wire-encode", "off", "native_wire_v1_recovery", "unavailable", "Operations Owner", 7, false),
+            ("wire-render-english", "off", "native_wire_v1_recovery", "unavailable", "Operations Owner", 7, false),
             ("adaptive_effort", "off", "owner_and_scorecard_required", "unavailable", "Product Owner", 0, true),
             ("visual_artifact", "off", "owner_and_scorecard_required", "unavailable", "Model Supply-Chain Owner", 0, true),
         ]

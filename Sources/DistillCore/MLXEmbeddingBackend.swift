@@ -12,7 +12,7 @@ import Tokenizers
 /// Wraps `MLXEmbedders` (vendored via mlx-swift-lm) to run an actual encoder on
 /// Apple Silicon — no deterministic stand-in. Produces L2-normalized sentence
 /// embeddings used by the cosine / near-dup / query-rerank / cross-turn lanes
-/// and by embedding-prototype zero-shot classification (intent, subtype, SR1).
+/// and by embedding-prototype zero-shot classification (intent and subtype).
 ///
 /// The model is downloaded once from Hugging Face (pinned commit SHA in the
 /// manifest) and cached on disk; weights load lazily on first use. Everything is

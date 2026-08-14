@@ -15,7 +15,10 @@ final class DistillSavingsCacheStateTests: XCTestCase {
         XCTAssertEqual(record(for: .commandOutput)?.cacheState, "tool_output_oneshot")
         XCTAssertEqual(record(for: .longText)?.cacheState, "prompt")
         XCTAssertEqual(record(for: .watchSummary)?.cacheState, "watch")
-        XCTAssertEqual(record(for: .sr1Humanize)?.cacheState, "sr1_humanize")
+        XCTAssertEqual(record(for: .wireEncode)?.cacheState, "wire_encode")
+        XCTAssertNil(record(for: .wireRenderEnglish),
+                     "local display rendering must not create a provider-savings row")
+        XCTAssertEqual(record(for: .naturalLanguage)?.cacheState, "natural_language")
     }
 
     func test_defaultCacheStateIsUnknown() {

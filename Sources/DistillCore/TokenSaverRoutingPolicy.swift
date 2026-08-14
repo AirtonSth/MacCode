@@ -17,7 +17,9 @@ public enum TokenSaverLane: String, Codable, Sendable, Equatable, CaseIterable {
     case commandOutput
     case longText
     case watchSummary
-    case sr1Humanize
+    case wireEncode
+    case wireRenderEnglish
+    case naturalLanguage
     case followUpPrompt
     case toolOutputHook
 }
@@ -74,10 +76,22 @@ public enum TokenSaverRoutingPolicy {
             justification: "watch summaries are extractive change selection with literal preservation"
         ),
         TokenSaverLaneInventory(
-            lane: .sr1Humanize,
-            currentMLXMode: .sr1Humanize,
+            lane: .wireEncode,
+            currentMLXMode: .wireEncode,
             disposition: .genuinelyAbstractive,
-            justification: "SR1 humanization is translation/rewriting, not pure extraction"
+            justification: "wire encoding is semantic rewriting into a constrained transport frame"
+        ),
+        TokenSaverLaneInventory(
+            lane: .wireRenderEnglish,
+            currentMLXMode: .wireRenderEnglish,
+            disposition: .genuinelyAbstractive,
+            justification: "wire rendering is translation from a constrained transport frame"
+        ),
+        TokenSaverLaneInventory(
+            lane: .naturalLanguage,
+            currentMLXMode: .naturalLanguage,
+            disposition: .genuinelyAbstractive,
+            justification: "short user-facing summaries are abstractive natural-language generation"
         ),
         TokenSaverLaneInventory(
             lane: .followUpPrompt,
@@ -95,7 +109,7 @@ public enum TokenSaverRoutingPolicy {
 
     public static func stages(for lane: TokenSaverLane) -> [TokenSaverRouteStage] {
         switch lane {
-        case .sr1Humanize:
+        case .wireEncode, .wireRenderEnglish, .naturalLanguage:
             return orderedStages
         case .commandOutput, .longText, .watchSummary, .followUpPrompt, .toolOutputHook:
             return [.deterministic, .encoderBERT]
@@ -104,7 +118,7 @@ public enum TokenSaverRoutingPolicy {
 
     public static func fallbackAfterEncoderFailure(for lane: TokenSaverLane) -> TokenSaverRouteStage {
         switch lane {
-        case .sr1Humanize:
+        case .wireEncode, .wireRenderEnglish, .naturalLanguage:
             return .deterministic
         case .commandOutput, .longText, .watchSummary, .followUpPrompt, .toolOutputHook:
             return .verbatim
@@ -117,6 +131,7 @@ public enum TokenSaverRoutingPolicy {
               !justification.isEmpty else {
             return false
         }
-        return lane == .sr1Humanize || justification.localizedCaseInsensitiveContains("abstractive")
+        return lane == .wireEncode || lane == .wireRenderEnglish || lane == .naturalLanguage
+            || justification.localizedCaseInsensitiveContains("abstractive")
     }
 }

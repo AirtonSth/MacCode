@@ -9,7 +9,7 @@ import Foundation
 /// agent depends on.
 public enum LiteralPreservation {
     // PERF: compile once. `pinnedLiterals` runs on every lossy adoption gate
-    // (semantic prose, prose pruning, SR1, faithfulness stacks). Rebuilding
+    // (semantic prose, prose pruning, wire encoding, faithfulness stacks). Rebuilding
     // 13 NSRegularExpressions per scan dominated multi-KB pin checks.
     private static let regexes: [NSRegularExpression] = [
         #"[\w./~-]+\.[A-Za-z0-9]+:\d+"#,                                  // file.ext:line (also covers JS `at fn (a.js:1:2)`)

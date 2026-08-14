@@ -814,12 +814,10 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             hintInstructions.contains("| distill"),
             "Token Saver on: Codex developer_instructions must instruct `| distill`"
         )
-        // Parity with Claude's per-session systemPrompt: full distill LANGUAGE spec per turn.
-        // "Registers:" is the register/prefix legend from the full distill body; a bare
-        // "| distill" pipe rule never carries it, so this proves the full spec is injected.
+        // The tool-output hint must stay separate from the conversation wire ABI.
         XCTAssertTrue(
-            hintInstructions.contains("R0 micro") && hintInstructions.contains("R1 work"),
-            "Codex developer_instructions must carry the full distill language spec, not only the pipe rule"
+            !hintInstructions.contains("RCW1"),
+            "the output-distill hint alone must not teach the conversation wire protocol"
         )
         XCTAssertEqual(
             hintInstructions.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,

@@ -30,7 +30,7 @@ public enum NLIGatePolicy {
         return aggressive
     }
 
-    /// I8.7: OOD eval on the distill DSL (S/C/D/R/O/N/P outputs). Go only if the gate's
+    /// I8.7: OOD eval on compressed semantic outputs. Go only if the gate's
     /// discrimination AUC clears the bar on the OOD set; else no-go (stay deterministic).
     public static func oodEvalGoNoGo(auc: Double, minimumAUC: Double = 0.85) -> Bool {
         auc.isFinite && auc >= minimumAUC

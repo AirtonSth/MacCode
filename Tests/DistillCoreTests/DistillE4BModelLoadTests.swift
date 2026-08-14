@@ -29,7 +29,7 @@ final class DistillE4BModelLoadTests: XCTestCase {
         let input = """
         RemoteCode Token Saver compresses long agent output locally on macOS.
         It must preserve exact commands, errors, file paths, and pass criteria.
-        The local distill model rewrites verbose prose into compact /distill form.
+        The local model rewrites verbose prose into concise plain language.
         """
         let response = try await scheduler.submit(DistillRequest(
             mode: .longText, priority: .interactive, input: input, maxOutputCharacters: 600

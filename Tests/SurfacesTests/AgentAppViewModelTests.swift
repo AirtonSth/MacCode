@@ -3029,50 +3029,17 @@ final class AgentAppViewModelTests: XCTestCase {
 
     func test_turnViewKeepsAssistantPartialVisibleWhenPersistedAnswerContainsIt() {
         let persisted = """
-        Dict: S=state C=context D=action R=risk O=outcome N=no-go P=proof
-        S wrapper not git repo.
-        C memory confirms wrapper workspace; git lives nested.
-        D locate nested repos, then stage/commit/push each dirty repo.
+        The wrapper is not a Git repository.
+        Memory confirms the wrapper workspace; Git lives in nested folders.
+        Locate nested repositories, then stage, commit, and push each dirty repository.
         """
 
         XCTAssertTrue(AgentAppView.shouldRenderAssistantItemBody(
             """
-            Dict: S=state C=context D=action R=risk O=outcome N=no-go P=proof
-            S wrapper not git repo.
+            The wrapper is not a Git repository.
             """,
             persistedAssistantTexts: [persisted]
         ), "live partial updates must stay visible even when an older persisted answer contains the same prefix")
-    }
-
-    func test_turnViewHidesSR1ItemWhenHumanizedAnswerIsPersisted() {
-        let sr1 = """
-        SR1
-        S: tests green
-        C: user asked in Portuguese
-        O: saved counter updated
-        """
-        let humanized = "Os testes passaram, e o contador de tokens salvos foi atualizado."
-
-        XCTAssertFalse(AgentAppView.shouldRenderAssistantItemBody(
-            sr1,
-            persistedAssistantTexts: [humanized]
-        ), "once the SR1 final answer has been humanized and persisted, the raw compressed item must not render as a second assistant response")
-    }
-
-    func test_turnViewHidesSpaceDelimitedSR1ItemWhenHumanizedAnswerIsPersisted() {
-        let sr1 = """
-        O Snake game criado.
-        O file: /Users/samuelfajreldines/snake.html (single-file, zero deps)
-        O feat: canvas 20x20 grid, score, wall+self collision, food respawn, game-over restart
-        O ctrl: setas ou WASD; ESPACO reinicia
-        P open: abrir snake.html no browser -> jogo roda
-        """
-        let humanized = "O Snake game foi criado em /Users/samuelfajreldines/snake.html e pode ser aberto no navegador."
-
-        XCTAssertFalse(AgentAppView.shouldRenderAssistantItemBody(
-            sr1,
-            persistedAssistantTexts: [humanized]
-        ), "space-delimited /distill output must be treated as SR1 so the raw compact item does not remain visible")
     }
 
     func test_turnViewHidesDuplicateAssistantItemBodiesWithinTurn() {
@@ -7407,11 +7374,11 @@ final class AgentAppViewModelTests: XCTestCase {
                       "the default model must be one the picker actually offers")
     }
 
-    // F6: the SR1 translation maps were additive-only and never cleared on a thread
-    // switch, so they accumulated the union of every translated message (and its full
+    // F6: the Token Saver translation maps were additive-only and never cleared on a thread
+    // switch, so they accumulated the union of every optimized message (and its full
     // original text) across every thread visited for the whole session.
     @MainActor
-    func test_sr1TranslationMaps_resetOnThreadSwitchButSurviveReselect() async throws {
+    func test_tokenSaverTranslationMaps_resetOnThreadSwitchButSurviveReselect() async throws {
         let (vm, threadRepo) = try makeVM()
         let a = AgentThread(workspaceId: vm.workspaceID, title: "A", provider: .claude, model: "m")
         let b = AgentThread(workspaceId: vm.workspaceID, title: "B", provider: .claude, model: "m")
@@ -7421,24 +7388,26 @@ final class AgentAppViewModelTests: XCTestCase {
 
         vm.selectThread(a.id)
         let msgId = AgentMessageID(UUID())
-        vm.coordinator.onSR1TranslatedMessageId?(msgId)   // live badge -> Task { @MainActor }
-        for _ in 0..<200 where !vm.sr1TranslatedMessageIds.contains(msgId) {
+        vm.coordinator.onWireTranslatedMessageId?(msgId)   // live badge -> Task { @MainActor }
+        for _ in 0..<200 where !vm.tokenSaverOptimizedMessageIds.contains(msgId) {
             try await Task.sleep(nanoseconds: 2_000_000)
         }
-        XCTAssertTrue(vm.sr1TranslatedMessageIds.contains(msgId),
-                      "a live SR1 translation must mark the message on the current thread")
+        XCTAssertTrue(vm.tokenSaverOptimizedMessageIds.contains(msgId),
+                      "a live wire translation must mark the message on the current thread")
 
         // Re-selecting the SAME thread must NOT wipe live translation state.
         vm.selectThread(a.id)
-        XCTAssertTrue(vm.sr1TranslatedMessageIds.contains(msgId),
-                      "re-selecting the same thread must keep its SR1 translation badges")
+        XCTAssertTrue(vm.tokenSaverOptimizedMessageIds.contains(msgId),
+                      "re-selecting the same thread must keep its Token Saver badge")
 
         // Switching to a DIFFERENT thread (no translations) must clear the maps.
         vm.selectThread(b.id)
-        XCTAssertTrue(vm.sr1TranslatedMessageIds.isEmpty,
-                      "switching threads must reset SR1 translation state (F6: no cross-thread accumulation)")
-        XCTAssertTrue(vm.sr1OriginalTextsByMessageId.isEmpty,
+        XCTAssertTrue(vm.tokenSaverOptimizedMessageIds.isEmpty,
+                      "switching threads must reset Token Saver translation state (F6: no cross-thread accumulation)")
+        XCTAssertTrue(vm.tokenSaverOriginalTextsByMessageId.isEmpty,
                       "switching threads must also drop the retained original texts")
+        XCTAssertTrue(vm.tokenSaverWireRequestTextsByMessageId.isEmpty,
+                      "switching threads must also drop private provider-bound request metadata")
     }
 
     // F9: deleting a thread must evict its per-thread VM caches and the coordinator's

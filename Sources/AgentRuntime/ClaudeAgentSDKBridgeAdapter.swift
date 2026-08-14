@@ -1686,8 +1686,8 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     /// self-declaration marker + the MCP-tool-availability rule) so the agent marks
     /// any unavoidable wait with the recovery marker and does not preemptively refuse
     /// a connected MCP tool as "unauthenticated" in a non-interactive run.
-    /// Managed Distill language + pipe rules only when Token Saver is active
-    /// (`RC_TOKEN_SAVER_DISTILL_HINT=1`). Codex/Grok use the same env gate —
+    /// Managed tool-output Distill policy and the separately admitted RCW1 ABI
+    /// only when Token Saver is active. Codex/Grok use the same environment gates —
     /// never via `~/.claude/skills` / `~/.codex/skills`.
     static func claudeSystemPrompt(environment: [String: String]) -> String {
         AgentSkillInstaller.tokenSaverProviderPrompt(

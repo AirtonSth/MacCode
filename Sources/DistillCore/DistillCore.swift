@@ -12,7 +12,9 @@ public enum DistillMode: String, Codable, Sendable, Equatable {
     case commandOutput
     case longText
     case watchSummary
-    case sr1Humanize
+    case wireEncode
+    case wireRenderEnglish
+    case naturalLanguage
 }
 
 public enum DistillPriority: Int, Codable, Sendable, Comparable {
@@ -454,37 +456,6 @@ public enum TokenEstimator {
     }
 }
 
-public enum TokenSaverSR1SavingsEstimator {
-    /// Estimated tokens avoided by sending the compressed reply instead of its
-    /// humanized form, using the same deterministic estimator on both legs so the
-    /// delta stays internally consistent.
-    ///
-    /// WHY there is no expansion or verbosity multiplier any more: this used to scale
-    /// both legs by 9 — a 3x "the human transcript is longer than the displayed text"
-    /// expansion times a 3x "an agent without Token Saver would have been ~3x more
-    /// verbose" credit — and to count characters as if they were tokens. Neither
-    /// factor was ever calibrated against the current dialect, and the second is a
-    /// counterfactual: it credits savings against a reply that was never generated,
-    /// let alone measured. The one instrumentation path that could have validated it
-    /// computes zero by construction (see `AppContext.flushPendingTokenSaverUsage`,
-    /// which passes the same value for actual and estimated tokens), so the headline
-    /// figure was unfalsifiable in both directions.
-    ///
-    /// Restoring a credit requires a real baseline: the same fixed corpus run with and
-    /// without Token Saver, scored against actual provider usage rather than character
-    /// counts. Until that exists this reports only what it can defend — the estimated
-    /// token delta between the two texts the system actually produced.
-    public static func estimate(sr1: String, humanized: String) -> (inputTokens: Int, outputTokens: Int, savedTokens: Int) {
-        let inputTokens = TokenEstimator.estimate(humanized)
-        let outputTokens = TokenEstimator.estimate(sr1)
-        return (
-            inputTokens: inputTokens,
-            outputTokens: outputTokens,
-            savedTokens: max(inputTokens - outputTokens, 0)
-        )
-    }
-}
-
 public struct DistillSavingsRecord: Sendable, Equatable {
     public let provider: String
     /// Saved-tokens mode, already folded with the producing engine where known
@@ -496,7 +467,7 @@ public struct DistillSavingsRecord: Sendable, Equatable {
     public let savedTokens: Int
     /// Cache relevance of this saving (G3): `tool_output_oneshot` is consumed once and
     /// never re-sent (char-delta is honest/cache-neutral); `prompt` is cache-relevant;
-    /// `sr1_humanize`/`watch` are response-side. Lets the headline keep only honest rows.
+    /// `wire_render_english`/`watch` are response-side. Lets the headline keep only honest rows.
     public let cacheState: String
     /// The engine that produced this saving (deterministic / BERT / MLX), raw. `mode`
     /// already folds it in for display; kept here for telemetry/tests.
@@ -572,26 +543,22 @@ public enum DistillSavingsCalculator {
                 delivered: delivered,
                 threadID: thread
             )
-        case .sr1Humanize:
-            // The agent emitted the compressed SR1 response instead of the full
-            // human-language answer; use the SR1 transcript-expansion estimator
-            // so short semantic prefixes still get credit for the avoided prose.
-            let sr1 = sr1ResponseSource(from: request.input)
-            let estimate = TokenSaverSR1SavingsEstimator.estimate(sr1: sr1, humanized: response.output)
-            return DistillSavingsRecord(
-                provider: provider,
-                mode: "sr1-humanize",
-                inputTokens: estimate.inputTokens,
-                outputTokens: estimate.outputTokens,
-                savedTokens: estimate.savedTokens,
-                cacheState: "sr1_humanize",
-                attributability: "not_prompt_bound",
-                delivered: delivered,
-                threadID: thread
-            )
-        case .longText, .watchSummary:
-            let cacheState = request.cacheState ?? (request.mode == .longText ? "prompt" : "watch")
-            let attributability = request.mode == .longText ? "prompt_bound" : "not_prompt_bound"
+        case .wireRenderEnglish:
+            // Rendering changes only local display text. It does not establish a
+            // counterfactual provider response and therefore cannot claim savings.
+            return nil
+        case .longText, .watchSummary, .wireEncode, .naturalLanguage:
+            let defaultCacheState: String
+            switch request.mode {
+            case .longText: defaultCacheState = "prompt"
+            case .watchSummary: defaultCacheState = "watch"
+            case .wireEncode: defaultCacheState = "wire_encode"
+            case .naturalLanguage: defaultCacheState = "natural_language"
+            case .commandOutput, .wireRenderEnglish: defaultCacheState = "unknown"
+            }
+            let cacheState = request.cacheState ?? defaultCacheState
+            let attributability = request.mode == .watchSummary || request.mode == .naturalLanguage
+                ? "not_prompt_bound" : "prompt_bound"
             return DistillSavingsRecord(
                 provider: provider,
                 mode: TokenSaverEngineLabel.mode(base: request.mode.rawValue, stage: response.routeStage),
@@ -607,13 +574,6 @@ public enum DistillSavingsCalculator {
         }
     }
 
-    private static func sr1ResponseSource(from input: String) -> String {
-        let marker = "SR1_RESPONSE:"
-        guard let range = input.range(of: marker) else {
-            return input.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return input[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
-    }
 }
 
 public enum DistillError: Error, Sendable, Equatable {
@@ -672,7 +632,9 @@ public func tokenSaverLane(for mode: DistillMode) -> TokenSaverLane {
     case .commandOutput: return .commandOutput
     case .longText: return .longText
     case .watchSummary: return .watchSummary
-    case .sr1Humanize: return .sr1Humanize
+    case .wireEncode: return .wireEncode
+    case .wireRenderEnglish: return .wireRenderEnglish
+    case .naturalLanguage: return .naturalLanguage
     }
 }
 
@@ -724,205 +686,6 @@ private struct DistillResultCacheEntry: Sendable {
     let output: String
     let stage: TokenSaverRouteStage?
     let insertedAt: Date
-}
-
-private enum SR1LineParser {
-    // Single source of truth: see CoreModel.DistillSemanticPrefixes for why this
-    // must not be re-typed per module.
-    private static let semanticPrefixes = DistillSemanticPrefixes.set
-    // PERF: cleanedVariableValue recompiled these via range(of:options:
-    // .regularExpression) on every SR1 variable expansion / humanize pass.
-    private static let variableKeyRegex = try! NSRegularExpression(pattern: #"#[A-Za-z][0-9]+"#)
-    private static let aliasDeclarationRegex = try! NSRegularExpression(
-        pattern: DistillSemanticPrefixes.aliasDeclarationPattern
-    )
-    // PERF: segment/variable cleaning allocated CharacterSet(charactersIn:) on
-    // every multi-marker line and every alias value during SR1 humanize/expand.
-    private static let trailingDotTrimSet = CharacterSet(charactersIn: ".")
-    private static let trailingPunctuationTrimSet = CharacterSet(charactersIn: ".,;")
-
-    static func parseSemanticLine(_ line: String) -> (prefix: Character, content: String)? {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard let first = trimmed.first?.uppercased().first,
-              semanticPrefixes.contains(first) else {
-            return nil
-        }
-
-        let rest = trimmed.dropFirst()
-        guard let delimiter = rest.first else { return nil }
-
-        let content: String
-        if delimiter == ":" || delimiter == "=" {
-            content = rest.dropFirst().trimmingCharacters(in: .whitespaces)
-        } else if delimiter == " " || delimiter == "\t" {
-            content = rest.trimmingCharacters(in: .whitespaces)
-        } else {
-            return nil
-        }
-
-        guard !content.isEmpty else { return nil }
-        return (first, content)
-    }
-
-    static func parseSemanticSegments(_ text: String) -> [(prefix: Character, content: String)] {
-        text
-            .split(whereSeparator: \.isNewline)
-            .flatMap { parseSemanticSegmentsInLine(String($0)) }
-    }
-
-    static func expandVariables(in text: String, from source: String) -> String {
-        let aliases = extractVariableAliases(source)
-        guard !aliases.isEmpty else { return text }
-
-        var expanded = text
-        for (key, value) in aliases.sorted(by: { $0.key.count > $1.key.count }) {
-            expanded = replacingWholeVariableKey(key, with: value, in: expanded)
-        }
-        return expanded
-    }
-
-    private static func parseSemanticSegmentsInLine(_ rawLine: String) -> [(prefix: Character, content: String)] {
-        let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !line.isEmpty else { return [] }
-        let markerRanges = semanticMarkerRanges(in: line)
-        guard markerRanges.count >= 2 else {
-            return parseSemanticLine(line).map { [$0] } ?? []
-        }
-
-        var segments: [(prefix: Character, content: String)] = []
-        for index in markerRanges.indices {
-            let marker = markerRanges[index]
-            let contentStart = line.index(after: marker.range.lowerBound)
-            let delimiter = line[contentStart]
-            let segmentStart = (delimiter == ":" || delimiter == "=")
-                ? line.index(after: contentStart)
-                : contentStart
-            let segmentEnd = index + 1 < markerRanges.count
-                ? markerRanges[index + 1].range.lowerBound
-                : line.endIndex
-            let content = line[segmentStart..<segmentEnd]
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .trimmingCharacters(in: trailingDotTrimSet)
-            if !content.isEmpty {
-                segments.append((marker.prefix, content))
-            }
-        }
-        return segments
-    }
-
-    private static func semanticMarkerRanges(in line: String) -> [(prefix: Character, range: Range<String.Index>)] {
-        var result: [(Character, Range<String.Index>)] = []
-        var index = line.startIndex
-        while index < line.endIndex {
-            let next = line.index(after: index)
-            defer { index = next }
-            let prefix = line[index].uppercased().first ?? "\0"
-            guard semanticPrefixes.contains(prefix),
-                  next < line.endIndex,
-                  isSemanticDelimiter(line[next]),
-                  isSemanticBoundary(before: index, in: line) else {
-                continue
-            }
-            result.append((prefix, index..<next))
-        }
-        return result
-    }
-
-    private static func isSemanticDelimiter(_ character: Character) -> Bool {
-        character == ":" || character == "=" || character == " " || character == "\t"
-    }
-
-    private static func isSemanticBoundary(before index: String.Index, in line: String) -> Bool {
-        if index == line.startIndex { return true }
-        var cursor = line.index(before: index)
-        while cursor > line.startIndex, line[cursor].isWhitespace {
-            cursor = line.index(before: cursor)
-        }
-        let previous = line[cursor]
-        return previous == "." || previous == ";" || previous == "!" || previous == "?"
-    }
-
-    private static func extractVariableAliases(_ text: String) -> [String: String] {
-        var aliases: [String: String] = [:]
-        let lines = text.split(whereSeparator: \.isNewline).map(String.init)
-        for line in lines {
-            for (key, value) in keyValueAliases(in: line) {
-                aliases[key] = value
-            }
-            for (key, value) in valueKeyAliases(in: line) {
-                aliases[key] = value
-            }
-        }
-        return aliases
-    }
-
-    private static func keyValueAliases(in line: String) -> [(String, String)] {
-        let pattern = #"(#[A-Za-z][0-9]+)\s*=\s*([^;\n]+?)(?=(?:\s+#[A-Za-z][0-9]+\s*=)|$)"#
-        return regexMatches(pattern: pattern, in: line).compactMap { result in
-            guard result.numberOfRanges >= 3,
-                  let keyRange = Range(result.range(at: 1), in: line),
-                  let valueRange = Range(result.range(at: 2), in: line),
-                  let value = cleanedVariableValue(String(line[valueRange])) else {
-                return nil
-            }
-            return (String(line[keyRange]), value)
-        }
-    }
-
-    private static func valueKeyAliases(in line: String) -> [(String, String)] {
-        let pattern = #"(^|[.;]\s+)([^#=;\n]{2,100}?)\s*=\s*(#[A-Za-z][0-9]+)(?=\s|[.;,]|$)"#
-        return regexMatches(pattern: pattern, in: line).compactMap { result in
-            guard result.numberOfRanges >= 4,
-                  let valueRange = Range(result.range(at: 2), in: line),
-                  let keyRange = Range(result.range(at: 3), in: line),
-                  let value = cleanedVariableValue(String(line[valueRange])) else {
-                return nil
-            }
-            return (String(line[keyRange]), value)
-        }
-    }
-
-    private static func cleanedVariableValue(_ raw: String) -> String? {
-        var value = raw
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: trailingPunctuationTrimSet)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if value.localizedCaseInsensitiveContains("dict:") ||
-            hasRegexMatch(aliasDeclarationRegex, in: value) {
-            return nil
-        }
-        let segments = parseSemanticSegments(value)
-        if segments.count == 1 {
-            value = segments[0].content
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .trimmingCharacters(in: trailingPunctuationTrimSet)
-        }
-        guard !value.isEmpty,
-              !hasRegexMatch(variableKeyRegex, in: value) else {
-            return nil
-        }
-        return value
-    }
-
-    private static func hasRegexMatch(_ regex: NSRegularExpression, in text: String) -> Bool {
-        let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        return regex.firstMatch(in: text, options: [], range: range) != nil
-    }
-
-    private static func replacingWholeVariableKey(_ key: String, with value: String, in text: String) -> String {
-        let pattern = #"(?<![A-Za-z0-9_])"# + NSRegularExpression.escapedPattern(for: key) + #"(?![A-Za-z0-9_])"#
-        var output = text
-        for result in regexMatches(pattern: pattern, in: output).reversed() {
-            guard let range = Range(result.range, in: output) else { continue }
-            output.replaceSubrange(range, with: value)
-        }
-        return output
-    }
-
-    private static func regexMatches(pattern: String, in text: String) -> [NSTextCheckingResult] {
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
-        return regex.matches(in: text, range: NSRange(text.startIndex..<text.endIndex, in: text))
-    }
 }
 
 public actor DistillScheduler {
@@ -1172,8 +935,7 @@ public struct LocalDistillRuntime: DistillRuntime {
     private static func deterministicOutput(_ request: DistillRequest) async throws -> String {
         // Deterministic content routing (G4): lossless structural compression of
         // JSON/log payloads on the pure "compress this" modes, before any heuristic
-        // summarization. Skipped for .commandOutput (it must answer the contract
-        // question, not blind-minify) and .sr1Humanize (a translation task).
+        // summarization. Translation and wire modes have their own contracts.
         if request.mode == .longText || request.mode == .watchSummary,
            let routed = contentRouter.route(request.input, options: routerOptions(for: request)) {
             return routed.output
@@ -1185,22 +947,28 @@ public struct LocalDistillRuntime: DistillRuntime {
                 maxOutputCharacters: request.maxOutputCharacters
             )
         }
-        let lines = request.input
-            .split(whereSeparator: \.isNewline)
-            .prefix(12)
-            .map(String.init)
-        let prefix: String
         switch request.mode {
         case .commandOutput:
-            prefix = "O"
-        case .longText:
-            prefix = "S"
-        case .watchSummary:
-            prefix = "D"
-        case .sr1Humanize:
-            return humanizeSR1Fallback(request.input, maxOutputCharacters: request.maxOutputCharacters)
+            return commandOutputFallback(
+                input: request.input,
+                question: request.question,
+                maxOutputCharacters: request.maxOutputCharacters
+            )
+        case .longText, .watchSummary:
+            return String(request.input.prefix(request.maxOutputCharacters))
+        case .wireEncode:
+            let frame = RCWireFrame(
+                direction: .request,
+                sequence: 1,
+                records: [.init(kind: .goal, value: request.input)]
+            )
+            return (try? RCWireProtocol.serialize(frame)) ?? request.input
+        case .wireRenderEnglish:
+            guard let frames = try? RCWireProtocol.parse(request.input) else { return request.input }
+            return RCWireProtocol.renderEnglish(frames)
+        case .naturalLanguage:
+            return String(request.input.prefix(request.maxOutputCharacters))
         }
-        return lines.isEmpty ? "\(prefix) no content" : lines.map { "\(prefix) \($0)" }.joined(separator: "\n")
     }
 
     static func routerOptions(for request: DistillRequest) -> DistillRouterOptions {
@@ -1458,47 +1226,6 @@ public struct LocalDistillRuntime: DistillRuntime {
         return String(output.prefix(maxOutputCharacters - suffix.count)) + suffix
     }
 
-    static func humanizeSR1Fallback(_ input: String, maxOutputCharacters: Int) -> String {
-        let portuguese = input.localizedCaseInsensitiveContains("portuguese") ||
-            input.localizedCaseInsensitiveContains("português")
-        var source = input
-        if let range = input.range(of: "SR1_RESPONSE:", options: [.caseInsensitive]) {
-            source = String(input[range.upperBound...])
-        }
-        source = source.trimmingCharacters(in: .whitespacesAndNewlines)
-        // O-first prose: surface outcome lines; drop S/C/D/N chrome.
-        var outcomes: [String] = []
-        var extras: [String] = []
-        for raw in source.split(whereSeparator: \.isNewline) {
-            let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !line.isEmpty else { continue }
-            let lower = line.lowercased()
-            if lower == "sr1" || lower == "dict" || lower.hasPrefix("dict:")
-                || lower.hasPrefix("s=state") || lower.hasPrefix("c=context") {
-                continue
-            }
-            let segments = SR1LineParser.parseSemanticSegments(line)
-            if segments.isEmpty {
-                if !line.hasPrefix("|") { extras.append(line) }
-                continue
-            }
-            for parsed in segments {
-                let content = parsed.content.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !content.isEmpty else { continue }
-                if parsed.prefix == "O" {
-                    outcomes.append(content)
-                } else if parsed.prefix == "R" || parsed.prefix == "P" {
-                    extras.append(content)
-                }
-            }
-        }
-        let pieces = outcomes.isEmpty ? extras : (outcomes + extras.prefix(2))
-        let output = pieces.isEmpty
-            ? (portuguese ? "Nao consegui expandir a resposta comprimida." : "I could not expand the compressed response.")
-            : pieces.joined(separator: "\n")
-        let expanded = SR1LineParser.expandVariables(in: output, from: source)
-        return String(expanded.prefix(maxOutputCharacters))
-    }
 }
 
 private extension String {
@@ -1725,8 +1452,7 @@ public struct MLXDistillRuntime: DistillRuntime {
 
         // Deterministic content routing (G4): lossless structural compression of
         // JSON/log on the pure "compress this" modes, before the model is invoked.
-        // Covers the .longText prompt-compression path. .commandOutput is excluded
-        // (honors its contract question above) and .sr1Humanize is a translation.
+        // Covers the generic prose-compression paths only. Wire modes own framing.
         if request.mode == .longText || request.mode == .watchSummary,
            let routed = Self.contentRouter.route(request.input, options: Self.routerOptions(for: request)) {
             return DistillStageResult(output: routed.output, stage: .deterministic)
@@ -1772,15 +1498,42 @@ public struct MLXDistillRuntime: DistillRuntime {
             ? Self.collapseDuplicatedCommandOutput(output)
             : output
         let restoredOutput = protected.payload.restore(in: normalizedOutput)
-        guard Self.isUsefulOutput(restoredOutput, mode: request.mode) else {
+        // The local model is good at semantic compression but is not the owner of
+        // the transport ABI. Swift frames its compact English payload so syntax is
+        // deterministic even when the installed model was trained before RCW1.
+        let protocolOutput: String
+        if request.mode == .wireEncode {
+            protocolOutput = Self.wireRequestFrame(semanticBrief: restoredOutput)
+                ?? Self.fallbackOutput(for: request)
+        } else {
+            protocolOutput = restoredOutput
+        }
+        guard Self.isUsefulOutput(protocolOutput, mode: request.mode) else {
             return Self.fallbackOutput(for: request)
         }
-        return Self.guardLossyProseOutput(restoredOutput, request: request)
+        return Self.guardLossyProseOutput(protocolOutput, request: request)
+    }
+
+    static func wireRequestFrame(semanticBrief: String) -> String? {
+        let brief = semanticBrief.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !brief.isEmpty else { return nil }
+        if RCWireProtocol.isWire(brief) {
+            guard let frames = try? RCWireProtocol.parse(brief),
+                  frames.allSatisfy({ $0.direction == .request }) else { return nil }
+            return brief
+        }
+        // Never hide a malformed protocol-looking model response inside a goal.
+        guard !brief.hasPrefix("RCW") else { return nil }
+        return try? RCWireProtocol.serialize(RCWireFrame(
+            direction: .request,
+            sequence: 1,
+            records: [.init(kind: .goal, value: brief)]
+        ))
     }
 
     static func requestByProtectingTagsAndMarkers(_ request: DistillRequest) -> (request: DistillRequest, payload: ProtectedTagPayload) {
         switch request.mode {
-        case .longText, .watchSummary:
+        case .longText, .watchSummary, .wireEncode:
             let payload = TagAndMarkerProtector.protect(request.input)
             guard !payload.isEmpty else { return (request, payload) }
             return (
@@ -1797,7 +1550,7 @@ public struct MLXDistillRuntime: DistillRuntime {
                 ),
                 payload
             )
-        case .commandOutput, .sr1Humanize:
+        case .commandOutput, .wireRenderEnglish, .naturalLanguage:
             return (request, ProtectedTagPayload(text: request.input, replacements: [:]))
         }
     }
@@ -1806,7 +1559,7 @@ public struct MLXDistillRuntime: DistillRuntime {
     /// compression dropped a load-bearing literal (file:line, UUID, hash, long number,
     /// diff change line) present in the input, reject it and return the input verbatim.
     /// .commandOutput is exempt — it is contract extraction, not literal-preserving
-    /// compression — and .sr1Humanize is a translation.
+    /// compression. Wire rendering and natural-language generation are translation.
     static func guardLossyProseOutput(_ output: String, request: DistillRequest) -> String {
         switch request.mode {
         case .longText, .watchSummary:
@@ -1815,8 +1568,16 @@ public struct MLXDistillRuntime: DistillRuntime {
             return FaithfulnessGate.validate(original: request.input, compressed: literalGuarded.output).accepted
                 ? literalGuarded.output
                 : request.input
-        case .commandOutput, .sr1Humanize:
+        case .commandOutput, .wireRenderEnglish, .naturalLanguage:
             return output
+        case .wireEncode:
+            guard let frames = try? RCWireProtocol.parse(output),
+                  frames.allSatisfy({ $0.direction == .request }),
+                  RCWireProtocol.preservesProtectedSemantics(original: request.input, wire: output) else {
+                return request.input
+            }
+            let literalGuarded = LiteralPreservation.guarded(original: request.input, compressed: output)
+            return literalGuarded.droppedLiteral == nil ? output : request.input
         }
     }
 
@@ -1841,17 +1602,25 @@ public struct MLXDistillRuntime: DistillRuntime {
 
     private static func systemInstructions(for mode: DistillMode) -> String {
         switch mode {
-        case .sr1Humanize:
+        case .wireEncode:
             return """
-            You translate /distill output into human language for a software engineer.
-            /distill output is compressed Military English + AR-0/AR-1 for prompts, task specs, commands, or agent instructions.
-            It may contain Dict/Dict+, dynamic inline variables, and fixed prefixes S, C, D, R, O, N, P.
-            Prefix meanings are usually S=state/status, C=cause/context, D=action/decision, R=risk/blocker, O=outcome/output, N=constraint/no-go, P=pass criteria/proof.
-            Expand aliases from Dict and Dict+ when present. Keep aliases unchanged when no definition is present.
-            Preserve constraints, pass criteria, required output, blockers, uncertainty, file names, paths, commands, environment variables, IDs, security warnings, and production/data-loss warnings.
-            Do not invent missing facts. Do not claim execution happened unless the input says it happened.
-            Write concise natural language in the requested language or locale.
-            Return only the translation. No preamble. No markdown.
+            Compress an English software task into a compact semantic brief for another AI agent.
+            Preserve negation, modality, ordering, conditions, commands, paths, URLs, IDs, hashes, numbers, units, errors, quotes, code, approvals, security warnings, and data-loss warnings verbatim.
+            Drop repetition, filler, hedging, and politeness. Never invent facts, aliases, tags, or a transport grammar.
+            Output only the compact English brief. Swift owns the RC Wire framing.
+            """
+        case .wireRenderEnglish:
+            return """
+            Render valid RC Wire v1 response frames as concise fluent English for a software engineer.
+            Preserve every fact, negation, condition, command, path, URL, ID, hash, number, unit, error, quote, code span, approval, warning, outcome, evidence, risk, and question.
+            Do not invent facts or claim work that the frames do not report.
+            Return only the English answer. Never output RCW1 tags or explain the protocol.
+            """
+        case .naturalLanguage:
+            return """
+            Rewrite the supplied content as one concise natural-language English sentence.
+            Preserve exact facts, names, numbers, statuses, paths, commands, and warnings.
+            Return only the sentence.
             """
         case .commandOutput:
             return """
@@ -1869,11 +1638,10 @@ public struct MLXDistillRuntime: DistillRuntime {
             """
         case .longText, .watchSummary:
             return """
-            You compress long text into /distill compressed language for another AI model that already understands it.
-            Use Military English with fixed prefixes, one item per line: S=state, C=context, D=action, R=risk, O=outcome, N=no-go, P=proof.
+            You compress long text into concise plain language for another AI model.
             Preserve every exact command, file path, file:line, error string, number, ID, status, and proof verbatim.
             Drop filler, repetition, hedging, and politeness. Never invent facts. No preamble, no explanation, no markdown.
-            Output only the compressed S/C/D/R/O/N/P lines. If the source is already shorter than your answer would be, reuse the source wording.
+            If the source is already shorter than your answer would be, reuse the source wording.
             """
         }
     }
@@ -1892,7 +1660,7 @@ public struct MLXDistillRuntime: DistillRuntime {
         case .longText:
             return """
             /no_think
-            Compress the following into /distill compressed language (S/C/D/R/O/N/P lines).
+            Compress the following into concise plain language.
             Preserve exact commands, paths, file:line, errors, numbers, IDs, and status verbatim.
 
             \(fitInput(request.input))
@@ -1902,33 +1670,49 @@ public struct MLXDistillRuntime: DistillRuntime {
         case .watchSummary:
             return """
             /no_think
-            Summarize the relevant change into /distill compressed language (S/C/D/R/O/N/P lines).
+            Summarize the relevant change in concise plain language.
             Preserve exact commands, paths, file:line, errors, numbers, IDs verbatim.
 
             \(fitInput(request.input))
 
             OUTPUT:
             """
-        case .sr1Humanize:
+        case .wireEncode:
             return """
             /no_think
-            Rewrite the SR1_RESPONSE into natural language for the user.
-            Use TARGET_LANGUAGE.
-            Output at most \(request.maxOutputCharacters) characters.
-            Output only the final user-facing answer.
-            Preserve exact commands, paths, IDs, errors, numbers, statuses, and proof.
-            Do not output markdown unless the answer needs a short list.
-            Do not output SR1 prefixes, prefix dictionaries, XML tags, or instructions.
+            Compress this English user task into one compact semantic brief.
+            Keep every protected literal and intent-critical condition verbatim.
 
             \(request.input)
 
-            OUTPUT:
+            BRIEF:
+            """
+        case .wireRenderEnglish:
+            return """
+            /no_think
+            Render these RC Wire v1 response frames as concise English.
+
+            \(request.input)
+
+            ENGLISH:
+            """
+        case .naturalLanguage:
+            return """
+            /no_think
+            Rewrite as one concise English sentence, preserving exact facts.
+
+            \(request.input)
+
+            SENTENCE:
             """
         }
     }
 
     private static func maxTokens(for request: DistillRequest) -> Int {
-        min(512, max(32, request.maxOutputCharacters / 4))
+        let requested = max(32, request.maxOutputCharacters / 4)
+        // Encoding is on the latency-critical path. A compact semantic brief is
+        // deliberately bounded; complex turns that cannot fit still fail open.
+        return request.mode == .wireEncode ? min(128, requested) : min(512, requested)
     }
 
     static func fitInput(_ input: String, maxCharacters: Int = 24_000) -> String {
@@ -1987,7 +1771,11 @@ public struct MLXDistillRuntime: DistillRuntime {
               !lowercased.contains("\ninput:") else {
             return false
         }
-        if mode == .sr1Humanize, Self.isLikelySR1(trimmed) {
+        if mode == .wireEncode {
+            guard let frames = try? RCWireProtocol.parse(trimmed),
+                  frames.allSatisfy({ $0.direction == .request }) else { return false }
+        }
+        if mode == .wireRenderEnglish, RCWireProtocol.isWire(trimmed) {
             return false
         }
 
@@ -2017,7 +1805,6 @@ public struct MLXDistillRuntime: DistillRuntime {
     }
 
     public static func fallbackOutput(for request: DistillRequest) -> String {
-        let prefix: String
         switch request.mode {
         case .commandOutput:
             return LocalDistillRuntime.commandOutputFallback(
@@ -2025,42 +1812,16 @@ public struct MLXDistillRuntime: DistillRuntime {
                 question: request.question,
                 maxOutputCharacters: request.maxOutputCharacters
             )
-        case .longText:
-            prefix = "S"
-        case .watchSummary:
-            prefix = "D"
-        case .sr1Humanize:
-            return LocalDistillRuntime.humanizeSR1Fallback(request.input, maxOutputCharacters: request.maxOutputCharacters)
+        case .longText, .watchSummary, .naturalLanguage:
+            return String(request.input.prefix(request.maxOutputCharacters))
+        case .wireEncode:
+            let frame = RCWireFrame(direction: .request, sequence: 1, records: [
+                .init(kind: .goal, value: request.input)
+            ])
+            return (try? RCWireProtocol.serialize(frame)) ?? request.input
+        case .wireRenderEnglish:
+            guard let frames = try? RCWireProtocol.parse(request.input) else { return request.input }
+            return RCWireProtocol.renderEnglish(frames)
         }
-
-        let lines = request.input
-            .split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .prefix(8)
-            .map { "\(prefix) \($0)" }
-
-        let output = lines.isEmpty ? "\(prefix) no content" : lines.joined(separator: "\n")
-        return String(output.prefix(request.maxOutputCharacters))
-    }
-
-    private static func isLikelySR1(_ output: String) -> Bool {
-        var semanticLines = 0
-        var prefixes = Set<Character>()
-        for raw in output.split(whereSeparator: \.isNewline).prefix(12) {
-            let line = raw.trimmingCharacters(in: .whitespaces)
-            let segments = SR1LineParser.parseSemanticSegments(line)
-            if segments.count >= 2 {
-                return true
-            }
-            if let parsed = segments.first {
-                semanticLines += 1
-                prefixes.insert(parsed.prefix)
-            }
-        }
-        if semanticLines == 1, let prefix = prefixes.first, prefix != "O" {
-            return true
-        }
-        return semanticLines >= 2 && prefixes.count >= 2
     }
 }

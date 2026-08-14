@@ -544,6 +544,95 @@ final class FakeRunnerTests: XCTestCase {
         XCTFail("coordinator must write a recoverable provider session runtime row")
     }
 
+    func test_coordinatorPersistsTrustedWireCapabilityForFollowUpAdmission() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-wire-capability-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "wire", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [
+                .codex: FakeProviderRunner(provider: .codex, scenario: .simpleAssistant(reply: "OK"))
+            ]
+        )
+        coordinator.runEnvironmentProvider = { _, _, base in
+            var environment = base
+            environment[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] = "1"
+            return environment
+        }
+
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: tmp,
+            prompt: "short plaintext seed"
+        ))
+
+        try await waitUntil("trusted wire capability persisted for a later follow-up") {
+            guard let session = try? sessionRepo.get(threadId: thread.id),
+                  let payload = Self.runtimePayload(session.runtimePayloadJSON) else { return false }
+            return payload["wireProtocolVersion"] as? String == RCWireProtocol.version
+        }
+    }
+
+    func test_coordinatorNeverPromotesLegacySessionToWireCapabilityMidSession() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-legacy-wire-capability-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "legacy", provider: .claude, model: "claude-sonnet-4-6")
+        try threadRepo.upsert(thread)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .claude,
+            status: .completed,
+            resumeCursor: "legacy-provider-thread",
+            cwd: tmp,
+            model: "claude-sonnet-4-6",
+            runtimePayloadJSON: #"{"providerThreadId":"legacy-provider-thread","turnCount":1}"#
+        ))
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [
+                .claude: FakeProviderRunner(provider: .claude, scenario: .simpleAssistant(reply: "OK"))
+            ]
+        )
+        coordinator.runEnvironmentProvider = { _, _, base in
+            var environment = base
+            environment[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] = "1"
+            return environment
+        }
+
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .claude,
+            model: "claude-sonnet-4-6",
+            cwd: tmp,
+            prompt: "legacy plaintext follow-up"
+        ))
+
+        try await waitUntil("legacy provider turn completes without an in-session ABI upgrade") {
+            guard let session = try? sessionRepo.get(threadId: thread.id),
+                  session.status == .completed,
+                  let payload = Self.runtimePayload(session.runtimePayloadJSON) else { return false }
+            return payload["turnCount"] as? Int == 2
+                && payload["wireProtocolVersion"] == nil
+        }
+    }
+
     func test_coordinatorTracksPendingUserInputIdsInProviderRuntimePayload() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-coordinator-pending-runtime-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()

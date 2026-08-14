@@ -654,12 +654,11 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
         }
     }
 
-    // MARK: - Stop must not stick on in-flight SR1/distill humanize
+    // MARK: - Stop must not stick on in-flight wire rendering
 
-    /// Runner that streams an SR1 assistant item then holds the run open until
-    /// cancel (or a long hang). Mirrors the live case: Token Saver is humanizing
-    /// streamed dialect while the user hits Stop.
-    private final class SR1StreamThenHangRunner: AgentProviderRunner, @unchecked Sendable {
+    /// Runner that streams an RCW1 assistant item then holds the run open until
+    /// cancel (or a long hang). Mirrors the live case while the user hits Stop.
+    private final class WireStreamThenHangRunner: AgentProviderRunner, @unchecked Sendable {
         let provider: AgentProvider = .claude
         private let lock = NSLock()
         private var onEvent: (@Sendable (AgentRunEvent) -> Void)?
@@ -671,27 +670,26 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
         ) async throws -> AgentRunHandle {
             lock.lock(); self.onEvent = onEvent; lock.unlock()
             let providerThreadId = request.providerThreadId ?? UUID().uuidString
-            let itemId = "sr1-item-1"
+            let itemId = "wire-item-1"
             onEvent(.status(.running))
             onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
-            onEvent(.event(.turnStarted(turnId: "t-sr1")))
+            onEvent(.event(.turnStarted(turnId: "t-wire")))
             let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
             onEvent(.event(.itemStarted(item: AssistantItem(
                 id: itemId,
-                turnId: "t-sr1",
+                turnId: "t-wire",
                 type: .assistantMessage,
                 state: .streaming,
                 body: "",
                 startedAtMs: nowMs
             ))))
-            // Prefix that mustBufferProviderTextPrefix treats as SR1 dialect.
+            // Exact byte-zero sentinel selects the bounded RCW1 hold path.
             onEvent(.event(.itemDelta(
                 itemId: itemId,
-                bodyAppend: "S: build pass. P: unit tests green.",
+                bodyAppend: "RCW1\tA\t1\nO\tBuild passed",
                 outputAppend: nil,
                 summary: nil
             )))
-            onEvent(.event(.itemCompleted(itemId: itemId, finalState: .completed)))
             return AgentRunHandle(runId: request.runId, process: nil) { [weak self] in
                 guard let self else { return }
                 self.lock.lock(); let emit = self.onEvent; self.lock.unlock()
@@ -701,7 +699,7 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
     }
 
     /// WHY: provider-completed `.finished` used to wait unbounded on
-    /// providerTextTranslationsInFlight (SR1/distill). A hung translator left
+    /// providerTextTranslationsInFlight. A hung renderer left
     /// durable agent_runs running and Working latched for all providers.
     /// Token Saver must fail open: deadline drains the deferred terminal with
     /// the original provider payload.
@@ -718,7 +716,7 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
             ) async throws -> AgentRunHandle {
                 lock.lock(); self.onEvent = onEvent; lock.unlock()
                 onEvent(.status(.running))
-                let itemId = "sr1-item"
+                let itemId = "wire-item"
                 onEvent(.event(.itemStarted(item: AssistantItem(
                     id: itemId,
                     turnId: "t1",
@@ -729,13 +727,13 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
                 ))))
                 onEvent(.event(.itemDelta(
                     itemId: itemId,
-                    bodyAppend: "S: build pass. P: unit tests green.",
+                    bodyAppend: "RCW1\tA\t1\nO\tBuild passed\nE\tUnit tests are green\n.\n",
                     outputAppend: nil,
                     summary: nil
                 )))
                 onEvent(.event(.itemCompleted(itemId: itemId, finalState: .completed)))
-                // Provider terminal while humanize is still in flight.
-                onEvent(.finished(.completed, finalMessage: "S: done. P: shipped.", providerThreadId: "pt-1"))
+                // Provider terminal while rendering is still in flight.
+                onEvent(.finished(.completed, finalMessage: "RCW1\tA\t1\nO\tShipped\n.\n", providerThreadId: "pt-1"))
                 return AgentRunHandle(runId: request.runId, process: nil) {}
             }
         }
@@ -754,7 +752,7 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
         let hangGate = DispatchSemaphore(value: 0)
         coordinator.finalResponseTranslator = { response, _, _, _ in
             hangGate.wait()
-            return "Humanized: \(response)"
+            return "Rendered: \(response)"
         }
         let recorder = LifecycleRecorder()
         coordinator.addObserver(recorder)
@@ -775,7 +773,7 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
         hangGate.signal()
 
         XCTAssertNil(coordinator.activeRunId(threadId: thread.id),
-                     "translation deadline must release active ownership without waiting for distill")
+                     "translation deadline must release active ownership without waiting for local rendering")
         XCTAssertEqual(try runRepo.get(id: runId)?.status, .completed)
         XCTAssertNotNil(try runRepo.get(id: runId)?.finishedAt)
         XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .completed)
@@ -783,16 +781,14 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
                        "exactly one terminal lifecycle callback after deadline drain")
     }
 
-    /// WHY: Stop used to set isStopping=true then no-op while
-    /// providerTextTranslationsInFlight > 0 (SR1 humanize via distill). The
-    /// finished(.cancelled) path deferred forever, so Working/Stopping stuck and
-    /// the Stop button stayed disabled. User cancel must clear that gate and
-    /// reach a terminal cancelled state without waiting for distill.
-    func test_stopRun_whileSR1HumanizeInFlight_cancelsWithoutWaitingForTranslator() async throws {
-        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("stop-during-sr1")
-        let thread = AgentThread(title: "sr1 stop", provider: .claude, model: "fake-model")
+    /// WHY: a split RCW1 prefix may be buffered when the user hits Stop. Cancel
+    /// must drop the private transport buffer and complete immediately without
+    /// leaking it into the transcript or waiting for a renderer.
+    func test_stopRun_whileWirePrefixBuffered_cancelsWithoutWaitingForRenderer() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("stop-during-wire")
+        let thread = AgentThread(title: "wire stop", provider: .claude, model: "fake-model")
         try threadRepo.upsert(thread)
-        let runner = SR1StreamThenHangRunner()
+        let runner = WireStreamThenHangRunner()
         let coordinator = AgentRunCoordinator(
             runRepo: runRepo,
             messageRepo: messageRepo,
@@ -800,13 +796,9 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
             providerSessionRepo: sessionRepo,
             providers: [.claude: runner]
         )
-        let hangGate = DispatchSemaphore(value: 0)
-        var translatorEntered = false
         coordinator.finalResponseTranslator = { response, _, _, _ in
-            translatorEntered = true
-            // Simulate a stuck/slow distill sidecar. Stop must not wait on this.
-            hangGate.wait()
-            return "Humanized: \(response)"
+            XCTFail("an incomplete streamed frame must remain buffered, not reach the renderer")
+            return response
         }
         let recorder = LifecycleRecorder()
         coordinator.addObserver(recorder)
@@ -821,10 +813,8 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
             cwd: tmp,
             prompt: "do work"
         ))
-        // Let the SR1 item complete path schedule translation.
+        // Let the partial RCW1 item enter the bounded private hold buffer.
         try await Task.sleep(nanoseconds: 80_000_000)
-        XCTAssertTrue(translatorEntered,
-                      "precondition: SR1 item completion must start humanize so the gate is live")
 
         let stopStarted = Date()
         coordinator.stopRun(threadId: thread.id)
@@ -833,10 +823,8 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
             recorder.runFinishedCallbacks.contains { $0.0 == thread.id && $0.1 == .cancelled }
         }
         let elapsed = Date().timeIntervalSince(stopStarted)
-        hangGate.signal() // release the hung translator so the Task can exit
-
         XCTAssertLessThan(elapsed, 1.0,
-                          "Stop must finish as cancelled without waiting on hung SR1 humanize (took \(elapsed)s)")
+                          "Stop must finish as cancelled without waiting on a buffered wire prefix (took \(elapsed)s)")
         XCTAssertNil(coordinator.activeRunId(threadId: thread.id),
                      "Stop must release active ownership even when humanize was in flight")
         XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .cancelled)
@@ -901,13 +889,13 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
                        "live run must not receive a terminal fan-out from reconcile")
     }
 
-    /// WHY: finishingRuns was set while final-response SR1 translation ran, but
+    /// WHY: finishingRuns was set while final-response RCW1 rendering ran, but
     /// pendingTerminalEvents was still empty. markStopRequested treated
     /// finishingRuns as durabilityPending and returned without claiming cancel —
-    /// pure no-op Stop until humanize returned.
-    func test_stopRun_duringFinalResponseSR1Translation_claimsCancelImmediately() async throws {
-        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("stop-final-sr1")
-        final class SR1FinalThenHangRunner: AgentProviderRunner, @unchecked Sendable {
+    /// pure no-op Stop until rendering returned.
+    func test_stopRun_duringFinalResponseWireRendering_claimsCancelImmediately() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("stop-final-wire")
+        final class WireFinalThenHangRunner: AgentProviderRunner, @unchecked Sendable {
             let provider: AgentProvider = .claude
             func listModels() async -> [AgentModelDescriptor] { [] }
             func startRun(
@@ -918,30 +906,30 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
                 onEvent(.status(.running))
                 onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
                 onEvent(.event(.turnStarted(turnId: "t-final")))
-                // Provider terminal with SR1 final — triggers finishingRuns + async translate.
+                // Provider terminal with RCW1 final — triggers finishingRuns + async rendering.
                 onEvent(.finished(
                     .completed,
-                    finalMessage: "S: build pass. P: unit tests green.",
+                    finalMessage: "RCW1\tA\t1\nO\tBuild passed\nE\tUnit tests are green\n.\n",
                     providerThreadId: providerThreadId
                 ))
                 return AgentRunHandle(runId: request.runId, process: nil) {}
             }
         }
-        let thread = AgentThread(title: "final sr1 stop", provider: .claude, model: "fake-model")
+        let thread = AgentThread(title: "final wire stop", provider: .claude, model: "fake-model")
         try threadRepo.upsert(thread)
         let coordinator = AgentRunCoordinator(
             runRepo: runRepo,
             messageRepo: messageRepo,
             threadRepo: threadRepo,
             providerSessionRepo: sessionRepo,
-            providers: [.claude: SR1FinalThenHangRunner()]
+            providers: [.claude: WireFinalThenHangRunner()]
         )
         let hangGate = DispatchSemaphore(value: 0)
         var translatorEntered = false
         coordinator.finalResponseTranslator = { response, _, _, _ in
             translatorEntered = true
             hangGate.wait()
-            return "Humanized final: \(response)"
+            return "Rendered final: \(response)"
         }
         let recorder = LifecycleRecorder()
         coordinator.addObserver(recorder)
@@ -954,14 +942,14 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
             provider: .claude,
             model: "fake-model",
             cwd: tmp,
-            prompt: "finish with sr1"
+            prompt: "finish with wire"
         ))
         try await Task.sleep(nanoseconds: 80_000_000)
         XCTAssertTrue(translatorEntered,
-                      "precondition: final SR1 response must enter humanize before Stop")
+                      "precondition: final RCW1 response must enter rendering before Stop")
         // Ownership may still be held while translation runs.
         XCTAssertNotNil(coordinator.activeRunId(threadId: thread.id),
-                        "precondition: final SR1 humanize must still own the run in memory")
+                        "precondition: final RCW1 rendering must still own the run in memory")
 
         let stopStarted = Date()
         coordinator.stopRun(threadId: thread.id)
@@ -972,11 +960,11 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
         hangGate.signal()
 
         XCTAssertLessThan(elapsed, 1.0,
-                          "Stop during final SR1 humanize must not no-op until distill returns")
+                          "Stop during final RCW1 rendering must not no-op until the renderer returns")
         XCTAssertNil(coordinator.activeRunId(threadId: thread.id))
         let terminal = recorder.runFinishedCallbacks.first { $0.0 == thread.id }?.1
         XCTAssertEqual(terminal, .cancelled,
-                       "user Stop during final humanize must publish cancelled, not wait for completed")
+                       "user Stop during final rendering must publish cancelled, not wait for completed")
     }
 }
 

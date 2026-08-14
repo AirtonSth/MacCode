@@ -225,8 +225,9 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertEqual(claude.manifest.sourceRevision, "rev-a")
 
         let codexText = try String(contentsOf: URL(fileURLWithPath: codex.manifest.installPath))
-        XCTAssertTrue(codexText.contains("/distill"))
-        XCTAssertTrue(codexText.contains("S=state"))
+        XCTAssertTrue(codexText.contains("| distill"))
+        XCTAssertTrue(codexText.contains("not a conversation mode or user command"))
+        XCTAssertFalse(codexText.contains("S=state"))
     }
 
     func test_agentSkillInstallerWritesDistillInstructionsIntoProviderConfigFiles() throws {
@@ -245,9 +246,11 @@ final class TokenSaverInstallTests: XCTestCase {
         let grokText = try String(contentsOf: grokInstructions)
         XCTAssertTrue(codexText.contains(AgentSkillInstaller.distillInstructionsBeginMarker))
         XCTAssertTrue(claudeText.contains(AgentSkillInstaller.distillInstructionsEndMarker))
-        XCTAssertTrue(codexText.contains("Use `/distill` dialect for provider turns"))
-        XCTAssertTrue(codexText.contains("managed `distill` CLI"))
-        // CLI recovery language lives in the skill body; on-disk AGENTS.md is the dialect + pipe rules.
+        XCTAssertTrue(codexText.contains("Distill is only for local command/tool-output reduction"))
+        XCTAssertTrue(codexText.contains("not a conversation style or user command"),
+                      "the managed provider config must state that Distill is not a conversation style")
+        XCTAssertTrue(codexText.contains("managed `distill` SKILL.md"))
+        // CLI recovery language lives in the skill body; on-disk AGENTS.md carries only output-pipe rules.
         XCTAssertFalse(codexText.contains(TokenSaverProviderSafetyABI.block))
         XCTAssertFalse(claudeText.contains(TokenSaverProviderSafetyABI.block))
         XCTAssertFalse(grokText.contains(TokenSaverProviderSafetyABI.block),
@@ -256,7 +259,7 @@ final class TokenSaverInstallTests: XCTestCase {
                        "providers must not be instructed to invoke the old TypeScript distill CLI")
         XCTAssertFalse(claudeText.contains("git diff | distill"),
                        "always-loaded provider config should reference the skill instead of carrying examples")
-        XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("git log/status/diff (summaries)"))
+        XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("git log --oneline -50"))
     }
 
     func test_installAppPrivateDistillSkillNeverTouchesProviderHomes() throws {
@@ -312,7 +315,7 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertEqual(alreadyOwnedRuntime.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1,
                        "runtime injection must preserve exactly one ABI when the base already carries it")
 
-        // Token Saver off (no distill hint) → no Distill dialect / safety ABI.
+        // Token Saver off (no distill hint) → no output policy / safety ABI.
         let offRuntime = AgentSkillInstaller.tokenSaverProviderPrompt(
             "provider runtime context",
             environment: [:]
@@ -327,8 +330,7 @@ final class TokenSaverInstallTests: XCTestCase {
         // Token Saver on still protects skill content as a verbatim category while
         // keeping ordinary-output Distill eligibility.
         XCTAssertTrue(runtimePrompt.contains("NEVER Distill skill content"))
-        XCTAssertTrue(runtimePrompt.contains("eligible ordinary")
-                      || runtimePrompt.contains("Good to pipe:"))
+        XCTAssertTrue(runtimePrompt.contains("MANDATORY default-pipe"))
         XCTAssertFalse(runtimePrompt.contains("[[rc:skill"),
                        "skill content must not be represented via recovery handles")
     }
@@ -752,6 +754,72 @@ final class TokenSaverInstallTests: XCTestCase {
         )
     }
 
+    func test_managedProviderAndAgentAppAliasesRepairRecognizedRelocatedBuildTargets() throws {
+        // WHY: isolated builds and app upgrades relocate the native service. A
+        // still-executable old RemoteCode target previously blocked all Agent App
+        // delegation while ordinary Token Saver turns appeared healthy.
+        let home = tempDir()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let oldService = home
+            .appendingPathComponent("old/.build/debug/RemoteCodeDistillService")
+        let activeService = home
+            .appendingPathComponent("new/RemoteCode.app/Contents/MacOS/RemoteCodeDistillService")
+        for service in [oldService, activeService] {
+            try FileManager.default.createDirectory(
+                at: service.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data("#!/bin/sh\nexit 0\n".utf8).write(to: service)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: service.path
+            )
+        }
+        let managedBin = installer.managedCLIBinURL
+        let realProviderBin = home.appendingPathComponent("real-provider-bin")
+        try FileManager.default.createDirectory(at: managedBin, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: realProviderBin, withIntermediateDirectories: true)
+        for name in ["claude", "codex", "grok"] {
+            let realProvider = realProviderBin.appendingPathComponent(name)
+            try Data("#!/bin/sh\nexit 0\n".utf8).write(to: realProvider)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: realProvider.path
+            )
+        }
+        for name in ["claude", "codex", "grok", AgentSkillInstaller.agentAppMiddlewareCommand] {
+            try FileManager.default.createSymbolicLink(
+                at: managedBin.appendingPathComponent(name),
+                withDestinationURL: oldService
+            )
+        }
+
+        let installed = try installer.installProviderProxies(
+            serviceBinaryURL: activeService,
+            searchDirectoriesOverride: [realProviderBin.path]
+        )
+        let agentApp = try XCTUnwrap(
+            try installer.installAgentAppMiddleware(serviceBinaryURL: activeService)
+        )
+
+        XCTAssertEqual(agentApp, managedBin.appendingPathComponent("remote-code"))
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: agentApp.path),
+            activeService.path
+        )
+        XCTAssertEqual(Set(installed), Set(["claude", "codex", "grok"]))
+        for provider in installed {
+            XCTAssertEqual(
+                try FileManager.default.destinationOfSymbolicLink(
+                    atPath: managedBin.appendingPathComponent(provider).path
+                ),
+                activeService.path,
+                "\(provider) must follow the active artifact"
+            )
+        }
+    }
+
     func test_agentSkillInstallerWritesManagedDistillCLIForLocalMacLLM() throws {
         let home = tempDir()
         let appSupport = tempDir()
@@ -830,7 +898,7 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertFalse(text.contains("stale distill instructions"))
         XCTAssertEqual(text.components(separatedBy: AgentSkillInstaller.distillInstructionsBeginMarker).count - 1, 1)
         XCTAssertFalse(text.contains("bun test 2>&1 | distill"))
-        XCTAssertTrue(text.contains("managed `distill` CLI"))
+        XCTAssertTrue(text.contains("managed `distill` SKILL.md"))
     }
 
     func test_agentSkillInstallerUninstallDistillInstructionsRemovesOnlyManagedBlock() throws {

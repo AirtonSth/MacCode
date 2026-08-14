@@ -90,18 +90,17 @@ enum LiveActivitySummary {
 
     // MARK: - Prompt
 
-    /// Envelope for the `.sr1Humanize` distill mode — the only public mode that
-    /// emits free natural language (the others emit compressed S/C/D/R/O/N/P
-    /// lines, which would be unreadable on a Lock Screen).
+    /// Envelope for the local natural-language mode. This path is separate from
+    /// provider wire rendering so Lock Screen text stays independently readable.
     static func prompt(source: Source, targetLanguage: String) -> String {
         """
         TARGET_LANGUAGE: \(targetLanguage)
         USER_FACING_RULES:
         Write exactly one short sentence, at most \(maximumCharacters) characters, saying what the coding agent is doing right now.
         Use plain language. No markdown, no bullet points, no quotes, no prefixes, no labels.
-        Only use facts present in SR1_RESPONSE. Never invent a file, command, or result.
+        Only use facts present in SOURCE_TEXT. Never invent a file, command, or result.
 
-        SR1_RESPONSE:
+        SOURCE_TEXT:
         \(source.text)
         """
     }
@@ -109,11 +108,8 @@ enum LiveActivitySummary {
     // MARK: - Output guard
 
     // PERF: sanitized runs on every accepted model caption before Lock Screen
-    // publish and recompiled whitespace + dialect-prefix patterns each call.
+    // publish and previously recompiled the whitespace pattern each call.
     private static let multiWhitespaceRegex = try! NSRegularExpression(pattern: #"\s+"#)
-    private static let compressedDialectPrefixRegex = try! NSRegularExpression(
-        pattern: #"^[SCDRONP]\s"#
-    )
 
     private static func replaceAll(
         _ regex: NSRegularExpression,
@@ -152,15 +148,12 @@ enum LiveActivitySummary {
         // Verbatim passthrough means the model never ran (or was bypassed).
         if line == source.text.trimmingCharacters(in: .whitespacesAndNewlines) { return nil }
 
-        // Compressed-dialect output and leaked scaffolding are not prose.
+        // Internal transport and leaked model scaffolding are not prose.
         let lowered = line.lowercased()
-        for marker in ["sr1_response", "target_language", "user_facing_rules", "<think>", "output:", "dict:"] {
+        for marker in ["<think>", "output:"] {
             if lowered.contains(marker) { return nil }
         }
-        let lineRange = NSRange(location: 0, length: (line as NSString).length)
-        if compressedDialectPrefixRegex.firstMatch(in: line, options: [], range: lineRange) != nil {
-            return nil
-        }
+        if lowered.hasPrefix("rcw1 ") { return nil }
 
         // Strip wrapping quotes the model sometimes adds despite the rules.
         if line.count > 1, line.hasPrefix("\""), line.hasSuffix("\"") {

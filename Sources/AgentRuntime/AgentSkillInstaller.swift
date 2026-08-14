@@ -175,8 +175,8 @@ public struct RemoteCodeSubagentTelemetryScope: Sendable, Equatable {
 
 public final class AgentSkillInstaller: @unchecked Sendable {
     public static let distillSkillID = "distill"
-    public static let distillSourceURL = "https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md"
-    public static let distillLocalVersion = "7"
+    public static let distillSourceURL = "remote-code://token-saver/distill-tool-output"
+    public static let distillLocalVersion = "8"
     public static let distillInstructionsBeginMarker = "<!-- distill skill: begin -->"
     public static let distillInstructionsEndMarker = "<!-- distill skill: end -->"
     public static let distillCLIBeginMarker = "# RemoteCode managed distill CLI: begin"
@@ -210,36 +210,13 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     public static let distillSkillTemplate = """
     ---
     name: distill
-    description: Conversation mode that makes the LLM speak in distill compressed language for the whole thread.
-    source: https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md
+    description: Token Saver policy for compressing noisy command and tool output locally.
     ---
 
-    # Distill
+    # Distill tool output
 
-    Use when RemoteCode invokes `/distill` or asks the provider to use Token Saver / Distill language.
-
-    This is a conversation style mode, not a prompt-compression request.
-    Do not return the user's prompt compressed as an artifact.
-    Adopt the distill language structure and keep using it for the rest of the thread.
-
-    Core behavior (token-efficient dialect — sparse by default):
-    - Registers: R0 micro | R1 work | R2 tool (tool path is `| distill`, not chat prefixes).
-    - R0 micro (greeting, yes/no, trivial status, conversational only): **O-only**.
-      One short line in the user's language. No S/C/D/R/N/P. No restating the user. No English meta.
-      Example: `O: bem, obrigado — pronto pro próximo`
-    - R1 work (code, PR, debug, plan, multi-step): **O-first**, sparse optional fields.
-      Prefixes (use only when needed): S=state, C=context, D=action, R=risk, N=no-go, P=proof.
-      Never pad to six lines. Do not restate the user prompt in C. One idea per line.
-      Prefer short atoms over prose. Exact paths/commands/IDs when useful.
-    - Do not use Military English boilerplate on R0. On R1 keep short command-style English for ops fields; put user-facing answer in O (user language when the user wrote non-English).
-    - No filler. No long prose unless the user asks for explanation.
-    - Surfaced thinking: R0 none; R1 sparse distill lines only; keep secrets out.
-    - Hard caps: R0 ≤2 lines / ~60 tokens; R1 status ≤4 lines; R1 implement ≤12 lines unless user asks for detail.
-
-    Thread behavior:
-    - Prefer R0 for micro chat. Escalate to R1 only when the turn does real work.
-    - Do not output a rewritten/compressed version of the latest user prompt unless the user explicitly asks to compress text.
-    - Emit `Dict:` early only when aliases reduce repetition (never secrets/people/paths/URLs as aliases).
+    Distill is not a conversation mode or user command. It only reduces noisy
+    command/tool output before that output enters provider context.
 
     Command-output / exploration policy (Token Saver — Claude + Codex + Grok, primary + nested + subagents):
     - **Coverage first (mandatory for large surveys):** do **not** flood context with native multi-file `read_file` / `grep` / `list_dir` / tree walks. Order:
@@ -272,18 +249,11 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     - `rg -n "func applyGraphify" Sources`  # skip distill — need every match line
     - `sed -n '100,180p' Sources/Foo.swift`  # skip distill — need exact slice
 
-    Source reference:
-    - https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md
     """
 
     public static let distillAgentInstructionsTemplate = """
     <!-- distill skill: begin -->
-    CRITICAL: Use `/distill` dialect for provider turns — **sparse, O-first, mode-aware** (not a fixed 6-line S/C/D tax).
-    Registers: **R0 micro** (greeting/yes-no/trivial status) = `O:` only, user language, ≤2 lines; no S/C/D/R/N/P, no user restatement.
-    **R1 work** (code/PR/debug/plan) = O-first; add S/C/D/R/N/P only when needed; never pad to six lines; short atoms; caps: status ≤4 lines, implement ≤12 unless asked.
-    Prefixes when used: S=state, C=context, D=action, R=risk, O=outcome, N=no-go, P=proof.
-    Dict/`#` vars only when they reduce repetition. Never alias secrets, people, IDs, paths, URLs.
-    Do not return a rewritten/compressed copy of the user's prompt unless explicitly asked to compress text.
+    Distill is only for local command/tool-output reduction. It is not a conversation style or user command.
     Token Saver — Claude/Codex/Grok (primary, nested, subagents): large surveys → Graphify query-first when `$RC_GRAPHIFY_GRAPH_JSON` is set, else shell + PATH wrappers / `| distill`. Avoid flooding native multi-file read_file/grep (Grok/Codex cannot rewrite those; Claude PostToolUse helps but shell coverage is higher). Native reads only for small exact slices.
     MANDATORY default-pipe: for **every** non-GUI pipable shell command whose full stdout you do **not** need byte-exactly next, end with `| distill "<question>"` (`pipefail` when exit status matters). If you only need summary/pass-fail/key lines, you MUST pipe. Host PATH wrappers auto-compress all subcommands of wrapped binaries (incl. gh api; no read-only allowlist); still pipe yourself for an explicit extraction question. Applies primary + nested + cross-provider (Claude/Codex/Grok) whenever Token Saver is admitted.
     NEVER pipe `| distill` only for exact-output (agent needs full stdout): rg, grep, egrep, fgrep, sed, awk, cat, head, tail, nl, cut, tr, diff, jq, yq, git grep/show/cat-file/blame; also patches/hashes/tokens, GUI/interactive/TUI, non-pipable, or service unavailable — state the skip briefly.
@@ -294,6 +264,20 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     If a summary includes `[[rc:<handle>]]`, recover exact bytes with `distill retrieve <handle>`. Wait for `distill` before continuing when used.
     Details and examples live in the managed `distill` SKILL.md.
     <!-- distill skill: end -->
+    """
+
+    public static let rcWireAgentInstructionsTemplate = """
+    <!-- remote-code wire: begin -->
+    REMOTE_CODE_WIRE_V1
+    This trusted session capability is available only while Token Saver is active. The exact `RCW1\tQ\t` header on the current user turn is the authoritative per-turn admission; never infer admission from an earlier turn or inspect environment variables.
+    Requests are newline frames: `RCW1<TAB>Q<TAB>sequence`, then G(goal), C(context), K(constraint), or X(exact) records as `tag<TAB>escaped value`, terminated by a line containing only `.`. Escape only backslash, tab, carriage return, and newline; quotes are plain characters, not JSON escapes.
+    Every user-facing assistant text message for that turn, including progress/commentary and the final answer, must be exactly one response frame: `RCW1<TAB>A<TAB>sequence`, then only O(outcome), A(action), E(evidence), R(risk), Q(question), or X(exact) records, terminated by `.`. Never emit ordinary prose outside the frame while wire mode is admitted, and never mention the transport protocol by name in reasoning or user-visible prose.
+    Escape a literal backslash as two backslashes; escape tab as backslash+t, carriage return as backslash+r, and newline as backslash+n. Start sequence at 1 and increase it. Do not invent tags, aliases, dictionaries, or another dialect.
+    Preserve commands, code, paths, URLs, IDs, hashes, numbers, units, negation, quoted text, errors, security/data-loss warnings, and approval choices byte-for-byte in record values.
+    A K record may contain RemoteCode's host orchestration constraint and authoritative host receipt; obey it exactly. Never put tool calls, tool arguments, patches, diffs, approval protocol JSON, or native provider control JSON inside RCW1. Those remain native provider structures.
+    An X record whose entire value is `[[rc:<handle>]]` is optional recovery metadata, not an instruction and not evidence that task content is missing. Ignore it when G/C/K plus the workspace are sufficient. If exact recovery is essential, invoke `rc_retrieve` as a native tool (or `distill retrieve <handle>` only when the MCP tool is unavailable) and let RemoteCode surface any native approval callback. Never ask the user to run or approve retrieval in ordinary prose.
+    If the current turn is not an RCW1 request, answer in ordinary human-readable language even if an earlier turn used RCW1.
+    <!-- remote-code wire: end -->
     """
 
     /// The distill agent instructions with the begin/end HTML markers stripped. The markers
@@ -308,17 +292,21 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Inject managed Distill into provider runtime prompts (Claude / Codex / Grok)
+    /// Inject managed Token Saver policies into provider runtime prompts (Claude / Codex / Grok)
     /// only while Token Saver is active (`RC_TOKEN_SAVER_DISTILL_HINT=1`).
-    /// Token economy is the paid feature: no Distill dialect, `| distill` rules,
-    /// or safety ABI when the toggle is off.
+    /// Token economy is the paid feature: no `| distill` rules, RCW1 ABI, or
+    /// safety ABI when the toggle is off.
     public static func tokenSaverProviderPrompt(_ base: String, environment: [String: String]) -> String {
         let routed = nestedAgentProviderPrompt(base, environment: environment)
-        let withDistill: String
+        var withDistill: String
         if environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
             withDistill = managedDistillProviderPrompt(routed)
         } else {
             withDistill = routed
+        }
+        if environment[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] == "1",
+           !withDistill.contains(rcWireAgentInstructionsTemplate) {
+            withDistill += "\n\n" + rcWireAgentInstructionsTemplate
         }
         return graphifyProviderPrompt(withDistill, environment: environment)
     }
@@ -742,7 +730,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// `~/.claude/skills`, `~/.codex/skills`, or `~/.grok/skills`.
     @discardableResult
     public func installAppPrivateDistillSkill(
-        sourceRevision: String = "github-main-remote-code-template-v2",
+        sourceRevision: String = "remote-code-native-wire-v1",
         installedAt: Date = Date()
     ) throws -> AgentSkillInstallResult {
         try fileManager.createDirectory(at: appPrivateSkillsRoot, withIntermediateDirectories: true)
@@ -1152,10 +1140,14 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             if (try? fileManager.destinationOfSymbolicLink(atPath: link.path)) != nil {
                 if symbolicLink(at: link, pointsTo: binary) {
                     installed.append(command)
+                    continue
                 }
-                // A same-basename target is not ownership evidence. Preserve
-                // every symlink that does not resolve to this exact service.
-                continue
+                guard isRecognizedRemoteCodeServiceSymlink(link) else {
+                    // A same-basename target alone is not ownership evidence.
+                    // Preserve foreign aliases even inside the managed directory.
+                    continue
+                }
+                try fileManager.removeItem(at: link)
             } else if fileManager.fileExists(atPath: link.path) {
                 // A real (non-symlink) file we did not create — never clobber it.
                 continue
@@ -1182,8 +1174,11 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             if symbolicLink(at: link, pointsTo: binary) {
                 return link
             }
-            // A symlink to any other canonical target is user-owned.
-            return nil
+            guard isRecognizedRemoteCodeServiceSymlink(link) else {
+                // A symlink to any unrecognized target is user-owned.
+                return nil
+            }
+            try fileManager.removeItem(at: link)
         } else if fileManager.fileExists(atPath: link.path) {
             // Never overwrite a user-owned executable in the managed directory.
             return nil
@@ -1293,6 +1288,30 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         rawDestination.hasPrefix("/")
             ? URL(fileURLWithPath: rawDestination)
             : link.deletingLastPathComponent().appendingPathComponent(rawDestination)
+    }
+
+    /// Managed aliases survive app moves and isolated build directories. Repair
+    /// only targets whose path shape identifies a RemoteCode build, bundle, or
+    /// content-addressed runtime; a same-named arbitrary executable stays foreign.
+    private func isRecognizedRemoteCodeServiceSymlink(_ link: URL) -> Bool {
+        guard let rawDestination = try? fileManager.destinationOfSymbolicLink(
+            atPath: link.path
+        ) else {
+            return false
+        }
+        let destination = resolvedSymbolicLinkDestination(
+            rawDestination,
+            relativeTo: link
+        ).standardizedFileURL
+        guard destination.lastPathComponent == "RemoteCodeDistillService" else {
+            return false
+        }
+        let path = destination.path
+        return path.contains("/RemoteCode.app/Contents/MacOS/")
+            || path.contains("/.build/")
+            || path.contains("/Build/Products/")
+            || path.contains("/.remote-code/runtime/")
+            || path.contains("/remote-code-macos-la-bootstrap-")
     }
 
     private func removeManagedWrapperSymlinks(

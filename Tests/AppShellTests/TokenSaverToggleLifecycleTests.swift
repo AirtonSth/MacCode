@@ -263,15 +263,15 @@ final class TokenSaverToggleLifecycleTests: XCTestCase {
             ).isEmpty,
             "a persisted ON request must not emit paid capabilities after entitlement loss"
         )
-        let sr1AfterLapse = await fixture.context.tokenSaverHumanizeSR1Response(
+        let wireAfterLapse = await fixture.context.tokenSaverRenderWireResponse(
             "C1:#g1=\"secret\";R:#g1",
             provider: .codex,
             threadId: thread.id
         )
         XCTAssertEqual(
-            sr1AfterLapse,
+            wireAfterLapse,
             "C1:#g1=\"secret\";R:#g1",
-            "SR1 fallback is a paid mutation and must be bypassed after entitlement loss"
+            "wire rendering is a paid mutation and must be bypassed after entitlement loss"
         )
         XCTAssertEqual(fixture.context.tokenSaverDistillServiceController.status, .notStarted)
         XCTAssertFalse(GraphifyWorkspaceService.shared.enabled)

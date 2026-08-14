@@ -1250,14 +1250,16 @@ public final class DistillHTTPServer: @unchecked Sendable {
         case .commandOutput: return "command-output"
         case .longText: return "longText"
         case .watchSummary: return "watchSummary"
-        case .sr1Humanize: return "sr1-humanize"
+        case .wireEncode: return "wire-encode"
+        case .wireRenderEnglish: return "wire-render-english"
+        case .naturalLanguage: return "natural-language"
         }
     }
 
     private static func savingsAttributability(for mode: DistillMode) -> String {
         switch mode {
-        case .longText: return "prompt_bound"
-        case .commandOutput, .watchSummary, .sr1Humanize: return "not_prompt_bound"
+        case .longText, .wireEncode: return "prompt_bound"
+        case .commandOutput, .watchSummary, .wireRenderEnglish, .naturalLanguage: return "not_prompt_bound"
         }
     }
 
@@ -1267,7 +1269,9 @@ public final class DistillHTTPServer: @unchecked Sendable {
         case .commandOutput: return "tool_output_oneshot"
         case .longText: return "prompt"
         case .watchSummary: return "watch"
-        case .sr1Humanize: return "sr1_humanize"
+        case .wireEncode: return "wire_encode"
+        case .wireRenderEnglish: return "wire_render_english"
+        case .naturalLanguage: return "natural_language"
         }
     }
 
@@ -1436,10 +1440,17 @@ public final class DistillHTTPServer: @unchecked Sendable {
                         // PERF: one UTF-8 materialization for prepare + readback equality
                         // on lossy optimize outputs (can be multi-KB/MB).
                         let originalBytes = Data(distillRequest.input.utf8)
+                        let recoveryLane: String
+                        switch distillRequest.mode {
+                        case .commandOutput: recoveryLane = "deterministic_wrapper"
+                        case .wireEncode: recoveryLane = "wire-encode"
+                        case .wireRenderEnglish: recoveryLane = "wire-render-english"
+                        case .longText, .watchSummary, .naturalLanguage: recoveryLane = "semantic_prose"
+                        }
                         let preparation = try scopedRecoveryStore.prepareOriginal(
                             originalBytes,
                             context: scopedContext,
-                            lane: distillRequest.mode == .commandOutput ? "deterministic_wrapper" : "semantic_prose"
+                            lane: recoveryLane
                         )
                         guard preparation.readBackVerified,
                               try scopedRecoveryStore.retrieveOriginal(

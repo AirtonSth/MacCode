@@ -830,7 +830,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
 
     /// `session/load` replay for recoverSession: keep history for `readThread`
     /// without pushing into the live `onEvent` path (avoids durable stream
-    /// pollution / SR1 re-translation of historical text).
+    /// pollution / wire re-rendering of historical text).
     private func recordHydratedTimeline(method: String, params: Any?, session: Session) {
         guard method == "session/update",
               let params = params as? [String: Any],

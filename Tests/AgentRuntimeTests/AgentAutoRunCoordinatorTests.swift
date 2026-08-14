@@ -571,6 +571,90 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
                        "successful retry must clear pending finalization exactly once")
     }
 
+    func testAutoWireCompressesOnlyHumanPromptAndPreservesHostReceiptAcrossEveryProvider() async throws {
+        // WHY: Auto used to wrap the user text before Token Saver ran. The local
+        // encoder then saw orchestration prose instead of the human request and
+        // failed open on the default UI path. Every provider must receive the
+        // same byte-zero RCW1 frame plus its exact admitted host receipt.
+        for provider in [AgentProvider.claude, .codex, .grok] {
+            let (db, root) = try database()
+            defer { try? FileManager.default.removeItem(atPath: root) }
+            let threadRepo = AgentThreadRepository(db: db)
+            let messageRepo = AgentMessageRepository(db: db)
+            let runRepo = AgentRunRepository(db: db)
+            let runtime = AgentOrchestrationRuntime(
+                repository: AgentOrchestrationRepository(db: db),
+                packageVerification: { true },
+                killSwitch: { false }
+            )
+            let instanceID = "\(provider.rawValue)-live"
+            let configuration = AgentRoutingConfiguration(
+                mode: .auto,
+                manualSelection: AgentModelSelection(
+                    provider: provider,
+                    modelId: "test-model",
+                    reasoningEffort: .medium,
+                    serviceTier: .auto
+                ),
+                manualProviderInstanceId: instanceID,
+                eligibleProviders: [provider],
+                policyDigest: runtime.policyDigest,
+                revision: 1
+            )
+            let thread = AgentThread(
+                title: "auto-wire-\(provider.rawValue)",
+                provider: provider,
+                model: "test-model",
+                routingConfiguration: configuration
+            )
+            try threadRepo.upsert(thread)
+            let runner = RecordingProviderRunner(provider: provider)
+            let snapshot = liveSnapshot(provider: provider, model: "test-model")
+            let coordinator = AgentRunCoordinator(
+                runRepo: runRepo,
+                messageRepo: messageRepo,
+                threadRepo: threadRepo,
+                orchestrationRuntime: runtime,
+                providerSnapshotSupplier: { [snapshot] in [snapshot] },
+                providers: [provider: runner]
+            )
+            let humanPrompt = "Analyze this detailed reliability report and propose the smallest safe fix."
+            coordinator.promptCompressor = { prompt, selectedProvider, selectedThread, runID in
+                XCTAssertEqual(prompt, humanPrompt,
+                               "\(provider.rawValue) must encode only the human-authored text")
+                XCTAssertEqual(selectedProvider, provider)
+                XCTAssertEqual(selectedThread, thread.id)
+                XCTAssertNotNil(runID)
+                return "RCW1\tQ\t1\nG\tAnalyze the reliability report; propose the smallest safe fix.\n.\n"
+            }
+
+            _ = try await coordinator.startRun(AgentRunRequest(
+                threadId: thread.id,
+                provider: provider,
+                providerInstanceId: instanceID,
+                model: "test-model",
+                cwd: root,
+                prompt: humanPrompt,
+                userMessageContent: humanPrompt
+            ))
+
+            let dispatched = try XCTUnwrap(runner.lastRequest)
+            XCTAssertTrue(dispatched.prompt.hasPrefix("RCW1\tQ\t1\n"),
+                          "\(provider.rawValue) must keep the wire sentinel at byte zero")
+            XCTAssertEqual(dispatched.environment["RC_TOKEN_SAVER_WIRE_VERSION"], "1")
+            let frame = try XCTUnwrap(RCWireProtocol.parse(dispatched.prompt).first)
+            XCTAssertEqual(frame.records.first?.kind, .goal)
+            let control = try XCTUnwrap(frame.records.last(where: { $0.kind == .constraint })?.value)
+            XCTAssertTrue(control.contains("provider=\(provider.rawValue)"))
+            XCTAssertTrue(control.contains("provider_instance_id=\(instanceID)"))
+            XCTAssertTrue(control.contains("Run $remote-code-orchestrate"))
+            XCTAssertEqual(dispatched.userMessageContent, humanPrompt,
+                           "\(provider.rawValue) transcript must remain canonical human text")
+            XCTAssertFalse(dispatched.prompt.contains(humanPrompt),
+                           "\(provider.rawValue) must not duplicate the original prompt in the wire envelope")
+        }
+    }
+
     func testAutoDeadlineCancelsAnActiveProviderAndFinalizesItsReceipt() async throws {
         let (db, root) = try database()
         defer { try? FileManager.default.removeItem(atPath: root) }

@@ -197,23 +197,25 @@ final class AgentAppPerfBundleTests: XCTestCase {
                                  "one batched provider token burst must not publish one SwiftUI invalidation per token; that was the long-run typing/scrolling slowdown")
     }
 
-    /// SR1 translation badges must still update after stream events are applied in
+    /// Token Saver badges must still update after wire events are applied in
     /// bulk. This protects the user-visible "View original" affordance while the
     /// stream flush avoids publishing empty/no-op badge state on every token.
-    func test_streamEventBatch_updatesSR1TranslationBadgeStateAfterBulkTimelineApply() async throws {
+    func test_streamEventBatch_updatesTokenSaverBadgeStateAfterBulkTimelineApply() async throws {
         let (vm, _) = try makeVM()
-        vm.createThread(title: "sr1 translation")
+        vm.createThread(title: "wire translation")
         let tid = try XCTUnwrap(vm.selectedThreadId)
         let runId = AgentRunID()
         let messageId = AgentMessageID()
-        let original = "S=state D=patch P=tests"
+        let original = "RCW1\tA\t1\nO\tState, patch, tests.\n.\n"
+        let request = "RCW1\tQ\t1\nG\tInspect and report.\n.\n"
 
         vm.runCoordinator(
             vm.coordinator,
-            didReceive: .sr1Translation(AssistantSR1Translation(
+            didReceive: .wireTranslation(AssistantWireTranslation(
                 messageId: messageId.value.uuidString,
                 originalText: original,
-                rewrittenText: "State, patch, tests."
+                rewrittenText: "State, patch, tests.",
+                wireRequestText: request
             )),
             run: runId,
             threadId: tid
@@ -221,26 +223,28 @@ final class AgentAppPerfBundleTests: XCTestCase {
 
         await Task.yield()
 
-        XCTAssertTrue(vm.sr1TranslatedMessageIds.contains(messageId),
-                      "batched stream flush must still mark SR1-translated messages so the transcript shows the translation badge")
-        XCTAssertEqual(vm.sr1OriginalText(for: messageId), original,
+        XCTAssertTrue(vm.tokenSaverOptimizedMessageIds.contains(messageId),
+                      "batched stream flush must still mark wire-rendered messages so the transcript shows the badge")
+        XCTAssertEqual(vm.tokenSaverOriginalText(for: messageId), original,
                        "batched stream flush must preserve the original compressed text for the View original disclosure")
+        XCTAssertEqual(vm.tokenSaverWireRequestText(for: messageId), request,
+                       "the disclosure must expose exactly what RemoteCode sent while keeping the human prompt canonical")
     }
 
-    func test_sr1PublishedCacheDropsTranslationsEvictedByHotBudget() throws {
+    func test_tokenSaverPublishedCacheDropsTranslationsEvictedByHotBudget() throws {
         let (vm, _) = try makeVM()
         var state = AssistantTimelineState()
         let text = String(repeating: "s", count: 100_000)
         for _ in 0..<50 {
             let messageID = AgentMessageID()
-            state.apply(.sr1Translation(AssistantSR1Translation(
+            state.apply(.wireTranslation(AssistantWireTranslation(
                 messageId: messageID.value.uuidString,
                 originalText: text,
                 rewrittenText: text
             )))
         }
-        vm.refreshSR1TranslationStateFromTimeline(state)
-        let before = vm.sr1TranslatedMessageIds
+        vm.refreshTokenSaverOptimizationStateFromTimeline(state)
+        let before = vm.tokenSaverOptimizedMessageIds
         XCTAssertEqual(before.count, 50)
 
         // Production aggregateHotTextByteLimit is now 32 MiB, so this small fixture no
@@ -248,16 +252,16 @@ final class AgentAppPerfBundleTests: XCTestCase {
         // 8 MiB budget (mirrors test_timelineAggregateBudgetIncludesRequestsInputsPlansAndWorkLog).
         let testBudget = 8 * 1_024 * 1_024
         state.enforceAggregateHotTextBudget(byteLimit: testBudget)
-        vm.refreshSR1TranslationStateFromTimeline(state)
+        vm.refreshTokenSaverOptimizationStateFromTimeline(state)
 
-        let retained = Set(state.sr1TranslationsByMessageId.keys.compactMap(UUID.init(uuidString:)).map(AgentMessageID.init))
-        XCTAssertEqual(vm.sr1TranslatedMessageIds, retained,
+        let retained = Set(state.tokenSaverTranslationsByMessageId.keys.compactMap(UUID.init(uuidString:)).map(AgentMessageID.init))
+        XCTAssertEqual(vm.tokenSaverOptimizedMessageIds, retained,
                        "published badges must be an exact projection of the budgeted timeline")
-        XCTAssertTrue(vm.sr1TranslatedMessageIds.isStrictSubset(of: before),
+        XCTAssertTrue(vm.tokenSaverOptimizedMessageIds.isStrictSubset(of: before),
                       "translations evicted by the 8 MiB budget must not remain in a duplicate cache")
-        XCTAssertEqual(Set(vm.sr1OriginalTextsByMessageId.keys), retained)
+        XCTAssertEqual(Set(vm.tokenSaverOriginalTextsByMessageId.keys), retained)
         XCTAssertLessThanOrEqual(
-            vm.sr1OriginalTextsByMessageId.values.reduce(0) { $0 + $1.utf8.count },
+            vm.tokenSaverOriginalTextsByMessageId.values.reduce(0) { $0 + $1.utf8.count },
             testBudget
         )
     }
@@ -1214,29 +1218,29 @@ final class AgentAppPerfBundleTests: XCTestCase {
         XCTAssertEqual(empty.nextOps, 1)
     }
 
-    // MARK: - SR1 publish skip
+    // MARK: - Token Saver publish skip
 
-    /// WHY: the skip exists to avoid rebuilding the published SR1 sets on every
+    /// WHY: the skip exists to avoid rebuilding the published Token Saver sets on every
     /// token. It is only safe while it is a strict superset of the cases where
-    /// refreshSR1TranslationStateFromTimeline can change state — in particular the
+    /// refreshTokenSaverOptimizationStateFromTimeline can change state — in particular the
     /// eviction path, where the timeline is already empty but the published cache
     /// still holds badges that MUST be cleared.
-    func test_shouldPublishSR1State_skipsOnlyWhenRepublishIsANoOp() {
+    func test_shouldPublishTokenSaverOptimizationState_skipsOnlyWhenRepublishIsANoOp() {
         let empty = AssistantTimelineState()
         XCTAssertFalse(
-            AgentAppViewModel.shouldPublishSR1State(
+            AgentAppViewModel.shouldPublishTokenSaverOptimizationState(
                 timeline: empty, publishedIds: [], publishedOriginals: [:]
             ),
             "both sides empty is the pure-token path and must skip"
         )
 
         var translated = AssistantTimelineState()
-        translated.apply(.sr1Translation(AssistantSR1Translation(
+        translated.apply(.wireTranslation(AssistantWireTranslation(
             messageId: UUID().uuidString, originalText: "o", rewrittenText: "r"
         )))
-        XCTAssertFalse(translated.sr1TranslationsByMessageId.isEmpty)
+        XCTAssertFalse(translated.tokenSaverTranslationsByMessageId.isEmpty)
         XCTAssertTrue(
-            AgentAppViewModel.shouldPublishSR1State(
+            AgentAppViewModel.shouldPublishTokenSaverOptimizationState(
                 timeline: translated, publishedIds: [], publishedOriginals: [:]
             ),
             "a new translation must always publish"
@@ -1246,25 +1250,25 @@ final class AgentAppPerfBundleTests: XCTestCase {
         // published badges are still live and have to be cleared.
         let stale = AgentMessageID(UUID())
         XCTAssertTrue(
-            AgentAppViewModel.shouldPublishSR1State(
+            AgentAppViewModel.shouldPublishTokenSaverOptimizationState(
                 timeline: empty, publishedIds: [stale], publishedOriginals: [:]
             ),
             "budget-evicted translations must still clear the published id set"
         )
         XCTAssertTrue(
-            AgentAppViewModel.shouldPublishSR1State(
+            AgentAppViewModel.shouldPublishTokenSaverOptimizationState(
                 timeline: empty, publishedIds: [], publishedOriginals: [stale: "o"]
             ),
             "budget-evicted translations must still clear the published originals"
         )
 
         var itemOnly = AssistantTimelineState()
-        itemOnly.apply(.sr1Translation(AssistantSR1Translation(
+        itemOnly.apply(.wireTranslation(AssistantWireTranslation(
             itemId: "item", originalText: "o", rewrittenText: "r"
         )))
-        XCTAssertFalse(itemOnly.sr1TranslationsByItemId.isEmpty)
+        XCTAssertFalse(itemOnly.tokenSaverTranslationsByItemId.isEmpty)
         XCTAssertTrue(
-            AgentAppViewModel.shouldPublishSR1State(
+            AgentAppViewModel.shouldPublishTokenSaverOptimizationState(
                 timeline: itemOnly, publishedIds: [], publishedOriginals: [:]
             ),
             "item-scoped translations must not be silently dropped by the guard"
@@ -1294,25 +1298,25 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
     }
 
-    /// WHY: `aggregateBudgetDecision` and `shouldPublishSR1State` are pure and
+    /// WHY: `aggregateBudgetDecision` and `shouldPublishTokenSaverOptimizationState` are pure and
     /// individually tested, but the invariant that actually protects the hot-text
     /// ceiling lives in their COMPOSITION inside `commitStreamQuantum`: the
     /// counter must be written back, and the budget walk must run BEFORE the
     /// publish guard reads the timeline. A regression that drops
     /// `streamAggregateBudgetOps = budget.nextOps`, or swaps the two blocks, would
     /// leave both unit tests green. This drives the real method.
-    func test_commitStreamQuantum_coalescesWalkThenPublishesEvictedSR1State() throws {
+    func test_commitStreamQuantum_coalescesWalkThenPublishesEvictedTokenSaverState() throws {
         let (vm, _) = try makeVM()
         vm.aggregateHotTextByteLimitForTesting = 4_000
 
-        // A timeline holding one SR1 translation, well under the lowered ceiling.
+        // A timeline holding one wire translation, well under the lowered ceiling.
         let messageId = UUID().uuidString
         var small = AssistantTimelineState()
-        small.apply(.sr1Translation(AssistantSR1Translation(
+        small.apply(.wireTranslation(AssistantWireTranslation(
             messageId: messageId, originalText: "original", rewrittenText: "rewritten"
         )))
         vm.commitStreamQuantum(reducedQuantum(timeline: small, force: true))
-        XCTAssertEqual(vm.sr1TranslatedMessageIds.count, 1,
+        XCTAssertEqual(vm.tokenSaverOptimizedMessageIds.count, 1,
                        "a committed translation must publish its badge")
         XCTAssertEqual(vm.streamAggregateBudgetOpsForTesting, 0,
                        "a forced walk must reset the coalescing counter")
@@ -1335,9 +1339,9 @@ final class AgentAppPerfBundleTests: XCTestCase {
         // The oversize must live in the TRANSLATION itself: enforceAggregateHotTextBudget
         // clears item bodies first and returns as soon as it is back under the
         // ceiling, so a large item body would be freed without ever reaching the
-        // sr1Translations eviction loops.
+        // compatibility-backed translation eviction loops.
         var oversized = AssistantTimelineState()
-        oversized.apply(.sr1Translation(AssistantSR1Translation(
+        oversized.apply(.wireTranslation(AssistantWireTranslation(
             messageId: messageId,
             originalText: String(repeating: "o", count: 10_000),
             rewrittenText: String(repeating: "r", count: 10_000)
@@ -1346,11 +1350,11 @@ final class AgentAppPerfBundleTests: XCTestCase {
                              "fixture must actually exceed the lowered ceiling")
 
         vm.commitStreamQuantum(reducedQuantum(timeline: oversized, force: true))
-        XCTAssertTrue(vm.timeline.sr1TranslationsByMessageId.isEmpty,
+        XCTAssertTrue(vm.timeline.tokenSaverTranslationsByMessageId.isEmpty,
                       "the budget walk must evict translations over the ceiling")
-        XCTAssertTrue(vm.sr1TranslatedMessageIds.isEmpty,
+        XCTAssertTrue(vm.tokenSaverOptimizedMessageIds.isEmpty,
                       "walk-then-publish order must clear badges evicted in the same commit")
-        XCTAssertTrue(vm.sr1OriginalTextsByMessageId.isEmpty,
+        XCTAssertTrue(vm.tokenSaverOriginalTextsByMessageId.isEmpty,
                       "evicted originals must not survive in the published cache")
     }
 
@@ -1824,8 +1828,8 @@ final class AgentAppPerfBundleTests: XCTestCase {
 
         // When evaluated, hide set recomputes for equal-length content swaps
         // (multi-item combined live answer — same path as production hide).
-        // Avoid SR1 semantic prefixes (S/C/D/R/O/N/P) so neither body is
-        // filtered as dialect. Single-item live body that equals persisted is
+        // Plain prose keeps this fixture outside the wire prefix path. Single-item
+        // live body that equals persisted is
         // intentionally *not* hidden; multi-item join is.
         let contentA = "hello there friendx"
         let contentB = "hello there buddyyy" // same UTF-8 length, different text

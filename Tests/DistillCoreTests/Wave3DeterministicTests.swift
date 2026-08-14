@@ -111,7 +111,7 @@ final class Wave3DeterministicTests: XCTestCase {
         let recorder = DistillServiceMetricsRecorder()
         await recorder.recordRoute(.init(lane: .commandOutput, stage: .deterministic, wallClockMilliseconds: 3))
         await recorder.recordRoute(.init(lane: .longText, stage: .encoderBERT, wallClockMilliseconds: 50))
-        await recorder.recordRoute(.init(lane: .sr1Humanize, stage: .llmMLX, wallClockMilliseconds: 1500))
+        await recorder.recordRoute(.init(lane: .wireEncode, stage: .llmMLX, wallClockMilliseconds: 1500))
         await recorder.recordEncoderMetrics(.init(invocations: 10, accepts: 7, fallbacks: 3, failures: 0, deadlineTimeouts: 1, disabled: false))
 
         let m = await recorder.snapshot(activeRequests: 0, maxConcurrentRequests: 4)

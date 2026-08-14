@@ -10,6 +10,26 @@ import os
 // through the unified logging system, keyed by thread/run ids.
 private let agentRunLog = Logger(subsystem: "io.remotecode.agent", category: "run")
 
+/// Resolves an async translator/timeout race exactly once without structured
+/// concurrency waiting for the losing task. A local model can block in native
+/// code and ignore cancellation; the provider turn still has to complete.
+private final class FirstStringContinuation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<String, Never>?
+
+    init(_ continuation: CheckedContinuation<String, Never>) {
+        self.continuation = continuation
+    }
+
+    func resume(returning value: String) {
+        let pending = lock.withLock { () -> CheckedContinuation<String, Never>? in
+            defer { continuation = nil }
+            return continuation
+        }
+        pending?.resume(returning: value)
+    }
+}
+
 private final class PendingProviderStart: @unchecked Sendable {
     let runId: AgentRunID
     let acceptancePermit: AgentRunAcceptancePermit
@@ -388,6 +408,7 @@ public struct TokenSaverExecutionReceipt: Codable, Sendable, Equatable {
 public enum TokenSaverExecutionReceiptSeam {
     public static let disabledLanesEnvKey = "RC_TOKEN_SAVER_DISABLED_LANES"
     public static let enabledLanesEnvKey = "RC_TOKEN_SAVER_ENABLED_LANES"
+    public static let wireCapabilityEnvKey = "RC_TOKEN_SAVER_WIRE_CAPABILITY"
     public static let maximumEncodedBytes = 4_096
 
     public static func admit(
@@ -470,6 +491,10 @@ public enum TokenSaverExecutionReceiptSeam {
         }
         if receipt.capabilities.distill == true {
             env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1"
+            if !receipt.disabledLanes.contains("wire-encode"),
+               !receipt.disabledLanes.contains("wire-render-english") {
+                env[wireCapabilityEnvKey] = "1"
+            }
             if let waveLive = receipt.waveLive, !waveLive.isEmpty {
                 env["RC_TOKEN_SAVER_WAVE_LIVE"] = waveLive
             }
@@ -887,6 +912,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private static let deletedThreadRetirementRetryMaximumDelayNanoseconds: UInt64 = 2_000_000_000
     private typealias RunMetadata = (provider: AgentProvider, providerInstanceId: String?, model: String, cwd: String, serviceTier: AgentServiceTier, runtimeMode: AgentPermissionMode, interactionMode: AgentInteractionMode, adapterKey: String, binaryIdentity: String?)
     private var activeRunMetadata: [AgentRunID: RunMetadata] = [:]
+    /// Exact provider-bound RCW1 prompt for the current turn. The human-authored
+    /// prompt remains canonical in AgentMessage; this copy is private disclosure
+    /// metadata attached to the response before the run is released.
+    private var activeWireRequestTexts: [AgentRunID: String] = [:]
     /// Process environments are immutable after launch. Resident provider adapters
     /// therefore retain the exact scope of the process that owns their idle session.
     /// A changed attempt/admission scope forces a process refresh before the next turn.
@@ -929,13 +958,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// cleanup must wait until every in-flight translation finishes.
     private var providerTextTranslationsInFlight: [AgentRunID: Int] = [:]
     private var deferredProviderTerminalEvents: [AgentRunID: DeferredProviderTerminalEvent] = [:]
-    /// Bound on how long a provider-completed `.finished` may wait for SR1/distill
-    /// humanize. Token Saver must fail open: a hung translator cannot leave
-    /// Working latched forever. Default sits above distill startup polls (~60s)
-    /// + request timeout (8s). Tests inject a short value.
-    var providerTerminalTranslationDeadline: TimeInterval = 90
+    /// Bound on how long a provider-completed `.finished` may wait for wire rendering
+    /// Token Saver must fail open: a hung local renderer cannot leave Working
+    /// latched forever. Swift's deterministic renderer remains available after
+    /// this five-second hard deadline. Tests may inject a shorter value.
+    var providerTerminalTranslationDeadline: TimeInterval = 5
     private var deferredProviderTerminalDeadlineWorkItems: [AgentRunID: DispatchWorkItem] = [:]
-    private var activeDistillOutputRuns: Set<AgentRunID> = []
     private var finishingRuns: Set<AgentRunID> = []
     /// Provider terminal payloads wait here until the final stream batch crosses
     /// the SQLite durability barrier. A transient writer lock must never let the
@@ -1089,8 +1117,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     var gracefulStopTimeout: TimeInterval = 2
     var hardStopTimeout: TimeInterval = 5
 
-    /// Token Saver /distill hook: async transform applied to provider text
-    /// detected as SR1 compressed language. The returned value is what gets
+    /// Token Saver hook: async transform applied to an RCW1 provider response.
+    /// The returned value is what gets
     /// persisted and shown to users. Must fail open by returning the input
     /// unchanged on any error.
     public var finalResponseTranslator: (@Sendable (_ response: String, _ provider: AgentProvider, _ threadId: AgentThreadID, _ runId: AgentRunID) async -> String)?
@@ -1110,10 +1138,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// retention-governed data.
     public var onRunPrepared: (@Sendable (_ request: AgentRunRequest, _ originalPrompt: String) async -> Void)?
 
-    /// Fired (on an arbitrary executor) when a final assistant message was SR1-translated
+    /// Fired (on an arbitrary executor) when a final assistant message was wire-rendered
     /// and persisted. Callers can use the id to badge the message in the UI.
     /// Not fired when translation is a no-op (finalResponseTranslator absent or text unchanged).
-    public var onSR1TranslatedMessageId: (@Sendable (AgentMessageID) -> Void)?
+    public var onWireTranslatedMessageId: (@Sendable (AgentMessageID) -> Void)?
 
     /// Optional durable terminal-transition ledger (write-before-UI). Forensic only.
     public var terminalTransitionLedger: TerminalTransitionLedger?
@@ -1513,11 +1541,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let delegationCapabilitySHA256 = delegationCapability.map(
             AgentDelegationCapability.sha256Hex
         )
-        let request = try await requestAdmittingAutoRoute(
+        let admittedRequest = try await requestAdmittingAutoRoute(
             request,
             routingSnapshot: routingSnapshot,
             delegationCapabilitySHA256: delegationCapabilitySHA256
         )
+        let request = admittedRequest.request
         // A user-initiated run ends any background-await auto-continuation streak;
         // the auto-nudge path passes `isAutoContinuation: true` to preserve the bound.
         // F37: it must also invalidate any ALREADY-SCHEDULED continuation (same
@@ -1536,11 +1565,47 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let preservedUserContent = request.userMessageContent ?? request.prompt
         var outboundPrompt = request.prompt
         if let promptCompressor {
-            outboundPrompt = await promptCompressor(request.prompt, request.provider, request.threadId, request.runId)
+            let transformed = await promptCompressor(
+                preservedUserContent,
+                request.provider,
+                request.threadId,
+                request.runId
+            )
+            if let route = admittedRequest.autoRoute {
+                if RCWireProtocol.isWire(transformed) {
+                    outboundPrompt = (try? AgentOrchestrationRuntime.autoOrchestrateProviderWirePrompt(
+                        wirePrompt: transformed,
+                        admittedRoute: route
+                    )) ?? request.prompt
+                } else {
+                    outboundPrompt = AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(
+                        userPrompt: transformed,
+                        admittedRoute: route
+                    )
+                }
+            } else {
+                outboundPrompt = transformed
+            }
         }
+        lock.lock()
+        if RCWireProtocol.isWire(outboundPrompt) {
+            activeWireRequestTexts[request.runId] = outboundPrompt
+        } else {
+            activeWireRequestTexts.removeValue(forKey: request.runId)
+        }
+        lock.unlock()
         var effectiveEnvironment = request.environment
         let scopedEnvironment = await runEnvironmentProvider?(request.provider, request.threadId, request.environment) ?? [:]
         effectiveEnvironment.merge(scopedEnvironment) { _, scoped in scoped }
+        // Per-turn atomic wire admission. The session-level capability teaches
+        // the provider the ABI, while this key asks for RCW1 output only when
+        // this exact outbound prompt was safely encoded. Its absence is the
+        // authoritative plaintext reset for reused provider sessions.
+        if RCWireProtocol.isWire(outboundPrompt) {
+            effectiveEnvironment["RC_TOKEN_SAVER_WIRE_VERSION"] = "1"
+        } else {
+            effectiveEnvironment.removeValue(forKey: "RC_TOKEN_SAVER_WIRE_VERSION")
+        }
         // Host-authoritative attempt identity: stamp discrete keys + compact receipt
         // so nested Codex/Claude/Grok workers inherit the same attempt for attribution.
         let attemptId = request.runId.value.uuidString
@@ -1615,7 +1680,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             thread.updatedAt = Date()
             try threadRepo.upsert(thread)
         }
-        let existingRuntimePayload = try providerSessionRepo?.get(threadId: effectiveRequest.threadId)?.runtimePayloadJSON
+        let existingProviderSession = try providerSessionRepo?.get(threadId: effectiveRequest.threadId)
+        let existingRuntimePayload = existingProviderSession?.runtimePayloadJSON
+        var nextRuntimePayload = ProviderSessionRuntimePayload.decode(existingRuntimePayload)
+        if existingProviderSession == nil,
+           effectiveEnvironment[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] == "1" {
+            nextRuntimePayload.wireProtocolVersion = RCWireProtocol.version
+        }
         try providerSessionRepo?.upsert(ProviderSessionRuntime(
             threadId: effectiveRequest.threadId,
             provider: effectiveRequest.provider,
@@ -1630,7 +1701,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             runtimeMode: effectiveRequest.permissionMode,
             lastRunId: effectiveRequest.runId,
             lastEventKind: "run.pending",
-            runtimePayloadJSON: existingRuntimePayload
+            runtimePayloadJSON: nextRuntimePayload.encoded()
         ))
         do {
             if let orchestrationRuntime,
@@ -1676,11 +1747,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
         let coordinator = self
         let handle: AgentRunHandle
-        let expectsDistillOutput = Self.promptInvokesDistill(effectiveRequest.prompt) ||
-            Self.promptInvokesDistill(effectiveRequest.userMessageContent)
-        if expectsDistillOutput {
-            markDistillOutputMode(runId)
-        }
         do {
             handle = try await runner.sendTurn(effectiveRequest) { ev in
                 coordinator.handle(event: ev, runId: runId, threadId: effectiveRequest.threadId)
@@ -1694,7 +1760,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             providerTurnScopes[effectiveRequest.threadId] = ProviderTurnScope(environment: effectiveRequest.environment)
             lock.unlock()
         } catch {
-            clearDistillOutputMode(runId)
             lock.lock()
             let gen = preparationStates[effectiveRequest.threadId]?.generation ?? 0
             // claimSpawn already advanced to running; terminalize that generation.
@@ -1733,7 +1798,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     providerSession: startedSession
                 )
             } catch {
-                clearDistillOutputMode(runId)
                 handle.cancel()
                 markStartFailure(
                     error,
@@ -1750,7 +1814,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             status == .running || status == .pending ? nil : status
         }
         if terminalStatus == .cancelled {
-            clearDistillOutputMode(runId)
             handle.cancel()
             return runId
         }
@@ -1906,7 +1969,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         _ request: AgentRunRequest,
         routingSnapshot suppliedSnapshot: AgentOrchestrationRoutingSnapshot?,
         delegationCapabilitySHA256: String?
-    ) async throws -> AgentRunRequest {
+    ) async throws -> (request: AgentRunRequest, autoRoute: AgentOrchestrationRoute?) {
         let routingSnapshot: AgentOrchestrationRoutingSnapshot
         if let suppliedSnapshot {
             if suppliedSnapshot.providerSnapshots.isEmpty,
@@ -1923,7 +1986,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         } else {
             guard let thread = try threadRepo.get(id: request.threadId),
                   thread.effectiveRoutingConfiguration.mode == .auto else {
-                return request
+                return (request, nil)
             }
             guard let providerSnapshotSupplier else {
                 throw AgentOrchestrationAdmissionError.noEligibleProvider
@@ -1934,16 +1997,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             )
         }
         guard routingSnapshot.configuration.mode == .auto else {
-            return request
+            return (request, nil)
         }
         guard let orchestrationRuntime else {
             // No orchestration runtime: still never switch provider — DEEP on Source.
-            return try Self.autoDeepFallbackRequest(
+            return (try Self.autoDeepFallbackRequest(
                 request,
                 configuration: routingSnapshot.configuration,
                 providerSnapshots: routingSnapshot.providerSnapshots,
                 launchConfigurations: routingSnapshot.launchConfigurations
-            )
+            ), nil)
         }
         do {
             let admission = try orchestrationRuntime.admit(
@@ -1972,7 +2035,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 userPrompt: request.prompt,
                 admittedRoute: admission.route
             )
-            return AgentRunRequest(
+            return (AgentRunRequest(
                 runId: request.runId,
                 threadId: request.threadId,
                 provider: admission.route.provider,
@@ -1994,19 +2057,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 ),
                 extraArgs: request.extraArgs,
                 runAsUser: request.runAsUser
-            )
+            ), admission.route)
         } catch let error as AgentOrchestrationAdmissionError {
             // Same-host only. Orchestration gates may drop the skill wrap and
             // use DEEP; never switch Claude → Codex (or any other cross-host).
             switch error {
             case .packageUnavailable, .rolloutDisabled, .killSwitchEnabled, .invalidPolicy:
-                return try Self.autoDeepFallbackRequest(
+                return (try Self.autoDeepFallbackRequest(
                     request,
                     configuration: routingSnapshot.configuration,
                     providerSnapshots: routingSnapshot.providerSnapshots,
                     launchConfigurations: routingSnapshot.launchConfigurations,
                     runtime: orchestrationRuntime
-                )
+                ), nil)
             case .preferredSourceUnavailable, .noEligibleProvider, .invalidRoutingMode,
                  .deadlineExpired, .invalidBudget, .costBudgetUnavailable, .quotaExceeded,
                  .receiptPersistenceFailed, .invalidChildAdmission:
@@ -2142,9 +2205,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 handle.cancel()
             }
             // Always route through markStopRequested: when a terminal is already
-            // claimed it re-arms the durability retry (and clears the SR1/distill
-            // translation gate so Stop cannot stick on "Stopping…"). When only a
-            // deferred provider terminal is waiting on in-flight humanize, cancel
+            // claimed it re-arms the durability retry (and clears the local wire
+            // rendering gate so Stop cannot stick on "Stopping…"). When only a
+            // deferred provider terminal is waiting on in-flight rendering, cancel
             // still claims the slot. Never skip markStopRequested for user Stop.
             markStopRequested(threadId: threadId, runId: runId)
             return
@@ -2853,7 +2916,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             || bufferedProviderTextItems[runId] != nil
             || providerTextTranslationsInFlight[runId] != nil
             || deferredProviderTerminalEvents[runId] != nil
-            || activeDistillOutputRuns.contains(runId)
             || finishingRuns.contains(runId)
             || pendingTerminalEvents[runId] != nil
             || terminalRetryScheduled.contains(runId)
@@ -2940,6 +3002,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private func purgeRunRuntimeLocked(_ runId: AgentRunID) {
         active.removeValue(forKey: runId)
         activeRunMetadata.removeValue(forKey: runId)
+        activeWireRequestTexts.removeValue(forKey: runId)
         activeTurnIds.removeValue(forKey: runId)
         latestTokenUsage.removeValue(forKey: runId)
         reconciledTokenUsage.removeValue(forKey: runId)
@@ -2956,7 +3019,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         providerTextTranslationsInFlight.removeValue(forKey: runId)
         deferredProviderTerminalEvents.removeValue(forKey: runId)
         deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
-        activeDistillOutputRuns.remove(runId)
         finishingRuns.remove(runId)
         pendingTerminalEvents.removeValue(forKey: runId)
         terminalRetryScheduled.remove(runId)
@@ -3447,13 +3509,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // commits. This prevents Stop-first from evicting active ownership or
             // publishing `.cancelled` while SQLite still holds uncommitted events.
             //
-            // User Stop must never wait on SR1/distill humanize. In-flight text
+            // User Stop must never wait on local wire rendering. In-flight text
             // translations used to defer `.finished(.cancelled)` forever (or until
             // distill startup timed out ~60s), leaving the UI on "Stopping…" with
             // the button disabled. Clear that gate on every Stop claim/retry.
             lock.lock()
             providerTextTranslationsInFlight.removeValue(forKey: runId)
-            // Drop a deferred provider terminal waiting on humanize — user cancel
+            // Drop a deferred provider terminal waiting on rendering — user cancel
             // supersedes it when the durability slot is still free. If a terminal
             // is already claimed below, the deferred entry is obsolete either way.
             deferredProviderTerminalEvents.removeValue(forKey: runId)
@@ -3470,7 +3532,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
 
             // finishingRuns alone must NOT block user cancel. That flag is also
-            // set while final-response SR1 translation runs (before any
+            // set while final-response wire rendering runs (before any
             // pendingTerminalEvent exists); treating it as durabilityPending made
             // Stop a no-op until humanize returned — Working/Stopping stuck.
             finishingRuns.insert(runId)
@@ -3520,11 +3582,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 activeProjection = activeRunProjectionLocked()
             }
             activeRunMetadata.removeValue(forKey: runId)
+            activeWireRequestTexts.removeValue(forKey: runId)
             activeTurnIds.removeValue(forKey: runId)
             activeAssistantMessageIds.removeValue(forKey: runId)
             activeProviderTextItemTypes.removeValue(forKey: runId)
             bufferedProviderTextItems.removeValue(forKey: runId)
-            activeDistillOutputRuns.remove(runId)
             finishingRuns.remove(runId)
             // Do not clear seq while a failed flush still owns a retryable batch.
             // Clearing here reissued seq 1 for late Grok ACP events (e.g.
@@ -3632,6 +3694,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             activeThreads.removeValue(forKey: threadId)
         }
         activeRunMetadata.removeValue(forKey: runId)
+        activeWireRequestTexts.removeValue(forKey: runId)
         latestTokenUsage.removeValue(forKey: runId)
         reconciledTokenUsage.removeValue(forKey: runId)
         receiptUsageFinalizationInFlight.remove(runId)
@@ -3641,7 +3704,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         activeAssistantMessageIds.removeValue(forKey: runId)
         activeProviderTextItemTypes.removeValue(forKey: runId)
         bufferedProviderTextItems.removeValue(forKey: runId)
-        activeDistillOutputRuns.remove(runId)
         finishingRuns.remove(runId)
         pendingTerminalEvents.removeValue(forKey: runId)
         terminalRetryScheduled.remove(runId)
@@ -4016,6 +4078,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             outboundText = text
         }
         try adapter.respondToUserInput(threadId: threadId, requestId: requestId, verbatimText: text, outboundText: outboundText)
+    }
+
+    /// User-initiated retry for a persisted raw RCW1 response. This uses the
+    /// same bounded renderer race as the live path and never starts a provider
+    /// turn or mutates provider state.
+    public func retryWireResponse(_ response: String, threadId: AgentThreadID) async -> String {
+        await translateWireResponse(response, runId: AgentRunID(), threadId: threadId)
     }
 
     public func cancelUserInput(threadId: AgentThreadID, requestId: String) throws {
@@ -5434,13 +5503,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     lock.unlock()
                     Task { [weak self] in
                         guard let self else { return }
-                        let translated = await self.translateSR1Response(text, runId: runId, threadId: threadId)
+                        let translated = await self.translateWireResponse(text, runId: runId, threadId: threadId)
                         if translated != text {
                             self.handle(
-                                event: .event(.sr1Translation(AssistantSR1Translation(
+                                event: .event(.wireTranslation(AssistantWireTranslation(
                                     itemId: itemId,
                                     originalText: text,
-                                    rewrittenText: translated
+                                    rewrittenText: translated,
+                                    wireRequestText: self.wireRequestText(runId: runId)
                                 ))),
                                 runId: runId,
                                 threadId: threadId,
@@ -5822,7 +5892,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lock.lock()
             if (providerTextTranslationsInFlight[runId] ?? 0) > 0 {
                 // User-initiated cancel (markStopRequested) must not wait for
-                // SR1 humanize / distill. Provider-completed terminals still defer
+                // local wire rendering. Provider-completed terminals still defer
                 // so the translated final can land before ownership is released.
                 let isUserStopCancel = reportedStatus == .cancelled && !providerTerminalAcknowledged
                 if isUserStopCancel {
@@ -5895,11 +5965,70 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             let finalMessage = sanitizeFinalAssistantText(rawFinalMessage)
             if allowFinalResponseTranslation,
                reportedStatus == .completed,
-               let finalMessage,
-               shouldTranslateFinalResponse(finalMessage) {
+               let rawProviderText = rawFinalMessage,
+               let displayedText = finalMessage,
+               !displayedText.isEmpty,
+               !shouldTranslateFinalResponse(rawProviderText),
+               let admittedWireRequest = wireRequestText(runId: runId) {
+                // The request was admitted as wire, but the provider returned
+                // ordinary prose. Keep that readable prose instead of routing it
+                // through MLX, while still persisting the exact transport response
+                // and visibly disclosing the provider's protocol fallback.
+                lock.lock()
+                let messageId = activeAssistantMessageIds[runId]
+                    ?? Self.terminalAssistantMessageId(runId: runId)
+                lock.unlock()
+                self.handle(
+                    event: .event(.wireTranslation(AssistantWireTranslation(
+                        messageId: messageId.value.uuidString,
+                        originalText: rawProviderText,
+                        rewrittenText: displayedText,
+                        fallbackReason: "provider_plaintext_fallback",
+                        wireRequestText: admittedWireRequest
+                    ))),
+                    runId: runId,
+                    threadId: threadId,
+                    allowFinalResponseTranslation: false
+                )
+                onWireTranslatedMessageId?(messageId)
+            }
+            if allowFinalResponseTranslation,
+               reportedStatus == .completed,
+               let rawWire = rawFinalMessage,
+               shouldTranslateFinalResponse(rawWire) {
+                let wirePayload = RCWireProtocol.transportEnvelope(in: rawWire)?.payload ?? rawWire
+                let preliminary = (try? RCWireProtocol.parse(wirePayload))
+                    .map(RCWireProtocol.renderEnglish) ?? "Token Saver could not decode the provider response. The original response is available in the Token Saver optimized disclosure."
+                // Durably enqueue the exact provider frame before starting any
+                // local model work. A crash/timeout after this point can always
+                // replay the raw response and deterministic renderer.
+                self.handle(
+                    event: .event(.wireTranslation(AssistantWireTranslation(
+                        originalText: rawWire,
+                        rewrittenText: preliminary,
+                        fallbackReason: "pending_local_render",
+                        wireRequestText: self.wireRequestText(runId: runId)
+                    ))),
+                    runId: runId,
+                    threadId: threadId,
+                    allowFinalResponseTranslation: false
+                )
                 Task { [weak self] in
                     guard let self else { return }
-                    let translated = await self.translateFinalResponse(finalMessage, runId: runId, threadId: threadId)
+                    let translated = await self.translateFinalResponse(rawWire, runId: runId, threadId: threadId)
+                    if translated != rawWire {
+                        // Store the raw provider frame before any user-facing rewrite.
+                        self.handle(
+                            event: .event(.wireTranslation(AssistantWireTranslation(
+                                originalText: rawWire,
+                                rewrittenText: translated,
+                                wireRequestText: self.wireRequestText(runId: runId)
+                            ))),
+                            runId: runId,
+                            threadId: threadId,
+                            allowFinalResponseTranslation: false
+                        )
+                    }
                     if let completedTurnId = self.completedTurnId(runId: runId) {
                         self.handle(
                             event: .event(.turnCompleted(turnId: completedTurnId, finalMessage: translated)),
@@ -5911,12 +6040,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     self.lock.lock()
                     let translatedMsgId = self.activeAssistantMessageIds[runId]
                     self.lock.unlock()
-                    if let mid = translatedMsgId, translated != finalMessage {
+                    if let mid = translatedMsgId, translated != rawWire {
                         self.handle(
-                            event: .event(.sr1Translation(AssistantSR1Translation(
+                            event: .event(.wireTranslation(AssistantWireTranslation(
                                 messageId: mid.value.uuidString,
-                                originalText: finalMessage,
-                                rewrittenText: translated
+                                originalText: rawWire,
+                                rewrittenText: translated,
+                                wireRequestText: self.wireRequestText(runId: runId)
                             ))),
                             runId: runId,
                             threadId: threadId,
@@ -5933,7 +6063,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     // activeAssistantMessageIds[runId] is set by the turnCompleted
                     // handle above (persistAssistantIfMissing -> activeAssistantMessageIds).
                     if let mid = translatedMsgId {
-                        self.onSR1TranslatedMessageId?(mid)
+                        self.onWireTranslatedMessageId?(mid)
                     }
                 }
 	                return
@@ -6109,11 +6239,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             active.removeValue(forKey: runId)
             activeThreads.removeValue(forKey: threadId)
             activeRunMetadata.removeValue(forKey: runId)
+            activeWireRequestTexts.removeValue(forKey: runId)
             activeTurnIds.removeValue(forKey: runId)
             activeAssistantMessageIds.removeValue(forKey: runId)
             activeProviderTextItemTypes.removeValue(forKey: runId)
             bufferedProviderTextItems.removeValue(forKey: runId)
-            activeDistillOutputRuns.remove(runId)
             latestRunErrorMessages.removeValue(forKey: runId)
             finishingRuns.remove(runId)
             pendingTerminalEvents.removeValue(forKey: runId)
@@ -6648,7 +6778,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     }
 
     private func shouldTranslateFinalResponse(_ text: String) -> Bool {
-        finalResponseTranslator != nil && SR1ResponseDetector.isSR1(text)
+        finalResponseTranslator != nil && RCWireProtocol.transportEnvelope(in: text) != nil
     }
 
     private func completeProviderTextTranslation(runId: AgentRunID) -> DeferredProviderTerminalEvent? {
@@ -6666,7 +6796,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return deferred
     }
 
-    /// Fail open when SR1/distill humanize never drains after a provider terminal.
+    /// Fail open when wire rendering never drains after a provider terminal.
     /// Arms once per deferred terminal; cancel paths and successful translation
     /// drain clear the work item.
     private func scheduleDeferredProviderTerminalDeadline(runId: AgentRunID, threadId: AgentThreadID) {
@@ -6715,6 +6845,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     private struct BufferedProviderTextItem {
         var text: String
+        var rawText: String
+        var renderedText: String
         var target: ProviderTextTarget
         var itemType: AssistantItemType
     }
@@ -6756,7 +6888,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             let target = itemType == .reasoning ? ProviderTextTarget.body : rawTarget
 
             lock.lock()
-            // PERF: same O(n²) residual as timeline itemDelta — under the SR1
+            // PERF: same O(n²) residual as timeline itemDelta — under the wire
             // hold lock, `cappedText(text + delta)` rebuilt the growing buffer
             // on every token. appendCapped stays under liveTextLimit without
             // reallocating the full body on the common path.
@@ -6783,17 +6915,110 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     append: delta,
                     limit: AssistantTimelineState.liveTextLimit
                 )
+                AssistantTimelineState.appendCapped(
+                    &bufferedProviderTextItems.values[runIndex][itemId]!.rawText,
+                    append: delta,
+                    limit: AssistantTimelineState.liveTextLimit
+                )
+                if let envelope = RCWireProtocol.transportEnvelope(
+                    in: bufferedProviderTextItems.values[runIndex][itemId]!.text
+                ) {
+                    bufferedProviderTextItems.values[runIndex][itemId]!.text = envelope.payload
+                }
+                let buffered = bufferedProviderTextItems.values[runIndex][itemId]!
+                if RCWireProtocol.prefixDisposition(
+                    buffered.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                ) == .plainText,
+                   !RCWireProtocol.containsTransportCandidate(buffered.text) {
+                    bufferedProviderTextItems.values[runIndex].removeValue(forKey: itemId)
+                    if bufferedProviderTextItems.values[runIndex].isEmpty {
+                        bufferedProviderTextItems.removeValue(forKey: runId)
+                    }
+                    lock.unlock()
+                    let event: AssistantEvent
+                    switch buffered.target {
+                    case .body:
+                        event = .itemDelta(itemId: itemId, bodyAppend: buffered.text, outputAppend: nil, summary: nil)
+                    case .output:
+                        event = .itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: buffered.text, summary: nil)
+                    }
+                    return .emit([event])
+                }
+                if let frames = try? RCWireProtocol.parse(buffered.text),
+                   frames.allSatisfy({ $0.direction == .response }) {
+                    let rendered = RCWireProtocol.renderEnglish(frames)
+                    if !rendered.isEmpty {
+                        bufferedProviderTextItems.values[runIndex][itemId]!.text = ""
+                        let separator = buffered.renderedText.isEmpty ? "" : "\n\n"
+                        AssistantTimelineState.appendCapped(
+                            &bufferedProviderTextItems.values[runIndex][itemId]!.renderedText,
+                            append: separator + rendered,
+                            limit: AssistantTimelineState.liveTextLimit
+                        )
+                        let updated = bufferedProviderTextItems.values[runIndex][itemId]!
+                        lock.unlock()
+                        let deltaEvent: AssistantEvent
+                        switch updated.target {
+                        case .body:
+                            deltaEvent = .itemDelta(itemId: itemId, bodyAppend: separator + rendered, outputAppend: nil, summary: nil)
+                        case .output:
+                            deltaEvent = .itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: separator + rendered, summary: nil)
+                        }
+                        return .emit([
+                            .wireTranslation(AssistantWireTranslation(
+                                itemId: itemId,
+                                originalText: updated.rawText,
+                                rewrittenText: updated.renderedText,
+                                wireRequestText: wireRequestText(runId: runId)
+                            )),
+                            deltaEvent
+                        ])
+                    }
+                }
                 lock.unlock()
                 return .hold
             }
             var runBuffers = bufferedProviderTextItems[runId] ?? [:]
             let shouldBuffer = shouldBufferProviderTextPrefix(delta)
             if shouldBuffer {
-                runBuffers[itemId] = BufferedProviderTextItem(
+                var newBuffer = BufferedProviderTextItem(
                     text: AssistantTimelineState.cappedText(delta),
+                    rawText: AssistantTimelineState.cappedText(delta),
+                    renderedText: "",
                     target: target,
                     itemType: itemType
                 )
+                if let envelope = RCWireProtocol.transportEnvelope(in: newBuffer.text) {
+                    newBuffer.text = envelope.payload
+                }
+                if let frames = try? RCWireProtocol.parse(newBuffer.text),
+                   frames.allSatisfy({ $0.direction == .response }) {
+                    let rendered = RCWireProtocol.renderEnglish(frames)
+                    if !rendered.isEmpty {
+                        newBuffer.text = ""
+                        newBuffer.renderedText = rendered
+                        runBuffers[itemId] = newBuffer
+                        bufferedProviderTextItems[runId] = runBuffers
+                        lock.unlock()
+                        let deltaEvent: AssistantEvent
+                        switch target {
+                        case .body:
+                            deltaEvent = .itemDelta(itemId: itemId, bodyAppend: rendered, outputAppend: nil, summary: nil)
+                        case .output:
+                            deltaEvent = .itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: rendered, summary: nil)
+                        }
+                        return .emit([
+                            .wireTranslation(AssistantWireTranslation(
+                                itemId: itemId,
+                                originalText: newBuffer.rawText,
+                                rewrittenText: rendered,
+                                wireRequestText: wireRequestText(runId: runId)
+                            )),
+                            deltaEvent
+                        ])
+                    }
+                }
+                runBuffers[itemId] = newBuffer
                 bufferedProviderTextItems[runId] = runBuffers
                 lock.unlock()
                 return .hold
@@ -6818,6 +7043,43 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
             lock.unlock()
             guard let buffered else { return nil }
+            if let wirePayload = RCWireProtocol.transportEnvelope(in: buffered.rawText)?.payload {
+                let completeRendered: String
+                if let frames = try? RCWireProtocol.parse(wirePayload),
+                   frames.allSatisfy({ $0.direction == .response }) {
+                    completeRendered = RCWireProtocol.renderEnglish(frames)
+                } else {
+                    let error = "Token Saver could not decode the provider response. The original response is available in the Token Saver optimized disclosure."
+                    completeRendered = buffered.renderedText.isEmpty
+                        ? error
+                        : buffered.renderedText + "\n\n" + error
+                }
+                var events: [AssistantEvent] = [
+                    .wireTranslation(AssistantWireTranslation(
+                        itemId: itemId,
+                        originalText: buffered.rawText,
+                        rewrittenText: completeRendered,
+                        fallbackReason: completeRendered == buffered.renderedText ? nil : "deterministic_render",
+                        wireRequestText: wireRequestText(runId: runId)
+                    ))
+                ]
+                if completeRendered != buffered.renderedText {
+                    let append: String
+                    if completeRendered.hasPrefix(buffered.renderedText) {
+                        append = String(completeRendered.dropFirst(buffered.renderedText.count))
+                    } else {
+                        append = completeRendered
+                    }
+                    switch buffered.target {
+                    case .body:
+                        events.append(.itemDelta(itemId: itemId, bodyAppend: append, outputAppend: nil, summary: nil))
+                    case .output:
+                        events.append(.itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: append, summary: nil))
+                    }
+                }
+                events.append(.itemCompleted(itemId: itemId, finalState: finalState))
+                return .emit(events)
+            }
             if shouldTranslateProviderText(buffered.text, runId: runId) {
                 let target = buffered.itemType == .reasoning ? ProviderTextTarget.body : buffered.target
                 return .translate(itemId: itemId, text: buffered.text, target: target, finalState: finalState)
@@ -6841,76 +7103,32 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return activeProviderTextItemTypes[runId]?[itemId]
     }
 
+    private func wireRequestText(runId: AgentRunID) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeWireRequestTexts[runId]
+    }
+
     private func isProviderTextItem(_ type: AssistantItemType) -> Bool {
-        type == .assistantMessage || type == .reasoning
+        type == .assistantMessage
     }
 
     private func shouldBufferProviderTextPrefix(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Pure-whitespace deltas are not SR1 signals; stream them live so a
+        // Pure-whitespace deltas are not wire signals; stream them live so a
         // normal reply whose first chunk is "\n" does not appear all-at-once.
         guard !trimmed.isEmpty else { return false }
-        if SR1ResponseDetector.isSR1(trimmed) { return true }
-        let lower = trimmed.lowercased()
-        if lower.hasPrefix("sr1") || lower.hasPrefix("dict") { return true }
-        guard let first = trimmed.first?.uppercased().first,
-              // Single source of truth: see CoreModel.DistillSemanticPrefixes.
-              DistillSemanticPrefixes.set.contains(first) else {
+        if RCWireProtocol.containsTransportCandidate(text) { return true }
+        switch RCWireProtocol.prefixDisposition(trimmed) {
+        case .wire, .undecided:
+            return true
+        case .plainText:
             return false
         }
-        let rest = trimmed.dropFirst()
-        guard let delimiter = rest.first else { return true }
-        return delimiter == ":" || delimiter == "=" || delimiter == " " || delimiter == "\t"
     }
 
     private func shouldTranslateProviderText(_ text: String, runId: AgentRunID) -> Bool {
-        if SR1ResponseDetector.isSR1(text) {
-            markDistillOutputMode(runId)
-            return true
-        }
-        let allowOutcomeSpace = runUsesDistillOutputMode(runId)
-        // R0 exemption: a lone short `O:` line is the dialect's own chat-reply shape,
-        // so translating it buys an extra local-model round trip plus a "translated"
-        // badge on the cheapest replies. Only exempt while this run has not already
-        // produced real dialect output — once it has, a bare outcome line is far more
-        // likely to be a continuation of that dialect than a greeting.
-        if !allowOutcomeSpace,
-           SR1ResponseDetector.isBareShortOutcomeLine(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            return false
-        }
-        if SR1ResponseDetector.isSingleSemanticLine(text, allowSpaceDelimitedOutcome: allowOutcomeSpace) {
-            markDistillOutputMode(runId)
-            return true
-        }
-        return false
-    }
-
-    private func markDistillOutputMode(_ runId: AgentRunID) {
-        lock.lock()
-        activeDistillOutputRuns.insert(runId)
-        lock.unlock()
-    }
-
-    private func clearDistillOutputMode(_ runId: AgentRunID) {
-        lock.lock()
-        activeDistillOutputRuns.remove(runId)
-        discardRunThreadOwnershipIfReleasedLocked(runId)
-        lock.unlock()
-    }
-
-    private func runUsesDistillOutputMode(_ runId: AgentRunID) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return activeDistillOutputRuns.contains(runId)
-    }
-
-    private static func promptInvokesDistill(_ text: String?) -> Bool {
-        guard let text else { return false }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard trimmed.hasPrefix("/distill") else { return false }
-        guard trimmed.count > "/distill".count else { return true }
-        let boundary = trimmed.index(trimmed.startIndex, offsetBy: "/distill".count)
-        return trimmed[boundary].isWhitespace
+        RCWireProtocol.transportEnvelope(in: text) != nil
     }
 
     private static func hasUnread(for status: AgentRunStatus) -> Bool {
@@ -6935,11 +7153,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     }
 
     private func translateFinalResponse(_ response: String, runId: AgentRunID, threadId: AgentThreadID) async -> String {
-        await translateSR1Response(response, runId: runId, threadId: threadId)
+        await translateWireResponse(response, runId: runId, threadId: threadId)
     }
 
-    private func translateSR1Response(_ response: String, runId: AgentRunID, threadId: AgentThreadID) async -> String {
+    private func translateWireResponse(_ response: String, runId: AgentRunID, threadId: AgentThreadID) async -> String {
         guard let finalResponseTranslator else { return response }
+        let wirePayload = RCWireProtocol.transportEnvelope(in: response)?.payload ?? response
         let provider: AgentProvider = {
             lock.lock()
             let activeProvider = activeRunMetadata[runId]?.provider
@@ -6947,24 +7166,33 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             if let activeProvider { return activeProvider }
             return (try? threadRepo.get(id: threadId)?.provider) ?? .codex
         }()
-        // Fail open on hung distill: never let SR1 humanize block the turn
+        // Fail open on a hung local renderer: never let wire rendering block the turn
         // longer than the provider-terminal translation deadline. The translator
         // Task may still complete later; its result is ignored after the race.
         let deadlineNs = UInt64(max(0.05, providerTerminalTranslationDeadline) * 1_000_000_000)
-        let translated: String = await withTaskGroup(of: String.self) { group in
-            group.addTask {
-                await finalResponseTranslator(response, provider, threadId, runId)
+        let deterministicFallback: String = {
+            if let frames = try? RCWireProtocol.parse(wirePayload),
+               frames.allSatisfy({ $0.direction == .response }) {
+                let rendered = RCWireProtocol.renderEnglish(frames)
+                if !rendered.isEmpty { return rendered }
             }
-            group.addTask {
+            return "Token Saver could not decode the provider response. The original response is available in the Token Saver optimized disclosure."
+        }()
+        let translated: String = await withCheckedContinuation { continuation in
+            let first = FirstStringContinuation(continuation)
+            Task {
+                first.resume(returning: await finalResponseTranslator(wirePayload, provider, threadId, runId))
+            }
+            Task {
                 try? await Task.sleep(nanoseconds: deadlineNs)
-                return response
+                first.resume(returning: deterministicFallback)
             }
-            let first = await group.next() ?? response
-            group.cancelAll()
-            return first
         }
         let trimmed = sanitizeFinalAssistantText(translated).trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? response : trimmed
+        if trimmed.isEmpty || RCWireProtocol.transportEnvelope(in: trimmed) != nil {
+            return deterministicFallback
+        }
+        return trimmed
     }
 
     private func captureCheckpoint(
@@ -7719,10 +7947,11 @@ private struct ProviderSessionRuntimePayload: Codable, Equatable {
     var pendingUserInputRequestIds: [String] = []
     var claudeResumeSessionAt: String?
     var claudeInFlightToolIds: [String] = []
+    var wireProtocolVersion: String?
     var updatedAtMs: Int64?
 
     private enum CodingKeys: String, CodingKey {
-        case providerThreadId, lastCompletedTurnId, turnCount, model, serviceTier, runtimeMode, interactionMode, activeTurnId, activePlan, pendingApprovalRequestIds, pendingUserInputRequestIds, claudeResumeSessionAt, claudeInFlightToolIds, updatedAtMs
+        case providerThreadId, lastCompletedTurnId, turnCount, model, serviceTier, runtimeMode, interactionMode, activeTurnId, activePlan, pendingApprovalRequestIds, pendingUserInputRequestIds, claudeResumeSessionAt, claudeInFlightToolIds, wireProtocolVersion, updatedAtMs
     }
 
     init(turnCount: Int = 0) {
@@ -7744,6 +7973,7 @@ private struct ProviderSessionRuntimePayload: Codable, Equatable {
         pendingUserInputRequestIds = try container.decodeIfPresent([String].self, forKey: .pendingUserInputRequestIds) ?? []
         claudeResumeSessionAt = try container.decodeIfPresent(String.self, forKey: .claudeResumeSessionAt)
         claudeInFlightToolIds = try container.decodeIfPresent([String].self, forKey: .claudeInFlightToolIds) ?? []
+        wireProtocolVersion = try container.decodeIfPresent(String.self, forKey: .wireProtocolVersion)
         updatedAtMs = try container.decodeIfPresent(Int64.self, forKey: .updatedAtMs)
     }
 

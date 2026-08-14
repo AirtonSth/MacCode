@@ -49,12 +49,8 @@ final class DistillLiveModelTests: XCTestCase {
                 || response.output.localizedCaseInsensitiveContains("macOS"),
             "Expected output to compress the input facts, got: \(response.output)"
         )
-        XCTAssertTrue(
-            response.output.contains("S")
-                || response.output.contains("D")
-                || response.output.contains("P"),
-            "Expected /distill-style output, got: \(response.output)"
-        )
+        XCTAssertFalse(response.output.localizedCaseInsensitiveContains("RCW1"),
+                       "long-text compression must remain plain language, got: \(response.output)")
         print("TokenSaverLiveModel output=\(response.output)")
     }
 }

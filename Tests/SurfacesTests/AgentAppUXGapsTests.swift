@@ -14,7 +14,7 @@ import AgentRuntime
 ///  P2 — providerLocked: system messages do NOT lock the provider
 ///  P2 — content-omitted: applyBodyBudget still blanks bodies (logic unchanged)
 ///  P3 — providerLocked false after only system messages
-///  UX-SR1-BADGE — showsTranslatedBadge: true=>true, false=>false
+///  UX-TOKEN-SAVER-BADGE — showsTokenSaverOptimizedBadge: true=>true, false=>false
 @MainActor
 final class AgentAppUXGapsTests: XCTestCase {
 
@@ -372,38 +372,67 @@ final class AgentAppUXGapsTests: XCTestCase {
         XCTAssertNil(vm.runStartedAt)
     }
 
-    // MARK: - UX-SR1-BADGE: showsTranslatedBadge seam
+    // MARK: - Token Saver optimized disclosure
 
-    /// WHY: a humanized SR1 reply must be transparently labeled so the user knows
-    /// it was rewritten by Token Saver. The badge decision is a pure function of
-    /// the wasTranslated flag so it can be verified without any view setup.
-    func test_showsTranslatedBadge_true_whenWasSR1Translated() {
+    /// WHY: an optimized provider exchange must remain transparent to the user.
+    func test_showsTokenSaverOptimizedBadge_true_whenOptimized() {
         XCTAssertTrue(
-            AgentAppView.showsTranslatedBadge(wasSR1Translated: true),
-            "Badge must appear when the message was SR1-translated"
+            AgentAppView.showsTokenSaverOptimizedBadge(wasTokenSaverOptimized: true),
+            "Badge must appear when Token Saver optimized the exchange"
         )
     }
 
-    func test_showsTranslatedBadge_false_whenNotTranslated() {
+    func test_showsTokenSaverOptimizedBadge_false_whenNotTranslated() {
         XCTAssertFalse(
-            AgentAppView.showsTranslatedBadge(wasSR1Translated: false),
-            "Badge must NOT appear for normal (non-SR1) messages"
+            AgentAppView.showsTokenSaverOptimizedBadge(wasTokenSaverOptimized: false),
+            "Badge must NOT appear for ordinary messages"
         )
     }
 
-    func test_sr1BadgeLabel_exposesViewOriginalWhenOriginalTextExists() {
+    func test_tokenSaverBadgeLabel_exposesViewOriginalWhenOriginalTextExists() {
         XCTAssertEqual(
-            AgentAppView.sr1BadgeLabel(hasOriginalText: true),
-            "translated from compressed output - View original",
-            "Badge text must expose the original SR1 text affordance when persisted original text is available"
+            AgentAppView.tokenSaverBadgeLabel(hasOriginalText: true),
+            "Token Saver optimized - View transport details",
+            "Badge must expose the raw provider response when persisted metadata is available"
         )
     }
 
-    func test_sr1BadgeLabel_usesPlainBadgeWithoutOriginalText() {
+    func test_tokenSaverBadgeLabel_usesPlainBadgeWithoutOriginalText() {
         XCTAssertEqual(
-            AgentAppView.sr1BadgeLabel(hasOriginalText: false),
-            "translated from compressed output",
+            AgentAppView.tokenSaverBadgeLabel(hasOriginalText: false),
+            "Token Saver optimized",
             "Badge text must remain compact when older events have no original text to show"
+        )
+    }
+
+    /// WHY: completed turns hide their duplicate durable assistant row. The
+    /// visible turn must still inherit that row's persisted Token Saver badge.
+    func test_tokenSaverOptimizedMessageID_matchesTimelineOwnedFinal() {
+        let threadId = AgentThreadID()
+        let optimizedId = AgentMessageID()
+        let ordinaryId = AgentMessageID()
+        let answer = "Diagnosis: latency is healthy, but status is not ready."
+        let messages = [
+            AgentMessage(id: ordinaryId, threadId: threadId, role: .assistant, content: "Earlier answer"),
+            AgentMessage(id: optimizedId, threadId: threadId, role: .assistant, content: answer)
+        ]
+
+        XCTAssertEqual(
+            AgentAppView.tokenSaverOptimizedMessageID(
+                matching: answer,
+                messages: messages,
+                optimizedMessageIDs: [optimizedId]
+            ),
+            optimizedId,
+            "A timeline-owned final must resolve the hidden durable row carrying its wire metadata"
+        )
+        XCTAssertNil(
+            AgentAppView.tokenSaverOptimizedMessageID(
+                matching: answer,
+                messages: messages,
+                optimizedMessageIDs: [ordinaryId]
+            ),
+            "Content equality alone must never label a turn whose durable row was not optimized"
         )
     }
 

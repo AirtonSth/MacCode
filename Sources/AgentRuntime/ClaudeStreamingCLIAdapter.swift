@@ -1963,22 +1963,6 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         return nil
     }
 
-    /// Pure helper: merges (original SR1 text, rewritten translation) into a
-    /// payload dict suitable for embedding in a persisted stream event so a
-    /// "view original" affordance is possible downstream.
-    ///
-    /// Contract:
-    ///   - When original != rewritten: dict contains "originalText" (original),
-    ///     "rewrittenText" (rewritten), "sr1Translated" = true.
-    ///   - When original == rewritten (no rewrite): dict contains "rewrittenText"
-    ///     only, "sr1Translated" = false. "originalText" is omitted (redundant).
-    nonisolated static func sr1TranslationPayload(original: String, rewritten: String) -> [String: Any] {
-        if original == rewritten {
-            return ["rewrittenText": rewritten, "sr1Translated": false]
-        }
-        return ["originalText": original, "rewrittenText": rewritten, "sr1Translated": true]
-    }
-
     private static func jsonString(_ object: [String: Any]) -> String? {
         guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
             return nil

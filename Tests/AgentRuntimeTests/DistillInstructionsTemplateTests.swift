@@ -56,19 +56,11 @@ final class DistillInstructionsTemplateTests: XCTestCase {
                       "workers must not be forced to restate Distill rules inside skill prompts")
         XCTAssertFalse(t.contains("Every subagent, worker, reviewer, or delegated prompt MUST repeat"),
                        "removed: requiring every worker to restate Distill")
-        // Sparse dialect: R0 micro O-only + R1 work O-first (token savings vs 6-line tax).
-        XCTAssertTrue(t.contains("R0 micro"), "R0 micro register present")
-        XCTAssertTrue(t.contains("R1 work"), "R1 work register present")
-        XCTAssertTrue(t.contains("O-first") || t.contains("O: only") || t.contains("`O:` only"),
-                      "O-first / O-only sparsity present")
-        XCTAssertTrue(t.lowercased().contains("never pad to six"),
-                      "must forbid fixed six-line S/C/D padding")
-        // Reasoning/thinking narration must be distill-shaped too, so the existing reasoning ->
-        // humanize -> savings pipeline can compress and credit it instead of leaking verbose prose.
-        XCTAssertTrue(t.lowercased().contains("reasoning") || t.lowercased().contains("r1"),
-                      "agent must keep thinking/work turns in sparse distill, not free prose")
-        XCTAssertFalse(t.contains("Keep hidden chain-of-thought private"),
-                       "thinking is no longer exempt from distill; surfaced reasoning is compressed and counted")
+        XCTAssertFalse(t.contains("R0 micro"))
+        XCTAssertFalse(t.contains("R1 work"))
+        XCTAssertFalse(t.contains("O-first"))
+        XCTAssertTrue(t.contains("not a conversation style or user command"),
+                      "the surviving Distill policy must be tool-output-only")
         // Retrieve half of the reversibility story (G2/N5).
         XCTAssertTrue(t.contains("distill retrieve <handle>"), "retrieve command documented")
         XCTAssertTrue(t.contains("[[rc:<handle>]]"), "handle marker documented so the agent knows how to recover originals")
@@ -77,8 +69,8 @@ final class DistillInstructionsTemplateTests: XCTestCase {
         XCTAssertLessThan(t.count, 2_600, "provider config must stay compact (skill-complete rule may add a few lines)")
         XCTAssertFalse(t.contains("bun test 2>&1 | distill"), "examples belong in the managed skill")
         XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("bun test 2>&1 | distill"))
-        XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("R0 micro"),
-                      "full skill carries R0 dialect details")
+        XCTAssertFalse(AgentSkillInstaller.distillSkillTemplate.contains("R0 micro"),
+                       "managed skill must not reinstall the removed conversation dialect")
         XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("NEVER Distill skill content"),
                       "full skill body also protects skill content as a verbatim category")
         XCTAssertTrue(
@@ -97,7 +89,7 @@ final class DistillInstructionsTemplateTests: XCTestCase {
     }
 
     func test_tokenSaverOffDoesNotInjectDistillPolicy() {
-        // WHY: Token Saver off must fail open with no Distill dialect injection.
+        // WHY: Token Saver off must fail open with no Token Saver policy.
         let off = AgentSkillInstaller.tokenSaverProviderPrompt("base only", environment: [:])
         XCTAssertEqual(off, "base only")
         XCTAssertFalse(off.contains("| distill"))
@@ -105,10 +97,33 @@ final class DistillInstructionsTemplateTests: XCTestCase {
 
         let on = AgentSkillInstaller.tokenSaverProviderPrompt(
             "base only",
-            environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
+            environment: [
+                "RC_TOKEN_SAVER_DISTILL_HINT": "1",
+                TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey: "1",
+            ]
         )
         XCTAssertTrue(on.contains("NEVER Distill skill content"))
         XCTAssertTrue(on.contains("| distill") || on.contains("distill"),
                       "Token Saver on still injects ordinary-output Distill eligibility")
+        XCTAssertTrue(on.contains("REMOTE_CODE_WIRE_V1"),
+                      "the trusted session capability must predate a later encoded follow-up")
+
+        let wireOnly = AgentSkillInstaller.tokenSaverProviderPrompt(
+            "base only",
+            environment: ["RC_TOKEN_SAVER_WIRE_VERSION": "1"]
+        )
+        XCTAssertEqual(wireOnly, "base only",
+                       "a per-turn flag cannot enable protocol code while Token Saver capability is off")
+        XCTAssertTrue(on.contains("authoritative per-turn admission"),
+                      "the request header, not an environment variable, is authoritative per turn")
+        XCTAssertTrue(on.contains("including progress/commentary and the final answer"),
+                      "all user-visible assistant text must stay inside the decodable wire contract")
+        XCTAssertTrue(on.contains("Never emit ordinary prose outside the frame"),
+                      "mixed plain and wire responses would bypass the deterministic renderer")
+        XCTAssertTrue(on.contains("optional recovery metadata"),
+                      "a recovery handle must not make providers retrieve redundant prompt text by default")
+        XCTAssertTrue(on.contains("Never ask the user to run or approve retrieval in ordinary prose"),
+                      "retrieval approvals belong to native provider callbacks, never an undecodable chat response")
+        XCTAssertFalse(on.contains("R0 micro"))
     }
 }

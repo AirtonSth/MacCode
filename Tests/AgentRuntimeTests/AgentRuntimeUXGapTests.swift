@@ -156,25 +156,18 @@ final class AgentRuntimeUXGapTests: XCTestCase {
                       "Must explain checkpoint so users know context can be restored. got: \(desc)")
     }
 
-    // MARK: - L192: Whitespace-only first delta must not trigger SR1 buffering
+    // MARK: - Wire prefix buffering
 
-    /// A pure-whitespace string must NOT be detected as SR1 by the detector.
+    /// A pure-whitespace string must NOT be detected as wire.
     /// If it were, the coordinator would buffer the entire reply and emit it
     /// all at once at completion, destroying live streaming for normal replies.
-    func test_sr1Detector_pureWhitespace_isNotSR1() {
-        XCTAssertFalse(SR1ResponseDetector.isSR1("\n"),
-                       "A lone newline is not SR1; buffering it would delay normal-reply streaming")
-        XCTAssertFalse(SR1ResponseDetector.isSR1("\n\n   \t\n"),
-                       "Whitespace-only text is not SR1")
-        XCTAssertFalse(SR1ResponseDetector.isSR1("  "),
-                       "Spaces-only text is not SR1")
+    func test_wireDetector_pureWhitespace_isNotWire() {
+        XCTAssertFalse(RCWireProtocol.isWire("\n"))
+        XCTAssertFalse(RCWireProtocol.isWire("\n\n   \t\n"))
+        XCTAssertFalse(RCWireProtocol.isWire("  "))
     }
 
-    /// An SR1-formatted response must still be detected correctly, proving
-    /// that the whitespace fix did not break SR1 detection.
-    func test_sr1Detector_validSR1_isDetected() {
-        let sr1 = "S: state ready\nC: context clear\nD: action deploy"
-        XCTAssertTrue(SR1ResponseDetector.isSR1(sr1),
-                      "Valid SR1 text must still be detected after the whitespace-only fix")
+    func test_wireDetector_validRCW1_isDetected() {
+        XCTAssertTrue(RCWireProtocol.isWire("RCW1\tA\t1\nO\tdone\n.\n"))
     }
 }

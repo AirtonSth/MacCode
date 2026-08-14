@@ -513,11 +513,15 @@ final class DistillContentRouterTests: XCTestCase {
         XCTAssertEqual(try canonical(pretty), try canonical(output), "routed output is the lossless minify")
     }
 
-    func test_localRuntime_leavesProseLongTextToFallback() async throws {
+    func test_localRuntime_leavesProseLongTextVerbatimWithoutLegacyDialect() async throws {
         let prose = (0..<20).map { "narrative line number \($0) describing things" }.joined(separator: "\n")
         let request = DistillRequest(mode: .longText, input: prose)
         let output = try await LocalDistillRuntime().distill(request)
-        XCTAssertTrue(output.contains("S "), "prose falls through to the heuristic summary path")
+        XCTAssertEqual(
+            output,
+            prose,
+            "the deterministic fallback must stay lossless and must not revive the removed conversation dialect"
+        )
     }
 
     // MARK: - Helpers

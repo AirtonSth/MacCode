@@ -98,7 +98,7 @@ private final class ScriptedFinalRunner: AgentProviderRunner, @unchecked Sendabl
 private final class ScriptedStreamRunner: AgentProviderRunner, @unchecked Sendable {
     let provider: AgentProvider
     let itemType: AssistantItemType
-    let body: String
+    let bodyChunks: [String]
     let output: String?
     let finalMessage: String
 
@@ -111,8 +111,16 @@ private final class ScriptedStreamRunner: AgentProviderRunner, @unchecked Sendab
     ) {
         self.provider = provider
         self.itemType = itemType
-        self.body = body
+        self.bodyChunks = body.isEmpty ? [] : [body]
         self.output = output
+        self.finalMessage = finalMessage
+    }
+
+    init(provider: AgentProvider, bodyChunks: [String], finalMessage: String = "done") {
+        self.provider = provider
+        self.itemType = .assistantMessage
+        self.bodyChunks = bodyChunks
+        self.output = nil
         self.finalMessage = finalMessage
     }
 
@@ -122,7 +130,7 @@ private final class ScriptedStreamRunner: AgentProviderRunner, @unchecked Sendab
         let handle = AgentRunHandle(runId: request.runId, process: nil) {}
         let providerThreadId = request.providerThreadId ?? UUID().uuidString
         let itemType = self.itemType
-        let body = self.body
+        let bodyChunks = self.bodyChunks
         let output = self.output
         let finalMessage = self.finalMessage
         Task.detached {
@@ -137,8 +145,8 @@ private final class ScriptedStreamRunner: AgentProviderRunner, @unchecked Sendab
                 type: itemType,
                 startedAtMs: 0
             ))))
-            if !body.isEmpty {
-                onEvent(.event(.itemDelta(itemId: itemId, bodyAppend: body, outputAppend: nil, summary: nil)))
+            for chunk in bodyChunks {
+                onEvent(.event(.itemDelta(itemId: itemId, bodyAppend: chunk, outputAppend: nil, summary: nil)))
             }
             if let output {
                 onEvent(.event(.itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: output, summary: "Reasoning")))
@@ -306,6 +314,13 @@ private extension AssistantEvent {
         return nil
     }
 
+    var outputAppendForTest: String? {
+        if case .itemDelta(_, _, let outputAppend, _) = self {
+            return outputAppend
+        }
+        return nil
+    }
+
     var turnCompletedFinalMessageForTest: String? {
         if case .turnCompleted(_, let finalMessage) = self {
             return finalMessage
@@ -377,6 +392,10 @@ final class TokenSaverCompressionTests: XCTestCase {
                     "REMOTE_CODE_AGENT_PROVIDER": selectedProvider.rawValue,
                 ]
             }
+            coordinator.promptCompressor = { prompt, _, _, _ in
+                guard prompt == "first" else { return prompt }
+                return "RCW1\tQ\t1\nG\tfirst\n.\n"
+            }
 
             let firstRunID = AgentRunID()
             _ = try await coordinator.startRun(.init(
@@ -404,6 +423,12 @@ final class TokenSaverCompressionTests: XCTestCase {
             try await waitForRun(secondRunID, in: runRepo)
 
             XCTAssertEqual(adapter.requests.count, 2, "\(provider.rawValue) must execute both turns")
+            XCTAssertEqual(adapter.requests[0].environment["RC_TOKEN_SAVER_WIRE_VERSION"], "1",
+                           "\(provider.rawValue) must atomically admit RCW1 for the encoded turn")
+            XCTAssertNil(adapter.requests[1].environment["RC_TOKEN_SAVER_WIRE_VERSION"],
+                         "\(provider.rawValue) must explicitly reset wire admission when the next turn bypasses encoding")
+            XCTAssertTrue(RCWireProtocol.isWire(adapter.requests[0].prompt))
+            XCTAssertEqual(adapter.requests[1].prompt, "second")
             let firstEnvironment = adapter.requests[0].environment
             let secondEnvironment = adapter.requests[1].environment
             XCTAssertEqual(firstEnvironment["RC_TOKEN_SAVER_ATTEMPT_ID"], firstRunID.value.uuidString)
@@ -572,33 +597,27 @@ final class TokenSaverCompressionTests: XCTestCase {
         XCTAssertEqual(messages.first(where: { $0.role == .user })?.content, original)
     }
 
-    func test_sr1FinalResponseIsHumanizedBeforePersistence() async throws {
+    func test_wireFinalResponseIsRenderedBeforePersistenceAndKeepsRawMetadata() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-ts-response-humanize-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
         let messageRepo = AgentMessageRepository(db: db)
         let runRepo = AgentRunRepository(db: db)
-        let sr1 = """
-        SR1
-        S: tests green
-        C: user asked in Portuguese
-        O: saved counter updated
-        P: macOS suite passed
-        """
-        let runner = ScriptedFinalRunner(provider: .claude, finalMessage: sr1)
-        let thread = AgentThread(title: "sr1", provider: .claude, model: "fake-model")
+        let wire = "RCW1\tA\t1\nO\tSaved counter updated.\nE\tmacOS suite passed.\n.\n"
+        let runner = ScriptedFinalRunner(provider: .claude, finalMessage: wire)
+        let thread = AgentThread(title: "wire", provider: .claude, model: "fake-model")
         try threadRepo.upsert(thread)
         let coordinator = AgentRunCoordinator(
             runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
             providers: [.claude: runner]
         )
 
-        let humanized = "Os testes passaram, e o contador de tokens salvos foi atualizado."
+        let rendered = "Tests passed and the saved-token counter was updated."
         coordinator.finalResponseTranslator = { response, provider, threadId, _ in
             XCTAssertEqual(provider, .claude)
             XCTAssertEqual(threadId, thread.id)
-            XCTAssertTrue(SR1ResponseDetector.isSR1(response))
-            return humanized
+            XCTAssertTrue(RCWireProtocol.isWire(response))
+            return rendered
         }
 
         _ = try await coordinator.startRun(AgentRunRequest(
@@ -606,22 +625,66 @@ final class TokenSaverCompressionTests: XCTestCase {
             provider: .claude,
             model: "fake-model",
             cwd: tmp,
-            prompt: "Explique em português o resultado."
+            prompt: "Explain the result."
         ))
         let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
 
-        XCTAssertEqual(assistant.content, humanized,
-                       "the Agent App transcript must persist the human-language answer, not the SR1 compressed provider response")
-        XCTAssertFalse(assistant.content.contains("SR1"))
-        XCTAssertFalse(assistant.content.contains("S: tests green"))
-        let translation = try await waitForSR1Translation(
+        XCTAssertEqual(assistant.content, rendered,
+                       "the transcript must persist readable text, not provider wire")
+        XCTAssertFalse(assistant.content.contains("RCW1"))
+        let translation = try await waitForWireTranslation(
             coordinator,
             threadId: thread.id,
             messageId: assistant.id.value.uuidString
         )
-        XCTAssertEqual(translation.originalText, sr1,
-                       "persisted stream replay must retain the original SR1 text for view-original")
-        XCTAssertEqual(translation.rewrittenText, humanized)
+        XCTAssertEqual(translation.originalText, wire,
+                       "persisted stream replay must retain the original provider wire for disclosure")
+        XCTAssertEqual(translation.rewrittenText, rendered)
+    }
+
+    func test_providerPreambleBeforeWireIsRenderedWithoutTransportLeak() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-ts-response-preamble-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let wire = "RCW1\tA\t1\nO\tThe provider matrix passed.\nE\tClaude exited 0.\n.\n"
+        let raw = "Response in the requested RCW1 frame:\n\n" + wire
+        let runner = ScriptedFinalRunner(provider: .claude, finalMessage: raw)
+        let thread = AgentThread(title: "wire preamble", provider: .claude, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providers: [.claude: runner]
+        )
+
+        let rendered = "The provider matrix passed. Claude exited 0."
+        coordinator.finalResponseTranslator = { response, _, _, _ in
+            XCTAssertEqual(response, wire.trimmingCharacters(in: .whitespacesAndNewlines),
+                           "the local renderer must receive only the strict frame payload")
+            return rendered
+        }
+
+        _ = try await coordinator.startRun(.init(
+            threadId: thread.id,
+            provider: .claude,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "Run the provider matrix."
+        ))
+        let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
+        let translation = try await waitForWireTranslation(
+            coordinator,
+            threadId: thread.id,
+            messageId: assistant.id.value.uuidString
+        )
+
+        XCTAssertEqual(assistant.content, rendered)
+        XCTAssertFalse(assistant.content.contains("RCW1"),
+                       "a provider preamble must not make private wire visible")
+        XCTAssertEqual(translation.originalText, raw,
+                       "the exact nonconforming provider response remains available in disclosure")
+        XCTAssertEqual(translation.rewrittenText, rendered)
     }
 
     func test_finalAssistantHandleMarkerIsStrippedBeforePersistenceAndTurnCompletedDisplay() async throws {
@@ -664,8 +727,8 @@ final class TokenSaverCompressionTests: XCTestCase {
         let threadRepo = AgentThreadRepository(db: db)
         let messageRepo = AgentMessageRepository(db: db)
         let runRepo = AgentRunRepository(db: db)
-        let sr1 = "S: build pass. P: unit tests green."
-        let runner = ScriptedFinalRunner(provider: .claude, finalMessage: sr1)
+        let wire = "RCW1\tA\t1\nO\tBuild passed.\nE\tunit tests green.\n.\n"
+        let runner = ScriptedFinalRunner(provider: .claude, finalMessage: wire)
         let thread = AgentThread(title: "translated handle", provider: .claude, model: "fake-model")
         try threadRepo.upsert(thread)
         let coordinator = AgentRunCoordinator(
@@ -691,149 +754,15 @@ final class TokenSaverCompressionTests: XCTestCase {
         XCTAssertFalse(assistant.content.contains("[[rc:"))
     }
 
-    func test_sr1SemanticLineWithoutHeaderIsHumanizedBeforePersistence() async throws {
-        let tmp = NSTemporaryDirectory() + "rc2-ts-response-humanize-line-" + UUID().uuidString
+    func test_wireAssistantStreamRendersDeterministicallyWithoutLeakingRawFrame() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-wire-stream-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
         let messageRepo = AgentMessageRepository(db: db)
         let runRepo = AgentRunRepository(db: db)
-        let compressed = "S: humanizacao codex acionada"
-        let runner = ScriptedFinalRunner(provider: .codex, finalMessage: compressed)
-        let thread = AgentThread(title: "sr1 line", provider: .codex, model: "fake-model")
-        try threadRepo.upsert(thread)
-        let coordinator = AgentRunCoordinator(
-            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
-            providers: [.codex: runner]
-        )
-
-        coordinator.finalResponseTranslator = { response, provider, threadId, _ in
-            XCTAssertEqual(provider, .codex)
-            XCTAssertEqual(threadId, thread.id)
-            XCTAssertTrue(SR1ResponseDetector.isSR1(response),
-                          "single SR1 semantic lines from /distill must not be persisted as readable prose")
-            return "Estado: humanizacao codex acionada"
-        }
-
-        _ = try await coordinator.startRun(AgentRunRequest(
-            threadId: thread.id,
-            provider: .codex,
-            model: "fake-model",
-            cwd: tmp,
-            prompt: "Responda em portugues."
-        ))
-        let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
-
-        XCTAssertEqual(assistant.content, "Estado: humanizacao codex acionada")
-        XCTAssertFalse(assistant.content.contains("S:"))
-    }
-
-    func test_sr1SpaceDelimitedDistillLinesAreHumanizedBeforePersistence() async throws {
-        let tmp = NSTemporaryDirectory() + "rc2-ts-response-humanize-space-" + UUID().uuidString
-        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
-        let threadRepo = AgentThreadRepository(db: db)
-        let messageRepo = AgentMessageRepository(db: db)
-        let runRepo = AgentRunRepository(db: db)
-        let compressed = """
-        O Snake game criado.
-        O file: /Users/samuelfajreldines/snake.html (single-file, zero deps)
-        O feat: canvas 20x20 grid, score, wall+self collision, food respawn, game-over restart
-        O ctrl: setas ou WASD; ESPACO reinicia
-        P open: abrir snake.html no browser -> jogo roda
-        """
-        let runner = ScriptedFinalRunner(provider: .claude, finalMessage: compressed)
-        let thread = AgentThread(title: "sr1 space", provider: .claude, model: "fake-model")
-        try threadRepo.upsert(thread)
-        let coordinator = AgentRunCoordinator(
-            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
-            providers: [.claude: runner]
-        )
-
-        coordinator.finalResponseTranslator = { response, provider, threadId, _ in
-            XCTAssertEqual(provider, .claude)
-            XCTAssertEqual(threadId, thread.id)
-            XCTAssertTrue(SR1ResponseDetector.isSR1(response),
-                          "real /distill output may use 'O text' and 'P text' without a colon after the prefix")
-            return "O Snake game foi criado em /Users/samuelfajreldines/snake.html e pode ser aberto no navegador."
-        }
-
-        _ = try await coordinator.startRun(AgentRunRequest(
-            threadId: thread.id,
-            provider: .claude,
-            model: "fake-model",
-            cwd: tmp,
-            prompt: "/distill crie o snage game em html"
-        ))
-        let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
-
-        XCTAssertFalse(assistant.content.contains("O file:"),
-                       "the Agent App transcript must not persist raw /distill SR1 lines")
-        XCTAssertFalse(assistant.content.contains("P open:"))
-        XCTAssertTrue(assistant.content.contains("Snake game foi criado"))
-    }
-
-    func test_mixedSR1AndHumanDistillAnswerIsHumanizedBeforePersistence() async throws {
-        let tmp = NSTemporaryDirectory() + "rc2-ts-response-humanize-mixed-" + UUID().uuidString
-        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
-        let threadRepo = AgentThreadRepository(db: db)
-        let messageRepo = AgentMessageRepository(db: db)
-        let runRepo = AgentRunRepository(db: db)
-        let compressed = """
-        S done.
-        O created /tmp/index.html: self-contained Snake game.
-        P verified:
-        PASS inline JS parses.
-        PASS HTTP smoke: 200, title present, canvas present.
-        C controls:
-        Arrow keys / WASD move.
-        Space pauses.
-        Enter restarts after game over.
-        Touch buttons included.
-        O criado /tmp/index.html: jogo Snake self-contained.
-        """
-        let runner = ScriptedFinalRunner(provider: .codex, finalMessage: compressed)
-        let thread = AgentThread(title: "sr1 mixed", provider: .codex, model: "fake-model")
-        try threadRepo.upsert(thread)
-        let coordinator = AgentRunCoordinator(
-            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
-            providers: [.codex: runner]
-        )
-
-        coordinator.finalResponseTranslator = { response, provider, threadId, _ in
-            XCTAssertEqual(provider, .codex)
-            XCTAssertEqual(threadId, thread.id)
-            XCTAssertTrue(SR1ResponseDetector.isSR1(response),
-                          "mixed compressed S/O/P/C lines plus a human sentence must still be treated as SR1")
-            return "O jogo Snake foi criado em /tmp/index.html e verificado com sucesso."
-        }
-
-        _ = try await coordinator.startRun(AgentRunRequest(
-            threadId: thread.id,
-            provider: .codex,
-            model: "fake-model",
-            cwd: tmp,
-            prompt: "/distill crie o snage game em html"
-        ))
-        let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
-
-        XCTAssertEqual(assistant.content, "O jogo Snake foi criado em /tmp/index.html e verificado com sucesso.")
-        XCTAssertFalse(assistant.content.contains("S done."))
-        XCTAssertFalse(assistant.content.contains("O created"))
-        XCTAssertFalse(assistant.content.contains("P verified"))
-        XCTAssertFalse(assistant.content.contains("C controls"))
-    }
-
-    func test_sr1AssistantMessageStreamIsHumanizedBeforeTimelinePersistence() async throws {
-        let tmp = NSTemporaryDirectory() + "rc2-ts-stream-humanize-" + UUID().uuidString
-        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
-        let threadRepo = AgentThreadRepository(db: db)
-        let messageRepo = AgentMessageRepository(db: db)
-        let runRepo = AgentRunRepository(db: db)
-        let compressed = """
-        Dict: S=state C=context D=action R=risk O=outcome N=no-go P=proof
-        S received. D use /distill. D inspect /tmp, then create minimal HTML snake game.
-        """
-        let runner = ScriptedStreamRunner(provider: .codex, body: compressed)
-        let thread = AgentThread(title: "sr1 stream", provider: .codex, model: "fake-model")
+        let wire = "RCW1\tA\t1\nA\tInspecting App.swift.\n.\nRCW1\tA\t2\nO\tThe race was fixed.\nE\tFocused tests passed.\n.\n"
+        let runner = ScriptedStreamRunner(provider: .codex, body: wire)
+        let thread = AgentThread(title: "wire stream", provider: .codex, model: "fake-model")
         try threadRepo.upsert(thread)
         let coordinator = AgentRunCoordinator(
             runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
@@ -841,160 +770,85 @@ final class TokenSaverCompressionTests: XCTestCase {
         )
         let observer = RecordingObserver()
         coordinator.addObserver(observer)
-
-        coordinator.finalResponseTranslator = { response, provider, threadId, _ in
-            XCTAssertEqual(provider, .codex)
-            XCTAssertEqual(threadId, thread.id)
-            XCTAssertTrue(SR1ResponseDetector.isSR1(response))
-            // Force the provider terminal callback to arrive while stream
-            // humanization is still in flight. The translated delta must cross
-            // the same durability barrier before terminal cleanup.
-            try? await Task.sleep(nanoseconds: 50_000_000)
-            return "Recebi o pedido em /distill e vou criar um jogo Snake HTML mínimo em /tmp."
+        coordinator.finalResponseTranslator = { _, _, _, _ in
+            XCTFail("complete streamed frames use the deterministic renderer without an MLX wait")
+            return "wrong"
         }
 
-        _ = try await coordinator.startRun(AgentRunRequest(
-            threadId: thread.id,
-            provider: .codex,
-            model: "fake-model",
-            cwd: tmp,
-            prompt: "/distill crie o snage game em html"
+        _ = try await coordinator.startRun(.init(
+            threadId: thread.id, provider: .codex, model: "fake-model", cwd: tmp, prompt: "Fix the race."
         ))
 
-        let expected = "Recebi o pedido em /distill e vou criar um jogo Snake HTML mínimo em /tmp."
-        let liveDeadline = Date().addingTimeInterval(3)
-        while Date() < liveDeadline,
-              !observer.recordedEvents.contains(where: { $0.bodyAppendForTest == expected }) {
-            try? await Task.sleep(nanoseconds: 10_000_000)
-        }
-
-        let liveBodies = observer.recordedEvents.compactMap(\.bodyAppendForTest).joined(separator: "\n")
-        XCTAssertTrue(liveBodies.contains(expected),
-                      "live Agent App observers must receive the human-language text instead of the SR1 stream")
-        XCTAssertFalse(liveBodies.contains("Dict: S=state"),
-                       "raw SR1 provider text must not reach the live timeline")
-        XCTAssertFalse(liveBodies.contains("S received."))
-
-        let replayDeadline = Date().addingTimeInterval(3)
-        while Date() < replayDeadline,
-              !coordinator.latestStreamEvents(threadId: thread.id)
-                .compactMap(\.bodyAppendForTest)
-                .joined(separator: "\n")
-                .contains(expected) {
-            try? await Task.sleep(nanoseconds: 10_000_000)
-        }
-        let persistedBodies = coordinator.latestStreamEvents(threadId: thread.id)
-            .compactMap(\.bodyAppendForTest)
-            .joined(separator: "\n")
-        XCTAssertTrue(persistedBodies.contains(expected),
-                      "replayed Agent App timelines must also use the humanized stream text")
-        XCTAssertFalse(persistedBodies.contains("Dict: S=state"))
-    }
-
-    func test_inlineSR1AssistantMessageStreamIsHumanizedBeforeTimelinePersistence() async throws {
-        let tmp = NSTemporaryDirectory() + "rc2-ts-inline-stream-humanize-" + UUID().uuidString
-        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
-        let threadRepo = AgentThreadRepository(db: db)
-        let messageRepo = AgentMessageRepository(db: db)
-        let runRepo = AgentRunRepository(db: db)
-        let compressed = "S come. C cwd=/tmp. D load /distill rule, then create minimal HTML snake game."
-        let runner = ScriptedStreamRunner(provider: .codex, body: compressed)
-        let thread = AgentThread(title: "inline sr1 stream", provider: .codex, model: "fake-model")
-        try threadRepo.upsert(thread)
-        let coordinator = AgentRunCoordinator(
-            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
-            providers: [.codex: runner]
-        )
-        let observer = RecordingObserver()
-        coordinator.addObserver(observer)
-
-        coordinator.finalResponseTranslator = { response, provider, threadId, _ in
-            XCTAssertEqual(provider, .codex)
-            XCTAssertEqual(threadId, thread.id)
-            XCTAssertTrue(SR1ResponseDetector.isSR1(response),
-                          "inline SR1 clauses like 'S ... C ... D ...' must be detected before the Agent App renders them")
-            return "O contexto é /tmp. Vou carregar a regra /distill e criar um jogo Snake HTML mínimo."
-        }
-
-        _ = try await coordinator.startRun(AgentRunRequest(
-            threadId: thread.id,
-            provider: .codex,
-            model: "fake-model",
-            cwd: tmp,
-            prompt: "/distill crie o snage game em html"
-        ))
-
-        let expected = "O contexto é /tmp. Vou carregar a regra /distill e criar um jogo Snake HTML mínimo."
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline,
-              !observer.recordedEvents.contains(where: { $0.bodyAppendForTest == expected }) {
+              !observer.recordedEvents.compactMap(\.bodyAppendForTest).joined().contains("Focused tests passed") {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
+        let visible = observer.recordedEvents.compactMap(\.bodyAppendForTest).joined(separator: "")
+        XCTAssertTrue(visible.contains("Action: Inspecting App.swift."))
+        XCTAssertTrue(visible.contains("The race was fixed."))
+        XCTAssertTrue(visible.contains("Evidence: Focused tests passed."))
+        XCTAssertFalse(visible.contains("RCW1"), "raw wire must never leak into the primary transcript")
 
-        let liveBodies = observer.recordedEvents.compactMap(\.bodyAppendForTest).joined(separator: "\n")
-        XCTAssertTrue(liveBodies.contains(expected))
-        XCTAssertFalse(liveBodies.contains("S come."))
-        XCTAssertFalse(liveBodies.contains("C cwd=/tmp"))
+        var timeline = AssistantTimelineState()
+        for event in coordinator.latestStreamEvents(threadId: thread.id) { timeline.apply(event) }
+        let metadata = try XCTUnwrap(timeline.tokenSaverTranslationsByItemId["stream-item"])
+        XCTAssertEqual(metadata.originalText, wire)
+        XCTAssertTrue(metadata.rewrittenText.contains("Focused tests passed"))
     }
 
-    func test_singleSemanticSR1ReasoningLineIsHumanizedBeforeTimelinePersistence() async throws {
-        let tmp = NSTemporaryDirectory() + "rc2-ts-single-sr1-humanize-" + UUID().uuidString
+    func test_splitWireSentinelNeverLeaksPartialTransportText() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-wire-split-sentinel-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
         let messageRepo = AgentMessageRepository(db: db)
         let runRepo = AgentRunRepository(db: db)
-        let compressed = "S /distill ativo."
-        let runner = ScriptedStreamRunner(provider: .codex, itemType: .reasoning, body: "", output: compressed)
-        let thread = AgentThread(title: "single sr1 reasoning", provider: .codex, model: "fake-model")
+        let wire = "RCW1\tA\t1\nO\tThe split frame stayed private.\n.\n"
+        let runner = ScriptedStreamRunner(
+            provider: .grok,
+            bodyChunks: ["R", "C", "W", "1\t", "A\t1\n", "O\tThe split frame stayed private.\n", ".\n"]
+        )
+        let thread = AgentThread(title: "split wire sentinel", provider: .grok, model: "fake-model")
         try threadRepo.upsert(thread)
         let coordinator = AgentRunCoordinator(
             runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
-            providers: [.codex: runner]
+            providers: [.grok: runner]
         )
         let observer = RecordingObserver()
         coordinator.addObserver(observer)
+        coordinator.finalResponseTranslator = { response, _, _, _ in response }
 
-        coordinator.finalResponseTranslator = { response, provider, threadId, _ in
-            XCTAssertEqual(provider, .codex)
-            XCTAssertEqual(threadId, thread.id)
-            XCTAssertTrue(SR1ResponseDetector.isSR1(response),
-                          "single semantic lines like 'S /distill ativo.' must be treated as SR1 when streamed by the provider")
-            return "O modo /distill está ativo."
-        }
-
-        _ = try await coordinator.startRun(AgentRunRequest(
-            threadId: thread.id,
-            provider: .codex,
-            model: "fake-model",
-            cwd: tmp,
-            prompt: "/distill crie o snage game em html"
+        _ = try await coordinator.startRun(.init(
+            threadId: thread.id, provider: .grok, model: "fake-model", cwd: tmp, prompt: "Report the result."
         ))
-
-        let expected = "O modo /distill está ativo."
         let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline,
-              !observer.recordedEvents.contains(where: { $0.bodyAppendForTest == expected }) {
+        while Date() < deadline {
+            var currentTimeline = AssistantTimelineState()
+            for event in coordinator.latestStreamEvents(threadId: thread.id) { currentTimeline.apply(event) }
+            if currentTimeline.tokenSaverTranslationsByItemId["stream-item"]?.originalText == wire {
+                break
+            }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
 
-        let liveBodies = observer.recordedEvents.compactMap(\.bodyAppendForTest).joined(separator: "\n")
-        XCTAssertTrue(liveBodies.contains(expected))
-        XCTAssertFalse(liveBodies.contains("S /distill ativo."))
+        let visible = observer.recordedEvents.compactMap(\.bodyAppendForTest).joined()
+        XCTAssertEqual(visible, "The split frame stayed private.")
+        XCTAssertFalse(visible.contains("RCW1"))
+        XCTAssertFalse(visible.hasPrefix("R"), "a fragmented sentinel must remain buffered until classified")
+        var timeline = AssistantTimelineState()
+        for event in coordinator.latestStreamEvents(threadId: thread.id) { timeline.apply(event) }
+        XCTAssertEqual(timeline.tokenSaverTranslationsByItemId["stream-item"]?.originalText, wire)
     }
 
-    func test_sr1ReasoningStreamIsHumanizedBeforeTimelinePersistence() async throws {
-        let tmp = NSTemporaryDirectory() + "rc2-ts-reasoning-humanize-" + UUID().uuidString
+    func test_truncatedWireStreamShowsReadableErrorAndKeepsRawDisclosure() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-wire-truncated-stream-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
         let messageRepo = AgentMessageRepository(db: db)
         let runRepo = AgentRunRepository(db: db)
-        let compressed = """
-        S context loaded.
-        C /tmp has no project scaffold for this task.
-        D create one self-contained snake-game.html. P open file in browser directly; no server needed.
-        """
-        let runner = ScriptedStreamRunner(provider: .claude, itemType: .reasoning, body: "", output: compressed)
-        let thread = AgentThread(title: "sr1 reasoning", provider: .claude, model: "fake-model")
+        let raw = "RCW1\tA\t1\nO\tThis frame was truncated"
+        let runner = ScriptedStreamRunner(provider: .claude, bodyChunks: ["RC", "W1\tA\t1\n", "O\tThis frame was truncated"])
+        let thread = AgentThread(title: "truncated wire", provider: .claude, model: "fake-model")
         try threadRepo.upsert(thread)
         let coordinator = AgentRunCoordinator(
             runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
@@ -1002,37 +856,65 @@ final class TokenSaverCompressionTests: XCTestCase {
         )
         let observer = RecordingObserver()
         coordinator.addObserver(observer)
+        coordinator.finalResponseTranslator = { response, _, _, _ in response }
 
-        coordinator.finalResponseTranslator = { response, provider, threadId, _ in
-            XCTAssertEqual(provider, .claude)
-            XCTAssertEqual(threadId, thread.id)
-            XCTAssertTrue(SR1ResponseDetector.isSR1(response))
-            return "O contexto foi carregado. Como /tmp não tem projeto, vou criar um arquivo HTML único para o Snake."
-        }
-
-        _ = try await coordinator.startRun(AgentRunRequest(
-            threadId: thread.id,
-            provider: .claude,
-            model: "fake-model",
-            cwd: tmp,
-            prompt: "/distill crie o snage game em html"
+        _ = try await coordinator.startRun(.init(
+            threadId: thread.id, provider: .claude, model: "fake-model", cwd: tmp, prompt: "Report the result."
         ))
-
-        let expected = "O contexto foi carregado. Como /tmp não tem projeto, vou criar um arquivo HTML único para o Snake."
         let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline,
-              !observer.recordedEvents.contains(where: { $0.bodyAppendForTest == expected }) {
+        while Date() < deadline {
+            var currentTimeline = AssistantTimelineState()
+            for event in coordinator.latestStreamEvents(threadId: thread.id) { currentTimeline.apply(event) }
+            if currentTimeline.tokenSaverTranslationsByItemId["stream-item"]?.originalText == raw {
+                break
+            }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
 
-        let liveBodies = observer.recordedEvents.compactMap(\.bodyAppendForTest).joined(separator: "\n")
-        XCTAssertTrue(liveBodies.contains(expected),
-                      "reasoning/commentary rows shown in Agent App must be humanized before display")
-        XCTAssertFalse(liveBodies.contains("S context loaded."))
-        XCTAssertFalse(liveBodies.contains("C /tmp has no project scaffold"))
+        let visible = observer.recordedEvents.compactMap(\.bodyAppendForTest).joined()
+        XCTAssertTrue(visible.contains("Token Saver could not decode"))
+        XCTAssertFalse(visible.contains("RCW1"), "malformed transport must not masquerade as fluent output")
+        var timeline = AssistantTimelineState()
+        for event in coordinator.latestStreamEvents(threadId: thread.id) { timeline.apply(event) }
+        let metadata = try XCTUnwrap(timeline.tokenSaverTranslationsByItemId["stream-item"])
+        XCTAssertEqual(metadata.originalText, raw)
+        let wireMetadata = coordinator.latestStreamEvents(threadId: thread.id).compactMap { event -> AssistantWireTranslation? in
+            guard case .wireTranslation(let translation) = event else { return nil }
+            return translation
+        }.last
+        XCTAssertEqual(wireMetadata?.fallbackReason, "deterministic_render")
     }
 
-    func test_normalFinalResponseDoesNotInvokeSR1Translator() async throws {
+    func test_reasoningStreamIsNeverDecodedAsAssistantWire() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-wire-reasoning-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let raw = "RCW1\tA\t1\nA\tprivate reasoning record\n.\n"
+        let runner = ScriptedStreamRunner(provider: .claude, itemType: .reasoning, body: "", output: raw)
+        let thread = AgentThread(title: "reasoning", provider: .claude, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providers: [.claude: runner]
+        )
+        let observer = RecordingObserver()
+        coordinator.addObserver(observer)
+        coordinator.finalResponseTranslator = { _, _, _, _ in
+            XCTFail("RCW1 v1 covers assistant messages, not reasoning/tool protocol events")
+            return "wrong"
+        }
+
+        _ = try await coordinator.startRun(.init(
+            threadId: thread.id, provider: .claude, model: "fake-model", cwd: tmp, prompt: "Inspect."
+        ))
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let output = observer.recordedEvents.compactMap(\.outputAppendForTest).joined()
+        XCTAssertEqual(output, raw)
+    }
+
+    func test_normalFinalResponseDoesNotInvokeWireTranslator() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-ts-response-normal-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
@@ -1048,7 +930,7 @@ final class TokenSaverCompressionTests: XCTestCase {
         )
 
         coordinator.finalResponseTranslator = { _, _, _, _ in
-            XCTFail("normal prose must not be sent through the SR1 humanizer")
+            XCTFail("normal prose must not be sent through the wire renderer")
             return "wrong"
         }
 
@@ -1062,6 +944,56 @@ final class TokenSaverCompressionTests: XCTestCase {
         let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
 
         XCTAssertEqual(assistant.content, normal)
+    }
+
+    func test_plainProviderResponseToAdmittedWireStaysReadableAndPersistsFallbackDisclosure() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-wire-plain-fallback-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let plain = "Approval is required before I can inspect the fixture."
+        let runner = ScriptedFinalRunner(provider: .claude, finalMessage: plain)
+        let thread = AgentThread(title: "wire fallback", provider: .claude, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providers: [.claude: runner]
+        )
+        let requestWire = try RCWireProtocol.serialize(.init(
+            direction: .request,
+            sequence: 1,
+            records: [.init(kind: .goal, value: "Inspect the fixture.")]
+        ))
+        coordinator.promptCompressor = { _, _, _, _ in requestWire }
+        coordinator.finalResponseTranslator = { _, _, _, _ in
+            XCTFail("human-readable provider fallback must not wait for local rendering")
+            return "wrong"
+        }
+
+        _ = try await coordinator.startRun(.init(
+            threadId: thread.id,
+            provider: .claude,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "Inspect the fixture and explain the result."
+        ))
+        let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
+        let translation = try await waitForWireTranslation(
+            coordinator,
+            threadId: thread.id,
+            messageId: assistant.id.value.uuidString
+        )
+
+        XCTAssertEqual(assistant.content, plain,
+                       "a provider protocol miss must remain readable instead of becoming an empty or raw-wire reply")
+        XCTAssertEqual(translation.originalText, plain,
+                       "the exact provider response must survive for transport disclosure")
+        XCTAssertEqual(translation.rewrittenText, plain)
+        XCTAssertEqual(translation.fallbackReason, "provider_plaintext_fallback",
+                       "the UI must distinguish provider nonconformance from a successful decoded frame")
+        XCTAssertEqual(translation.wireRequestText, requestWire,
+                       "the disclosure must retain what RemoteCode actually sent")
     }
 
     private func waitForAssistantMessage(
@@ -1079,22 +1011,22 @@ final class TokenSaverCompressionTests: XCTestCase {
         throw XCTSkip("assistant message did not persist")
     }
 
-    private func waitForSR1Translation(
+    private func waitForWireTranslation(
         _ coordinator: AgentRunCoordinator,
         threadId: AgentThreadID,
         messageId: String
-    ) async throws -> AssistantSR1Translation {
+    ) async throws -> AssistantWireTranslation {
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline {
             for event in coordinator.latestStreamEvents(threadId: threadId) {
-                if case .sr1Translation(let translation) = event,
+                if case .wireTranslation(let translation) = event,
                    translation.messageId == messageId {
                     return translation
                 }
             }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
-        XCTFail("timed out waiting for persisted SR1 translation event")
-        throw XCTSkip("SR1 translation event did not persist")
+        XCTFail("timed out waiting for persisted wire translation metadata")
+        throw XCTSkip("wire translation metadata did not persist")
     }
 }

@@ -1,7 +1,7 @@
 import XCTest
 import AppKit
 import CoreModel
-import AgentRuntime
+@testable import AgentRuntime
 import DistillCore
 import Persistence
 import SocketServer
@@ -29,12 +29,13 @@ final class TokenSaverAppContextTests: XCTestCase {
         func prepareOriginal(
             _ data: Data,
             context: TokenSaverRecoveryRequestContext,
-            lane _: String
+            lane: String
         ) throws -> TokenSaverScopedPreparation {
             let prepared = try store.prepare(
                 data,
                 scope: scope(context),
                 operationID: context.operationID,
+                lane: lane,
                 expiresAt: Date().addingTimeInterval(7 * 86_400),
                 disk: .init(freeBytes: 40 * 1_024 * 1_024 * 1_024, totalBytes: 100 * 1_024 * 1_024 * 1_024)
             )
@@ -76,16 +77,6 @@ final class TokenSaverAppContextTests: XCTestCase {
             context: TokenSaverRecoveryRequestContext
         ) throws -> Bool {
             try store.ack(capability: capability, scope: scope(context), idempotencyKey: idempotencyKey)
-        }
-    }
-
-    private struct PartialSR1HumanizeRuntime: DistillRuntime {
-        func distill(_ request: DistillRequest) async throws -> String {
-            """
-            Dict: S=state C=context D=action R=risk O=outcome N=no-go P=proof
-            Estado: starting
-            Acao: create #g1
-            """
         }
     }
 
@@ -163,22 +154,24 @@ final class TokenSaverAppContextTests: XCTestCase {
             try context.threadRepo.delete(id: threadID)
             try context.threadRepo.upsert(thread)
         }
-        try context.tokenSaverLaneStateRepo.upsert(.init(
-            projectID: thread.projectId!.value.uuidString,
-            lane: lane,
-            state: "promoted",
-            reason: "test_scorecard_passed",
-            evidenceLevel: "provider_usage",
-            ownerRole: "Operations Owner:test",
-            permissionBoundary: "project",
-            retentionDays: 30,
-            optedOut: false,
-            killSwitchActive: false,
-            attributionJoined: true,
-            reconciliationPassed: true,
-            usageSemanticsAvailable: true,
-            scorecardID: "test-scorecard"
-        ))
+        for laneName in Set([lane, "wire-encode", "wire-render-english"]) {
+            try context.tokenSaverLaneStateRepo.upsert(.init(
+                projectID: thread.projectId!.value.uuidString,
+                lane: laneName,
+                state: "promoted",
+                reason: "test_scorecard_passed",
+                evidenceLevel: "provider_usage",
+                ownerRole: "Operations Owner:test",
+                permissionBoundary: "project",
+                retentionDays: 30,
+                optedOut: false,
+                killSwitchActive: false,
+                attributionJoined: true,
+                reconciliationPassed: true,
+                usageSemanticsAvailable: true,
+                scorecardID: "test-scorecard"
+            ))
+        }
         return threadID
     }
 
@@ -264,9 +257,10 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: pathLink.path), cliURL.path)
 
         let skillText = try String(contentsOf: appPrivateSkill)
-        XCTAssertTrue(skillText.contains("source: https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md"))
-        XCTAssertTrue(skillText.contains("S=state"))
-        XCTAssertTrue(skillText.contains("P=proof"))
+        XCTAssertTrue(skillText.contains("Distill tool output"))
+        XCTAssertTrue(skillText.contains("not a conversation mode or user command"))
+        XCTAssertFalse(skillText.contains("S=state"))
+        XCTAssertFalse(skillText.contains("R0 micro"))
         let cliDest = try FileManager.default.destinationOfSymbolicLink(atPath: cliURL.path)
         XCTAssertTrue(cliDest.hasSuffix("RemoteCodeDistillService"), "managed CLI is a native symlink, not a script")
         XCTAssertFalse(cliDest.contains("dev/distill/src/cli.ts"))
@@ -751,20 +745,20 @@ final class TokenSaverAppContextTests: XCTestCase {
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
 
-        // Real in-process distill service (LocalDistillRuntime, no MLX needed).
+        let wire = try RCWireProtocol.serialize(.init(direction: .request, sequence: 1, records: [
+            .init(kind: .goal, value: "Apply the implementation guidance without filler.")
+        ]))
         let configuration = try DistillServiceConfiguration(
             authToken: "test-token",
             appSupportDirectory: appSupport
         )
-        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 4)
+        let scheduler = DistillScheduler(runtime: FixedOutputRuntime(output: wire), maxConcurrentRequests: 4)
         let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler, scopedRecoveryStore: TestScopedRecoveryStore(db: context.db))
         let ready = try await server.start()
         defer { server.stop() }
         context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "test-token")
 
-        let bigPrompt = (1...40)
-            .map { "line \($0): a verbose instruction line that the distiller will compress away" }
-            .joined(separator: "\n")
+        let bigPrompt = String(repeating: "A verbose English instruction line that the encoder can compact safely.\n", count: 50)
         XCTAssertGreaterThan(bigPrompt.count, 2_000, "must clear the raised NetPositiveGate floor")
 
         // Fresh thread => no prior turn => gate treats it as COLD => compresses (N5).
@@ -782,20 +776,117 @@ final class TokenSaverAppContextTests: XCTestCase {
                                    "a measured savings row must be persisted to the local DB for the compressed run")
         XCTAssertEqual(claude.inputTokens, TokenEstimator.estimate(bigPrompt),
                        "savings are recorded in estimated tokens, not characters")
-        XCTAssertEqual(claude.outputTokens, TokenEstimator.estimate(compressed),
-                       "savings are recorded in estimated tokens, not characters")
-        XCTAssertEqual(claude.savedTokens, max(TokenEstimator.estimate(bigPrompt) - TokenEstimator.estimate(compressed), 0))
+        let deliveredTokens = TokenEstimator.estimate(compressed)
+            + TokenEstimator.estimate(AgentSkillInstaller.rcWireAgentInstructionsTemplate)
+        XCTAssertEqual(claude.outputTokens, deliveredTokens,
+                       "the ledger includes both wire payload and fixed ABI overhead")
+        XCTAssertEqual(claude.savedTokens, max(TokenEstimator.estimate(bigPrompt) - deliveredTokens, 0))
         XCTAssertEqual(claude.runs, 1)
         XCTAssertGreaterThan(summary.averageSavedPerRun, 0, "the per-run average (média) must be computable from real data")
     }
 
-    func test_semanticSidecarAdoptionRequiresPromotedLaneRetentionAndScopedReadback() async throws {
+    func test_wireEncodingBypassesLegacyProviderSessionWithoutTrustedCapability() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2LegacyWireSession-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        let threadID = try makeAdmittedTokenSaverThread(in: context, provider: .claude)
+        try admitTokenSaver(in: context, threadID: threadID, lane: "semantic_prose")
+        try context.providerSessionRuntimeRepo.upsert(.init(
+            threadId: threadID,
+            provider: .claude,
+            status: .completed,
+            resumeCursor: "legacy-provider-session",
+            runtimePayloadJSON: "{}"
+        ))
+        let original = String(
+            repeating: "A long English follow-up that relies on trusted prior session context. ",
+            count: 60
+        )
+
+        let result = await context.tokenSaverCompress(
+            prompt: original,
+            provider: .claude,
+            threadId: threadID,
+            runId: AgentRunID()
+        )
+
+        XCTAssertEqual(result, original,
+                       "legacy resumes must keep human text instead of introducing protocol rules as user content")
+        XCTAssertFalse(AppContext.providerSessionSupportsWire("{}"))
+        XCTAssertTrue(AppContext.providerSessionSupportsWire(#"{"wireProtocolVersion":"RCW1"}"#))
+    }
+
+    func test_wireEncodingUsesWorkspaceAsExactScopeWhenThreadHasNoNestedProject() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2WorkspaceWireScope-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        let wire = try RCWireProtocol.serialize(.init(direction: .request, sequence: 1, records: [
+            .init(kind: .goal, value: "Inspect the workspace fixture and report the exact result.")
+        ]))
+        let configuration = try DistillServiceConfiguration(
+            authToken: "workspace-wire-token",
+            appSupportDirectory: appSupport
+        )
+        let scheduler = DistillScheduler(runtime: FixedOutputRuntime(output: wire), maxConcurrentRequests: 2)
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: scheduler,
+            scopedRecoveryStore: TestScopedRecoveryStore(db: context.db)
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+        context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "workspace-wire-token")
+
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(
+            projectId: nil,
+            workspaceId: workspaceID,
+            title: "top-level workspace",
+            provider: .codex,
+            model: "test-model"
+        )
+        try context.threadRepo.upsert(thread)
+        for lane in ["wire-encode", "wire-render-english"] {
+            try context.tokenSaverLaneStateRepo.upsert(.init(
+                projectID: workspaceID.value.uuidString,
+                lane: lane,
+                state: "promoted",
+                reason: "test_scorecard_passed",
+                evidenceLevel: "provider_usage",
+                ownerRole: "Provider Compatibility Owner:test",
+                permissionBoundary: "workspace",
+                retentionDays: 30,
+                optedOut: false,
+                killSwitchActive: false,
+                attributionJoined: true,
+                reconciliationPassed: true,
+                usageSemanticsAvailable: true,
+                scorecardID: "workspace-wire-scorecard"
+            ))
+        }
+        let prompt = String(repeating: "Verbose English workspace evidence can be compacted safely. ", count: 90)
+
+        let encoded = await context.tokenSaverCompress(
+            prompt: prompt,
+            provider: .codex,
+            threadId: thread.id,
+            runId: AgentRunID()
+        )
+
+        XCTAssertTrue(RCWireProtocol.isWire(encoded),
+                      "top-level Agent App workspaces must not silently bypass RCW1 because project_id is nil")
+    }
+
+    func test_wireEncodingStoresOriginalAndCarriesRecoveryInsideValidFrame() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2SemanticRecovery-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
         let configuration = try DistillServiceConfiguration(authToken: "semantic-token", appSupportDirectory: appSupport)
+        let semanticWire = try RCWireProtocol.serialize(.init(direction: .request, sequence: 1, records: [
+            .init(kind: .goal, value: "Apply the concise recoverable guidance.")
+        ]))
         let scheduler = DistillScheduler(
-            runtime: FixedOutputRuntime(output: "Concise safe prose."),
+            runtime: FixedOutputRuntime(output: semanticWire),
             maxConcurrentRequests: 2,
             resultCacheCapacity: 0
         )
@@ -807,56 +898,19 @@ final class TokenSaverAppContextTests: XCTestCase {
         let threadID = try makeAdmittedTokenSaverThread(in: context, provider: .claude)
         let thread = try XCTUnwrap(context.threadRepo.get(id: threadID))
         let projectID = try XCTUnwrap(thread.projectId?.value.uuidString)
-        let repeatedBlock = String(
-            repeating: "Verbose prose carries recoverable contextual explanation and guidance. ",
-            count: 50
+        let prompt = String(
+            repeating: "Verbose English guidance carries recoverable contextual explanation. ",
+            count: 90
         )
-        let prompt = repeatedBlock + "\n\n" + repeatedBlock
         let runID = AgentRunID()
-        func setSemantic(state: String, retentionDays: Int) throws {
-            try context.tokenSaverLaneStateRepo.upsert(.init(
-                projectID: projectID,
-                lane: "semantic_prose",
-                state: state,
-                reason: "test",
-                evidenceLevel: "provider_usage",
-                ownerRole: "Security Owner:test",
-                permissionBoundary: "project",
-                retentionDays: retentionDays,
-                optedOut: false,
-                killSwitchActive: false,
-                attributionJoined: true,
-                reconciliationPassed: true,
-                usageSemanticsAvailable: true,
-                scorecardID: "semantic-scorecard"
-            ))
-        }
-
-        try setSemantic(state: "shadow_only", retentionDays: 30)
-        let shadowOutput = await context.tokenSaverCompress(
-            prompt: prompt, provider: .claude, threadId: threadID, runId: runID
-        )
-        let deterministicOutput = DistillBlockDeduper.dedupe(prompt).output
-        XCTAssertEqual(shadowOutput, deterministicOutput, "shadow semantic output must never replace deterministic provider bytes")
-        try setSemantic(state: "promoted", retentionDays: 0)
-        let zeroRetentionOutput = await context.tokenSaverCompress(
-            prompt: prompt, provider: .claude, threadId: threadID, runId: runID
-        )
-        XCTAssertEqual(zeroRetentionOutput, deterministicOutput, "retention zero must keep only the non-lossy deterministic win")
-        let recoveryBefore = try context.db.prepare("SELECT COUNT(*) FROM token_saver_recovery_objects;")
-        XCTAssertTrue(try recoveryBefore.step())
-        XCTAssertEqual(recoveryBefore.columnInt64(0), 0)
-
-        try setSemantic(state: "promoted", retentionDays: 7)
         let adopted = await context.tokenSaverCompress(
             prompt: prompt, provider: .claude, threadId: threadID, runId: runID
         )
-        XCTAssertTrue(adopted.contains("[[rc:rcv1."))
-        XCTAssertLessThan(adopted.utf8.count, prompt.utf8.count)
-        let capabilities = adopted.components(separatedBy: "[[rc:").dropFirst().compactMap {
-            $0.components(separatedBy: "]]").first
-        }
-        XCTAssertEqual(capabilities.count, 2, "dedupe + semantic loss requires stage and full-original recovery")
+        let frame = try XCTUnwrap(RCWireProtocol.parse(adopted).first)
+        let marker = try XCTUnwrap(frame.records.last(where: { $0.kind == .exact })?.value)
+        XCTAssertTrue(marker.hasPrefix("[[rc:rcv1."))
+        XCTAssertTrue(marker.hasSuffix("]]"))
+        let capability = String(marker.dropFirst(5).dropLast(2))
         let scope = TokenSaverPersistentScope(
             workspaceID: try XCTUnwrap(thread.workspaceId?.value.uuidString),
             projectID: projectID,
@@ -865,243 +919,8 @@ final class TokenSaverAppContextTests: XCTestCase {
             attemptID: runID.value.uuidString
         )
         let recoveryStore = TokenSaverScopedRecoveryStore(db: context.db)
-        let recovered = try capabilities.compactMap {
-            try recoveryStore.retrieve(capability: $0, scope: scope)
-        }
-        XCTAssertTrue(recovered.contains(Data(prompt.utf8)), "one marker must recover the exact full pre-pipeline prompt")
-        XCTAssertTrue(
-            recovered.contains(Data(deterministicOutput.utf8)),
-            "accepted dual-marker path must also recover the exact deterministic stage original"
-        )
-        let recoveryAfter = try context.db.prepare("SELECT COUNT(*) FROM token_saver_recovery_objects;")
-        XCTAssertTrue(try recoveryAfter.step())
-        XCTAssertEqual(recoveryAfter.columnInt64(0), 2)
-        let outbox = try context.db.prepare("SELECT COUNT(*), MIN(state) FROM token_saver_recovery_outbox;")
-        XCTAssertTrue(try outbox.step())
-        XCTAssertEqual(outbox.columnInt64(0), 2)
-        XCTAssertEqual(outbox.columnText(1), "acked")
-        let liveCaps = try context.db.prepare(
-            "SELECT COUNT(*) FROM token_saver_recovery_capabilities WHERE revoked_at_ms IS NULL;"
-        )
-        XCTAssertTrue(try liveCaps.step())
-        XCTAssertEqual(liveCaps.columnInt64(0), 2)
-    }
-
-    func test_semanticAtomicFinalizationInjectedFailureEmitsNoMarkerAndDiscardsProvisionals() async throws {
-        // C6-I1: if multi-object finalization fails after the first member would have
-        // committed under the old split-transaction path, fail-open must emit no marker
-        // and discard every still-provisional recovery object.
-        let appSupport = NSTemporaryDirectory() + "RC2SemanticAtomicFinalize-" + UUID().uuidString
-        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        let configuration = try DistillServiceConfiguration(
-            authToken: "test-only-token",
-            appSupportDirectory: appSupport
-        )
-        let scheduler = DistillScheduler(
-            runtime: FixedOutputRuntime(output: "Concise safe prose."),
-            maxConcurrentRequests: 2,
-            resultCacheCapacity: 0
-        )
-        let server = DistillHTTPServer(
-            configuration: configuration,
-            scheduler: scheduler,
-            scopedRecoveryStore: TestScopedRecoveryStore(db: context.db)
-        )
-        let ready = try await server.start()
-        defer { server.stop() }
-        context.distillClientOverrideForTesting = DistillServiceClient(
-            ready: ready,
-            authToken: "test-only-token"
-        )
-
-        let threadID = try makeAdmittedTokenSaverThread(in: context, provider: .claude)
-        try admitTokenSaver(in: context, threadID: threadID, lane: "semantic_prose")
-        let repeatedBlock = String(
-            repeating: "Verbose prose carries recoverable contextual explanation and guidance. ",
-            count: 50
-        )
-        let prompt = repeatedBlock + "\n\n" + repeatedBlock
-        let runID = AgentRunID()
-
-        TokenSaverScopedRecoveryStore.testInjectFailureBetweenSemanticFinalizationMembers = true
-        defer { TokenSaverScopedRecoveryStore.testInjectFailureBetweenSemanticFinalizationMembers = false }
-
-        let output = await context.tokenSaverCompress(
-            prompt: prompt, provider: .claude, threadId: threadID, runId: runID
-        )
-
-        let deterministicOutput = DistillBlockDeduper.dedupe(prompt).output
-        XCTAssertEqual(
-            output,
-            deterministicOutput.count < prompt.count ? deterministicOutput : prompt,
-            "injected finalization failure must fail open to deterministic/original"
-        )
-        XCTAssertFalse(output.contains("[[rc:"), "fail-open after finalization failure must emit no recovery marker")
-
-        let liveObjects = try context.db.prepare(
-            "SELECT COUNT(*) FROM token_saver_recovery_objects WHERE tombstoned_at_ms IS NULL;"
-        )
-        XCTAssertTrue(try liveObjects.step())
-        XCTAssertEqual(liveObjects.columnInt64(0), 0, "all provisionals must be discarded after finalization failure")
-        let liveCaps = try context.db.prepare(
-            "SELECT COUNT(*) FROM token_saver_recovery_capabilities WHERE revoked_at_ms IS NULL;"
-        )
-        XCTAssertTrue(try liveCaps.step())
-        XCTAssertEqual(liveCaps.columnInt64(0), 0, "zero live capabilities after discard")
-        let outbox = try context.db.prepare(
-            "SELECT COUNT(*), MIN(state), MIN(transport_outcome) FROM token_saver_recovery_outbox;"
-        )
-        XCTAssertTrue(try outbox.step())
-        XCTAssertGreaterThan(outbox.columnInt64(0), 0, "stage/full objects were prepared then abandoned")
-        XCTAssertEqual(outbox.columnText(1), "acked")
-        XCTAssertEqual(outbox.columnText(2), "acked")
-        let scrubbed = try context.db.prepare(
-            """
-            SELECT COUNT(*) FROM token_saver_recovery_objects
-            WHERE original = X'' AND integrity_sha256 = '' AND byte_count = 0
-              AND tombstoned_at_ms IS NOT NULL;
-            """
-        )
-        XCTAssertTrue(try scrubbed.step())
-        XCTAssertEqual(scrubbed.columnInt64(0), outbox.columnInt64(0))
-    }
-
-    func test_semanticMarkerOverheadRejectionFallsBackWithoutLiveRecovery() async throws {
-        // C4-I1: a model-only character win can still lose after markers are attached.
-        // The final UTF-8 gate must reject before ack and leave zero live private rows.
-        let appSupport = NSTemporaryDirectory() + "RC2SemanticMarkerOverhead-" + UUID().uuidString
-        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        let configuration = try DistillServiceConfiguration(
-            authToken: "test-only-token",
-            appSupportDirectory: appSupport
-        )
-        // Single non-duplicated prose body so deterministic stage == original (one marker).
-        let prompt = String(
-            repeating: "Unique verbose prose carries recoverable contextual explanation and guidance. ",
-            count: 40
-        )
-        XCTAssertGreaterThan(prompt.count, 2_000)
-        XCTAssertEqual(DistillBlockDeduper.dedupe(prompt).output, prompt)
-        // Save fewer characters than a single [[rc:rcv1...]] marker adds.
-        let marginalCandidate = String(prompt.dropLast(24))
-        XCTAssertLessThan(marginalCandidate.utf8.count, prompt.utf8.count)
-        let scheduler = DistillScheduler(
-            runtime: FixedOutputRuntime(output: marginalCandidate),
-            maxConcurrentRequests: 2,
-            resultCacheCapacity: 0
-        )
-        let server = DistillHTTPServer(
-            configuration: configuration,
-            scheduler: scheduler,
-            scopedRecoveryStore: TestScopedRecoveryStore(db: context.db)
-        )
-        let ready = try await server.start()
-        defer { server.stop() }
-        context.distillClientOverrideForTesting = DistillServiceClient(
-            ready: ready,
-            authToken: "test-only-token"
-        )
-
-        let threadID = try makeAdmittedTokenSaverThread(in: context, provider: .claude)
-        try admitTokenSaver(in: context, threadID: threadID, lane: "semantic_prose")
-        let runID = AgentRunID()
-        let output = await context.tokenSaverCompress(
-            prompt: prompt,
-            provider: .claude,
-            threadId: threadID,
-            runId: runID
-        )
-
-        XCTAssertEqual(output, prompt, "marker overhead must force deterministic/original fail-open")
-        XCTAssertFalse(output.contains("[[rc:"), "rejected semantic candidate must emit no recovery marker")
-        let liveObjects = try context.db.prepare(
-            "SELECT COUNT(*) FROM token_saver_recovery_objects WHERE tombstoned_at_ms IS NULL;"
-        )
-        XCTAssertTrue(try liveObjects.step())
-        XCTAssertEqual(liveObjects.columnInt64(0), 0, "no live stage/full-original private rows may remain")
-        let liveCaps = try context.db.prepare(
-            "SELECT COUNT(*) FROM token_saver_recovery_capabilities WHERE revoked_at_ms IS NULL;"
-        )
-        XCTAssertTrue(try liveCaps.step())
-        XCTAssertEqual(liveCaps.columnInt64(0), 0, "zero live capabilities after abandonment")
-        let outbox = try context.db.prepare(
-            "SELECT COUNT(*), MIN(state), MIN(transport_outcome) FROM token_saver_recovery_outbox;"
-        )
-        XCTAssertTrue(try outbox.step())
-        XCTAssertGreaterThan(outbox.columnInt64(0), 0, "stage was prepared then abandoned")
-        XCTAssertEqual(outbox.columnText(1), "acked")
-        XCTAssertEqual(outbox.columnText(2), "acked")
-        let scrubbed = try context.db.prepare(
-            """
-            SELECT COUNT(*) FROM token_saver_recovery_objects
-            WHERE original = X'' AND integrity_sha256 = '' AND byte_count = 0
-              AND tombstoned_at_ms IS NOT NULL;
-            """
-        )
-        XCTAssertTrue(try scrubbed.step())
-        XCTAssertEqual(scrubbed.columnInt64(0), outbox.columnInt64(0))
-    }
-
-    func test_semanticModelLossAfterStagePreparationLeavesNoLivePrivateRow() async throws {
-        // Distill prepares stage recovery whenever lossy output differs from input.
-        // If the model later loses the adoption race, that provisional must be discarded.
-        let appSupport = NSTemporaryDirectory() + "RC2SemanticModelLoss-" + UUID().uuidString
-        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        let configuration = try DistillServiceConfiguration(
-            authToken: "test-only-token",
-            appSupportDirectory: appSupport
-        )
-        let prompt = String(
-            repeating: "Unique verbose prose carries recoverable contextual explanation and guidance. ",
-            count: 40
-        )
-        // Same-length different bytes: Distill still prepares stage recovery (output != input),
-        // but AppContext modelWon requires a strict character win and therefore rejects.
-        let nonWinningCandidate = String(repeating: "Z", count: prompt.count)
-        let scheduler = DistillScheduler(
-            runtime: FixedOutputRuntime(output: nonWinningCandidate),
-            maxConcurrentRequests: 2,
-            resultCacheCapacity: 0
-        )
-        let server = DistillHTTPServer(
-            configuration: configuration,
-            scheduler: scheduler,
-            scopedRecoveryStore: TestScopedRecoveryStore(db: context.db)
-        )
-        let ready = try await server.start()
-        defer { server.stop() }
-        context.distillClientOverrideForTesting = DistillServiceClient(
-            ready: ready,
-            authToken: "test-only-token"
-        )
-
-        let threadID = try makeAdmittedTokenSaverThread(in: context, provider: .claude)
-        try admitTokenSaver(in: context, threadID: threadID, lane: "semantic_prose")
-        let output = await context.tokenSaverCompress(
-            prompt: prompt,
-            provider: .claude,
-            threadId: threadID,
-            runId: AgentRunID()
-        )
-
-        XCTAssertEqual(output, prompt)
-        XCTAssertFalse(output.contains("[[rc:"))
-        let liveObjects = try context.db.prepare(
-            "SELECT COUNT(*) FROM token_saver_recovery_objects WHERE tombstoned_at_ms IS NULL;"
-        )
-        XCTAssertTrue(try liveObjects.step())
-        XCTAssertEqual(liveObjects.columnInt64(0), 0, "model-loss after stage prep must leave no live private row")
-        let liveCaps = try context.db.prepare(
-            "SELECT COUNT(*) FROM token_saver_recovery_capabilities WHERE revoked_at_ms IS NULL;"
-        )
-        XCTAssertTrue(try liveCaps.step())
-        XCTAssertEqual(liveCaps.columnInt64(0), 0)
-        let totalObjects = try context.db.prepare("SELECT COUNT(*) FROM token_saver_recovery_objects;")
-        XCTAssertTrue(try totalObjects.step())
-        XCTAssertEqual(totalObjects.columnInt64(0), 1, "exactly the stage provisional is prepared then tombstoned")
+        XCTAssertEqual(try recoveryStore.retrieve(capability: capability, scope: scope), Data(prompt.utf8),
+                       "the in-frame handle must retrieve the exact human prompt")
     }
 
     func test_tokenSaverProjectVerbatimAdmissionReturnsExactBytesWithoutWriters() async throws {
@@ -1130,15 +949,16 @@ final class TokenSaverAppContextTests: XCTestCase {
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
 
         let configuration = try DistillServiceConfiguration(authToken: "codex-token", appSupportDirectory: appSupport)
-        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 4)
+        let codexWire = try RCWireProtocol.serialize(.init(direction: .request, sequence: 1, records: [
+            .init(kind: .goal, value: "Apply the compact Codex instruction.")
+        ]))
+        let scheduler = DistillScheduler(runtime: FixedOutputRuntime(output: codexWire), maxConcurrentRequests: 4)
         let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler, scopedRecoveryStore: TestScopedRecoveryStore(db: context.db))
         let ready = try await server.start()
         defer { server.stop() }
         context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "codex-token")
 
-        let bigPrompt = (1...40)
-            .map { "line \($0): a verbose codex instruction line that the distiller will compress away" }
-            .joined(separator: "\n")
+        let bigPrompt = String(repeating: "A verbose English Codex instruction that the encoder can compact safely.\n", count: 50)
         XCTAssertGreaterThan(bigPrompt.count, 2_000)
 
         let threadID = try makeAdmittedTokenSaverThread(in: context, provider: .codex)
@@ -1160,6 +980,143 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertNil(summary.savings(for: "claude"), "this run was codex-only; no claude row should exist")
     }
 
+    func test_wireEncodeAndDeterministicDecodeCoverEveryNestedProviderPair() async throws {
+        // WHY: proving RCW1 on primary Claude/Codex/Grok and proving Token Saver
+        // receipt inheritance separately can still hide a nested-only bypass. Every
+        // same-provider and cross-provider Agent App child must use the child thread's
+        // inherited project scope for both wire directions.
+        let appSupport = NSTemporaryDirectory() + "RC2NestedWireMatrix-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let router = AppCommandRouter(context: context)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        let requestWire = try RCWireProtocol.serialize(.init(
+            direction: .request,
+            sequence: 1,
+            records: [.init(kind: .goal, value: "Inspect the delegated reliability evidence and report the smallest safe correction.")]
+        ))
+        let responseWire = try RCWireProtocol.serialize(.init(
+            direction: .response,
+            sequence: 1,
+            records: [
+                .init(kind: .outcome, value: "The delegated reliability diagnosis completed."),
+                .init(kind: .evidence, value: "The child preserved its host-owned project scope."),
+            ]
+        ))
+        let expectedRendered = RCWireProtocol.renderEnglish(try RCWireProtocol.parse(responseWire))
+        let configuration = try DistillServiceConfiguration(
+            authToken: "nested-wire-matrix-token",
+            appSupportDirectory: appSupport
+        )
+        let scheduler = DistillScheduler(
+            runtime: FixedOutputRuntime(output: requestWire),
+            maxConcurrentRequests: 4
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: scheduler,
+            scopedRecoveryStore: TestScopedRecoveryStore(db: context.db)
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+        context.distillClientOverrideForTesting = DistillServiceClient(
+            ready: ready,
+            authToken: "nested-wire-matrix-token"
+        )
+
+        let workspace = try router.createWorkspace(
+            name: "nested-wire-matrix",
+            cwd: NSTemporaryDirectory()
+        )
+        let providers: [AgentProvider] = [.claude, .codex, .grok]
+        let prompt = String(
+            repeating: "Verbose English nested reliability context can be compacted safely for the delegated investigation. ",
+            count: 50
+        )
+
+        for parentProvider in providers {
+            let parent = AgentThread(
+                projectId: ProjectID(),
+                workspaceId: workspace.id,
+                title: "nested wire parent \(parentProvider.rawValue)",
+                provider: parentProvider,
+                model: "test-model",
+                permissionMode: .fullAccess
+            )
+            try context.threadRepo.upsert(parent)
+            try admitTokenSaver(in: context, threadID: parent.id)
+            let parentRunID = AgentRunID()
+            let parentCapability = AgentDelegationCapability.issue()
+            _ = try context.orchestrationRuntime.recordExternalRoot(
+                runId: parentRunID,
+                threadId: parent.id,
+                provider: parentProvider,
+                providerInstanceId: parentProvider.rawValue,
+                model: "test-model",
+                permissionMode: .fullAccess,
+                delegationCapabilitySHA256: AgentDelegationCapability.sha256Hex(parentCapability)
+            )
+
+            for childProvider in providers {
+                let child = try await router.createAgentThreadRouting(
+                    workspace: workspace.id,
+                    title: "nested wire \(parentProvider.rawValue) to \(childProvider.rawValue)",
+                    provider: childProvider,
+                    model: "test-model",
+                    permissionMode: .supervised,
+                    reasoningEffort: .medium,
+                    serviceTier: .auto,
+                    modelSelection: nil,
+                    providerInstanceId: nil,
+                    runAsUser: nil,
+                    surfaceID: nil,
+                    routing: nil,
+                    nestedRunContext: AgentNestedRunContext(
+                        parentRunID: parentRunID,
+                        parentThreadID: parent.id,
+                        nodeID: "nested.\(parentProvider.rawValue).\(childProvider.rawValue)",
+                        parentCapability: parentCapability
+                    )
+                )
+                XCTAssertEqual(child.projectId, parent.projectId, "\(parentProvider) to \(childProvider) project scope")
+                XCTAssertEqual(child.workspaceId, parent.workspaceId, "\(parentProvider) to \(childProvider) workspace scope")
+
+                let encoded = await context.tokenSaverCompress(
+                    prompt: prompt,
+                    provider: childProvider,
+                    threadId: child.id,
+                    runId: AgentRunID()
+                )
+                XCTAssertTrue(
+                    RCWireProtocol.isWire(encoded),
+                    "\(parentProvider) to \(childProvider) child must admit RCW1"
+                )
+                let rendered = await context.tokenSaverRenderWireResponse(
+                    responseWire,
+                    provider: childProvider,
+                    threadId: child.id,
+                    runId: AgentRunID()
+                )
+                XCTAssertEqual(
+                    rendered,
+                    expectedRendered,
+                    "\(parentProvider) to \(childProvider) must retain a local-model-independent readable result"
+                )
+                try await router.deleteAgentThread(thread: child.id)
+            }
+        }
+
+        let savings = try context.tokenSaverSavingsRepo.summary()
+        for provider in providers {
+            XCTAssertEqual(
+                savings.savings(for: provider.rawValue)?.runs,
+                3,
+                "each provider must be exercised once under every possible parent"
+            )
+        }
+    }
+
     func test_tokenSaverFollowUpCompressionRecordsPromptFollowupCacheState() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2TokenSaverFollowupLedger-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
@@ -1169,15 +1126,16 @@ final class TokenSaverAppContextTests: XCTestCase {
             authToken: "followup-token",
             appSupportDirectory: appSupport
         )
-        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 4)
+        let followUpWire = try RCWireProtocol.serialize(.init(direction: .request, sequence: 1, records: [
+            .init(kind: .goal, value: "Apply the compact follow-up remediation.")
+        ]))
+        let scheduler = DistillScheduler(runtime: FixedOutputRuntime(output: followUpWire), maxConcurrentRequests: 4)
         let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler, scopedRecoveryStore: TestScopedRecoveryStore(db: context.db))
         let ready = try await server.start()
         defer { server.stop() }
         context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "followup-token")
 
-        let prompt = (1...40)
-            .map { "follow-up verbose prose segment \($0) with repeated diagnostic context and remediation detail" }
-            .joined(separator: "\n")
+        let prompt = String(repeating: "Follow-up verbose English prose with repeated diagnostic context and remediation detail.\n", count: 50)
 
         let threadID = try makeAdmittedTokenSaverThread(in: context, provider: .claude)
         try admitTokenSaver(in: context, threadID: threadID, lane: "semantic_prose")
@@ -1285,61 +1243,6 @@ final class TokenSaverAppContextTests: XCTestCase {
                        "a known no-win prompt should be remembered locally instead of paying the sidecar again")
         XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0,
                        "no-win skip-set entries must not fabricate savings rows")
-    }
-
-    func test_tokenSaverDedupsRepeatedBlockEvenWithoutModelService() async throws {
-        let appSupport = NSTemporaryDirectory() + "RC2Dedup-" + UUID().uuidString
-        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        // No distill client override and no sidecar → the model step is unavailable; the
-        // deterministic, non-lossy dedup must still apply (P4) and fail open to it.
-
-        let block = String(repeating: "The renderer validates each config field before drawing the widget. ", count: 10)
-        let padding = String(repeating: "padding sentence to clear the floor. ", count: 30)
-        let prompt = "Task intro. \(padding)\n\n\(block)\n\nMiddle note.\n\n\(block)\n\nEnd."
-        XCTAssertGreaterThan(prompt.count, 2_000)
-
-        let threadID = try makeAdmittedTokenSaverThread(in: context, provider: .claude)
-        let out = await context.tokenSaverCompress(prompt: prompt, provider: .claude, threadId: threadID)
-        XCTAssertLessThan(out.count, prompt.count, "the duplicate block is collapsed even with no model service")
-        XCTAssertTrue(out.contains("⟪identical to block #"), "model-readable dedup pointer present (non-lossy)")
-        XCTAssertTrue(out.contains(block), "the first occurrence stays inline — no information lost")
-        XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 1, "the dedup saving is recorded")
-    }
-
-    func test_tokenSaverNearDedupDoesNotEmitUnscopedRecoveryMarker() async throws {
-        let appSupport = NSTemporaryDirectory() + "RC2NearDedup-" + UUID().uuidString
-        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-
-        let stableTail = String(repeating: " stable auth diagnostic payload", count: 180)
-        let first = """
-        2026-06-13T10:20:30Z pid=1234 crashed at 0x0000000abcdef123
-        ERROR auth failed in LoginView.swift:88\(stableTail)
-        """
-        let second = """
-        2026-06-13T10:20:31Z pid=5678 crashed at 0x0000000abcdef999
-        ERROR auth failed in LoginView.swift:88\(stableTail)
-        """
-        let prompt = "Task intro.\n\n\(first)\n\n\(second)\n\nEnd."
-        XCTAssertGreaterThan(prompt.utf8.count, 8_192)
-
-        let threadID = try makeAdmittedTokenSaverThread(in: context, provider: .claude)
-        let out = await context.tokenSaverCompress(prompt: prompt, provider: .claude, threadId: threadID)
-
-        XCTAssertLessThan(out.count, prompt.count)
-        XCTAssertTrue(out.contains("same as block #1 above except"))
-        XCTAssertTrue(out.contains("pid=1234"))
-        XCTAssertTrue(out.contains("pid=5678"))
-        XCTAssertNil(
-            out.range(of: #"\[\[rc:[0-9a-f]+\]\]"#, options: .regularExpression),
-            "Wave -1: exact/volatile dedup may remain self-contained, but no raw-hash recovery marker may be emitted"
-        )
-        XCTAssertEqual(
-            try ReversibleContentStore(db: context.db).count(),
-            0,
-            "Wave -1: near-dedup must not create a new unscoped recovery row"
-        )
     }
 
     func test_tokenSaverDiffPromptFailsOpenUntilScopedRecoveryShips() async throws {
@@ -2056,288 +1959,114 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertTrue(lifecycleEvents.isEmpty)
     }
 
-    func test_tokenSaverOffKeepsSR1ByteIdenticalWithoutClientOrLedgerWrites() async throws {
-        let appSupport = NSTemporaryDirectory() + "RC2SR1OffLane-" + UUID().uuidString
-        let context = try AppContext(
-            channel: .debug,
-            appSupportOverride: appSupport
-        )
+    func test_tokenSaverOffStillRendersValidWireDeterministically() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2WireOff-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = false }
+        let thread = AgentThread(title: "wire off", provider: .grok, model: "test")
+        try context.threadRepo.upsert(thread)
+        let wire = "RCW1\tA\t1\nO\tThe result is ready.\n.\n"
 
+        let result = await context.tokenSaverRenderWireResponse(wire, provider: .grok, threadId: thread.id)
+
+        XCTAssertEqual(result, "The result is ready.",
+                       "a toggle change after provider admission must never expose raw wire to the human")
+        XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0)
+    }
+
+    func test_wireEncoderBypassesNonEnglishAndHighRiskPromptsBeforeLocalModel() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2WireEligibility-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
         let runtime = CountingEchoRuntime()
         let configuration = try DistillServiceConfiguration(
-            authToken: "off-lane-token",
+            authToken: "wire-eligibility-token",
             appSupportDirectory: appSupport
         )
-        let scheduler = DistillScheduler(runtime: runtime, maxConcurrentRequests: 1)
+        let scheduler = DistillScheduler(runtime: runtime, maxConcurrentRequests: 2)
         let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
         let ready = try await server.start()
         defer { server.stop() }
         context.distillClientOverrideForTesting = DistillServiceClient(
             ready: ready,
-            authToken: "off-lane-token"
+            authToken: "wire-eligibility-token"
+        )
+        let threadID = try makeAdmittedTokenSaverThread(in: context, provider: .claude)
+        try admitTokenSaver(in: context, threadID: threadID, lane: "semantic_prose")
+
+        let portuguese = String(
+            repeating: "Por favor explique o problema e preserve exatamente todos os dados do usuario. ",
+            count: 45
+        )
+        let highRisk = String(
+            repeating: "Approve deleting production data only after an explicit security confirmation. ",
+            count: 45
+        )
+        let portugueseResult = await context.tokenSaverCompress(
+            prompt: portuguese,
+            provider: .claude,
+            threadId: threadID,
+            runId: AgentRunID()
+        )
+        let highRiskResult = await context.tokenSaverCompress(
+            prompt: highRisk,
+            provider: .claude,
+            threadId: threadID,
+            runId: AgentRunID()
         )
 
-        let thread = AgentThread(title: "off lane", provider: .grok, model: "test", status: .completed)
-        try context.threadRepo.upsert(thread)
-        let sr1 = """
-        SR1
-        S=done
-        O=The result is ready.
-        """
-
-        let result = await context.tokenSaverHumanizeSR1Response(sr1, provider: .grok, threadId: thread.id)
-
-        XCTAssertEqual(result, sr1, "Token Saver OFF must preserve provider bytes exactly")
-        let clientCallCount = await runtime.callCount
-        XCTAssertEqual(clientCallCount, 0, "an already-live sidecar client must not be called")
+        XCTAssertEqual(Data(portugueseResult.utf8), Data(portuguese.utf8),
+                       "non-English v1 input must reach the provider byte-identically")
+        XCTAssertEqual(Data(highRiskResult.utf8), Data(highRisk.utf8),
+                       "approval and destructive turns must bypass lossy wire encoding")
+        let localModelCalls = await runtime.callCount
+        XCTAssertEqual(localModelCalls, 0,
+                       "locale and risk gates must run before invoking the local model")
         XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0)
-        XCTAssertEqual(
-            TokenSaverUsageStore(
-                appSupportDirectory: URL(fileURLWithPath: appSupport, isDirectory: true)
-            ).load().usedTokens,
-            0,
-            "SR1 rewrite gating must not synthesize local provider usage"
-        )
-        let attempts = try context.db.prepare("SELECT COUNT(*) FROM token_saver_attempts;")
-        XCTAssertTrue(try attempts.step())
-        XCTAssertEqual(attempts.columnInt64(0), 0)
-        let auditEvents = try context.db.prepare("SELECT COUNT(*) FROM token_saver_audit_events;")
-        XCTAssertTrue(try auditEvents.step())
-        XCTAssertEqual(auditEvents.columnInt64(0), 0)
     }
 
-    func test_tokenSaverHumanizesSR1FinalResponseThroughDistillClientInUserLanguage() async throws {
-        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverHumanizeSR1-" + UUID().uuidString
+    func test_wireResponseUsesDeterministicRendererWhenLocalModelUnavailable() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2WireFallback-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-
-        let configuration = try DistillServiceConfiguration(
-            authToken: "humanize-token",
-            appSupportDirectory: appSupport
-        )
-        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 4)
-        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
-        let ready = try await server.start()
-        defer { server.stop() }
-        context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "humanize-token")
-
-        let thread = AgentThread(title: "sr1", provider: .codex, model: "fake-model")
+        let thread = AgentThread(title: "wire fallback", provider: .claude, model: "test")
         try context.threadRepo.upsert(thread)
         try admitTokenSaver(in: context, threadID: thread.id)
-        try context.messageRepo.append(AgentMessage(
-            threadId: thread.id,
-            role: .user,
-            content: "/distill Responda em portugues o resultado dos testes."
-        ))
-        let sr1 = """
-        SR1
-        S: tests green
-        C: user asked in Portuguese
-        O: saved counter updated
-        P: macOS suite passed
-        """
+        let wire = "RCW1\tA\t1\nO\tBuild completed.\nE\t143 tests passed.\nR\tProduction was not changed.\n.\n"
 
-        let humanized = await context.tokenSaverHumanizeSR1Response(sr1, provider: .codex, threadId: thread.id)
+        let rendered = await context.tokenSaverRenderWireResponse(wire, provider: .claude, threadId: thread.id)
 
-        XCTAssertFalse(SR1ResponseDetector.isSR1(humanized),
-                       "the Agent App must store the human-language answer, not another SR1 block")
-        // Fail-open UI prefers O (outcome) over ops chrome (S/C/D). Portuguese is
-        // still the target language for the Distill request when the sidecar answers.
-        XCTAssertTrue(
-            humanized.contains("saved counter updated") || humanized.localizedCaseInsensitiveContains("estado"),
-            "humanized answer must surface the SR1 outcome (or a PT-labeled expansion)"
-        )
-        XCTAssertTrue(
-            humanized.contains("macOS suite passed") || humanized.localizedCaseInsensitiveContains("prova"),
-            "proof line remains available when present on the SR1 block"
-        )
+        XCTAssertEqual(rendered, "Build completed.\n\nEvidence: 143 tests passed.\n\nRisk: Production was not changed.")
+        XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0,
+                       "local display rendering must not claim provider-token savings")
     }
 
-    func test_tokenSaverHumanizesSpaceDelimitedDistillResponseThroughDistillClient() async throws {
-        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverHumanizeSR1Space-" + UUID().uuidString
-        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-
-        let configuration = try DistillServiceConfiguration(
-            authToken: "humanize-space-token",
-            appSupportDirectory: appSupport
-        )
-        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 4)
-        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
-        let ready = try await server.start()
-        defer { server.stop() }
-        context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "humanize-space-token")
-
-        let thread = AgentThread(title: "sr1 space", provider: .claude, model: "fake-model")
-        try context.threadRepo.upsert(thread)
-        try admitTokenSaver(in: context, threadID: thread.id)
-        try context.messageRepo.append(AgentMessage(
-            threadId: thread.id,
-            role: .user,
-            content: "/distill crie o snage game em html"
-        ))
-        let sr1 = """
-        O Snake game criado.
-        O file: /Users/samuelfajreldines/snake.html (single-file, zero deps)
-        O feat: canvas 20x20 grid, score, wall+self collision, food respawn, game-over restart
-        O ctrl: setas ou WASD; ESPACO reinicia
-        P open: abrir snake.html no browser -> jogo roda
-        """
-
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        let humanized = await context.tokenSaverHumanizeSR1Response(sr1, provider: .claude, threadId: thread.id)
-
-        XCTAssertFalse(SR1ResponseDetector.isSR1(humanized),
-                       "humanized output must not still look like SR1")
-        XCTAssertFalse(humanized.contains("O file:"),
-                       "space-delimited O prefixes must be expanded out of the UI answer")
-        XCTAssertTrue(humanized.contains("Snake game criado."),
-                      "primary outcome remains user-visible")
-        XCTAssertTrue(
-            humanized.contains("abrir snake.html") || humanized.contains("open:"),
-            "proof/open guidance remains available when present"
-        )
-    }
-
-    func test_tokenSaverHumanizeFallsBackWhenLocalLLMLeavesSR1Dictionary() async throws {
-        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverHumanizePartialSR1-" + UUID().uuidString
-        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-
-        let configuration = try DistillServiceConfiguration(
-            authToken: "partial-humanize-token",
-            appSupportDirectory: appSupport
-        )
-        let scheduler = DistillScheduler(runtime: PartialSR1HumanizeRuntime(), maxConcurrentRequests: 4)
-        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
-        let ready = try await server.start()
-        defer { server.stop() }
-        context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "partial-humanize-token")
-
-        let thread = AgentThread(title: "sr1 partial", provider: .codex, model: "fake-model")
-        try context.threadRepo.upsert(thread)
-        try admitTokenSaver(in: context, threadID: thread.id)
-        try context.messageRepo.append(AgentMessage(
-            threadId: thread.id,
-            role: .user,
-            content: "/distill crie o snage game em html"
-        ))
-        let sr1 = """
-        Dict: S=state C=context D=action R=risk O=outcome N=no-go P=proof #g1=Snake HTML game
-        S starting. D load /distill rules, inspect /tmp, then create #g1.
-        """
-
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        let humanized = await context.tokenSaverHumanizeSR1Response(sr1, provider: .codex, threadId: thread.id)
-
-        XCTAssertFalse(humanized.contains("Dict:"),
-                       "the Agent App must not display a local-LLM partial translation that still contains the SR1 dictionary")
-        XCTAssertFalse(humanized.contains("#g1"),
-                       "SR1 variables are for provider compression only and must be expanded before the user sees the answer")
-        // Partial SR1 from the local model is rejected → fail-open humanize (may be a
-        // cannot-expand notice when the block has no recoverable O/P segments).
-        XCTAssertFalse(humanized.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                       "fail-open path must still return a user-facing string")
-        XCTAssertFalse(SR1ResponseDetector.isSR1(humanized),
-                       "fail-open output must not still look like SR1")
-    }
-
-    func test_tokenSaverHumanizedSR1ResponseCreditsDefaultAgentVerbosityFactor() async throws {
-        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverSR1OutputSavings-" + UUID().uuidString
+    func test_malformedWireReturnsExplicitReadableErrorAndPreservesNoFakeSavings() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2WireMalformed-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        let thread = AgentThread(title: "wire malformed", provider: .codex, model: "test")
+        try context.threadRepo.upsert(thread)
+        try admitTokenSaver(in: context, threadID: thread.id)
 
-        let configuration = try DistillServiceConfiguration(
-            authToken: "sr1-output-savings-token",
-            appSupportDirectory: appSupport
+        let rendered = await context.tokenSaverRenderWireResponse(
+            "RCW1\tA\t1\nO\ttruncated",
+            provider: .codex,
+            threadId: thread.id
         )
-        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 4)
-        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
-        let ready = try await server.start()
-        defer { server.stop() }
-        context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "sr1-output-savings-token")
 
-        let thread = AgentThread(title: "sr1 output savings", provider: .codex, model: "fake-model")
-        try context.threadRepo.upsert(thread)
-        try admitTokenSaver(in: context, threadID: thread.id)
-        try context.messageRepo.append(AgentMessage(
-            threadId: thread.id,
-            role: .user,
-            content: "/distill crie o snage game em html"
-        ))
-        let sr1 = """
-        S ok.
-        O /tmp/index.html.
-        P pass.
-        """
-        let runId = AgentRunID()
-
-        let humanized = await context.tokenSaverHumanizeSR1Response(sr1, provider: .codex, threadId: thread.id, runId: runId)
-        _ = await context.tokenSaverHumanizeSR1Response(sr1, provider: .codex, threadId: thread.id, runId: runId)
-
-        let summary = try context.tokenSaverSavingsRepo.summary()
-        let codex = try XCTUnwrap(summary.savings(for: "codex"))
-        // WHY no expansion factor: the 9x credit this used to assert was an
-        // uncalibrated counterfactual applied to character counts. Both legs now use
-        // the same deterministic token estimator, so the recorded saving is a delta
-        // between two texts that were actually produced.
-        let perInput = TokenEstimator.estimate(humanized)
-        let perOutput = TokenEstimator.estimate(sr1)
-        let expectedInput = perInput * 2
-        let expectedOutput = perOutput * 2
-        let expectedSaved = max(perInput - perOutput, 0) * 2
-        XCTAssertEqual(codex.inputTokens, expectedInput,
-                       "SR1 humanization accounting records the estimated token size of the humanized text")
-        XCTAssertEqual(codex.outputTokens, expectedOutput,
-                       "the emitted compressed response is measured with the same estimator")
-        XCTAssertEqual(codex.savedTokens, expectedSaved,
-                       "saved = estimated humanized tokens - estimated SR1 tokens, per sidecar call, with no credit")
-        XCTAssertEqual(codex.runs, 2,
-                       "every successful local sidecar humanization call must update Token Saver reports")
+        XCTAssertTrue(rendered.contains("could not decode"))
+        XCTAssertFalse(rendered.isEmpty)
+        XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0)
     }
 
-    func test_tokenSaverHumanizedSR1FallbackCreditsDefaultAgentVerbosityFactorWhenSidecarUnavailable() async throws {
-        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverSR1FallbackSavings-" + UUID().uuidString
-        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-
-        let thread = AgentThread(title: "sr1 fallback", provider: .claude, model: "fake-model")
-        try context.threadRepo.upsert(thread)
-        try admitTokenSaver(in: context, threadID: thread.id)
-        try context.messageRepo.append(AgentMessage(
-            threadId: thread.id,
-            role: .user,
-            content: "Please answer in English using the compact Token Saver language."
-        ))
-
-        let sr1 = """
-        S ok.
-        O /tmp/index.html created.
-        P tests passed.
-        """
-
-        let humanized = await context.tokenSaverHumanizeSR1Response(sr1, provider: .claude, threadId: thread.id)
-
-        XCTAssertNotEqual(humanized, sr1)
-        let summary = try context.tokenSaverSavingsRepo.summary()
-        let claude = try XCTUnwrap(summary.savings(for: "claude"),
-                                   "fallback SR1 expansion still saves output tokens and must be visible in the report")
-        // Same estimator on both legs; no expansion or verbosity credit (see the
-        // estimator's own comment for why the 9x factor was removed).
-        XCTAssertEqual(claude.inputTokens, TokenEstimator.estimate(humanized))
-        XCTAssertEqual(claude.outputTokens, TokenEstimator.estimate(sr1))
-        XCTAssertEqual(claude.savedTokens,
-                       max(TokenEstimator.estimate(humanized) - TokenEstimator.estimate(sr1), 0))
-        XCTAssertEqual(claude.runs, 1)
-        XCTAssertEqual(summary.modes.first?.mode, "sr1-humanize")
-    }
-
-    func test_tokenSaverUsageForDistillSkillRunDoesNotRecordSavingsWithoutSidecarCall() throws {
+    func test_providerUsageDoesNotRecordSavingsWithoutAttributableTransform() throws {
         let appSupport = NSTemporaryDirectory() + "RC2TokenSaverDistillSkillSavings-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
 
         let thread = AgentThread(
-            title: "distill skill",
+            title: "provider usage only",
             provider: .codex,
             model: "gpt-test"
         )
@@ -2345,7 +2074,7 @@ final class TokenSaverAppContextTests: XCTestCase {
         try context.messageRepo.append(AgentMessage(
             threadId: thread.id,
             role: .user,
-            content: "/distill"
+            content: "Summarize the build output."
         ))
         let run = AgentRun(
             threadId: thread.id,
@@ -2369,7 +2098,7 @@ final class TokenSaverAppContextTests: XCTestCase {
 
         let summary = try context.tokenSaverSavingsRepo.summary()
         XCTAssertEqual(summary.totalRuns, 0,
-                       "provider token-usage events do not know the original command output or humanized SR1 length; savings are recorded only by local sidecar calls")
+                       "provider token-usage events do not know the original transformed bytes; savings are recorded only by attributable local calls")
     }
 
     func test_providerUsageCreatesAppendOnlyAttemptEvidenceWithoutClaimingSavings() throws {
@@ -2632,13 +2361,13 @@ final class TokenSaverAppContextTests: XCTestCase {
         )
     }
 
-    func test_tokenSaverUsageForDistillSkillRunWithTotalOnlyUsageDoesNotFabricateSavings() throws {
+    func test_totalOnlyProviderUsageDoesNotFabricateSavings() throws {
         let appSupport = NSTemporaryDirectory() + "RC2TokenSaverDistillSkillTotalOnlySavings-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
 
         let thread = AgentThread(
-            title: "distill skill total only",
+            title: "total-only provider usage",
             provider: .codex,
             model: "gpt-test"
         )
@@ -2646,7 +2375,7 @@ final class TokenSaverAppContextTests: XCTestCase {
         try context.messageRepo.append(AgentMessage(
             threadId: thread.id,
             role: .user,
-            content: "/distill Responda usando SR1."
+            content: "Summarize the build output."
         ))
         let run = AgentRun(
             threadId: thread.id,
@@ -2665,16 +2394,16 @@ final class TokenSaverAppContextTests: XCTestCase {
 
         let summary = try context.tokenSaverSavingsRepo.summary()
         XCTAssertEqual(summary.totalRuns, 0,
-                       "total-only provider usage must not invent Token Saver savings; command-output and SR1 savings are measured by the sidecar")
+                       "total-only provider usage must not invent Token Saver savings; attributable transforms are measured by the sidecar")
     }
 
-    func test_tokenSaverUsageForInputOnlyDistillEventDoesNotFabricateSavedTokens() throws {
+    func test_inputOnlyProviderUsageDoesNotFabricateSavedTokens() throws {
         let appSupport = NSTemporaryDirectory() + "RC2TokenSaverDistillSkillInputOnlyNoSavings-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
 
         let thread = AgentThread(
-            title: "distill input only",
+            title: "input-only provider usage",
             provider: .claude,
             model: "claude-test"
         )
@@ -2682,7 +2411,7 @@ final class TokenSaverAppContextTests: XCTestCase {
         try context.messageRepo.append(AgentMessage(
             threadId: thread.id,
             role: .user,
-            content: "/distill"
+            content: "Summarize the build output."
         ))
         let run = AgentRun(
             threadId: thread.id,
@@ -3000,60 +2729,6 @@ final class TokenSaverAppContextTests: XCTestCase {
         )
     }
 
-    func test_tokenSaverMeasurementRecordsSavingsWithNilProjectId() async throws {
-        // WHY: production DBs have project_id NULL on every agent_thread and 0
-        // token_saver_lane_state rows. Measurement must still land so sr1-humanize
-        // savings are not silently dead.
-        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverMeasureNilProject-" + UUID().uuidString
-        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-
-        let thread = AgentThread(
-            title: "nil project measurement",
-            provider: .claude,
-            model: "test-model",
-            status: .completed
-        )
-        XCTAssertNil(thread.projectId, "fixture must reproduce the production project_id NULL case")
-        try context.threadRepo.upsert(thread)
-
-        let sr1 = """
-        SR1
-        S=done
-        O=The result is ready for the user.
-        P=ok
-        """
-        let humanized = await context.tokenSaverHumanizeSR1Response(
-            sr1,
-            provider: .claude,
-            threadId: thread.id
-        )
-        XCTAssertFalse(SR1ResponseDetector.isSR1(humanized))
-
-        let summary = try context.tokenSaverSavingsRepo.summary()
-        XCTAssertGreaterThan(
-            summary.totalRuns,
-            0,
-            "measurement write must succeed on project_id == nil when Token Saver is enabled"
-        )
-        XCTAssertEqual(summary.modes.first?.mode, "sr1-humanize")
-
-        // Governance snapshot is attached even when admission would have denied.
-        let gov = try context.db.prepare(
-            "SELECT governance_json FROM token_saver_savings WHERE mode = 'sr1-humanize' LIMIT 1;"
-        )
-        XCTAssertTrue(try gov.step())
-        let govJSON = try XCTUnwrap(gov.columnText(0))
-        XCTAssertTrue(
-            govJSON.contains("admission_allowed") || govJSON.contains("\"admission_allowed\":false"),
-            "savings row must carry governance snapshot; got \(govJSON)"
-        )
-        XCTAssertTrue(
-            govJSON.contains("governed_write") || govJSON.contains("\"governed_write\":false"),
-            "measurement rows are not governed writes; got \(govJSON)"
-        )
-    }
-
     func test_tokenSaverAdmissionDenialAppendsAuditEvent() async throws {
         // WHY: project-admission denials used to return silently, hiding the
         // empty-lane_state / nil-project silent-death condition from operators.
@@ -3096,7 +2771,7 @@ final class TokenSaverAppContextTests: XCTestCase {
             ORDER BY id DESC LIMIT 1;
         """)
         XCTAssertTrue(try row.step())
-        XCTAssertEqual(row.columnText(0), "deterministic_wrapper", "lane goes in reason")
+        XCTAssertEqual(row.columnText(0), "wire-encode", "the denied conversation codec lane goes in reason")
         XCTAssertEqual(
             row.columnText(1),
             "missing_project_scope",
@@ -3127,74 +2802,6 @@ final class TokenSaverAppContextTests: XCTestCase {
             disabled.split(separator: ",").map(String.init).contains("semantic_prose"),
             "resolved disabled set must export to child env; got \(disabled)"
         )
-    }
-
-    func test_appSideSavingsWritePersistsDeliveredAndNonUnknownAttributability() async throws {
-        // WHY: TokenSaverSavingsRepository.record defaults are attributability="unknown"
-        // and delivered=false. displayedSavingsEligibilitySQL admits
-        // (attributability='unknown' AND provider!='unknown') only as a pre-migration
-        // escape hatch. New app-side rows that omit the kwargs land in that bucket,
-        // so delivered can never filter app writes and forfeited-looking rows present
-        // as attributed. AppContext must write delivered=1 + non-unknown class.
-        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverHonestyColumns-" + UUID().uuidString
-        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-
-        let thread = AgentThread(
-            title: "honesty columns",
-            provider: .claude,
-            model: "test-model",
-            status: .completed
-        )
-        try context.threadRepo.upsert(thread)
-
-        let sr1 = """
-        SR1
-        S=done
-        O=The result is ready for the user.
-        P=ok
-        """
-        let humanized = await context.tokenSaverHumanizeSR1Response(
-            sr1,
-            provider: .claude,
-            threadId: thread.id
-        )
-        XCTAssertFalse(SR1ResponseDetector.isSR1(humanized))
-
-        let stmt = try context.db.prepare("""
-            SELECT attributability, delivered, provider
-            FROM token_saver_savings
-            WHERE mode = 'sr1-humanize'
-            LIMIT 1;
-        """)
-        XCTAssertTrue(try stmt.step(), "app-side SR1 humanize must persist a savings row")
-        let attributability = try XCTUnwrap(stmt.columnText(0))
-        let delivered = stmt.columnInt64(1)
-        let provider = try XCTUnwrap(stmt.columnText(2))
-
-        XCTAssertEqual(
-            delivered,
-            1,
-            "app-side delivered compressions must persist delivered=1 (not the false default)"
-        )
-        XCTAssertNotEqual(
-            attributability,
-            "unknown",
-            "new rows must not rely on the pre-migration attributability=unknown escape hatch"
-        )
-        XCTAssertEqual(
-            attributability,
-            "not_prompt_bound",
-            "app-side measurement rows are delivered but not proven prompt-bound"
-        )
-        XCTAssertNotEqual(provider, "unknown", "provider must be the real agent provider")
-
-        // Eligibility must hold via delivered=1, independent of the legacy branch.
-        XCTAssertTrue(
-            delivered == 1 || (attributability == "unknown" && provider != "unknown"),
-            "row must satisfy displayedSavingsEligibilitySQL"
-        )
-        XCTAssertEqual(delivered, 1, "eligibility for this new row is via delivered=1 only")
     }
 
     func test_sidecarMainConstructionWiresSavingsAndAuditHandlers() throws {

@@ -551,7 +551,7 @@ function ensureQuery() {
       resumeSessionAt: current.resumeSessionAt,
       sessionId: current.resume ? undefined : current.sessionId,
       permissionMode: current.permissionMode,
-      // Token Saver distill instructions (pipe `| distill` + speak distill language), the
+      // Token Saver instructions (eligible `| distill` output plus optional RCW1 ABI), the
       // analog of Codex's per-turn developer_instructions. The host sends this only when
       // Token Saver is on; when undefined the SDK keeps its default (empty) custom prompt, so
       // this is purely additive and never introduces the claude_code preset.
@@ -563,7 +563,7 @@ function ensureQuery() {
       effort: current.effort,
       settings: current.settings,
       // Load filesystem settings so the SDK discovers Agent Skills (e.g. the managed
-      // /distill skill in ~/.claude/skills and project .claude/skills). Without this the
+      // output-distill skill in ~/.claude/skills and project .claude/skills). Without this the
       // SDK can run in isolation mode and load no skills at all. Trade-off: this also
       // loads the user's CLAUDE.md, settings.json, and hooks into the session.
       settingSources: ['user', 'project', 'local'],

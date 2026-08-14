@@ -91,11 +91,10 @@ final class LiveActivitySummaryTests: XCTestCase {
         XCTAssertNil(LiveActivitySummary.sanitized("Running: swift test", source: src))
     }
 
-    /// Compressed-dialect output and leaked scaffolding are not prose.
-    func testRejectsCompressedDialectAndLeakedScaffolding() {
+    /// Internal wire output and leaked scaffolding are not prose.
+    func testRejectsWireAndLeakedScaffolding() {
         let src = source("x")
-        XCTAssertNil(LiveActivitySummary.sanitized("S ran tests\nC ok", source: src))
-        XCTAssertNil(LiveActivitySummary.sanitized("SR1_RESPONSE: something", source: src))
+        XCTAssertNil(LiveActivitySummary.sanitized("RCW1\tA\t1\nO\tRan tests.\n.", source: src))
         XCTAssertNil(LiveActivitySummary.sanitized("<think>hmm</think>", source: src))
         XCTAssertNil(LiveActivitySummary.sanitized("   ", source: src))
         XCTAssertNil(LiveActivitySummary.sanitized("ok", source: src), "a fragment is not a sentence")

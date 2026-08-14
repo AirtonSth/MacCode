@@ -3481,7 +3481,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
 
         // A later turn must produce a DIFFERENT goal item id: item ids are
         // unique across turns (invariant relied on by the reducer's
-        // newest-first item lookup and SR1 translation eviction).
+        // newest-first item lookup and Token Saver translation eviction).
         client.notificationHandler?("turn/started", ["threadId": "codex-thread-1", "turnId": "turn-app-server-2"])
         client.notificationHandler?("thread/goal/updated", goalPayload)
         let secondTurnGoal = try XCTUnwrap(goalItems(summary: "Goal updated").last)

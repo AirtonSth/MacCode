@@ -424,11 +424,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// an app relaunch and has a recoverable provider session. Drives the inline
     /// Continue action. Cleared when a run starts or the selected thread changes.
     @Published public private(set) var selectedThreadHasRecoverableContext: Bool = false
-    /// UX-SR1-BADGE: ids of assistant messages that were SR1-translated.
-    /// Populated live by the coordinator callback and rebuilt from persisted stream
-    /// events on thread open so the badge survives restarts.
-    @Published public private(set) var sr1TranslatedMessageIds: Set<AgentMessageID> = []
-    @Published public private(set) var sr1OriginalTextsByMessageId: [AgentMessageID: String] = [:]
+    /// Assistant messages whose provider exchange used Token Saver wire.
+    /// Populated live and rebuilt from persisted events so the badge survives restarts.
+    @Published public private(set) var tokenSaverOptimizedMessageIds: Set<AgentMessageID> = []
+    @Published public private(set) var tokenSaverOriginalTextsByMessageId: [AgentMessageID: String] = [:]
+    @Published public private(set) var tokenSaverWireRequestTextsByMessageId: [AgentMessageID: String] = [:]
+    @Published public private(set) var tokenSaverTranslationRetryMessageIds: Set<AgentMessageID> = []
     /// The UI holds only a bounded recent message page. Older durable messages
     /// remain in SQLite and are intentionally outside the hot screen-memory set.
     @Published public private(set) var messageHistoryIsPartial = false
@@ -535,8 +536,42 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         self.clock = clock
     }
 
-    public func sr1OriginalText(for id: AgentMessageID) -> String? {
-        sr1OriginalTextsByMessageId[id]
+    public func tokenSaverOriginalText(for id: AgentMessageID) -> String? {
+        tokenSaverOriginalTextsByMessageId[id]
+    }
+
+    public func tokenSaverWireRequestText(for id: AgentMessageID) -> String? {
+        tokenSaverWireRequestTextsByMessageId[id]
+    }
+
+    public func retryTokenSaverTranslation(for id: AgentMessageID) {
+        guard !tokenSaverTranslationRetryMessageIds.contains(id),
+              let raw = tokenSaverOriginalTextsByMessageId[id],
+              let index = messages.firstIndex(where: { $0.id == id }) else { return }
+        let existing = messages[index]
+        tokenSaverTranslationRetryMessageIds.insert(id)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let rendered = await coordinator.retryWireResponse(raw, threadId: existing.threadId)
+            defer { tokenSaverTranslationRetryMessageIds.remove(id) }
+            guard !rendered.isEmpty, !RCWireProtocol.isWire(rendered) else { return }
+            let updated = AgentMessage(
+                id: existing.id,
+                threadId: existing.threadId,
+                role: existing.role,
+                content: rendered,
+                createdAt: existing.createdAt,
+                attachments: existing.attachments
+            )
+            do {
+                try messageRepo.append(updated)
+                if let liveIndex = messages.firstIndex(where: { $0.id == id }) {
+                    messages[liveIndex] = updated
+                }
+            } catch {
+                statusMessage = "Local translation retry could not be saved: \(error.localizedDescription)"
+            }
+        }
     }
 
     public init(
@@ -588,9 +623,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         reloadCustomModels()
         self.coordinator.addObserver(self)
-        self.coordinator.onSR1TranslatedMessageId = { [weak self] msgId in
+        self.coordinator.onWireTranslatedMessageId = { [weak self] msgId in
             Task { @MainActor [weak self] in
-                self?.sr1TranslatedMessageIds.insert(msgId)
+                self?.tokenSaverOptimizedMessageIds.insert(msgId)
             }
         }
         // XCTest: same-stack rail load so selectThread(initial) sees rows.
@@ -772,8 +807,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         messages = []
         messageHistoryIsPartial = false
         timeline = AssistantTimelineState()
-        sr1TranslatedMessageIds = []
-        sr1OriginalTextsByMessageId = [:]
+        tokenSaverOptimizedMessageIds = []
+        tokenSaverOriginalTextsByMessageId = [:]
+        tokenSaverWireRequestTextsByMessageId = [:]
     }
 
     /// Used by the multi-surface rail reload hub (EventBus fan-out).
@@ -1426,13 +1462,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         publishInterestedThreadId(id)
         providerThreadSnapshotStatusMessage = nil
         providerThreadSnapshotLastConfirmedAt = providerThreadSnapshotConfirmedAtByThread[id]
-        // F6: the SR1 translation maps are per-thread state. Reset them on a
+        // F6: Token Saver translation maps are per-thread state. Reset them on a
         // thread switch so they don't accumulate the union of every translated
         // message (and its full original text) across every thread visited this
-        // session. refreshSR1TranslationStateFromTimeline() below rebuilds them
+        // session. refreshTokenSaverOptimizationStateFromTimeline() below rebuilds them
         // from the opened thread's replayed timeline.
-        sr1TranslatedMessageIds = []
-        sr1OriginalTextsByMessageId = [:]
+        tokenSaverOptimizedMessageIds = []
+        tokenSaverOriginalTextsByMessageId = [:]
+        tokenSaverWireRequestTextsByMessageId = [:]
         // Per-thread provider state: the opened thread republishes its own
         // count on its next snapshot, so carrying the previous thread's
         // shell count over would advertise work that isn't this thread's.
@@ -1534,7 +1571,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         restoreQueuedFollowupTranscriptPresentation(threadId: id)
         rehydrateProposedPlans(threadId: id)
         rehydratePendingCallbacks(threadId: id)
-        refreshSR1TranslationStateFromTimeline(preservingExisting: true)
+        refreshTokenSaverOptimizationStateFromTimeline(preservingExisting: true)
         // PERF: rebuild the O(1) item index once over the fully-replayed timeline so
         // subsequent item-location lookups skip the O(turns x items) linear scan.
         timelineItemIndex = TimelineItemIndex(turns: timeline.turns)
@@ -1601,7 +1638,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     self.rehydrateProposedPlans(threadId: id)
                     self.rehydratePendingCallbacks(threadId: id)
                     self.lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: replayEvents)
-                    self.refreshSR1TranslationStateFromTimeline(preservingExisting: true)
+                    self.refreshTokenSaverOptimizationStateFromTimeline(preservingExisting: true)
                     self.timelineItemIndex = TimelineItemIndex(turns: self.timeline.turns)
                 } catch {
                     guard self.selectedThreadId == id,
@@ -4907,8 +4944,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         streamUIBackpressured = false
         streamAggregateBudgetOps = 0
         historyReplayNotice = nil
-        sr1TranslatedMessageIds = []
-        sr1OriginalTextsByMessageId = [:]
+        tokenSaverOptimizedMessageIds = []
+        tokenSaverOriginalTextsByMessageId = [:]
+        tokenSaverWireRequestTextsByMessageId = [:]
         providerThreadSnapshotStatusMessage = nil
         providerThreadSnapshotLastConfirmedAt = nil
         selectedThreadHasRecoverableContext = false
@@ -6993,20 +7031,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return (false, ops)
     }
 
-    /// True when republishing SR1 translation state can change anything.
+    /// True when republishing Token Saver optimization state can change anything.
     ///
-    /// `refreshSR1TranslationStateFromTimeline` derives the published set purely
-    /// from `timeline.sr1TranslationsByMessageId` and REPLACES it, so with every
+    /// `refreshTokenSaverOptimizationStateFromTimeline` derives the published set purely
+    /// from the timeline's compatibility-backed translation maps and REPLACES it, so with every
     /// side empty it is a no-op — the common case on every streamed token. The
     /// published-side terms keep the clearing path alive after the aggregate
     /// budget walk evicts translations.
-    static func shouldPublishSR1State(
+    static func shouldPublishTokenSaverOptimizationState(
         timeline: AssistantTimelineState,
         publishedIds: Set<AgentMessageID>,
         publishedOriginals: [AgentMessageID: String]
     ) -> Bool {
-        !timeline.sr1TranslationsByMessageId.isEmpty
-            || !timeline.sr1TranslationsByItemId.isEmpty
+        !timeline.tokenSaverTranslationsByMessageId.isEmpty
+            || !timeline.tokenSaverTranslationsByItemId.isEmpty
             || !publishedIds.isEmpty
             || !publishedOriginals.isEmpty
     }
@@ -7015,7 +7053,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Test-only override for the aggregate hot-text ceiling.
     ///
     /// The walk-before-publish order in `commitStreamQuantum` is load-bearing:
-    /// the walk evicts SR1 translations and the publish guard must observe the
+    /// the walk evicts Token Saver translations and the publish guard must observe the
     /// post-eviction timeline. Proving that composition needs a real eviction,
     /// and allocating 96 MiB in a unit test is not viable — so tests lower the
     /// ceiling instead. DEBUG-only so release builds keep the constant.
@@ -7072,14 +7110,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // Order is load-bearing: the walk above can evict translations, and the
         // guard below must see the post-eviction timeline so the published cache
         // clears with them. Pinned by
-        // test_commitStreamQuantum_coalescesWalkThenPublishesEvictedSR1State,
+        // test_commitStreamQuantum_coalescesWalkThenPublishesEvictedWireState,
         // which fails if these two blocks are swapped.
-        if Self.shouldPublishSR1State(
+        if Self.shouldPublishTokenSaverOptimizationState(
             timeline: timeline,
-            publishedIds: sr1TranslatedMessageIds,
-            publishedOriginals: sr1OriginalTextsByMessageId
+            publishedIds: tokenSaverOptimizedMessageIds,
+            publishedOriginals: tokenSaverOriginalTextsByMessageId
         ) {
-            refreshSR1TranslationStateFromTimeline()
+            refreshTokenSaverOptimizationStateFromTimeline()
         }
         scheduleTimelineUpdateTick()
         if reduced.hasProposedPlan {
@@ -7134,7 +7172,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if case let .error(_, recoverable) = event {
             lastErrorRecoverable = recoverable
         }
-        refreshSR1TranslationStateFromTimeline()
+        refreshTokenSaverOptimizationStateFromTimeline()
         scheduleTimelineUpdateTick()
         if case .proposedPlan = event {
             scheduleFullAccessPlanAutoImplementIfNeeded()
@@ -7185,7 +7223,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         timeline = rebuilt
         rehydrateDurableActiveState(threadId: threadId)
         lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: events)
-        refreshSR1TranslationStateFromTimeline()
+        refreshTokenSaverOptimizationStateFromTimeline()
         timelineItemIndex = TimelineItemIndex(turns: timeline.turns)
         scheduleTimelineUpdateTick()
     }
@@ -7591,36 +7629,44 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return updated
     }
 
-    func refreshSR1TranslationStateFromTimeline(
+    func refreshTokenSaverOptimizationStateFromTimeline(
         _ sourceTimeline: AssistantTimelineState? = nil,
         preservingExisting: Bool = false
     ) {
         let sourceTimeline = sourceTimeline ?? timeline
         var ids: Set<AgentMessageID> = []
         var originals: [AgentMessageID: String] = [:]
-        for (rawId, translation) in sourceTimeline.sr1TranslationsByMessageId {
+        var requests: [AgentMessageID: String] = [:]
+        for (rawId, translation) in sourceTimeline.tokenSaverTranslationsByMessageId {
             guard let uuid = UUID(uuidString: rawId) else { continue }
             let id = AgentMessageID(uuid)
             ids.insert(id)
             originals[id] = translation.originalText
+            if let request = translation.wireRequestText, !request.isEmpty {
+                requests[id] = request
+            }
         }
         // Two callers, two semantics:
         // - Live-stream batches REPLACE, so translations evicted by the hot-text
         //   budget also leave the published cache (memory bound).
         // - selectThread replays PRESERVE, because live badges
-        //   (onSR1TranslatedMessageId) are not in the persisted replay and a
+        //   (onWireTranslatedMessageId) are not in the persisted replay and a
         //   same-thread reselect or the deferred provider-snapshot re-replay must
         //   not wipe them (F6 keeps clearing as the explicit job of the
         //   thread-SWITCH branch in selectThread).
         if preservingExisting {
-            ids.formUnion(sr1TranslatedMessageIds)
-            originals.merge(sr1OriginalTextsByMessageId) { fromTimeline, _ in fromTimeline }
+            ids.formUnion(tokenSaverOptimizedMessageIds)
+            originals.merge(tokenSaverOriginalTextsByMessageId) { fromTimeline, _ in fromTimeline }
+            requests.merge(tokenSaverWireRequestTextsByMessageId) { fromTimeline, _ in fromTimeline }
         }
-        if ids != sr1TranslatedMessageIds {
-            sr1TranslatedMessageIds = ids
+        if ids != tokenSaverOptimizedMessageIds {
+            tokenSaverOptimizedMessageIds = ids
         }
-        if originals != sr1OriginalTextsByMessageId {
-            sr1OriginalTextsByMessageId = originals
+        if originals != tokenSaverOriginalTextsByMessageId {
+            tokenSaverOriginalTextsByMessageId = originals
+        }
+        if requests != tokenSaverWireRequestTextsByMessageId {
+            tokenSaverWireRequestTextsByMessageId = requests
         }
     }
 }
@@ -9242,18 +9288,34 @@ public struct AgentAppView: View {
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
-    /// Pure seam: whether to show the "translated from compressed output" badge.
-    /// WHY: humanized SR1 replies should be transparently labeled so the user knows
-    /// the message was rewritten by Token Saver. Tested in isolation so the badge
-    /// decision is independent of view state.
-    static func showsTranslatedBadge(wasSR1Translated: Bool) -> Bool {
-        wasSR1Translated
+    /// Pure seam for the low-chrome Token Saver disclosure.
+    static func showsTokenSaverOptimizedBadge(wasTokenSaverOptimized: Bool) -> Bool {
+        wasTokenSaverOptimized
     }
 
-    static func sr1BadgeLabel(hasOriginalText: Bool) -> String {
+    static func tokenSaverBadgeLabel(hasOriginalText: Bool) -> String {
         hasOriginalText
-            ? "translated from compressed output - View original"
-            : "translated from compressed output"
+            ? "Token Saver optimized - View transport details"
+            : "Token Saver optimized"
+    }
+
+    /// Resolve the durable assistant row represented by a timeline-owned final.
+    ///
+    /// The transcript deliberately hides a persisted assistant row when the same
+    /// answer is already rendered by its turn. Token Saver metadata is keyed by
+    /// that durable row, so the visible turn must inherit the row's disclosure or
+    /// the optimization badge disappears even though replay retained the event.
+    static func tokenSaverOptimizedMessageID(
+        matching visibleText: String,
+        messages: [AgentMessage],
+        optimizedMessageIDs: Set<AgentMessageID>
+    ) -> AgentMessageID? {
+        messages.last(where: { message in
+            message.role == .assistant
+                && optimizedMessageIDs.contains(message.id)
+                && (assistantText(message.content, matches: visibleText)
+                    || assistantText(visibleText, matches: message.content))
+        })?.id
     }
 
     static let fullAccessScopeDescription =
@@ -9319,10 +9381,6 @@ public struct AgentAppView: View {
     }
 
     static func shouldRenderAssistantItemBody(_ body: String, priorAssistantTexts: [String] = [], persistedAssistantTexts: [String] = []) -> Bool {
-        if SR1ResponseDetector.isSR1(body),
-           persistedAssistantTexts.contains(where: { !$0.isEmpty && !SR1ResponseDetector.isSR1($0) }) {
-            return false
-        }
         return !body.isEmpty &&
             !assistantText(body, equalsAny: priorAssistantTexts) &&
             !assistantText(body, equalsAny: persistedAssistantTexts)
@@ -13059,33 +13117,12 @@ public struct AgentAppView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .accessibilityLabel("Content omitted: message body was too large to display")
                 } else {
-                    let showBadge = Self.showsTranslatedBadge(
-                        wasSR1Translated: vm.sr1TranslatedMessageIds.contains(msg.id)
+                    let showBadge = Self.showsTokenSaverOptimizedBadge(
+                        wasTokenSaverOptimized: vm.tokenSaverOptimizedMessageIds.contains(msg.id)
                     )
                     VStack(alignment: .leading, spacing: DS.Space.xs) {
                         if showBadge {
-                            if let original = vm.sr1OriginalText(for: msg.id) {
-                                DisclosureGroup {
-                                    Text(original)
-                                        .font(DS.Font.caption)
-                                        .foregroundColor(DS.Palette.textSecondary)
-                                        .textSelection(.enabled)
-                                        .padding(DS.Space.sm)
-                                        .background(DS.Palette.surface, in: RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                                } label: {
-                                    Text(Self.sr1BadgeLabel(hasOriginalText: true))
-                                        .font(DS.Font.caption2)
-                                        .foregroundColor(DS.Palette.textTertiary)
-                                }
-                                .accessibilityLabel("This reply was translated from Token Saver compressed output. View original.")
-                                .accessibilityIdentifier("agent.assistantMessage.sr1Original.\(msg.id.value.uuidString)")
-                            } else {
-                                Text(Self.sr1BadgeLabel(hasOriginalText: false))
-                                    .font(DS.Font.caption2)
-                                    .foregroundColor(DS.Palette.textTertiary)
-                                    .accessibilityLabel("This reply was translated from Token Saver compressed output")
-                                    .accessibilityIdentifier("agent.assistantMessage.sr1Badge.\(msg.id.value.uuidString)")
-                            }
+                            tokenSaverOptimizedDisclosure(messageId: msg.id)
                         }
                         assistantProse(msg.content)
                         assistantCopyBar(text: BackgroundAwaitContinuation.strippingAwaitingMarker(msg.content), identifierSuffix: msg.id.value.uuidString)
@@ -13100,6 +13137,74 @@ public struct AgentAppView: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    @ViewBuilder
+    private func tokenSaverOptimizedDisclosure(messageId: AgentMessageID) -> some View {
+        if let original = vm.tokenSaverOriginalText(for: messageId) {
+            DisclosureGroup {
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    if let request = vm.tokenSaverWireRequestText(for: messageId) {
+                        Text("What was sent")
+                            .font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.textTertiary)
+                        Text(request)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .textSelection(.enabled)
+                        Button("Copy what was sent") {
+                            copyToPasteboard(request)
+                        }
+                        .buttonStyle(.plain)
+                        .font(DS.Font.caption2)
+                        .accessibilityIdentifier("agent.assistantMessage.copyTokenSaverRequest.\(messageId.value.uuidString)")
+                    }
+                    Text("Original provider response")
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textTertiary)
+                    Text(original)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .textSelection(.enabled)
+                    Button("Copy original provider response") {
+                        copyToPasteboard(original)
+                    }
+                    .buttonStyle(.plain)
+                    .font(DS.Font.caption2)
+                    .accessibilityIdentifier("agent.assistantMessage.copyTokenSaverOriginal.\(messageId.value.uuidString)")
+                    Button(vm.tokenSaverTranslationRetryMessageIds.contains(messageId) ? "Retrying translation…" : "Retry translation") {
+                        vm.retryTokenSaverTranslation(for: messageId)
+                    }
+                    .buttonStyle(.plain)
+                    .font(DS.Font.caption2)
+                    .disabled(vm.tokenSaverTranslationRetryMessageIds.contains(messageId))
+                    .accessibilityLabel("Retry local translation")
+                    .accessibilityIdentifier("agent.assistantMessage.retryTokenSaverTranslation.\(messageId.value.uuidString)")
+                }
+                .padding(DS.Space.sm)
+                .background(DS.Palette.surface, in: RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            } label: {
+                Text(Self.tokenSaverBadgeLabel(hasOriginalText: true))
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
+            .accessibilityLabel("Token Saver optimized this reply. View transport details.")
+            .accessibilityIdentifier("agent.assistantMessage.tokenSaverOriginal.\(messageId.value.uuidString)")
+        } else {
+            Text(Self.tokenSaverBadgeLabel(hasOriginalText: false))
+                .font(DS.Font.caption2)
+                .foregroundColor(DS.Palette.textTertiary)
+                .accessibilityLabel("Token Saver optimized this reply")
+                .accessibilityIdentifier("agent.assistantMessage.tokenSaverBadge.\(messageId.value.uuidString)")
+        }
+    }
+
+    private func tokenSaverOptimizedMessageID(matching visibleText: String) -> AgentMessageID? {
+        Self.tokenSaverOptimizedMessageID(
+            matching: visibleText,
+            messages: vm.messages,
+            optimizedMessageIDs: vm.tokenSaverOptimizedMessageIds
+        )
     }
 
     @ViewBuilder
@@ -13149,6 +13254,9 @@ public struct AgentAppView: View {
             // already rendered it (prevents the answer showing twice).
             if let final = turn.finalAssistantMessage, inputs.shouldRenderFinal {
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    if let messageId = tokenSaverOptimizedMessageID(matching: final) {
+                        tokenSaverOptimizedDisclosure(messageId: messageId)
+                    }
                     assistantProse(final, cacheMarkdown: turn.finished)
                     assistantCopyBar(text: BackgroundAwaitContinuation.strippingAwaitingMarker(final), identifierSuffix: turn.turnId)
                 }
@@ -13241,7 +13349,12 @@ public struct AgentAppView: View {
         switch item.type {
         case .assistantMessage:
             if Self.shouldRenderAssistantItemBody(item.body, persistedAssistantTexts: persistedAssistantTexts) {
-                assistantProse(item.body, cacheMarkdown: item.state != .streaming)
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    if let messageId = tokenSaverOptimizedMessageID(matching: item.body) {
+                        tokenSaverOptimizedDisclosure(messageId: messageId)
+                    }
+                    assistantProse(item.body, cacheMarkdown: item.state != .streaming)
+                }
             }
         case .reasoning:
             reasoningRow(item)

@@ -6,7 +6,8 @@ import CoreModel
 
 /// Full matrix: Claude / Codex / Grok as primary, same-provider nested, and every
 /// cross-provider pair — Token Saver techniques must stay admitted (distill hint,
-/// managed_path, dialect injection, Claude-only PostToolUse).
+/// managed_path, tool-output policy, Claude-only PostToolUse). Conversation
+/// wire admission is per-turn and therefore deliberately absent here.
 final class TokenSaverCrossProviderMatrixTests: XCTestCase {
     private let threadID = "10000000-0000-0000-0000-000000000011"
     private let workspaceID = "20000000-0000-0000-0000-000000000012"
@@ -37,11 +38,12 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
 
     func test_primaryAgents_allProvidersGetFullTokenSaverTechniquesWhenSidecarHealthy() {
         // WHY: product requires every admitted primary (Claude/Codex/Grok) to receive
-        // the same provider-neutral admit signal + dialect; only Claude gets PostToolUse.
+        // the same provider-neutral output admit signal; only Claude gets PostToolUse.
         for provider in providers {
             let receipt = admit(provider)
             let env = TokenSaverExecutionReceiptSeam.environment(from: receipt)
             XCTAssertEqual(env["RC_TOKEN_SAVER_DISTILL_HINT"], "1", "\(provider) distill hint")
+            XCTAssertNil(env["RC_TOKEN_SAVER_WIRE_VERSION"], "wire is admitted only after a specific prompt encodes")
             XCTAssertEqual(receipt.capabilities.distill, true, "\(provider) distill")
             XCTAssertEqual(receipt.capabilities.managedPath, true, "\(provider) managed_path")
             XCTAssertEqual(env["RC_TOKEN_SAVER_THREAD_ID"], threadID)
@@ -61,6 +63,9 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
                 "\(provider) must exempt GUI from | distill"
             )
             XCTAssertTrue(prompt.contains("NEVER pipe"), "\(provider) exact-output still forbidden")
+            XCTAssertTrue(prompt.contains("REMOTE_CODE_WIRE_V1"),
+                          "every Token Saver session must trust RCW1 before a later encoded follow-up arrives")
+            XCTAssertFalse(prompt.contains("R0 micro"), "removed Distill Language must not return")
 
             if provider == .claude {
                 XCTAssertEqual(receipt.capabilities.postToolUse, true)
@@ -85,6 +90,7 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
                 provider: provider
             )
             XCTAssertEqual(child["RC_TOKEN_SAVER_DISTILL_HINT"], "1", "\(provider) nested")
+            XCTAssertNil(child["RC_TOKEN_SAVER_WIRE_VERSION"], "nested output receipts do not pre-admit RCW1")
             XCTAssertEqual(child["RC_TOKEN_SAVER_ROOT_RUN_ID"], rootRunID)
 
             let processEnv = CodexRunner.processEnvironment(
@@ -104,6 +110,8 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
             )
             let prompt = AgentSkillInstaller.tokenSaverProviderPrompt("", environment: processEnv)
             XCTAssertTrue(prompt.contains("| distill"), "\(provider) nested dialect")
+            XCTAssertTrue(prompt.contains("REMOTE_CODE_WIRE_V1"),
+                          "\(provider) nested session must support a later encoded turn")
         }
     }
 
@@ -124,6 +132,7 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
                 XCTAssertEqual(retargeted.capabilities.managedPath, true, "\(parent)→\(child) managed")
                 let env = TokenSaverExecutionReceiptSeam.environment(from: retargeted)
                 XCTAssertEqual(env["RC_TOKEN_SAVER_DISTILL_HINT"], "1", "\(parent)→\(child) hint")
+                XCTAssertNil(env["RC_TOKEN_SAVER_WIRE_VERSION"], "\(parent)→\(child) wire remains per-turn")
 
                 let expectedPost = ProviderProxyPolicy.childPostToolUseCapability(
                     targetProvider: child,
@@ -145,6 +154,8 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
                     prompt.contains("| distill"),
                     "\(parent)→\(child) must inject mandatory | distill dialect"
                 )
+                XCTAssertTrue(prompt.contains("REMOTE_CODE_WIRE_V1"),
+                              "\(parent)→\(child) must install the trusted session capability")
             }
         }
     }
@@ -194,10 +205,28 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
             )
             XCTAssertEqual(prompt, "base")
             XCTAssertFalse(prompt.contains("| distill"))
+            XCTAssertFalse(prompt.contains("REMOTE_CODE_WIRE_V1"))
         }
     }
 
-    func test_providerProxyArguments_injectDialectWhenChildEnvAdmitted() {
+    func test_wireKillSwitchDisablesBothDirectionsWithoutDisablingToolOutputDistill() {
+        let receipt = TokenSaverExecutionReceiptSeam.admit(
+            tokenSaverEnabled: true,
+            sameUser: true,
+            sidecarAvailable: true,
+            provider: .codex,
+            threadId: threadID,
+            disabledLanes: ["wire-encode"]
+        )
+        let env = TokenSaverExecutionReceiptSeam.environment(from: receipt)
+        XCTAssertEqual(env["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
+        XCTAssertNil(env["RC_TOKEN_SAVER_WIRE_VERSION"])
+        let prompt = AgentSkillInstaller.tokenSaverProviderPrompt("base", environment: env)
+        XCTAssertTrue(prompt.contains("| distill"))
+        XCTAssertFalse(prompt.contains("REMOTE_CODE_WIRE_V1"))
+    }
+
+    func test_providerProxyArguments_injectOutputPolicyWhenChildEnvAdmitted() {
         // WHY: nested launches go through providerProxyArguments; cross-provider children
         // must still receive the mandatory | distill policy block when DISTILL_HINT=1.
         for child in providers {
@@ -293,7 +322,7 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
         XCTAssertNotNil(hooks["PostToolUse"], "PostToolUse must be merged in")
     }
 
-    func test_tokenSaverDialect_forcesShellAndGraphifyCoverageForAllProviders() {
+    func test_tokenSaverOutputPolicy_forcesShellAndGraphifyCoverageForAllProviders() {
         // WHY: Grok/Codex native tools cannot rewrite; dialect must force
         // Graphify + shell+|distill coverage for Claude/Codex/Grok alike.
         for provider in providers {
@@ -318,7 +347,7 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
         }
     }
 
-    func test_providerProxyArguments_allProvidersGetDialectOnSupportedNestedTurns() {
+    func test_providerProxyArguments_allProvidersGetOutputPolicyOnSupportedNestedTurns() {
         // WHY: product requires dialect + managed PATH for Claude/Codex/Grok nested
         // raw CLI. PostToolUse rewrite is Claude-only (upstream ceiling: Codex has no
         // updatedToolOutput; Grok PostToolUse is passive per docs.x.ai hooks guide).
@@ -445,7 +474,7 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
         )
     }
 
-    func test_dialectPrompt_allProviders_requirePipeAndDocumentNoAllowlist() {
+    func test_outputPolicy_allProviders_requirePipeAndDocumentNoAllowlist() {
         // WHY: voluntary | distill + wrapper policy must be identical for every
         // admitted provider and nested shape (gate = DISTILL_HINT, not provider).
         for provider in providers {

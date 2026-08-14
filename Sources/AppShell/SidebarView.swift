@@ -2275,7 +2275,7 @@ public struct SidebarKeyIntentMapper {
 
 /// One display row in the Token Saver savings breakdown.
 public struct TokenSaverBreakdownRow: Equatable, Sendable {
-    /// Human-readable mode label (e.g. "command-output", "prompt", "sr1").
+    /// Human-readable mode label (e.g. "command-output", "prompt", "wire-encode").
     public let mode: String
     /// All-time tokens saved for this mode across all providers.
     public let savedTokens: Int

@@ -557,41 +557,41 @@ final class AssistantTimelineTests: XCTestCase {
         XCTAssertEqual(AssistantTimelineState.cappedText("😀😀😀😀", limit: 2), "😀😀")
     }
 
-    // F10: when turns are evicted past `liveTurnLimit`, SR1 item translations keyed on
+    // F10: when turns are evicted past `liveTurnLimit`, wire translations keyed on
     // the dropped turns' items must be pruned so the maps don't retain pre-translation
     // text for turns that no longer exist. Retained turns keep their translations.
     func test_trimTurns_prunesOrphanedItemTranslationsForEvictedTurns() {
         var s = AssistantTimelineState()
         s.apply(.turnStarted(turnId: "turn-old"))
         s.apply(.itemStarted(item: AssistantItem(id: "old-item", turnId: "turn-old", type: .tool, startedAtMs: 0)))
-        s.apply(.sr1Translation(AssistantSR1Translation(itemId: "old-item", originalText: "orig", rewrittenText: "rw")))
-        XCTAssertNotNil(s.sr1TranslationsByItemId["old-item"])
+        s.apply(.wireTranslation(AssistantWireTranslation(itemId: "old-item", originalText: "orig", rewrittenText: "rw")))
+        XCTAssertNotNil(s.tokenSaverTranslationsByItemId["old-item"])
 
         // Push the oldest turn out of the live window.
         let extra = AssistantTimelineState.liveTurnLimit + 1
         for i in 0..<extra { s.apply(.turnStarted(turnId: "turn-\(i)")) }
         // A retained (recent) turn with a translation that must survive.
         s.apply(.itemStarted(item: AssistantItem(id: "new-item", turnId: "turn-\(extra - 1)", type: .tool, startedAtMs: 1)))
-        s.apply(.sr1Translation(AssistantSR1Translation(itemId: "new-item", originalText: "o2", rewrittenText: "r2")))
+        s.apply(.wireTranslation(AssistantWireTranslation(itemId: "new-item", originalText: "o2", rewrittenText: "r2")))
 
         XCTAssertEqual(s.turns.count, AssistantTimelineState.liveTurnLimit,
                        "turns stay bounded by liveTurnLimit")
         XCTAssertFalse(s.turns.contains { $0.turnId == "turn-old" }, "oldest turn was evicted")
-        XCTAssertNil(s.sr1TranslationsByItemId["old-item"],
+        XCTAssertNil(s.tokenSaverTranslationsByItemId["old-item"],
                      "translation keyed on an evicted turn's item must be pruned, not leaked")
-        XCTAssertNotNil(s.sr1TranslationsByItemId["new-item"],
+        XCTAssertNotNil(s.tokenSaverTranslationsByItemId["new-item"],
                         "translation for a retained turn's item must survive trimming")
     }
 
     // F10: a single turn's `items` array stays bounded by `liveTurnItemLimit`.
     // items[0] is the transcript sort anchor and is intentionally retained;
-    // oldest non-anchor items in the rest are dropped; newest kept; SR1 pruned.
+    // oldest non-anchor items in the rest are dropped; newest kept; wire metadata pruned.
     func test_trimTurnItems_boundsSingleTurnItemsAndPrunesTranslations() {
         var s = AssistantTimelineState()
         s.apply(.turnStarted(turnId: "t"))
         s.apply(.itemStarted(item: AssistantItem(id: "anchor", turnId: "t", type: .tool, startedAtMs: 0)))
         s.apply(.itemStarted(item: AssistantItem(id: "victim", turnId: "t", type: .tool, startedAtMs: 1)))
-        s.apply(.sr1Translation(AssistantSR1Translation(itemId: "victim", originalText: "o", rewrittenText: "r")))
+        s.apply(.wireTranslation(AssistantWireTranslation(itemId: "victim", originalText: "o", rewrittenText: "r")))
 
         // anchor + victim + (limit - 1) more = limit + 1 → trims one non-anchor.
         let extra = AssistantTimelineState.liveTurnItemLimit - 1
@@ -607,7 +607,7 @@ final class AssistantTimelineTests: XCTestCase {
                        "oldest non-anchor item is trimmed when the per-turn cap is exceeded")
         XCTAssertTrue(s.turns[0].items.contains { $0.id == "item-\(extra - 1)" },
                       "the newest item (the active streaming target) is always retained")
-        XCTAssertNil(s.sr1TranslationsByItemId["victim"],
+        XCTAssertNil(s.tokenSaverTranslationsByItemId["victim"],
                      "a trimmed item's translation must be pruned with it")
     }
 
@@ -626,9 +626,9 @@ final class AssistantTimelineTests: XCTestCase {
     /// Microbench: growing body via + vs appendCapped (n=5 medians).
     ///
     /// Scope: the timeline `itemDelta` shape only — a directly-owned `var body`.
-    /// The coordinator SR1 hold buffer keeps its entry inside a dictionary, where
+    /// The coordinator wire hold buffer keeps its entry inside a dictionary, where
     /// copy-on-write aliasing changes the result, so it is measured separately by
-    /// `test_microbench_sr1HoldBuffer_inPlaceDictionaryAppendBeatsCopyOut`.
+    /// `test_microbench_wireHoldBuffer_inPlaceDictionaryAppendBeatsCopyOut`.
     func test_microbench_itemDeltaAppend_appendCappedFasterThanPlusRebuild() {
         let token = String(repeating: "x", count: 32)
         let deltas = 4_000
@@ -681,7 +681,7 @@ final class AssistantTimelineTests: XCTestCase {
         )
     }
 
-    /// WHY: `AgentRunCoordinator.interceptProviderTextEvent` keeps the SR1 hold
+    /// WHY: `AgentRunCoordinator.interceptProviderTextEvent` keeps the wire hold
     /// buffer inside `bufferedProviderTextItems[runId][itemId]`. Copying the entry
     /// out (`if var buffered = runBuffers[itemId]`) before appending leaves the
     /// String storage referenced by both the copy and the dictionary, so
@@ -698,7 +698,7 @@ final class AssistantTimelineTests: XCTestCase {
     /// Scope: this measures the shape, on a proxy struct — the real
     /// `BufferedProviderTextItem` and `bufferedProviderTextItems` are private to
     /// `AgentRunCoordinator` and cannot be constructed from a test.
-    func test_microbench_sr1HoldBuffer_inPlaceDictionaryAppendBeatsCopyOut() {
+    func test_microbench_wireHoldBuffer_inPlaceDictionaryAppendBeatsCopyOut() {
         struct HoldBuffer { var text: String }
         let token = String(repeating: "x", count: 32)
         let warmup = 2
@@ -784,7 +784,7 @@ final class AssistantTimelineTests: XCTestCase {
 
         let small = ratio(500)
         let large = ratio(4_000)
-        NSLog("[perf-proof] sr1HoldBuffer small_copyOut_ms=%@ small_inPlace_ms=%@ small_pct=%.2f large_copyOut_ms=%@ large_inPlace_ms=%@ large_pct=%.2f",
+        NSLog("[perf-proof] wireHoldBuffer small_copyOut_ms=%@ small_inPlace_ms=%@ small_pct=%.2f large_copyOut_ms=%@ large_inPlace_ms=%@ large_pct=%.2f",
               String(small.before), String(small.after), small.improvement,
               String(large.before), String(large.after), large.improvement)
         XCTAssertGreaterThan(
@@ -812,7 +812,7 @@ final class AssistantTimelineTests: XCTestCase {
     /// WHY: `appendCapped`'s cheap path only applies while the buffer is UNDER the
     /// limit. Once a held body saturates `liveTextLimit`, every further token takes
     /// the re-cap branch — `cappedText` walks graphemes and rebuilds the suffix —
-    /// which for the SR1 hold path runs with the coordinator's lock held. This is
+    /// which for the wire hold path runs with the coordinator's lock held. This is
     /// not a regression (the pre-MR shape paid it on every token regardless), but
     /// the win must not be claimed for the saturated regime.
     ///

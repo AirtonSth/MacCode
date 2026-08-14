@@ -1,4 +1,5 @@
 import XCTest
+import CoreModel
 @testable import DistillCore
 
 final class DistillCoreTests: XCTestCase {
@@ -317,7 +318,7 @@ final class DistillCoreTests: XCTestCase {
         ))
 
         XCTAssertEqual(response.output, "PASS",
-                       "command output compression must return exactly what the provider requested, not SR1/O-prefixed prose")
+                       "command output compression must return exactly what the provider requested, not transport-prefixed prose")
         XCTAssertFalse(response.output.contains("PROMPT:"))
         XCTAssertFalse(response.output.contains("INPUT:"))
     }
@@ -554,21 +555,16 @@ final class DistillCoreTests: XCTestCase {
                        "I2: SDK PostToolUse compression must be measurable separately from one-shot pipe savings")
     }
 
-    func test_sr1HumanizeSavingsCreditDefaultAgentVerbosityFactor() {
-        let sr1 = "S ok.\nO done."
+    func test_wireRenderSavingsUseOnlyProducedTexts() {
+        let wire = "RCW1\tA\t1\nO\tdone\n."
         let request = DistillRequest(
-            mode: .sr1Humanize,
-            input: """
-            TARGET_LANGUAGE: Portuguese (Brazil)
-
-            SR1_RESPONSE:
-            \(sr1)
-            """,
+            mode: .wireRenderEnglish,
+            input: wire,
             provider: "codex",
             recordSavings: true,
             maxOutputCharacters: 500
         )
-        let human = "Estado: ok.\nResultado: done with human wording."
+        let human = "Done."
         let response = DistillResponse(
             requestID: request.id,
             output: human,
@@ -586,15 +582,7 @@ final class DistillCoreTests: XCTestCase {
         // number was unfalsifiable. The estimator now reports the estimated token delta
         // between the two texts that actually exist, via the same deterministic
         // estimator on both legs.
-        XCTAssertEqual(record?.provider, "codex")
-        XCTAssertEqual(record?.mode, "sr1-humanize")
-        XCTAssertEqual(record?.inputTokens, TokenEstimator.estimate(human),
-                       "input leg is the estimated token size of the humanized text, not its character count")
-        XCTAssertEqual(record?.outputTokens, TokenEstimator.estimate(sr1),
-                       "output leg uses the same estimator so saved = input - output stays consistent")
-        XCTAssertEqual(record?.savedTokens,
-                       max(TokenEstimator.estimate(human) - TokenEstimator.estimate(sr1), 0),
-                       "saved tokens is a defensible delta between two produced texts, with no counterfactual credit")
+        XCTAssertNil(record, "local rendering cannot claim counterfactual provider-token savings")
     }
 
     func test_mlxCommandOutputCollapsesDuplicatedModelBlocks() throws {
@@ -627,69 +615,22 @@ final class DistillCoreTests: XCTestCase {
         XCTAssertFalse(response.output.contains("INPUT:"))
     }
 
-    func test_sr1HumanizeFallbackExpandsSpaceDelimitedDistillLines() async throws {
+    func test_wireRenderFallbackProducesReadableEnglish() async throws {
         let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
         let response = try await scheduler.submit(DistillRequest(
-            mode: .sr1Humanize,
-            input: """
-            TARGET_LANGUAGE: Portuguese (Brazil)
-
-            SR1_RESPONSE:
-            O Snake game criado.
-            O file: /Users/samuelfajreldines/snake.html (single-file, zero deps)
-            P open: abrir snake.html no browser -> jogo roda
-            """,
+            mode: .wireRenderEnglish,
+            input: "RCW1\tA\t1\nO\tSnake game created\nE\tfile: /Users/samuelfajreldines/snake.html\n.",
             maxOutputCharacters: 500
         ))
 
         XCTAssertEqual(
             response.output,
             """
-            Snake game criado.
-            file: /Users/samuelfajreldines/snake.html (single-file, zero deps)
-            open: abrir snake.html no browser -> jogo roda
+            Snake game created
+
+            Evidence: file: /Users/samuelfajreldines/snake.html
             """
         )
-    }
-
-    func test_sr1HumanizeFallbackExpandsInlineDistillClauses() async throws {
-        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
-        let response = try await scheduler.submit(DistillRequest(
-            mode: .sr1Humanize,
-            input: """
-            TARGET_LANGUAGE: Portuguese (Brazil)
-
-            SR1_RESPONSE:
-            S come. C cwd=/tmp. D load /distill rule, then create minimal HTML snake game.
-            """,
-            maxOutputCharacters: 500
-        ))
-
-        XCTAssertEqual(
-            response.output,
-            "Nao consegui expandir a resposta comprimida."
-        )
-    }
-
-    func test_sr1HumanizeFallbackExpandsCompressedVariables() async throws {
-        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
-        let response = try await scheduler.submit(DistillRequest(
-            mode: .sr1Humanize,
-            input: """
-            TARGET_LANGUAGE: Portuguese (Brazil)
-
-            SR1_RESPONSE:
-            Dict: S=state C=context D=action R=risk O=outcome N=no-go P=proof #g1=Snake HTML game
-            S received. D create #g1 in one file. O #g1 ready.
-            """,
-            maxOutputCharacters: 500
-        ))
-
-        XCTAssertFalse(response.output.contains("#g1"),
-                       "SR1 aliases are a provider compression detail and must not be shown in the humanized answer")
-        // O-first prose: only the outcome (O) segment survives, S/C/D chrome dropped,
-        // and the #g1 alias is expanded to its literal value.
-        XCTAssertEqual(response.output, "Snake HTML game ready")
     }
 
     func test_schedulerReportsMeasuredTokenSavingsFromRealCompression() async throws {
@@ -732,7 +673,7 @@ final class DistillCoreTests: XCTestCase {
         )
     }
 
-    func test_mlxSR1HumanizeRejectsPartialDictionaryOutput() {
+    func test_mlxWireRendererRejectsWireOutput() {
         let output = """
         Dict: S=state C=context D=action R=risk O=outcome N=no-go P=proof
         Estado: starting
@@ -740,12 +681,12 @@ final class DistillCoreTests: XCTestCase {
         """
 
         XCTAssertFalse(
-            MLXDistillRuntime.isUsefulOutput(output, mode: .sr1Humanize),
-            "SR1 humanization must reject partial translations that still expose the SR1 dictionary"
+            MLXDistillRuntime.isUsefulOutput(output, mode: .wireRenderEnglish),
+            "wire rendering must reject output that still exposes transport text"
         )
     }
 
-    func test_mlxSR1HumanizeRejectsMixedCompressedAndHumanOutput() {
+    func test_mlxWireRendererRejectsMixedWireAndHumanOutput() {
         let output = """
         S done.
         O created /tmp/index.html: self-contained Snake game.
@@ -761,8 +702,29 @@ final class DistillCoreTests: XCTestCase {
         """
 
         XCTAssertFalse(
-            MLXDistillRuntime.isUsefulOutput(output, mode: .sr1Humanize),
-            "SR1 humanization must reject model output that preserves compressed S/O/P/C lines before a human-language sentence"
+            MLXDistillRuntime.isUsefulOutput("RCW1\tA\t1\nO\tdone\n.\n\(output)", mode: .wireRenderEnglish),
+            "wire rendering must reject model output that preserves an RCW1 frame"
+        )
+    }
+
+    func test_mlxWireEncoderLetsSwiftOwnFraming() throws {
+        let brief = "Inspect src/HealthPolicy.swift. Do not edit. Keep p95 <= 250 ms."
+
+        let wire = try XCTUnwrap(MLXDistillRuntime.wireRequestFrame(semanticBrief: brief))
+        let frames = try RCWireProtocol.parse(wire)
+
+        XCTAssertEqual(frames, [RCWireFrame(
+            direction: .request,
+            sequence: 1,
+            records: [.init(kind: .goal, value: brief)]
+        )], "the local model supplies semantics while native Swift owns the versioned ABI")
+        XCTAssertTrue(RCWireProtocol.preservesProtectedSemantics(original: brief, wire: wire))
+    }
+
+    func test_mlxWireEncoderRejectsMalformedProtocolLookingText() {
+        XCTAssertNil(
+            MLXDistillRuntime.wireRequestFrame(semanticBrief: "RCW9 Q malformed"),
+            "malformed model syntax must fail open instead of being hidden inside a valid goal record"
         )
     }
 
@@ -777,7 +739,7 @@ final class DistillCoreTests: XCTestCase {
 
         XCTAssertEqual(
             output,
-            "S RemoteCode Token Saver runs locally on macOS.\nS It preserves exact commands."
+            "RemoteCode Token Saver runs locally on macOS.\nIt preserves exact commands."
         )
         XCTAssertLessThanOrEqual(output.count, request.maxOutputCharacters)
     }

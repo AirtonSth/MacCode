@@ -50,12 +50,46 @@ public struct AssistantSR1Translation: Codable, Sendable, Equatable {
     public var messageId: String?
     public var originalText: String
     public var rewrittenText: String
+    /// Present only on new RCW1 records. Optional so persisted historical SR1
+    /// events remain decodable without a schema migration.
+    public var wireRequestText: String?
 
-    public init(itemId: String? = nil, messageId: String? = nil, originalText: String, rewrittenText: String) {
+    public init(itemId: String? = nil, messageId: String? = nil, originalText: String, rewrittenText: String, wireRequestText: String? = nil) {
         self.itemId = itemId
         self.messageId = messageId
         self.originalText = originalText
         self.rewrittenText = rewrittenText
+        self.wireRequestText = wireRequestText
+    }
+}
+
+/// Persisted metadata for an RCW1 provider response. The historical SR1 type
+/// remains decode-only so existing transcripts keep rendering after upgrade.
+public struct AssistantWireTranslation: Codable, Sendable, Equatable {
+    public var itemId: String?
+    public var messageId: String?
+    public var originalText: String
+    public var rewrittenText: String
+    public var protocolVersion: String
+    public var fallbackReason: String?
+    public var wireRequestText: String?
+
+    public init(
+        itemId: String? = nil,
+        messageId: String? = nil,
+        originalText: String,
+        rewrittenText: String,
+        protocolVersion: String = RCWireProtocol.version,
+        fallbackReason: String? = nil,
+        wireRequestText: String? = nil
+    ) {
+        self.itemId = itemId
+        self.messageId = messageId
+        self.originalText = originalText
+        self.rewrittenText = rewrittenText
+        self.protocolVersion = protocolVersion
+        self.fallbackReason = fallbackReason
+        self.wireRequestText = wireRequestText
     }
 }
 
@@ -708,6 +742,7 @@ public enum AssistantEvent: Codable, Sendable, Equatable {
     case accountUsage(AssistantAccountUsage)
     case contextCompaction(summary: String?)
     case providerRuntime(ProviderRuntimeEvent)
+    case wireTranslation(AssistantWireTranslation)
     case sr1Translation(AssistantSR1Translation)
     case error(message: String, recoverable: Bool)
 
@@ -731,6 +766,7 @@ public enum AssistantEvent: Codable, Sendable, Equatable {
         case .accountUsage(let u): return "accountUsage(\(u.provider.rawValue) \(Int(u.weeklyUsedPercent.rounded()))%)"
         case .contextCompaction: return "contextCompaction"
         case .providerRuntime(let e): return "providerRuntime(\(e.provider.rawValue) \(e.method))"
+        case .wireTranslation(let t): return "wireTranslation(\(t.itemId ?? t.messageId ?? "-"))"
         case .sr1Translation(let t): return "sr1Translation(\(t.itemId ?? t.messageId ?? "-"))"
         case .error(let m, _): return "error(\(m))"
         }
@@ -803,6 +839,11 @@ public enum AssistantEvent: Codable, Sendable, Equatable {
                 + event.id.utf8.count + event.source.utf8.count + event.method.utf8.count
                 + s(event.providerTurnId) + s(event.providerItemId)
                 + s(event.providerRequestId) + event.payloadJSON.utf8.count
+        case .wireTranslation(let translation):
+            return envelope
+                + s(translation.itemId) + s(translation.messageId)
+                + translation.originalText.utf8.count + translation.rewrittenText.utf8.count
+                + translation.protocolVersion.utf8.count + s(translation.fallbackReason)
         case .sr1Translation(let translation):
             return envelope
                 + s(translation.itemId) + s(translation.messageId)
@@ -878,8 +919,16 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     public var tokenUsage: AssistantTokenUsage?
     public var contextCompactionSummary: String?
     public var providerRuntimeEvents: [ProviderRuntimeEvent]
+    /// Legacy persisted field names retained for decoding existing workflow state.
+    /// New RCW1 events are adapted into these presentation-only maps.
     public var sr1TranslationsByItemId: [String: AssistantSR1Translation]
     public var sr1TranslationsByMessageId: [String: AssistantSR1Translation]
+    public var tokenSaverTranslationsByItemId: [String: AssistantSR1Translation] {
+        sr1TranslationsByItemId
+    }
+    public var tokenSaverTranslationsByMessageId: [String: AssistantSR1Translation] {
+        sr1TranslationsByMessageId
+    }
     private var pendingItemDeltas: [String: PendingItemDelta]
     // F39: insertion order of pendingItemDeltas keys so the cap evicts oldest-first
     // (Dictionary has no stable order; a legit early-arriving delta is always the
@@ -993,10 +1042,12 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         for translation in sr1TranslationsByItemId.values {
             total += bytes(translation.itemId) + bytes(translation.messageId)
                 + translation.originalText.utf8.count + translation.rewrittenText.utf8.count
+                + bytes(translation.wireRequestText)
         }
         for translation in sr1TranslationsByMessageId.values {
             total += bytes(translation.itemId) + bytes(translation.messageId)
                 + translation.originalText.utf8.count + translation.rewrittenText.utf8.count
+                + bytes(translation.wireRequestText)
         }
         for (id, delta) in pendingItemDeltas {
             total += id.utf8.count + delta.body.utf8.count + delta.output.utf8.count
@@ -1062,6 +1113,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     private static func hotTextContribution(translation: AssistantSR1Translation) -> Int {
         let text = hotTextBytes(translation.itemId) + hotTextBytes(translation.messageId)
             + translation.originalText.utf8.count + translation.rewrittenText.utf8.count
+            + hotTextBytes(translation.wireRequestText)
         return text + aggregateHotElementOverhead
     }
 
@@ -1421,6 +1473,20 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                     createdAtMs: event.receivedAtMs
                 ))
             }
+        case .wireTranslation(let translation):
+            let compatibility = AssistantSR1Translation(
+                itemId: translation.itemId,
+                messageId: translation.messageId,
+                originalText: translation.originalText,
+                rewrittenText: translation.rewrittenText,
+                wireRequestText: translation.wireRequestText
+            )
+            if let itemId = translation.itemId, !itemId.isEmpty {
+                sr1TranslationsByItemId[itemId] = compatibility
+            }
+            if let messageId = translation.messageId, !messageId.isEmpty {
+                sr1TranslationsByMessageId[messageId] = compatibility
+            }
         case .sr1Translation(let translation):
             if let itemId = translation.itemId, !itemId.isEmpty {
                 sr1TranslationsByItemId[itemId] = translation
@@ -1459,7 +1525,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     private mutating func trimTurns() {
         guard turns.count > Self.liveTurnLimit else { return }
         let dropCount = turns.count - Self.liveTurnLimit
-        // F10: evicted turns' items are gone, so drop any SR1 translations keyed on
+        // F10: evicted turns' items are gone, so drop any Token Saver translations keyed on
         // those item ids — otherwise the maps retain pre-translation text for turns
         // that no longer exist. Item ids are unique per turn, so retained turns keep
         // their translations. (messageId translations map to persisted messages
@@ -1474,7 +1540,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
 
     // F10: keep one turn's `items` array bounded (see `liveTurnItemLimit`). Trims
     // oldest items **after** index 0 — items[0].startedAtMs is the transcript sort
-    // anchor; dropping it reorders Lazy rows mid-stream. Also drops orphaned SR1.
+    // anchor; dropping it reorders Lazy rows mid-stream. Also drops orphaned translations.
     private mutating func trimTurnItems(at idx: Int) {
         guard turns[idx].items.count > Self.liveTurnItemLimit else { return }
         let first = turns[idx].items[0]

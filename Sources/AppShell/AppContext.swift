@@ -34,8 +34,8 @@ public enum TokenSaverLaneKillSwitch: Sendable {
         "semantic_prose",
         "adaptive_effort",
         "visual_artifact",
-        "sr1-humanize",
-        "sr1_humanize",
+        "wire-encode",
+        "wire-render-english",
     ]
 
     public struct CLIStateOverlay: Sendable, Equatable {
@@ -514,7 +514,6 @@ public final class AppContext {
     // Raised from 600: below ~2k chars a model round-trip on the awaited prompt path
     // rarely nets out positive once MLX latency is counted (NetPositiveGate floor, G3).
     private static let tokenSaverMinCompressChars = 2_000
-    private static let tokenSaverDistillStartupPolls = 300
     private static let tokenSaverPromptSkipSetTTL: TimeInterval = 1_800
     private static let tokenSaverUsageNotificationMinimumInterval: TimeInterval = 2
     /// Process-local once flag for empty lane_state diagnostic (silent-death condition).
@@ -905,7 +904,7 @@ public final class AppContext {
             guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .finalResponse) else {
                 return response
             }
-            return await self.tokenSaverHumanizeSR1Response(response, provider: provider, threadId: threadId, runId: runId)
+            return await self.tokenSaverRenderWireResponse(response, provider: provider, threadId: threadId, runId: runId)
         }
         // Recovered sessions rebuild their own request env in the coordinator, bypassing
         // providerEnvironment; feed them the same Token Saver env so distill survives resume.
@@ -1268,10 +1267,23 @@ public final class AppContext {
                 ]))
             case .providerRuntime(let event):
                 EventBus.shared.publish(kind: "agent.provider_runtime.event", payload: runtimeEventPayload(event, threadId: t))
+            case .wireTranslation(let translation):
+                var payload: [String: JSONValue] = [
+                    "thread_id": .string(t),
+                    "original_text": .string(AssistantTimelineState.cappedText(translation.originalText)),
+                    "rewritten_text": .string(AssistantTimelineState.cappedText(translation.rewrittenText)),
+                    "protocol_version": .string(translation.protocolVersion)
+                ]
+                if let itemId = translation.itemId { payload["item_id"] = .string(itemId) }
+                if let messageId = translation.messageId { payload["message_id"] = .string(messageId) }
+                if let fallbackReason = translation.fallbackReason { payload["fallback_reason"] = .string(fallbackReason) }
+                if let wireRequestText = translation.wireRequestText {
+                    payload["wire_request_text"] = .string(AssistantTimelineState.cappedText(wireRequestText))
+                }
+                EventBus.shared.publish(kind: "agent.wire.translation", payload: .object(payload))
             case .sr1Translation(let translation):
-                // Mirror SR1 rewrites so remote clients can badge translated
-                // messages and offer "show original" like the mac UI. Texts are
-                // capped: the model carries no bound of its own.
+                // Historical replay only: paired clients still need to render
+                // persisted pre-RCW1 transcript rows. Texts remain capped.
                 var sr1Payload: [String: JSONValue] = [
                     "thread_id": .string(t),
                     "original_text": .string(AssistantTimelineState.cappedText(translation.originalText)),
@@ -2408,13 +2420,18 @@ public final class AppContext {
 
         // Always-on subagent routing is independent of Token Saver. Install each
         // component separately so a failure cannot remove or suppress siblings.
+        let activeServiceBinary = AgentSkillInstaller.resolveServiceBinary()
         do {
-            _ = try installer.installProviderProxies()
+            _ = try installer.installProviderProxies(
+                serviceBinaryURL: activeServiceBinary
+            )
         } catch {
             NSLog("RemoteCode provider proxy install failed: \(error)")
         }
         do {
-            _ = try installer.installAgentAppMiddleware()
+            _ = try installer.installAgentAppMiddleware(
+                serviceBinaryURL: activeServiceBinary
+            )
         } catch {
             NSLog("RemoteCode Agent App middleware install failed: \(error)")
         }
@@ -2826,10 +2843,8 @@ public final class AppContext {
             return .init(allowed: false, reason: "lifecycle_degraded")
         }
         let enabled = globallyEnabled ?? isTokenSaverRuntimeActive()
-        guard let thread = try? threadRepo.get(id: threadId),
-              let projectID = thread.projectId?.value.uuidString,
-              thread.workspaceId != nil,
-              let lane = try? tokenSaverLaneStateRepo.get(projectID: projectID, lane: laneName) else {
+        guard let scope = tokenSaverPersistentScope(threadId: threadId),
+              let lane = try? tokenSaverLaneStateRepo.get(projectID: scope.projectID, lane: laneName) else {
             return TokenSaverProjectRuntimeAdmissionPolicy.evaluate(.init(
                 globallyEnabled: enabled,
                 hasExactProjectScope: false,
@@ -2857,6 +2872,20 @@ public final class AppContext {
             usageSemanticsAvailable: lane.usageSemanticsAvailable,
             scorecardID: lane.scorecardID
         ))
+    }
+
+    /// Agent App workspace threads do not always have a nested project row. The
+    /// workspace UUID is still a stable, exact local boundary, so use it as the
+    /// project component instead of silently disabling governed Token Saver on
+    /// every top-level workspace thread.
+    private func tokenSaverPersistentScope(
+        threadId: AgentThreadID
+    ) -> (workspaceID: String, projectID: String)? {
+        guard let thread = try? threadRepo.get(id: threadId),
+              let workspaceID = thread.workspaceId?.value.uuidString else {
+            return nil
+        }
+        return (workspaceID, thread.projectId?.value.uuidString ?? workspaceID)
     }
 
     private func tokenSaverProjectObservation(
@@ -2931,7 +2960,7 @@ public final class AppContext {
         count: Int = 1
     ) {
         guard !decision.allowed else { return }
-        let projectID = (try? threadRepo.get(id: threadId))?.projectId?.value.uuidString
+        let projectID = tokenSaverPersistentScope(threadId: threadId)?.projectID
         NSLog(
             "RemoteCode Token Saver admission DENIED lane=\(lane) reason=\(decision.reason) thread=\(threadId.value.uuidString) project=\(projectID ?? "nil")"
         )
@@ -2951,8 +2980,7 @@ public final class AppContext {
         lane: String,
         governedWrite: Bool
     ) -> TokenSaverGovernanceSnapshot {
-        let thread = try? threadRepo.get(id: threadId)
-        let projectID = thread?.projectId?.value.uuidString
+        let projectID = tokenSaverPersistentScope(threadId: threadId)?.projectID
         let admission = tokenSaverProjectAdmission(threadId: threadId, lane: lane)
         var evidence: String?
         if let projectID,
@@ -2979,6 +3007,16 @@ public final class AppContext {
         )
     }
 
+    static func providerSessionSupportsWire(_ runtimePayloadJSON: String?) -> Bool {
+        guard let runtimePayloadJSON,
+              let data = runtimePayloadJSON.data(using: .utf8),
+              let decoded = try? JSONSerialization.jsonObject(with: data),
+              let object = decoded as? [String: Any] else {
+            return false
+        }
+        return object["wireProtocolVersion"] as? String == RCWireProtocol.version
+    }
+
     func tokenSaverCompress(
         prompt: String,
         provider: AgentProvider,
@@ -2986,30 +3024,63 @@ public final class AppContext {
         cacheState: String = "prompt",
         runId: AgentRunID? = nil
     ) async -> String {
+        let traceEligible = prompt.count >= Self.tokenSaverMinCompressChars
+        func trace(_ checkpoint: String) {
+            guard traceEligible else { return }
+            NSLog("RemoteCode RCW1 admission checkpoint=\(checkpoint) provider=\(provider.rawValue) cache=\(cacheState)")
+        }
+        trace("entered")
         let turn: TokenSaverAdapterMatrix.CrossUserTurn =
             cacheState.contains("follow") ? .followUp : .initial
         guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(
             isSameUser: tokenSaverIsSameUser(threadId: threadId),
             turn: turn
         ) else {
+            trace("denied_user_or_turn")
             return prompt
         }
-        // Operator per-lane kill switch (incident control) — same decision child env exports.
-        if tokenSaverLaneIsDisabled("deterministic_wrapper") {
-            recordTokenSaverAdmissionDenial(
-                threadId: threadId,
-                lane: "deterministic_wrapper",
-                decision: .init(allowed: false, reason: "operator_lane_disabled")
-            )
+        guard Self.isWireEligibleEnglishPrompt(prompt) else {
+            trace("ineligible_language_or_risk")
             return prompt
         }
-        let admission = tokenSaverProjectAdmission(threadId: threadId, lane: "deterministic_wrapper")
-        guard admission.allowed else {
+        guard !tokenSaverLaneIsDisabled("wire-encode"),
+              !tokenSaverLaneIsDisabled("wire-render-english") else {
+            trace("lane_disabled")
+            return prompt
+        }
+        guard let persistentScope = tokenSaverPersistentScope(threadId: threadId) else {
             recordTokenSaverAdmissionDenial(
                 threadId: threadId,
-                lane: "deterministic_wrapper",
-                decision: admission
+                lane: "wire-encode",
+                decision: .init(allowed: false, reason: "missing_project_scope")
             )
+            trace("missing_scope")
+            return prompt
+        }
+        // Workspace-only threads use their stable workspace UUID as the project
+        // component. Seed both rows before the atomic two-direction admission.
+        try? tokenSaverLaneStateRepo.ensureDefaults(projectID: persistentScope.projectID)
+        let encodeAdmission = tokenSaverProjectAdmission(threadId: threadId, lane: "wire-encode")
+        let renderAdmission = tokenSaverProjectAdmission(threadId: threadId, lane: "wire-render-english")
+        guard encodeAdmission.allowed, renderAdmission.allowed else {
+            let deniedLane = encodeAdmission.allowed ? "wire-render-english" : "wire-encode"
+            let denial = encodeAdmission.allowed ? renderAdmission : encodeAdmission
+            recordTokenSaverAdmissionDenial(
+                threadId: threadId,
+                lane: deniedLane,
+                decision: denial
+            )
+            trace("governance_denied")
+            return prompt
+        }
+        // A provider session created before the trusted RCW1 capability was
+        // installed must remain human-text fail-open. Sending a self-describing
+        // control contract inside user content is both less trusted and was
+        // rejected by real Claude resume sessions. New sessions record the
+        // capability at creation, so later follow-ups can safely use wire.
+        if let session = try? providerSessionRuntimeRepo.get(threadId: threadId),
+           !Self.providerSessionSupportsWire(session.runtimePayloadJSON) {
+            trace("legacy_session")
             return prompt
         }
         // NetPositiveGate (G3): there is no app-side cached prefix to preserve (resume sends
@@ -3022,67 +3093,49 @@ public final class AppContext {
         let gate = NetPositiveGate(floorCharacters: floor, warmResumeTTLSeconds: 300)
         let secondsSinceLastTurn = secondsSinceLastTurn(threadId: threadId)
         guard gate.shouldCompress(inputCharacters: prompt.count, secondsSinceLastTurn: secondsSinceLastTurn) else {
+            trace("net_gate")
             return prompt
         }
-        let semanticObservation = tokenSaverProjectObservation(threadId: threadId, lane: "semantic_prose")
-        let semanticPromoted: Bool = {
-            guard tokenSaverProjectAdmission(threadId: threadId, lane: "semantic_prose").allowed,
-                  let thread = try? threadRepo.get(id: threadId),
-                  let projectID = thread.projectId?.value.uuidString,
-                  let lane = try? tokenSaverLaneStateRepo.get(projectID: projectID, lane: "semantic_prose") else {
-                return false
-            }
-            return lane.retentionDays > 0 && !lane.optedOut && !lane.killSwitchActive
-        }()
         let promptBytes = prompt.utf8.count
-        // A shadow/audit no-win must not suppress a later promoted optimize call for
-        // the same prompt. The two paths have different recovery and adoption rights.
+        // A prior no-win should suppress duplicate local work for the same prompt.
         let skipKey = DistillResultCacheKey(request: DistillRequest(
-            mode: .longText,
+            mode: .wireEncode,
             priority: .interactive,
             input: prompt,
             maxOutputCharacters: max(512, prompt.count)
-        ), pipelineVersion: DistillResultCacheKey.pipelineVersion + (semanticPromoted ? "-optimize" : "-audit"))
+        ), pipelineVersion: DistillResultCacheKey.pipelineVersion + "-wire-v1")
         if tokenSaverPromptSkipSetContains(skipKey) {
+            trace("known_no_win")
             return prompt
         }
-        // T-003 Wave -1: diff windowing is lossy and depended on a global raw
-        // hash. Keep it off until scoped recovery is authorized and read back.
-        let diffWindowed: String? = nil
-        // Non-lossy dedup pre-pass (P4): collapse exact-duplicate large blocks within the
-        // prompt to a model-readable "identical to block above" pointer. The model keeps
-        // full information (content once + a pointer it understands), so this is safe to
-        // send AND a win even if the model compression step is unavailable.
-        let dedupeProbe = DistillBlockDeduper.dedupe(prompt)
-        // The self-contained exact/volatile pointer keeps the first block and its
-        // changed fields inline. Do not attach an unscoped recovery marker.
-        let deduped = dedupeProbe.output
-        let deterministicCandidate = [diffWindowed, deduped]
-            .compactMap { $0 }
-            .filter { $0.utf8.count < prompt.utf8.count }
-            .min { $0.utf8.count < $1.utf8.count }
-            ?? prompt
+        trace("admitted")
+        // Wire encoding is one atomic semantic transform. If the local encoder
+        // is unavailable or rejected, the exact human prompt must reach the
+        // provider; an unrelated prose/dedupe transform is not a valid fallback.
+        let deterministicCandidate = prompt
         let deterministicBytes = deterministicCandidate.utf8.count
         let deterministicCharacters = deterministicCandidate.count
 
         // Adopt `candidate` only if it beats the ORIGINAL prompt; record honest end-to-end
         // savings (original -> final), tagged with the caller's cache_state AND the engine
         // that produced the win (deterministic pre-pass vs the model) so the Token Saver
-        // breakdown attributes per technique.
+        // breakdown attributes the wire encoding technique.
         func adopt(_ candidate: String, stage: TokenSaverRouteStage) -> String {
-            guard candidate.utf8.count < promptBytes else {
+            let inputTokens = TokenEstimator.estimate(prompt)
+            let outputTokens = TokenEstimator.estimate(candidate)
+            let grammarTokens = TokenEstimator.estimate(AgentSkillInstaller.rcWireAgentInstructionsTemplate)
+            guard RCWireProtocol.isWire(candidate),
+                  outputTokens + grammarTokens < inputTokens else {
                 self.tokenSaverPromptSkipSet[skipKey] = Date()
                 return prompt
             }
-            let inputTokens = TokenEstimator.estimate(prompt)
-            let outputTokens = TokenEstimator.estimate(candidate)
             recordTokenSaverSidecarSavings(
                 provider: provider,
                 threadId: threadId,
-                mode: DistillMode.longText.rawValue,
+                mode: DistillMode.wireEncode.rawValue,
                 inputTokens: inputTokens,
-                outputTokens: outputTokens,
-                savedTokens: max(inputTokens - outputTokens, 0),
+                outputTokens: outputTokens + grammarTokens,
+                savedTokens: max(inputTokens - outputTokens - grammarTokens, 0),
                 cacheState: cacheState,
                 routeStage: stage
             )
@@ -3090,65 +3143,67 @@ public final class AppContext {
         }
 
         // Demand-start Distill without blocking this turn on MLX warmup. Kick the
-        // sidecar for later turns / concurrent SR1; if not already `.running`,
-        // fail open to deterministic/original input (Token Saver fail-open).
-        if semanticObservation.allowed {
-            startTokenSaverDistillServiceIfEligible()
-        }
-        guard semanticObservation.allowed,
-              let client = currentDistillClient() else {
-            if !semanticObservation.allowed {
-                NSLog("RemoteCode Token Saver semantic observation skipped: \(semanticObservation.reason)")
-            }
-            // No model service: deterministic pre-passes still fail open and can save tokens.
-            return deterministicBytes < promptBytes ? adopt(deterministicCandidate, stage: .deterministic) : prompt
+        // sidecar for later turns; if not already `.running`, fail open to the
+        // exact original input (Token Saver fail-open).
+        startTokenSaverDistillServiceIfEligible()
+        guard let client = currentDistillClient() else {
+            trace("sidecar_not_ready")
+            return prompt
         }
         let request = DistillRequest(
-            mode: .longText,
+            mode: .wireEncode,
             priority: .interactive,
             input: deterministicCandidate,
-            runMode: semanticPromoted ? .optimize : .audit,
+            runMode: .optimize,
             maxOutputCharacters: max(512, deterministicCharacters)
+        )
+        let scopedRecoveryAvailable = runId != nil
+            && tokenSaverPersistentScope(threadId: threadId) != nil
+        NSLog(
+            "RemoteCode RCW1 encode started provider=\(provider.rawValue) scoped_recovery=\(scopedRecoveryAvailable)"
         )
         do {
             let response: DistillResponse
-            if semanticPromoted,
-               let runId,
-               let thread = try? threadRepo.get(id: threadId),
-               let workspaceID = thread.workspaceId?.value.uuidString,
-               let projectID = thread.projectId?.value.uuidString {
+            if let runId,
+               let scope = tokenSaverPersistentScope(threadId: threadId) {
                 response = try await client.distill(
                     request,
                     recoveryContext: .init(
-                        workspaceID: workspaceID,
-                        projectID: projectID,
+                        workspaceID: scope.workspaceID,
+                        projectID: scope.projectID,
                         threadID: threadId.value.uuidString,
                         provider: provider.rawValue,
                         attemptID: runId.value.uuidString,
-                        operationID: "semantic-prose:\(runId.value.uuidString)"
+                        operationID: "wire-encode:\(runId.value.uuidString)"
                     )
                 )
             } else {
                 response = try await client.distill(request)
             }
+            let responseStage = response.routeStage?.rawValue ?? "unknown"
+            NSLog(
+                "RemoteCode RCW1 encode returned provider=\(provider.rawValue) wire=\(RCWireProtocol.isWire(response.output)) recovery_handle=\(response.originalHandle != nil) stage=\(responseStage)"
+            )
             let modelOutput = response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? deterministicCandidate : response.output
-            let literalSafeModelOutput = LiteralPreservation.guarded(original: prompt, compressed: modelOutput).droppedLiteral == nil
+            let wireFrames = try? RCWireProtocol.parse(modelOutput)
+            let isValidRequestWire = wireFrames?.allSatisfy { $0.direction == .request } == true
+            let literalSafeModelOutput = isValidRequestWire
+                && RCWireProtocol.preservesProtectedSemantics(original: prompt, wire: modelOutput)
+                && LiteralPreservation.guarded(original: prompt, compressed: modelOutput).droppedLiteral == nil
                 ? modelOutput
                 : deterministicCandidate
-            // The deterministic lane never adopts sidecar bytes. A semantic candidate
-            // is live only after its own lane is promoted and exact-scope recovery was
-            // durably stored and read back. Shadow runs observe it verbatim-only.
+            // A wire candidate is live only after schema/literal/net-savings gates
+            // and exact-scope recovery has been durably stored and read back.
             let modelWon = literalSafeModelOutput.utf8.count < deterministicBytes
+            let modelNetPositive = TokenEstimator.estimate(literalSafeModelOutput)
+                + TokenEstimator.estimate(AgentSkillInstaller.rcWireAgentInstructionsTemplate)
+                < TokenEstimator.estimate(prompt)
             if !modelWon, deterministicBytes >= promptBytes {
                 tokenSaverPromptSkipSet[skipKey] = Date()
             }
-            let semanticAdmitted = tokenSaverProjectAdmission(
-                threadId: threadId,
-                lane: "semantic_prose"
-            ).allowed
             guard modelWon,
-                  semanticAdmitted,
-                  let recoveredCandidate = prepareSemanticCandidate(
+                  modelNetPositive,
+                  let recoveredCandidate = prepareWireCandidate(
                     original: prompt,
                     stageOriginal: deterministicCandidate,
                     candidate: literalSafeModelOutput,
@@ -3160,26 +3215,23 @@ public final class AppContext {
                   ) else {
                 // Distill may already have prepared a stage object before any later
                 // pre-adoption gate. Abandon only that provisional when adoption fails.
-                discardProvisionalSemanticRecovery(
+                discardProvisionalWireRecovery(
                     capability: response.originalHandle,
                     idempotencyKey: response.recoveryIdempotencyKey,
                     provider: provider,
                     threadId: threadId,
                     runId: runId
                 )
-                return deterministicBytes < promptBytes
-                    ? adopt(deterministicCandidate, stage: .deterministic)
-                    : prompt
+                return prompt
             }
             return adopt(recoveredCandidate, stage: response.routeStage ?? .llmMLX)
         } catch {
             NSLog("RemoteCode Token Saver compression skipped (provider=\(provider.rawValue)): \(error)")
-            // Fail-open to the deterministic pre-pass if it helped, else the original.
-            return deterministicBytes < promptBytes ? adopt(deterministicCandidate, stage: .deterministic) : prompt
+            return prompt
         }
     }
 
-    private func prepareSemanticCandidate(
+    private func prepareWireCandidate(
         original: String,
         stageOriginal: String,
         candidate: String,
@@ -3192,19 +3244,13 @@ public final class AppContext {
         guard let runId,
               let capability,
               let idempotencyKey,
-              let thread = try? threadRepo.get(id: threadId),
-              let workspaceID = thread.workspaceId?.value.uuidString,
-              let projectID = thread.projectId?.value.uuidString,
-              let lane = try? tokenSaverLaneStateRepo.get(projectID: projectID, lane: "semantic_prose"),
-              lane.state == "promoted",
-              lane.retentionDays > 0,
-              !lane.optedOut,
-              !lane.killSwitchActive else {
+              let resolvedScope = tokenSaverPersistentScope(threadId: threadId),
+              !tokenSaverLaneIsDisabled("wire-encode") else {
             return nil
         }
         let scope = TokenSaverPersistentScope(
-            workspaceID: workspaceID,
-            projectID: projectID,
+            workspaceID: resolvedScope.workspaceID,
+            projectID: resolvedScope.projectID,
             threadID: threadId.value.uuidString,
             provider: provider.rawValue,
             attemptID: runId.value.uuidString
@@ -3249,8 +3295,8 @@ public final class AppContext {
                 let preparedFull = try TokenSaverRuntimeRecoveryWorker(db: db).prepareOriginal(
                     originalBytes,
                     scope: scope,
-                    operationID: "semantic-full-original:\(runId.value.uuidString)",
-                    lane: "semantic_prose",
+                    operationID: "wire-full-original:\(runId.value.uuidString)",
+                    lane: "wire-encode",
                     disk: disk
                 )
                 provisionals.append((preparedFull.capability, preparedFull.idempotencyKey))
@@ -3266,8 +3312,13 @@ public final class AppContext {
             }
 
             // Final marker-inclusive net-positive gate before durable delivery/ack.
-            let recoverable = candidate + "\n" + recoveryMarkers.joined(separator: "\n")
-            guard recoverable.utf8.count < original.utf8.count else {
+            var recoverable = candidate
+            for marker in recoveryMarkers {
+                recoverable = try RCWireProtocol.addingExactRecord(marker, to: recoverable)
+            }
+            guard TokenEstimator.estimate(recoverable)
+                    + TokenEstimator.estimate(AgentSkillInstaller.rcWireAgentInstructionsTemplate)
+                    < TokenEstimator.estimate(original) else {
                 discardProvisionals()
                 return nil
             }
@@ -3293,13 +3344,13 @@ public final class AppContext {
             }
             return recoverable
         } catch {
-            NSLog("RemoteCode Token Saver semantic recovery preparation failed: \(error)")
+            NSLog("RemoteCode Token Saver wire recovery preparation failed: \(error)")
             discardProvisionals()
             return nil
         }
     }
 
-    private func discardProvisionalSemanticRecovery(
+    private func discardProvisionalWireRecovery(
         capability: String?,
         idempotencyKey: String?,
         provider: AgentProvider,
@@ -3309,14 +3360,12 @@ public final class AppContext {
         guard let runId,
               let capability,
               let idempotencyKey,
-              let thread = try? threadRepo.get(id: threadId),
-              let workspaceID = thread.workspaceId?.value.uuidString,
-              let projectID = thread.projectId?.value.uuidString else {
+              let resolvedScope = tokenSaverPersistentScope(threadId: threadId) else {
             return
         }
         let scope = TokenSaverPersistentScope(
-            workspaceID: workspaceID,
-            projectID: projectID,
+            workspaceID: resolvedScope.workspaceID,
+            projectID: resolvedScope.projectID,
             threadID: threadId.value.uuidString,
             provider: provider.rawValue,
             attemptID: runId.value.uuidString
@@ -3564,8 +3613,8 @@ public final class AppContext {
     /// Returns nil whenever the local model cannot be used or does not produce
     /// usable prose — the caller then keeps its deterministic preview, so the
     /// Lock Screen never degrades because the model was busy, gated, or slow.
-    /// Uses `.sr1Humanize`, the only public distill mode that emits free natural
-    /// language; the other modes emit compressed S/C/D/R/O/N/P lines.
+    /// Uses the local natural-language mode; wire rendering is reserved for
+    /// provider responses that carry the exact RCW1 sentinel.
     ///
     /// No provider tokens are spent: this is the local Token Saver sidecar.
     func liveActivityDescriptionSummary(
@@ -3577,7 +3626,7 @@ public final class AppContext {
 
         let targetLanguage = threadId.map { inferredUserLanguage(threadId: $0) } ?? "English"
         let request = DistillRequest(
-            mode: .sr1Humanize,
+            mode: .naturalLanguage,
             priority: .background,
             input: LiveActivitySummary.prompt(source: source, targetLanguage: targetLanguage),
             maxOutputCharacters: LiveActivitySummary.maximumCharacters * 2
@@ -3591,87 +3640,67 @@ public final class AppContext {
         }
     }
 
-    func tokenSaverHumanizeSR1Response(_ response: String, provider: AgentProvider, threadId: AgentThreadID, runId: AgentRunID? = nil) async -> String {
-        // Token Saver owns every SR1 rewrite, including the deterministic fallback.
-        // Check the live paid-feature gate before detection, fallback construction,
-        // or resolving a client that may still be alive during toggle teardown.
-        guard isTokenSaverRuntimeActive() else {
+    func tokenSaverRenderWireResponse(_ response: String, provider: AgentProvider, threadId: AgentThreadID, runId: AgentRunID? = nil) async -> String {
+        guard RCWireProtocol.isWire(response) else {
             return response
         }
-        guard SR1ResponseDetector.isSR1(response) else { return response }
-
-        let targetLanguage = inferredUserLanguage(threadId: threadId)
-        let fallback = Self.fallbackHumanizeSR1(response, targetLanguage: targetLanguage)
-        guard let client = await currentDistillClientWaitingForStartup() else {
-            NSLog("RemoteCode Token Saver SR1 humanize fallback used (provider=\(provider.rawValue)): distill client unavailable (status=\(Self.describe(tokenSaverDistillServiceController.status)))")
-            recordTokenSaverSR1HumanizeSavings(sr1: response, humanized: fallback, provider: provider, threadId: threadId)
+        guard let frames = try? RCWireProtocol.parse(response),
+              frames.allSatisfy({ $0.direction == .response }) else {
+            return "Token Saver could not decode the provider response. The original response was preserved below the Token Saver optimized disclosure."
+        }
+        let fallback = RCWireProtocol.renderEnglish(frames)
+        guard !fallback.isEmpty else {
+            return "Token Saver decoded an empty provider response. The original response was preserved below the Token Saver optimized disclosure."
+        }
+        // Once a provider has emitted a valid wire frame, toggling Token Saver
+        // off or tripping either kill switch must still leave a readable answer.
+        // The total Swift renderer is independent of the local model and is safe
+        // for replay after restart.
+        guard !RCWireProtocol.requiresDeterministicRendering(frames) else { return fallback }
+        guard isTokenSaverRuntimeActive(),
+              !tokenSaverLaneIsDisabled("wire-encode"),
+              !tokenSaverLaneIsDisabled("wire-render-english"),
+              tokenSaverProjectAdmission(threadId: threadId, lane: "wire-render-english").allowed else {
             return fallback
         }
-
-        let input = """
-        TARGET_LANGUAGE: \(targetLanguage)
-        USER_FACING_RULES:
-        Expand any SR1 variables such as #g1 using their definitions from SR1_RESPONSE before answering.
-        Never show unresolved # variables to the user.
-
-        SR1_RESPONSE:
-        \(response)
-        """
+        guard let client = currentDistillClient() else {
+            return fallback
+        }
         let request = DistillRequest(
-            mode: .sr1Humanize,
+            mode: .wireRenderEnglish,
             priority: .interactive,
-            input: input,
+            input: response,
             maxOutputCharacters: max(1_200, min(12_000, response.count * 4))
         )
         do {
-            let translated = try await client.distill(request).output.trimmingCharacters(in: .whitespacesAndNewlines)
-            let expanded = SR1ResponseDetector.expandVariables(in: translated, from: response)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let humanized: String
-            if !expanded.isEmpty, !SR1ResponseDetector.isSR1(expanded) {
-                humanized = expanded
+            let response: DistillResponse
+            if let runId,
+               let scope = tokenSaverPersistentScope(threadId: threadId) {
+                response = try await client.distill(
+                    request,
+                    recoveryContext: .init(
+                        workspaceID: scope.workspaceID,
+                        projectID: scope.projectID,
+                        threadID: threadId.value.uuidString,
+                        provider: provider.rawValue,
+                        attemptID: runId.value.uuidString,
+                        operationID: "wire-render:\(runId.value.uuidString)"
+                    )
+                )
             } else {
-                humanized = fallback
+                response = try await client.distill(request)
             }
-            recordTokenSaverSR1HumanizeSavings(sr1: response, humanized: humanized, provider: provider, threadId: threadId)
-            return humanized
+            let rendered = response.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            let humanText = !rendered.isEmpty
+                && !RCWireProtocol.isWire(rendered)
+                && RCWireProtocol.renderedTextPreservesProtectedSemantics(rendered, frames: frames)
+                ? rendered
+                : fallback
+            return humanText
         } catch {
-            NSLog("RemoteCode Token Saver SR1 humanize fallback used (provider=\(provider.rawValue)): \(error)")
-            recordTokenSaverSR1HumanizeSavings(sr1: response, humanized: fallback, provider: provider, threadId: threadId)
+            NSLog("RemoteCode Token Saver RCW1 deterministic renderer used (provider=\(provider.rawValue)): \(error)")
             return fallback
         }
-    }
-
-    private func currentDistillClientWaitingForStartup() async -> DistillServiceClient? {
-        guard isTokenSaverRuntimeActive() else {
-            return nil
-        }
-        if let client = currentDistillClient() {
-            return client
-        }
-
-        startTokenSaverDistillServiceIfEligible()
-        for _ in 0..<Self.tokenSaverDistillStartupPolls {
-            // The toggle can change while the sidecar is warming. Re-check before
-            // every client resolution so a late ready event cannot reactivate SR1.
-            guard isTokenSaverRuntimeActive() else {
-                return nil
-            }
-            if let client = currentDistillClient() {
-                return client
-            }
-            if case .blocked = tokenSaverDistillServiceController.status {
-                break
-            }
-            if case .failed = tokenSaverDistillServiceController.status {
-                break
-            }
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        }
-        guard isTokenSaverRuntimeActive() else {
-            return nil
-        }
-        return currentDistillClient()
     }
 
     private static func describe(_ status: TokenSaverDistillServiceStatus) -> String {
@@ -3704,7 +3733,7 @@ public final class AppContext {
         return "English"
     }
 
-    // PERF: language sniff for SR1/Live Activity recompiled character-class
+    // PERF: language sniff for wire/Live Activity recompiled character-class
     // regexes per call. CharacterSet membership is O(n) over scalars without
     // regex compile (same accent/marker contract as before).
     private static let portugueseAccentScalars = CharacterSet(charactersIn: "áàâãçéêíóôõú")
@@ -3733,49 +3762,25 @@ public final class AppContext {
         return markers.contains { lower.contains($0) }
     }
 
-    private static func fallbackHumanizeSR1(_ response: String, targetLanguage: String) -> String {
-        let portuguese = targetLanguage.localizedCaseInsensitiveContains("Portuguese")
-        let spanish = targetLanguage.localizedCaseInsensitiveContains("Spanish")
+    /// RCW1 v1 is deliberately English-only. Uncertain locale and turns whose
+    /// meaning is unusually risky stay byte-identical on the provider path.
+    private static func isWireEligibleEnglishPrompt(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !looksPortuguese(trimmed),
+              !looksSpanish(trimmed) else { return false }
+        let letters = trimmed.unicodeScalars.filter(CharacterSet.letters.contains)
+        guard !letters.isEmpty else { return false }
+        let nonASCII = letters.filter { !$0.isASCII }.count
+        guard Double(nonASCII) / Double(letters.count) <= 0.10 else { return false }
 
-        // Prefer O (outcome) as the user-facing answer. Do not rename every
-        // prefix to Estado/Contexto — that is not human and wastes UI tokens.
-        var outcomes: [String] = []
-        var extras: [String] = []
-        for raw in response.split(whereSeparator: \.isNewline) {
-            let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !line.isEmpty else { continue }
-            let lower = line.lowercased()
-            if lower == "sr1" || lower == "dict" || lower.hasPrefix("dict:")
-                || lower.hasPrefix("s=state") || lower.hasPrefix("c=context") {
-                continue
-            }
-            let segments = SR1ResponseDetector.parseSemanticSegments(line)
-            if segments.isEmpty {
-                if !line.hasPrefix("|") { extras.append(line) }
-                continue
-            }
-            for seg in segments {
-                let content = seg.content.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !content.isEmpty else { continue }
-                if seg.prefix == "O" {
-                    outcomes.append(content)
-                } else if seg.prefix == "R" || seg.prefix == "P" {
-                    // Keep risk/proof as short add-ons only when present.
-                    extras.append(content)
-                }
-                // Drop S/C/D/N in fail-open UI — they are ops chrome.
-            }
-        }
-
-        let pieces = outcomes.isEmpty ? extras : (outcomes + extras.prefix(2))
-        if pieces.isEmpty {
-            if portuguese { return "Nao consegui expandir a resposta comprimida." }
-            if spanish { return "No pude expandir la respuesta comprimida." }
-            return "I could not expand the compressed response."
-        }
-        let joined = pieces.joined(separator: "\n")
-        return SR1ResponseDetector.expandVariables(in: joined, from: response)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = " " + trimmed.lowercased() + " "
+        let highRiskMarkers = [
+            " rm -rf ", " sudo ", " delete production ", " drop database ",
+            " irreversible ", " approval ", " approve ", " permission ",
+            " password ", " secret ", " security confirmation ", " data loss "
+        ]
+        return !highRiskMarkers.contains { lower.contains($0) }
     }
 
     private func recordTokenSaverPreparedObservation(request: AgentRunRequest, originalPrompt: String) {
@@ -4182,8 +4187,7 @@ public final class AppContext {
                     // raw cost of this turn WITHOUT the dialect injected was never
                     // generated, so there is nothing to subtract. Any non-zero number
                     // produced here would be a counterfactual, which is exactly the
-                    // mistake that made the sr1-humanize figure unfalsifiable (see
-                    // TokenSaverSR1SavingsEstimator).
+                    // mistake that made the old response-translation figure unfalsifiable.
                     //
                     // A real baseline needs the same fixed corpus run with and without
                     // `distillAgentInstructionsBody` injected, compared against actual
@@ -4416,11 +4420,11 @@ public final class AppContext {
     ) {
         // WHY: Measurement/accounting must not depend on project admission. Real installs
         // have project_id NULL on all threads and 0 lane_state rows, which made every
-        // savings write (including sr1-humanize) silently dead. Lossy/governed paths
+        // savings writes silently dead. Lossy/governed paths
         // still use tokenSaverProjectAdmission; this path only needs paid feature + same-user.
         guard isTokenSaverRuntimeActive() else { return }
         guard tokenSaverIsSameUser(threadId: threadId) else { return }
-        let laneForGovernance = mode == "sr1-humanize" ? "sr1-humanize" : "deterministic_wrapper"
+        let laneForGovernance = mode == "wire-render-english" ? "wire-render-english" : "deterministic_wrapper"
         // Keep admission decision for audit snapshot (do not gate the write on it).
         let governance = tokenSaverGovernanceSnapshot(
             threadId: threadId,
@@ -4816,23 +4820,6 @@ public final class AppContext {
         graphifyItemBuffersLock.lock()
         graphifyItemBuffers.removeValue(forKey: bufferKey)
         graphifyItemBuffersLock.unlock()
-    }
-
-    private func recordTokenSaverSR1HumanizeSavings(
-        sr1: String,
-        humanized: String,
-        provider: AgentProvider,
-        threadId: AgentThreadID
-    ) {
-        let estimate = TokenSaverSR1SavingsEstimator.estimate(sr1: sr1, humanized: humanized)
-        recordTokenSaverSidecarSavings(
-            provider: provider,
-            threadId: threadId,
-            mode: "sr1-humanize",
-            inputTokens: estimate.inputTokens,
-            outputTokens: estimate.outputTokens,
-            savedTokens: estimate.savedTokens
-        )
     }
 
     private var pendingSave: DispatchWorkItem?
