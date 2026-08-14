@@ -663,6 +663,14 @@ public enum EventStreamFilter: Sendable, Equatable {
         "agent.message.queued"
     ])
 
+    /// Files tab subscription: state + edit lifecycle only.
+    /// Stream kinds (`agent.item.delta` / `surface.output`) must not hop
+    /// each open Files surface to the main queue.
+    public static let filesSurface = EventStreamFilter.kindPrefixes([
+        "files.state.",
+        "files.edit."
+    ])
+
     public static func parse(_ raw: String?) -> EventStreamFilter {
         parse(filterHeader: raw, interestThreadHeader: nil)
     }
