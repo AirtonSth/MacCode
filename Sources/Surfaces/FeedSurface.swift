@@ -273,8 +273,15 @@ public struct FeedPanelView: View {
             }
         }
         .background(DS.Palette.surface)
-        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
-            timestampTick &+= 1
+        // Lifetime pulse — `Timer.publish` in `body` allocated a new
+        // publisher and resubscribed on every ingest/`timestampTick`
+        // rebuild (and starved the 1s fire during EventBus bursts).
+        .task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled else { return }
+                timestampTick &+= 1
+            }
         }
     }
 
