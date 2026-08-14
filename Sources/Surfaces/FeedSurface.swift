@@ -20,10 +20,20 @@ public final class FeedPanelViewModel: ObservableObject {
         /// Precomputed lowercased haystack so the filter scan doesn't
         /// allocate a fresh `lowercased()` per item per keystroke (PERF-004).
         let searchKey: String
+        /// Absolute hover label. The 1s relative-time tick used to allocate
+        /// a FormatStyle per visible row even though `ts` never changes.
+        public let absoluteTimestampLabel: String
 
         public init(id: Int64, kind: String, title: String, ts: Date) {
             self.id = id; self.kind = kind; self.title = title; self.ts = ts
             self.searchKey = (kind + " " + title).lowercased()
+            self.absoluteTimestampLabel = Self.absoluteTimestampLabel(for: ts)
+        }
+
+        /// Same style as the previous `.formatted(date: .abbreviated, time: .standard)`
+        /// help string, computed once at ingest.
+        nonisolated public static func absoluteTimestampLabel(for ts: Date) -> String {
+            ts.formatted(date: .abbreviated, time: .standard)
         }
     }
 
@@ -233,7 +243,7 @@ public struct FeedPanelView: View {
                                     Spacer()
                                     Text(relativeLabel(for: item))
                                         .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary)
-                                        .help(item.ts.formatted(date: .abbreviated, time: .standard))
+                                        .help(item.absoluteTimestampLabel)
                                 }
                                 if !item.title.isEmpty {
                                     Text(item.title).font(DS.Font.caption)

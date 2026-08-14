@@ -150,4 +150,19 @@ final class FeedPanelViewModelClockTests: XCTestCase {
         XCTAssertEqual(ts, fixedTs.timeIntervalSince1970, accuracy: 0.001,
                        "json ts field must match the item timestamp so clients can reconstruct absolute time")
     }
+
+    /// WHY: the 1s relative tick used to FormatStyle every visible row's
+    /// hover string even though ts is immutable. The ingest-time label must
+    /// match the previous FormatStyle so hover copy does not change.
+    func test_absoluteTimestampLabel_matchesFormatStyleAndIsStable() {
+        let ts = Date(timeIntervalSince1970: 1_700_000_000)
+        let item = FeedPanelViewModel.Item(id: 1, kind: "k", title: "t", ts: ts)
+        XCTAssertEqual(
+            item.absoluteTimestampLabel,
+            ts.formatted(date: .abbreviated, time: .standard),
+            "hover label must stay the same string the 1s body used to format"
+        )
+        let again = FeedPanelViewModel.Item(id: 2, kind: "k", title: "t", ts: ts)
+        XCTAssertEqual(item.absoluteTimestampLabel, again.absoluteTimestampLabel)
+    }
 }
