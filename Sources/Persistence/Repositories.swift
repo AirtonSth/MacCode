@@ -3282,10 +3282,20 @@ public final class AgentRunRepository: @unchecked Sendable {
     // a short lock so concurrent thread reads avoid per-call codec construction.
     private let streamEventCodecLock = NSLock()
     private let streamEventDecoder = JSONDecoder()
+    /// Highest durable `seq` observed for a run on this repository instance.
+    /// Token-rate flushes used to SELECT `(run_id, seq)` before every INSERT
+    /// even when the coordinator had just allocated a never-written sequence.
+    /// Seed from `MAX(seq)` on cache miss so a new instance / relaunch still
+    /// probes retries of already-written identities.
+    private let committedStreamSeqLock = NSLock()
+    private var lastCommittedStreamSeqByRun: [String: Int] = [:]
+    private static let committedStreamSeqCacheLimit = 128
     public init(db: SQLiteDB) { self.db = db }
 #if DEBUG
     /// `iso.string(from:)` calls from `persistStreamBatch` (one per flush).
     private(set) var streamBatchISO8601FormatCountForTesting = 0
+    /// Identity `SELECT` probes from `persistStreamEventIdempotently`.
+    private(set) var streamEventIdentitySelectCountForTesting = 0
 #endif
 
     /// Store-before-loss soft bound used by coordinator + repository (S3).
@@ -3598,6 +3608,7 @@ public final class AgentRunRepository: @unchecked Sendable {
         try st.bind(4, bounded.payloadJSON)
         try st.bind(5, iso.string(from: Date()))
         _ = try st.step()
+        rememberCommittedStreamSeq(runId: runId, seq: seq)
         // Single-path writers (tests + rare direct callers) must also reclaim so
         // a large admit never relies on the batch prune cadence alone.
         if let run = try get(id: runId) {
@@ -3619,11 +3630,43 @@ public final class AgentRunRepository: @unchecked Sendable {
     /// Used to seed in-memory allocation after process relaunch or ownership repair
     /// so a retry cannot reuse seq 1 for a different event kind.
     public func maxStreamEventSeq(runId: AgentRunID) throws -> Int {
+        try maxStreamEventSeq(db: db, runId: runId)
+    }
+
+    private func maxStreamEventSeq(db: SQLiteDB, runId: AgentRunID) throws -> Int {
         let st = try db.prepare(
             "SELECT COALESCE(MAX(seq), 0) FROM agent_stream_events WHERE run_id = ?;"
         )
         try st.bind(1, runId.value.uuidString)
         return (try st.step()) ? Int(st.columnInt64(0)) : 0
+    }
+
+    private func rememberedCommittedStreamSeq(runId: AgentRunID) -> Int? {
+        committedStreamSeqLock.lock()
+        defer { committedStreamSeqLock.unlock() }
+        return lastCommittedStreamSeqByRun[runId.value.uuidString]
+    }
+
+    private func rememberCommittedStreamSeq(runId: AgentRunID, seq: Int) {
+        let key = runId.value.uuidString
+        committedStreamSeqLock.lock()
+        defer { committedStreamSeqLock.unlock() }
+        if lastCommittedStreamSeqByRun.count >= Self.committedStreamSeqCacheLimit,
+           lastCommittedStreamSeqByRun[key] == nil {
+            lastCommittedStreamSeqByRun.removeAll(keepingCapacity: true)
+        }
+        lastCommittedStreamSeqByRun[key] = max(lastCommittedStreamSeqByRun[key] ?? 0, seq)
+    }
+
+    /// Known high-water seq for `runId`. Cache miss reads durable `MAX(seq)`
+    /// once so INSERT-first never duplicates a row written by another instance.
+    private func knownCommittedStreamSeq(db: SQLiteDB, runId: AgentRunID) throws -> Int {
+        if let cached = rememberedCommittedStreamSeq(runId: runId) {
+            return cached
+        }
+        let maxSeq = try maxStreamEventSeq(db: db, runId: runId)
+        rememberCommittedStreamSeq(runId: runId, seq: maxSeq)
+        return maxSeq
     }
 
     /// One ordered mirror write. A provider runtime event shares the transaction
@@ -4023,6 +4066,41 @@ public final class AgentRunRepository: @unchecked Sendable {
         createdAt: String? = nil
     ) throws {
         let bounded = try boundedStreamRow(kind: item.kind, payloadJSON: item.payloadJSON)
+        let lastCommitted = try knownCommittedStreamSeq(db: db, runId: runId)
+        // First write of a freshly allocated seq cannot collide. Retry and
+        // relaunch still SELECT so matching bytes stay idempotent and a
+        // different identity still fails loud.
+        if item.seq <= lastCommitted {
+            try probeExistingStreamEventIdentity(
+                db: db,
+                runId: runId,
+                item: item,
+                bounded: bounded,
+                createdAt: createdAt
+            )
+            return
+        }
+
+        let insert = try db.prepare("INSERT INTO agent_stream_events(run_id, seq, event_kind, payload_json, created_at) VALUES(?, ?, ?, ?, ?);")
+        try insert.bind(1, runId.value.uuidString)
+        try insert.bind(2, Int64(item.seq))
+        try insert.bind(3, bounded.kind)
+        try insert.bind(4, bounded.payloadJSON)
+        try insert.bind(5, createdAt ?? iso.string(from: Date()))
+        _ = try insert.step()
+        rememberCommittedStreamSeq(runId: runId, seq: item.seq)
+    }
+
+    private func probeExistingStreamEventIdentity(
+        db: SQLiteDB,
+        runId: AgentRunID,
+        item: StreamWriteIntent,
+        bounded: (kind: String, payloadJSON: String),
+        createdAt: String?
+    ) throws {
+#if DEBUG
+        streamEventIdentitySelectCountForTesting += 1
+#endif
         let existing = try db.prepare("SELECT event_kind, payload_json FROM agent_stream_events WHERE run_id = ? AND seq = ? LIMIT 1;")
         try existing.bind(1, runId.value.uuidString)
         try existing.bind(2, Int64(item.seq))
@@ -4047,6 +4125,7 @@ public final class AgentRunRepository: @unchecked Sendable {
         try insert.bind(4, bounded.payloadJSON)
         try insert.bind(5, createdAt ?? iso.string(from: Date()))
         _ = try insert.step()
+        rememberCommittedStreamSeq(runId: runId, seq: item.seq)
     }
 
     private func persistProviderEventIdempotently(

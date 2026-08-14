@@ -552,6 +552,99 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(provider, stamps, "paired provider rows must reuse the same batch timestamp")
     }
 
+    func test_persistStreamBatch_skipsIdentitySelectOnFirstWriteOfNewSeqs() throws {
+        // WHY: persistStreamBatch used to SELECT event_kind+payload_json for
+        // every (run_id, seq) before INSERT (~16 probes / 250ms flush) even
+        // when the coordinator had just allocated those sequences. First write
+        // of a seq above the durable high-water mark can INSERT; retry and a
+        // fresh repository instance must still probe so matching bytes stay
+        // idempotent and a different identity still fails loud.
+        let tmp = NSTemporaryDirectory() + "RC2StreamIdentitySelect-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let thread = AgentThread(title: "stream-select", provider: .codex, model: "m")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "m")
+        let runs = AgentRunRepository(db: db)
+        try runs.upsert(run)
+
+        func intent(seq: Int, kind: String = "itemDelta(i1)") -> AgentRunRepository.StreamWriteIntent {
+            AgentRunRepository.StreamWriteIntent(
+                seq: seq,
+                kind: kind,
+                payloadJSON: #"{"itemDelta":{"itemId":"i1","seq":\#(seq)}}"#,
+                providerEvent: nil
+            )
+        }
+
+        let firstFlush = (1...16).map { intent(seq: $0) }
+        XCTAssertEqual(runs.streamEventIdentitySelectCountForTesting, 0)
+        try runs.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: firstFlush,
+            shouldPruneStreamEvents: false
+        )
+        XCTAssertEqual(
+            runs.streamEventIdentitySelectCountForTesting, 0,
+            "first write of seqs 1...16 must INSERT without an identity SELECT"
+        )
+        XCTAssertEqual(try runs.maxStreamEventSeq(runId: run.id), 16)
+
+        try runs.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: firstFlush,
+            shouldPruneStreamEvents: false
+        )
+        XCTAssertEqual(
+            runs.streamEventIdentitySelectCountForTesting, 16,
+            "retry of the same prefix must SELECT each identity instead of inserting a second row"
+        )
+        XCTAssertEqual(try runs.maxStreamEventSeq(runId: run.id), 16)
+
+        let secondFlush = (17...32).map { intent(seq: $0) }
+        try runs.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: secondFlush,
+            shouldPruneStreamEvents: false
+        )
+        XCTAssertEqual(
+            runs.streamEventIdentitySelectCountForTesting, 16,
+            "seqs above the committed high-water mark must not SELECT again"
+        )
+        XCTAssertEqual(try runs.maxStreamEventSeq(runId: run.id), 32)
+
+        let fresh = AgentRunRepository(db: db)
+        try fresh.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: [intent(seq: 32)],
+            shouldPruneStreamEvents: false
+        )
+        XCTAssertEqual(
+            fresh.streamEventIdentitySelectCountForTesting, 1,
+            "a new repository instance must seed from durable MAX and probe a retry"
+        )
+        XCTAssertEqual(try fresh.maxStreamEventSeq(runId: run.id), 32)
+
+        XCTAssertThrowsError(
+            try fresh.persistStreamBatch(
+                runId: run.id,
+                threadId: thread.id,
+                items: [intent(seq: 32, kind: "turnStarted(t1)")],
+                shouldPruneStreamEvents: false
+            )
+        ) { error in
+            let text = String(describing: error)
+            XCTAssertTrue(
+                text.contains("Conflicting stream event identity"),
+                "retry with a different kind must still fail loud: \(text)"
+            )
+        }
+    }
+
     func test_streamEventReplayLimitKeepsNewestEventsInChronologicalOrder() throws {
         let tmp = NSTemporaryDirectory() + "RC2Test-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: tmp) }
