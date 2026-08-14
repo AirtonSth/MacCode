@@ -1973,7 +1973,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         return (
             object,
             object.flatMap {
-                ProviderRuntimeEvent.fromJSONObject($0, provider: .claude, source: "claude.stream-json")
+                ProviderRuntimeEvent.fromJSONObjectIfNeeded($0, provider: .claude, source: "claude.stream-json")
             },
             object.map { parser.parseObject($0) } ?? []
         )

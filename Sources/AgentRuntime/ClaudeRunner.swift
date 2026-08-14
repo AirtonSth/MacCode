@@ -376,7 +376,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         let object = jsonObject(from: line)
         return (
             object.flatMap {
-                ProviderRuntimeEvent.fromJSONObject(
+                ProviderRuntimeEvent.fromJSONObjectIfNeeded(
                     $0, provider: .claude, source: "claude.stream-json", receivedAtMs: receivedAtMs
                 )
             },

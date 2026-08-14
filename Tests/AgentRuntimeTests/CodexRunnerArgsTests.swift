@@ -357,8 +357,10 @@ final class CodexRunnerArgsTests: XCTestCase {
             CodexRunner.streamJSONDecodeCountForTesting, 1,
             "runtime + parser must share one JSONSerialization"
         )
-        XCTAssertEqual(interpreted.runtimeEvent?.method, "item.delta")
-        XCTAssertEqual(interpreted.runtimeEvent?.source, "codex.exec.json")
+        XCTAssertNil(
+            interpreted.runtimeEvent,
+            "token-rate item.delta must not mint providerRuntime; itemDelta is the product event"
+        )
         XCTAssertTrue(
             interpreted.parsedEvents.contains { event in
                 if case .itemDelta(_, let body, _, _) = event { return body == "Hi" }
@@ -366,5 +368,40 @@ final class CodexRunnerArgsTests: XCTestCase {
             },
             "decode-once must still surface the token: \(interpreted.parsedEvents)"
         )
+    }
+
+    func test_highFrequencyExecDeltasSkipProviderRuntime() {
+        // WHY: interpretStreamJSONLine used to fromJSONObject every exec --json
+        // line. item.delta fires at token rate; each one
+        // JSONSerialization.data(.sortedKeys) then persistStream + EventBus
+        // EventLog. itemDelta already carries the bytes. Lifecycle stays.
+        XCTAssertFalse(ProviderRuntimeEvent.shouldEmitFromDecodedStreamObject([
+            "type": "item.delta", "item_id": "i1", "body_delta": "x",
+        ]))
+        XCTAssertTrue(
+            ProviderRuntimeEvent.shouldEmitFromDecodedStreamObject([
+                "type": "item.started", "item_id": "i1", "turn_id": "t1",
+            ]),
+            "item start is lifecycle and still needs the raw provider payload"
+        )
+        XCTAssertTrue(ProviderRuntimeEvent.shouldEmitFromDecodedStreamObject([
+            "type": "turn.started", "turn_id": "t1",
+        ]))
+        XCTAssertTrue(ProviderRuntimeEvent.shouldEmitFromDecodedStreamObject([
+            "type": "item.completed", "item_id": "i1",
+        ]))
+        XCTAssertTrue(ProviderRuntimeEvent.shouldEmitFromDecodedStreamObject([
+            "type": "turn.completed", "turn_id": "t1",
+        ]))
+
+        let parser = CodexParser()
+        _ = parser.parseObject(["type": "turn.started", "turn_id": "t1"], now: 1)
+        let lifecycle = CodexRunner.interpretStreamJSONLine(
+            #"{"type":"turn.started","turn_id":"t1"}"#,
+            parser: parser,
+            receivedAtMs: 1
+        )
+        XCTAssertEqual(lifecycle.runtimeEvent?.method, "turn.started")
+        XCTAssertEqual(lifecycle.runtimeEvent?.source, "codex.exec.json")
     }
 }

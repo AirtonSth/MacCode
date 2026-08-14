@@ -127,6 +127,190 @@ final class AgentTranscriptStateGenerationTests: XCTestCase {
         XCTAssertEqual(state.contentGeneration, start + 2)
     }
 
+    func test_contentGeneration_skipsToolBodyOnlyStreamAssigns() {
+        // WHY: commitStreamQuantum assigns `timeline` on every tool delta
+        // (~30 Hz). Hide-set only depends on assistant bodies / finals /
+        // work *presence*. Rehashing every assistant body while a shell
+        // dump grows does not change hidden IDs and dominates paint.
+        let state = AgentTranscriptState()
+        var timeline = AssistantTimelineState()
+        timeline.turns = [
+            AssistantTurnSnapshot(
+                turnId: "t1",
+                items: [
+                    AssistantItem(
+                        id: "a1",
+                        turnId: "t1",
+                        type: .assistantMessage,
+                        body: "done",
+                        startedAtMs: 1
+                    ),
+                    AssistantItem(
+                        id: "tool-1",
+                        turnId: "t1",
+                        type: .tool,
+                        body: "ls",
+                        output: "a",
+                        startedAtMs: 2
+                    )
+                ],
+                finalAssistantMessage: "done",
+                finished: true
+            )
+        ]
+        state.timeline = timeline
+        let afterStructure = state.contentGeneration
+
+        timeline.turns[0].items[1].output = String(repeating: "x", count: 8_192)
+        state.timeline = timeline
+        XCTAssertEqual(
+            state.contentGeneration,
+            afterStructure,
+            "growing an existing tool body must not invalidate hide-set memos"
+        )
+        XCTAssertTrue(
+            AgentTranscriptState.hideSetRelevantTimelineEquals(state.timeline, timeline)
+        )
+
+        timeline.turns[0].items.append(
+            AssistantItem(id: "tool-2", turnId: "t1", type: .tool, body: "pwd", startedAtMs: 3)
+        )
+        state.timeline = timeline
+        XCTAssertEqual(
+            state.contentGeneration,
+            afterStructure,
+            "another tool on a turn that already has work must not rehash hide-set"
+        )
+
+        var assistantGrown = timeline
+        assistantGrown.turns[0].items[0].body = "done!"
+        state.timeline = assistantGrown
+        XCTAssertEqual(
+            state.contentGeneration,
+            afterStructure + 1,
+            "assistant body growth must still recompute hide-set"
+        )
+    }
+
+    func test_contentGeneration_bumpsWhenWorkFirstAppears() {
+        // WHY: hide-set hides the persisted answer once a turn owns Work so
+        // far. The first non-assistant item flips that boolean and must bump.
+        let state = AgentTranscriptState()
+        var timeline = AssistantTimelineState()
+        timeline.turns = [
+            AssistantTurnSnapshot(
+                turnId: "t1",
+                items: [
+                    AssistantItem(
+                        id: "a1",
+                        turnId: "t1",
+                        type: .assistantMessage,
+                        body: "done",
+                        startedAtMs: 1
+                    )
+                ],
+                finalAssistantMessage: "done",
+                finished: true
+            )
+        ]
+        state.timeline = timeline
+        let afterAnswer = state.contentGeneration
+
+        timeline.turns[0].items.append(
+            AssistantItem(id: "tool-1", turnId: "t1", type: .tool, body: "ls", startedAtMs: 2)
+        )
+        state.timeline = timeline
+        XCTAssertEqual(
+            state.contentGeneration,
+            afterAnswer + 1,
+            "first work item must invalidate hide-set so the persisted answer can hide"
+        )
+    }
+
+    func test_hideSetEquals_skipsHistoricalItemWalkWhenItemsStorageShared() {
+        // WHY: commitStreamQuantum copies the whole timeline then apply()
+        // CoW-mutates only the live turn. Hide-set used to walk every
+        // historical assistant body on each ~30 Hz tool delta even though
+        // those turns still share `items` storage. Budget eviction copies
+        // that storage and must still walk.
+        var timeline = AssistantTimelineState()
+        for index in 0..<8 {
+            let turnId = "hist-\(index)"
+            timeline.turns.append(AssistantTurnSnapshot(
+                turnId: turnId,
+                items: [
+                    AssistantItem(
+                        id: "a-\(index)",
+                        turnId: turnId,
+                        type: .assistantMessage,
+                        body: String(repeating: "answer-\(index)-", count: 40),
+                        startedAtMs: Int64(index)
+                    ),
+                    AssistantItem(
+                        id: "tool-\(index)",
+                        turnId: turnId,
+                        type: .tool,
+                        body: "cmd",
+                        output: String(repeating: "out", count: 80),
+                        startedAtMs: Int64(index)
+                    )
+                ],
+                finalAssistantMessage: "done-\(index)",
+                finished: true
+            ))
+        }
+        timeline.apply(.turnStarted(turnId: "live"))
+        timeline.apply(.itemStarted(item: AssistantItem(
+            id: "live-tool",
+            turnId: "live",
+            type: .tool,
+            body: "ls",
+            output: "a",
+            startedAtMs: 100
+        )))
+        let before = timeline
+        timeline.apply(.itemDelta(
+            itemId: "live-tool",
+            bodyAppend: nil,
+            outputAppend: String(repeating: "x", count: 256),
+            summary: nil
+        ))
+
+        AgentTranscriptState.hideSetHistoricalTurnWalksForTesting = 0
+        XCTAssertTrue(
+            AgentTranscriptState.hideSetRelevantTimelineEquals(before, timeline),
+            "live tool-body growth must not look like a hide-set change"
+        )
+        XCTAssertEqual(
+            AgentTranscriptState.hideSetHistoricalTurnWalksForTesting,
+            0,
+            "historical turns that still share items storage must not re-walk assistant bodies"
+        )
+
+        var historicalMutated = timeline
+        historicalMutated.turns[0].items[0].body = "changed-answer"
+        AgentTranscriptState.hideSetHistoricalTurnWalksForTesting = 0
+        XCTAssertFalse(
+            AgentTranscriptState.hideSetRelevantTimelineEquals(timeline, historicalMutated),
+            "copying a historical assistant body must still invalidate hide-set"
+        )
+        XCTAssertEqual(
+            AgentTranscriptState.hideSetHistoricalTurnWalksForTesting,
+            1,
+            "diverged historical items storage must take the full walk"
+        )
+
+        let state = AgentTranscriptState()
+        state.timeline = before
+        let generation = state.contentGeneration
+        state.timeline = timeline
+        XCTAssertEqual(
+            state.contentGeneration,
+            generation,
+            "shared-storage tool dump must not bump contentGeneration"
+        )
+    }
+
     func test_paintTick_doesNotPublishTranscriptState() {
         // WHY: TranscriptReactiveScope observes AgentTranscriptState. If the
         // ~30 Hz scroll tick stayed @Published on that object, the whole

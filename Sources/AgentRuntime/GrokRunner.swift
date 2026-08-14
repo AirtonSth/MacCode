@@ -327,11 +327,12 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
         source: String,
         receivedAtMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
     ) -> ProviderRuntimeEvent? {
-        guard let event = ProviderRuntimeEvent.fromJSONObject(
+        // Skip before JSONSerialization.data(.sortedKeys). The previous
+        // fromJSONObject-then-drop path still serialized every thought/text
+        // token, then discarded the event. itemDelta already carries the bytes.
+        ProviderRuntimeEvent.fromJSONObjectIfNeeded(
             object, provider: .grok, source: source, receivedAtMs: receivedAtMs
-        ) else { return nil }
-        if Self.isTokenStreamMethod(event.method) { return nil }
-        return event
+        )
     }
 
     /// Grok `streaming-json` emits one NDJSON object per reasoning/answer token.

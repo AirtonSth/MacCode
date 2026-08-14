@@ -133,14 +133,32 @@ final class ClaudeAgentSDKBridgeAdapterPerfTests: XCTestCase {
         )
         XCTAssertFalse(interpretation.isSDKError)
         XCTAssertNil(interpretation.userInputRequest)
-        XCTAssertEqual(interpretation.runtimeEvent?.method, "content_block_delta")
-        XCTAssertEqual(interpretation.runtimeEvent?.source, "claude.agent-sdk")
+        XCTAssertNil(
+            interpretation.runtimeEvent,
+            "token-rate deltas must not mint providerRuntime; itemDelta is the product event"
+        )
         XCTAssertTrue(
             interpretation.parsedEvents.contains { event in
                 if case .itemDelta(_, let body, _, _) = event { return body == "Hi" }
                 return false
             },
             "decode-once must still surface the text delta: \(interpretation.parsedEvents)"
+        )
+
+        ClaudeAgentSDKBridgeAdapter.sdkLineJSONDecodeCountForTesting = 0
+        let wrapped = #"{"type":"stream_event","session_id":"sid","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}}"#
+        let wrappedInterp = ClaudeAgentSDKBridgeAdapter.interpretSDKLine(wrapped, parser: parser)
+        XCTAssertEqual(ClaudeAgentSDKBridgeAdapter.sdkLineJSONDecodeCountForTesting, 1)
+        XCTAssertNil(
+            wrappedInterp.runtimeEvent,
+            "SDK stream_event wrappers around content_block_delta must not mint providerRuntime"
+        )
+        XCTAssertTrue(
+            wrappedInterp.parsedEvents.contains { event in
+                if case .itemDelta(_, let body, _, _) = event { return body == "Hi" }
+                return false
+            },
+            "wrapped delta must still surface itemDelta: \(wrappedInterp.parsedEvents)"
         )
     }
 

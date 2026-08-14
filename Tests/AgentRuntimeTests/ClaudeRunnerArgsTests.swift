@@ -509,8 +509,10 @@ final class ClaudeRunnerArgsTests: XCTestCase {
             ClaudeRunner.streamJSONDecodeCountForTesting, 1,
             "runtime + parser must share one JSONSerialization"
         )
-        XCTAssertEqual(interpreted.runtimeEvent?.method, "content_block_delta")
-        XCTAssertEqual(interpreted.runtimeEvent?.source, "claude.stream-json")
+        XCTAssertNil(
+            interpreted.runtimeEvent,
+            "token-rate deltas must not mint providerRuntime; itemDelta is the product event"
+        )
         XCTAssertTrue(
             interpreted.parsedEvents.contains { event in
                 if case .itemDelta(_, let body, _, _) = event { return body == "Hi" }
@@ -518,5 +520,46 @@ final class ClaudeRunnerArgsTests: XCTestCase {
             },
             "decode-once must still surface the text delta: \(interpreted.parsedEvents)"
         )
+    }
+
+    func test_highFrequencyStreamingTypesSkipProviderRuntime() {
+        // WHY: interpretStreamJSONLine used to fromJSONObject every stream-json
+        // line. content_block_delta (and SDK stream_event wrappers) fire at
+        // token rate; each one JSONSerialization.data(.sortedKeys) then
+        // persistStream + EventBus EventLog. itemDelta already carries the
+        // bytes. Lifecycle types stay.
+        XCTAssertFalse(ProviderRuntimeEvent.shouldEmitFromDecodedStreamObject(
+            ["type": "content_block_delta", "delta": ["type": "text_delta", "text": "x"]]
+        ))
+        XCTAssertFalse(ProviderRuntimeEvent.shouldEmitFromDecodedStreamObject(
+            ["type": "input_json_delta", "partial_json": "{"]
+        ))
+        XCTAssertFalse(ProviderRuntimeEvent.shouldEmitFromDecodedStreamObject(
+            ["type": "ping"]
+        ))
+        XCTAssertFalse(ProviderRuntimeEvent.shouldEmitFromDecodedStreamObject([
+            "type": "stream_event",
+            "event": ["type": "content_block_delta", "delta": ["type": "text_delta", "text": "x"]],
+        ]))
+        XCTAssertTrue(
+            ProviderRuntimeEvent.shouldEmitFromDecodedStreamObject(["type": "system", "subtype": "init"]),
+            "system init is lifecycle and still needs the raw provider payload"
+        )
+        XCTAssertTrue(ProviderRuntimeEvent.shouldEmitFromDecodedStreamObject(["type": "result"]))
+        XCTAssertTrue(ProviderRuntimeEvent.shouldEmitFromDecodedStreamObject([
+            "type": "stream_event",
+            "event": ["type": "content_block_start", "index": 0],
+        ]), "non-delta stream_event wrappers still emit providerRuntime")
+        XCTAssertTrue(ProviderRuntimeEvent.shouldEmitFromDecodedStreamObject(["type": "assistant"]))
+
+        let parser = ClaudeParser()
+        _ = parser.parseObject(["type": "system", "subtype": "init", "session_id": "sid"], now: 1)
+        let lifecycle = ClaudeRunner.interpretStreamJSONLine(
+            #"{"type":"system","subtype":"init","session_id":"sid"}"#,
+            parser: parser,
+            receivedAtMs: 1
+        )
+        XCTAssertEqual(lifecycle.runtimeEvent?.method, "system")
+        XCTAssertEqual(lifecycle.runtimeEvent?.source, "claude.stream-json")
     }
 }

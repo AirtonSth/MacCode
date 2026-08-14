@@ -2036,7 +2036,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             isSDKError: object?["type"] as? String == "sdk_error",
             userInputRequest: bridgeUserInputRequest(in: object),
             runtimeEvent: object.flatMap {
-                ProviderRuntimeEvent.fromJSONObject($0, provider: .claude, source: "claude.agent-sdk")
+                ProviderRuntimeEvent.fromJSONObjectIfNeeded($0, provider: .claude, source: "claude.agent-sdk")
             },
             parsedEvents: object.map { parser.parseObject($0) } ?? []
         )
