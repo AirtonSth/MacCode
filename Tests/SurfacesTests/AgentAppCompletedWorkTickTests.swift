@@ -59,6 +59,30 @@ final class AgentAppCompletedWorkTickTests: XCTestCase {
         XCTAssertFalse(afterPrune.hasNewlyFinished)
     }
 
+    func test_completedWorkTurnIds_reusesKnownSetWhileLiveTurnStreams() {
+        // WHY: each stream flush used to allocate a new Set and re-insert
+        // every finished turn id (~30 Hz, up to liveTurnLimit). A live
+        // unfinished turn must not force that alloc.
+        let done = [
+            turn("t1", finished: true, final: "a"),
+            turn("t2", finished: true, final: "b"),
+            turn("t3", finished: true, final: "c")
+        ]
+        let first = AgentAppView.completedWorkTurnIds(turns: done, previouslyKnown: [])
+        XCTAssertEqual(first.ids, ["t1", "t2", "t3"])
+        let streaming = done + [turn("live", finished: false, final: nil)]
+        let second = AgentAppView.completedWorkTurnIds(
+            turns: streaming,
+            previouslyKnown: first.ids
+        )
+        XCTAssertFalse(second.hasNewlyFinished)
+        XCTAssertEqual(
+            second.ids,
+            first.ids,
+            "a still-live unfinished turn must not rebuild or grow the finished-id set"
+        )
+    }
+
     func test_completedWorkTurnIds_whitespaceOnlyFinalIsNotFinished() {
         let update = AgentAppView.completedWorkTurnIds(
             turns: [turn("blank", finished: false, final: "  \n")],

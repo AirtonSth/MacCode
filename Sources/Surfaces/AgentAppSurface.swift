@@ -10083,21 +10083,34 @@ public struct AgentAppView: View {
 
     /// Rebuilds the finished-turn set from the live timeline (so pruned
     /// turns drop out) without rescanning already-known finals.
+    /// Stream flushes (~30 Hz) usually add tokens to a still-live turn:
+    /// reuse `previouslyKnown` so we do not allocate a new Set of every
+    /// finished turn id on each flush.
     nonisolated static func completedWorkTurnIds(
         turns: [AssistantTurnSnapshot],
         previouslyKnown: Set<String>
     ) -> (ids: Set<String>, hasNewlyFinished: Bool) {
-        var ids = Set<String>()
-        ids.reserveCapacity(turns.count)
         var hasNewlyFinished = false
+        var knownStillPresent = 0
         for turn in turns {
             if previouslyKnown.contains(turn.turnId) {
-                ids.insert(turn.turnId)
+                knownStillPresent += 1
                 continue
             }
             if turn.finished || finalAssistantHasVisibleText(turn.finalAssistantMessage) {
-                ids.insert(turn.turnId)
                 hasNewlyFinished = true
+            }
+        }
+        if !hasNewlyFinished && knownStillPresent == previouslyKnown.count {
+            return (previouslyKnown, false)
+        }
+        var ids = Set<String>()
+        ids.reserveCapacity(turns.count)
+        for turn in turns {
+            if previouslyKnown.contains(turn.turnId)
+                || turn.finished
+                || finalAssistantHasVisibleText(turn.finalAssistantMessage) {
+                ids.insert(turn.turnId)
             }
         }
         return (ids, hasNewlyFinished)
