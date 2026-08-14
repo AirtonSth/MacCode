@@ -312,6 +312,8 @@ public final class SidebarViewModel: ObservableObject {
     @Published public var workspaces: [Workspace] = [] {
         didSet {
             busyStateCache.removeAll(keepingCapacity: true)
+            busyTooltipCache.removeAll(keepingCapacity: true)
+            busySurfaceTitlesCache.removeAll(keepingCapacity: true)
             filteredWorkspacesCache = nil
         }
     }
@@ -321,6 +323,14 @@ public final class SidebarViewModel: ObservableObject {
     /// every render. Invalidated whenever `workspaces` is reassigned via
     /// `reload`, which is driven by the same mutations that change busy.
     private var busyStateCache: [WorkspaceID: Bool] = [:]
+    /// Final tooltip keyed by workspace + running thread titles. Agent titles
+    /// win without a SurfaceRegistry walk; surface titles are cached separately.
+    private var busyTooltipCache: [WorkspaceID: (titles: [String], tooltip: String?)] = [:]
+    private var busySurfaceTitlesCache: [WorkspaceID: [String]] = [:]
+    /// Test seam: SurfaceRegistry walks performed for tooltips.
+    var busySurfaceWalkCountForTesting = 0
+    /// Test seam: inject running titles without a live coordinator run.
+    var busyTooltipRunningTitlesOverrideForTesting: [WorkspaceID: [String]]?
     // PERF: filteredWorkspaces is recomputed on every SwiftUI body evaluation
     // and on the drag-scroll timer (16 Hz). Cache the last filtered result and
     // invalidate only when workspaces or filterText changes so repeated renders
@@ -2070,10 +2080,47 @@ public final class SidebarViewModel: ObservableObject {
         return nil
     }
 
+    /// Thread titles take priority over surfaces. A walk is wasted whenever
+    /// an agent is already running in the workspace (the common busy case).
+    nonisolated public static func needsBusySurfaceWalk(runningThreadTitles: [String]) -> Bool {
+        runningThreadTitles.isEmpty
+    }
+
     /// Returns a tooltip string describing the active busy source for `ws`,
     /// or nil when the workspace is idle.
     public func busyTooltip(for ws: Workspace) -> String? {
-        let surfaceTitles: [String] = ws.layout.paneIDs().flatMap { pid -> [String] in
+        let runningThreadTitles = busyTooltipRunningTitlesOverrideForTesting?[ws.id]
+            ?? context?.activeAgentThreadTitles(in: ws.id)
+            ?? []
+        if let cached = busyTooltipCache[ws.id], cached.titles == runningThreadTitles {
+            return cached.tooltip
+        }
+        if !Self.needsBusySurfaceWalk(runningThreadTitles: runningThreadTitles) {
+            let tooltip = Self.busyTooltip(
+                runningThreadTitles: runningThreadTitles,
+                busySurfaceTitles: []
+            )
+            busyTooltipCache[ws.id] = (runningThreadTitles, tooltip)
+            return tooltip
+        }
+        let surfaceTitles: [String]
+        if let cachedSurfaces = busySurfaceTitlesCache[ws.id] {
+            surfaceTitles = cachedSurfaces
+        } else {
+            busySurfaceWalkCountForTesting += 1
+            surfaceTitles = collectBusySurfaceTitles(ws)
+            busySurfaceTitlesCache[ws.id] = surfaceTitles
+        }
+        let tooltip = Self.busyTooltip(
+            runningThreadTitles: runningThreadTitles,
+            busySurfaceTitles: surfaceTitles
+        )
+        busyTooltipCache[ws.id] = (runningThreadTitles, tooltip)
+        return tooltip
+    }
+
+    private func collectBusySurfaceTitles(_ ws: Workspace) -> [String] {
+        ws.layout.paneIDs().flatMap { pid -> [String] in
             guard let pane = ws.layout.find(paneID: pid) else { return [] }
             return pane.surfaces.compactMap { desc -> String? in
                 guard SurfaceRegistry.shared.surface(desc.id)?.isBusy == true else { return nil }
@@ -2085,11 +2132,6 @@ public final class SidebarViewModel: ObservableObject {
                 }
             }
         }
-        let runningThreadTitles = context?.activeAgentThreadTitles(in: ws.id) ?? []
-        return Self.busyTooltip(
-            runningThreadTitles: runningThreadTitles,
-            busySurfaceTitles: surfaceTitles
-        )
     }
 
     public func reorderWorkspace(_ dragged: WorkspaceID, before target: WorkspaceID) {

@@ -103,6 +103,45 @@ final class SidebarRefreshPerfGuardTests: XCTestCase {
             "busyTooltip must remain read-free after repeated runtime refreshes")
     }
 
+    /// WHY: SwiftUI re-evaluates workspace rows on usage/filter/@Published.
+    /// An agent-busy row must not walk SurfaceRegistry — thread titles win.
+    func test_busyTooltip_skipsSurfaceWalkWhenAgentTitlesPresent() throws {
+        let (_, router, vm) = try make(prefix: "agent-skip-walk")
+        let ws = try router.createWorkspace(name: "w", cwd: NSTemporaryDirectory())
+        vm.reload()
+        let row = try XCTUnwrap(vm.workspaces.first(where: { $0.id == ws.id }))
+        vm.busyTooltipRunningTitlesOverrideForTesting = [row.id: ["Fix CI"]]
+
+        XCTAssertEqual(vm.busyTooltip(for: row), "Agent run in thread \"Fix CI\"")
+        XCTAssertEqual(vm.busyTooltip(for: row), "Agent run in thread \"Fix CI\"")
+        XCTAssertEqual(
+            vm.busySurfaceWalkCountForTesting,
+            0,
+            "agent-busy tooltip must not walk panes/SurfaceRegistry"
+        )
+    }
+
+    /// WHY: terminal-only busy still needs one surface walk per workspaces
+    /// snapshot; repeated bodies (filter, usage) must hit the cache.
+    func test_busyTooltip_walksSurfacesOncePerWorkspaceSnapshot() throws {
+        let (_, router, vm) = try make(prefix: "surface-cache")
+        let ws = try router.createWorkspace(name: "w", cwd: NSTemporaryDirectory())
+        vm.reload()
+        let row = try XCTUnwrap(vm.workspaces.first(where: { $0.id == ws.id }))
+
+        _ = vm.busyTooltip(for: row)
+        _ = vm.busyTooltip(for: row)
+        XCTAssertEqual(vm.busySurfaceWalkCountForTesting, 1)
+
+        vm.workspaces = vm.workspaces
+        _ = vm.busyTooltip(for: row)
+        XCTAssertEqual(
+            vm.busySurfaceWalkCountForTesting,
+            2,
+            "workspaces didSet must drop the surface-title cache"
+        )
+    }
+
     // MARK: - PERF-MAC_SIDEBAR-002 no-op reload
 
     /// WHY: `sidebar.refresh()` runs on every coalesced refreshFromState and
