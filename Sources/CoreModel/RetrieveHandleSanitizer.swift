@@ -3,11 +3,13 @@ import Foundation
 /// Strips unresolved CCR handle markers from final user-facing text.
 public enum RetrieveHandleSanitizer {
     private static let uuid = #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"#
+    private static let compactScopedCapability = #"rcv1\.[A-Za-z0-9_-]{22}"#
+    private static let legacyScopedCapability = #"rcv1\."# + uuid + #"\."# + uuid + uuid
 
     // PERF: compile once — strip/contains run on final assistant text and distill
     // gates; range(of:options:.regularExpression) recompiled every call.
     private static let handleRegex = try! NSRegularExpression(
-        pattern: #"\[\[rc:(?:[0-9a-fA-F]+|rcv1\."# + uuid + #"\."# + uuid + uuid + #")\]\]"#
+        pattern: #"\[\[rc:(?:[0-9a-fA-F]+|"# + compactScopedCapability + #"|"# + legacyScopedCapability + #")\]\]"#
     )
     private static let trailingSpacesBeforeNewlineRegex = try! NSRegularExpression(
         pattern: #"[ \t]+\n"#

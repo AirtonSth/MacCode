@@ -8460,10 +8460,16 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         return showsLiveToolElapsed(for: item)
     }
 
-    /// Token Saver distill wrapper was present on the command (display chip only).
+    /// Token Saver ran for this tool (display chip only). Explicit pipes are visible
+    /// in the command; transparent PATH interception is proven by its scoped recovery
+    /// receipt in the delivered output.
     static func toolCommandWasDistilled(for item: AssistantItem) -> Bool {
-        guard let raw = rawShellCommand(for: item) ?? toolCommandPreview(for: item) else { return false }
-        return firstMatchRange(distillPipePresentRegex, in: raw) != nil
+        if let raw = rawShellCommand(for: item) ?? toolCommandPreview(for: item),
+           firstMatchRange(distillPipePresentRegex, in: raw) != nil {
+            return true
+        }
+        guard let detail = detailText(for: item) else { return false }
+        return RetrieveHandleSanitizer.containsHandle(detail)
     }
 
     /// Compact elapsed label (`12s`, `1m 53s`) from start→end timestamps.

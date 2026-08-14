@@ -1003,8 +1003,7 @@ public final class TokenSaverScopedRecoveryStore: @unchecked Sendable {
             try revoke.bind(2, objectID)
             _ = try revoke.step()
         }
-        let secret = UUID().uuidString.lowercased() + UUID().uuidString.lowercased()
-        let capability = "rcv1.\(objectID).\(secret)"
+        let capability = "rcv1.\(Self.compactCapabilityToken())"
         let statement = try database.prepare("""
             INSERT INTO token_saver_recovery_capabilities
                 (capability_hash, object_id, revoked_at_ms, created_at_ms)
@@ -1016,6 +1015,22 @@ public final class TokenSaverScopedRecoveryStore: @unchecked Sendable {
         try statement.bind(3, nowMS)
         _ = try statement.step()
         return capability
+    }
+
+    /// 128 random bits encoded as unpadded base64url (22 characters). The database
+    /// maps a one-way hash of this bearer to its object, so exposing the object UUID
+    /// in every provider-visible recovery marker only spent tokens without adding
+    /// authorization. Existing long `rcv1.*` capabilities remain valid on retrieval.
+    private static func compactCapabilityToken() -> String {
+        var generator = SystemRandomNumberGenerator()
+        var bytes = [UInt8](repeating: 0, count: 16)
+        for index in bytes.indices {
+            bytes[index] = UInt8.random(in: .min ... .max, using: &generator)
+        }
+        return Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "="))
     }
 
     private func authorizedObjectID(

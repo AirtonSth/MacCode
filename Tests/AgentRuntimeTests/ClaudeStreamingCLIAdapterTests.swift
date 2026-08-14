@@ -1149,9 +1149,9 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         // AND the never-pipe list for exact-output tools. This previously asserted
         // "pipe EVERY pipable ..." and was red — the template moved to the
         // fidelity-based predicate and the assertion was left behind.
-        XCTAssertTrue(on.contains("Good to pipe:"),
+        XCTAssertTrue(on.contains("MANDATORY default-pipe:"),
                       "Token Saver on: system prompt carries the `| distill` piping rule")
-        XCTAssertTrue(on.contains("for exact-output tools"),
+        XCTAssertTrue(on.contains("NEVER pipe `| distill` only for exact-output"),
                       "Token Saver on: system prompt carries the never-pipe rule for byte-exact output")
         XCTAssertTrue(on.contains("S=state"),
                       "Token Saver on: system prompt carries distill-language prefixes")

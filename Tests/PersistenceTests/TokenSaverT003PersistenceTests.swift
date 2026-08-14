@@ -73,6 +73,24 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
         XCTAssertEqual(try store.retrieve(capability: prepared.capability, scope: scope()), original)
     }
 
+    func test_scopedStore_mintsCompactURLSafeCapabilityWithoutWeakeningRecovery() throws {
+        // WHY: every lossy tool result pays this marker in provider context; keep the
+        // bearer compact while retaining a full 128 bits of random capability material.
+        let store = TokenSaverScopedRecoveryStore(db: try makeDB())
+        let original = Data("compact capability original".utf8)
+        let prepared = try store.prepare(
+            original,
+            scope: scope(),
+            operationID: "compact-capability",
+            expiresAt: nil,
+            disk: disk
+        )
+
+        XCTAssertEqual(prepared.capability.count, 27)
+        XCTAssertNotNil(prepared.capability.range(of: #"^rcv1\.[A-Za-z0-9_-]{22}$"#, options: .regularExpression))
+        XCTAssertEqual(try store.retrieve(capability: prepared.capability, scope: scope()), original)
+    }
+
     func test_scopedStore_retryReusesObjectAndIdempotencyButRotatesCapability() throws {
         let db = try makeDB()
         let store = TokenSaverScopedRecoveryStore(db: db)

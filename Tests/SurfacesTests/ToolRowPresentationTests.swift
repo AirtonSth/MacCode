@@ -229,6 +229,30 @@ final class ToolRowPresentationTests: XCTestCase {
         XCTAssertNotEqual(summary, full)
     }
 
+    func test_toolCommandWasDistilled_detectsAutomaticInterceptorReceipt() {
+        // WHY: transparent PATH interception leaves the original command unchanged;
+        // the reversible output receipt is the authoritative evidence that Distill ran.
+        let item = toolItem(
+            body: #"{"command":"ls -la /usr/bin"}"#,
+            summary: "Bash",
+            output: "important lines\n[[rc:rcv1.ABCDEFGHIJKLMNOPQRSTUV]]"
+        )
+
+        XCTAssertFalse(item.body.contains("| distill"))
+        XCTAssertTrue(AgentTimelineItemPresentation.toolCommandWasDistilled(for: item))
+    }
+
+    func test_toolCommandWasDistilled_ignoresMalformedRecoveryMarker() {
+        // WHY: arbitrary tool output must not be able to spoof the Distilled badge.
+        let item = toolItem(
+            body: #"{"command":"printf hello"}"#,
+            summary: "Bash",
+            output: "hello [[rc:rcv1.not-a-capability]]"
+        )
+
+        XCTAssertFalse(AgentTimelineItemPresentation.toolCommandWasDistilled(for: item))
+    }
+
     func test_toolCommandPreview_humanizesTaskTimeoutPayload() {
         // WHY: raw `task_ids: [1] timeout_ms: 180000` reads like a debug dump.
         let item = toolItem(

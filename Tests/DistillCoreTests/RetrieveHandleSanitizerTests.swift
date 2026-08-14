@@ -37,6 +37,14 @@ final class RetrieveHandleSanitizerTests: XCTestCase {
         XCTAssertTrue(RetrieveHandleSanitizer.containsHandle(text))
     }
 
+    func test_stripsCompactScopedCapabilityMarker() {
+        let capability = "rcv1.ABCDEFGHIJKLMNOPQRSTUV"
+        let text = "Compressed output [[rc:\(capability)]]"
+
+        XCTAssertEqual(RetrieveHandleSanitizer.strip(text), "Compressed output")
+        XCTAssertTrue(RetrieveHandleSanitizer.containsHandle(text))
+    }
+
     func test_leavesMalformedCapabilityLiteralUnchanged() {
         let text = "User text [[rc:rcv1.not-a-uuid.not-a-secret]]"
 
