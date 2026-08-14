@@ -4965,9 +4965,7 @@ public final class AppContext {
         // Counter is local to the closure; only ever mutated on `queue` (serial).
         var appendCount = 0
         EventBus.shared.persister = { ev in
-            // surface.output is high-frequency binary; never persisted (same
-            // predicate as AppDelegate.shouldPersistEvent).
-            guard ev.kind != "surface.output" else { return }
+            guard AppDelegate.shouldPersistEvent(ev) else { return }
             let json = EventBus.encodePayloadForPersistence(ev.payload)
             queue.async {
                 _ = try? log.append(seq: ev.seq, kind: ev.kind, payloadJSON: json)
