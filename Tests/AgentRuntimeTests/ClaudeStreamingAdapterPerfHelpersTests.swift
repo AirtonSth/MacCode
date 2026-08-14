@@ -60,6 +60,40 @@ final class ClaudeStreamingAdapterPerfHelpersTests: XCTestCase {
         )
     }
 
+    func test_interpretStreamJSONLine_decodesJSONOnce() {
+        // WHY: handleLine used to JSONSerialization for F12 (uuid/runtime)
+        // and again in ClaudeParser.parseLine. Token-rate stream-json must
+        // decode once; extra parses allocate without changing events.
+        let parser = ClaudeParser()
+        _ = parser.parseObject([
+            "type": "system", "subtype": "init", "session_id": "sid",
+        ], now: 1)
+        _ = parser.parseObject([
+            "type": "message_start", "message": ["id": "m1"],
+        ], now: 1)
+        _ = parser.parseObject([
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": ["type": "text", "id": "item0"],
+        ], now: 1)
+        ClaudeStreamingCLIAdapter.streamJSONDecodeCountForTesting = 0
+        let line = #"{"type":"content_block_delta","index":0,"session_id":"sid","delta":{"type":"text_delta","text":"Hi"}}"#
+        let interpreted = ClaudeStreamingCLIAdapter.interpretStreamJSONLine(line, parser: parser)
+        XCTAssertEqual(
+            ClaudeStreamingCLIAdapter.streamJSONDecodeCountForTesting, 1,
+            "runtime + parser must share one JSONSerialization"
+        )
+        XCTAssertEqual(interpreted.runtimeEvent?.method, "content_block_delta")
+        XCTAssertEqual(interpreted.runtimeEvent?.source, "claude.stream-json")
+        XCTAssertTrue(
+            interpreted.parsedEvents.contains { event in
+                if case .itemDelta(_, let body, _, _) = event { return body == "Hi" }
+                return false
+            },
+            "decode-once must still surface the text delta: \(interpreted.parsedEvents)"
+        )
+    }
+
     func test_snapshotSignature_isStableAcrossSetInsertionOrder() {
         // WHY: the signature coalesces identical snapshots. It must NOT change just
         // because a Set yields its members in a different order, or every tool delta
